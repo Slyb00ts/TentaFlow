@@ -2,6 +2,8 @@
 // File: tf-key-value.js
 // Description: <tf-key-value> — key-value display table. Set .entries to an
 //              array of {key, value, chip?, chipTone?} to render rows.
+//              Entries may carry keyNode/valueNode DOM nodes instead of the
+//              key/value strings for caller-managed (e.g. reactive) cells.
 // Example:
 //   const kv = document.querySelector('tf-key-value');
 //   kv.entries = [
@@ -43,14 +45,19 @@ class TfKeyValue extends HTMLElement {
 
       const keyTd = document.createElement('td');
       keyTd.className = 'tf-kv-key';
-      keyTd.textContent = entry.key || '';
+      if (entry.keyNode) keyTd.appendChild(entry.keyNode);
+      else keyTd.textContent = entry.key || '';
 
       const valTd = document.createElement('td');
       valTd.className = 'tf-kv-value';
 
-      const valText = document.createElement('span');
-      valText.textContent = entry.value || '';
-      valTd.appendChild(valText);
+      if (entry.valueNode) {
+        valTd.appendChild(entry.valueNode);
+      } else {
+        const valText = document.createElement('span');
+        valText.textContent = entry.value || '';
+        valTd.appendChild(valText);
+      }
 
       if (entry.chip) {
         const chip = document.createElement('span');

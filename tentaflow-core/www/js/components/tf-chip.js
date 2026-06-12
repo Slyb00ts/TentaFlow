@@ -6,6 +6,11 @@
 //       scope-chat | scope-deploy | scope-mesh-read | scope-mesh-admin |
 //       scope-trace | scope-license (API key scopes).
 //       Light DOM + klasa .tf-chip, opcjonalna pulsujaca kropka.
+//       The `label` attribute overrides the text (reactive updates via
+//       setAttribute), `removable` adds a × button emitting a `remove` event,
+//       and a child with slot="lead" (e.g. avatar) is kept before the label.
+//       `variant="tag"` + `tone` + `size` renders a static tag (.tf-tag--*
+//       classes) instead of the status pill.
 // Przyklad: <tf-chip status="online" dot>Online</tf-chip>
 // =============================================================================
 
@@ -16,14 +21,10 @@ const STATUS_CLASSES = new Set([
   'scope-mesh-admin', 'scope-trace', 'scope-license',
 ]);
 
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+const TAG_TONES = new Set([
+  'neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted',
+]);
+const TAG_SIZES = new Set(['xs', 'sm', 'md']);
 
 function safeIconName(value) {
   const text = String(value || '').trim();
@@ -32,24 +33,31 @@ function safeIconName(value) {
 
 class TfChip extends HTMLElement {
   static get observedAttributes() {
-    return ['status', 'dot', 'clickable', 'active', 'icon'];
+    return [
+      'status', 'dot', 'clickable', 'active', 'icon',
+      'label', 'variant', 'tone', 'size', 'removable',
+    ];
   }
 
   constructor() {
     super();
     this._span = null;
     this._label = '';
+    this._lead = null;
     this._onKeyDown = this._onKeyDown.bind(this);
+    this._onClick = this._onClick.bind(this);
   }
 
   connectedCallback() {
     if (!this._span) this._build();
     this.addEventListener('keydown', this._onKeyDown);
+    this.addEventListener('click', this._onClick);
     this._update();
   }
 
   disconnectedCallback() {
     this.removeEventListener('keydown', this._onKeyDown);
+    this.removeEventListener('click', this._onClick);
   }
 
   attributeChangedCallback() {
@@ -57,6 +65,14 @@ class TfChip extends HTMLElement {
   }
 
   _build() {
+    // Element children marked slot="lead" (avatar etc.) are preserved and
+    // re-inserted before the label; remaining text becomes the default label.
+    for (const child of [...this.children]) {
+      if (child.getAttribute('slot') === 'lead') {
+        this._lead = child;
+        child.remove();
+      }
+    }
     this._label = this.textContent;
     this.innerHTML = '';
     const span = document.createElement('span');
@@ -66,6 +82,26 @@ class TfChip extends HTMLElement {
   }
 
   _update() {
+    const span = this._span;
+    const label = this.hasAttribute('label')
+      ? this.getAttribute('label')
+      : this._label;
+    span.textContent = '';
+
+    if ((this.getAttribute('variant') || '') === 'tag') {
+      // Static read-only tag variant — reuses .tf-tag styling, label only.
+      const tone = (this.getAttribute('tone') || '').toLowerCase();
+      const size = (this.getAttribute('size') || '').toLowerCase();
+      const cls = ['tf-tag'];
+      if (TAG_TONES.has(tone)) cls.push(`tf-tag--tone-${tone}`);
+      if (TAG_SIZES.has(size)) cls.push(`tf-tag--size-${size}`);
+      span.className = cls.join(' ');
+      span.appendChild(document.createTextNode(label));
+      this.removeAttribute('role');
+      this.removeAttribute('tabindex');
+      return;
+    }
+
     const status = (this.getAttribute('status') || 'info').toLowerCase();
     const hasDot = this.hasAttribute('dot');
     const icon = safeIconName(this.getAttribute('icon'));
@@ -76,22 +112,44 @@ class TfChip extends HTMLElement {
     // i 'active' sa stylowane przez controls.css lub CSS modulu uzywajacego.
     if (this.hasAttribute('clickable')) cls.push('clickable');
     if (this.hasAttribute('active')) cls.push('active');
-    this._span.className = cls.join(' ');
-    const parts = [];
-    if (hasDot) parts.push('<span class="tf-chip-dot"></span>');
-    if (icon) {
-      parts.push(
-        `<svg class="tf-chip-icon" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-${icon}"/></svg>`,
-      );
+    span.className = cls.join(' ');
+
+    if (hasDot) {
+      const dot = document.createElement('span');
+      dot.className = 'tf-chip-dot';
+      span.appendChild(dot);
     }
-    parts.push(escapeHtml(this._label));
-    this._span.innerHTML = parts.join('');
+    if (icon) {
+      const tmp = document.createElement('span');
+      tmp.innerHTML =
+        `<svg class="tf-chip-icon" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-${icon}"/></svg>`;
+      span.appendChild(tmp.firstChild);
+    }
+    if (this._lead) span.appendChild(this._lead);
+    span.appendChild(document.createTextNode(label));
+    if (this.hasAttribute('removable')) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tf-chip__remove';
+      btn.setAttribute('aria-label', 'Remove');
+      btn.textContent = '×';
+      span.appendChild(btn);
+    }
+
     if (this.hasAttribute('clickable')) {
       this.setAttribute('role', 'button');
       this.setAttribute('tabindex', '0');
     } else {
       this.removeAttribute('role');
       this.removeAttribute('tabindex');
+    }
+  }
+
+  _onClick(e) {
+    const target = e.target;
+    if (target && target.closest && target.closest('.tf-chip__remove')) {
+      e.stopPropagation();
+      this.dispatchEvent(new CustomEvent('remove'));
     }
   }
 

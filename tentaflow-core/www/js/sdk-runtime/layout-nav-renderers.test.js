@@ -1,9 +1,11 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-nav-renderers.test.js
-// Opis: Testy NavTabs (Krok 3.3a-4).
+// Opis: NavTabs (0x010C) tests — renderer output is the <tf-tabs> + <tf-tab>
+// dashboard web components.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-tabs.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -11,6 +13,12 @@ import {
 } from './component-renderer.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 import { NAV_TABS_TAG } from './layout-nav-renderers.js';
+
+// tf-tabs references bare ResizeObserver; the harness only exposes it on
+// the happy-dom window object.
+if (window.ResizeObserver && !globalThis.ResizeObserver) {
+  globalThis.ResizeObserver = window.ResizeObserver;
+}
 
 const results = [];
 function test(name, fn) {
@@ -54,40 +62,92 @@ function comp(tag, fields, extra = {}) {
     test_id: extra.test_id ?? null,
   };
 }
+// NavTab item as FieldMap: 0=id, 1=label, 2=icon, 3=badge, 4=panel_id, 5=locked.
+function navItem({ id, label, icon, badge, panelId, locked }) {
+  const fields = [];
+  if (id !== undefined) fields.push([0, id]);
+  if (label !== undefined) fields.push([1, { kind: 'literal', value: label }]);
+  if (icon !== undefined) fields.push([2, icon]);
+  if (badge !== undefined) fields.push([3, badge]);
+  if (panelId !== undefined) fields.push([4, panelId]);
+  if (locked !== undefined) fields.push([5, locked]);
+  return fields;
+}
 function setup() {
   _clearComponentRendererRegistry();
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
+}
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
 }
 
 // ============================================================================
 // NavTabs
 // ============================================================================
 
-test('NavTabs renders nav with role=tablist and variant class', () => {
+test('NavTabs renders tf-tabs with mapped variant attribute', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
     comp(NAV_TABS_TAG, [
-      [
-        0,
-        [
-          { id: 't1', label: { kind: 'literal', value: 'One' }, locked: false },
-          { id: 't2', label: { kind: 'literal', value: 'Two' }, locked: false },
-        ],
-      ],
+      [0, [
+        navItem({ id: 't1', label: 'One', locked: false }),
+        navItem({ id: 't2', label: 'Two', locked: false }),
+      ]],
       [1, { kind: 'literal', value: 't1' }],
       [2, 'underlined'],
       [3, false],
     ])
   );
-  assertEq(el.tagName, 'NAV');
-  assertEq(el.getAttribute('role'), 'tablist');
-  assert(el.classList.contains('tf-nav-tabs'));
-  assert(el.classList.contains('tf-nav-tabs--variant-underlined'));
+  assertEq(el.tagName, 'TF-TABS');
+  // SDK 'underlined' maps onto the tf-tabs 'underline' variant.
+  assertEq(el.getAttribute('variant'), 'underline');
+  const tabs = el.querySelectorAll('tf-tab');
+  assertEq(tabs.length, 2);
+  assertEq(tabs[0].id, 't1');
+  assertEq(tabs[1].id, 't2');
 });
 
-test('NavTabs aria-selected follows active_id BindRef reactively', () => {
+test('NavTabs variant pills maps to soft, default maps to solid', () => {
+  setup();
+  const engine = makeEngine();
+  const pills = engine.render(
+    comp(NAV_TABS_TAG, [
+      [0, []], [1, { kind: 'literal', value: '' }], [2, 'pills'], [3, false],
+    ])
+  );
+  assertEq(pills.getAttribute('variant'), 'soft');
+  const solid = engine.render(
+    comp(NAV_TABS_TAG, [
+      [0, []], [1, { kind: 'literal', value: '' }], [2, 'default'], [3, false],
+    ], { id: 'c2' })
+  );
+  assertEq(solid.getAttribute('variant'), 'solid');
+});
+
+test('NavTabs builds tab buttons with labels when connected', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(
+    comp(NAV_TABS_TAG, [
+      [0, [
+        navItem({ id: 'a', label: 'Alpha', locked: false }),
+        navItem({ id: 'b', label: 'Beta', locked: false }),
+      ]],
+      [1, { kind: 'literal', value: 'a' }],
+      [2, 'default'],
+      [3, false],
+    ])
+  ));
+  const btns = el.querySelectorAll('button.tf-tab');
+  assertEq(btns.length, 2);
+  assertEq(btns[0].querySelector('.tf-tab-label').textContent, 'Alpha');
+  assertEq(btns[1].querySelector('.tf-tab-label').textContent, 'Beta');
+});
+
+test('NavTabs active tab follows active_id BindRef reactively', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -95,88 +155,126 @@ test('NavTabs aria-selected follows active_id BindRef reactively', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(NAV_TABS_TAG, [
-      [
-        0,
-        [
-          { id: 't1', label: { kind: 'literal', value: 'A' }, locked: false },
-          { id: 't2', label: { kind: 'literal', value: 'B' }, locked: false },
-        ],
-      ],
+      [0, [
+        navItem({ id: 't1', label: 'A', locked: false }),
+        navItem({ id: 't2', label: 'B', locked: false }),
+      ]],
       [1, { kind: 'bound', path: PATH('active') }],
       [2, 'default'],
       [3, false],
     ])
-  );
-  const tabs = el.querySelectorAll('.tf-nav-tabs__tab');
-  assertEq(tabs[0].getAttribute('aria-selected'), 'true');
-  assertEq(tabs[0].getAttribute('tabindex'), '0');
-  assertEq(tabs[1].getAttribute('aria-selected'), 'false');
-  assertEq(tabs[1].getAttribute('tabindex'), '-1');
+  ));
+  assertEq(el.getAttribute('value'), 't1');
+  const btns = el.querySelectorAll('button.tf-tab');
+  assert(btns[0].classList.contains('active'));
+  assert(!btns[1].classList.contains('active'));
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('active'), op: { kind: 'set', value: 't2' } }],
   });
-  assertEq(tabs[0].getAttribute('aria-selected'), 'false');
-  assertEq(tabs[1].getAttribute('aria-selected'), 'true');
+  assertEq(el.getAttribute('value'), 't2');
+  assert(!btns[0].classList.contains('active'));
+  assert(btns[1].classList.contains('active'));
 });
 
-test('NavTabs click dispatches select with item_id detail', () => {
+test('NavTabs label BindRef updates rendered tab text', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('lbl'), value: 'First' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(NAV_TABS_TAG, [
+      [0, [
+        [[0, 't1'], [1, { kind: 'bound', path: PATH('lbl') }], [5, false]],
+      ]],
+      [1, { kind: 'literal', value: 't1' }],
+      [2, 'default'],
+      [3, false],
+    ])
+  ));
+  assertEq(el.querySelector('.tf-tab-label').textContent, 'First');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'Renamed' } }],
+  });
+  assertEq(el.querySelector('.tf-tab-label').textContent, 'Renamed');
+});
+
+test('NavTabs tab click dispatches select with item_id detail', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(NAV_TABS_TAG, [
-      [
-        0,
-        [{ id: 'tab1', label: { kind: 'literal', value: 'X' }, locked: false }],
-      ],
+      [0, [
+        navItem({ id: 'tab1', label: 'X', locked: false }),
+        navItem({ id: 'tab2', label: 'Y', locked: false }),
+      ]],
       [1, { kind: 'literal', value: 'tab1' }],
       [2, 'default'],
       [3, false],
     ])
-  );
+  ));
   let received = null;
   el.addEventListener('select', (e) => { received = e.detail; });
-  el.querySelector('.tf-nav-tabs__tab').click();
-  assertEq(received, { item_id: 'tab1' });
+  el.querySelectorAll('button.tf-tab')[1].click();
+  assertEq(received, { item_id: 'tab2' });
+  assertEq(el.getAttribute('value'), 'tab2');
 });
 
 test('NavTabs locked tab is disabled and does not dispatch select', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(NAV_TABS_TAG, [
-      [
-        0,
-        [{ id: 'tab1', label: { kind: 'literal', value: 'X' }, locked: true }],
-      ],
-      [1, { kind: 'literal', value: 'other' }],
+      [0, [
+        navItem({ id: 'tab1', label: 'X', locked: false }),
+        navItem({ id: 'tab2', label: 'Y', locked: true }),
+      ]],
+      [1, { kind: 'literal', value: 'tab1' }],
       [2, 'default'],
       [3, false],
     ])
-  );
-  const tab = el.querySelector('.tf-nav-tabs__tab');
-  assert(tab.hasAttribute('disabled'));
-  assert(tab.classList.contains('tf-nav-tabs__tab--locked'));
+  ));
+  const lockedTab = el.querySelectorAll('tf-tab')[1];
+  assert(lockedTab.hasAttribute('disabled'));
+  assert(lockedTab.querySelector('button.tf-tab').hasAttribute('disabled'));
   let received = null;
   el.addEventListener('select', (e) => { received = e.detail; });
-  tab.click();
+  lockedTab.querySelector('button.tf-tab').click();
   assertEq(received, null);
 });
 
-test('NavTabs scroll_overflow=true adds scroll class', () => {
+test('NavTabs badge maps to tf-tab count attribute', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
     comp(NAV_TABS_TAG, [
-      [0, []],
-      [1, { kind: 'literal', value: '' }],
-      [2, 'pills'],
-      [3, true],
+      [0, [navItem({ id: 't1', label: 'X', locked: false, badge: '7' })]],
+      [1, { kind: 'literal', value: 't1' }],
+      [2, 'default'],
+      [3, false],
     ])
   );
-  assert(el.classList.contains('tf-nav-tabs--scroll'));
+  assertEq(el.querySelector('tf-tab').getAttribute('count'), '7');
+});
+
+test('NavTabs string icon maps to tf-tab icon attribute', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(NAV_TABS_TAG, [
+      [0, [navItem({ id: 't1', label: 'X', locked: false, icon: 'star' })]],
+      [1, { kind: 'literal', value: 't1' }],
+      [2, 'default'],
+      [3, false],
+    ])
+  );
+  assertEq(el.querySelector('tf-tab').getAttribute('icon'), 'star');
 });
 
 test('NavTabs panel_id attribute exposed for router', () => {
@@ -184,63 +282,13 @@ test('NavTabs panel_id attribute exposed for router', () => {
   const engine = makeEngine();
   const el = engine.render(
     comp(NAV_TABS_TAG, [
-      [
-        0,
-        [{ id: 't1', label: { kind: 'literal', value: 'X' }, locked: false, panel_id: 'p42' }],
-      ],
+      [0, [navItem({ id: 't1', label: 'X', locked: false, panelId: 'p42' })]],
       [1, { kind: 'literal', value: 't1' }],
       [2, 'default'],
       [3, false],
     ])
   );
-  const tab = el.querySelector('.tf-nav-tabs__tab');
-  assertEq(tab.getAttribute('data-nav-panel-id'), 'p42');
-});
-
-test('NavTabs icon present is rejected (deferred to chunk 3.3d)', () => {
-  setup();
-  const engine = makeEngine();
-  assertThrows(() =>
-    engine.render(
-      comp(NAV_TABS_TAG, [
-        [
-          0,
-          [{
-            id: 't1',
-            label: { kind: 'literal', value: 'X' },
-            locked: false,
-            icon: { kind: 'name', name: 'star' },
-          }],
-        ],
-        [1, { kind: 'literal', value: 't1' }],
-        [2, 'default'],
-        [3, false],
-      ])
-    )
-  );
-});
-
-test('NavTabs badge present is rejected (deferred to chunk 3.3d)', () => {
-  setup();
-  const engine = makeEngine();
-  assertThrows(() =>
-    engine.render(
-      comp(NAV_TABS_TAG, [
-        [
-          0,
-          [{
-            id: 't1',
-            label: { kind: 'literal', value: 'X' },
-            locked: false,
-            badge: { variant: 'solid', tone: 'primary', pulse: false },
-          }],
-        ],
-        [1, { kind: 'literal', value: 't1' }],
-        [2, 'default'],
-        [3, false],
-      ])
-    )
-  );
+  assertEq(el.querySelector('tf-tab').getAttribute('data-nav-panel-id'), 'p42');
 });
 
 test('NavTabs rejects duplicate item id', () => {
@@ -249,13 +297,10 @@ test('NavTabs rejects duplicate item id', () => {
   assertThrows(() =>
     engine.render(
       comp(NAV_TABS_TAG, [
-        [
-          0,
-          [
-            { id: 'x', label: { kind: 'literal', value: 'A' }, locked: false },
-            { id: 'x', label: { kind: 'literal', value: 'B' }, locked: false },
-          ],
-        ],
+        [0, [
+          navItem({ id: 'x', label: 'A', locked: false }),
+          navItem({ id: 'x', label: 'B', locked: false }),
+        ]],
         [1, { kind: 'literal', value: 'x' }],
         [2, 'default'],
         [3, false],
@@ -264,21 +309,28 @@ test('NavTabs rejects duplicate item id', () => {
   );
 });
 
-test('NavTabs rejects item with unknown key', () => {
+test('NavTabs rejects empty item id', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() =>
     engine.render(
       comp(NAV_TABS_TAG, [
-        [
-          0,
-          [{
-            id: 't1',
-            label: { kind: 'literal', value: 'X' },
-            locked: false,
-            evil: true,
-          }],
-        ],
+        [0, [navItem({ id: '', label: 'A', locked: false })]],
+        [1, { kind: 'literal', value: '' }],
+        [2, 'default'],
+        [3, false],
+      ])
+    )
+  );
+});
+
+test('NavTabs rejects missing item label', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(NAV_TABS_TAG, [
+        [0, [navItem({ id: 't1', locked: false })]],
         [1, { kind: 'literal', value: 't1' }],
         [2, 'default'],
         [3, false],
@@ -332,31 +384,6 @@ test('NavTabs rejects unknown component field key', () => {
       ])
     )
   );
-});
-
-test('NavTabs keyboard ArrowRight moves focus to next tab', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(
-    comp(NAV_TABS_TAG, [
-      [
-        0,
-        [
-          { id: 'a', label: { kind: 'literal', value: 'A' }, locked: false },
-          { id: 'b', label: { kind: 'literal', value: 'B' }, locked: false },
-        ],
-      ],
-      [1, { kind: 'literal', value: 'a' }],
-      [2, 'default'],
-      [3, false],
-    ])
-  );
-  document.body.appendChild(el);
-  const tabs = el.querySelectorAll('.tf-nav-tabs__tab');
-  tabs[0].focus();
-  el.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-  // happy-dom obsługuje focus + bubbling — assert focus moved.
-  assertEq(document.activeElement, tabs[1]);
 });
 
 // ---- report ----

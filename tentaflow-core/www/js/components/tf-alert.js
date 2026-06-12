@@ -21,6 +21,7 @@ class TfAlert extends HTMLElement {
   constructor() {
     super();
     this._root = null;
+    this._actionsEl = null;
   }
 
   connectedCallback() {
@@ -33,6 +34,11 @@ class TfAlert extends HTMLElement {
   }
 
   _build() {
+    // Preserve a slotted actions container (e.g. SDK-rendered buttons) before
+    // clearing; it is re-appended into the content area on every update.
+    const actionsContent = this.querySelector('[slot="actions"]');
+    if (actionsContent) actionsContent.removeAttribute('slot');
+    this._actionsEl = actionsContent;
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-alert';
@@ -62,6 +68,10 @@ class TfAlert extends HTMLElement {
 
     this._root.innerHTML =
       `${iconHtml}<div class="tf-alert-content">${titleHtml}${msgHtml}</div>${closeHtml}`;
+
+    if (this._actionsEl) {
+      this._root.querySelector('.tf-alert-content').appendChild(this._actionsEl);
+    }
 
     if (dismissable) {
       const btn = this._root.querySelector('.tf-alert-close');

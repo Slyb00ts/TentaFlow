@@ -1,15 +1,17 @@
 // =============================================================================
-// Plik: sdk-runtime/form-combobox-renderer.js
-// Opis: Renderery Combobox (0x0305) + Autocomplete (0x0306) — chunk
-// 3.3c-3c. Oba używają input'a jako primary control (vs Select gdzie był
-// trigger-button); Combobox dodatkowo trzyma static options array z
-// filtrem lokalnym (lub remote_search emit'em), Autocomplete jest cienki
-// — tylko emit debounced 'search' event, results renderuje host przez
-// osobny slot/Component.
+// File: sdk-runtime/form-combobox-renderer.js
+// Description: Combobox (0x0305) + Autocomplete (0x0306) renderers. Both
+// render through the <tf-combobox> web component (input + filtering popover).
+// Combobox feeds the component a static options array (local filter, or a
+// debounced remote 'search' emit); Autocomplete is thin — only a debounced
+// 'search' emit, results are rendered by the host through a separate
+// slot/Component.
 //
-// Wire: combobox role=combobox + aria-expanded + aria-controls +
-// aria-activedescendant. Selection emit'uje 'change' z SelectValue (lub
-// 'tstr' dla free_input). Search/remote emit'uje 'search' z `{ query }`.
+// Wire: selection emits 'change' with SelectValue (or 'tstr' for free_input).
+// Search/remote emits 'search' with `{ query }`. Raw component events are
+// intercepted and re-emitted in SDK shape (the `__tfReemit` pattern, same as
+// the Select renderer) so the dispatcher never sees component-internal
+// payloads.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/form/selectors.rs
 // Combobox + Autocomplete.
@@ -23,7 +25,7 @@ import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
-// Walidatory
+// Validators
 // =============================================================================
 
 const INPUT_SIZES = new Set(['sm', 'md', 'lg']);
@@ -171,24 +173,47 @@ function parseSelectGroup(raw, ctx) {
   return { id, label };
 }
 
-function applyTextBind(element, bindRef, ctx) {
+function applyPlaceholderReactive(el, bindRef, ctx) {
+  if (bindRef == null) return;
   const apply = () => {
     const v = resolveBindRef(bindRef, ctx.store);
-    element.textContent = v == null ? '' : String(v);
+    if (v == null || v === '') el.removeAttribute('placeholder');
+    else el.setAttribute('placeholder', String(v));
   };
   apply();
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
-function applyPlaceholderReactive(input, bindRef, ctx) {
-  if (bindRef == null) return;
-  const apply = () => {
-    const v = resolveBindRef(bindRef, ctx.store);
-    if (v == null || v === '') input.removeAttribute('placeholder');
-    else input.setAttribute('placeholder', String(v));
+/// Applies the visible label (`label` attribute) or the required a11y label
+/// (`aria-label` attribute) on a tf-combobox host, reactively.
+function applyLabelOrAria(el, labelBind, component, ctx, componentName) {
+  if (labelBind != null) {
+    const applyLabel = () => {
+      const v = resolveBindRef(labelBind, ctx.store);
+      el.setAttribute('label', v == null ? '' : String(v));
+    };
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
+    return;
+  }
+  if (component.a11y == null || component.a11y.label == null) {
+    throw new TypeError(
+      `${componentName} without \`label\` field requires Component.a11y.label for accessible name`
+    );
+  }
+  const initial = resolveBindRef(component.a11y.label, ctx.store);
+  if (typeof initial !== 'string' || initial.trim().length === 0) {
+    throw new TypeError(
+      `${componentName}.a11y.label must resolve to non-blank string at initial render`
+    );
+  }
+  const applyAria = () => {
+    const v = resolveBindRef(component.a11y.label, ctx.store);
+    if (typeof v === 'string' && v.trim().length > 0) el.setAttribute('aria-label', v);
+    else el.removeAttribute('aria-label');
   };
-  apply();
-  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
+  applyAria();
+  ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
 }
 
 // =============================================================================
@@ -197,8 +222,8 @@ function applyPlaceholderReactive(input, bindRef, ctx) {
 
 export const COMBOBOX_TAG = 0x0305;
 const COMBOBOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
-// Default debounce dla remote_search emit'a (ms). Spec'u dla Combobox nie
-// definiuje, więc trzymamy stałą zgodną z UX (300 = ~typowy autocomplete).
+// Default debounce for the remote_search emit (ms). The Combobox spec does
+// not define one, so a UX-typical constant is used (300 ≈ usual autocomplete).
 const COMBOBOX_REMOTE_DEBOUNCE_MS = 300;
 
 function renderCombobox(component, ctx) {
@@ -212,8 +237,8 @@ function renderCombobox(component, ctx) {
   const options = optionsRaw.map((o, i) => parseSelectOption(o, `Combobox.options[${i}]`));
   const placeholderBind = ctx.readField(component.fields, 2);
   const labelBind = ctx.readField(component.fields, 3);
-  // §5 0x0305: searchable always true — egzekwowane na decode po stronie
-  // host'a; tu wymagamy tej samej wartości dla spójności wire'a.
+  // §5 0x0305: searchable always true — enforced on decode host-side; the
+  // same value is required here for wire consistency.
   const searchable = requireBool(ctx.readField(component.fields, 4), 'Combobox.searchable');
   if (!searchable) {
     throw new TypeError('Combobox.searchable must be true (catalog §5 0x0305)');
@@ -227,11 +252,12 @@ function renderCombobox(component, ctx) {
     if (!Array.isArray(groupsRaw)) throw new TypeError('Combobox.groups: expected Array<SelectGroup>');
     return groupsRaw.map((g, i) => parseSelectGroup(g, `Combobox.groups[${i}]`));
   })();
+  const groupById = new Map();
   if (groups) {
-    const ids = new Set(groups.map((g) => g.id));
+    for (const g of groups) groupById.set(g.id, g);
     for (let i = 0; i < options.length; i++) {
-      if (options[i].groupId != null && !ids.has(options[i].groupId)) {
-        throw new TypeError(`Combobox.options[${i}].group_id '${options[i].groupId}' nie ma w groups`);
+      if (options[i].groupId != null && !groupById.has(options[i].groupId)) {
+        throw new TypeError(`Combobox.options[${i}].group_id '${options[i].groupId}' not present in groups`);
       }
     }
   }
@@ -244,174 +270,65 @@ function renderCombobox(component, ctx) {
     throw new TypeError('Combobox.remote_search=true requires remote_action_id');
   }
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-combobox');
-  wrapper.classList.add(`tf-combobox--size-${size}`);
-  if (virtualize) wrapper.classList.add('tf-combobox--virtualize');
+  const el = document.createElement('tf-combobox');
+  el.classList.add(`tf-combobox--size-${size}`);
+  if (virtualize) el.classList.add('tf-combobox--virtualize');
+  if (clearable) el.setAttribute('clearable', '');
+  if (freeInput) el.setAttribute('free-input', '');
+  el.setAttribute('min-chars', String(minSearchChars));
 
-  let labelEl = null;
-  if (labelBind != null) {
-    labelEl = document.createElement('label');
-    labelEl.classList.add('tf-combobox__label');
-    applyTextBind(labelEl, labelBind, ctx);
-    wrapper.appendChild(labelEl);
-  }
+  applyLabelOrAria(el, labelBind, component, ctx, 'Combobox');
+  applyPlaceholderReactive(el, placeholderBind, ctx);
 
-  // Field row: input + (clear?) + caret.
-  const fieldRow = document.createElement('div');
-  fieldRow.classList.add('tf-combobox__field');
-
-  const input = document.createElement('input');
-  input.setAttribute('type', 'text');
-  input.setAttribute('role', 'combobox');
-  input.setAttribute('aria-haspopup', 'listbox');
-  input.setAttribute('aria-expanded', 'false');
-  input.setAttribute('aria-autocomplete', 'list');
-  input.classList.add('tf-combobox__input');
-  const inputId = `tf-combobox-${component.id}`;
-  input.setAttribute('id', inputId);
-  if (labelEl) labelEl.setAttribute('for', inputId);
-
-  if (labelBind == null) {
-    if (component.a11y == null || component.a11y.label == null) {
-      throw new TypeError(
-        'Combobox without `label` field requires Component.a11y.label for accessible name'
-      );
-    }
-    const initial = resolveBindRef(component.a11y.label, ctx.store);
-    if (typeof initial !== 'string' || initial.trim().length === 0) {
-      throw new TypeError(
-        'Combobox.a11y.label must resolve to non-blank string at initial render'
-      );
-    }
-    const applyAriaLabel = () => {
-      const v = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof v === 'string' && v.trim().length > 0) input.setAttribute('aria-label', v);
-      else input.removeAttribute('aria-label');
-    };
-    applyAriaLabel();
-    ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAriaLabel));
-  }
-
-  applyPlaceholderReactive(input, placeholderBind, ctx);
-  fieldRow.appendChild(input);
-
-  let clearButton = null;
-  if (clearable) {
-    clearButton = document.createElement('button');
-    clearButton.setAttribute('type', 'button');
-    clearButton.classList.add('tf-combobox__clear');
-    clearButton.setAttribute('aria-label', 'Clear selection');
-    clearButton.textContent = '×';
-    clearButton.hidden = true;
-    fieldRow.appendChild(clearButton);
-  }
-
-  const caret = document.createElement('span');
-  caret.classList.add('tf-combobox__caret');
-  caret.setAttribute('aria-hidden', 'true');
-  caret.textContent = '▾';
-  fieldRow.appendChild(caret);
-
-  wrapper.appendChild(fieldRow);
-
-  // Disabled handling — natywny `disabled` na <input> wystarcza; clear też.
+  // Reactive disabled.
   let disabledActive = false;
   const isDisabledFn = (() => {
     if (disabledBind == null) return () => false;
     const apply = () => {
       disabledActive = resolveBindRef(disabledBind, ctx.store) === true;
-      if (disabledActive) {
-        input.setAttribute('disabled', '');
-        input.setAttribute('aria-disabled', 'true');
-        if (clearButton) clearButton.disabled = true;
-      } else {
-        input.removeAttribute('disabled');
-        input.removeAttribute('aria-disabled');
-        if (clearButton) clearButton.disabled = false;
-      }
+      el.disabled = disabledActive;
     };
     apply();
     ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, apply));
     return () => disabledActive;
   })();
 
-  // Popover + listbox.
-  const popover = document.createElement('div');
-  popover.classList.add('tf-combobox__popover');
-  popover.hidden = true;
-  const popoverId = `${inputId}-popover`;
-  popover.setAttribute('id', popoverId);
-  input.setAttribute('aria-controls', popoverId);
-
-  const listbox = document.createElement('ul');
-  listbox.setAttribute('role', 'listbox');
-  listbox.classList.add('tf-combobox__listbox');
-  popover.appendChild(listbox);
-  wrapper.appendChild(popover);
-
-  // Option DOM build.
-  const optionNodes = [];
-  const renderOption = (opt, idx, container) => {
-    const li = document.createElement('li');
-    li.setAttribute('role', 'option');
-    li.classList.add('tf-combobox__option');
-    li.setAttribute('id', `${inputId}-opt-${idx}`);
-    if (opt.disabled) {
-      li.setAttribute('aria-disabled', 'true');
-      li.classList.add('tf-combobox__option--disabled');
+  // Options feed: component option.value carries the SDK option index, so the
+  // change interceptor can map back to the typed SelectValue. Labels,
+  // descriptions and group labels are BindRefs — re-feed on any change.
+  const buildComponentOptions = () => options.map((opt, idx) => {
+    const labelText = resolveBindRef(opt.label, ctx.store);
+    const out = {
+      value: idx,
+      label: labelText == null ? '' : String(labelText),
+      disabled: opt.disabled,
+    };
+    if (opt.description != null) {
+      const d = resolveBindRef(opt.description, ctx.store);
+      out.description = d == null ? '' : String(d);
     }
-    if (opt.icon) {
-      const iconEl = renderIcon(opt.icon, `Combobox.options[${idx}].icon`);
-      iconEl.classList.add('tf-combobox__option-icon');
-      li.appendChild(iconEl);
+    if (opt.icon != null) {
+      out.icon = renderIcon(opt.icon, `Combobox.options[${idx}].icon`);
     }
-    const lblEl = document.createElement('span');
-    lblEl.classList.add('tf-combobox__option-label');
-    applyTextBind(lblEl, opt.label, ctx);
-    li.appendChild(lblEl);
-    if (opt.description) {
-      const descEl = document.createElement('span');
-      descEl.classList.add('tf-combobox__option-description');
-      applyTextBind(descEl, opt.description, ctx);
-      li.appendChild(descEl);
+    if (opt.groupId != null) {
+      const g = resolveBindRef(groupById.get(opt.groupId).label, ctx.store);
+      out.group = g == null ? '' : String(g);
     }
-    container.appendChild(li);
-    optionNodes.push({ el: li, opt, idx, visible: true });
-  };
-
-  if (groups) {
-    const groupContainers = new Map();
-    for (const g of groups) {
-      const block = document.createElement('li');
-      block.setAttribute('role', 'group');
-      block.setAttribute('aria-labelledby', `${inputId}-grp-${g.id}`);
-      block.classList.add('tf-combobox__group');
-      const header = document.createElement('div');
-      header.classList.add('tf-combobox__group-header');
-      header.setAttribute('id', `${inputId}-grp-${g.id}`);
-      applyTextBind(header, g.label, ctx);
-      block.appendChild(header);
-      const inner = document.createElement('ul');
-      inner.setAttribute('role', 'presentation');
-      inner.classList.add('tf-combobox__group-list');
-      block.appendChild(inner);
-      listbox.appendChild(block);
-      groupContainers.set(g.id, { block, inner });
+    return out;
+  });
+  const refreshOptions = () => { el.options = buildComponentOptions(); };
+  refreshOptions();
+  for (const opt of options) {
+    ctx.registerCleanup(subscribeBindRef(opt.label, ctx.store, refreshOptions));
+    if (opt.description != null) {
+      ctx.registerCleanup(subscribeBindRef(opt.description, ctx.store, refreshOptions));
     }
-    options.forEach((opt, idx) => {
-      const c = opt.groupId != null ? groupContainers.get(opt.groupId).inner : listbox;
-      renderOption(opt, idx, c);
-    });
-  } else {
-    options.forEach((opt, idx) => renderOption(opt, idx, listbox));
   }
-
-  // ---- state ----
-  let activeIdx = -1;
-  let isOpen = false;
-  let remoteDebounce = null;
-  let lastRemoteQuery = null;
+  if (groups) {
+    for (const g of groups) {
+      ctx.registerCleanup(subscribeBindRef(g.label, ctx.store, refreshOptions));
+    }
+  }
 
   const findSelectedIdx = () => {
     let current;
@@ -420,178 +337,90 @@ function renderCombobox(component, ctx) {
     return options.findIndex((o) => selectValueEquals(o.value, current));
   };
 
-  /// Wpisana wartość w input — pokazujemy label wybranej opcji jeśli value
-  /// matchuje opcję, inaczej raw string ze store'a (dla free_input).
-  /// Gdy popover jest otwarty (typing in progress), NIE nadpisujemy
-  /// input.value — chronimy typing user'a niezależnie od ścieżki sel/raw.
-  const syncInputFromStore = () => {
+  // Store → input text: the label of the matching option, otherwise the raw
+  // store string (free_input). Sync goes through the component `value`
+  // property — it never overwrites the input while it has focus, which
+  // protects in-progress typing.
+  const syncFromStore = () => {
     const sel = findSelectedIdx();
-    if (!isOpen) {
-      if (sel >= 0) {
-        const v = resolveBindRef(options[sel].label, ctx.store);
-        const next = v == null ? '' : String(v);
-        if (input.value !== next) input.value = next;
-      } else {
-        let cur;
-        try { cur = ctx.store.read(bindPath); } catch { cur = undefined; }
-        const next = cur == null ? '' : String(cur);
-        if (input.value !== next) input.value = next;
-      }
+    let text;
+    if (sel >= 0) {
+      const v = resolveBindRef(options[sel].label, ctx.store);
+      text = v == null ? '' : String(v);
+    } else {
+      let cur;
+      try { cur = ctx.store.read(bindPath); } catch { cur = undefined; }
+      text = cur == null ? '' : String(cur);
     }
-    if (clearButton) {
-      const hasValue = (input.value && input.value.length > 0) || sel >= 0;
-      clearButton.hidden = !hasValue;
-    }
+    if (el.getAttribute('value') !== text) el.value = text;
   };
-  syncInputFromStore();
-  ctx.registerCleanup(ctx.store.subscribe(bindPath, syncInputFromStore));
+  syncFromStore();
+  ctx.registerCleanup(ctx.store.subscribe(bindPath, syncFromStore));
 
-  const refreshAriaSelected = () => {
-    const sel = findSelectedIdx();
-    for (const n of optionNodes) {
-      if (n.idx === sel) n.el.setAttribute('aria-selected', 'true');
-      else n.el.removeAttribute('aria-selected');
-    }
-  };
-  refreshAriaSelected();
-  ctx.registerCleanup(ctx.store.subscribe(bindPath, refreshAriaSelected));
-
-  const visibleNodes = () => optionNodes.filter((n) => n.visible && !n.opt.disabled);
-
-  const setActive = (idx) => {
-    activeIdx = idx;
-    for (const n of optionNodes) n.el.classList.remove('tf-combobox__option--active');
-    if (idx < 0) {
-      input.removeAttribute('aria-activedescendant');
-      return;
-    }
-    const n = optionNodes[idx];
-    n.el.classList.add('tf-combobox__option--active');
-    input.setAttribute('aria-activedescendant', n.el.id);
-    if (typeof n.el.scrollIntoView === 'function') {
-      try { n.el.scrollIntoView({ block: 'nearest' }); } catch {}
-    }
-  };
-  const moveActive = (dir) => {
-    const vis = visibleNodes();
-    if (vis.length === 0) return;
-    let curPos = vis.findIndex((n) => n.idx === activeIdx);
-    let nextPos = curPos < 0 ? (dir > 0 ? 0 : vis.length - 1) : (curPos + dir + vis.length) % vis.length;
-    setActive(vis[nextPos].idx);
-  };
-  const moveActiveTo = (pos) => {
-    const vis = visibleNodes();
-    if (vis.length === 0) return;
-    setActive(vis[Math.max(0, Math.min(pos, vis.length - 1))].idx);
-  };
-
-  const applySearch = (query) => {
-    const q = query.trim().toLowerCase();
-    for (const n of optionNodes) {
-      let labelText = '';
-      try {
-        const lv = resolveBindRef(n.opt.label, ctx.store);
-        labelText = lv == null ? '' : String(lv).toLowerCase();
-      } catch {}
-      const matches = q.length === 0 ? true : labelText.includes(q);
-      n.visible = matches;
-      n.el.hidden = !matches;
-    }
-    if (groups) {
-      for (const g of groups) {
-        const visible = optionNodes.some((n) => n.visible && n.opt.groupId === g.id);
-        const headerEl = document.getElementById(`${inputId}-grp-${g.id}`);
-        if (headerEl && headerEl.parentElement) headerEl.parentElement.hidden = !visible;
-      }
-    }
-    const cur = optionNodes[activeIdx];
-    if (!cur || !cur.visible || cur.opt.disabled) {
-      const vis = visibleNodes();
-      setActive(vis.length > 0 ? vis[0].idx : -1);
-    }
-  };
-
-  const emitChange = (detail) => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('change', {
-        bubbles: false,
-        detail,
-      })
-    );
-  };
+  let remoteDebounce = null;
+  let lastRemoteQuery = null;
 
   const emitSearch = (query) => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('search', {
+    const ce = new (globalThis.CustomEvent || globalThis.Event)('search', {
+      bubbles: false,
+      detail: { query, action_id: remoteActionId },
+    });
+    el.dispatchEvent(ce);
+  };
+
+  // tf-combobox 'change' carries {value, label} where value is the option
+  // index (option commit), null (clear) or raw text with free=true
+  // (free-input commit). Convert to the SDK SelectValue shape before the
+  // dispatcher sees it — the raw event is blocked and a single synthetic
+  // event tagged `__tfReemit` carries the converted payload.
+  const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
+    // Native 'change' from the inner text input bubbles through too — it has
+    // no detail and is not a commit; swallow it.
+    if (!e.detail || typeof e.detail !== 'object') return;
+    if (isDisabledFn()) return;
+    let ce;
+    if (e.detail.free === true && typeof e.detail.value === 'string') {
+      if (!freeInput) return;
+      ce = new CustomEvent('change', { bubbles: false, detail: { value: e.detail.value, kind: 'tstr' } });
+    } else if (e.detail.value == null) {
+      if (!clearable) return;
+      ce = new CustomEvent('change', { bubbles: false, detail: { value: null, kind: null } });
+    } else if (typeof e.detail.value === 'number') {
+      const opt = options[e.detail.value];
+      if (!opt || opt.disabled) return;
+      ce = new CustomEvent('change', {
         bubbles: false,
-        detail: { query, action_id: remoteActionId },
-      })
-    );
-  };
-
-  /// Spec'owy gate: minimum N chars przed otwarciem popover'a.
-  const canOpenForQuery = (query) => {
-    return (query || '').length >= minSearchChars;
-  };
-
-  const open = () => {
-    if (isOpen || isDisabledFn()) return;
-    if (!canOpenForQuery(input.value)) return;
-    isOpen = true;
-    popover.hidden = false;
-    input.setAttribute('aria-expanded', 'true');
-    wrapper.classList.add('tf-combobox--open');
-    const vis = visibleNodes();
-    setActive(vis.length > 0 ? vis[0].idx : -1);
-  };
-
-  const close = () => {
-    if (!isOpen) return;
-    isOpen = false;
-    popover.hidden = true;
-    input.setAttribute('aria-expanded', 'false');
-    wrapper.classList.remove('tf-combobox--open');
-    input.removeAttribute('aria-activedescendant');
-    activeIdx = -1;
-    for (const n of optionNodes) n.el.classList.remove('tf-combobox__option--active');
-  };
-
-  const commitOption = (idx) => {
-    if (idx < 0) return;
-    if (isDisabledFn()) { close(); return; }
-    const opt = optionNodes[idx]?.opt;
-    if (!opt || opt.disabled) return;
-    emitChange({ value: opt.value.value, kind: opt.value.tag });
-    close();
-  };
-
-  /// Commit raw text — tylko gdy free_input=true. Inaczej ignorujemy
-  /// (Enter w polu bez aktywnej opcji = no-op).
-  const commitFreeText = (text) => {
-    if (!freeInput) return;
-    if (isDisabledFn()) return;
-    emitChange({ value: text, kind: 'tstr' });
-    close();
-  };
-
-  // ---- event wiring ----
-  const onInput = () => {
-    if (isDisabledFn()) return;
-    const q = input.value;
-    if (q.length >= minSearchChars) {
-      applySearch(q);
-      if (!isOpen) open();
+        detail: { value: opt.value.value, kind: opt.value.tag },
+      });
     } else {
-      // Poniżej progu — zamknij popover ORAZ skasuj zaplanowane remote
-      // search'e, żeby stary query nie poleciał po debounce'ie.
-      if (isOpen) close();
+      return;
+    }
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
+  };
+  el.addEventListener('change', onChange);
+  ctx.registerCleanup(() => el.removeEventListener('change', onChange));
+
+  // tf-combobox 'input' {query} drives the remote-search debounce. The raw
+  // event is blocked — the Combobox schema exposes no 'input' handler.
+  const onInput = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
+    if (!e.detail || typeof e.detail.query !== 'string') return;
+    if (isDisabledFn()) return;
+    const q = e.detail.query;
+    if (q.length < minSearchChars) {
+      // Below the threshold — cancel any scheduled remote search so a stale
+      // query never fires after the debounce.
       if (remoteDebounce) {
         clearTimeout(remoteDebounce);
         remoteDebounce = null;
       }
+      return;
     }
-    if (clearButton) clearButton.hidden = q.length === 0 && findSelectedIdx() < 0;
-    if (remoteSearch && q.length >= minSearchChars && q !== lastRemoteQuery) {
+    if (remoteSearch && q !== lastRemoteQuery) {
       if (remoteDebounce) clearTimeout(remoteDebounce);
       remoteDebounce = setTimeout(() => {
         lastRemoteQuery = q;
@@ -599,109 +428,15 @@ function renderCombobox(component, ctx) {
       }, COMBOBOX_REMOTE_DEBOUNCE_MS);
     }
   };
-  input.addEventListener('input', onInput);
-  ctx.registerCleanup(() => input.removeEventListener('input', onInput));
+  el.addEventListener('input', onInput);
+  ctx.registerCleanup(() => el.removeEventListener('input', onInput));
 
-  const onKeyDown = (e) => {
-    if (isDisabledFn()) return;
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        if (!isOpen) open(); else moveActive(1);
-        return;
-      case 'ArrowUp':
-        e.preventDefault();
-        if (!isOpen) open(); else moveActive(-1);
-        return;
-      case 'Home':
-        if (!isOpen) return;
-        e.preventDefault();
-        moveActiveTo(0);
-        return;
-      case 'End':
-        if (!isOpen) return;
-        e.preventDefault();
-        moveActiveTo(Number.MAX_SAFE_INTEGER);
-        return;
-      case 'Enter':
-        e.preventDefault();
-        if (isOpen && activeIdx >= 0) {
-          commitOption(activeIdx);
-        } else if (freeInput && input.value.length > 0) {
-          commitFreeText(input.value);
-        }
-        return;
-      case 'Escape':
-        if (isOpen) {
-          e.preventDefault();
-          close();
-        }
-        return;
-      case 'Tab':
-        if (isOpen) close();
-        return;
-    }
-  };
-  input.addEventListener('keydown', onKeyDown);
-  ctx.registerCleanup(() => input.removeEventListener('keydown', onKeyDown));
-
-  const onFocus = () => {
-    if (isDisabledFn()) return;
-    if (canOpenForQuery(input.value)) open();
-  };
-  input.addEventListener('focus', onFocus);
-  ctx.registerCleanup(() => input.removeEventListener('focus', onFocus));
-
-  if (clearButton) {
-    const onClear = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (isDisabledFn()) return;
-      input.value = '';
-      emitChange({ value: null, kind: null });
-      close();
-    };
-    clearButton.addEventListener('click', onClear);
-    ctx.registerCleanup(() => clearButton.removeEventListener('click', onClear));
-  }
-
-  // Caret click też otwiera/zamyka (jak dropdown).
-  const onCaretClick = (e) => {
-    if (isDisabledFn()) return;
-    e.preventDefault();
-    if (isOpen) close(); else {
-      try { input.focus(); } catch {}
-      open();
-    }
-  };
-  caret.addEventListener('click', onCaretClick);
-  ctx.registerCleanup(() => caret.removeEventListener('click', onCaretClick));
-
-  const onListboxMouseDown = (e) => {
-    const li = e.target.closest('li[role="option"]');
-    if (!li) return;
-    e.preventDefault();
-    const node = optionNodes.find((n) => n.el === li);
-    if (!node) return;
-    commitOption(node.idx);
-  };
-  listbox.addEventListener('mousedown', onListboxMouseDown);
-  ctx.registerCleanup(() => listbox.removeEventListener('mousedown', onListboxMouseDown));
-
-  const onDocClick = (e) => {
-    if (!isOpen) return;
-    if (wrapper.contains(e.target)) return;
-    close();
-  };
-  document.addEventListener('click', onDocClick);
-  ctx.registerCleanup(() => document.removeEventListener('click', onDocClick));
-
-  // Cleanup pending debounce na destroy.
+  // Cleanup pending debounce on destroy.
   ctx.registerCleanup(() => {
     if (remoteDebounce) clearTimeout(remoteDebounce);
   });
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
@@ -726,75 +461,40 @@ function renderAutocomplete(component, ctx) {
   const placeholderBind = ctx.readField(component.fields, 5);
   const labelBind = ctx.readField(component.fields, 6);
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-autocomplete');
-
-  let labelEl = null;
-  if (labelBind != null) {
-    labelEl = document.createElement('label');
-    labelEl.classList.add('tf-autocomplete__label');
-    applyTextBind(labelEl, labelBind, ctx);
-    wrapper.appendChild(labelEl);
-  }
-
-  const input = document.createElement('input');
-  input.setAttribute('type', 'text');
-  input.setAttribute('role', 'combobox');
-  input.setAttribute('aria-autocomplete', 'list');
-  input.setAttribute('aria-expanded', 'false');
-  input.classList.add('tf-autocomplete__input');
-  const inputId = `tf-autocomplete-${component.id}`;
-  input.setAttribute('id', inputId);
-  if (labelEl) labelEl.setAttribute('for', inputId);
+  // Autocomplete is the same input primitive — a tf-combobox with no local
+  // options. Results are rendered by the host through a separate slot, so the
+  // component popover never opens.
+  const el = document.createElement('tf-combobox');
+  el.classList.add('tf-autocomplete');
+  el.setAttribute('min-chars', String(minSearchChars));
   if (resultTemplateId) {
-    // Wskazówka dla host'a — który slot wyświetli wyniki. Renderer nie
-    // wyświetla wyników wewnętrznie; host re-renderuje listbox przez slot
-    // i powiązuje go z input'em przez aria-controls (ustawiamy id slotu
-    // jako data-attribute żeby host mógł sięgnąć bez extra spec'u).
-    input.setAttribute('aria-controls', `${inputId}-${resultTemplateId}`);
-    input.setAttribute('data-result-template-id', resultTemplateId);
+    // Host hint — which slot displays the results. The renderer does not
+    // display results internally; the host re-renders the listbox through a
+    // slot and links it via aria-controls (the slot id is exposed as a
+    // data-attribute so the host can reach it without extra spec).
+    el.setAttribute('aria-controls', `tf-autocomplete-${component.id}-${resultTemplateId}`);
+    el.setAttribute('data-result-template-id', resultTemplateId);
   }
 
-  if (labelBind == null) {
-    if (component.a11y == null || component.a11y.label == null) {
-      throw new TypeError(
-        'Autocomplete without `label` field requires Component.a11y.label for accessible name'
-      );
-    }
-    const initial = resolveBindRef(component.a11y.label, ctx.store);
-    if (typeof initial !== 'string' || initial.trim().length === 0) {
-      throw new TypeError(
-        'Autocomplete.a11y.label must resolve to non-blank string at initial render'
-      );
-    }
-    const applyAriaLabel = () => {
-      const v = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof v === 'string' && v.trim().length > 0) input.setAttribute('aria-label', v);
-      else input.removeAttribute('aria-label');
-    };
-    applyAriaLabel();
-    ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAriaLabel));
-  }
+  applyLabelOrAria(el, labelBind, component, ctx, 'Autocomplete');
+  applyPlaceholderReactive(el, placeholderBind, ctx);
 
-  applyPlaceholderReactive(input, placeholderBind, ctx);
-
-  // Reactive value sync ze store (one-way read).
+  // Reactive value sync from the store (one-way read) via the component
+  // `value` property — it skips the inner write while the input has focus.
   const apply = () => {
     let v;
     try { v = ctx.store.read(bindPath); } catch { v = undefined; }
     const next = v == null ? '' : String(v);
-    if (input.value !== next) input.value = next;
+    if (el.getAttribute('value') !== next) el.value = next;
   };
   apply();
   ctx.registerCleanup(ctx.store.subscribe(bindPath, apply));
-
-  wrapper.appendChild(input);
 
   let debounceTimer = null;
   let lastQuery = null;
 
   const emitSearch = (query) => {
-    wrapper.dispatchEvent(
+    el.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('search', {
         bubbles: false,
         detail: { query, action_id: remoteActionId, result_template_id: resultTemplateId },
@@ -802,19 +502,21 @@ function renderAutocomplete(component, ctx) {
     );
   };
 
-  const onInput = () => {
-    const q = input.value;
-    // input.value też emit'uje 'input' wrapperowy dla host'a — chunk 3.6
-    // potem podpina write-back; tu raw text idzie też przez `input` event'a
-    // żeby host mógł od razu reagować (np. ukryć stary popover).
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('input', {
-        bubbles: false,
-        detail: { value: q, kind: 'tstr' },
-      })
-    );
+  // tf-combobox 'input' {query} → SDK 'input' {value, kind} re-emit (so the
+  // host can react immediately, e.g. hide a stale popover) + debounced
+  // 'search' emit. Write-back is wired by chunk 3.6.
+  const onInput = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
+    if (!e.detail || typeof e.detail.query !== 'string') return;
+    const q = e.detail.query;
+    const ce = new CustomEvent('input', {
+      bubbles: false,
+      detail: { value: q, kind: 'tstr' },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
     if (q.length < minSearchChars) {
-      input.setAttribute('aria-expanded', 'false');
       if (debounceTimer) {
         clearTimeout(debounceTimer);
         debounceTimer = null;
@@ -825,55 +527,54 @@ function renderAutocomplete(component, ctx) {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       lastQuery = q;
-      input.setAttribute('aria-expanded', 'true');
       emitSearch(q);
     }, debounceMs);
   };
-  input.addEventListener('input', onInput);
-  ctx.registerCleanup(() => input.removeEventListener('input', onInput));
+  el.addEventListener('input', onInput);
+  ctx.registerCleanup(() => el.removeEventListener('input', onInput));
 
-  const onChange = () => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('change', {
-        bubbles: false,
-        detail: { value: input.value, kind: 'tstr' },
-      })
+  // Native 'change' from the inner text input → SDK 'change' {value, kind}.
+  const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
+    const ce = new CustomEvent('change', {
+      bubbles: false,
+      detail: { value: el.value, kind: 'tstr' },
+    });
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
+  };
+  el.addEventListener('change', onChange);
+  ctx.registerCleanup(() => el.removeEventListener('change', onChange));
+
+  // Focus events do not bubble, but focusin/focusout do — translate them to
+  // the SDK 'focus'/'blur' events on the host element.
+  const onFocusIn = () => {
+    el.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('focus', { bubbles: false, detail: null })
     );
   };
-  input.addEventListener('change', onChange);
-  ctx.registerCleanup(() => input.removeEventListener('change', onChange));
-
-  const onBlur = () => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('blur', {
-        bubbles: false,
-        detail: null,
-      })
+  const onFocusOut = () => {
+    el.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('blur', { bubbles: false, detail: null })
     );
   };
-  input.addEventListener('blur', onBlur);
-  ctx.registerCleanup(() => input.removeEventListener('blur', onBlur));
-
-  const onFocus = () => {
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('focus', {
-        bubbles: false,
-        detail: null,
-      })
-    );
-  };
-  input.addEventListener('focus', onFocus);
-  ctx.registerCleanup(() => input.removeEventListener('focus', onFocus));
+  el.addEventListener('focusin', onFocusIn);
+  el.addEventListener('focusout', onFocusOut);
+  ctx.registerCleanup(() => {
+    el.removeEventListener('focusin', onFocusIn);
+    el.removeEventListener('focusout', onFocusOut);
+  });
 
   ctx.registerCleanup(() => {
     if (debounceTimer) clearTimeout(debounceTimer);
   });
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormComboboxRenderers() {

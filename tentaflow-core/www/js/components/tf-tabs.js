@@ -147,7 +147,12 @@ class TfTabs extends HTMLElement {
   }
 
   get value() { return this.getAttribute('value'); }
-  set value(v) { this.setAttribute('value', v); }
+  set value(v) {
+    this.setAttribute('value', v);
+    // Sync directly as well: attributeChangedCallback is not dispatched in
+    // every DOM environment (e.g. happy-dom); _syncActive is idempotent.
+    if (this._scroller) this._syncActive();
+  }
 
   _build() {
     // Collect existing <tf-tab> children then wrap them in viewport + scroller.
@@ -302,7 +307,7 @@ class TfTabs extends HTMLElement {
   _onTabClick(e) {
     const id = e.detail?.id;
     if (!id || id === this.getAttribute('value')) return;
-    this.setAttribute('value', id);
+    this.value = id;
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
       detail: { value: id },

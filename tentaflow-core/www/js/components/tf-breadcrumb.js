@@ -4,6 +4,15 @@
 //       elements separated by a ">" delimiter. Supports href and current state.
 // =============================================================================
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 class TfBreadcrumb extends HTMLElement {
   constructor() {
     super();
@@ -45,7 +54,8 @@ class TfBreadcrumb extends HTMLElement {
     items.forEach((item, i) => {
       const href = item.getAttribute('href');
       const current = item.hasAttribute('current');
-      const text = item.textContent.trim();
+      // Labels can carry arbitrary user/state text — escape before innerHTML.
+      const text = escapeHtml(item.textContent.trim());
 
       if (i > 0) {
         parts.push('<span class="tf-breadcrumb-sep" aria-hidden="true">&#8250;</span>');
@@ -54,7 +64,7 @@ class TfBreadcrumb extends HTMLElement {
       if (current || !href) {
         parts.push(`<span class="tf-breadcrumb-item current" aria-current="page">${text}</span>`);
       } else {
-        parts.push(`<a class="tf-breadcrumb-item" href="${href}">${text}</a>`);
+        parts.push(`<a class="tf-breadcrumb-item" href="${escapeHtml(href)}">${text}</a>`);
       }
     });
 

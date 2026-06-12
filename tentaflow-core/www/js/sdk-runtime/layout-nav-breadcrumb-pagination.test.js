@@ -1,9 +1,11 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-nav-breadcrumb-pagination.test.js
-// Opis: Testy Breadcrumb + Pagination (Krok 3.3a-5).
+// Opis: Breadcrumb (0x0110) + Pagination (0x0111) tests. Breadcrumb renders
+// through the <tf-breadcrumb> dashboard web component.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-breadcrumb.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -13,6 +15,12 @@ import { bootstrapSdkRuntime } from './bootstrap.js';
 import {
   BREADCRUMB_TAG, PAGINATION_TAG,
 } from './layout-nav-breadcrumb-pagination.js';
+
+// tf-breadcrumb references bare MutationObserver; the harness only exposes
+// it on the happy-dom window object.
+if (window.MutationObserver && !globalThis.MutationObserver) {
+  globalThis.MutationObserver = window.MutationObserver;
+}
 
 const results = [];
 function test(name, fn) {
@@ -65,7 +73,7 @@ function setup() {
 // Breadcrumb
 // ============================================================================
 
-test('Breadcrumb renders nav role + ol list with items + separators', () => {
+test('Breadcrumb renders tf-breadcrumb with items, separators and aria-current', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -73,24 +81,27 @@ test('Breadcrumb renders nav role + ol list with items + separators', () => {
       [
         0,
         [
-          { label: { kind: 'literal', value: 'Home' }, is_current: false },
-          { label: { kind: 'literal', value: 'Reports' }, is_current: false },
+          { label: { kind: 'literal', value: 'Home' }, action_id: 'go-home', is_current: false },
+          { label: { kind: 'literal', value: 'Reports' }, action_id: 'go-reports', is_current: false },
           { label: { kind: 'literal', value: 'Q4' }, is_current: true },
         ],
       ],
       [1, 'chevron'],
     ])
   );
-  assertEq(el.tagName, 'NAV');
-  assertEq(el.getAttribute('aria-label'), 'Breadcrumb');
-  const items = el.querySelectorAll('.tf-breadcrumb__item');
+  assertEq(el.tagName, 'TF-BREADCRUMB');
+  assertEq(el.getAttribute('data-separator'), 'chevron');
+  document.body.appendChild(el);
+  const nav = el.querySelector('nav.tf-breadcrumb');
+  assertEq(nav.getAttribute('aria-label'), 'Breadcrumb');
+  const items = nav.querySelectorAll('.tf-breadcrumb-item');
   assertEq(items.length, 3);
-  const seps = el.querySelectorAll('.tf-breadcrumb__separator');
-  assertEq(seps.length, 2);
-  assertEq(items[2].querySelector('.tf-breadcrumb__link').getAttribute('aria-current'), 'page');
+  assertEq(nav.querySelectorAll('.tf-breadcrumb-sep').length, 2);
+  assertEq(items[2].getAttribute('aria-current'), 'page');
+  assertEq(items[2].textContent, 'Q4');
 });
 
-test('Breadcrumb current item renders as span, others as links', () => {
+test('Breadcrumb current item renders as span, action items as links', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -105,12 +116,13 @@ test('Breadcrumb current item renders as span, others as links', () => {
       [1, 'slash'],
     ])
   );
-  const items = el.querySelectorAll('.tf-breadcrumb__item');
-  assertEq(items[0].querySelector('.tf-breadcrumb__link').tagName, 'A');
-  assertEq(items[1].querySelector('.tf-breadcrumb__link').tagName, 'SPAN');
+  document.body.appendChild(el);
+  const items = el.querySelectorAll('.tf-breadcrumb-item');
+  assertEq(items[0].tagName, 'A');
+  assertEq(items[1].tagName, 'SPAN');
 });
 
-test('Breadcrumb link click dispatches click with action_id', () => {
+test('Breadcrumb link click dispatches click with action_id and item_index', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -119,15 +131,25 @@ test('Breadcrumb link click dispatches click with action_id', () => {
         0,
         [
           { label: { kind: 'literal', value: 'A' }, action_id: 'navA', is_current: false },
+          { label: { kind: 'literal', value: 'B' }, action_id: 'navB', is_current: false },
+          { label: { kind: 'literal', value: 'C' }, is_current: true },
         ],
       ],
       [1, 'dot'],
     ])
   );
-  let received = null;
-  el.addEventListener('click', (e) => { received = e.detail; });
-  el.querySelector('a').click();
-  assertEq(received, { action_id: 'navA', item_index: 0 });
+  document.body.appendChild(el);
+  const received = [];
+  el.addEventListener('click', (e) => { received.push(e.detail); });
+  const anchors = el.querySelectorAll('a.tf-breadcrumb-item');
+  anchors[1].click();
+  anchors[0].click();
+  // Only our CustomEvent (with detail) reaches the root — the native
+  // MouseEvent is stopped in the capture-phase delegate.
+  assertEq(received, [
+    { action_id: 'navB', item_index: 1 },
+    { action_id: 'navA', item_index: 0 },
+  ]);
 });
 
 test('Breadcrumb default max_items=5 collapses long trails with ellipsis', () => {
@@ -140,39 +162,67 @@ test('Breadcrumb default max_items=5 collapses long trails with ellipsis', () =>
   const el = engine.render(
     comp(BREADCRUMB_TAG, [[0, items], [1, 'chevron']])
   );
-  // 1 first + ellipsis + last 3 (5-2=3) = 5 list items shown
-  const lis = el.querySelectorAll('.tf-breadcrumb__list > .tf-breadcrumb__item');
-  assertEq(lis.length, 5);
-  assert(el.querySelector('.tf-breadcrumb__item--ellipsis') != null);
+  document.body.appendChild(el);
+  // 1 first + ellipsis + last 3 (5-2=3) = 5 items shown
+  const shown = el.querySelectorAll('.tf-breadcrumb-item');
+  assertEq(shown.length, 5);
+  assertEq(shown[0].textContent, 'L0');
+  assertEq(shown[1].textContent, '…');
+  assertEq(shown[4].textContent, 'L7');
 });
 
-test('Breadcrumb item icon present is rejected (defer 3.3d)', () => {
+test('Breadcrumb label BindRef updates rendered text reactively', () => {
   setup();
-  const engine = makeEngine();
-  assertThrows(() =>
-    engine.render(
-      comp(BREADCRUMB_TAG, [
-        [
-          0,
-          [{ label: { kind: 'literal', value: 'X' }, is_current: false, icon: { kind: 'name', name: 'star' } }],
-        ],
-        [1, 'chevron'],
-      ])
-    )
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('crumb'), value: 'Draft' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(
+    comp(BREADCRUMB_TAG, [
+      [0, [{ label: { kind: 'bound', path: PATH('crumb') }, is_current: true }]],
+      [1, 'chevron'],
+    ])
   );
+  document.body.appendChild(el);
+  assertEq(el.querySelector('.tf-breadcrumb-item').textContent, 'Draft');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('crumb'), op: { kind: 'set', value: 'Published' } }],
+  });
+  assertEq(el.querySelector('.tf-breadcrumb-item').textContent, 'Published');
 });
 
-test('Breadcrumb item local_action present is rejected (defer 3.6)', () => {
+test('Breadcrumb item icon and local_action are gracefully ignored', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BREADCRUMB_TAG, [
+      [
+        0,
+        [{
+          label: { kind: 'literal', value: 'X' },
+          is_current: true,
+          icon: { kind: 'name', name: 'star' },
+          local_action: { kind: 'navigate' },
+        }],
+      ],
+      [1, 'chevron'],
+    ])
+  );
+  document.body.appendChild(el);
+  assertEq(el.querySelector('.tf-breadcrumb-item').textContent, 'X');
+});
+
+test('Breadcrumb rejects invalid separator', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() =>
     engine.render(
       comp(BREADCRUMB_TAG, [
-        [
-          0,
-          [{ label: { kind: 'literal', value: 'X' }, is_current: false, local_action: { kind: 'navigate' } }],
-        ],
-        [1, 'chevron'],
+        [0, [{ label: { kind: 'literal', value: 'X' }, is_current: true }]],
+        [1, 'arrow'],
       ])
     )
   );

@@ -2,10 +2,13 @@
 // File: sdk-runtime/feedback-overlay-renderer.test.js
 // Description: Tests for Modal (0x0509), Drawer (0x050A), Popover (0x050B),
 // Sheet (0x050C), GateScreen (0x050D), ConfirmationDialog (0x050E) —
-// chunk 3.3e-3.
+// chunk 3.3e-3. Dialog overlays render through the <tf-modal> web component,
+// which is imported after the DOM harness so elements upgrade for real
+// ESC/backdrop/close behavior.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-modal.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -73,15 +76,20 @@ function modalFields({
   return f;
 }
 
-test('Modal renders with role=dialog and size class', () => {
+test('Modal renders as open tf-modal with size class on card', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ size: 'lg' })));
   document.body.appendChild(el);
-  assert(el.classList.contains('tf-modal'));
-  assertEq(el.getAttribute('role'), 'dialog');
-  assertEq(el.getAttribute('aria-modal'), 'true');
-  assert(el.querySelector('.tf-modal__container').classList.contains('tf-modal--size-lg'));
+  assertEq(el.tagName, 'TF-MODAL');
+  assertEq(el.getAttribute('variant'), 'modal');
+  assertEq(el.getAttribute('size'), 'lg');
+  assert(el.hasAttribute('open'));
+  const card = el.querySelector('.tf-modal-card');
+  assert(card != null);
+  assertEq(card.getAttribute('role'), 'dialog');
+  assertEq(card.getAttribute('aria-modal'), 'true');
+  assert(card.classList.contains('tf-modal--size-lg'));
 });
 
 test('Modal renders title via BindRef', () => {
@@ -89,7 +97,8 @@ test('Modal renders title via BindRef', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ title: LIT('My Modal') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-modal__title').textContent, 'My Modal');
+  assertEq(el.getAttribute('title'), 'My Modal');
+  assertEq(el.querySelector('.tf-modal-title').textContent, 'My Modal');
 });
 
 test('Modal title reacts to patch', () => {
@@ -99,19 +108,18 @@ test('Modal title reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(MODAL_TAG, modalFields({ title: BOUND('mt') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-modal__title').textContent, 'Old');
+  assertEq(el.getAttribute('title'), 'Old');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('mt'), op: { kind: 'set', value: 'New' } }] });
-  assertEq(el.querySelector('.tf-modal__title').textContent, 'New');
+  assertEq(el.getAttribute('title'), 'New');
 });
 
-test('Modal renders body slot with data-slot-id', () => {
+test('Modal renders body slot with data-slot-id inside tf-modal body', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ bodySlot: 'modal-body' })));
   document.body.appendChild(el);
-  const bodyEl = el.querySelector('.tf-modal__body');
-  assert(bodyEl != null);
-  assertEq(bodyEl.getAttribute('data-slot-id'), 'modal-body');
+  const slotEl = el.querySelector('.tf-modal-body [data-slot-id="modal-body"]');
+  assert(slotEl != null);
 });
 
 test('Modal renders footer slot when provided', () => {
@@ -119,22 +127,32 @@ test('Modal renders footer slot when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ footerSlot: 'modal-footer' })));
   document.body.appendChild(el);
-  const footerEl = el.querySelector('.tf-modal__footer');
-  assert(footerEl != null);
-  assertEq(footerEl.getAttribute('data-slot-id'), 'modal-footer');
+  const slotEl = el.querySelector('.tf-modal-footer [data-slot-id="modal-footer"]');
+  assert(slotEl != null);
 });
 
-test('Modal closable=true shows close button', () => {
+test('Modal closable=true shows close button dispatching dismiss', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ closable: true })));
   document.body.appendChild(el);
-  const closeBtn = el.querySelector('.tf-modal__close');
+  assert(!el.hasAttribute('no-close'));
+  const closeBtn = el.querySelector('.tf-modal-close');
   assert(closeBtn != null);
+  assert(closeBtn.style.display !== 'none');
   let dismissed = false;
   el.addEventListener('dismiss', () => { dismissed = true; });
   closeBtn.click();
   assert(dismissed);
+});
+
+test('Modal closable=false hides close button', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(MODAL_TAG, modalFields({ closable: false })));
+  document.body.appendChild(el);
+  assert(el.hasAttribute('no-close'));
+  assertEq(el.querySelector('.tf-modal-close').style.display, 'none');
 });
 
 test('Modal dismissible=true dispatches dismiss on ESC', () => {
@@ -146,6 +164,30 @@ test('Modal dismissible=true dispatches dismiss on ESC', () => {
   el.addEventListener('dismiss', () => { dismissed = true; });
   document.dispatchEvent(new globalThis.KeyboardEvent('keydown', { key: 'Escape' }));
   assert(dismissed);
+});
+
+test('Modal dismissible=true dispatches dismiss on backdrop click', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(MODAL_TAG, modalFields({ dismissible: true })));
+  document.body.appendChild(el);
+  let dismissed = false;
+  el.addEventListener('dismiss', () => { dismissed = true; });
+  el.querySelector('.tf-modal-backdrop').click();
+  assert(dismissed);
+});
+
+test('Modal dismissible=false ignores ESC and backdrop', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(MODAL_TAG, modalFields({ dismissible: false })));
+  document.body.appendChild(el);
+  assert(el.hasAttribute('no-dismiss'));
+  let dismissed = false;
+  el.addEventListener('dismiss', () => { dismissed = true; });
+  document.dispatchEvent(new globalThis.KeyboardEvent('keydown', { key: 'Escape' }));
+  el.querySelector('.tf-modal-backdrop').click();
+  assert(!dismissed);
 });
 
 test('Modal rejects missing title', () => {
@@ -165,7 +207,8 @@ test('Modal renders subtitle when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(MODAL_TAG, modalFields({ subtitle: LIT('Sub') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-modal__subtitle').textContent, 'Sub');
+  assertEq(el.getAttribute('subtitle'), 'Sub');
+  assertEq(el.querySelector('.tf-modal-subtitle').textContent, 'Sub');
 });
 
 test('Modal preventScroll adds class', () => {
@@ -190,15 +233,28 @@ function drawerFields({
   return f;
 }
 
-test('Drawer renders with side and size classes', () => {
+test('Drawer renders as tf-modal with drawer variant and size', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(DRAWER_TAG, drawerFields({ side: 'left', size: 'lg' })));
   document.body.appendChild(el);
-  assert(el.classList.contains('tf-drawer'));
-  assert(el.classList.contains('tf-drawer--side-left'));
-  assert(el.classList.contains('tf-drawer--size-lg'));
-  assertEq(el.getAttribute('role'), 'dialog');
+  assertEq(el.tagName, 'TF-MODAL');
+  assertEq(el.getAttribute('variant'), 'drawer-left');
+  assertEq(el.getAttribute('size'), 'lg');
+  assert(el.hasAttribute('open'));
+  assert(el.hasAttribute('no-close'));
+  const card = el.querySelector('.tf-modal-card');
+  assert(card.classList.contains('tf-modal-card--drawer-left'));
+  assertEq(card.getAttribute('role'), 'dialog');
+});
+
+test('Drawer side=top maps to drawer-top variant', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(DRAWER_TAG, drawerFields({ side: 'top' })));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('variant'), 'drawer-top');
+  assert(el.querySelector('.tf-modal-card').classList.contains('tf-modal-card--drawer-top'));
 });
 
 test('Drawer renders body slot', () => {
@@ -206,7 +262,7 @@ test('Drawer renders body slot', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(DRAWER_TAG, drawerFields({ bodySlot: 'dr-body' })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-drawer__body').getAttribute('data-slot-id'), 'dr-body');
+  assert(el.querySelector('.tf-modal-body [data-slot-id="dr-body"]') != null);
 });
 
 test('Drawer renders title when provided', () => {
@@ -214,7 +270,8 @@ test('Drawer renders title when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(DRAWER_TAG, drawerFields({ title: LIT('Settings') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-drawer__title').textContent, 'Settings');
+  assertEq(el.getAttribute('title'), 'Settings');
+  assertEq(el.querySelector('.tf-modal-title').textContent, 'Settings');
 });
 
 test('Drawer title reacts to patch', () => {
@@ -224,9 +281,9 @@ test('Drawer title reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(DRAWER_TAG, drawerFields({ title: BOUND('dt') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-drawer__title').textContent, 'First');
+  assertEq(el.getAttribute('title'), 'First');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('dt'), op: { kind: 'set', value: 'Second' } }] });
-  assertEq(el.querySelector('.tf-drawer__title').textContent, 'Second');
+  assertEq(el.getAttribute('title'), 'Second');
 });
 
 test('Drawer dismissible=true dispatches dismiss on ESC', () => {
@@ -240,6 +297,18 @@ test('Drawer dismissible=true dispatches dismiss on ESC', () => {
   assert(dismissed);
 });
 
+test('Drawer dismissible=false sets no-dismiss', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(DRAWER_TAG, drawerFields({ dismissible: false })));
+  document.body.appendChild(el);
+  assert(el.hasAttribute('no-dismiss'));
+  let dismissed = false;
+  el.addEventListener('dismiss', () => { dismissed = true; });
+  document.dispatchEvent(new globalThis.KeyboardEvent('keydown', { key: 'Escape' }));
+  assert(!dismissed);
+});
+
 test('Drawer rejects invalid side', () => {
   setup();
   const engine = makeEngine(makeStore());
@@ -251,7 +320,7 @@ test('Drawer renders footer slot when provided', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(DRAWER_TAG, drawerFields({ footerSlot: 'dr-footer' })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-drawer__footer').getAttribute('data-slot-id'), 'dr-footer');
+  assert(el.querySelector('.tf-modal-footer [data-slot-id="dr-footer"]') != null);
 });
 
 // ============================================================================
@@ -337,14 +406,17 @@ function sheetFields({
   return f;
 }
 
-test('Sheet renders with dialog role and detent class', () => {
+test('Sheet renders as bottom drawer tf-modal with detent class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SHEET_TAG, sheetFields({ detents: ['large'] })));
   document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-MODAL');
+  assertEq(el.getAttribute('variant'), 'drawer-bottom');
+  assert(el.hasAttribute('open'));
   assert(el.classList.contains('tf-sheet'));
-  assertEq(el.getAttribute('role'), 'dialog');
-  assert(el.querySelector('.tf-sheet__container').classList.contains('tf-sheet--detent-large'));
+  assert(el.classList.contains('tf-sheet--detent-large'));
+  assertEq(el.querySelector('.tf-modal-card').getAttribute('role'), 'dialog');
 });
 
 test('Sheet renders body slot', () => {
@@ -352,7 +424,7 @@ test('Sheet renders body slot', () => {
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SHEET_TAG, sheetFields({ bodySlot: 'sh-body' })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-sheet__body').getAttribute('data-slot-id'), 'sh-body');
+  assert(el.querySelector('.tf-modal-body [data-slot-id="sh-body"]') != null);
 });
 
 test('Sheet current_detent reacts to patch', () => {
@@ -362,11 +434,10 @@ test('Sheet current_detent reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(SHEET_TAG, sheetFields({ detents: ['small', 'large'], currentDetent: BOUND('sd') })));
   document.body.appendChild(el);
-  const container = el.querySelector('.tf-sheet__container');
-  assert(container.classList.contains('tf-sheet--detent-small'));
+  assert(el.classList.contains('tf-sheet--detent-small'));
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('sd'), op: { kind: 'set', value: 'large' } }] });
-  assert(container.classList.contains('tf-sheet--detent-large'));
-  assert(!container.classList.contains('tf-sheet--detent-small'));
+  assert(el.classList.contains('tf-sheet--detent-large'));
+  assert(!el.classList.contains('tf-sheet--detent-small'));
 });
 
 test('Sheet rejects empty detents', () => {
@@ -392,12 +463,13 @@ test('Sheet dismissible dispatches dismiss on ESC', () => {
   assert(dismissed);
 });
 
-test('Sheet renders handle', () => {
+test('Sheet renders title when provided', () => {
   setup();
   const engine = makeEngine(makeStore());
-  const el = engine.render(comp(SHEET_TAG, sheetFields()));
+  const el = engine.render(comp(SHEET_TAG, sheetFields({ title: LIT('Pick one') })));
   document.body.appendChild(el);
-  assert(el.querySelector('.tf-sheet__handle') != null);
+  assertEq(el.getAttribute('title'), 'Pick one');
+  assertEq(el.querySelector('.tf-modal-title').textContent, 'Pick one');
 });
 
 // ============================================================================
@@ -457,7 +529,7 @@ test('GateScreen title reacts to patch', () => {
   assertEq(el.querySelector('.tf-gate-screen__title').textContent, 'Updated');
 });
 
-test('GateScreen renders action buttons', () => {
+test('GateScreen renders action buttons as tf-button', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(GATE_SCREEN_TAG, gateFields()));
@@ -465,6 +537,7 @@ test('GateScreen renders action buttons', () => {
   const actionsEl = el.querySelector('.tf-gate-screen__actions');
   assert(actionsEl != null);
   assert(actionsEl.children.length > 0);
+  assertEq(actionsEl.children[0].tagName, 'TF-BUTTON');
 });
 
 test('GateScreen rejects non-Button action children', () => {
@@ -501,14 +574,17 @@ function confirmFields({
   return f;
 }
 
-test('ConfirmationDialog renders with tone class and alertdialog role', () => {
+test('ConfirmationDialog renders as tf-modal with tone class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields({ tone: 'critical' })));
   document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-MODAL');
   assert(el.classList.contains('tf-confirm-dialog'));
   assert(el.classList.contains('tf-confirm-dialog--tone-critical'));
-  assertEq(el.getAttribute('role'), 'alertdialog');
+  assert(el.hasAttribute('open'));
+  assert(el.hasAttribute('no-close'));
+  assertEq(el.querySelector('.tf-modal-card').getAttribute('role'), 'dialog');
 });
 
 test('ConfirmationDialog renders title and message', () => {
@@ -518,7 +594,7 @@ test('ConfirmationDialog renders title and message', () => {
     title: LIT('Delete?'), message: LIT('This is permanent'),
   })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-confirm-dialog__title').textContent, 'Delete?');
+  assertEq(el.getAttribute('title'), 'Delete?');
   assertEq(el.querySelector('.tf-confirm-dialog__message').textContent, 'This is permanent');
 });
 
@@ -529,39 +605,44 @@ test('ConfirmationDialog title reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields({ title: BOUND('ct') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-confirm-dialog__title').textContent, 'Old title');
+  assertEq(el.getAttribute('title'), 'Old title');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('ct'), op: { kind: 'set', value: 'New title' } }] });
-  assertEq(el.querySelector('.tf-confirm-dialog__title').textContent, 'New title');
+  assertEq(el.getAttribute('title'), 'New title');
 });
 
-test('ConfirmationDialog cancel dispatches dismiss', () => {
+test('ConfirmationDialog cancel tf-button dispatches dismiss', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields()));
   document.body.appendChild(el);
+  const cancelBtn = el.querySelector('.tf-confirm-dialog__cancel');
+  assertEq(cancelBtn.tagName, 'TF-BUTTON');
   let dismissed = false;
   el.addEventListener('dismiss', () => { dismissed = true; });
-  el.querySelector('.tf-confirm-dialog__cancel').click();
+  cancelBtn.click();
   assert(dismissed);
 });
 
-test('ConfirmationDialog confirm dispatches confirm event', () => {
+test('ConfirmationDialog confirm tf-button dispatches confirm event', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields()));
   document.body.appendChild(el);
+  const confirmBtn = el.querySelector('.tf-confirm-dialog__confirm');
+  assertEq(confirmBtn.tagName, 'TF-BUTTON');
+  assertEq(confirmBtn.getAttribute('variant'), 'primary');
   let confirmed = false;
   el.addEventListener('confirm', () => { confirmed = true; });
-  el.querySelector('.tf-confirm-dialog__confirm').click();
+  confirmBtn.click();
   assert(confirmed);
 });
 
-test('ConfirmationDialog destructive=true adds destructive class', () => {
+test('ConfirmationDialog destructive=true uses danger-solid confirm variant', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields({ destructive: true })));
   document.body.appendChild(el);
-  assert(el.querySelector('.tf-confirm-dialog__confirm--destructive') != null);
+  assertEq(el.querySelector('.tf-confirm-dialog__confirm').getAttribute('variant'), 'danger-solid');
 });
 
 test('ConfirmationDialog require_typing disables confirm until typed', () => {
@@ -571,14 +652,20 @@ test('ConfirmationDialog require_typing disables confirm until typed', () => {
   document.body.appendChild(el);
   const confirmBtn = el.querySelector('.tf-confirm-dialog__confirm');
   assert(confirmBtn.hasAttribute('disabled'));
-  const input = el.querySelector('.tf-confirm-dialog__typing-input');
+  const input = el.querySelector('.tf-confirm-dialog__typing');
   assert(input != null);
-  input.value = 'DELE';
-  input.dispatchEvent(new globalThis.Event('input'));
+  assertEq(input.tagName, 'TF-INPUT');
+  assertEq(input.getAttribute('label'), 'DELETE');
+  let confirmed = false;
+  el.addEventListener('confirm', () => { confirmed = true; });
+  confirmBtn.click();
+  assert(!confirmed);
+  input.dispatchEvent(new globalThis.CustomEvent('input', { detail: { value: 'DELE' } }));
   assert(confirmBtn.hasAttribute('disabled'));
-  input.value = 'DELETE';
-  input.dispatchEvent(new globalThis.Event('input'));
+  input.dispatchEvent(new globalThis.CustomEvent('input', { detail: { value: 'DELETE' } }));
   assert(!confirmBtn.hasAttribute('disabled'));
+  confirmBtn.click();
+  assert(confirmed);
 });
 
 test('ConfirmationDialog ESC dispatches dismiss', () => {
@@ -619,9 +706,9 @@ test('ConfirmationDialog confirm label reacts to patch', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(CONFIRMATION_DIALOG_TAG, confirmFields({ confirmLabel: BOUND('cl') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-confirm-dialog__confirm').textContent, 'Yes');
+  assertEq(el.querySelector('.tf-confirm-dialog__confirm').getAttribute('label'), 'Yes');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('cl'), op: { kind: 'set', value: 'Proceed' } }] });
-  assertEq(el.querySelector('.tf-confirm-dialog__confirm').textContent, 'Proceed');
+  assertEq(el.querySelector('.tf-confirm-dialog__confirm').getAttribute('label'), 'Proceed');
 });
 
 // ============================================================================

@@ -1,13 +1,14 @@
 // =============================================================================
 // File: tf-file-input.js
 // Description: <tf-file-input> — styled file upload component.
-//   Attributes: accept, multiple, label, disabled.
+//   Attributes: accept, multiple, label, disabled, capture (user/environment),
+//   no-drop (disables drag-and-drop, click-to-pick only).
 //   Events: change (detail: {files: FileList}).
 // =============================================================================
 
 class TfFileInput extends HTMLElement {
   static get observedAttributes() {
-    return ['accept', 'multiple', 'label', 'disabled'];
+    return ['accept', 'multiple', 'label', 'disabled', 'capture', 'no-drop'];
   }
 
   constructor() {
@@ -95,6 +96,10 @@ class TfFileInput extends HTMLElement {
     if (multiple) this._input.setAttribute('multiple', '');
     else this._input.removeAttribute('multiple');
 
+    const capture = this.getAttribute('capture');
+    if (capture) this._input.setAttribute('capture', capture);
+    else this._input.removeAttribute('capture');
+
     this._labelEl.textContent = label;
     this._dropzone.classList.toggle('tf-file-input-disabled', disabled);
 
@@ -113,7 +118,7 @@ class TfFileInput extends HTMLElement {
   }
 
   _onDragOver(e) {
-    if (this.hasAttribute('disabled')) return;
+    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop')) return;
     e.preventDefault();
     this._dropzone.classList.add('tf-file-input-over');
   }
@@ -123,7 +128,7 @@ class TfFileInput extends HTMLElement {
   }
 
   _onDrop(e) {
-    if (this.hasAttribute('disabled')) return;
+    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop')) return;
     e.preventDefault();
     this._dropzone.classList.remove('tf-file-input-over');
     if (e.dataTransfer?.files) {

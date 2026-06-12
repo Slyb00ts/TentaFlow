@@ -1,19 +1,20 @@
 // =============================================================================
-// Plik: sdk-runtime/form-file-color-renderer.js
-// Opis: Renderery FileInput (0x0318) + ColorPicker (0x0319) — chunk 3.3c-6.
+// File: sdk-runtime/form-file-color-renderer.js
+// Description: FileInput (0x0318) + ColorPicker (0x0319) renderers.
 //
-// FileInput: <input type="file"> z opcjonalnym drag-drop area, walidacja
-// accept/max_size_bytes/max_files po wyborze, emit 'change' z listą plików
-// (metadata only — actual upload to host przez upload_action_id),
-// 'reject' gdy walidacja nie przeszła.
+// FileInput renders through the <tf-file-input> web component (dropzone +
+// hidden native input live inside the component). The renderer validates the
+// component's selection against accept/max_size_bytes/max_files and emits
+// 'files_selected' with file metadata (actual upload goes to the host via
+// upload_action_id) or 'reject' when validation fails.
 //
-// ColorPicker: 4 warianty:
-//   - swatch        — siatka kolorów (allowed_tokens lub default palette)
-//   - wheel         — <input type="color"> native
-//   - compact       — chip + small dropdown swatches
+// ColorPicker has 4 variants:
+//   - swatch        — color grid (allowed_tokens or default palette)
+//   - wheel         — <tf-color-input> web component
+//   - compact       — swatch grid + <tf-input> hex field for fine-tuning
 //   - tokens_only   — pure semantic token list (allowed_tokens required)
 //
-// Wszystkie używają reactive bind_path (read-only). Spec ref:
+// All variants use reactive bind_path (read-only). Spec ref:
 // tentaflow-sdk-spec/src/protocol/ui/form/file_color.rs.
 // =============================================================================
 
@@ -24,7 +25,7 @@ import {
 import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 
 // =============================================================================
-// Walidatory
+// Validators
 // =============================================================================
 
 const FILE_CAPTURES = new Set(['user', 'environment']);
@@ -37,11 +38,10 @@ const COLOR_TOKENS = new Set([
   'accent_primary', 'accent_secondary',
   'tone_neutral', 'tone_success', 'tone_warning', 'tone_critical', 'tone_info',
 ]);
-// Hex color #RGB / #RRGGBB / #RRGGBBAA — używane gdy variant != tokens_only
-// i user wybiera dowolny kolor wheel'em / swatch hex'em.
+// Hex color #RGB / #RRGGBB / #RRGGBBAA — used when variant != tokens_only and
+// the user picks an arbitrary color via the wheel / hex field.
 const HEX_COLOR_RE = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
-// Default palette dla swatch gdy brak allowed_tokens — 16 sensownych
-// kolorów (HSL-spaced).
+// Default swatch palette when allowed_tokens is absent — 16 sensible colors.
 const DEFAULT_SWATCH_PALETTE = Object.freeze([
   '#000000', '#ffffff', '#9ca3af', '#374151',
   '#ef4444', '#f97316', '#eab308', '#84cc16',
@@ -68,9 +68,8 @@ function requireU8(v, ctx) {
   return v;
 }
 function requireU64(v, ctx) {
-  // JS Number bezpieczne do 2^53; spec używa u64 ale realnie pliki >2^53 są
-  // niespotykane. Wartości bigint są też akceptowane (host może wysłać u64
-  // jako bigint).
+  // JS Number is safe up to 2^53; the spec uses u64 but files above 2^53 are
+  // unrealistic. BigInt is also accepted (the host may send u64 as bigint).
   if (typeof v === 'bigint') {
     if (v < 0n) throw new TypeError(`${ctx}: expected u64, got ${v}`);
     return v;
@@ -103,8 +102,7 @@ function applyTextBind(element, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
-/// Czy plik pasuje do accept pattern'a (mime/wildcard/extension).
-/// Akceptujemy:
+/// Whether a file matches an accept pattern (mime/wildcard/extension):
 ///   "image/png"     → exact MIME
 ///   "image/\*"      → MIME family
 ///   ".pdf"          → extension match (case-insensitive)
@@ -156,55 +154,30 @@ function renderFileInput(component, ctx) {
   const labelBind = ctx.readField(component.fields, 8);
   const hintBind = ctx.readField(component.fields, 9);
 
-  // multiple=false ALE max_files>1 jest sprzeczne — wymuszamy spójność.
+  // multiple=false but max_files>1 is contradictory — enforce consistency.
   if (!multiple && maxFiles > 1) {
     throw new TypeError('FileInput.multiple=false requires max_files=1');
   }
 
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-file-input');
-  if (dragAndDrop) wrapper.classList.add('tf-file-input--dnd');
+  wrapper.classList.add('tf-file-input-field');
+  if (dragAndDrop) wrapper.classList.add('tf-file-input-field--dnd');
 
-  let labelEl = null;
+  // Dropzone + hidden native input live inside the web component.
+  const fileEl = document.createElement('tf-file-input');
+  if (accept.length > 0) fileEl.setAttribute('accept', accept.join(','));
+  if (multiple) fileEl.setAttribute('multiple', '');
+  if (capture) fileEl.setAttribute('capture', capture);
+  if (!dragAndDrop) fileEl.setAttribute('no-drop', '');
+
   if (labelBind != null) {
-    labelEl = document.createElement('label');
-    labelEl.classList.add('tf-file-input__label');
-    applyTextBind(labelEl, labelBind, ctx);
-    wrapper.appendChild(labelEl);
-  }
-
-  // Drop zone albo prosty button trigger.
-  const dropzone = document.createElement('div');
-  dropzone.classList.add('tf-file-input__dropzone');
-  if (dragAndDrop) dropzone.classList.add('tf-file-input__dropzone--dnd');
-  dropzone.setAttribute('role', 'button');
-  dropzone.setAttribute('tabindex', '0');
-
-  const trigger = document.createElement('span');
-  trigger.classList.add('tf-file-input__trigger');
-  trigger.textContent = multiple ? 'Wybierz pliki' : 'Wybierz plik';
-  dropzone.appendChild(trigger);
-
-  if (dragAndDrop) {
-    const dndHint = document.createElement('span');
-    dndHint.classList.add('tf-file-input__dnd-hint');
-    dndHint.textContent = 'lub upuść tutaj';
-    dropzone.appendChild(dndHint);
-  }
-
-  const input = document.createElement('input');
-  input.setAttribute('type', 'file');
-  input.classList.add('tf-file-input__input');
-  const inputId = `tf-file-input-${component.id}`;
-  input.setAttribute('id', inputId);
-  if (labelEl) labelEl.setAttribute('for', inputId);
-  if (accept.length > 0) input.setAttribute('accept', accept.join(','));
-  if (multiple) input.setAttribute('multiple', '');
-  if (capture) input.setAttribute('capture', capture);
-  // Ukryty natywnie — dropzone wywołuje click na input'cie.
-  input.classList.add('tf-file-input__input--hidden');
-
-  if (labelBind == null) {
+    const applyLabel = () => {
+      const v = resolveBindRef(labelBind, ctx.store);
+      fileEl.setAttribute('label', v == null ? '' : String(v));
+    };
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
+  } else {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError('FileInput without label requires Component.a11y.label');
     }
@@ -215,19 +188,16 @@ function renderFileInput(component, ctx) {
     const applyAria = () => {
       const v = resolveBindRef(component.a11y.label, ctx.store);
       if (typeof v === 'string' && v.trim().length > 0) {
-        input.setAttribute('aria-label', v);
-        dropzone.setAttribute('aria-label', v);
+        fileEl.setAttribute('aria-label', v);
       } else {
-        input.removeAttribute('aria-label');
-        dropzone.removeAttribute('aria-label');
+        fileEl.removeAttribute('aria-label');
       }
     };
     applyAria();
     ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
   }
 
-  wrapper.appendChild(input);
-  wrapper.appendChild(dropzone);
+  wrapper.appendChild(fileEl);
 
   if (hintBind != null) {
     const hint = document.createElement('span');
@@ -236,14 +206,14 @@ function renderFileInput(component, ctx) {
     wrapper.appendChild(hint);
   }
 
-  // Lista wybranych plików — wyświetla się po valid selection.
+  // Selected-file list — rendered from the store (metadata after upload).
   const fileList = document.createElement('ul');
   fileList.classList.add('tf-file-input__list');
   wrapper.appendChild(fileList);
 
-  // Sync z store: store value to lista metadata (po upload). Bez wsparcia
-  // dla wstawiania natywnych File obiektów w input.files (security), więc
-  // tylko renderujemy nazwy z store i ewentualnie clear przyciskiem.
+  // Store sync: the store value is a metadata list (post-upload). Native File
+  // objects cannot be injected back into the input (security), so only names
+  // and sizes from the store are rendered.
   const renderStoreFiles = () => {
     fileList.innerHTML = '';
     let v;
@@ -271,7 +241,7 @@ function renderFileInput(component, ctx) {
   renderStoreFiles();
   ctx.registerCleanup(ctx.store.subscribe(bindPath, renderStoreFiles));
 
-  // Walidacja FileList → emit 'change' z metadata lub 'reject' z reason.
+  // FileList validation → emit 'files_selected' with metadata or 'reject'.
   const validateAndEmit = (files) => {
     if (!files || files.length === 0) return;
     const arr = Array.from(files);
@@ -312,11 +282,11 @@ function renderFileInput(component, ctx) {
       type: f.type || '',
       last_modified: f.lastModified || 0,
     }));
-    // Spec FileInput schema (schema/data.rs:1139) deklaruje
+    // The FileInput spec schema (schema/data.rs:1139) declares
     // handlers=["files_selected", "upload_progress", "upload_complete",
-    // "upload_error"]. Renderer emit'uje `files_selected` przy
-    // poprawnym wyborze; upload_* eventy emit'uje host po faktycznym
-    // upload'zie (renderer nie zajmuje się siecią).
+    // "upload_error"]. The renderer emits `files_selected` on a valid pick;
+    // upload_* events are emitted by the host after the actual upload (the
+    // renderer does no networking).
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('files_selected', {
         bubbles: false,
@@ -329,56 +299,20 @@ function renderFileInput(component, ctx) {
     );
   };
 
-  const onInputChange = () => validateAndEmit(input.files);
-  input.addEventListener('change', onInputChange);
-  ctx.registerCleanup(() => input.removeEventListener('change', onInputChange));
-
-  const onDropzoneClick = (e) => {
-    e.preventDefault();
-    try { input.click(); } catch {}
+  // tf-file-input emits a bubbling 'change' with detail {files}. Block the
+  // raw event (its shape is not the SDK contract) and run validation; the
+  // SDK-shaped 'files_selected'/'reject' events are dispatched on the wrapper.
+  const onChange = (e) => {
+    e.stopImmediatePropagation();
+    validateAndEmit(e.detail && e.detail.files);
   };
-  const onDropzoneKey = (e) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      try { input.click(); } catch {}
-    }
-  };
-  dropzone.addEventListener('click', onDropzoneClick);
-  dropzone.addEventListener('keydown', onDropzoneKey);
-  ctx.registerCleanup(() => {
-    dropzone.removeEventListener('click', onDropzoneClick);
-    dropzone.removeEventListener('keydown', onDropzoneKey);
-  });
-
-  if (dragAndDrop) {
-    const onDragOver = (e) => {
-      e.preventDefault();
-      dropzone.classList.add('tf-file-input__dropzone--over');
-    };
-    const onDragLeave = () => {
-      dropzone.classList.remove('tf-file-input__dropzone--over');
-    };
-    const onDrop = (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('tf-file-input__dropzone--over');
-      if (e.dataTransfer && e.dataTransfer.files) {
-        validateAndEmit(e.dataTransfer.files);
-      }
-    };
-    dropzone.addEventListener('dragover', onDragOver);
-    dropzone.addEventListener('dragleave', onDragLeave);
-    dropzone.addEventListener('drop', onDrop);
-    ctx.registerCleanup(() => {
-      dropzone.removeEventListener('dragover', onDragOver);
-      dropzone.removeEventListener('dragleave', onDragLeave);
-      dropzone.removeEventListener('drop', onDrop);
-    });
-  }
+  fileEl.addEventListener('change', onChange);
+  ctx.registerCleanup(() => fileEl.removeEventListener('change', onChange));
 
   return wrapper;
 }
 
-/// Format human-readable size (1024-based).
+/// Human-readable size (1024-based).
 function formatBytes(bytes) {
   const n = typeof bytes === 'bigint' ? Number(bytes) : Number(bytes);
   if (!Number.isFinite(n) || n < 0) return '';
@@ -421,14 +355,6 @@ function renderColorPicker(component, ctx) {
   wrapper.classList.add(`tf-color-picker--variant-${variant}`);
   if (showAlpha) wrapper.classList.add('tf-color-picker--alpha');
 
-  let labelEl = null;
-  if (labelBind != null) {
-    labelEl = document.createElement('label');
-    labelEl.classList.add('tf-color-picker__label');
-    applyTextBind(labelEl, labelBind, ctx);
-    wrapper.appendChild(labelEl);
-  }
-
   if (labelBind == null) {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError('ColorPicker without label requires Component.a11y.label');
@@ -439,19 +365,19 @@ function renderColorPicker(component, ctx) {
     }
   }
 
-  // Czytanie aktualnej wartości i emit'owanie change.
+  // Current value read + change emit.
   const readCurrent = () => {
     let v;
     try { v = ctx.store.read(bindPath); } catch { v = undefined; }
     return typeof v === 'string' ? v : '';
   };
-  // Spec ColorPicker schema (schema/data.rs:1153) deklaruje handlers=[] —
-  // ColorPicker mutuje stan WYŁĄCZNIE przez bind_path write-back, bez
-  // public handler'ów dispatchowanych do addona. Używamy dedykowanego
-  // wewnętrznego DOM event'u `tf-bind-write` (NIEobecnego w
-  // `EVENT_KIND_WIRE`), więc addon NIE może attach'ować handler'a o tej
-  // nazwie — `ComponentRenderer.applyEventHandlers` odrzuci to przez
-  // walidator wire kind'a. Chunk 3.6 zlistenuje na ten sygnał lokalnie.
+  // The ColorPicker spec schema (schema/data.rs:1153) declares handlers=[] —
+  // ColorPicker mutates state ONLY through bind_path write-back, with no
+  // public handlers dispatched to the addon. A dedicated internal DOM event
+  // `tf-bind-write` (absent from `EVENT_KIND_WIRE`) is used, so the addon
+  // cannot attach a handler under that name —
+  // `ComponentRenderer.applyEventHandlers` rejects it via the wire-kind
+  // validator. Chunk 3.6 listens for this signal locally.
   const emitChange = (val, isToken) => {
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('tf-bind-write', {
@@ -462,48 +388,67 @@ function renderColorPicker(component, ctx) {
   };
 
   if (variant === 'wheel') {
-    // Native color input. Bez alpha — HTML5 nie wspiera.
-    const input = document.createElement('input');
-    input.setAttribute('type', 'color');
-    input.classList.add('tf-color-picker__wheel');
-    const inputId = `tf-color-picker-${component.id}`;
-    input.setAttribute('id', inputId);
-    if (labelEl) labelEl.setAttribute('for', inputId);
-    // Sync value ze store.
+    // <tf-color-input> web component (swatch trigger + native color input).
+    // No alpha — HTML5 color input does not support it.
+    const colorEl = document.createElement('tf-color-input');
+    colorEl.classList.add('tf-color-picker__wheel');
+    if (labelBind != null) {
+      const applyLabel = () => {
+        const v = resolveBindRef(labelBind, ctx.store);
+        colorEl.setAttribute('label', v == null ? '' : String(v));
+      };
+      applyLabel();
+      ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
+    } else {
+      const applyAria = () => {
+        const v = resolveBindRef(component.a11y.label, ctx.store);
+        if (typeof v === 'string' && v.trim().length > 0) {
+          colorEl.setAttribute('aria-label', v);
+        } else {
+          colorEl.removeAttribute('aria-label');
+        }
+      };
+      applyAria();
+      ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAria));
+    }
+    // Store → component value sync. The native picker takes only #RRGGBB, so
+    // #RGB is expanded and alpha is stripped; invalid values fall back to
+    // #000000 (same as the previous native-input behavior).
     const sync = () => {
       const v = readCurrent();
-      if (!HEX_COLOR_RE.test(v)) {
-        // Native picker akceptuje tylko #RRGGBB — domyślnie ustaw #000000.
-        if (document.activeElement !== input) input.value = '#000000';
-        return;
+      let normalized = '#000000';
+      if (HEX_COLOR_RE.test(v)) {
+        normalized = v.length === 4
+          ? `#${v[1]}${v[1]}${v[2]}${v[2]}${v[3]}${v[3]}`
+          : v.slice(0, 7);
       }
-      // Trim do 6 hex (input type=color nie obsługuje #RGB ani alpha).
-      const normalized = v.length === 4
-        ? `#${v[1]}${v[1]}${v[2]}${v[2]}${v[3]}${v[3]}`
-        : v.slice(0, 7);
-      if (document.activeElement !== input) input.value = normalized;
+      // Property write — applies to the inner input/swatch directly.
+      colorEl.value = normalized;
     };
     sync();
     ctx.registerCleanup(ctx.store.subscribe(bindPath, sync));
-    if (labelBind == null) {
-      const aria = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof aria === 'string') input.setAttribute('aria-label', aria);
-    }
-    // stopPropagation chroni przed bubbling'iem natywnego `change`
-    // do wrappera, gdzie ComponentRenderer.applyEventHandlers mógłby
-    // dispatch'ować to do addon handlera — schema ColorPicker handlers=[]
-    // tego nie pozwala.
+    // tf-color-input emits a bubbling 'change' {value}. Block it (the schema
+    // allows no public handlers) and route through the internal bind-write.
     const onChange = (e) => {
-      e.stopPropagation();
-      emitChange(input.value, false);
+      e.stopImmediatePropagation();
+      emitChange(e.detail && typeof e.detail.value === 'string' ? e.detail.value : colorEl.value, false);
     };
-    input.addEventListener('change', onChange);
-    ctx.registerCleanup(() => input.removeEventListener('change', onChange));
-    wrapper.appendChild(input);
+    colorEl.addEventListener('change', onChange);
+    ctx.registerCleanup(() => colorEl.removeEventListener('change', onChange));
+    wrapper.appendChild(colorEl);
     return wrapper;
   }
 
-  // swatch / compact / tokens_only — siatka swatches.
+  // swatch / compact / tokens_only — swatch grid (no tf-* component covers a
+  // semantic-token swatch grid; buttons are the correct primitive here).
+  let labelEl = null;
+  if (labelBind != null) {
+    labelEl = document.createElement('label');
+    labelEl.classList.add('tf-color-picker__label');
+    applyTextBind(labelEl, labelBind, ctx);
+    wrapper.appendChild(labelEl);
+  }
+
   const grid = document.createElement('div');
   grid.classList.add('tf-color-picker__grid');
   grid.setAttribute('role', 'radiogroup');
@@ -513,9 +458,6 @@ function renderColorPicker(component, ctx) {
   }
 
   const swatchSources = (() => {
-    if (variant === 'tokens_only') {
-      return allowedTokens.map((t) => ({ token: t, value: t, isToken: true }));
-    }
     if (allowedTokens != null) {
       return allowedTokens.map((t) => ({ token: t, value: t, isToken: true }));
     }
@@ -531,8 +473,8 @@ function renderColorPicker(component, ctx) {
     btn.setAttribute('data-value', sw.value);
     if (sw.isToken) {
       btn.setAttribute('data-token', sw.token);
-      // CSS musi mapować data-token → background-color (semantic tokens
-      // resolve'owane przez tf-theme.css).
+      // CSS maps data-token → background-color (semantic tokens resolved by
+      // tf-theme.css).
       btn.classList.add(`tf-color-picker__swatch--token-${sw.token}`);
     } else {
       btn.style.backgroundColor = sw.value;
@@ -566,55 +508,57 @@ function renderColorPicker(component, ctx) {
 
   wrapper.appendChild(grid);
 
-  // Compact dodaje też hex-text-input dla fine-tuningu.
+  // Compact also gets a hex text field for fine-tuning — <tf-input>.
   if (variant === 'compact') {
-    const hexInput = document.createElement('input');
-    hexInput.setAttribute('type', 'text');
-    hexInput.setAttribute('placeholder', '#rrggbb');
-    hexInput.setAttribute('maxlength', showAlpha ? '9' : '7');
-    hexInput.classList.add('tf-color-picker__hex');
+    const hexEl = document.createElement('tf-input');
+    hexEl.classList.add('tf-color-picker__hex');
+    hexEl.setAttribute('placeholder', '#rrggbb');
+    hexEl.setAttribute('maxlength', showAlpha ? '9' : '7');
     if (labelBind == null) {
       const aria = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof aria === 'string') hexInput.setAttribute('aria-label', `${aria} (hex)`);
+      if (typeof aria === 'string') hexEl.setAttribute('aria-label', `${aria} (hex)`);
     }
-    const syncHex = () => {
+    const applyHex = (force) => {
+      // Never clobber the field while the user is typing in it — unless this
+      // is an explicit revert after an invalid commit.
+      if (!force && hexEl.contains(document.activeElement)) return;
       const cur = readCurrent();
-      if (HEX_COLOR_RE.test(cur)) {
-        if (document.activeElement !== hexInput) hexInput.value = cur;
-      } else if (document.activeElement !== hexInput) {
-        hexInput.value = '';
-      }
+      hexEl.value = HEX_COLOR_RE.test(cur) ? cur : '';
     };
-    syncHex();
-    ctx.registerCleanup(ctx.store.subscribe(bindPath, syncHex));
+    applyHex(false);
+    ctx.registerCleanup(ctx.store.subscribe(bindPath, () => applyHex(false)));
+    // tf-input emits a bubbling CustomEvent 'change' {value}; the native
+    // 'change' of its inner input bubbles through as well. Block both (the
+    // schema allows no public handlers) but validate only on the CustomEvent
+    // so a single edit produces a single bind-write.
     const onChange = (e) => {
-      // stopPropagation — patrz wheel onChange.
-      e.stopPropagation();
-      const v = hexInput.value.trim();
+      e.stopImmediatePropagation();
+      if (!e.detail || typeof e.detail.value !== 'string') return;
+      const v = e.detail.value.trim();
       if (v === '') {
         emitChange('', false);
         return;
       }
       if (!HEX_COLOR_RE.test(v)) {
-        syncHex();
+        applyHex(true);
         return;
       }
       if (!showAlpha && v.length === 9) {
-        syncHex();
+        applyHex(true);
         return;
       }
       emitChange(v, false);
     };
-    hexInput.addEventListener('change', onChange);
-    ctx.registerCleanup(() => hexInput.removeEventListener('change', onChange));
-    wrapper.appendChild(hexInput);
+    hexEl.addEventListener('change', onChange);
+    ctx.registerCleanup(() => hexEl.removeEventListener('change', onChange));
+    wrapper.appendChild(hexEl);
   }
 
   return wrapper;
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormFileColorRenderers() {

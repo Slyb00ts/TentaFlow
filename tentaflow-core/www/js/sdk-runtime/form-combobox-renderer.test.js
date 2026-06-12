@@ -1,9 +1,11 @@
 // =============================================================================
-// Plik: sdk-runtime/form-combobox-renderer.test.js
-// Opis: Testy Combobox (0x0305) + Autocomplete (0x0306) — chunk 3.3c-3c.
+// File: sdk-runtime/form-combobox-renderer.test.js
+// Description: Tests for Combobox (0x0305) + Autocomplete (0x0306) rendered
+// through the tf-combobox web component.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-combobox.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -50,6 +52,39 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
+
+/// Deterministic timer stub — debounce tests flush manually instead of
+/// waiting on real timers.
+function withFakeTimers(fn) {
+  const timers = [];
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  // Ids start at 1 — debounce code treats the handle as truthy.
+  globalThis.setTimeout = (cb, ms) => {
+    timers.push({ cb, ms, cancelled: false });
+    return timers.length;
+  };
+  globalThis.clearTimeout = (id) => {
+    if (typeof id === 'number' && timers[id - 1]) timers[id - 1].cancelled = true;
+    else realClearTimeout(id);
+  };
+  const flush = () => {
+    for (const t of timers.splice(0)) {
+      if (!t.cancelled) t.cb();
+    }
+  };
+  try {
+    fn(flush);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+}
+
 function tstrOpt(v, lbl, opts = {}) {
   const f = [
     [0, { kind: 'tstr', value: v }],
@@ -92,148 +127,142 @@ function keydown(el, key, mods = {}) {
   el.dispatchEvent(ev);
   return ev;
 }
+function typeText(input, text) {
+  input.value = text;
+  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: true }));
+}
 
 // ============================================================================
 // Combobox (0x0305)
 // ============================================================================
 
-test('Combobox renderuje <input role=combobox> z aria-autocomplete=list', () => {
+test('Combobox renders tf-combobox with inner input role=combobox + aria-autocomplete=list', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [tstrOpt('a', 'Apple')],
-    3: { kind: 'literal', value: 'F' },
-  })));
-  const input = el.querySelector('input');
-  assertEq(input.tagName, 'INPUT');
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'A')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.tagName, 'TF-COMBOBOX');
+  const input = el.querySelector('input.tf-combobox-input');
   assertEq(input.getAttribute('role'), 'combobox');
   assertEq(input.getAttribute('aria-autocomplete'), 'list');
   assertEq(input.getAttribute('aria-expanded'), 'false');
 });
 
+test('Combobox label bind lands as label attribute + visible label element', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'A')],
+    3: { kind: 'literal', value: 'Etykieta' },
+  }))));
+  assertEq(el.getAttribute('label'), 'Etykieta');
+  assertEq(el.querySelector('.tf-combobox-label').textContent, 'Etykieta');
+});
+
 test('Combobox searchable=false throws', () => {
   setup();
   const engine = makeEngine();
-  // Manualnie wymuszamy searchable=false (override).
-  const fields = cbFields({
-    options: [tstrOpt('a', 'A')],
-    3: { kind: 'literal', value: 'L' },
-  });
-  // Znajdź klucz 4 i zamień na false.
-  for (const e of fields) if (e[0] === 4) e[1] = false;
-  assertThrows(() => engine.render(comp(COMBOBOX_TAG, fields)));
+  const f = cbFields({ options: [], 3: { kind: 'literal', value: 'L' } })
+    .map(([k, v]) => (k === 4 ? [4, false] : [k, v]));
+  assertThrows(() => engine.render(comp(COMBOBOX_TAG, f)));
 });
 
-test('Combobox pokazuje label aktualnie wybranej opcji w input.value', () => {
+test('Combobox shows the selected option label in input.value', () => {
   setup();
   const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('q'), value: 'b' }],
-    state_revision: 0, truncated: false,
-  });
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: 'b' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   assertEq(el.querySelector('input').value, 'Banana');
 });
 
-test('Combobox typing filtruje opcje + otwiera popover', () => {
+test('Combobox typing filters options + opens popover', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana'), tstrOpt('c', 'Cherry')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   const input = el.querySelector('input');
-  input.value = 'an';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  const popover = el.querySelector('.tf-combobox__popover');
-  assertEq(popover.hidden, false);
-  const opts = el.querySelectorAll('.tf-combobox__option');
+  typeText(input, 'an');
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, false);
+  assertEq(input.getAttribute('aria-expanded'), 'true');
+  const opts = el.querySelectorAll('.tf-combobox-option');
   assertEq(opts[0].hidden, true);   // Apple
   assertEq(opts[1].hidden, false);  // Banana
   assertEq(opts[2].hidden, true);   // Cherry
 });
 
-test('Combobox min_search_chars gate — popover NIE otwiera się przed limit', () => {
+test('Combobox min_search_chars gate — popover does NOT open below the limit', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple')],
-    minChars: 3,
+    minChars: 2,
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   const input = el.querySelector('input');
-  input.value = 'ap';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, true);
-  input.value = 'app';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, false);
+  typeText(input, 'a');
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, true);
+  typeText(input, 'ap');
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, false);
 });
 
-test('Combobox Enter na aktywnej opcji commituje + zamyka', () => {
+test('Combobox Enter on the active option commits SDK SelectValue + closes', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
   const input = el.querySelector('input');
-  keydown(input, 'ArrowDown');  // open + active=0
-  keydown(input, 'ArrowDown');  // active=1
+  typeText(input, 'a');  // opens, active = first visible
+  keydown(input, 'ArrowDown');  // active = Banana
   keydown(input, 'Enter');
   assertEq(got, { value: 'b', kind: 'tstr' });
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, true);
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, true);
 });
 
-test('Combobox free_input=true Enter z tekstem nie-z-opcji emituje change tstr', () => {
+test('Combobox free_input=true Enter with non-option text emits change tstr', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple')],
     freeInput: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
   const input = el.querySelector('input');
-  // Najpierw zamknij popover, żeby Enter nie wybrał aktywnej opcji.
-  input.value = 'xyz';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  keydown(input, 'Escape');  // close
+  typeText(input, 'xyz');  // no option matches → no active option
   keydown(input, 'Enter');
   assertEq(got, { value: 'xyz', kind: 'tstr' });
 });
 
-test('Combobox free_input=false Enter z raw text BEZ commit', () => {
+test('Combobox free_input=false Enter with raw text does NOT commit', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple')],
     freeInput: false,
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
   const input = el.querySelector('input');
-  input.value = 'xyz';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  keydown(input, 'Escape');
+  typeText(input, 'xyz');
   keydown(input, 'Enter');
   assertEq(got, null);
 });
 
-test('Combobox remote_search=true wymaga remote_action_id', () => {
+test('Combobox remote_search=true requires remote_action_id', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(COMBOBOX_TAG, cbFields({
@@ -243,64 +272,48 @@ test('Combobox remote_search=true wymaga remote_action_id', () => {
   }))));
 });
 
-test('Combobox remote_search emituje "search" event po debounce', (done) => {
+test('Combobox remote_search emits "search" after debounce', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [],
-    remoteSearch: true,
-    minChars: 2,
-    3: { kind: 'literal', value: 'L' },
-    13: 'remote_query',
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('search', (e) => { got = e.detail; });
-  const input = el.querySelector('input');
-  input.value = 'foo';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  // 300ms debounce + buffer
-  setTimeout(() => {
-    try {
-      assertEq(got, { query: 'foo', action_id: 'remote_query' });
-    } catch (e) {
-      results.push({ name: 'Combobox remote_search emituje search [async]', ok: false, err: e });
-      return;
-    }
-    results.push({ name: 'Combobox remote_search emituje search [async]', ok: true });
-  }, 450);
+  withFakeTimers((flush) => {
+    const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+      options: [],
+      remoteSearch: true,
+      minChars: 2,
+      3: { kind: 'literal', value: 'L' },
+      13: 'remote_query',
+    }))));
+    let got = null;
+    el.addEventListener('search', (e) => { got = e.detail; });
+    typeText(el.querySelector('input'), 'foo');
+    assertEq(got, null);  // not before the debounce fires
+    flush();
+    assertEq(got, { query: 'foo', action_id: 'remote_query' });
+  });
 });
 
-test('Combobox typing → szybki backspace poniżej minChars anuluje remote search', () => {
+test('Combobox typing → quick backspace below minChars cancels remote search', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [],
-    remoteSearch: true,
-    minChars: 3,
-    3: { kind: 'literal', value: 'L' },
-    13: 'do_q',
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('search', (e) => { got = e.detail; });
-  const input = el.querySelector('input');
-  input.value = 'foo';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  input.value = 'f';  // skasuj do 1 znaku przed debounce
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  setTimeout(() => {
-    try {
-      assertEq(got, null);  // search NIE powinien być wysłany
-    } catch (e) {
-      results.push({ name: 'Combobox backspace cancels remote search [async]', ok: false, err: e });
-      return;
-    }
-    results.push({ name: 'Combobox backspace cancels remote search [async]', ok: true });
-  }, 450);
+  withFakeTimers((flush) => {
+    const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+      options: [],
+      remoteSearch: true,
+      minChars: 3,
+      3: { kind: 'literal', value: 'L' },
+      13: 'do_q',
+    }))));
+    let got = null;
+    el.addEventListener('search', (e) => { got = e.detail; });
+    const input = el.querySelector('input');
+    typeText(input, 'foo');
+    typeText(input, 'f');  // drop below minChars before the debounce fires
+    flush();
+    assertEq(got, null);
+  });
 });
 
-test('Combobox store push z matched opcją NIE nadpisuje input.value gdy popover otwarty', () => {
+test('Combobox store push does NOT clobber input.value while typing (focused)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -308,17 +321,13 @@ test('Combobox store push z matched opcją NIE nadpisuje input.value gdy popover
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   const input = el.querySelector('input');
-  input.value = 'typ';  // user typing
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  // Popover teraz otwarty.
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, false);
-  // Symulujemy late store push (matched opcja) — input.value powinien zostać 'typ'.
+  input.focus();
+  typeText(input, 'typ');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('q'), op: { kind: 'set', value: 'b' } }],
@@ -326,44 +335,56 @@ test('Combobox store push z matched opcją NIE nadpisuje input.value gdy popover
   assertEq(input.value, 'typ');
 });
 
-test('Combobox listbox mousedown na opcji commituje', () => {
+test('Combobox option mousedown commits the SelectValue', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const input = el.querySelector('input');
-  keydown(input, 'ArrowDown');  // open
-  const opts = el.querySelectorAll('.tf-combobox__option');
-  opts[1].dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
+  typeText(el.querySelector('input'), 'b');
+  const second = el.querySelectorAll('.tf-combobox-option')[1];
+  second.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
   assertEq(got, { value: 'b', kind: 'tstr' });
 });
 
-test('Combobox clear button emituje change=null + czyści input', () => {
+test('Combobox disabled option is not committable', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('x', 'Xapple', { disabled: true }), tstrOpt('b', 'Xbanana')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  const input = el.querySelector('input');
+  typeText(input, 'x');  // both match, first is disabled → active = second
+  keydown(input, 'Enter');
+  assertEq(got, { value: 'b', kind: 'tstr' });
+});
+
+test('Combobox clear button emits change=null + clears the input', () => {
   setup();
   const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('q'), value: 'a' }],
-    state_revision: 0, truncated: false,
-  });
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: 'a' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
     options: [tstrOpt('a', 'Apple')],
     clearable: true,
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-combobox__clear').click();
+  const clear = el.querySelector('.tf-combobox-clear');
+  assertEq(clear.hidden, false);
+  clear.click();
   assertEq(got, { value: null, kind: null });
   assertEq(el.querySelector('input').value, '');
 });
 
-test('Combobox disabled BindRef blokuje input + clear', () => {
+test('Combobox disabled BindRef disables input + clear', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -371,18 +392,65 @@ test('Combobox disabled BindRef blokuje input + clear', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [tstrOpt('a', 'A')],
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'Apple')],
     clearable: true,
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const input = el.querySelector('input');
-  assertEq(input.hasAttribute('disabled'), true);
-  assertEq(el.querySelector('.tf-combobox__clear').disabled, true);
+  }))));
+  assertEq(el.querySelector('input').disabled, true);
+  assertEq(el.querySelector('.tf-combobox-clear').disabled, true);
+  // Flip OFF — input enabled again.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
+  });
+  assertEq(el.querySelector('input').disabled, false);
 });
 
-test('Combobox bez label wymaga a11y.label', () => {
+test('Combobox option icon renders SVG via shared icon renderer', () => {
+  setup();
+  const engine = makeEngine();
+  const withIcon = [
+    [0, { kind: 'tstr', value: 'a' }],
+    [1, { kind: 'literal', value: 'Apple' }],
+    [2, { kind: 'named', name: 'check' }],
+    [3, false],
+  ];
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [withIcon],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const svg = el.querySelector('.tf-combobox-option-icon svg.tf-icon');
+  assert(svg != null, 'expected SVG rendered by icon-renderer for IconRef::Named');
+});
+
+test('Combobox groups render group headers with resolved labels', () => {
+  setup();
+  const engine = makeEngine();
+  const grp1 = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'Apple', { groupId: 'fr' })],
+    9: [grp1],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const header = el.querySelector('.tf-combobox-group-header');
+  assertEq(header.textContent, 'Owoce');
+  assert(el.querySelector('.tf-combobox-group .tf-combobox-option') != null);
+});
+
+test('Combobox option with unknown group_id throws', () => {
+  setup();
+  const engine = makeEngine();
+  const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
+  assertThrows(() => engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'A', { groupId: 'unknown_id' })],
+    9: [grp],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+});
+
+test('Combobox without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(COMBOBOX_TAG, cbFields({
@@ -390,42 +458,73 @@ test('Combobox bez label wymaga a11y.label', () => {
   }))));
 });
 
+test('Combobox a11y.label lands as aria-label on the host', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('lbl'), value: 'Szukaj' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'A')],
+  }), { a11y: { label: { kind: 'bound', path: PATH('lbl') } } }));
+  assertEq(el.getAttribute('aria-label'), 'Szukaj');
+});
+
 test('Combobox unknown field key throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(COMBOBOX_TAG, [
-    [0, PATH('q')], [1, []], [4, true], [5, false], [6, false], [8, 'md'],
-    [10, false], [11, 0], [12, false],
-    [3, { kind: 'literal', value: 'L' }],
+    ...cbFields({ options: [], 3: { kind: 'literal', value: 'L' } }),
     [99, 'oops'],
   ])));
 });
 
-test('Combobox Escape zamyka popover', () => {
+test('Combobox Escape closes the popover', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(COMBOBOX_TAG, cbFields({
-    options: [tstrOpt('a', 'A')],
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'Apple')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   const input = el.querySelector('input');
-  keydown(input, 'ArrowDown');
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, false);
+  typeText(input, 'a');
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, false);
   keydown(input, 'Escape');
-  assertEq(el.querySelector('.tf-combobox__popover').hidden, true);
+  assertEq(el.querySelector('.tf-combobox-popover').hidden, true);
+  assertEq(input.getAttribute('aria-expanded'), 'false');
+});
+
+test('Combobox raw component change never reaches listeners (only SDK shape)', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(COMBOBOX_TAG, cbFields({
+    options: [tstrOpt('a', 'Apple')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const shapes = [];
+  el.addEventListener('change', (e) => { shapes.push(e.detail); });
+  typeText(el.querySelector('input'), 'a');
+  el.querySelector('.tf-combobox-option').dispatchEvent(
+    new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true })
+  );
+  // Exactly ONE event in the SDK shape — never the raw {value: idx, label}.
+  assertEq(shapes, [{ value: 'a', kind: 'tstr' }]);
 });
 
 // ============================================================================
 // Autocomplete (0x0306)
 // ============================================================================
 
-test('Autocomplete renderuje <input role=combobox> z aria-autocomplete=list', () => {
+test('Autocomplete renders tf-combobox with inner input role=combobox', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(AUTOCOMPLETE_TAG, acFields({
-    6: { kind: 'literal', value: 'L' },
-  })));
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'Szukaj' },
+  }))));
+  assertEq(el.tagName, 'TF-COMBOBOX');
+  assert(el.classList.contains('tf-autocomplete'));
   const input = el.querySelector('input');
   assertEq(input.getAttribute('role'), 'combobox');
   assertEq(input.getAttribute('aria-autocomplete'), 'list');
@@ -436,98 +535,144 @@ test('Autocomplete debounce_ms=0 throws', () => {
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(AUTOCOMPLETE_TAG, acFields({
     debounceMs: 0,
-    6: { kind: 'literal', value: 'L' },
+    6: { kind: 'literal', value: 'S' },
   }))));
 });
 
-test('Autocomplete typing emituje search po debounce', () => {
+test('Autocomplete typing emits SDK input event immediately', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(AUTOCOMPLETE_TAG, acFields({
-    actionId: 'find_user', minChars: 2, debounceMs: 50,
-    6: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
   let got = null;
-  el.addEventListener('search', (e) => { got = e.detail; });
-  const input = el.querySelector('input');
-  input.value = 'ja';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  setTimeout(() => {
-    try {
-      assertEq(got, { query: 'ja', action_id: 'find_user', result_template_id: null });
-    } catch (e) {
-      results.push({ name: 'Autocomplete typing emituje search [async-2]', ok: false, err: e });
-      return;
-    }
-    results.push({ name: 'Autocomplete typing emituje search [async-2]', ok: true });
-  }, 100);
+  el.addEventListener('input', (e) => { got = e.detail; });
+  typeText(el.querySelector('input'), 'qu');
+  assertEq(got, { value: 'qu', kind: 'tstr' });
 });
 
-test('Autocomplete poniżej minChars NIE emituje search', () => {
+test('Autocomplete typing emits search after debounce', () => {
+  setup();
+  const engine = makeEngine();
+  withFakeTimers((flush) => {
+    const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+      actionId: 'find_user', minChars: 2, debounceMs: 50,
+      2: 'user_results',
+      6: { kind: 'literal', value: 'S' },
+    }))));
+    let got = null;
+    el.addEventListener('search', (e) => { got = e.detail; });
+    typeText(el.querySelector('input'), 'jan');
+    assertEq(got, null);
+    flush();
+    assertEq(got, { query: 'jan', action_id: 'find_user', result_template_id: 'user_results' });
+  });
+});
+
+test('Autocomplete below minChars does NOT emit search', () => {
+  setup();
+  const engine = makeEngine();
+  withFakeTimers((flush) => {
+    const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+      minChars: 3,
+      6: { kind: 'literal', value: 'S' },
+    }))));
+    let got = null;
+    el.addEventListener('search', (e) => { got = e.detail; });
+    typeText(el.querySelector('input'), 'ab');
+    flush();
+    assertEq(got, null);
+  });
+});
+
+test('Autocomplete backspace below minChars cancels a pending search', () => {
+  setup();
+  const engine = makeEngine();
+  withFakeTimers((flush) => {
+    const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+      minChars: 3,
+      6: { kind: 'literal', value: 'S' },
+    }))));
+    let got = null;
+    el.addEventListener('search', (e) => { got = e.detail; });
+    const input = el.querySelector('input');
+    typeText(input, 'abc');
+    typeText(input, 'a');
+    flush();
+    assertEq(got, null);
+  });
+});
+
+test('Autocomplete result_template_id sets aria-controls + data-attr', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(AUTOCOMPLETE_TAG, acFields({
-    actionId: 'x', minChars: 3, debounceMs: 30,
-    6: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+    2: 'res_tpl',
+    6: { kind: 'literal', value: 'S' },
+  }), { id: 'c9' }));
+  assertEq(el.getAttribute('data-result-template-id'), 'res_tpl');
+  assertEq(el.getAttribute('aria-controls'), 'tf-autocomplete-c9-res_tpl');
+});
+
+test('Autocomplete store push syncs input value (one-way read)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: 'init' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
+  assertEq(el.querySelector('input').value, 'init');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('q'), op: { kind: 'set', value: 'next' } }],
+  });
+  assertEq(el.querySelector('input').value, 'next');
+});
+
+test('Autocomplete change re-emits SDK {value, kind:tstr}', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
   let got = null;
-  el.addEventListener('search', (e) => { got = e.detail; });
+  el.addEventListener('change', (e) => { got = e.detail; });
   const input = el.querySelector('input');
-  input.value = 'ab';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  setTimeout(() => {
-    try {
-      assertEq(got, null);
-    } catch (e) {
-      results.push({ name: 'Autocomplete poniżej minChars NIE emituje [async-3]', ok: false, err: e });
-      return;
-    }
-    results.push({ name: 'Autocomplete poniżej minChars NIE emituje [async-3]', ok: true });
-  }, 80);
+  input.value = 'final text';
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(got, { value: 'final text', kind: 'tstr' });
 });
 
-test('Autocomplete result_template_id ustawia aria-controls + data-attr', () => {
+test('Autocomplete focus/blur translated to SDK focus/blur events', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(AUTOCOMPLETE_TAG, acFields({
-    2: 'results-list',
-    6: { kind: 'literal', value: 'L' },
-  })));
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
+  let focused = false;
+  let blurred = false;
+  el.addEventListener('focus', () => { focused = true; });
+  el.addEventListener('blur', () => { blurred = true; });
   const input = el.querySelector('input');
-  assert(input.getAttribute('aria-controls').endsWith('-results-list'));
-  assertEq(input.getAttribute('data-result-template-id'), 'results-list');
+  input.dispatchEvent(new (globalThis.Event)('focusin', { bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('focusout', { bubbles: true }));
+  assertEq(focused, true);
+  assertEq(blurred, true);
 });
 
-test('Autocomplete bez label wymaga a11y.label', () => {
+test('Autocomplete without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
-  assertThrows(() => engine.render(comp(AUTOCOMPLETE_TAG, acFields({}))));
-});
-
-test('Autocomplete typing emituje input event z value', () => {
-  setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(AUTOCOMPLETE_TAG, acFields({
-    6: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const got = [];
-  el.addEventListener('input', (e) => got.push(e.detail));
-  const input = el.querySelector('input');
-  input.value = 'x';
-  input.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  assertEq(got, [{ value: 'x', kind: 'tstr' }]);
+  assertThrows(() => engine.render(comp(AUTOCOMPLETE_TAG, acFields())));
 });
 
 test('Autocomplete unknown field key throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(AUTOCOMPLETE_TAG, [
-    [0, PATH('q')], [1, 'act'], [3, 0], [4, 50],
-    [6, { kind: 'literal', value: 'L' }],
-    [99, 'oops'],
+    ...acFields({ 6: { kind: 'literal', value: 'S' } }),
+    [99, 'x'],
   ])));
 });
 
@@ -543,13 +688,9 @@ function reportResults() {
   lines.push(`${pass}/${pass + fail} tests passed${fail ? ` — ${fail} FAILED` : ''}`);
   return { pass, fail, text: lines.join('\n') };
 }
-// Async testy zostawiają wpisy do `results` po opóźnieniu; raport po
-// najdłuższym debounce'ie + buforze.
 if (typeof process !== 'undefined') {
-  setTimeout(() => {
-    const r = reportResults();
-    console.log(r.text);
-    if (r.fail > 0) process.exit(1);
-  }, 700);
+  const r = reportResults();
+  console.log(r.text);
+  if (r.fail > 0) process.exit(1);
 }
 export { reportResults };

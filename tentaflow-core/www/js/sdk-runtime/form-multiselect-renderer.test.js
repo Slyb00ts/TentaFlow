@@ -1,9 +1,11 @@
 // =============================================================================
-// Plik: sdk-runtime/form-multiselect-renderer.test.js
-// Opis: Testy MultiSelect (0x0304) — chunk 3.3c-3b.
+// File: sdk-runtime/form-multiselect-renderer.test.js
+// Description: Tests for MultiSelect (0x0304) rendered through the
+// tf-multiselect web component.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-multiselect.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -31,15 +33,9 @@ function assertThrows(fn, m) {
 const PATH = (...segs) => segs.map((s) =>
   typeof s === 'number' ? { kind: 'index', value: s } : { kind: 'key', value: s });
 
-function makeStore() {
-  return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n });
-}
+function makeStore() { return new StateStore({ addon_id: 'a', panel_id: 'p', panel_epoch: 1n }); }
 function makeEngine(store) {
-  return new ComponentRenderer({
-    store: store || makeStore(),
-    eventDispatcher: { emit() {} },
-    locale: 'en-US',
-  });
+  return new ComponentRenderer({ store: store || makeStore(), eventDispatcher: { emit() {} }, locale: 'en-US' });
 }
 function comp(tag, fields, extra = {}) {
   return {
@@ -56,7 +52,10 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
-
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 function tstrOpt(v, lbl, opts = {}) {
   const f = [
     [0, { kind: 'tstr', value: v }],
@@ -89,192 +88,199 @@ function keydown(el, key, mods = {}) {
   el.dispatchEvent(ev);
   return ev;
 }
+function mousedownOn(el) {
+  el.dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
+}
+function seededEngine(selected) {
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('sel'), value: selected }],
+    state_revision: 0, truncated: false,
+  });
+  return { store, engine: makeEngine(store) };
+}
 
 // ============================================================================
 // Render
 // ============================================================================
 
-test('MultiSelect trigger to <div role=combobox> (NIE <button>) by uniknąć button-in-button', () => {
+test('MultiSelect renders tf-multiselect with <div role=combobox> trigger (NOT <button>)', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')], clearable: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  const trigger = el.querySelector('.tf-multiselect__trigger');
+  }))));
+  assertEq(el.tagName, 'TF-MULTISELECT');
+  const trigger = el.querySelector('.tf-multiselect-trigger');
   assertEq(trigger.tagName, 'DIV');
   assertEq(trigger.getAttribute('role'), 'combobox');
   assertEq(trigger.getAttribute('tabindex'), '0');
+  assertEq(trigger.getAttribute('aria-haspopup'), 'listbox');
 });
 
-test('MultiSelect renderuje trigger combobox + placeholder gdy brak zaznaczeń', () => {
+test('MultiSelect shows placeholder when nothing is selected', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({ entries: [{ path: PATH('sel'), value: [] }], state_revision: 0, truncated: false });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
-    3: { kind: 'literal', value: 'Owoce' },
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple')],
     2: { kind: 'literal', value: 'Wybierz...' },
-  })));
-  const trigger = el.querySelector('.tf-multiselect__trigger');
-  assertEq(trigger.getAttribute('role'), 'combobox');
-  const ph = el.querySelector('.tf-multiselect__placeholder');
-  assertEq(ph.textContent, 'Wybierz...');
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.querySelector('.tf-multiselect-placeholder').textContent, 'Wybierz...');
 });
 
-test('MultiSelect listbox ma aria-multiselectable=true', () => {
+test('MultiSelect popover has role=listbox + aria-multiselectable=true', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  const lb = el.querySelector('[role="listbox"]');
-  assertEq(lb.getAttribute('aria-multiselectable'), 'true');
+  }))));
+  const popover = el.querySelector('.tf-multiselect-popover');
+  assertEq(popover.getAttribute('role'), 'listbox');
+  assertEq(popover.getAttribute('aria-multiselectable'), 'true');
 });
 
-test('MultiSelect renderuje chipy dla wszystkich zaznaczonych', () => {
+test('MultiSelect renders chips for all selected values (SelectValue shape)', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: [{ kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'c' }] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const { engine } = seededEngine([
+    { kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'c' },
+  ]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana'), tstrOpt('c', 'Cherry')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  const chips = el.querySelectorAll('.tf-multiselect__chip');
+  }))));
+  const chips = el.querySelectorAll('.tf-multiselect-chip');
   assertEq(chips.length, 2);
-  assertEq(chips[0].querySelector('.tf-multiselect__chip-label').textContent, 'Apple');
-  assertEq(chips[1].querySelector('.tf-multiselect__chip-label').textContent, 'Cherry');
+  assertEq(chips[0].textContent.includes('Apple'), true);
+  assertEq(chips[1].textContent.includes('Cherry'), true);
 });
 
-test('MultiSelect akceptuje raw primitive values w store (bez SelectValue wrap)', () => {
+test('MultiSelect accepts raw primitive values in the store (no SelectValue wrap)', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
+  const { engine } = seededEngine(['b']);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  assertEq(el.querySelectorAll('.tf-multiselect__chip').length, 2);
+  }))));
+  const chips = el.querySelectorAll('.tf-multiselect-chip');
+  assertEq(chips.length, 1);
+  assertEq(chips[0].textContent.includes('Banana'), true);
+});
+
+test('MultiSelect store push updates chips reactively', () => {
+  setup();
+  const { store, engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.querySelectorAll('.tf-multiselect-chip').length, 0);
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sel'), op: { kind: 'set', value: ['a', 'b'] } }],
+  });
+  assertEq(el.querySelectorAll('.tf-multiselect-chip').length, 2);
 });
 
 // ============================================================================
-// Open + toggle
+// Open / toggle / change semantics
 // ============================================================================
 
-test('MultiSelect trigger click otwiera popover', () => {
+test('MultiSelect trigger click opens the popover', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-multiselect__trigger');
-  const popover = el.querySelector('.tf-multiselect__popover');
+  }))));
+  const trigger = el.querySelector('.tf-multiselect-trigger');
+  const popover = el.querySelector('.tf-multiselect-popover');
+  assertEq(popover.hidden, true);
   trigger.click();
   assertEq(popover.hidden, false);
   assertEq(trigger.getAttribute('aria-expanded'), 'true');
 });
 
-test('MultiSelect option mousedown TOGGLE w/ change=array, popover zostaje otwarty', () => {
+test('MultiSelect option mousedown TOGGLES with change={value:[],kind:array}, popover stays open', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const trigger = el.querySelector('.tf-multiselect__trigger');
-  trigger.click();
-  const opts = el.querySelectorAll('.tf-multiselect__option');
-  opts[0].dispatchEvent(new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true }));
-  assertEq(got, { value: [{ kind: 'tstr', value: 'a' }], kind: 'array' });
-  // Popover MUSI zostać otwarty.
-  assertEq(el.querySelector('.tf-multiselect__popover').hidden, false);
-});
-
-test('MultiSelect click drugi raz na zaznaczonej opcji odznacza ją', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-multiselect__trigger').click();
-  // Odznacz 'a' — w detail powinno zostać tylko 'b'.
-  el.querySelectorAll('.tf-multiselect__option')[0].dispatchEvent(
-    new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true })
-  );
+  el.querySelector('.tf-multiselect-trigger').click();
+  mousedownOn(el.querySelectorAll('.tf-multiselect-option')[1]);
   assertEq(got, { value: [{ kind: 'tstr', value: 'b' }], kind: 'array' });
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, false);
 });
 
-test('MultiSelect aria-selected odzwierciedla zaznaczenie', () => {
+test('MultiSelect second click on a selected option deselects it', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  const opts = el.querySelectorAll('.tf-multiselect__option');
-  assertEq(opts[0].hasAttribute('aria-selected'), false);
+  }))));
+  const events = [];
+  el.addEventListener('change', (e) => { events.push(e.detail); });
+  el.querySelector('.tf-multiselect-trigger').click();
+  const optB = el.querySelectorAll('.tf-multiselect-option')[1];
+  mousedownOn(optB);
+  mousedownOn(optB);
+  assertEq(events, [
+    { value: [{ kind: 'tstr', value: 'b' }], kind: 'array' },
+    { value: [], kind: 'array' },
+  ]);
+});
+
+test('MultiSelect aria-selected reflects the store selection', () => {
+  setup();
+  const { engine } = seededEngine([{ kind: 'tstr', value: 'b' }]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const opts = el.querySelectorAll('.tf-multiselect-option');
+  assert(!opts[0].hasAttribute('aria-selected'));
   assertEq(opts[1].getAttribute('aria-selected'), 'true');
-  assertEq(opts[1].querySelector('.tf-multiselect__option-check').textContent, '✓');
+  assert(opts[1].classList.contains('tf-multiselect-option--selected'));
 });
 
-// ============================================================================
-// max_selections
-// ============================================================================
-
-test('MultiSelect max_selections blokuje add powyżej limitu', () => {
+test('MultiSelect disabled option is not toggleable', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('x', 'X', { disabled: true }), tstrOpt('b', 'B')],
     3: { kind: 'literal', value: 'L' },
-    10: 2,  // max_selections=2
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-multiselect__trigger').click();
-  // Próba dodania 'c' powinna być zignorowana.
-  el.querySelectorAll('.tf-multiselect__option')[2].dispatchEvent(
-    new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true })
-  );
+  el.querySelector('.tf-multiselect-trigger').click();
+  mousedownOn(el.querySelectorAll('.tf-multiselect-option')[0]);
   assertEq(got, null);
+  assertEq(el.querySelectorAll('.tf-multiselect-option')[0].getAttribute('aria-disabled'), 'true');
 });
 
-test('MultiSelect max_selections=0 throws przy renderze', () => {
+test('MultiSelect max_selections blocks adding above the limit', () => {
+  setup();
+  const { engine } = seededEngine([{ kind: 'tstr', value: 'a' }]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
+    3: { kind: 'literal', value: 'L' },
+    10: 1,
+  }))));
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  el.querySelector('.tf-multiselect-trigger').click();
+  mousedownOn(el.querySelectorAll('.tf-multiselect-option')[1]);
+  assertEq(got, null);  // adding beyond max is rejected, no event
+});
+
+test('MultiSelect max_selections=0 throws at render', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(MULTISELECT_TAG, msFields({
@@ -284,230 +290,235 @@ test('MultiSelect max_selections=0 throws przy renderze', () => {
   }))));
 });
 
-// ============================================================================
-// Chip remove
-// ============================================================================
-
-test('MultiSelect chip × usuwa konkretną wartość', () => {
+test('MultiSelect chip × removes the specific value', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b', 'c'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
+  const { engine } = seededEngine([
+    { kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'b' },
+  ]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  // Drugi chip (B) — × na nim.
-  const removes = el.querySelectorAll('.tf-multiselect__chip-remove');
-  removes[1].click();
-  assertEq(got, {
-    value: [{ kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'c' }],
-    kind: 'array',
-  });
+  el.querySelectorAll('.tf-multiselect-chip-remove')[0].click();
+  assertEq(got, { value: [{ kind: 'tstr', value: 'b' }], kind: 'array' });
 });
 
-test('MultiSelect chip × NIE otwiera popover', () => {
+test('MultiSelect chip × does NOT open the popover', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A')],
+  const { engine } = seededEngine([{ kind: 'tstr', value: 'a' }]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  el.querySelector('.tf-multiselect__chip-remove').click();
-  assertEq(el.querySelector('.tf-multiselect__popover').hidden, true);
+  }))));
+  el.querySelector('.tf-multiselect-chip-remove').click();
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, true);
 });
 
 // ============================================================================
-// Clearable
+// Clear / select-all
 // ============================================================================
 
-test('MultiSelect clearable=true + zaznaczone renderuje clear button', () => {
+test('MultiSelect clearable=true + selection renders the clear button', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A')],
-    clearable: true,
+  const { engine } = seededEngine([{ kind: 'tstr', value: 'a' }]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple')], clearable: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  assertEq(el.querySelector('.tf-multiselect__clear').hidden, false);
+  }))));
+  assertEq(el.querySelector('.tf-multiselect-clear').hidden, false);
 });
 
-test('MultiSelect clear emituje change=[]', () => {
+test('MultiSelect clearable=false hides the clear button', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    clearable: true,
+  const { engine } = seededEngine([{ kind: 'tstr', value: 'a' }]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple')], clearable: false,
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
+  assertEq(el.querySelector('.tf-multiselect-clear').hidden, true);
+});
+
+test('MultiSelect clear emits change=[]', () => {
+  setup();
+  const { engine } = seededEngine([
+    { kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'b' },
+  ]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')], clearable: true,
+    3: { kind: 'literal', value: 'L' },
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-multiselect__clear').click();
+  el.querySelector('.tf-multiselect-clear').click();
   assertEq(got, { value: [], kind: 'array' });
 });
 
-// ============================================================================
-// Select all
-// ============================================================================
-
-test('MultiSelect show_select_all=true renderuje przycisk "Select all"', () => {
+test('MultiSelect show_select_all=true renders the "Select all" button', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    showSelectAll: true,
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A')], showSelectAll: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  const btn = el.querySelector('.tf-multiselect__select-all');
+  }))));
+  const btn = el.querySelector('.tf-multiselect-select-all');
+  assertEq(btn.hidden, false);
   assertEq(btn.textContent, 'Select all');
-  assertEq(btn.dataset.mode, 'all');
 });
 
-test('MultiSelect "Select all" emituje change ze wszystkimi enabled options', () => {
+test('MultiSelect "Select all" emits change with all enabled options', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B', { disabled: true }), tstrOpt('c', 'C')],
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('x', 'X', { disabled: true }), tstrOpt('b', 'B')],
     showSelectAll: true,
     3: { kind: 'literal', value: 'L' },
-  })));
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-multiselect__select-all').click();
+  el.querySelector('.tf-multiselect-select-all').click();
   assertEq(got, {
-    value: [{ kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'c' }],
+    value: [{ kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'b' }],
     kind: 'array',
   });
 });
 
-test('MultiSelect "Select all" → "Clear all" po pełnym zaznaczeniu', () => {
+test('MultiSelect "Select all" → "Clear all" once everything is selected', () => {
   setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a', 'b'] }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
+  const { engine } = seededEngine([
+    { kind: 'tstr', value: 'a' }, { kind: 'tstr', value: 'b' },
+  ]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')], showSelectAll: true,
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const btn = el.querySelector('.tf-multiselect-select-all');
+  assertEq(btn.textContent, 'Clear all');
+  let got = null;
+  el.addEventListener('change', (e) => { got = e.detail; });
+  btn.click();
+  assertEq(got, { value: [], kind: 'array' });
+});
+
+test('MultiSelect select-all with max_selections < enabled count never selects all', () => {
+  setup();
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B'), tstrOpt('c', 'C')],
     showSelectAll: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  const btn = el.querySelector('.tf-multiselect__select-all');
-  assertEq(btn.textContent, 'Clear all');
-  assertEq(btn.dataset.mode, 'clear');
+    10: 2,
+  }))));
+  const btn = el.querySelector('.tf-multiselect-select-all');
+  // Nothing selected + cannot fit all within the limit → button is a no-op.
+  assertEq(btn.disabled, true);
+  assertEq(btn.dataset.mode, 'noop');
 });
 
 // ============================================================================
 // Search
 // ============================================================================
 
-test('MultiSelect search filter ukrywa nie-pasujące', () => {
+test('MultiSelect search filter hides non-matching options', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana'), tstrOpt('c', 'Cherry')],
     searchable: true,
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  el.querySelector('.tf-multiselect__trigger').click();
-  const search = el.querySelector('.tf-multiselect__search');
-  search.value = 'app';
+  }))));
+  el.querySelector('.tf-multiselect-trigger').click();
+  const search = el.querySelector('.tf-multiselect-search');
+  assertEq(search.hidden, false);
+  search.value = 'an';
   search.dispatchEvent(new (globalThis.Event)('input', { bubbles: false }));
-  const opts = el.querySelectorAll('.tf-multiselect__option');
-  assertEq(opts[0].hidden, false);
-  assertEq(opts[1].hidden, true);
+  const opts = el.querySelectorAll('.tf-multiselect-option');
+  assertEq(opts[0].hidden, true);   // Apple
+  assertEq(opts[1].hidden, false);  // Banana
+  assertEq(opts[2].hidden, true);   // Cherry
+});
+
+test('MultiSelect searchable=false hides the search input (no-search)', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A')],
+    searchable: false,
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assert(el.hasAttribute('no-search'));
+  assertEq(el.querySelector('.tf-multiselect-search').hidden, true);
 });
 
 // ============================================================================
 // Disabled
 // ============================================================================
 
-test('MultiSelect disabled BindRef blokuje open + toggle', () => {
+test('MultiSelect disabled BindRef blocks open + toggle', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('lock'), value: true }, { path: PATH('sel'), value: [] }],
+    entries: [{ path: PATH('sel'), value: [] }, { path: PATH('lock'), value: true }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const trigger = el.querySelector('.tf-multiselect__trigger');
+  }))));
+  const trigger = el.querySelector('.tf-multiselect-trigger');
   assertEq(trigger.getAttribute('aria-disabled'), 'true');
+  assert(!trigger.hasAttribute('tabindex'));
   trigger.click();
-  assertEq(el.querySelector('.tf-multiselect__popover').hidden, true);
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, true);
 });
 
-test('MultiSelect disabled wyłącza select-all button (show_select_all=true)', () => {
+test('MultiSelect disabled disables the select-all button (show_select_all=true)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: [] }, { path: PATH('lock'), value: false }],
+    entries: [{ path: PATH('sel'), value: [] }, { path: PATH('lock'), value: true }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
-    showSelectAll: true,
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A')], showSelectAll: true,
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const btn = el.querySelector('.tf-multiselect__select-all');
-  assertEq(btn.disabled, false);
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('lock'), op: { kind: 'set', value: true } }],
-  });
-  assertEq(btn.disabled, true);
-  assertEq(btn.dataset.mode, 'noop');
+  }))));
+  assertEq(el.querySelector('.tf-multiselect-select-all').disabled, true);
 });
 
-test('MultiSelect disabled wyłącza nested clear + chip remove buttons', () => {
+test('MultiSelect disabled disables nested clear + chip-remove buttons', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('sel'), value: ['a'] }, { path: PATH('lock'), value: true }],
+    entries: [
+      { path: PATH('sel'), value: [{ kind: 'tstr', value: 'a' }] },
+      { path: PATH('lock'), value: true },
+    ],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')], clearable: true,
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  const trigger = el.querySelector('.tf-multiselect__trigger');
-  assert(!trigger.hasAttribute('tabindex'));
-  assertEq(el.querySelector('.tf-multiselect__clear').disabled, true);
-  assertEq(el.querySelector('.tf-multiselect__chip-remove').disabled, true);
+  }))));
+  assertEq(el.querySelector('.tf-multiselect-clear').disabled, true);
+  assertEq(el.querySelector('.tf-multiselect-chip-remove').disabled, true);
+  // Flip OFF — buttons are enabled again.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lock'), op: { kind: 'set', value: false } }],
+  });
+  assertEq(el.querySelector('.tf-multiselect-clear').disabled, false);
+  assertEq(el.querySelector('.tf-multiselect-chip-remove').disabled, false);
 });
 
-test('MultiSelect disabled flip mid-open blokuje toggle', () => {
+test('MultiSelect disabled flip mid-open blocks toggle', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -515,22 +526,19 @@ test('MultiSelect disabled flip mid-open blokuje toggle', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
     7: { kind: 'bound', path: PATH('lock') },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-multiselect__trigger').click();
+  el.querySelector('.tf-multiselect-trigger').click();  // open OK (lock=false)
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('lock'), op: { kind: 'set', value: true } }],
   });
-  el.querySelector('.tf-multiselect__option').dispatchEvent(
-    new (globalThis.MouseEvent || globalThis.Event)('mousedown', { bubbles: true, cancelable: true })
-  );
+  mousedownOn(el.querySelector('.tf-multiselect-option'));
   assertEq(got, null);
 });
 
@@ -538,121 +546,141 @@ test('MultiSelect disabled flip mid-open blokuje toggle', () => {
 // Keyboard
 // ============================================================================
 
-test('MultiSelect Enter toggluje aktywną opcję bez zamykania popover', () => {
+test('MultiSelect Enter toggles the active option without closing the popover', () => {
   setup();
-  const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A'), tstrOpt('b', 'B')],
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple'), tstrOpt('b', 'Banana')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
+  }))));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const trigger = el.querySelector('.tf-multiselect__trigger');
-  trigger.click();  // open, active=0
-  keydown(trigger, 'ArrowDown');  // active=1
+  const trigger = el.querySelector('.tf-multiselect-trigger');
+  keydown(trigger, 'ArrowDown');  // opens, active = first
+  keydown(trigger, 'ArrowDown');  // active = second
   keydown(trigger, 'Enter');
   assertEq(got, { value: [{ kind: 'tstr', value: 'b' }], kind: 'array' });
-  assertEq(el.querySelector('.tf-multiselect__popover').hidden, false);
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, false);
 });
 
-test('MultiSelect Escape zamyka popover', () => {
+test('MultiSelect Escape closes the popover', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  const trigger = el.querySelector('.tf-multiselect__trigger');
+  }))));
+  const trigger = el.querySelector('.tf-multiselect-trigger');
   trigger.click();
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, false);
   keydown(trigger, 'Escape');
-  assertEq(el.querySelector('.tf-multiselect__popover').hidden, true);
+  assertEq(el.querySelector('.tf-multiselect-popover').hidden, true);
+  assertEq(trigger.getAttribute('aria-expanded'), 'false');
 });
 
 // ============================================================================
-// A11y label fallback
+// Labels / a11y / validation
 // ============================================================================
 
-test('MultiSelect bez label wymaga a11y.label + mirror na trigger', () => {
+test('MultiSelect label bind renders the label element + aria-labelledby', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'A')],
+    3: { kind: 'literal', value: 'Detektory' },
+  }))));
+  const label = el.querySelector('.tf-multiselect-label');
+  assertEq(label.textContent, 'Detektory');
+  assertEq(el.querySelector('.tf-multiselect-trigger').getAttribute('aria-labelledby'), label.id);
+});
+
+test('MultiSelect without label requires a11y.label + mirror on the trigger', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
-    entries: [{ path: PATH('lbl'), value: 'Tagi' }],
+    entries: [{ path: PATH('lbl'), value: 'Wybierz' }],
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
-  }), { a11y: { label: { kind: 'bound', path: PATH('lbl') } } }));
-  assertEq(el.querySelector('.tf-multiselect__trigger').getAttribute('aria-label'), 'Tagi');
+  }), { a11y: { label: { kind: 'bound', path: PATH('lbl') } } })));
+  assertEq(el.getAttribute('aria-label'), 'Wybierz');
+  assertEq(el.querySelector('.tf-multiselect-trigger').getAttribute('aria-label'), 'Wybierz');
 });
 
-test('MultiSelect bez label i bez a11y.label throws', () => {
+test('MultiSelect without label and without a11y.label throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
   }))));
 });
-
-// ============================================================================
-// Validation
-// ============================================================================
 
 test('MultiSelect unknown field key throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(MULTISELECT_TAG, [
-    [0, PATH('sel')], [1, []], [4, false], [5, false], [6, false], [8, 'md'], [11, false],
-    [3, { kind: 'literal', value: 'L' }],
+    ...msFields({ options: [], 3: { kind: 'literal', value: 'L' } }),
     [99, 'oops'],
   ])));
 });
 
-test('MultiSelect option z nieznanym group_id throws', () => {
+test('MultiSelect option with unknown group_id throws', () => {
   setup();
   const engine = makeEngine();
   const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
   assertThrows(() => engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A', { groupId: 'unknown' })],
+    options: [tstrOpt('a', 'A', { groupId: 'unknown_id' })],
     9: [grp],
     3: { kind: 'literal', value: 'L' },
   }))));
 });
 
-test('MultiSelect destroy odpina document click listener', () => {
+test('MultiSelect group renders role=group + header with resolved label', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
+  const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple', { groupId: 'fr' })],
+    9: [grp],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const group = el.querySelector('.tf-multiselect-group');
+  assertEq(group.getAttribute('role'), 'group');
+  const header = el.querySelector('.tf-multiselect-group-header');
+  assertEq(header.textContent, 'Owoce');
+  assertEq(group.getAttribute('aria-labelledby'), header.id);
+  assert(group.querySelector('.tf-multiselect-option') != null);
+});
+
+test('MultiSelect raw component change never reaches listeners (only SDK shape)', () => {
+  setup();
+  const { engine } = seededEngine([]);
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
+    options: [tstrOpt('a', 'Apple')],
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  const shapes = [];
+  el.addEventListener('change', (e) => { shapes.push(e.detail); });
+  el.querySelector('.tf-multiselect-trigger').click();
+  mousedownOn(el.querySelector('.tf-multiselect-option'));
+  // Exactly ONE event in the SDK shape — never the raw {value: [idx]}.
+  assertEq(shapes, [{ value: [{ kind: 'tstr', value: 'a' }], kind: 'array' }]);
+});
+
+test('MultiSelect destroy + outside click does not throw', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(MULTISELECT_TAG, msFields({
     options: [tstrOpt('a', 'A')],
     3: { kind: 'literal', value: 'L' },
-  })));
-  document.body.appendChild(el);
-  el.querySelector('.tf-multiselect__trigger').click();
+  }))));
+  el.querySelector('.tf-multiselect-trigger').click();
   engine.destroy(el);
   const outside = document.createElement('div');
   document.body.appendChild(outside);
   outside.click();
-});
-
-// ============================================================================
-// Groups
-// ============================================================================
-
-test('MultiSelect group ma role=group + aria-labelledby na samym group elemencie', () => {
-  setup();
-  const engine = makeEngine();
-  const grp = [[0, 'fr'], [1, { kind: 'literal', value: 'Owoce' }]];
-  const el = engine.render(comp(MULTISELECT_TAG, msFields({
-    options: [tstrOpt('a', 'A', { groupId: 'fr' })],
-    9: [grp],
-    3: { kind: 'literal', value: 'L' },
-  })));
-  const group = el.querySelector('.tf-multiselect__group');
-  assertEq(group.getAttribute('role'), 'group');
-  const header = el.querySelector('.tf-multiselect__group-header');
-  assertEq(group.getAttribute('aria-labelledby'), header.id);
 });
 
 // ---- report ----

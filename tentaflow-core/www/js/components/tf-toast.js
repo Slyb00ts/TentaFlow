@@ -4,10 +4,16 @@
 //              TfToast.show({tone, title, message, duration}) to create toasts
 //              that auto-remove after a configurable duration.
 // Example: TfToast.show({ tone: 'success', title: 'Saved', message: 'Changes applied.' });
+//
+// Declarative usage: append a <tf-toast> element with attributes yourself.
+// The `persistent` boolean attribute disables the auto-dismiss timer (the
+// owner controls the element lifecycle, e.g. SDK addon state). Children with
+// slot="icon" / slot="action" are preserved and rendered before the title /
+// after the message respectively.
 // =============================================================================
 
 class TfToast extends HTMLElement {
-  static get observedAttributes() { return ['tone', 'title', 'message', 'duration']; }
+  static get observedAttributes() { return ['tone', 'title', 'message', 'duration', 'persistent']; }
 
   constructor() {
     super();
@@ -30,6 +36,9 @@ class TfToast extends HTMLElement {
   }
 
   _build() {
+    // Preserve slotted icon/action children before clearing.
+    const iconContent = this.querySelector('[slot="icon"]');
+    const actionContent = this.querySelector('[slot="action"]');
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-toast';
@@ -47,8 +56,16 @@ class TfToast extends HTMLElement {
     closeBtn.addEventListener('click', () => this._dismiss());
 
     el.appendChild(closeBtn);
+    if (iconContent) {
+      iconContent.removeAttribute('slot');
+      el.appendChild(iconContent);
+    }
     el.appendChild(titleEl);
     el.appendChild(msgEl);
+    if (actionContent) {
+      actionContent.removeAttribute('slot');
+      el.appendChild(actionContent);
+    }
     this.appendChild(el);
     this._root = el;
     this._titleEl = titleEl;
@@ -68,6 +85,7 @@ class TfToast extends HTMLElement {
   }
 
   _startDismiss() {
+    if (this.hasAttribute('persistent')) return;
     const duration = parseInt(this.getAttribute('duration'), 10) || 4000;
     this._timer = setTimeout(() => this._dismiss(), duration);
   }

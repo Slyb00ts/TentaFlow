@@ -3,7 +3,7 @@
 // Opis: Testy 4 cards Layout (Krok 3.3a-3): Card/SectionCard/Collapsible/Accordion.
 // =============================================================================
 
-import './_dom-test-harness.js';
+import { window as harnessWindow } from './_dom-test-harness.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -18,6 +18,12 @@ import {
 // przez chunk 3.3b-1. Helper budowy fixture'owego Button-component'u
 // (minimal valid shape) używamy w SectionCard.header_actions tests.
 const BUTTON_TAG = 0x0401;
+
+// The harness exports bound globals; a bound class has no .prototype, which
+// breaks `class X extends HTMLElement`. Restore the raw constructor before
+// loading web components (dynamic import runs after the harness).
+globalThis.HTMLElement = harnessWindow.HTMLElement;
+await import('../components/tf-section-card.js');
 function makeButtonFixture(extra = {}) {
   return comp(BUTTON_TAG, [
     [0, 'primary'],
@@ -75,6 +81,11 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// Attach to the document so custom elements upgrade (connectedCallback)
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 const BORDER_NONE = { kind: 'none' };
 
@@ -95,6 +106,8 @@ test('Card renders with all 11 required + defaults', () => {
       [10, false],
     ])
   );
+  assertEq(el.tagName, 'TF-SECTION-CARD');
+  assert(el.hasAttribute('plain'));
   assert(el.classList.contains('tf-card'));
   assert(el.classList.contains('tf-card--variant-filled'));
   assert(el.classList.contains('tf-card--padding-lg')); // default
@@ -195,6 +208,8 @@ test('Card renders children in order', () => {
       [9, false], [10, false],
     ])
   );
+  // plain variant keeps light DOM untouched also after connection
+  mount(el);
   const ids = [...el.children].map((c) => c.getAttribute('data-testid'));
   assertEq(ids, ['a', 'b']);
 });
@@ -220,11 +235,15 @@ test('SectionCard renders header with title + subtitle + Button actions + divide
       [12, 'subtle'],
     ])
   );
-  assert(el.classList.contains('tf-section-card'));
-  assertEq(el.querySelector('.tf-section-card__title').textContent, 'Tytuł');
+  mount(el);
+  assertEq(el.tagName, 'TF-SECTION-CARD');
+  assert(el.querySelector('.tf-section-card') != null);
+  assertEq(el.querySelector('.tf-section-card-title').textContent, 'Tytuł');
   assertEq(el.querySelector('.tf-section-card__subtitle').textContent, 'Podtytuł');
   assert(el.querySelector('.tf-section-card__actions [data-testid="btn1"]') != null);
-  assert(el.querySelector('.tf-section-card__header-divider') != null);
+  assert(el.hasAttribute('header-divider'));
+  const divider = el.querySelector('.tf-section-card__header-divider');
+  assert(divider != null && divider.style.display !== 'none');
 });
 
 test('SectionCard.header_actions rejects non-Button tag', () => {
@@ -260,7 +279,8 @@ test('SectionCard reactive title bound to store', () => {
       [12, 'subtle'],
     ])
   );
-  const titleEl = el.querySelector('.tf-section-card__title');
+  mount(el);
+  const titleEl = el.querySelector('.tf-section-card-title');
   assertEq(titleEl.textContent, 'A');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
@@ -279,6 +299,7 @@ test('SectionCard footer optional, omitted by default', () => {
       [8, 'filled'], [11, BORDER_NONE], [12, 'subtle'],
     ])
   );
+  mount(el);
   assertEq(el.querySelector('.tf-section-card__footer'), null);
 });
 
@@ -293,6 +314,7 @@ test('SectionCard with footer renders separately', () => {
       [8, 'filled'], [11, BORDER_NONE], [12, 'subtle'],
     ])
   );
+  mount(el);
   const footer = el.querySelector('.tf-section-card__footer');
   assert(footer != null);
   assert(footer.querySelector('[data-testid="fb"]') != null);
@@ -390,18 +412,18 @@ test('Accordion renders items with item id + header + body', () => {
       [
         0,
         [
-          {
-            id: 'it1',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'h1' }),
-            body: [comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'b1' })],
-            default_expanded: true,
-          },
-          {
-            id: 'it2',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'h2' }),
-            body: [comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'b2' })],
-            default_expanded: false,
-          },
+          [
+            [0, 'it1'],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'h1' })],
+            [2, [comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'b1' })]],
+            [3, true],
+          ],
+          [
+            [0, 'it2'],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'h2' })],
+            [2, [comp(SPACER_TAG, [[0, 'xs'], [1, 'x']], { test_id: 'b2' })]],
+            [3, false],
+          ],
         ],
       ],
       [1, 'multiple'],
@@ -430,12 +452,12 @@ test('Accordion item click dispatches open/close with item_id', () => {
       [
         0,
         [
-          {
-            id: 'a',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]),
-            body: [],
-            default_expanded: false,
-          },
+          [
+            [0, 'a'],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])],
+            [2, []],
+            [3, false],
+          ],
         ],
       ],
       [1, 'single'],
@@ -458,13 +480,13 @@ test('Accordion rejects item with unknown key', () => {
         [
           0,
           [
-            {
-              id: 'x',
-              header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]),
-              body: [],
-              default_expanded: false,
-              evil: true,
-            },
+            [
+              [0, 'x'],
+              [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])],
+              [2, []],
+              [3, false],
+              [9, true],
+            ],
           ],
         ],
         [1, 'single'],
@@ -485,18 +507,18 @@ test('Accordion uses default_expanded when bind resolves to non-array', () => {
       [
         0,
         [
-          {
-            id: 'a',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]),
-            body: [],
-            default_expanded: true,
-          },
-          {
-            id: 'b',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]),
-            body: [],
-            default_expanded: false,
-          },
+          [
+            [0, 'a'],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])],
+            [2, []],
+            [3, true],
+          ],
+          [
+            [0, 'b'],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])],
+            [2, []],
+            [3, false],
+          ],
         ],
       ],
       [1, 'multiple'],
@@ -521,8 +543,8 @@ test('Accordion mode=single clamps expanded_ids to first', () => {
       [
         0,
         [
-          { id: 'a', header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]), body: [], default_expanded: false },
-          { id: 'b', header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]), body: [], default_expanded: false },
+          [[0, 'a'], [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])], [2, []], [3, false]],
+          [[0, 'b'], [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])], [2, []], [3, false]],
         ],
       ],
       [1, 'single'],
@@ -559,12 +581,12 @@ test('Accordion rejects empty id', () => {
       comp(ACCORDION_TAG, [
         [
           0,
-          [{
-            id: '',
-            header: comp(SPACER_TAG, [[0, 'xs'], [1, 'x']]),
-            body: [],
-            default_expanded: false,
-          }],
+          [[
+            [0, ''],
+            [1, comp(SPACER_TAG, [[0, 'xs'], [1, 'x']])],
+            [2, []],
+            [3, false],
+          ]],
         ],
         [1, 'single'],
         [2, { kind: 'literal', value: [] }],

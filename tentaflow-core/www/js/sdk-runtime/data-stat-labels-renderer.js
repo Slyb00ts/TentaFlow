@@ -1,12 +1,12 @@
 // =============================================================================
 // Plik: sdk-runtime/data-stat-labels-renderer.js
 // Opis: Renderery stat + label komponentow §4 Data Display — chunk 3.3d-2:
-//   - KeyValue  (0x0207) — 2-kolumnowa lista label:value z KvItem
+//   - KeyValue  (0x0207) — <tf-key-value> z reaktywnymi keyNode/valueNode
 //   - StatCard  (0x0208) — <tf-stat-card> web component z trend/footnote
-//   - Stat      (0x0209) — compact stat bez kontenera
+//   - Stat      (0x0209) — <tf-stat-card size=...> compact variant
 //   - Badge     (0x020A) — status/count pill z count overflow (max)
-//   - Chip      (0x020B) — filter/tag chip z handlers click/remove
-//   - Tag       (0x020C) — static read-only label
+//   - Chip      (0x020B) — <tf-chip> z label/removable/lead avatar
+//   - Tag       (0x020C) — <tf-chip variant="tag"> static read-only label
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/{stat,labels}.rs.
 // =============================================================================
@@ -222,41 +222,41 @@ function renderKeyValue(component, ctx) {
     ? null
     : requireEnum(labelWidthRaw, SPACING_TOKENS, 'KeyValue.label_width');
 
-  const wrapper = document.createElement('dl');
+  // <tf-key-value> renders the table; reactive cells go in as keyNode /
+  // valueNode entries so bind subscriptions keep mutating them in place.
+  const wrapper = document.createElement('tf-key-value');
   wrapper.classList.add('tf-keyvalue');
   wrapper.classList.add(`tf-keyvalue--density-${density}`);
   wrapper.classList.add(`tf-keyvalue--layout-${layout}`);
   if (labelWidth) wrapper.setAttribute('data-label-width', labelWidth);
 
+  const entries = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
-    const row = document.createElement('div');
-    row.classList.add('tf-keyvalue__row');
 
-    const dt = document.createElement('dt');
-    dt.classList.add('tf-keyvalue__label');
+    const keyNode = document.createElement('span');
+    keyNode.classList.add('tf-keyvalue__label');
     if (it.icon) {
       const ic = renderIcon(it.icon, `KeyValue.items[${i}].icon`);
       ic.classList.add('tf-keyvalue__icon');
-      dt.appendChild(ic);
+      keyNode.appendChild(ic);
     }
     const lblText = document.createElement('span');
     lblText.classList.add('tf-keyvalue__label-text');
     applyReactiveText(lblText, it.label, ctx, null);
-    dt.appendChild(lblText);
-    row.appendChild(dt);
+    keyNode.appendChild(lblText);
 
-    const dd = document.createElement('dd');
-    dd.classList.add('tf-keyvalue__value');
+    const valueNode = document.createElement('span');
+    valueNode.classList.add('tf-keyvalue__value');
     const valText = document.createElement('span');
     valText.classList.add('tf-keyvalue__value-text');
     applyReactiveText(valText, it.value, ctx, it.format);
-    dd.appendChild(valText);
+    valueNode.appendChild(valText);
 
     if (it.action_id != null) {
-      dd.setAttribute('role', 'button');
-      dd.setAttribute('tabindex', '0');
-      dd.classList.add('tf-keyvalue__value--clickable');
+      valueNode.setAttribute('role', 'button');
+      valueNode.setAttribute('tabindex', '0');
+      valueNode.classList.add('tf-keyvalue__value--clickable');
       const onClick = (e) => {
         e.preventDefault();
         wrapper.dispatchEvent(
@@ -272,11 +272,11 @@ function renderKeyValue(component, ctx) {
           onClick(e);
         }
       };
-      dd.addEventListener('click', onClick);
-      dd.addEventListener('keydown', onKeyDown);
+      valueNode.addEventListener('click', onClick);
+      valueNode.addEventListener('keydown', onKeyDown);
       ctx.registerCleanup(() => {
-        dd.removeEventListener('click', onClick);
-        dd.removeEventListener('keydown', onKeyDown);
+        valueNode.removeEventListener('click', onClick);
+        valueNode.removeEventListener('keydown', onKeyDown);
       });
     }
 
@@ -284,11 +284,11 @@ function renderKeyValue(component, ctx) {
       const hint = document.createElement('span');
       hint.classList.add('tf-keyvalue__hint');
       applyReactiveText(hint, it.hint, ctx, null);
-      dd.appendChild(hint);
+      valueNode.appendChild(hint);
     }
-    row.appendChild(dd);
-    wrapper.appendChild(row);
+    entries.push({ keyNode, valueNode });
   }
+  wrapper.entries = entries;
 
   return wrapper;
 }
@@ -297,27 +297,25 @@ function renderKeyValue(component, ctx) {
 // Trend + Footnote rendering helpers (shared by StatCard + Stat)
 // =============================================================================
 
-function renderTrendBadge(trend, ctx) {
-  const el = document.createElement('span');
-  el.classList.add('tf-trend');
-  el.classList.add(`tf-trend--${trend.direction}`);
-  if (trend.tone) el.classList.add(`tf-trend--tone-${trend.tone}`);
-  const arrow = document.createElement('span');
-  arrow.classList.add('tf-trend__arrow');
-  arrow.setAttribute('aria-hidden', 'true');
-  arrow.textContent = trend.direction === 'up' ? '▲' : trend.direction === 'down' ? '▼' : '→';
-  el.appendChild(arrow);
-  const pct = document.createElement('span');
-  pct.classList.add('tf-trend__percent');
-  pct.textContent = `${Number.isInteger(trend.percent) ? trend.percent : trend.percent.toFixed(1)}%`;
-  el.appendChild(pct);
+function trendPercentText(trend) {
+  return `${Number.isInteger(trend.percent) ? trend.percent : trend.percent.toFixed(1)}%`;
+}
+
+/// Map a parsed Trend onto tf-stat-card delta / delta-type attributes.
+/// The optional trend label is a BindRef, so the delta text stays reactive.
+function applyTrendAttributes(el, trend, ctx) {
+  el.setAttribute('delta-type', TREND_TO_DELTA_TYPE[trend.direction] || 'neutral');
+  const pctText = trendPercentText(trend);
   if (trend.label != null) {
-    const lbl = document.createElement('span');
-    lbl.classList.add('tf-trend__label');
-    applyReactiveText(lbl, trend.label, ctx, null);
-    el.appendChild(lbl);
+    const applyDelta = () => {
+      const v = resolveBindRef(trend.label, ctx.store);
+      el.setAttribute('delta', v == null ? pctText : `${pctText} ${v}`);
+    };
+    applyDelta();
+    ctx.registerCleanup(subscribeBindRef(trend.label, ctx.store, applyDelta));
+  } else {
+    el.setAttribute('delta', pctText);
   }
-  return el;
 }
 
 function renderFootnoteBlock(fn, ctx) {
@@ -417,15 +415,10 @@ function renderStatCard(component, ctx) {
   }
 
   // Trend mapped to delta/delta-type attributes
-  if (trend) {
-    const deltaType = TREND_TO_DELTA_TYPE[trend.direction] || 'neutral';
-    el.setAttribute('delta-type', deltaType);
-    const pctText = `${Number.isInteger(trend.percent) ? trend.percent : trend.percent.toFixed(1)}%`;
-    el.setAttribute('delta', pctText);
-  }
+  if (trend) applyTrendAttributes(el, trend, ctx);
 
-  // Footnote rendered as child element (tf-stat-card renders children via
-  // light DOM, so we append extra elements after the component builds)
+  // Footnote appended as light-DOM child — tf-stat-card preserves
+  // pre-existing children after its generated content
   if (footnote) {
     const fnEl = renderFootnoteBlock(footnote, ctx);
     el.appendChild(fnEl);
@@ -453,25 +446,33 @@ function renderStat(component, ctx) {
   const trend = parseTrend(ctx.readField(component.fields, 3), 'Stat.trend');
   const size = requireEnum(ctx.readField(component.fields, 4), STAT_SIZES, 'Stat.size');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-stat');
-  wrapper.classList.add(`tf-stat--size-${size}`);
+  // Compact <tf-stat-card size=...> variant — no card chrome
+  const el = document.createElement('tf-stat-card');
+  el.setAttribute('size', size);
 
-  const lblEl = document.createElement('span');
-  lblEl.classList.add('tf-stat__label');
-  applyReactiveText(lblEl, label, ctx, null);
-  wrapper.appendChild(lblEl);
+  const applyLabel = () => {
+    const v = resolveBindRef(label, ctx.store);
+    el.setAttribute('label', v == null ? '' : String(v));
+  };
+  applyLabel();
+  ctx.registerCleanup(subscribeBindRef(label, ctx.store, applyLabel));
 
-  const valueRow = document.createElement('div');
-  valueRow.classList.add('tf-stat__value-row');
-  const valEl = document.createElement('span');
-  valEl.classList.add('tf-stat__value');
-  applyReactiveText(valEl, value, ctx, format);
-  valueRow.appendChild(valEl);
-  if (trend) valueRow.appendChild(renderTrendBadge(trend, ctx));
-  wrapper.appendChild(valueRow);
+  const applyValue = () => {
+    const raw = resolveBindRef(value, ctx.store);
+    if (raw == null) { el.setAttribute('value', ''); return; }
+    if (format != null) {
+      try { el.setAttribute('value', formatValue(raw, format, ctx.locale)); }
+      catch { el.setAttribute('value', String(raw)); }
+    } else {
+      el.setAttribute('value', String(raw));
+    }
+  };
+  applyValue();
+  ctx.registerCleanup(subscribeBindRef(value, ctx.store, applyValue));
 
-  return wrapper;
+  if (trend) applyTrendAttributes(el, trend, ctx);
+
+  return el;
 }
 
 // =============================================================================
@@ -565,14 +566,20 @@ function renderChip(component, ctx) {
       ? ctx.readField(iconRaw.fields, 0) : (typeof iconRaw === 'string' ? iconRaw : '');
     if (iconName) wrapper.setAttribute('icon', iconName);
   }
+  if (avatarRaw != null) {
+    const avatar = renderAvatarRef(avatarRaw, 'Chip.avatar');
+    avatar.setAttribute('slot', 'lead');
+    wrapper.appendChild(avatar);
+  }
   if (variant === 'toggle' || variant === 'selectable') {
     wrapper.setAttribute('clickable', '');
   }
+  if (removable) wrapper.setAttribute('removable', '');
 
-  // tf-chip reads text from textContent, set it reactively
+  // Reactive label via tf-chip label attribute
   const applyLabel = () => {
     const v = resolveBindRef(label, ctx.store);
-    wrapper.textContent = v != null ? String(v) : '';
+    wrapper.setAttribute('label', v != null ? String(v) : '');
   };
   applyLabel();
   if (typeof label === 'object' && label != null) {
@@ -582,7 +589,6 @@ function renderChip(component, ctx) {
   if (selectedBind != null) {
     const apply = () => {
       const sel = resolveBindRef(selectedBind, ctx.store) === true;
-      wrapper.setAttribute('active', sel ? '' : null);
       if (sel) wrapper.setAttribute('active', '');
       else wrapper.removeAttribute('active');
     };
@@ -659,11 +665,17 @@ function renderTag(component, ctx) {
   if (label == null) throw new TypeError('Tag.label is required');
   const size = requireEnum(ctx.readField(component.fields, 2), TAG_SIZES, 'Tag.size');
 
-  const wrapper = document.createElement('span');
-  wrapper.classList.add('tf-tag');
-  wrapper.classList.add(`tf-tag--tone-${tone}`);
-  wrapper.classList.add(`tf-tag--size-${size}`);
-  applyReactiveText(wrapper, label, ctx, null);
+  // Static tag = tf-chip tag variant (.tf-tag styling)
+  const wrapper = document.createElement('tf-chip');
+  wrapper.setAttribute('variant', 'tag');
+  wrapper.setAttribute('tone', tone);
+  wrapper.setAttribute('size', size);
+  const applyLabel = () => {
+    const v = resolveBindRef(label, ctx.store);
+    wrapper.setAttribute('label', v == null ? '' : String(v));
+  };
+  applyLabel();
+  ctx.registerCleanup(subscribeBindRef(label, ctx.store, applyLabel));
   return wrapper;
 }
 

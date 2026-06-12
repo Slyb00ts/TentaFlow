@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: sdk-runtime/layout-cards-renderers.js
 // Opis: Rendererzy 4 cards Layout (Faza 6 Krok 3.3a-3):
-//   - Card        (tag 0x0106) — generic container z padding/radius/shadow
-//   - SectionCard (tag 0x0107) — tf-section-card web component z title/icon
+//   - Card        (tag 0x0106) — <tf-section-card plain> z tf-card--* tokens
+//   - SectionCard (tag 0x0107) — <tf-section-card> web component z title/icon
 //   - Collapsible (tag 0x010D) — expandable section, handler "open"/"close"
 //   - Accordion   (tag 0x010E) — multi-Collapsible z mutex mode
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/layout/cards.rs`.
@@ -131,8 +131,8 @@ function borderTokenToClass(border, ctx) {
   }
 }
 
-/// Zastosuj wszystkie wspolne klasy Card-style do `el`. Uzywane przez Card
-/// (raw div — tf-card nie istnieje jako web component).
+/// Apply all shared Card-style token classes to `el`. Used by Card on the
+/// <tf-section-card plain> host element.
 function applyCardClasses(el, opts, ctxLabel) {
   el.classList.add(`tf-card--variant-${opts.variant}`);
   el.classList.add(`tf-card--padding-${opts.padding}`);
@@ -208,7 +208,10 @@ function renderCard(component, ctx) {
   }
   const clickable = requireBool(clickableRaw, 'Card.clickable');
 
-  const el = document.createElement('div');
+  // Plain (headerless) tf-section-card variant: the component leaves the
+  // light DOM alone and the renderer drives the tf-card--* token classes.
+  const el = document.createElement('tf-section-card');
+  el.setAttribute('plain', '');
   el.classList.add('tf-card');
   applyCardClasses(el, {
     variant, padding, gap, radius, shadow, background, accent, borderClasses,
@@ -329,33 +332,33 @@ function renderSectionCard(component, ctx) {
   const offTitle = subscribeBindRef(titleBind, ctx.store, applyTitle);
   ctx.registerCleanup(offTitle);
 
-  // Reactive subtitle via icon attribute slot (tf-section-card shows icon in
-  // header; subtitle is rendered as extra child if present)
+  // Reactive subtitle — placed under the title via the subtitle slot
   if (subtitleBind != null) {
     const subEl = document.createElement('div');
     subEl.classList.add('tf-section-card__subtitle');
-    subEl.slot = 'subtitle';
+    subEl.setAttribute('slot', 'subtitle');
     bindTextContent(subEl, subtitleBind, ctx);
     el.appendChild(subEl);
   }
 
-  // Header actions — rendered into header area (typically Button but any component allowed)
+  // Header actions — spec allows Button (0x0401) only
   if (headerActions.length > 0) {
     const actions = document.createElement('div');
     actions.classList.add('tf-section-card__actions');
-    for (const action of headerActions) {
-      if (!action || typeof action !== 'object') continue;
-      if (typeof action.tag !== 'number' || action.tag === 0) continue;
+    actions.setAttribute('slot', 'actions');
+    for (let i = 0; i < headerActions.length; i++) {
+      const action = headerActions[i];
+      if (!action || typeof action !== 'object' || action.tag !== BUTTON_TAG) {
+        throw new TypeError(
+          `SectionCard.header_actions[${i}]: only Button (0x0401) allowed`
+        );
+      }
       actions.appendChild(ctx.renderChild(action));
     }
     el.appendChild(actions);
   }
 
-  if (headerDivider) {
-    const divider = document.createElement('div');
-    divider.classList.add('tf-section-card__header-divider');
-    el.appendChild(divider);
-  }
+  if (headerDivider) el.setAttribute('header-divider', '');
 
   // Body children go into default slot
   for (const childComponent of body) {
@@ -366,6 +369,7 @@ function renderSectionCard(component, ctx) {
   if (footer && footer.length > 0) {
     const footerEl = document.createElement('div');
     footerEl.classList.add('tf-section-card__footer');
+    footerEl.setAttribute('slot', 'footer');
     for (const childComponent of footer) {
       footerEl.appendChild(ctx.renderChild(childComponent));
     }

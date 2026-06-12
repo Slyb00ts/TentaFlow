@@ -1,17 +1,16 @@
 // =============================================================================
-// Plik: sdk-runtime/form-multiselect-renderer.js
-// Opis: Renderer MultiSelect (0x0304) — multi-value chip-based select z
-// popover'em listbox (role=listbox + aria-multiselectable=true), klik
-// opcji TOGGLE'uje zaznaczenie BEZ zamykania popover'a, trigger pokazuje
-// chipy aktualnie zaznaczonych opcji (z indywidualnym × do usuwania),
-// opcjonalne max_selections (blokuje dodawanie powyżej limitu),
-// opcjonalne show_select_all (header w popover'ze: all/none w zależności
-// od stanu, lub deaktywowane przy max_selections < liczba opcji).
+// File: sdk-runtime/form-multiselect-renderer.js
+// Description: MultiSelect (0x0304) renderer — renders through the
+// <tf-multiselect> web component (chips trigger + multiselectable listbox
+// popover, optional search/select-all/clear/max-selections handled by the
+// component).
 //
-// Selected_path w store to ARRAY zaznaczonych wartości (każda element ma
-// shape SelectValue {kind, value}). Renderer jest read-only — toggle/clear
-// emit'uje `change` z `{ value: SelectValue[], kind: 'array' }`; write-back
-// dopina chunk 3.6.
+// selected_path in the store is an ARRAY of selected values (each element is
+// either a SelectValue {kind, value} or a raw primitive). The renderer is
+// read-only — toggle/clear emits 'change' with
+// `{ value: SelectValue[], kind: 'array' }`; write-back is wired by chunk
+// 3.6. Component option values carry SDK option indices so the change
+// interceptor can map back to typed SelectValues.
 //
 // Spec ref: `tentaflow-sdk-spec/src/protocol/ui/form/selectors.rs` MultiSelect.
 // =============================================================================
@@ -24,7 +23,7 @@ import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 import { renderIcon } from './icon-renderer.js';
 
 // =============================================================================
-// Walidatory
+// Validators
 // =============================================================================
 
 const INPUT_SIZES = new Set(['sm', 'md', 'lg']);
@@ -107,7 +106,7 @@ function parseSelectValue(sv, ctx) {
   throw new TypeError(`${ctx}.kind unsupported`);
 }
 
-/// Porównanie parsed SelectValue do store value (number lub bigint dla intów).
+/// Compares a parsed SelectValue to a store value (number or bigint for ints).
 function selectValueEquals(parsed, storeValue) {
   if (parsed.tag === 'tstr') return typeof storeValue === 'string' && storeValue === parsed.value;
   if (parsed.tag === 'bool') return typeof storeValue === 'boolean' && storeValue === parsed.value;
@@ -118,13 +117,12 @@ function selectValueEquals(parsed, storeValue) {
   return false;
 }
 
-/// Sprawdza czy SelectValue jest na liście zaznaczonych (raw store array).
+/// Checks whether a SelectValue is in the selected list (raw store array).
 function isOptionSelected(parsed, storeArray) {
   if (!Array.isArray(storeArray)) return false;
   return storeArray.some((sv) => {
-    // Akceptujemy zarówno `SelectValue` (tagged object) jak i raw value
-    // — capable host może zapisywać oba kształty. Normalizujemy do
-    // primitive porównania.
+    // Accept both `SelectValue` (tagged object) and raw values — a capable
+    // host may write either shape. Normalize to primitive comparison.
     if (sv && typeof sv === 'object' && 'kind' in sv && 'value' in sv) {
       return parsed.tag === sv.kind && selectValueEquals(parsed, sv.value);
     }
@@ -179,15 +177,6 @@ function parseSelectGroup(raw, ctx) {
   return { id, label };
 }
 
-function applyTextBind(element, bindRef, ctx) {
-  const apply = () => {
-    const v = resolveBindRef(bindRef, ctx.store);
-    element.textContent = v == null ? '' : String(v);
-  };
-  apply();
-  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
-}
-
 // =============================================================================
 // MultiSelect (0x0304)
 // =============================================================================
@@ -220,12 +209,13 @@ function renderMultiSelect(component, ctx) {
     }
     return groupsRaw.map((g, i) => parseSelectGroup(g, `MultiSelect.groups[${i}]`));
   })();
+  const groupById = new Map();
   if (groups) {
-    const ids = new Set(groups.map((g) => g.id));
+    for (const g of groups) groupById.set(g.id, g);
     for (let i = 0; i < options.length; i++) {
       const opt = options[i];
-      if (opt.groupId != null && !ids.has(opt.groupId)) {
-        throw new TypeError(`MultiSelect.options[${i}].group_id '${opt.groupId}' nie ma w groups`);
+      if (opt.groupId != null && !groupById.has(opt.groupId)) {
+        throw new TypeError(`MultiSelect.options[${i}].group_id '${opt.groupId}' not present in groups`);
       }
     }
   }
@@ -236,40 +226,25 @@ function renderMultiSelect(component, ctx) {
   }
   const showSelectAll = requireBool(ctx.readField(component.fields, 11), 'MultiSelect.show_select_all');
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-multiselect');
-  wrapper.classList.add(`tf-multiselect--size-${size}`);
-  if (virtualize) wrapper.classList.add('tf-multiselect--virtualize');
+  const el = document.createElement('tf-multiselect');
+  el.classList.add(`tf-multiselect--size-${size}`);
+  if (virtualize) el.classList.add('tf-multiselect--virtualize');
+  if (clearable) el.setAttribute('clearable', '');
+  if (showSelectAll) el.setAttribute('select-all', '');
+  if (maxSelections != null) el.setAttribute('max-selections', String(maxSelections));
+  if (!searchable) el.setAttribute('no-search', '');
 
-  let labelEl = null;
-  // div role=combobox nie odpowiada na <label for=...>; używamy <div>+
-  // aria-labelledby dla powiązania semantycznego. Element wygląda jak
-  // label, więc CSS daje "label-like" styling.
-  let labelDomId = null;
+  // Label: visible label → `label` attribute; otherwise the required
+  // a11y.label is mirrored as `aria-label` (the component copies it onto the
+  // focusable trigger).
   if (labelBind != null) {
-    labelEl = document.createElement('div');
-    labelEl.classList.add('tf-multiselect__label');
-    labelDomId = `tf-multiselect-${component.id}-label`;
-    labelEl.setAttribute('id', labelDomId);
-    applyTextBind(labelEl, labelBind, ctx);
-    wrapper.appendChild(labelEl);
-  }
-
-  // Trigger to <div role="combobox"> — NIE <button> — bo musi zawierać
-  // nested interaktywne elementy (chipy z × i clear). Button-in-button
-  // jest niepoprawnym HTML i łamie a11y/focus. Tabindex=0 zapewnia
-  // focusability; klik/keyboard handler'y na div'ie obsługują interakcję.
-  const trigger = document.createElement('div');
-  trigger.setAttribute('role', 'combobox');
-  trigger.setAttribute('aria-haspopup', 'listbox');
-  trigger.setAttribute('aria-expanded', 'false');
-  trigger.setAttribute('tabindex', '0');
-  trigger.classList.add('tf-multiselect__trigger');
-  const triggerId = `tf-multiselect-${component.id}`;
-  trigger.setAttribute('id', triggerId);
-  if (labelDomId) trigger.setAttribute('aria-labelledby', labelDomId);
-
-  if (labelBind == null) {
+    const applyLabel = () => {
+      const v = resolveBindRef(labelBind, ctx.store);
+      el.setAttribute('label', v == null ? '' : String(v));
+    };
+    applyLabel();
+    ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
+  } else {
     if (component.a11y == null || component.a11y.label == null) {
       throw new TypeError(
         'MultiSelect without `label` field requires Component.a11y.label for accessible name'
@@ -283,186 +258,80 @@ function renderMultiSelect(component, ctx) {
     }
     const applyAriaLabel = () => {
       const v = resolveBindRef(component.a11y.label, ctx.store);
-      if (typeof v === 'string' && v.trim().length > 0) {
-        trigger.setAttribute('aria-label', v);
-      } else {
-        trigger.removeAttribute('aria-label');
-      }
+      if (typeof v === 'string' && v.trim().length > 0) el.setAttribute('aria-label', v);
+      else el.removeAttribute('aria-label');
     };
     applyAriaLabel();
     ctx.registerCleanup(subscribeBindRef(component.a11y.label, ctx.store, applyAriaLabel));
   }
 
-  // Trigger zawiera chips area + (opcjonalnie) clear button + caret.
-  const chipsArea = document.createElement('span');
-  chipsArea.classList.add('tf-multiselect__chips');
-  trigger.appendChild(chipsArea);
-
-  let clearButton = null;
-  if (clearable) {
-    clearButton = document.createElement('button');
-    clearButton.setAttribute('type', 'button');
-    clearButton.classList.add('tf-multiselect__clear');
-    clearButton.setAttribute('aria-label', 'Clear all selections');
-    clearButton.textContent = '×';
-    clearButton.hidden = true;
-    trigger.appendChild(clearButton);
+  // Reactive placeholder.
+  if (placeholderBind != null) {
+    const applyPlaceholder = () => {
+      const v = resolveBindRef(placeholderBind, ctx.store);
+      if (v == null || v === '') el.removeAttribute('placeholder');
+      else el.setAttribute('placeholder', String(v));
+    };
+    applyPlaceholder();
+    ctx.registerCleanup(subscribeBindRef(placeholderBind, ctx.store, applyPlaceholder));
   }
 
-  const caret = document.createElement('span');
-  caret.classList.add('tf-multiselect__caret');
-  caret.setAttribute('aria-hidden', 'true');
-  caret.textContent = '▾';
-  trigger.appendChild(caret);
-
-  // Disabled na <div role=combobox>: aria-disabled, brak tabindex, plus
-  // synchronizacja `disabled` na nested <button>'ach (clear oraz chip ×).
-  // Chipy są re-render'owane, więc disabled state aplikujemy dynamicznie w
-  // refreshChips() — tu trzymamy referencyjny stan.
+  // Reactive disabled.
   let disabledActive = false;
-  // Trzymamy referencję do `refreshSelectAll` przez zmienną lazy-bind, bo
-  // ta funkcja jest zdefiniowana niżej — TDZ blokuje bezpośredni access.
-  let refreshSelectAllRef = null;
-  const syncNestedDisabled = () => {
-    if (clearButton) clearButton.disabled = disabledActive;
-    chipsArea.querySelectorAll('.tf-multiselect__chip-remove').forEach((b) => {
-      b.disabled = disabledActive;
-    });
-    if (refreshSelectAllRef != null) refreshSelectAllRef();
-  };
   const isDisabledFn = (() => {
     if (disabledBind == null) return () => false;
     const apply = () => {
       disabledActive = resolveBindRef(disabledBind, ctx.store) === true;
-      if (disabledActive) {
-        trigger.setAttribute('aria-disabled', 'true');
-        trigger.setAttribute('data-disabled', '');
-        trigger.removeAttribute('tabindex');
-      } else {
-        trigger.removeAttribute('aria-disabled');
-        trigger.removeAttribute('data-disabled');
-        trigger.setAttribute('tabindex', '0');
-      }
-      syncNestedDisabled();
+      el.disabled = disabledActive;
     };
     apply();
     ctx.registerCleanup(subscribeBindRef(disabledBind, ctx.store, apply));
     return () => disabledActive;
   })();
 
-  wrapper.appendChild(trigger);
-
-  // Popover.
-  const popover = document.createElement('div');
-  popover.classList.add('tf-multiselect__popover');
-  popover.hidden = true;
-  const popoverId = `${triggerId}-popover`;
-  popover.setAttribute('id', popoverId);
-  trigger.setAttribute('aria-controls', popoverId);
-
-  let searchInput = null;
-  let searchQuery = '';
-  if (searchable) {
-    searchInput = document.createElement('input');
-    searchInput.setAttribute('type', 'text');
-    searchInput.classList.add('tf-multiselect__search');
-    searchInput.setAttribute('aria-autocomplete', 'list');
-    popover.appendChild(searchInput);
+  // Options feed: component option.value carries the SDK option index so the
+  // change interceptor maps back to typed SelectValues. Labels, descriptions
+  // and group labels are BindRefs — re-feed the component on any change.
+  const buildComponentOptions = () => options.map((opt, idx) => {
+    const labelText = resolveBindRef(opt.label, ctx.store);
+    const out = {
+      value: idx,
+      label: labelText == null ? '' : String(labelText),
+      disabled: opt.disabled,
+    };
+    if (opt.description != null) {
+      const d = resolveBindRef(opt.description, ctx.store);
+      out.description = d == null ? '' : String(d);
+    }
+    if (opt.icon != null) {
+      out.icon = renderIcon(opt.icon, `MultiSelect.options[${idx}].icon`);
+    }
+    if (opt.groupId != null) {
+      const g = resolveBindRef(groupById.get(opt.groupId).label, ctx.store);
+      out.group = g == null ? '' : String(g);
+    }
+    return out;
+  });
+  const refreshOptions = () => { el.options = buildComponentOptions(); };
+  refreshOptions();
+  for (const opt of options) {
+    ctx.registerCleanup(subscribeBindRef(opt.label, ctx.store, refreshOptions));
+    if (opt.description != null) {
+      ctx.registerCleanup(subscribeBindRef(opt.description, ctx.store, refreshOptions));
+    }
   }
-
-  // Optional select-all header.
-  let selectAllBtn = null;
-  if (showSelectAll) {
-    selectAllBtn = document.createElement('button');
-    selectAllBtn.setAttribute('type', 'button');
-    selectAllBtn.classList.add('tf-multiselect__select-all');
-    // Tekst aktualizowany w refreshSelectAll() ze stanu zaznaczeń.
-    selectAllBtn.textContent = '';
-    popover.appendChild(selectAllBtn);
-  }
-
-  const listbox = document.createElement('ul');
-  listbox.setAttribute('role', 'listbox');
-  listbox.setAttribute('aria-multiselectable', 'true');
-  listbox.classList.add('tf-multiselect__listbox');
-  popover.appendChild(listbox);
-  wrapper.appendChild(popover);
-
-  // ---- option DOM build ----
-  const optionNodes = [];
-  const renderOption = (opt, idx, container) => {
-    const li = document.createElement('li');
-    li.setAttribute('role', 'option');
-    li.classList.add('tf-multiselect__option');
-    li.setAttribute('id', `${triggerId}-opt-${idx}`);
-    if (opt.disabled) {
-      li.setAttribute('aria-disabled', 'true');
-      li.classList.add('tf-multiselect__option--disabled');
-    }
-    // Checkbox-style indicator (czysto wizualny — selection state lecimy
-    // przez aria-selected, ale wizualnie pokazujemy ✓).
-    const check = document.createElement('span');
-    check.classList.add('tf-multiselect__option-check');
-    check.setAttribute('aria-hidden', 'true');
-    check.textContent = '';
-    li.appendChild(check);
-    if (opt.icon) {
-      const iconEl = renderIcon(opt.icon, `MultiSelect.options[${idx}].icon`);
-      iconEl.classList.add('tf-multiselect__option-icon');
-      li.appendChild(iconEl);
-    }
-    const lblEl = document.createElement('span');
-    lblEl.classList.add('tf-multiselect__option-label');
-    applyTextBind(lblEl, opt.label, ctx);
-    li.appendChild(lblEl);
-    if (opt.description) {
-      const descEl = document.createElement('span');
-      descEl.classList.add('tf-multiselect__option-description');
-      applyTextBind(descEl, opt.description, ctx);
-      li.appendChild(descEl);
-    }
-    container.appendChild(li);
-    optionNodes.push({ el: li, opt, idx, visible: true, check });
-  };
-
   if (groups) {
-    const groupContainers = new Map();
     for (const g of groups) {
-      const groupBlock = document.createElement('li');
-      groupBlock.setAttribute('role', 'group');
-      groupBlock.setAttribute('aria-labelledby', `${triggerId}-grp-${g.id}`);
-      groupBlock.classList.add('tf-multiselect__group');
-      const header = document.createElement('div');
-      header.classList.add('tf-multiselect__group-header');
-      header.setAttribute('id', `${triggerId}-grp-${g.id}`);
-      applyTextBind(header, g.label, ctx);
-      groupBlock.appendChild(header);
-      const inner = document.createElement('ul');
-      inner.setAttribute('role', 'presentation');
-      inner.classList.add('tf-multiselect__group-list');
-      groupBlock.appendChild(inner);
-      listbox.appendChild(groupBlock);
-      groupContainers.set(g.id, { block: groupBlock, inner });
+      ctx.registerCleanup(subscribeBindRef(g.label, ctx.store, refreshOptions));
     }
-    options.forEach((opt, idx) => {
-      const c = opt.groupId != null ? groupContainers.get(opt.groupId).inner : listbox;
-      renderOption(opt, idx, c);
-    });
-  } else {
-    options.forEach((opt, idx) => renderOption(opt, idx, listbox));
   }
 
-  // ---- state ----
-  let activeIdx = -1;
-  let isOpen = false;
-
+  // Store → component selection (the store is the source of truth).
   const readSelected = () => {
     let arr;
     try { arr = ctx.store.read(selectedPath); } catch { arr = undefined; }
     return Array.isArray(arr) ? arr : [];
   };
-
-  /// Index list zaznaczonych opcji (po index'ach w `options`).
   const selectedIndices = () => {
     const sel = readSelected();
     if (sel.length === 0) return [];
@@ -472,393 +341,45 @@ function renderMultiSelect(component, ctx) {
     }
     return out;
   };
+  const syncFromStore = () => { el.value = selectedIndices(); };
+  syncFromStore();
+  ctx.registerCleanup(ctx.store.subscribe(selectedPath, syncFromStore));
 
-  const refreshChips = () => {
-    chipsArea.innerHTML = '';
-    const indices = selectedIndices();
-    if (indices.length === 0) {
-      chipsArea.classList.add('tf-multiselect__chips--empty');
-      if (placeholderBind != null) {
-        const v = resolveBindRef(placeholderBind, ctx.store);
-        const ph = document.createElement('span');
-        ph.classList.add('tf-multiselect__placeholder');
-        ph.textContent = v == null ? '' : String(v);
-        chipsArea.appendChild(ph);
-      }
-      if (clearButton) clearButton.hidden = true;
+  // tf-multiselect 'change' carries {value: number[]} (option indices).
+  // Convert to the SDK `{ value: SelectValue[], kind: 'array' }` shape —
+  // the raw event is blocked and a single synthetic event tagged
+  // `__tfReemit` carries the converted payload to the dispatcher.
+  const onChange = (e) => {
+    if (e.__tfReemit) return;
+    e.stopImmediatePropagation();
+    if (!e.detail || !Array.isArray(e.detail.value)) return;
+    if (isDisabledFn()) {
+      // The component is read-only while disabled — discard the optimistic
+      // component-side mutation and restore the store selection.
+      syncFromStore();
       return;
     }
-    chipsArea.classList.remove('tf-multiselect__chips--empty');
-    for (const i of indices) {
-      const chip = document.createElement('span');
-      chip.classList.add('tf-multiselect__chip');
-      chip.setAttribute('data-option-idx', String(i));
-      const chipLabel = document.createElement('span');
-      chipLabel.classList.add('tf-multiselect__chip-label');
-      const v = resolveBindRef(options[i].label, ctx.store);
-      chipLabel.textContent = v == null ? '' : String(v);
-      chip.appendChild(chipLabel);
-      // Individual remove × na chipie.
-      const rm = document.createElement('button');
-      rm.setAttribute('type', 'button');
-      rm.classList.add('tf-multiselect__chip-remove');
-      rm.setAttribute('aria-label', `Remove ${chipLabel.textContent}`);
-      rm.setAttribute('tabindex', '-1');
-      rm.setAttribute('data-option-idx', String(i));
-      rm.textContent = '×';
-      if (disabledActive) rm.disabled = true;
-      chip.appendChild(rm);
-      chipsArea.appendChild(chip);
+    const detailArr = [];
+    for (const idx of e.detail.value) {
+      const opt = options[idx];
+      if (!opt) return;
+      detailArr.push({ kind: opt.value.tag, value: opt.value.value });
     }
-    if (clearButton) clearButton.hidden = false;
-  };
-
-  const refreshAriaSelected = () => {
-    const sel = readSelected();
-    for (const n of optionNodes) {
-      const isSel = isOptionSelected(n.opt.value, sel);
-      if (isSel) {
-        n.el.setAttribute('aria-selected', 'true');
-        n.el.classList.add('tf-multiselect__option--selected');
-        n.check.textContent = '✓';
-      } else {
-        n.el.removeAttribute('aria-selected');
-        n.el.classList.remove('tf-multiselect__option--selected');
-        n.check.textContent = '';
-      }
-    }
-  };
-
-  const refreshSelectAll = () => {
-    if (!selectAllBtn) return;
-    const enabledOptions = options.filter((o) => !o.disabled);
-    // Reactive component-level disabled zawsze wygrywa nad computed state.
-    if (disabledActive) {
-      selectAllBtn.disabled = true;
-      selectAllBtn.textContent = 'Select all';
-      selectAllBtn.dataset.mode = 'noop';
-      return;
-    }
-    if (enabledOptions.length === 0) {
-      selectAllBtn.disabled = true;
-      selectAllBtn.textContent = 'Select all';
-      return;
-    }
-    const sel = readSelected();
-    const allSelected = enabledOptions.every((o) => isOptionSelected(o.value, sel));
-    // Jeśli max_selections < liczba enabled options, "Select all" nie ma sensu
-    // przy stanie all=false (nie mieści wszystkich) — pokaż "Clear" jak coś
-    // zaznaczone, inaczej deaktywuj.
-    const anySelected = enabledOptions.some((o) => isOptionSelected(o.value, sel));
-    if (allSelected) {
-      selectAllBtn.disabled = false;
-      selectAllBtn.textContent = 'Clear all';
-      selectAllBtn.dataset.mode = 'clear';
-    } else if (maxSelections != null && enabledOptions.length > maxSelections) {
-      selectAllBtn.disabled = !anySelected;
-      selectAllBtn.textContent = anySelected ? 'Clear all' : 'Select all';
-      selectAllBtn.dataset.mode = anySelected ? 'clear' : 'noop';
-    } else {
-      selectAllBtn.disabled = false;
-      selectAllBtn.textContent = 'Select all';
-      selectAllBtn.dataset.mode = 'all';
-    }
-  };
-
-  // Po definicji refreshSelectAll możemy podpiąć ref dla syncNestedDisabled.
-  refreshSelectAllRef = refreshSelectAll;
-
-  const refreshAll = () => {
-    refreshChips();
-    refreshAriaSelected();
-    refreshSelectAll();
-  };
-
-  refreshAll();
-  ctx.registerCleanup(ctx.store.subscribe(selectedPath, refreshAll));
-  if (placeholderBind != null) {
-    ctx.registerCleanup(subscribeBindRef(placeholderBind, ctx.store, refreshChips));
-  }
-
-  // ---- emit helpers ----
-  const emitChange = (nextIndices) => {
-    const detailArr = nextIndices.map((i) => ({
-      kind: options[i].value.tag,
-      value: options[i].value.value,
-    }));
-    wrapper.dispatchEvent(
-      new (globalThis.CustomEvent || globalThis.Event)('change', {
-        bubbles: false,
-        detail: { value: detailArr, kind: 'array' },
-      })
-    );
-  };
-
-  const toggle = (idx) => {
-    if (isDisabledFn()) { close(); return; }
-    const opt = optionNodes[idx]?.opt;
-    if (!opt || opt.disabled) return;
-    const current = selectedIndices();
-    const inIdx = current.indexOf(idx);
-    let next;
-    if (inIdx >= 0) {
-      next = current.filter((i) => i !== idx);
-    } else {
-      if (maxSelections != null && current.length >= maxSelections) return;
-      next = [...current, idx];
-    }
-    emitChange(next);
-  };
-
-  const removeChip = (idx) => {
-    if (isDisabledFn()) return;
-    const current = selectedIndices();
-    if (current.indexOf(idx) < 0) return;
-    emitChange(current.filter((i) => i !== idx));
-  };
-
-  const clearAll = () => {
-    if (isDisabledFn()) return;
-    if (selectedIndices().length === 0) return;
-    emitChange([]);
-  };
-
-  // ---- active descendant / keyboard nav ----
-  const visibleNodes = () => optionNodes.filter((n) => n.visible && !n.opt.disabled);
-  const setActive = (idx) => {
-    activeIdx = idx;
-    for (const n of optionNodes) n.el.classList.remove('tf-multiselect__option--active');
-    if (idx < 0) {
-      trigger.removeAttribute('aria-activedescendant');
-      return;
-    }
-    const n = optionNodes[idx];
-    n.el.classList.add('tf-multiselect__option--active');
-    trigger.setAttribute('aria-activedescendant', n.el.id);
-    if (typeof n.el.scrollIntoView === 'function') {
-      try { n.el.scrollIntoView({ block: 'nearest' }); } catch {}
-    }
-  };
-  const moveActive = (dir) => {
-    const vis = visibleNodes();
-    if (vis.length === 0) return;
-    let curPos = vis.findIndex((n) => n.idx === activeIdx);
-    let nextPos;
-    if (curPos < 0) {
-      nextPos = dir > 0 ? 0 : vis.length - 1;
-    } else {
-      nextPos = (curPos + dir + vis.length) % vis.length;
-    }
-    setActive(vis[nextPos].idx);
-  };
-  const moveActiveTo = (pos) => {
-    const vis = visibleNodes();
-    if (vis.length === 0) return;
-    const clamped = Math.max(0, Math.min(pos, vis.length - 1));
-    setActive(vis[clamped].idx);
-  };
-
-  const applySearch = (query) => {
-    searchQuery = query;
-    const q = query.trim().toLowerCase();
-    for (const n of optionNodes) {
-      let labelText = '';
-      try {
-        const lv = resolveBindRef(n.opt.label, ctx.store);
-        labelText = lv == null ? '' : String(lv).toLowerCase();
-      } catch {}
-      const matches = q.length === 0 ? true : labelText.includes(q);
-      n.visible = matches;
-      n.el.hidden = !matches;
-    }
-    if (groups) {
-      for (const g of groups) {
-        const visible = optionNodes.some((n) => n.visible && n.opt.groupId === g.id);
-        const headerEl = document.getElementById(`${triggerId}-grp-${g.id}`);
-        if (headerEl && headerEl.parentElement) headerEl.parentElement.hidden = !visible;
-      }
-    }
-    const cur = optionNodes[activeIdx];
-    if (!cur || !cur.visible || cur.opt.disabled) {
-      const vis = visibleNodes();
-      setActive(vis.length > 0 ? vis[0].idx : -1);
-    }
-  };
-
-  // ---- open/close ----
-  const open = () => {
-    if (isOpen || isDisabledFn()) return;
-    isOpen = true;
-    popover.hidden = false;
-    trigger.setAttribute('aria-expanded', 'true');
-    wrapper.classList.add('tf-multiselect--open');
-    const vis = visibleNodes();
-    setActive(vis.length > 0 ? vis[0].idx : -1);
-    if (searchInput) {
-      searchInput.value = searchQuery;
-      try { searchInput.focus(); } catch {}
-    }
-  };
-
-  const close = () => {
-    if (!isOpen) return;
-    isOpen = false;
-    popover.hidden = true;
-    trigger.setAttribute('aria-expanded', 'false');
-    wrapper.classList.remove('tf-multiselect--open');
-    trigger.removeAttribute('aria-activedescendant');
-    activeIdx = -1;
-    for (const n of optionNodes) n.el.classList.remove('tf-multiselect__option--active');
-    try { trigger.focus(); } catch {}
-  };
-
-  // ---- event wiring ----
-  const onTriggerClick = (e) => {
-    if (isDisabledFn()) return;
-    if (clearButton && e.target === clearButton) return;
-    if (e.target.classList?.contains('tf-multiselect__chip-remove')) return;
-    e.preventDefault();
-    if (isOpen) close(); else open();
-  };
-  trigger.addEventListener('click', onTriggerClick);
-  ctx.registerCleanup(() => trigger.removeEventListener('click', onTriggerClick));
-
-  if (clearButton) {
-    const onClearClick = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      clearAll();
-    };
-    clearButton.addEventListener('click', onClearClick);
-    ctx.registerCleanup(() => clearButton.removeEventListener('click', onClearClick));
-  }
-
-  // Chip × remove — delegacja na chipsArea (chipy są re-render'owane przy
-  // każdej zmianie selection, więc listener musi być na trwałym kontenerze).
-  const onChipsClick = (e) => {
-    const rm = e.target.closest('.tf-multiselect__chip-remove');
-    if (!rm) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const idx = Number(rm.getAttribute('data-option-idx'));
-    if (Number.isInteger(idx)) removeChip(idx);
-  };
-  chipsArea.addEventListener('click', onChipsClick);
-  ctx.registerCleanup(() => chipsArea.removeEventListener('click', onChipsClick));
-
-  const onTriggerKeyDown = (e) => {
-    if (isDisabledFn()) return;
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        if (!isOpen) open(); else moveActive(1);
-        return;
-      case 'ArrowUp':
-        e.preventDefault();
-        if (!isOpen) open(); else moveActive(-1);
-        return;
-      case 'Home':
-        if (!isOpen) return;
-        e.preventDefault();
-        moveActiveTo(0);
-        return;
-      case 'End':
-        if (!isOpen) return;
-        e.preventDefault();
-        moveActiveTo(Number.MAX_SAFE_INTEGER);
-        return;
-      case 'Enter':
-      case ' ':
-        if (!isOpen) {
-          e.preventDefault();
-          open();
-        } else {
-          e.preventDefault();
-          toggle(activeIdx);
-        }
-        return;
-      case 'Escape':
-        if (isOpen) {
-          e.preventDefault();
-          close();
-        }
-        return;
-      case 'Tab':
-        if (isOpen) close();
-        return;
-    }
-  };
-  trigger.addEventListener('keydown', onTriggerKeyDown);
-  ctx.registerCleanup(() => trigger.removeEventListener('keydown', onTriggerKeyDown));
-
-  if (searchInput) {
-    const onSearchInput = () => applySearch(searchInput.value);
-    const onSearchKeyDown = (e) => {
-      switch (e.key) {
-        case 'ArrowDown':
-        case 'ArrowUp':
-        case 'Home':
-        case 'End':
-        case 'Enter':
-        case 'Escape':
-        case 'Tab':
-          onTriggerKeyDown(e);
-          return;
-      }
-    };
-    searchInput.addEventListener('input', onSearchInput);
-    searchInput.addEventListener('keydown', onSearchKeyDown);
-    ctx.registerCleanup(() => {
-      searchInput.removeEventListener('input', onSearchInput);
-      searchInput.removeEventListener('keydown', onSearchKeyDown);
+    const ce = new CustomEvent('change', {
+      bubbles: false,
+      detail: { value: detailArr, kind: 'array' },
     });
-  }
-
-  // Listbox click toggle (mousedown ubiega blur).
-  const onListboxMouseDown = (e) => {
-    const li = e.target.closest('li[role="option"]');
-    if (!li) return;
-    e.preventDefault();
-    const node = optionNodes.find((n) => n.el === li);
-    if (!node) return;
-    toggle(node.idx);
+    ce.__tfReemit = true;
+    el.dispatchEvent(ce);
   };
-  listbox.addEventListener('mousedown', onListboxMouseDown);
-  ctx.registerCleanup(() => listbox.removeEventListener('mousedown', onListboxMouseDown));
+  el.addEventListener('change', onChange);
+  ctx.registerCleanup(() => el.removeEventListener('change', onChange));
 
-  if (selectAllBtn) {
-    const onSelectAll = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (selectAllBtn.disabled || isDisabledFn()) return;
-      const mode = selectAllBtn.dataset.mode;
-      if (mode === 'clear') {
-        clearAll();
-      } else if (mode === 'all') {
-        const next = [];
-        for (let i = 0; i < options.length; i++) {
-          if (!options[i].disabled) next.push(i);
-        }
-        emitChange(next);
-      }
-    };
-    selectAllBtn.addEventListener('click', onSelectAll);
-    ctx.registerCleanup(() => selectAllBtn.removeEventListener('click', onSelectAll));
-  }
-
-  const onDocClick = (e) => {
-    if (!isOpen) return;
-    if (wrapper.contains(e.target)) return;
-    close();
-  };
-  document.addEventListener('click', onDocClick);
-  ctx.registerCleanup(() => document.removeEventListener('click', onDocClick));
-
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormMultiSelectRenderers() {
