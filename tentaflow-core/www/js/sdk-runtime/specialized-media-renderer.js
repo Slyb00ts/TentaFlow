@@ -359,10 +359,17 @@ function renderTerminal(component, ctx) {
   const maxBufferRaw = ctx.readField(component.fields, 6);
   let maxBufferLines = 10000;
   if (maxBufferRaw != null) {
-    if (typeof maxBufferRaw !== 'number' || !Number.isInteger(maxBufferRaw) || maxBufferRaw < 0 || maxBufferRaw > 0xFFFFFFFF) {
-      throw new TypeError('Terminal.max_buffer_lines must be u32');
+    if (typeof maxBufferRaw === 'bigint') {
+      if (maxBufferRaw < 0n || maxBufferRaw > 0xFFFFFFFFn) {
+        throw new TypeError('Terminal.max_buffer_lines must be u32');
+      }
+      maxBufferLines = Number(maxBufferRaw);
+    } else {
+      if (typeof maxBufferRaw !== 'number' || !Number.isInteger(maxBufferRaw) || maxBufferRaw < 0 || maxBufferRaw > 0xFFFFFFFF) {
+        throw new TypeError('Terminal.max_buffer_lines must be u32');
+      }
+      maxBufferLines = maxBufferRaw;
     }
-    maxBufferLines = maxBufferRaw;
   }
 
   const wrapper = document.createElement('div');

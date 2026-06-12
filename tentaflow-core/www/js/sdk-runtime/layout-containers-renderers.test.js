@@ -217,6 +217,33 @@ test('Grid Explicit maps each GridCol variant', () => {
   );
 });
 
+test('Grid Equal accepts BigInt count from wire decoder', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 4n }],
+      [1, 'md'],
+      [4, []],
+    ])
+  );
+  assertEq(el.style.gridTemplateColumns, 'repeat(4, minmax(0, 1fr))');
+});
+
+test('Grid Equal with out-of-range BigInt count rejected', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(GRID_TAG, [
+        [0, { kind: 'equal', count: 300n }],
+        [1, 'md'],
+        [4, []],
+      ])
+    )
+  );
+});
+
 test('Grid Equal with count=0 rejected', () => {
   setup();
   const engine = makeEngine();
@@ -256,14 +283,14 @@ test('Grid renders GridChild with col_span, row_span, col_start, align_self', ()
       [
         4,
         [
-          {
-            component: child,
-            col_span: 2,
-            row_span: 1,
-            col_start: 2,
-            align_self: 'center',
-            justify_self: 'space_around',
-          },
+          [
+            [0, child],
+            [1, 2n],
+            [2, 1],
+            [3, 2],
+            [5, 'center'],
+            [6, 'space_around'],
+          ],
         ],
       ],
     ])

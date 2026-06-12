@@ -72,12 +72,24 @@ function requirePath(v, ctx) {
   return v;
 }
 function requireU16(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFFFn) {
+      throw new TypeError(`${ctx}: expected u16, got ${v}`);
+    }
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFFFF) {
     throw new TypeError(`${ctx}: expected u16, got ${v}`);
   }
   return v;
 }
 function requireU8(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFn) {
+      throw new TypeError(`${ctx}: expected u8, got ${v}`);
+    }
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFF) {
     throw new TypeError(`${ctx}: expected u8, got ${v}`);
   }

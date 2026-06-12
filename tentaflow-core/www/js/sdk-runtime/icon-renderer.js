@@ -119,9 +119,14 @@ export function renderIcon(iconRef, ctx) {
       throw new TypeError(`${ctx}.asset.ref must be non-empty string`);
     }
     const safeSrc = assertSafeAssetSrc(ref, `${ctx}.asset.ref`);
-    const sizePx = iconRef.size_px;
+    let sizePx = iconRef.size_px;
     if (sizePx != null) {
-      if (!Number.isInteger(sizePx) || sizePx <= 0 || sizePx > 0xFFFF) {
+      if (typeof sizePx === 'bigint') {
+        if (sizePx <= 0n || sizePx > 0xFFFFn) {
+          throw new TypeError(`${ctx}.asset.size_px: must be u16 > 0`);
+        }
+        sizePx = Number(sizePx);
+      } else if (!Number.isInteger(sizePx) || sizePx <= 0 || sizePx > 0xFFFF) {
         throw new TypeError(`${ctx}.asset.size_px: must be u16 > 0`);
       }
     }

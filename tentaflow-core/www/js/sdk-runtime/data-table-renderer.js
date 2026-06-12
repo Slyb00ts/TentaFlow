@@ -49,6 +49,10 @@ function requireBool(v, ctx) {
   return v;
 }
 function requireU8(v, ctx) {
+  if (typeof v === 'bigint') {
+    if (v < 0n || v > 0xFFn) throw new TypeError(`${ctx}: expected u8, got ${v}`);
+    return Number(v);
+  }
   if (!Number.isInteger(v) || v < 0 || v > 0xFF) throw new TypeError(`${ctx}: expected u8, got ${v}`);
   return v;
 }
@@ -125,10 +129,16 @@ function parseColumnWidth(raw, ctx) {
     case 'fr': {
       for (const k of Object.keys(raw)) if (k !== 'kind' && k !== 'value') throw new TypeError(`${ctx}: unexpected key '${k}'`);
       const max = raw.kind === 'px' ? 0xFFFFFFFF : 0xFF;
-      if (!Number.isInteger(raw.value) || raw.value < 1 || raw.value > max) {
+      let value = raw.value;
+      if (typeof value === 'bigint') {
+        if (value < 1n || value > BigInt(max)) {
+          throw new TypeError(`${ctx}.value must be ${raw.kind === 'px' ? 'u32 >= 1' : 'u8 >= 1'}`);
+        }
+        value = Number(value);
+      } else if (!Number.isInteger(value) || value < 1 || value > max) {
         throw new TypeError(`${ctx}.value must be ${raw.kind === 'px' ? 'u32 >= 1' : 'u8 >= 1'}`);
       }
-      return { kind: raw.kind, value: raw.value };
+      return { kind: raw.kind, value };
     }
   }
   throw new TypeError(`${ctx}: unreachable`);
@@ -165,8 +175,13 @@ function parseColumn(raw, ctx, locale) {
           if (s.kind === 'key' && typeof s.value !== 'string') {
             throw new TypeError(`${ctx}.field_path[${si}].value must be string for kind=key`);
           }
-          if (s.kind === 'index' && !Number.isInteger(s.value)) {
-            throw new TypeError(`${ctx}.field_path[${si}].value must be integer for kind=index`);
+          if (s.kind === 'index') {
+            if (typeof s.value === 'bigint') {
+              s.value = Number(s.value);
+            }
+            if (!Number.isInteger(s.value)) {
+              throw new TypeError(`${ctx}.field_path[${si}].value must be integer for kind=index`);
+            }
           }
         }
         col.field_path = segs;

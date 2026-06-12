@@ -95,7 +95,14 @@ function assertSegment(seg, ctx) {
       );
     }
   } else if (seg.kind === 'index') {
-    if (!Number.isInteger(seg.value) || seg.value < 0 || seg.value > 0xFFFFFFFF) {
+    if (typeof seg.value === 'bigint') {
+      if (seg.value < 0n || seg.value > 0xFFFFFFFFn) {
+        throw new TypeError(`${ctx}: PathSegment.index.value must be u32 integer`);
+      }
+      // CBOR decoder may deliver the index as BigInt — normalize in place
+      // so traversal uses a plain Number array index.
+      seg.value = Number(seg.value);
+    } else if (!Number.isInteger(seg.value) || seg.value < 0 || seg.value > 0xFFFFFFFF) {
       throw new TypeError(`${ctx}: PathSegment.index.value must be u32 integer`);
     }
   } else {
@@ -686,7 +693,9 @@ function applyOpInPlace(root, opEntry) {
     }
     case 'insert_array': {
       const arr = readForArrayMutation(root, path);
-      const idx = op.index;
+      const idx = typeof op.index === 'bigint' && op.index >= 0n && op.index <= 0xFFFFFFFFn
+        ? Number(op.index)
+        : op.index;
       if (!Number.isInteger(idx) || idx < 0 || idx > arr.length) {
         throw rejectError(
           PATCH_REJECT_REASON.ArrayBounds,
@@ -700,7 +709,9 @@ function applyOpInPlace(root, opEntry) {
     }
     case 'remove_array': {
       const arr = readForArrayMutation(root, path);
-      const idx = op.index;
+      const idx = typeof op.index === 'bigint' && op.index >= 0n && op.index <= 0xFFFFFFFFn
+        ? Number(op.index)
+        : op.index;
       if (!Number.isInteger(idx) || idx < 0 || idx >= arr.length) {
         throw rejectError(
           PATCH_REJECT_REASON.ArrayBounds,
