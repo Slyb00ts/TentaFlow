@@ -292,11 +292,15 @@ function renderSlider(component, ctx) {
 
   wrapper.appendChild(fieldRow);
 
-  // tf-slider emits input/change with detail.value (string). Intercept,
-  // convert to f64 and re-emit with SDK format on wrapper.
+  // tf-slider emits input/change with detail.value (string). The inner native
+  // range input's own events ALSO bubble to the tf-slider host, so both raw
+  // events are stopped from reaching the wrapper and only the component
+  // CustomEvent (string detail.value) converts to f64 and re-emits — acting on
+  // both would dispatch two SDK events per slider move.
   const onInput = (e) => {
     e.stopPropagation();
-    const v = Number.parseFloat(e.detail?.value ?? slider.value);
+    if (!e.detail || typeof e.detail.value !== 'string') return;
+    const v = Number.parseFloat(e.detail.value);
     if (!Number.isFinite(v)) return;
     wrapper.dispatchEvent(
       new CustomEvent('input', {
@@ -307,7 +311,8 @@ function renderSlider(component, ctx) {
   };
   const onChange = (e) => {
     e.stopPropagation();
-    const v = Number.parseFloat(e.detail?.value ?? slider.value);
+    if (!e.detail || typeof e.detail.value !== 'string') return;
+    const v = Number.parseFloat(e.detail.value);
     if (!Number.isFinite(v)) return;
     wrapper.dispatchEvent(
       new CustomEvent('change', {
@@ -403,7 +408,10 @@ function buildSliderUi({
 
   wrapper.appendChild(fieldRow);
 
-  const onInput = () => {
+  // Native input/change bubble; stop them so the wrapper (where the
+  // dispatcher listens) only ever sees the SDK re-emit, never the raw event.
+  const onInput = (e) => {
+    e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
     wrapper.dispatchEvent(
@@ -413,7 +421,8 @@ function buildSliderUi({
       })
     );
   };
-  const onChange = () => {
+  const onChange = (e) => {
+    e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
     wrapper.dispatchEvent(
@@ -606,13 +615,22 @@ function renderRangeSlider(component, ctx) {
       })
     );
   };
-  const onMinChange = () => validateAndEmit('min');
-  const onMaxChange = () => validateAndEmit('max');
+  // Native change bubbles to the wrapper; stop it so the dispatcher only
+  // sees the validated SDK range event.
+  const onMinChange = (e) => { e.stopPropagation(); validateAndEmit('min'); };
+  const onMaxChange = (e) => { e.stopPropagation(); validateAndEmit('max'); };
+  // RangeSlider deliberately emits no SDK `input` event, so the handles' raw
+  // native input must not bubble to the wrapper either.
+  const onHandleInput = (e) => e.stopPropagation();
   minInput.addEventListener('change', onMinChange);
   maxInput.addEventListener('change', onMaxChange);
+  minInput.addEventListener('input', onHandleInput);
+  maxInput.addEventListener('input', onHandleInput);
   ctx.registerCleanup(() => {
     minInput.removeEventListener('change', onMinChange);
     maxInput.removeEventListener('change', onMaxChange);
+    minInput.removeEventListener('input', onHandleInput);
+    maxInput.removeEventListener('input', onHandleInput);
   });
 
   return wrapper;
@@ -861,7 +879,10 @@ function buildNumericUi({
     wrapper.appendChild(badge);
   }
 
-  const onChange = () => {
+  // Native input/change bubble; stop them so the wrapper (where the
+  // dispatcher listens) only ever sees the SDK re-emit, never the raw event.
+  const onChange = (e) => {
+    e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) {
       wrapper.dispatchEvent(
@@ -885,7 +906,8 @@ function buildNumericUi({
       })
     );
   };
-  const onInput = () => {
+  const onInput = (e) => {
+    e.stopPropagation();
     const v = Number.parseFloat(input.value);
     if (!Number.isFinite(v)) return;
     wrapper.dispatchEvent(

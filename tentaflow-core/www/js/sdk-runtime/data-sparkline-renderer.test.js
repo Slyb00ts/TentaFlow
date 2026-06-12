@@ -61,7 +61,12 @@ function sparklineFields({
   ];
 }
 
-test('Sparkline line variant renderuje <polyline>', () => {
+// tf-sparkline draws on <canvas> (no 2D context in happy-dom), so the
+// component module is intentionally NOT imported: <tf-sparkline> stays an
+// un-upgraded element and the renderer's property writes (.points, .color,
+// .fill, .height) are asserted directly as the renderer→component contract.
+
+test('Sparkline line variant binds points + sizing to tf-sparkline', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -70,13 +75,17 @@ test('Sparkline line variant renderuje <polyline>', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields()));
-  const svg = el.querySelector('svg');
-  assertEq(svg.getAttribute('width'), '100');
-  assertEq(svg.getAttribute('height'), '30');
-  assert(svg.querySelector('polyline.tf-sparkline__line') != null);
+  assert(el.classList.contains('tf-sparkline--variant-line'));
+  const spark = el.querySelector('tf-sparkline');
+  assert(spark != null, 'tf-sparkline must exist');
+  assertEq(spark.points, [1, 5, 3, 8, 2]);
+  assertEq(spark.fill, false);
+  assertEq(spark.height, 30);
+  assertEq(spark.style.width, '100px');
+  assertEq(spark.color, 'primary');
 });
 
-test('Sparkline area variant renderuje <polygon> + <polyline>', () => {
+test('Sparkline area variant sets fill=true', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -85,12 +94,11 @@ test('Sparkline area variant renderuje <polygon> + <polyline>', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'area' })));
-  const svg = el.querySelector('svg');
-  assert(svg.querySelector('polygon.tf-sparkline__area') != null);
-  assert(svg.querySelector('polyline.tf-sparkline__line') != null);
+  assert(el.classList.contains('tf-sparkline--variant-area'));
+  assertEq(el.querySelector('tf-sparkline').fill, true);
 });
 
-test('Sparkline bar variant renderuje N rectangles', () => {
+test('Sparkline bar variant keeps fill=false and sets variant class', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -99,7 +107,10 @@ test('Sparkline bar variant renderuje N rectangles', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
-  assertEq(el.querySelectorAll('rect.tf-sparkline__bar').length, 5);
+  assert(el.classList.contains('tf-sparkline--variant-bar'));
+  const spark = el.querySelector('tf-sparkline');
+  assertEq(spark.fill, false);
+  assertEq(spark.points.length, 5);
 });
 
 test('Sparkline show_min_max renderuje min/max badges', () => {
@@ -128,7 +139,7 @@ test('Sparkline z fractional values format z 2 miejscami', () => {
   assertEq(el.querySelector('.tf-sparkline__max').textContent, '0.46');
 });
 
-test('Sparkline reactive: data update rerenders SVG', () => {
+test('Sparkline reactive: store patch updates bound points', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -137,15 +148,16 @@ test('Sparkline reactive: data update rerenders SVG', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
-  assertEq(el.querySelectorAll('rect').length, 2);
+  const spark = el.querySelector('tf-sparkline');
+  assertEq(spark.points, [1, 2]);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('data'), op: { kind: 'set', value: [1, 2, 3, 4, 5] } }],
   });
-  assertEq(el.querySelectorAll('rect').length, 5);
+  assertEq(spark.points, [1, 2, 3, 4, 5]);
 });
 
-test('Sparkline empty data nie crashuje', () => {
+test('Sparkline empty data binds empty points without crash', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -154,10 +166,10 @@ test('Sparkline empty data nie crashuje', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields()));
-  assertEq(el.querySelectorAll('polyline').length, 0);
+  assertEq(el.querySelector('tf-sparkline').points, []);
 });
 
-test('Sparkline nieliczbowe wartości w array są filtrowane', () => {
+test('Sparkline non-numeric values are filtered out of points', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -166,10 +178,10 @@ test('Sparkline nieliczbowe wartości w array są filtrowane', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
-  assertEq(el.querySelectorAll('rect').length, 3);
+  assertEq(el.querySelector('tf-sparkline').points, [1, 2, 3]);
 });
 
-test('Sparkline wszystkie wartości równe — bez crash przez div/0', () => {
+test('Sparkline all-equal values bind unchanged (min/max badges equal)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -177,8 +189,10 @@ test('Sparkline wszystkie wartości równe — bez crash przez div/0', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields()));
-  assert(el.querySelector('polyline') != null);
+  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ showMinMax: true })));
+  assertEq(el.querySelector('tf-sparkline').points, [5, 5, 5, 5]);
+  assertEq(el.querySelector('.tf-sparkline__min').textContent, '5');
+  assertEq(el.querySelector('.tf-sparkline__max').textContent, '5');
 });
 
 test('Sparkline tone klasy', () => {
@@ -206,13 +220,14 @@ test('Sparkline height_px=0 throws', () => {
   assertThrows(() => engine.render(comp(SPARKLINE_TAG, sparklineFields({ h: 0 }))));
 });
 
-test('Sparkline SVG ma role=img + aria-label', () => {
+test('Sparkline width_px/height_px accept BigInt u16, tone maps to color role', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields()));
-  const svg = el.querySelector('svg');
-  assertEq(svg.getAttribute('role'), 'img');
-  assert(svg.hasAttribute('aria-label'));
+  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ w: 120n, h: 40n, tone: 'critical' })));
+  const spark = el.querySelector('tf-sparkline');
+  assertEq(spark.style.width, '120px');
+  assertEq(spark.height, 40);
+  assertEq(spark.color, 'danger');
 });
 
 test('Sparkline unknown field throws', () => {

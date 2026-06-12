@@ -4,6 +4,7 @@
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-list.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -82,7 +83,7 @@ function listFields({
 // List
 // ============================================================================
 
-test('List renderuje <ul> z N items', () => {
+test('List renders <tf-list> with N bound items', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -91,11 +92,15 @@ test('List renderuje <ul> z N items', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields()));
-  assertEq(el.querySelectorAll('.tf-list__item').length, 2);
+  document.body.appendChild(el);
+  const tfList = el.querySelector('tf-list');
+  assert(tfList != null, 'tf-list must exist');
+  assertEq(tfList.items.length, 2);
+  assertEq(el.querySelectorAll('.tf-list-item').length, 2);
   assertEq(el.getAttribute('data-template-id'), 'list_item');
 });
 
-test('List item fallback text z label/title/id', () => {
+test('List item title fallback from label/title/id', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -108,13 +113,14 @@ test('List item fallback text z label/title/id', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields()));
-  const items = el.querySelectorAll('.tf-list__item-content');
-  assertEq(items[0].textContent, 'L');
-  assertEq(items[1].textContent, 'T');
-  assertEq(items[2].textContent, 'c');
+  document.body.appendChild(el);
+  const titles = el.querySelectorAll('.tf-list-item-title');
+  assertEq(titles[0].textContent, 'L');
+  assertEq(titles[1].textContent, 'T');
+  assertEq(titles[2].textContent, 'c');
 });
 
-test('List XSS-safe: HTML w item.label nie tworzy elementu', () => {
+test('List passes raw label text into tf-list items (renderer does not interpret HTML)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -123,11 +129,35 @@ test('List XSS-safe: HTML w item.label nie tworzy elementu', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields()));
-  assertEq(el.querySelector('img'), null);
-  assertEq(el.querySelector('.tf-list__item-content').textContent, '<img src=x onerror=alert(1)>');
+  const tfList = el.querySelector('tf-list');
+  assertEq(tfList.items[0].title, '<img src=x onerror=alert(1)>');
+  assertEq(tfList.items[0].id, 'x');
 });
 
-test('List item click emituje item_click z item_id+item_index+template_id', () => {
+test('List XSS regression — HTML in item fields renders as text, never elements', () => {
+  setup();
+  delete window.__pwn;
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('items'), value: [{
+      id: 'x',
+      label: '<img src=x onerror=window.__pwn=1>',
+      sub: '<img src=x onerror=window.__pwn=1>',
+      chip: '<img src=x onerror=window.__pwn=1>',
+    }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(LIST_TAG, listFields()));
+  document.body.appendChild(el);
+  assertEq(el.querySelector('img'), null, 'payload must not create an element');
+  assertEq(el.querySelector('.tf-list-item-title').textContent, '<img src=x onerror=window.__pwn=1>');
+  assertEq(el.querySelector('.tf-list-item-sub').textContent, '<img src=x onerror=window.__pwn=1>');
+  assertEq(el.querySelector('.tf-chip').textContent, '<img src=x onerror=window.__pwn=1>');
+  assert(window.__pwn === undefined, 'onerror payload must not execute');
+});
+
+test('List item click re-emits item_click with item_id+item_index+template_id', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -136,13 +166,14 @@ test('List item click emituje item_click z item_id+item_index+template_id', () =
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields({ templateId: 'my_tpl' })));
+  document.body.appendChild(el);
   let got = null;
   el.addEventListener('item_click', (e) => { got = e.detail; });
-  el.querySelectorAll('.tf-list__item')[1].click();
+  el.querySelectorAll('.tf-list-item')[1].click();
   assertEq(got, { item_id: 'b', item_index: 1, template_id: 'my_tpl' });
 });
 
-test('List keyboard Enter na item triggers item_click', () => {
+test('List density=compact sets compact attribute on tf-list', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -150,14 +181,14 @@ test('List keyboard Enter na item triggers item_click', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(comp(LIST_TAG, listFields()));
-  let got = null;
-  el.addEventListener('item_click', (e) => { got = e.detail; });
-  el.querySelector('.tf-list__item').dispatchEvent(new (globalThis.KeyboardEvent || globalThis.Event)('keydown', { key: 'Enter', bubbles: false, cancelable: true }));
-  assertEq(got.item_id, 'x');
+  const el = engine.render(comp(LIST_TAG, listFields({ density: 'compact' })));
+  document.body.appendChild(el);
+  const tfList = el.querySelector('tf-list');
+  assert(tfList.hasAttribute('compact'));
+  assert(el.querySelector('.tf-list-item').classList.contains('compact'));
 });
 
-test('List items=[] z empty_state pokazuje empty_state, ukrywa <ul>', () => {
+test('List items=[] with empty_state shows empty state and renders no items', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -165,15 +196,18 @@ test('List items=[] z empty_state pokazuje empty_state, ukrywa <ul>', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const es = emptyStateComp({ heading: { kind: 'literal', value: 'Brak danych' } });
+  const es = emptyStateComp({ heading: { kind: 'literal', value: 'No data' } });
   const el = engine.render(comp(LIST_TAG, listFields({ emptyState: es })));
-  assertEq(el.querySelector('.tf-list__items').hidden, true);
-  const esEl = el.querySelector('.tf-empty-state');
+  document.body.appendChild(el);
+  assertEq(el.querySelector('tf-list').items.length, 0);
+  assertEq(el.querySelectorAll('.tf-list-item').length, 0);
+  const esEl = el.querySelector('.tf-list__empty-state');
   assertEq(esEl.hidden, false);
-  assertEq(esEl.querySelector('.tf-empty-state__heading').textContent, 'Brak danych');
+  assertEq(esEl.tagName, 'TF-EMPTY-STATE');
+  assertEq(esEl.getAttribute('title'), 'No data');
 });
 
-test('List items dodawane po empty toggle visibility', () => {
+test('List items added after empty toggle empty-state visibility', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -183,16 +217,17 @@ test('List items dodawane po empty toggle visibility', () => {
   const engine = makeEngine(store);
   const es = emptyStateComp();
   const el = engine.render(comp(LIST_TAG, listFields({ emptyState: es })));
-  assertEq(el.querySelector('.tf-list__items').hidden, true);
+  document.body.appendChild(el);
+  assertEq(el.querySelector('.tf-list__empty-state').hidden, false);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('items'), op: { kind: 'set', value: [{ id: 'a' }] } }],
   });
-  assertEq(el.querySelector('.tf-list__items').hidden, false);
-  assertEq(el.querySelector('.tf-empty-state').hidden, true);
+  assertEq(el.querySelector('.tf-list__empty-state').hidden, true);
+  assertEq(el.querySelectorAll('.tf-list-item').length, 1);
 });
 
-test('List max_visible truncates + renderuje "+N more"', () => {
+test('List max_visible truncates bound items (Number and BigInt)', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -201,9 +236,12 @@ test('List max_visible truncates + renderuje "+N more"', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields({ maxVisible: 3 })));
-  assertEq(el.querySelectorAll('.tf-list__item').length, 3);
-  const more = el.querySelector('.tf-list__more');
-  assertEq(more.textContent, '+2 more');
+  document.body.appendChild(el);
+  assertEq(el.querySelector('tf-list').items.length, 3);
+  assertEq(el.querySelectorAll('.tf-list-item').length, 3);
+  // u32 also accepted as BigInt
+  const el2 = engine.render(comp(LIST_TAG, listFields({ maxVisible: 2n }), { id: 'c2' }));
+  assertEq(el2.querySelector('tf-list').items.length, 2);
 });
 
 test('List max_visible=0 throws', () => {
@@ -225,14 +263,13 @@ test('List empty_state z innym tagiem throws', () => {
   assertThrows(() => engine.render(comp(LIST_TAG, listFields({ emptyState: bad }))));
 });
 
-test('List divider=true ustawia klasę', () => {
+test('List divider non-boolean throws', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(LIST_TAG, listFields({ divider: true })));
-  assert(el.classList.contains('tf-list--divider'));
+  assertThrows(() => engine.render(comp(LIST_TAG, listFields({ divider: 'yes' }))));
 });
 
-test('List reactive rebuild — usunięte items zwalniają listenery', () => {
+test('List reactive rebuild — replaced items detach and stop emitting clicks', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -241,17 +278,20 @@ test('List reactive rebuild — usunięte items zwalniają listenery', () => {
   });
   const engine = makeEngine(store);
   const el = engine.render(comp(LIST_TAG, listFields()));
-  // Patch: zmiana items, stary item DOM wymieniony.
-  const oldItem = el.querySelector('.tf-list__item');
+  document.body.appendChild(el);
+  const oldItem = el.querySelector('.tf-list-item');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('items'), op: { kind: 'set', value: [{ id: 'b' }] } }],
   });
-  assert(!el.contains(oldItem));
+  assert(!el.contains(oldItem), 'old item DOM must be replaced');
   let got = null;
   el.addEventListener('item_click', (e) => { got = e.detail; });
-  oldItem.click();  // już odpięty od wrapper'a; powinien NIE wyemitować
+  oldItem.click();  // detached from tf-list container; must NOT emit
   assertEq(got, null);
+  // the rebuilt item is live and bound to the new data
+  el.querySelector('.tf-list-item').click();
+  assertEq(got.item_id, 'b');
 });
 
 test('List unknown field throws', () => {

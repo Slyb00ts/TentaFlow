@@ -358,8 +358,11 @@ function renderDatePicker(component, ctx) {
     wrapper.appendChild(presetBar);
   }
 
-  // Forward tf-datepicker change event
+  // Forward tf-datepicker change event. The raw component event (detail
+  // { value, date }) bubbles, so it is stopped here — the dispatcher on the
+  // wrapper must only ever see the SDK-shaped re-emit.
   const onChange = (e) => {
+    e.stopImmediatePropagation();
     const v = picker.value;
     if (v && disabledSet && disabledSet.has(v)) {
       picker.value = lastValid;
@@ -574,8 +577,10 @@ function renderDateRangePicker(component, ctx) {
       })
     );
   };
-  const onFromChange = () => validateAndEmit('from');
-  const onToChange = () => validateAndEmit('to');
+  // Raw tf-datepicker change (detail { value, date }) bubbles past the
+  // pickers; stop it so only the validated SDK range event reaches the wrapper.
+  const onFromChange = (e) => { e.stopImmediatePropagation(); validateAndEmit('from'); };
+  const onToChange = (e) => { e.stopImmediatePropagation(); validateAndEmit('to'); };
   fromPicker.addEventListener('change', onFromChange);
   toPicker.addEventListener('change', onToChange);
   ctx.registerCleanup(() => {
@@ -646,7 +651,9 @@ function renderTimePicker(component, ctx) {
   applyValueReactive(input, bindPath, ctx, (s) => ISO_TIME_RE.test(s));
   wrapper.appendChild(input);
 
-  const onChange = () => {
+  // Native change bubbles; stop it so the wrapper only sees the SDK re-emit.
+  const onChange = (e) => {
+    e.stopImmediatePropagation();
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,
@@ -740,7 +747,9 @@ function renderDateTimePicker(component, ctx) {
   applyValueReactive(input, bindPath, ctx, (s) => ISO_LOCAL_DT_RE.test(s));
   wrapper.appendChild(input);
 
-  const onChange = () => {
+  // Native change bubbles; stop it so the wrapper only sees the SDK re-emit.
+  const onChange = (e) => {
+    e.stopImmediatePropagation();
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('change', {
         bubbles: false,

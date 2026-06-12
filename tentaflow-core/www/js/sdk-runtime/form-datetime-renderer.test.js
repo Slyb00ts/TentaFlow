@@ -1,9 +1,13 @@
 // =============================================================================
-// Plik: sdk-runtime/form-datetime-renderer.test.js
-// Opis: Testy DatePicker/DateRangePicker/TimePicker/DateTimePicker — chunk 3.3c-4.
+// File: sdk-runtime/form-datetime-renderer.test.js
+// Description: Tests for DatePicker (0x0314) / DateRangePicker (0x0315) /
+// TimePicker (0x0316) / DateTimePicker (0x0317). Date pickers render through
+// the <tf-datepicker> calendar component (imported for happy-dom upgrade);
+// time/datetime pickers use native inputs.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-datepicker.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -52,12 +56,18 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// tf-datepicker builds its calendar in connectedCallback, so tests that
+// click calendar days mount the rendered tree first.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
 // DatePicker
 // ============================================================================
 
-test('DatePicker renderuje <input type=date> z min/max', () => {
+test('DatePicker renders <tf-datepicker> with min/max attrs + label', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(DATE_PICKER_TAG, [
@@ -68,13 +78,16 @@ test('DatePicker renderuje <input type=date> z min/max', () => {
     [5, 'medium'],
     [6, 'monday'],
   ]));
-  const input = el.querySelector('input');
-  assertEq(input.getAttribute('type'), 'date');
-  assertEq(input.getAttribute('min'), '2024-01-01');
-  assertEq(input.getAttribute('max'), '2025-12-31');
+  assert(el.classList.contains('tf-datepicker-wrapper'));
+  assert(el.classList.contains('tf-datepicker--format-medium'));
+  assertEq(el.getAttribute('data-first-day-of-week'), 'monday');
+  assertEq(el.querySelector('.tf-datepicker__label').textContent, 'Data');
+  const picker = el.querySelector('tf-datepicker');
+  assertEq(picker.getAttribute('min'), '2024-01-01');
+  assertEq(picker.getAttribute('max'), '2025-12-31');
 });
 
-test('DatePicker reactive value sync ze store', () => {
+test('DatePicker reactive value sync from store', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('d'), value: '2024-06-15' }], state_revision: 0, truncated: false });
@@ -83,10 +96,32 @@ test('DatePicker reactive value sync ze store', () => {
     [0, PATH('d')], [1, { kind: 'literal', value: 'D' }],
     [5, 'short'], [6, 'monday'],
   ]));
-  assertEq(el.querySelector('input').value, '2024-06-15');
+  const picker = el.querySelector('tf-datepicker');
+  assertEq(picker.getAttribute('value'), '2024-06-15');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('d'), op: { kind: 'set', value: '2024-07-01' } }],
+  });
+  assertEq(picker.getAttribute('value'), '2024-07-01');
 });
 
-test('DatePicker change emituje value + kind=tstr', () => {
+test('DatePicker non-ISO store value is ignored (picker keeps last value)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('d'), value: '2024-06-15' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(DATE_PICKER_TAG, [
+    [0, PATH('d')], [1, { kind: 'literal', value: 'D' }],
+    [5, 'short'], [6, 'monday'],
+  ]));
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('d'), op: { kind: 'set', value: '15/06/2024' } }],
+  });
+  assertEq(el.querySelector('tf-datepicker').getAttribute('value'), '2024-06-15');
+});
+
+test('DatePicker picker change re-emits value + kind=tstr on wrapper', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(DATE_PICKER_TAG, [
@@ -95,13 +130,69 @@ test('DatePicker change emituje value + kind=tstr', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const input = el.querySelector('input');
-  input.value = '2024-06-15';
-  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  const picker = el.querySelector('tf-datepicker');
+  picker.value = '2024-06-15';
+  picker.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, { value: '2024-06-15', kind: 'tstr' });
 });
 
-test('DatePicker disabled_dates revert do poprzedniej wartości', () => {
+test('DatePicker calendar day click emits SDK change with clicked ISO date', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(DATE_PICKER_TAG, [
+    [0, PATH('d')], [1, { kind: 'literal', value: 'D' }],
+    [5, 'short'], [6, 'monday'],
+  ])));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  const day = el.querySelector('.tf-dp-day:not(.other)');
+  const iso = day.dataset.date;
+  day.click();
+  // The renderer re-emits the SDK-shaped payload on the wrapper.
+  const sdk = events.find((d) => d && d.kind === 'tstr');
+  assert(sdk != null, 'expected SDK change event with kind=tstr');
+  assertEq(sdk.value, iso);
+  assertEq(el.querySelector('tf-datepicker').value, iso);
+});
+
+test('DatePicker day click emits exactly ONE SDK change, raw detail never leaks', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(DATE_PICKER_TAG, [
+    [0, PATH('d')], [1, { kind: 'literal', value: 'D' }],
+    [5, 'short'], [6, 'monday'],
+  ])));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  const day = el.querySelector('.tf-dp-day:not(.other)');
+  const iso = day.dataset.date;
+  // tf-datepicker dispatches a BUBBLING change with detail { value, date };
+  // the renderer must stop it so only the SDK re-emit reaches the wrapper.
+  day.click();
+  assertEq(events.length, 1);
+  assertEq(events[0], { value: iso, kind: 'tstr' });
+  assert(!('date' in events[0]), 'raw tf-datepicker { value, date } detail leaked');
+});
+
+test('DatePicker disabled date: bubbling raw change never reaches wrapper', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(DATE_PICKER_TAG, [
+    [0, PATH('d')], [1, { kind: 'literal', value: 'D' }],
+    [5, 'short'], [6, 'monday'],
+    [7, ['2024-06-15']],
+  ]));
+  const picker = el.querySelector('tf-datepicker');
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  picker.value = '2024-06-15';  // disabled — renderer reverts, emits nothing
+  picker.dispatchEvent(new CustomEvent('change', {
+    bubbles: true, detail: { value: '2024-06-15', date: new Date() },
+  }));
+  assertEq(events, []);
+});
+
+test('DatePicker disabled_dates reverts to previous value', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(DATE_PICKER_TAG, [
@@ -109,16 +200,16 @@ test('DatePicker disabled_dates revert do poprzedniej wartości', () => {
     [5, 'short'], [6, 'monday'],
     [7, ['2024-06-15', '2024-06-16']],
   ]));
-  const input = el.querySelector('input');
+  const picker = el.querySelector('tf-datepicker');
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  input.value = '2024-06-15';  // disabled
-  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  picker.value = '2024-06-15';  // disabled
+  picker.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, null);
-  assertEq(input.value, '');  // revert do pustego (initial lastValid)
+  assertEq(picker.value, '');  // reverted to empty (initial lastValid)
 });
 
-test('DatePicker preset Today emituje aktualną datę', () => {
+test('DatePicker preset Today emits current date with preset_id', () => {
   setup();
   const engine = makeEngine();
   const preset = [[0, 'today'], [1, { kind: 'literal', value: 'Dzisiaj' }], [2, { kind: 'today' }]];
@@ -129,14 +220,18 @@ test('DatePicker preset Today emituje aktualną datę', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-datepicker__preset').click();
+  const btn = el.querySelector('.tf-datepicker__presets [data-preset-id=today]');
+  assertEq(btn.tagName.toLowerCase(), 'tf-button');
+  assertEq(btn.textContent, 'Dzisiaj');
+  btn.click();
   assert(got != null);
   assertEq(got.preset_id, 'today');
   assertEq(got.kind, 'tstr');
   assert(/^\d{4}-\d{2}-\d{2}$/.test(got.value));
+  assertEq(el.querySelector('tf-datepicker').value, got.value);
 });
 
-test('DatePicker preset custom offset_days=-10', () => {
+test('DatePicker preset custom offset_days=-10 emits valid ISO date', () => {
   setup();
   const engine = makeEngine();
   const preset = [[0, 'p10'], [1, { kind: 'literal', value: '-10' }], [2, { kind: 'custom', offset_days: -10 }]];
@@ -147,8 +242,8 @@ test('DatePicker preset custom offset_days=-10', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-datepicker__preset').click();
-  // Wystarczy że value jest valid ISO date — dokładna wartość zależy od testu time'u.
+  el.querySelector('[data-preset-id=p10]').click();
+  // Exact value depends on run time — a valid ISO date is sufficient.
   assert(/^\d{4}-\d{2}-\d{2}$/.test(got.value));
 });
 
@@ -182,7 +277,7 @@ test('DatePicker unknown field throws', () => {
   ])));
 });
 
-test('DatePicker preset Last7Days używa snake_case kind=last_7_days', () => {
+test('DatePicker preset Last7Days uses snake_case kind=last_7_days', () => {
   setup();
   const engine = makeEngine();
   const preset = [[0, '7d'], [1, { kind: 'literal', value: '7d' }], [2, { kind: 'last_7_days' }]];
@@ -193,11 +288,11 @@ test('DatePicker preset Last7Days używa snake_case kind=last_7_days', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-datepicker__preset').click();
+  el.querySelector('[data-preset-id="7d"]').click();
   assert(got != null && /^\d{4}-\d{2}-\d{2}$/.test(got.value));
 });
 
-test('DatePicker disabled date po preset revert do preset value (NIE do pustego)', () => {
+test('DatePicker disabled date after preset reverts to preset value (NOT empty)', () => {
   setup();
   const engine = makeEngine();
   const presetToday = [[0, 'today'], [1, { kind: 'literal', value: 'T' }], [2, { kind: 'today' }]];
@@ -207,15 +302,14 @@ test('DatePicker disabled date po preset revert do preset value (NIE do pustego)
     [7, ['2099-01-01']],  // disabled future date
     [8, [presetToday]],
   ]));
-  const input = el.querySelector('input');
-  // Wybierz preset Today.
-  el.querySelector('.tf-datepicker__preset').click();
-  const presetValue = input.value;
+  const picker = el.querySelector('tf-datepicker');
+  el.querySelector('[data-preset-id=today]').click();
+  const presetValue = picker.value;
   assert(presetValue.length > 0);
-  // Teraz user wybiera disabled date — powinno revert do preset value, NIE do pustego.
-  input.value = '2099-01-01';
-  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
-  assertEq(input.value, presetValue);
+  // User then picks a disabled date — must revert to preset value, NOT empty.
+  picker.value = '2099-01-01';
+  picker.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  assertEq(picker.value, presetValue);
 });
 
 test('DatePicker bez label wymaga a11y.label', () => {
@@ -230,20 +324,24 @@ test('DatePicker bez label wymaga a11y.label', () => {
 // DateRangePicker
 // ============================================================================
 
-test('DateRangePicker renderuje 2x input type=date + dash', () => {
+test('DateRangePicker renders 2x <tf-datepicker> + dash', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(DATE_RANGE_PICKER_TAG, [
     [0, PATH('from')], [1, PATH('to')],
     [2, { kind: 'literal', value: 'Zakres' }],
+    [3, '2024-01-01'], [4, '2025-12-31'],
     [6, 'short'], [7, 'monday'],
   ]));
-  const inputs = el.querySelectorAll('input[type=date]');
-  assertEq(inputs.length, 2);
+  const pickers = el.querySelectorAll('tf-datepicker');
+  assertEq(pickers.length, 2);
+  assertEq(pickers[0].getAttribute('min'), '2024-01-01');
+  assertEq(pickers[1].getAttribute('max'), '2025-12-31');
   assert(el.querySelector('.tf-daterange__dash') != null);
+  assertEq(el.querySelector('.tf-daterange__label').textContent, 'Zakres');
 });
 
-test('DateRangePicker from > to revert', () => {
+test('DateRangePicker from > to reverts the to picker', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(DATE_RANGE_PICKER_TAG, [
@@ -251,15 +349,38 @@ test('DateRangePicker from > to revert', () => {
     [2, { kind: 'literal', value: 'Z' }],
     [6, 'short'], [7, 'monday'],
   ]));
-  const [fromI, toI] = el.querySelectorAll('input');
-  let got = null;
-  el.addEventListener('change', (e) => { got = e.detail; });
-  fromI.value = '2024-06-15';
-  fromI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
-  toI.value = '2024-06-10';  // przed from
-  toI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
-  // Drugi change powinien być revert'owany.
-  assertEq(toI.value, '');
+  const [fromP, toP] = el.querySelectorAll('tf-datepicker');
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  fromP.value = '2024-06-15';
+  fromP.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  assertEq(events.length, 1);
+  assertEq(events[0], { value: { from: '2024-06-15', to: null }, kind: 'range', changed: 'from' });
+  toP.value = '2024-06-10';  // before from
+  toP.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  // Second change must be reverted and not emitted.
+  assertEq(events.length, 1);
+  assertEq(toP.value, '');
+});
+
+test('DateRangePicker bubbling raw picker change yields exactly one SDK range event', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(DATE_RANGE_PICKER_TAG, [
+    [0, PATH('from')], [1, PATH('to')],
+    [2, { kind: 'literal', value: 'Z' }],
+    [6, 'short'], [7, 'monday'],
+  ]));
+  const [fromP] = el.querySelectorAll('tf-datepicker');
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  fromP.value = '2024-06-15';
+  fromP.dispatchEvent(new CustomEvent('change', {
+    bubbles: true, detail: { value: '2024-06-15', date: new Date() },
+  }));
+  assertEq(events.length, 1);
+  assertEq(events[0], { value: { from: '2024-06-15', to: null }, kind: 'range', changed: 'from' });
+  assert(!('date' in events[0]), 'raw tf-datepicker detail leaked to wrapper');
 });
 
 test('DateRangePicker max_range_days enforcement', () => {
@@ -269,20 +390,20 @@ test('DateRangePicker max_range_days enforcement', () => {
     [0, PATH('from')], [1, PATH('to')],
     [2, { kind: 'literal', value: 'Z' }],
     [6, 'short'], [7, 'monday'],
-    [12, 7],  // max 7 dni
+    [12, 7],  // max 7 days
   ]));
-  const [fromI, toI] = el.querySelectorAll('input');
-  fromI.value = '2024-06-01';
-  fromI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
-  toI.value = '2024-06-15';  // 15 dni
-  toI.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
-  assertEq(toI.value, '');  // revert
+  const [fromP, toP] = el.querySelectorAll('tf-datepicker');
+  fromP.value = '2024-06-01';
+  fromP.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  toP.value = '2024-06-15';  // 15 days span
+  toP.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
+  assertEq(toP.value, '');  // reverted
 });
 
-test('DateRangePicker preset emituje range value', () => {
+test('DateRangePicker preset emits range value', () => {
   setup();
   const engine = makeEngine();
-  const inner = [[0, -6], [1, 0]];  // ostatnie 7 dni
+  const inner = [[0, -6], [1, 0]];  // last 7 days
   const preset = [[0, 'p7'], [1, { kind: 'literal', value: '7 dni' }], [2, inner]];
   const el = engine.render(comp(DATE_RANGE_PICKER_TAG, [
     [0, PATH('from')], [1, PATH('to')],
@@ -292,14 +413,18 @@ test('DateRangePicker preset emituje range value', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-daterange__preset').click();
+  const btn = el.querySelector('.tf-daterange__presets [data-preset-id=p7]');
+  btn.click();
   assertEq(got.kind, 'range');
   assertEq(got.preset_id, 'p7');
   assert(typeof got.value.from === 'string');
   assert(typeof got.value.to === 'string');
+  const [fromP, toP] = el.querySelectorAll('tf-datepicker');
+  assertEq(fromP.value, got.value.from);
+  assertEq(toP.value, got.value.to);
 });
 
-test('DateRangePicker preset z from > to NIE emituje', () => {
+test('DateRangePicker preset with from > to does NOT emit', () => {
   setup();
   const engine = makeEngine();
   // RangePresetRange { from_offset_days: 0, to_offset_days: -5 } → from > to
@@ -313,7 +438,7 @@ test('DateRangePicker preset z from > to NIE emituje', () => {
   ]));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  el.querySelector('.tf-daterange__preset').click();
+  el.querySelector('[data-preset-id=bad]').click();
   assertEq(got, null);
 });
 
@@ -389,6 +514,23 @@ test('TimePicker change emituje value', () => {
   assertEq(got, { value: '09:45', kind: 'tstr' });
 });
 
+test('TimePicker bubbled native change emits exactly one SDK event', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(TIME_PICKER_TAG, [
+    [0, PATH('t')], [1, 'minute'], [2, 'short'], [3, 1],
+    [4, { kind: 'literal', value: 'G' }],
+  ]));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  const input = el.querySelector('input');
+  input.value = '09:45';
+  // Real-browser bubbling: the native change reaches the wrapper unless the
+  // renderer stops it — only the SDK re-emit may arrive.
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(events, [{ value: '09:45', kind: 'tstr' }]);
+});
+
 test('TimePicker bez label wymaga a11y.label', () => {
   setup();
   const engine = makeEngine();
@@ -458,6 +600,22 @@ test('DateTimePicker change emituje value + timezone', () => {
   input.value = '2024-06-15T14:30';
   input.dispatchEvent(new (globalThis.Event)('change', { bubbles: false }));
   assertEq(got, { value: '2024-06-15T14:30', kind: 'tstr', timezone: 'UTC' });
+});
+
+test('DateTimePicker bubbled native change emits exactly one SDK event', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(DATE_TIME_PICKER_TAG, [
+    [0, PATH('dt')], [1, { kind: 'literal', value: 'DT' }],
+    [4, 'short'], [5, 'short'], [6, 'minute'], [7, 1], [9, 'monday'],
+    [11, 'UTC'],
+  ]));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  const input = el.querySelector('input');
+  input.value = '2024-06-15T14:30';
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(events, [{ value: '2024-06-15T14:30', kind: 'tstr', timezone: 'UTC' }]);
 });
 
 test('DateTimePicker step_minutes=0 throws', () => {

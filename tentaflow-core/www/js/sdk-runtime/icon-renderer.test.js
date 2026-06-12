@@ -188,6 +188,23 @@ test('renderIcon asset rejects size_px > u16', () => {
   );
 });
 
+test('renderIcon asset accepts bigint size_px within u16 range', () => {
+  setup();
+  const img = renderIcon({ kind: 'asset', ref: '/x.svg', size_px: 24n }, 'icon');
+  assertEq(img.getAttribute('width'), '24');
+  assertEq(img.getAttribute('height'), '24');
+});
+
+test('renderIcon asset rejects bigint size_px out of u16 range', () => {
+  setup();
+  assertThrows(() =>
+    renderIcon({ kind: 'asset', ref: '/x.svg', size_px: 0n }, 'icon')
+  );
+  assertThrows(() =>
+    renderIcon({ kind: 'asset', ref: '/x.svg', size_px: 70000n }, 'icon')
+  );
+});
+
 test('renderIcon rejects unknown kind', () => {
   setup();
   assertThrows(() => renderIcon({ kind: 'svg', name: 'star' }, 'x'));
@@ -205,18 +222,18 @@ const ICON_BUTTON_VALID = [
   [4, 'Save document'],
 ];
 
-test('IconButton renders <button> with icon and aria-label', () => {
+test('IconButton renders <tf-button> with icon attribute and aria-label', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(ICON_BUTTON_TAG, ICON_BUTTON_VALID));
-  assertEq(el.tagName, 'BUTTON');
-  assertEq(el.getAttribute('type'), 'button');
+  document.body.appendChild(el);
+  assertEq(el.tagName, 'TF-BUTTON');
   assertEq(el.getAttribute('aria-label'), 'Save document');
-  assert(el.classList.contains('tf-icon-button'));
-  assert(el.classList.contains('tf-icon-button--variant-primary'));
-  assert(el.classList.contains('tf-icon-button--tone-neutral'));
-  assert(el.classList.contains('tf-icon-button--size-md'));
-  assert(el.querySelector('.tf-icon') != null);
+  assertEq(el.getAttribute('variant'), 'primary');
+  // Named icon goes through the tf-button icon attribute (no child element).
+  assertEq(el.getAttribute('icon'), 'save');
+  // SDK size 'md' has no tf-button size mapping.
+  assertEq(el.getAttribute('size'), null);
 });
 
 test('IconButton rejects empty aria_label', () => {
@@ -292,7 +309,6 @@ test('IconButton loading sets aria-busy and disabled', () => {
     ])
   );
   assertEq(el.getAttribute('aria-busy'), 'true');
-  assert(el.classList.contains('tf-icon-button--loading'));
   assert(el.hasAttribute('disabled'));
 });
 

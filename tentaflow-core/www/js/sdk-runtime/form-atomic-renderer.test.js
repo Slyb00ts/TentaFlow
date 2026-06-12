@@ -1,9 +1,25 @@
 // =============================================================================
-// Plik: sdk-runtime/form-atomic-renderer.test.js
-// Opis: Testy Toggle/Checkbox/Radio — chunk 3.3c-1.
+// File: sdk-runtime/form-atomic-renderer.test.js
+// Description: Tests for Toggle (0x030A) / Checkbox (0x030B) / Radio (0x030C)
+// rendered through the <tf-toggle> / <tf-checkbox> / <tf-radio> web components.
+// Components are imported so happy-dom upgrades them on mount. tf-toggle
+// imports '/js/lib/sfx.js' with a browser-absolute specifier, so a module
+// resolve hook maps '/js/...' onto the www root before the dynamic import.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { registerHooks } from 'node:module';
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('/js/')) {
+      return nextResolve(new URL(`../..${specifier}`, import.meta.url).href, context);
+    }
+    return nextResolve(specifier, context);
+  },
+});
+await import('../components/tf-toggle.js');
+import '../components/tf-checkbox.js';
+import '../components/tf-radio.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -56,12 +72,17 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// Components build their light DOM in connectedCallback, so tests mount.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 // ============================================================================
 // Toggle (0x030A)
 // ============================================================================
 
-test('Toggle renders <button role=switch> z reactive aria-checked po store', () => {
+test('Toggle renders <tf-toggle> with reactive checked attr from store', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -69,27 +90,29 @@ test('Toggle renders <button role=switch> z reactive aria-checked po store', () 
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(TOGGLE_TAG, [
       [0, PATH('on')],
       [1, { kind: 'literal', value: 'Powiadomienia' }],
       [3, 'md'],
       [6, 'trailing'],
     ])
-  );
-  const switchEl = el.querySelector('.tf-toggle__switch');
-  assertEq(switchEl.tagName, 'BUTTON');
-  assertEq(switchEl.getAttribute('role'), 'switch');
-  assertEq(switchEl.getAttribute('aria-checked'), 'false');
+  ));
+  const toggle = el.querySelector('tf-toggle');
+  assert(toggle != null, 'expected tf-toggle host element');
+  assertEq(toggle.hasAttribute('checked'), false);
+  const sw = toggle.querySelector('[role=switch]');
+  assertEq(sw.getAttribute('aria-checked'), 'false');
+  assertEq(el.querySelector('.tf-toggle__label').textContent, 'Powiadomienia');
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('on'), op: { kind: 'set', value: true } }],
   });
-  assertEq(switchEl.getAttribute('aria-checked'), 'true');
-  assert(switchEl.classList.contains('tf-toggle__switch--on'));
+  assertEq(toggle.hasAttribute('checked'), true);
+  assertEq(sw.getAttribute('aria-checked'), 'true');
 });
 
-test('Toggle click dispatches change z negated value', () => {
+test('Toggle click re-emits change with SDK { value, kind: bool } payload', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -97,17 +120,45 @@ test('Toggle click dispatches change z negated value', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(TOGGLE_TAG, [
       [0, PATH('on')],
       [1, { kind: 'literal', value: 'X' }],
       [3, 'sm'], [6, 'leading'],
     ])
+  ));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  el.querySelector('tf-toggle [role=switch]').click();
+  // Exactly one SDK event — the raw component event must not leak to wrapper.
+  assertEq(events, [{ value: true, kind: 'bool' }]);
+});
+
+test('Toggle disabled: raw component change never leaks to wrapper', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('on'), value: false },
+      { path: PATH('locked'), value: true },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(TOGGLE_TAG, [
+      [0, PATH('on')], [1, { kind: 'literal', value: 'X' }],
+      [3, 'md'], [5, { kind: 'bound', path: PATH('locked') }], [6, 'trailing'],
+    ])
+  ));
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  // The raw component event bubbles; even on a muted toggle it must be
+  // stopped before it can reach the wrapper with its { checked } detail.
+  el.querySelector('tf-toggle').dispatchEvent(
+    new CustomEvent('change', { bubbles: true, detail: { checked: true } })
   );
-  let received = null;
-  el.addEventListener('change', (e) => { received = e.detail; });
-  el.querySelector('.tf-toggle__switch').click();
-  assertEq(received, { value: true, kind: 'bool' });
+  assertEq(events, []);
 });
 
 test('Toggle uses default tone=primary when field absent', () => {
@@ -125,9 +176,11 @@ test('Toggle uses default tone=primary when field absent', () => {
     ])
   );
   assert(el.classList.contains('tf-toggle--tone-primary'));
+  assert(el.classList.contains('tf-toggle--size-md'));
+  assert(el.classList.contains('tf-toggle--label-trailing'));
 });
 
-test('Toggle disabled BindRef blocks click + sets aria-disabled', () => {
+test('Toggle disabled BindRef sets disabled attr and blocks click', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -138,21 +191,25 @@ test('Toggle disabled BindRef blocks click + sets aria-disabled', () => {
     state_revision: 0, truncated: false,
   });
   const engine = makeEngine(store);
-  const el = engine.render(
+  const el = mount(engine.render(
     comp(TOGGLE_TAG, [
       [0, PATH('on')], [1, { kind: 'literal', value: 'X' }],
       [3, 'md'], [5, { kind: 'bound', path: PATH('locked') }], [6, 'trailing'],
     ])
+  ));
+  const toggle = el.querySelector('tf-toggle');
+  assertEq(toggle.hasAttribute('disabled'), true);
+  assertEq(
+    toggle.querySelector('[role=switch]').getAttribute('aria-disabled'),
+    'true'
   );
-  const sw = el.querySelector('.tf-toggle__switch');
-  assertEq(sw.getAttribute('aria-disabled'), 'true');
   let received = null;
   el.addEventListener('change', (e) => { received = e.detail; });
-  sw.click();
+  toggle.querySelector('[role=switch]').click();
   assertEq(received, null);
 });
 
-test('Toggle label_position=leading places label before switch', () => {
+test('Toggle label_position=leading places label before tf-toggle', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -166,11 +223,38 @@ test('Toggle label_position=leading places label before switch', () => {
       [3, 'md'], [6, 'leading'],
     ])
   );
-  // Label powinien być pierwszym dzieckiem.
   assertEq(el.children[0].classList.contains('tf-toggle__label'), true);
+  assertEq(el.children[1].tagName.toLowerCase(), 'tf-toggle');
 });
 
-test('Toggle bez label wymaga a11y.label', () => {
+test('Toggle hint BindRef renders reactive .tf-toggle__hint', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('on'), value: false },
+      { path: PATH('h'), value: 'pomocniczy' },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(
+    comp(TOGGLE_TAG, [
+      [0, PATH('on')], [1, { kind: 'literal', value: 'X' }],
+      [2, { kind: 'bound', path: PATH('h') }],
+      [3, 'md'], [6, 'trailing'],
+    ])
+  );
+  const hint = el.querySelector('.tf-toggle__hint');
+  assertEq(hint.textContent, 'pomocniczy');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('h'), op: { kind: 'set', value: 'inny' } }],
+  });
+  assertEq(hint.textContent, 'inny');
+});
+
+test('Toggle without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() =>
@@ -191,164 +275,7 @@ test('Toggle rejects unknown field key', () => {
   );
 });
 
-// ============================================================================
-// Checkbox (0x030B)
-// ============================================================================
-
-test('Checkbox renders <input type=checkbox> z reactive checked', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('chk'), value: false }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(CHECKBOX_TAG, [
-      [0, PATH('chk')],
-      [1, { kind: 'literal', value: 'Zgoda' }],
-      [5, 'md'],
-    ])
-  );
-  const box = el.querySelector('input[type=checkbox]');
-  assertEq(box.checked, false);
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('chk'), op: { kind: 'set', value: true } }],
-  });
-  assertEq(box.checked, true);
-});
-
-test('Checkbox change event dispatches z value=bool', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('chk'), value: false }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(CHECKBOX_TAG, [
-      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }], [5, 'md'],
-    ])
-  );
-  let received = null;
-  el.addEventListener('change', (e) => { received = e.detail; });
-  const box = el.querySelector('input');
-  box.checked = true;
-  box.dispatchEvent(new window.Event('change'));
-  assertEq(received, { value: true, kind: 'bool' });
-});
-
-test('Checkbox indeterminate BindRef reactive', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [
-      { path: PATH('chk'), value: false },
-      { path: PATH('ind'), value: true },
-    ],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(CHECKBOX_TAG, [
-      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }],
-      [3, { kind: 'bound', path: PATH('ind') }], [5, 'md'],
-    ])
-  );
-  const box = el.querySelector('input');
-  assertEq(box.indeterminate, true);
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('ind'), op: { kind: 'set', value: false } }],
-  });
-  assertEq(box.indeterminate, false);
-});
-
-test('Checkbox bez label wymaga a11y.label', () => {
-  setup();
-  const engine = makeEngine();
-  assertThrows(() =>
-    engine.render(comp(CHECKBOX_TAG, [[0, PATH('chk')], [5, 'md']]))
-  );
-});
-
-// ============================================================================
-// Radio (0x030C)
-// ============================================================================
-
-test('Radio renders <input type=radio> z reactive checked po SelectValue', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('view'), value: 'list' }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(RADIO_TAG, [
-      [0, PATH('view')],
-      [1, { kind: 'tstr', value: 'list' }],
-      [2, { kind: 'literal', value: 'Lista' }],
-    ])
-  );
-  const radio = el.querySelector('input[type=radio]');
-  assertEq(radio.checked, true);
-  store.applyPatch({
-    base_revision: 0, new_revision: 1,
-    ops: [{ path: PATH('view'), op: { kind: 'set', value: 'grid' } }],
-  });
-  assertEq(radio.checked, false);
-});
-
-test('Radio change dispatches z value+kind z SelectValue', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('n'), value: 0 }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(RADIO_TAG, [
-      [0, PATH('n')],
-      [1, { kind: 'u32', value: 5 }],
-      [2, { kind: 'literal', value: 'Pięć' }],
-    ])
-  );
-  let received = null;
-  el.addEventListener('change', (e) => { received = e.detail; });
-  const radio = el.querySelector('input');
-  radio.checked = true;
-  radio.dispatchEvent(new window.Event('change'));
-  assertEq(received, { value: 5, kind: 'u32' });
-});
-
-test('Radio rejects missing required value/label', () => {
-  setup();
-  const engine = makeEngine();
-  assertThrows(() => engine.render(comp(RADIO_TAG, [[0, PATH('x')]])));
-  assertThrows(() =>
-    engine.render(comp(RADIO_TAG, [[0, PATH('x')], [1, { kind: 'tstr', value: 'a' }]]))
-  );
-});
-
-test('Radio rejects SelectValue z unknown kind', () => {
-  setup();
-  const engine = makeEngine();
-  assertThrows(() =>
-    engine.render(
-      comp(RADIO_TAG, [
-        [0, PATH('x')],
-        [1, { kind: 'float', value: 1.5 }],
-        [2, { kind: 'literal', value: 'X' }],
-      ])
-    )
-  );
-});
-
-test('Toggle bez label propaguje a11y.label jako aria-label na switch', () => {
+test('Toggle without label propagates a11y.label as aria-label on tf-toggle', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -361,24 +288,10 @@ test('Toggle bez label propaguje a11y.label jako aria-label na switch', () => {
       [0, PATH('on')], [3, 'md'], [6, 'trailing'],
     ], { a11y: { label: { kind: 'literal', value: 'Powiadomienia' } } })
   );
-  const sw = el.querySelector('.tf-toggle__switch');
-  assertEq(sw.getAttribute('aria-label'), 'Powiadomienia');
-});
-
-test('Checkbox bez label propaguje a11y.label jako aria-label na input', () => {
-  setup();
-  const store = makeStore();
-  store.applySnapshot({
-    entries: [{ path: PATH('chk'), value: false }],
-    state_revision: 0, truncated: false,
-  });
-  const engine = makeEngine(store);
-  const el = engine.render(
-    comp(CHECKBOX_TAG, [[0, PATH('chk')], [5, 'md']], {
-      a11y: { label: { kind: 'literal', value: 'Zgoda RODO' } },
-    })
+  assertEq(
+    el.querySelector('tf-toggle').getAttribute('aria-label'),
+    'Powiadomienia'
   );
-  assertEq(el.querySelector('input').getAttribute('aria-label'), 'Zgoda RODO');
 });
 
 test('Toggle a11y.label rejects whitespace-only initial value', () => {
@@ -393,48 +306,413 @@ test('Toggle a11y.label rejects whitespace-only initial value', () => {
   );
 });
 
-test('Radio name nie koliduje dla key=a__i_1 vs [a, 1]', () => {
+// ============================================================================
+// Checkbox (0x030B)
+// ============================================================================
+
+test('Checkbox renders <tf-checkbox> with reactive checked attr', () => {
   setup();
-  const engine = makeEngine();
-  // PathSegment z key 'a__i_1' powinno mieć INNĄ name niż [key('a'), index(1)].
-  const r1 = engine.render(
-    comp(RADIO_TAG, [
-      [0, [{ kind: 'key', value: 'a__i_1' }]],
-      [1, { kind: 'tstr', value: 'x' }],
-      [2, { kind: 'literal', value: 'X' }],
-    ], { id: 'r1' })
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('chk'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')],
+      [1, { kind: 'literal', value: 'Zgoda' }],
+      [5, 'md'],
+    ])
+  ));
+  assertEq(el.tagName.toLowerCase(), 'tf-checkbox');
+  assert(el.classList.contains('tf-checkbox--size-md'));
+  assertEq(el.getAttribute('label'), 'Zgoda');
+  assertEq(el.querySelector('.tf-checkbox-text').textContent, 'Zgoda');
+  assertEq(el.hasAttribute('checked'), false);
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('chk'), op: { kind: 'set', value: true } }],
+  });
+  assertEq(el.hasAttribute('checked'), true);
+  assertEq(
+    el.querySelector('[role=checkbox]').getAttribute('aria-checked'),
+    'true'
   );
-  const r2 = engine.render(
-    comp(RADIO_TAG, [
-      [0, [{ kind: 'key', value: 'a' }, { kind: 'index', value: 1 }]],
-      [1, { kind: 'tstr', value: 'y' }],
-      [2, { kind: 'literal', value: 'Y' }],
-    ], { id: 'r2' })
-  );
-  const n1 = r1.querySelector('input').getAttribute('name');
-  const n2 = r2.querySelector('input').getAttribute('name');
-  assert(n1 !== n2, `path serialization collision: ${n1}`);
 });
 
-test('Radio name attr is deterministic from bind_path', () => {
+test('Checkbox click re-emits exactly ONE SDK change (no recursion)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('chk'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }], [5, 'md'],
+    ])
+  ));
+  // Listener registered AFTER the renderer's — exactly like the dispatcher.
+  // Pre-fix the re-emit re-entered the renderer's own listener (~1500
+  // recursive dispatches with a degraded payload); the guard must yield
+  // exactly one SDK-shaped event per click.
+  const events = [];
+  el.addEventListener('change', (e) => events.push(e.detail));
+  el.querySelector('.tf-checkbox-label').click();
+  assertEq(events, [{ value: true, kind: 'bool' }]);
+  el.querySelector('.tf-checkbox-label').click();
+  assertEq(events, [
+    { value: true, kind: 'bool' },
+    { value: false, kind: 'bool' },
+  ]);
+});
+
+test('Checkbox raw component { checked } detail never reaches dispatcher', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('chk'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }], [5, 'md'],
+    ])
+  ));
+  const seenDetails = [];
+  el.addEventListener('change', (e) => seenDetails.push(e.detail));
+  el.querySelector('.tf-checkbox-label').click();
+  assert(
+    seenDetails.every((d) => d != null && !('checked' in d) && 'kind' in d),
+    'raw component { checked } detail leaked to the dispatcher listener'
+  );
+});
+
+test('Checkbox indeterminate BindRef reactive (attr + aria-checked=mixed)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('chk'), value: false },
+      { path: PATH('ind'), value: true },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }],
+      [3, { kind: 'bound', path: PATH('ind') }], [5, 'md'],
+    ])
+  ));
+  assertEq(el.hasAttribute('indeterminate'), true);
+  assertEq(
+    el.querySelector('[role=checkbox]').getAttribute('aria-checked'),
+    'mixed'
+  );
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('ind'), op: { kind: 'set', value: false } }],
+  });
+  assertEq(el.hasAttribute('indeterminate'), false);
+});
+
+test('Checkbox disabled BindRef blocks click (no change emitted)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('chk'), value: false },
+      { path: PATH('lock'), value: true },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }],
+      [4, { kind: 'bound', path: PATH('lock') }], [5, 'md'],
+    ])
+  ));
+  assertEq(el.hasAttribute('disabled'), true);
+  let received = null;
+  el.addEventListener('change', (e) => { received = e.detail; });
+  el.querySelector('.tf-checkbox-label').click();
+  assertEq(received, null);
+});
+
+test('Checkbox label BindRef updates label attr reactively', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('chk'), value: false },
+      { path: PATH('lbl'), value: 'Zgoda' },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(CHECKBOX_TAG, [
+      [0, PATH('chk')],
+      [1, { kind: 'bound', path: PATH('lbl') }],
+      [5, 'md'],
+    ])
+  ));
+  assertEq(el.getAttribute('label'), 'Zgoda');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'Consent' } }],
+  });
+  assertEq(el.getAttribute('label'), 'Consent');
+  assertEq(el.querySelector('.tf-checkbox-text').textContent, 'Consent');
+});
+
+test('Checkbox without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
-  const path1 = PATH('cfg', 'view');
-  const radio1 = engine.render(
-    comp(RADIO_TAG, [
-      [0, path1], [1, { kind: 'tstr', value: 'a' }],
-      [2, { kind: 'literal', value: 'A' }],
-    ], { id: 'r1' })
+  assertThrows(() =>
+    engine.render(comp(CHECKBOX_TAG, [[0, PATH('chk')], [5, 'md']]))
   );
-  const radio2 = engine.render(
-    comp(RADIO_TAG, [
-      [0, path1], [1, { kind: 'tstr', value: 'b' }],
-      [2, { kind: 'literal', value: 'B' }],
-    ], { id: 'r2' })
+});
+
+test('Checkbox without label propagates a11y.label as aria-label', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('chk'), value: false }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(
+    comp(CHECKBOX_TAG, [[0, PATH('chk')], [5, 'md']], {
+      a11y: { label: { kind: 'literal', value: 'Zgoda RODO' } },
+    })
   );
-  const n1 = radio1.querySelector('input').getAttribute('name');
-  const n2 = radio2.querySelector('input').getAttribute('name');
-  assertEq(n1, n2);
+  assertEq(el.getAttribute('aria-label'), 'Zgoda RODO');
+});
+
+test('Checkbox rejects unknown field key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(comp(CHECKBOX_TAG, [
+      [0, PATH('chk')], [1, { kind: 'literal', value: 'X' }], [5, 'md'],
+      [77, 'rogue'],
+    ]))
+  );
+});
+
+// ============================================================================
+// Radio (0x030C)
+// ============================================================================
+
+test('Radio renders <tf-radio> with value/label attrs + reactive checked class', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('view'), value: 'list' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('view')],
+      [1, { kind: 'tstr', value: 'list' }],
+      [2, { kind: 'literal', value: 'Lista' }],
+    ])
+  ));
+  assertEq(el.tagName.toLowerCase(), 'tf-radio');
+  assertEq(el.getAttribute('value'), 'list');
+  assertEq(el.getAttribute('label'), 'Lista');
+  assert(el.classList.contains('tf-radio--checked'));
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('view'), op: { kind: 'set', value: 'grid' } }],
+  });
+  assert(!el.classList.contains('tf-radio--checked'));
+});
+
+test('Radio click dispatches change with SelectValue payload (tstr)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('view'), value: 'grid' }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('view')],
+      [1, { kind: 'tstr', value: 'list' }],
+      [2, { kind: 'literal', value: 'Lista' }],
+    ])
+  ));
+  let received = null;
+  el.addEventListener('change', (e) => { received = e.detail; });
+  el.querySelector('.tf-radio-label').click();
+  assertEq(received, { value: 'list', kind: 'tstr' });
+});
+
+test('Radio u32 SelectValue accepts BigInt and emits Number value', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('n'), value: 0 }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('n')],
+      [1, { kind: 'u32', value: 5n }],
+      [2, { kind: 'literal', value: 'Pięć' }],
+    ])
+  ));
+  assertEq(el.getAttribute('value'), '5');
+  let received = null;
+  el.addEventListener('change', (e) => { received = e.detail; });
+  el.click();
+  assertEq(received, { value: 5, kind: 'u32' });
+});
+
+test('Radio i32 SelectValue accepts negative BigInt in range', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('n')],
+      [1, { kind: 'i32', value: -2147483648n }],
+      [2, { kind: 'literal', value: 'Min' }],
+    ])
+  );
+  assertEq(el.getAttribute('value'), '-2147483648');
+});
+
+test('Radio SelectValue rejects out-of-range BigInt (u32 + i32)', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(comp(RADIO_TAG, [
+      [0, PATH('n')],
+      [1, { kind: 'u32', value: 0x100000000n }],
+      [2, { kind: 'literal', value: 'X' }],
+    ]))
+  );
+  assertThrows(() =>
+    engine.render(comp(RADIO_TAG, [
+      [0, PATH('n')],
+      [1, { kind: 'i32', value: -2147483649n }],
+      [2, { kind: 'literal', value: 'X' }],
+    ]))
+  );
+});
+
+test('Radio disabled BindRef blocks click (no change emitted)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('view'), value: 'grid' },
+      { path: PATH('lock'), value: true },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('view')],
+      [1, { kind: 'tstr', value: 'list' }],
+      [2, { kind: 'literal', value: 'Lista' }],
+      [4, { kind: 'bound', path: PATH('lock') }],
+    ])
+  ));
+  assertEq(el.hasAttribute('disabled'), true);
+  let received = null;
+  el.addEventListener('change', (e) => { received = e.detail; });
+  el.click();
+  assertEq(received, null);
+});
+
+test('Radio rejects missing required value/label', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(RADIO_TAG, [[0, PATH('x')]])));
+  assertThrows(() =>
+    engine.render(comp(RADIO_TAG, [[0, PATH('x')], [1, { kind: 'tstr', value: 'a' }]]))
+  );
+});
+
+test('Radio rejects SelectValue with unknown kind', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(RADIO_TAG, [
+        [0, PATH('x')],
+        [1, { kind: 'float', value: 1.5 }],
+        [2, { kind: 'literal', value: 'X' }],
+      ])
+    )
+  );
+});
+
+test('Radio rejects SelectValue with unexpected extra key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(RADIO_TAG, [
+        [0, PATH('x')],
+        [1, { kind: 'tstr', value: 'a', extra: 1 }],
+        [2, { kind: 'literal', value: 'X' }],
+      ])
+    )
+  );
+});
+
+test('Radio rejects unknown field key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() =>
+    engine.render(
+      comp(RADIO_TAG, [
+        [0, PATH('x')],
+        [1, { kind: 'tstr', value: 'a' }],
+        [2, { kind: 'literal', value: 'X' }],
+        [99, 'rogue'],
+      ])
+    )
+  );
+});
+
+test('Radio label BindRef updates label attr reactively', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('view'), value: 'list' },
+      { path: PATH('lbl'), value: 'Lista' },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(
+    comp(RADIO_TAG, [
+      [0, PATH('view')],
+      [1, { kind: 'tstr', value: 'list' }],
+      [2, { kind: 'bound', path: PATH('lbl') }],
+    ])
+  ));
+  assertEq(el.getAttribute('label'), 'Lista');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('lbl'), op: { kind: 'set', value: 'List' } }],
+  });
+  assertEq(el.getAttribute('label'), 'List');
 });
 
 // ---- report ----
