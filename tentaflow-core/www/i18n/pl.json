@@ -475,7 +475,7 @@
     "btn_delete": "Usuń",
     "btn_edit": "Edytuj",
     "btn_deploy_logs": "Logi wdrożenia",
-    "update_available": "Dostępna aktualizacja",
+    "update_available": "Aktualizacja dostępna",
     "update_available_tooltip": "Źródło bundla zmieniło się od momentu wdrożenia — wdróż serwis ponownie.",
     "btn_redeploy": "Aktualizuj",
     "node_local_badge": "lokalny",
@@ -581,7 +581,6 @@
     "model_col_nodes": "Dostępny na",
     "model_loaded": "Załadowany",
     "model_unloaded": "Niezaładowany",
-    "update_available": "Aktualizacja dostępna",
     "update_button": "Aktualizuj",
     "rebuild_button": "Przebuduj",
     "update_title": "Aktualizacja {name}",
@@ -1349,7 +1348,13 @@
     "invalid_port": "Port „{port}” nie jest wspierany przez {node_type}",
     "invalid_port_type": "Niekompatybilne typy portów: {from_type} → {to_type}",
     "edge_dangling": "Krawędź prowadzi do nieistniejącego węzła",
-    "cycle_detected": "Wykryto cykl w grafie przepływu"
+    "cycle_detected": "Wykryto cykl w grafie przepływu",
+    "loop_region_label": "Region pętli: {id}",
+    "group_loop_region": "Zgrupuj w region pętli",
+    "ungroup_loop_region": "Rozgrupuj region pętli",
+    "loop_back_cross_region": "Krawędź loop_back musi łączyć węzły tego samego regionu pętli",
+    "loop_region_entry": "wejście",
+    "loop_region_exit": "wyjście"
   },
   "flows_vars": {
     "title": "Zmienne flow",
@@ -1430,7 +1435,33 @@
     "map_scope_hint": "Dostępne w wyrażeniach: vars, payload, artifacts, meta (tylko do odczytu). Serwer waliduje wyrażenia przy zapisie i zgłasza błędy.",
     "map_hint_empty": "Wyrażenie jest puste.",
     "map_hint_unbalanced": "Niezbilansowane nawiasy.",
-    "map_hint_quotes": "Niezamknięty cudzysłów."
+    "map_hint_quotes": "Niezamknięty cudzysłów.",
+    "select_placeholder": "— wybierz —",
+    "dynamic_empty": "— brak dostępnych {source} {category} —",
+    "dynamic_stale": "{value} (niedostępne)",
+    "harness_default_hint": "Puste → domyślny systemowy",
+    "loop_region_section": "Konfiguracja regionu pętli",
+    "harness": {
+      "skills_template": "Szablon indeksu umiejętności",
+      "anti_injection_note": "Nota anty-injection",
+      "delegated_results_template": "Szablon wyników delegowanych",
+      "summary_system_prompt": "Prompt systemowy podsumowania",
+      "update_system_prompt": "Prompt systemowy aktualizacji",
+      "summary_prefix": "Prefiks podsumowania",
+      "summary_suffix": "Sufiks podsumowania",
+      "system_prompt": "Prompt systemowy",
+      "loop_max_iterations": "Maksymalna liczba iteracji",
+      "loop_final_pass": "Końcowy przebieg (final pass)",
+      "agent_id": "ID agenta",
+      "agent_name": "Nazwa agenta",
+      "task": "Zadanie",
+      "output_variable": "Zmienna wyjściowa",
+      "run_ids_var": "Zmienna z run_ids",
+      "timeout_secs": "Timeout (sekundy)",
+      "mode": "Tryb",
+      "seconds": "Sekundy",
+      "session_id": "ID sesji"
+    }
   },
   "flows": {
     "title": "Flow Builder",
@@ -1490,7 +1521,12 @@
       "map": "Mapowanie",
       "agent": "Agent",
       "agent_router": "Router agentów",
-      "compact_context": "Kompakcja kontekstu"
+      "compact_context": "Kompakcja kontekstu",
+      "persist_turn": "Zapis tury",
+      "spawn": "Uruchom subagenta",
+      "await_subagents": "Czekaj na subagentów",
+      "subagent_status": "Status subagentów",
+      "interval": "Bramka czasowa"
     },
     "node_descriptions": {
       "trigger": "Punkt wejścia flow (HTTP, QUIC, webhook)",
@@ -1519,7 +1555,12 @@
       "map": "Wykonuje flow-ciało równolegle dla każdego elementu tablicy; wyniki w kolejności wejściowej",
       "agent": "Uruchamia agenta jako blok i zwraca tylko podsumowanie (finalną odpowiedź)",
       "agent_router": "Wybiera najlepszego agenta dla zadania jednym wywołaniem LLM; nie uruchamia go",
-      "compact_context": "Streszcza środek rozmowy gdy kontekst przekroczy próg, chroniąc system prompt i najnowsze wiadomości"
+      "compact_context": "Streszcza środek rozmowy gdy kontekst przekroczy próg, chroniąc system prompt i najnowsze wiadomości",
+      "persist_turn": "Trwały zapis delty wiadomości tury do historii konwersacji",
+      "spawn": "Deterministyczne uruchomienie subagenta w tle (zwraca run_ids)",
+      "await_subagents": "Blokuje aż wskazane subagenty się zakończą (z timeoutem)",
+      "subagent_status": "Snapshot statusów subagentów do zmiennej flow",
+      "interval": "Bramka czasowa (sleep) do okresowego pollingu w regionie pętli"
     },
     "fields": {
       "model": "Model",

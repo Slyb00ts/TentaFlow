@@ -99,6 +99,19 @@ impl AgentRouterNodeAdapter {
             .map(|s| s.to_string())
     }
 
+    /// Router system instruction: node config `system_prompt` overrides the
+    /// built-in default. Empty/absent → `ROUTER_SYSTEM_PROMPT`. The prompt is the
+    /// only instruction channel the router obeys, so it is admin-editable, but the
+    /// `<user_task>` delimiter sanitization in `build_user_message` applies
+    /// regardless of this value (§3.10).
+    fn system_prompt(node: &FlowNode) -> &str {
+        node.config
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(ROUTER_SYSTEM_PROMPT)
+    }
+
     /// Resolves the candidate set: an explicit `agent_ids` list (filtered to
     /// routable + enabled), or every enabled routable agent when none is
     /// configured. Restricting to routable=1 closes the confused-deputy path
@@ -217,7 +230,7 @@ impl NodeAdapter for AgentRouterNodeAdapter {
         // llm block uses, so the call shows up in compliance like any other.
         let mut req = LlmRequest::new(model);
         req.messages = vec![
-            ChatMessage::system(ROUTER_SYSTEM_PROMPT),
+            ChatMessage::system(Self::system_prompt(node)),
             ChatMessage::user(Self::build_user_message(&candidates, &task)),
         ];
         req.temperature = Some(0.0);
@@ -405,6 +418,7 @@ mod tests {
             config,
             position: None,
             label: None,
+            region: None,
         }
     }
 
@@ -652,5 +666,67 @@ mod tests {
         // closing tag is defused.
         assert_eq!(msg.matches("</user_task>").count(), 1);
         assert_eq!(msg.matches("<user_task>").count(), 1);
+    }
+
+    /// No `system_prompt` config → the built-in default is sent to the model.
+    #[test]
+    fn system_prompt_defaults_to_const_when_absent() {
+        let n = node(json!({}));
+        assert_eq!(AgentRouterNodeAdapter::system_prompt(&n), ROUTER_SYSTEM_PROMPT);
+        let n = node(json!({"system_prompt": ""}));
+        assert_eq!(AgentRouterNodeAdapter::system_prompt(&n), ROUTER_SYSTEM_PROMPT);
+    }
+
+    /// A configured `system_prompt` overrides the default and reaches the model.
+    #[tokio::test]
+    async fn configured_system_prompt_is_used() {
+        let pool = db();
+        seed_agent(&pool, "id-a", "alpha", true, true);
+        let slot = service(pool.clone());
+
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("task".into());
+        env.meta.insert("model".into(), json!("m"));
+
+        // Capture the system prompt the router sends.
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        struct CapturingLlm {
+            captured: Arc<Mutex<String>>,
+        }
+        #[async_trait]
+        impl LlmDispatcher for CapturingLlm {
+            async fn execute_chat(&self, req: Req) -> Result<LlmResponse> {
+                *self.captured.lock().unwrap() = req.messages[0].text_or_default();
+                Ok(LlmResponse {
+                    content: r#"{"agent_id":"id-a","reason":"ok"}"#.into(),
+                    usage: TokenUsage::default(),
+                    finish_reason: FinishReason::Stop,
+                    tool_calls: Vec::new(),
+                })
+            }
+            async fn stream_chat(
+                &self,
+                _req: Req,
+            ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+                unreachable!()
+            }
+        }
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(CapturingLlm {
+            captured: captured.clone(),
+        });
+
+        AgentRouterNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"system_prompt": "ROUTE AS A PIRATE WOULD"})),
+                &[input(env)],
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let sys = captured.lock().unwrap().clone();
+        assert_eq!(sys, "ROUTE AS A PIRATE WOULD");
+        assert!(!sys.contains("routing classifier"));
     }
 }

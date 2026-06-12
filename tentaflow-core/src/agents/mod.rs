@@ -10,6 +10,7 @@ mod principal;
 mod retention_purge;
 mod run_manager;
 mod service;
+mod subagent_reactor;
 
 use std::sync::Arc;
 
@@ -26,10 +27,14 @@ pub use principal::AgentPrincipal;
 pub use retention_purge::{purge_expired_agent_runtime, start_agent_runtime_purge_task};
 pub use run_manager::{
     global as agent_run_manager_global, init_global as agent_run_manager_init_global,
-    AgentRunManager, BackgroundFlowRunner, CallerRun, FlowDispatcherRunner, RunStatus,
-    MAX_CONCURRENT_RUNS_SETTING,
+    AgentRunManager, BackgroundFlowRunner, CallerRun, ChildFinishedEvent, FlowDispatcherRunner,
+    RunStatus, MAX_CONCURRENT_RUNS_SETTING,
 };
 pub use service::AgentService;
+pub use subagent_reactor::{
+    init_global as subagent_reactor_init_global, FlowDispatcherReactorDispatch, ReactorFlowDispatch,
+    SubagentReactor,
+};
 
 /// Late-bound `AgentService` slot (§3.5.0), mirroring `ModelRuntimeSlot`.
 /// `build_registry()` is argument-free and runs before `AddonManager` exists,

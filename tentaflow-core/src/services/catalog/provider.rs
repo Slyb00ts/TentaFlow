@@ -434,6 +434,9 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
 #[allow(dead_code)]
 pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "trigger",
+    // Reactive entry: same passthrough modality role as `trigger` — it forwards
+    // the seeded child-result envelope and declares no media constraint.
+    "on_subagent_complete",
     "output",
     "condition",
     "combine",
@@ -442,6 +445,22 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "sentence_buffer",
     "session_context",
     "speaker_context",
+    "persist_turn",
+    // Harness control / sub-agent orchestration nodes (no media modality of
+    // their own — they steer the graph or run other flows / agents).
+    "agent",
+    "agent_context",
+    "agent_router",
+    "ask_user",
+    "await_subagents",
+    "compact_context",
+    "interval",
+    "loop",
+    "map",
+    "spawn",
+    "subagent_status",
+    "subflow",
+    "tool_exec",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks

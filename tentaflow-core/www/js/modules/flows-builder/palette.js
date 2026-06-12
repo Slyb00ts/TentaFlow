@@ -27,6 +27,8 @@ const TYPE_ICON = {
   template: 'code', transform: 'transform', router: 'transform',
   pii_filter: 'shield', tts_clean: 'shield',
   output: 'arrow-out', end: 'arrow-out',
+  persist_turn: 'database',
+  spawn: 'flow', await_subagents: 'clock', subagent_status: 'flow', interval: 'clock',
 };
 
 const TYPE_VAR = {
@@ -42,6 +44,9 @@ const TYPE_VAR = {
   session_context: '--node-session_context',
   speaker_context: '--node-speaker_context',
   memory_analyzer: '--node-memory_analyzer',
+  persist_turn: '--node-conversation_history',
+  spawn: '--node-spawn', await_subagents: '--node-spawn',
+  subagent_status: '--node-spawn', interval: '--node-spawn',
 };
 
 function catFor(tpl) {
@@ -51,11 +56,13 @@ function catFor(tpl) {
   const t = tpl.node_type;
   if (t === 'trigger' || t === 'start') return 'trigger';
   if (['llm','stt','tts','embeddings','reranker'].includes(t)) return 'service';
-  if (['memory','conversation_history','session_context','speaker_context','memory_analyzer'].includes(t)) return 'memory';
+  if (['memory','conversation_history','session_context','speaker_context','memory_analyzer','persist_turn'].includes(t)) return 'memory';
   if (['condition','switch'].includes(t)) return 'logic';
   if (['template','transform','router'].includes(t)) return 'transform';
   if (['pii_filter','tts_clean'].includes(t)) return 'filter';
   if (['output','end'].includes(t)) return 'output';
+  // Harness background blocks group under "service" (closest existing category).
+  if (['spawn','await_subagents','subagent_status','interval'].includes(t)) return 'service';
   return 'other';
 }
 

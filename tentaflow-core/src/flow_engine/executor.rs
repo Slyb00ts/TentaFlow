@@ -102,6 +102,7 @@ pub async fn execute_blocking(
         mut pending_deps,
         succ_nodes,
         out_edges,
+        region_internal,
     } = build_dependency_graph(&compiled, n);
     let ctx = Arc::new(ctx);
     let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
@@ -120,9 +121,13 @@ pub async fn execute_blocking(
 
     let mut join_set: JoinSet<NodeRun> = JoinSet::new();
     // Seed: wszystkie nody bez poprzedników (trigger) gotowe od razu.
+    // Region-internal members are never seeded — the region runner drives them.
     for pos in 0..n {
+        if region_internal[pos] {
+            continue;
+        }
         if pending_deps[pos] == 0 {
-            spawn_node(
+            spawn_unit(
                 &mut join_set,
                 &compiled,
                 &adapters,
@@ -228,7 +233,7 @@ pub async fn execute_blocking(
                 pending_deps[succ] -= 1;
                 if pending_deps[succ] == 0 {
                     if live_inputs[succ] > 0 {
-                        spawn_node(
+                        spawn_unit(
                             &mut join_set,
                             &compiled,
                             &adapters,
@@ -319,11 +324,35 @@ struct DependencyGraph {
     /// aktywności wejść następnika (`condition` ma dwie krawędzie różnych
     /// portów do dwóch gałęzi; tylko aktywny port daje żywe wejście).
     out_edges: Vec<Vec<(usize, String)>>,
+    /// `region_internal[pos]` = true for a contracted loop-region member that is
+    /// NOT the entry: it is driven by the region runner, never spawned by the
+    /// outer scheduler. The entry position represents the whole region.
+    region_internal: Vec<bool>,
 }
 
 /// Buduje graf zależności z compiled flow. Toposort w compile gwarantuje brak
 /// cykli, więc scheduler zawsze osusza JoinSet.
+///
+/// Inline loop regions are contracted to a single unit at their `entry_pos`:
+/// every region member position is remapped to its entry, so the outer graph
+/// sees the region as one node with the entry's external inputs and the exit's
+/// external outputs. Internal region edges (and the `loop_back` edge) collapse
+/// to self-loops and are dropped. `region_internal[pos]` marks the contracted
+/// (non-entry) members so the scheduler never spawns them standalone.
 fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> DependencyGraph {
+    // pos → contracted owner: a region member maps to its entry_pos, every
+    // other position maps to itself.
+    let mut owner: Vec<usize> = (0..n).collect();
+    let mut region_internal = vec![false; n];
+    for region in &compiled.regions {
+        for &m in &region.member_pos {
+            owner[m] = region.entry_pos;
+            if m != region.entry_pos {
+                region_internal[m] = true;
+            }
+        }
+    }
+
     // Jeden globalny HashSet par (from,pos) zamiast N HashSetów per node —
     // dedupy podwójnych krawędzi tej samej pary (rzadkie, np. dwie krawędzie do
     // jednego combine z tego samego noda) bez alokacji setu na każdy węzeł.
@@ -332,18 +361,30 @@ fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> DependencyGraph 
     let mut succ_nodes: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut out_edges: Vec<Vec<(usize, String)>> = vec![Vec::new(); n];
     for pos in 0..n {
+        // The contracted consumer: edges into a region member are dependencies
+        // of the region unit (entry_pos).
+        let to_pos = owner[pos];
         for &edge_idx in &compiled.incoming_edges_per_pos[pos] {
             let edge = &compiled.definition.edges[edge_idx];
-            if let Some(&from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()) {
-                if from_pos == pos {
+            // The back edge is not a forward dependency — the region runner
+            // drives the repeat, not the scheduler.
+            if edge.is_loop_back() {
+                continue;
+            }
+            if let Some(&raw_from) = compiled.run_idx_by_id.get(edge.from.as_str()) {
+                // The contracted producer: the region's output is stored at its
+                // entry_pos, so an external edge out of the exit is modelled as
+                // coming from the entry.
+                let from_pos = owner[raw_from];
+                if from_pos == to_pos {
                     continue;
                 }
                 // Krawędź per port — sterowanie bramkowaniem.
-                out_edges[from_pos].push((pos, edge.from_port.clone()));
+                out_edges[from_pos].push((to_pos, edge.from_port.clone()));
                 // Zależność per odrębny poprzednik — sterowanie barierą.
-                if seen_pairs.insert((from_pos, pos)) {
-                    pending_deps[pos] += 1;
-                    succ_nodes[from_pos].push(pos);
+                if seen_pairs.insert((from_pos, to_pos)) {
+                    pending_deps[to_pos] += 1;
+                    succ_nodes[from_pos].push(to_pos);
                 }
             }
         }
@@ -352,6 +393,7 @@ fn build_dependency_graph(compiled: &CompiledFlow, n: usize) -> DependencyGraph 
         pending_deps,
         succ_nodes,
         out_edges,
+        region_internal,
     }
 }
 
@@ -431,6 +473,624 @@ fn spawn_node(
     Ok(())
 }
 
+/// Spawns a scheduler unit at `pos`: an inline loop region (when `pos` is a
+/// region entry) runs its sub-DAG repeatedly inline; any other position runs as
+/// a single node. The region's result envelope is stored at `entry_pos`, so the
+/// contracted dependency graph (which maps the region's exit-outgoing edges to
+/// the entry) propagates it to the region's successors.
+fn spawn_unit(
+    join_set: &mut JoinSet<NodeRun>,
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    outputs: &[Option<Arc<FlowEnvelope>>],
+    active_ports: &[Option<HashSet<String>>],
+    pos: usize,
+) -> Result<()> {
+    let Some(region) = compiled.region_at_entry(pos) else {
+        return spawn_node(join_set, compiled, adapters, ctx, outputs, active_ports, pos);
+    };
+    let region = region.clone();
+    let def_idx = compiled.execution_order[region.entry_pos];
+    let entry_node = &compiled.definition.nodes[def_idx];
+    let entry_node_id = entry_node.id.clone();
+    let entry_node_type = entry_node.node_type.clone();
+    // Seed envelope = the region's single external input (falls back to the
+    // flow's initial envelope for a triggerless harness).
+    let inputs = build_inputs(compiled, region.entry_pos, outputs, active_ports);
+    let seed: FlowEnvelope = inputs
+        .first()
+        .map(|i| (*i.envelope).clone())
+        .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+
+    emit_node_started(ctx, &entry_node_id, &entry_node_type);
+    let compiled = compiled.clone();
+    let adapters = adapters.clone();
+    let ctx = ctx.clone();
+    let step_started_ms = ctx.clock.now_ms();
+    join_set.spawn(async move {
+        let attempt = Instant::now();
+        let result = run_loop_region(&compiled, &adapters, &ctx, &region, seed).await;
+        let duration_ms = attempt.elapsed().as_millis() as u64;
+        NodeRun {
+            pos: region.entry_pos,
+            node_id: entry_node_id,
+            node_type: entry_node_type,
+            step_started_ms,
+            duration_ms,
+            result: result.map_err(|e| e.to_string()),
+        }
+    });
+    Ok(())
+}
+
+/// Runs an inline loop region: the region's internal sub-DAG executes
+/// repeatedly over ONE evolving envelope (conversation history accumulates in
+/// `context.messages` across iterations — this is the whole point) until a
+/// structural stop condition, the iteration budget, or cancel/deadline. The
+/// loop stops when the last assistant message carries no tool calls (the agent
+/// produced a final answer). With `final_pass`, one extra grace iteration runs
+/// after budget exhaustion with `meta.loop_final_pass=true` so the body's llm
+/// block drops tools. Cancel/deadline surface as a node error so the executor
+/// aborts the flow, mirroring `loop_block.rs`.
+async fn run_loop_region(
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    region: &crate::flow_engine::cache::LoopRegion,
+    seed: FlowEnvelope,
+) -> Result<FlowEnvelope> {
+    let mut current = seed;
+    let mut iterations: u32 = 0;
+    // Runtime budget override: agent_context stamps `meta.loop_max_iterations`
+    // from the agent's per-definition `max_iterations`, so a single seeded
+    // region serves agents with different budgets. It overrides the compile-time
+    // region budget but is still clamped to the same hard cap (parity with the
+    // legacy loop block's resolution).
+    let max_iterations = current
+        .meta
+        .get("loop_max_iterations")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| (n as u32).min(crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP))
+        .unwrap_or(region.max_iterations);
+    let exit_reason: &str = loop {
+        // Cancel / deadline are checked before each iteration so a long agent
+        // loop honours a client disconnect or the flow deadline without waiting
+        // for the iteration body to finish (parity with loop_block.rs).
+        if ctx.cancel_token.is_cancelled() {
+            break "cancelled";
+        }
+        if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
+            break "cancelled";
+        }
+        if iterations >= max_iterations {
+            break "max_iterations";
+        }
+
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationStarted {
+                node_id: region.id.clone(),
+                n: iterations + 1,
+                max: max_iterations,
+            },
+        );
+        current = execute_subdag(compiled, adapters, ctx, region, current).await?;
+        iterations += 1;
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
+                node_id: region.id.clone(),
+                n: iterations,
+            },
+        );
+
+        // Structural stop: a final assistant turn WITHOUT tool calls means the
+        // agent answered and the loop is done. This replaces meta.harness_done.
+        if !last_assistant_has_tool_calls(&current) {
+            break "no_tool_calls";
+        }
+    };
+
+    // Grace summary: one extra iteration with loop_final_pass=true after the
+    // budget is exhausted, so the body's llm block drops tools and produces a
+    // final answer instead of another tool call. Only on max_iterations, and
+    // only when cancel/deadline have not already fired.
+    if region.final_pass
+        && exit_reason == "max_iterations"
+        && !ctx.cancel_token.is_cancelled()
+        && ctx.effective_deadline().is_none_or(|d| Instant::now() < d)
+    {
+        current
+            .meta
+            .insert("loop_final_pass".into(), serde_json::Value::Bool(true));
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationStarted {
+                node_id: region.id.clone(),
+                n: iterations + 1,
+                max: max_iterations,
+            },
+        );
+        current = execute_subdag(compiled, adapters, ctx, region, current).await?;
+        iterations += 1;
+        current.meta.remove("loop_final_pass");
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
+                node_id: region.id.clone(),
+                n: iterations,
+            },
+        );
+        if ctx.cancel_token.is_cancelled()
+            || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+        {
+            return Err(anyhow!(
+                "loop region '{}': cancelled during final pass after {iterations} iteration(s)",
+                region.id
+            ));
+        }
+    }
+
+    current
+        .meta
+        .insert("loop_iterations".into(), serde_json::Value::from(iterations));
+    current.meta.insert(
+        "loop_exit_reason".into(),
+        serde_json::Value::String(exit_reason.to_string()),
+    );
+    if exit_reason == "cancelled" {
+        if matches!(current.payload, FlowValue::Empty) {
+            current.payload = FlowValue::Text(String::new());
+        }
+        return Err(anyhow!(
+            "loop region '{}': cancelled after {iterations} iteration(s)",
+            region.id
+        ));
+    }
+    Ok(current)
+}
+
+/// Runs the region's internal sub-DAG once over `seed`, returning the evolved
+/// envelope. The members are in topological order (entry first, back edge
+/// excluded), each non-output node has ≤1 internal input (R4), so a sequential
+/// topo pass building inputs from already-computed members is correct. The
+/// envelope threads through every member — conversation history accumulates in
+/// place — and the exit member's output is the iteration result.
+async fn execute_subdag(
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    region: &crate::flow_engine::cache::LoopRegion,
+    seed: FlowEnvelope,
+) -> Result<FlowEnvelope> {
+    let member_set: HashSet<usize> = region.member_pos.iter().copied().collect();
+    // Per-member output for this single sub-DAG pass. The entry consumes the
+    // seed; every other member consumes its internal predecessor(s).
+    let mut member_out: HashMap<usize, Arc<FlowEnvelope>> = HashMap::new();
+    let seed_arc = Arc::new(seed);
+
+    for &pos in &region.member_pos {
+        let def_idx = compiled.execution_order[pos];
+        let node = &compiled.definition.nodes[def_idx];
+        let adapter = adapters.get(&node.node_type).ok_or_else(|| {
+            anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+        })?;
+
+        // Internal inputs from predecessor members (loop_back excluded). The
+        // entry additionally takes the seed, which carries the accumulated
+        // conversation from the previous iteration.
+        let mut inputs: Vec<NodeInput> = Vec::new();
+        for &edge_idx in &compiled.incoming_edges_per_pos[pos] {
+            let edge = &compiled.definition.edges[edge_idx];
+            if edge.is_loop_back() {
+                continue;
+            }
+            let Some(&from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()) else {
+                continue;
+            };
+            if !member_set.contains(&from_pos) {
+                continue;
+            }
+            if let Some(env) = member_out.get(&from_pos) {
+                inputs.push(NodeInput {
+                    from_node_id: edge.from.clone(),
+                    from_port: edge.from_port.clone(),
+                    envelope: env.clone(),
+                });
+            }
+        }
+        if pos == region.entry_pos {
+            inputs.push(NodeInput {
+                from_node_id: "__loop_region_seed__".to_string(),
+                from_port: "full".to_string(),
+                envelope: seed_arc.clone(),
+            });
+        }
+
+        let inbound: &FlowEnvelope =
+            io_mapping_inbound(&inputs).unwrap_or_else(|| seed_arc.as_ref());
+        let result =
+            run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, ctx).await?;
+        member_out.insert(pos, Arc::new(result));
+    }
+
+    let exit_out = member_out
+        .remove(&region.exit_pos)
+        .ok_or_else(|| anyhow!("loop region '{}': exit node produced no output", region.id))?;
+    Ok(Arc::try_unwrap(exit_out).unwrap_or_else(|arc| (*arc).clone()))
+}
+
+/// Streams an inline loop region (codex-style live token streaming). Behaves
+/// exactly like `run_loop_region` for control flow (structural stop, iteration
+/// budget, grace final pass, cancel/deadline) but, on each iteration, runs the
+/// region's `llm` member through `produce_stream` and forwards its text /
+/// reasoning deltas to `outbound` AS THEY ARRIVE — so the client sees every
+/// turn's narration and the final answer token-by-token. The non-llm members
+/// (`compact_context`, `tool_exec`) run blocking around the streamed llm step.
+///
+/// Returns the fully accumulated final envelope (one envelope threaded through
+/// every iteration, conversation history grown in place) so the post-producer
+/// finalizer can run `persist_turn` / `output` over the complete turn.
+///
+/// `outbound` carries only forward-progress deltas (text/reasoning + a final
+/// finish marker). Tool-call deltas are reassembled internally into the
+/// accumulated assistant message; they never go to the client as visible text.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_region_streaming(
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    region: &crate::flow_engine::cache::LoopRegion,
+    seed: FlowEnvelope,
+    outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
+    last_usage: &mut Option<TokenUsage>,
+    last_finish: &mut Option<FinishReason>,
+) -> Result<FlowEnvelope> {
+    let mut current = seed;
+    let mut iterations: u32 = 0;
+    let max_iterations = current
+        .meta
+        .get("loop_max_iterations")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| (n as u32).min(crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP))
+        .unwrap_or(region.max_iterations);
+
+    let exit_reason: &str = loop {
+        if ctx.cancel_token.is_cancelled() {
+            break "cancelled";
+        }
+        if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
+            break "cancelled";
+        }
+        if iterations >= max_iterations {
+            break "max_iterations";
+        }
+
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationStarted {
+                node_id: region.id.clone(),
+                n: iterations + 1,
+                max: max_iterations,
+            },
+        );
+        current =
+            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage)
+                .await?;
+        iterations += 1;
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
+                node_id: region.id.clone(),
+                n: iterations,
+            },
+        );
+
+        if !last_assistant_has_tool_calls(&current) {
+            break "no_tool_calls";
+        }
+    };
+
+    if region.final_pass
+        && exit_reason == "max_iterations"
+        && !ctx.cancel_token.is_cancelled()
+        && ctx.effective_deadline().is_none_or(|d| Instant::now() < d)
+    {
+        current
+            .meta
+            .insert("loop_final_pass".into(), serde_json::Value::Bool(true));
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationStarted {
+                node_id: region.id.clone(),
+                n: iterations + 1,
+                max: max_iterations,
+            },
+        );
+        current =
+            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage)
+                .await?;
+        iterations += 1;
+        current.meta.remove("loop_final_pass");
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
+                node_id: region.id.clone(),
+                n: iterations,
+            },
+        );
+        if ctx.cancel_token.is_cancelled()
+            || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+        {
+            return Err(anyhow!(
+                "loop region '{}': cancelled during final pass after {iterations} iteration(s)",
+                region.id
+            ));
+        }
+    }
+
+    current
+        .meta
+        .insert("loop_iterations".into(), serde_json::Value::from(iterations));
+    current.meta.insert(
+        "loop_exit_reason".into(),
+        serde_json::Value::String(exit_reason.to_string()),
+    );
+    if exit_reason == "cancelled" {
+        return Err(anyhow!(
+            "loop region '{}': cancelled after {iterations} iteration(s)",
+            region.id
+        ));
+    }
+    // The final iteration ended without tool calls (structural stop) or the
+    // budget summary closed it; the agent's final answer is in place. Surface a
+    // Stop finish for the client trailer.
+    *last_finish = Some(FinishReason::Stop);
+    Ok(current)
+}
+
+/// One streaming pass over the region's internal sub-DAG. Mirrors
+/// `execute_subdag` (sequential topo pass, ≤1 internal input per non-output
+/// member, R4) but the single `llm` member runs through `produce_stream`: its
+/// text / reasoning deltas are forwarded to `outbound` live and the full
+/// assistant message (content + reassembled tool calls) is appended to the
+/// threaded envelope — exactly what the blocking llm adapter's `execute` does,
+/// so a tool_exec member downstream sees the same `tool_calls` it would in the
+/// blocking region. Non-llm members run blocking.
+async fn execute_subdag_streaming(
+    compiled: &Arc<CompiledFlow>,
+    adapters: &Arc<AdapterRegistry>,
+    ctx: &Arc<ExecutionContext>,
+    region: &crate::flow_engine::cache::LoopRegion,
+    seed: FlowEnvelope,
+    outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
+    last_usage: &mut Option<TokenUsage>,
+) -> Result<FlowEnvelope> {
+    let member_set: HashSet<usize> = region.member_pos.iter().copied().collect();
+    let mut member_out: HashMap<usize, Arc<FlowEnvelope>> = HashMap::new();
+    let seed_arc = Arc::new(seed);
+
+    for &pos in &region.member_pos {
+        let def_idx = compiled.execution_order[pos];
+        let node = &compiled.definition.nodes[def_idx];
+
+        let mut inputs: Vec<NodeInput> = Vec::new();
+        for &edge_idx in &compiled.incoming_edges_per_pos[pos] {
+            let edge = &compiled.definition.edges[edge_idx];
+            if edge.is_loop_back() {
+                continue;
+            }
+            let Some(&from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()) else {
+                continue;
+            };
+            if !member_set.contains(&from_pos) {
+                continue;
+            }
+            if let Some(env) = member_out.get(&from_pos) {
+                inputs.push(NodeInput {
+                    from_node_id: edge.from.clone(),
+                    from_port: edge.from_port.clone(),
+                    envelope: env.clone(),
+                });
+            }
+        }
+        if pos == region.entry_pos {
+            inputs.push(NodeInput {
+                from_node_id: "__loop_region_seed__".to_string(),
+                from_port: "full".to_string(),
+                envelope: seed_arc.clone(),
+            });
+        }
+
+        // The `llm` member streams; every other member runs blocking. io-mapping
+        // never overlays a stream producer (R7), so the streamed member takes the
+        // raw-config produce_stream path while the rest keep the io-mapping seam.
+        let result = if adapters.is_stream_producer(&node.node_type) {
+            stream_llm_member(adapters, node, &inputs, ctx, outbound, last_usage).await?
+        } else {
+            let inbound: &FlowEnvelope =
+                io_mapping_inbound(&inputs).unwrap_or_else(|| seed_arc.as_ref());
+            let adapter = adapters.get(&node.node_type).ok_or_else(|| {
+                anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+            })?;
+            run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, ctx).await?
+        };
+        member_out.insert(pos, Arc::new(result));
+    }
+
+    let exit_out = member_out
+        .remove(&region.exit_pos)
+        .ok_or_else(|| anyhow!("loop region '{}': exit node produced no output", region.id))?;
+    Ok(Arc::try_unwrap(exit_out).unwrap_or_else(|arc| (*arc).clone()))
+}
+
+/// Runs the region's `llm` member as a live stream: drives `produce_stream`,
+/// forwards text / reasoning deltas to the client, and reassembles the full
+/// assistant turn (content + tool calls) into the output envelope — the same
+/// shape `LlmNodeAdapter::execute` would append, so downstream `tool_exec` and
+/// the structural stop see identical `context.messages`. A backend error in the
+/// stream is forwarded to the client and surfaced as a node error so the region
+/// (and the flow) abort, matching the blocking path's error propagation.
+async fn stream_llm_member(
+    adapters: &Arc<AdapterRegistry>,
+    node: &FlowNode,
+    inputs: &[NodeInput],
+    ctx: &Arc<ExecutionContext>,
+    outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
+    last_usage: &mut Option<TokenUsage>,
+) -> Result<FlowEnvelope> {
+    let producer = adapters.stream_producer(&node.node_type).ok_or_else(|| {
+        anyhow!(
+            "no StreamProducerAdapter for region member '{}' (type '{}')",
+            node.id,
+            node.node_type
+        )
+    })?;
+    let mut stream = producer.produce_stream(node, inputs, ctx).await?;
+
+    let mut content = String::new();
+    let mut tool_calls = ToolCallAccumulator::new();
+    let mut finish_reason: Option<FinishReason> = None;
+
+    while let Some(item) = stream.next().await {
+        let chunk = match item {
+            Ok(EnvelopeDelta::Llm(c)) => c,
+            Ok(EnvelopeDelta::Audio(_)) => {
+                // The region's llm member produces text deltas; an audio delta
+                // here would be a bug in the producer, not a recoverable case.
+                return Err(anyhow!(
+                    "region llm member '{}' produced an audio delta",
+                    node.id
+                ));
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                let _ = outbound.send(Err(anyhow!("{msg}"))).await;
+                return Err(anyhow!("region llm member '{}' stream error: {msg}", node.id));
+            }
+        };
+
+        if !content.is_empty() || !chunk.text_delta.is_empty() {
+            content.push_str(&chunk.text_delta);
+        }
+        tool_calls.absorb(&chunk.tool_calls);
+        if let Some(u) = chunk.usage.as_ref() {
+            *last_usage = Some(*u);
+            ctx.usage_sink.record(&node.id, *u);
+        }
+        if let Some(fr) = chunk.finish_reason {
+            finish_reason = Some(fr);
+        }
+
+        // Forward only visible narration (text/reasoning); tool-call deltas stay
+        // internal. The finish marker is emitted once, by the finalizer's own
+        // trailer, so intermediate iteration finishes are suppressed here.
+        if !chunk.text_delta.is_empty() || chunk.reasoning_delta.is_some() {
+            let forwarded = EnvelopeDelta::Llm(crate::flow_engine::envelope::LlmStreamChunk {
+                choice_index: chunk.choice_index,
+                text_delta: chunk.text_delta,
+                reasoning_delta: chunk.reasoning_delta,
+                tool_calls: Vec::new(),
+                usage: None,
+                finish_reason: None,
+                error: None,
+            });
+            if outbound.send(Ok(forwarded)).await.is_err() {
+                // Client disconnected; stop forwarding but let the iteration body
+                // finish so the region's accumulation stays consistent. The next
+                // cancel/deadline check in the loop ends the run.
+                break;
+            }
+        }
+    }
+    let _ = finish_reason;
+
+    // Build the assistant turn identical to the blocking llm adapter: clone the
+    // input envelope, set the text payload, append the assistant message with
+    // any reassembled tool calls.
+    let mut out: FlowEnvelope = inputs
+        .first()
+        .map(|i| (*i.envelope).clone())
+        .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+    out.payload = FlowValue::Text(content.clone());
+    let mut assistant = ChatMessage::assistant(content);
+    let calls = tool_calls.finish();
+    if !calls.is_empty() {
+        assistant.tool_calls = Some(calls);
+    }
+    out.context.messages.push(assistant);
+    Ok(out)
+}
+
+/// Reassembles streamed `ToolCallDelta` fragments into complete `LlmToolCall`s.
+/// id/name open a slot; argument text accumulates per `index` (OpenAI tool-call
+/// streaming shape). Bounded so a forged index cannot allocate unboundedly.
+struct ToolCallAccumulator {
+    slots: Vec<(String, String, String)>,
+}
+
+impl ToolCallAccumulator {
+    const MAX_SLOTS: usize = 256;
+
+    fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    fn absorb(&mut self, deltas: &[crate::flow_engine::envelope::ToolCallDelta]) {
+        for delta in deltas {
+            let idx = delta.index as usize;
+            if idx >= Self::MAX_SLOTS {
+                continue;
+            }
+            while self.slots.len() <= idx {
+                self.slots
+                    .push((String::new(), String::new(), String::new()));
+            }
+            let slot = &mut self.slots[idx];
+            if let Some(id) = &delta.id {
+                slot.0 = id.clone();
+            }
+            if let Some(name) = &delta.function_name {
+                slot.1.push_str(name);
+            }
+            if let Some(args) = &delta.arguments_delta {
+                slot.2.push_str(args);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<crate::flow_engine::envelope::LlmToolCall> {
+        self.slots
+            .into_iter()
+            .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
+            .map(
+                |(id, name, arguments)| crate::flow_engine::envelope::LlmToolCall {
+                    id,
+                    name,
+                    arguments,
+                },
+            )
+            .collect()
+    }
+}
+
+/// True when the conversation's last assistant message requested tool calls.
+/// The inline loop continues while the agent is still calling tools and stops
+/// when it returns a final answer (assistant turn with no tool calls).
+fn last_assistant_has_tool_calls(envelope: &FlowEnvelope) -> bool {
+    envelope
+        .context
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == crate::flow_engine::envelope::ChatRole::Assistant)
+        .and_then(|m| m.tool_calls.as_ref())
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 /// Generic io-mapping seam (§3.12) shared by the blocking and streaming paths.
 /// Evaluates `input_mapping` against `inbound`, runs the adapter on a config
 /// with the results overlaid, then evaluates `output_mapping` against the
@@ -487,10 +1147,10 @@ fn attribute_usage(ctx: &ExecutionContext, trace: &mut [TraceStep]) {
     }
 }
 
-/// Streaming execution. Wykonuje pre-LLM nody w toposorcie, na node'ie LLM
-/// (z `from_port="stream"` na edge'u out) buduje LlmRequest przez typed
-/// accessor, dispatchuje stream_chat, spawnuje finalizer i zwraca
-/// StreamingExecution natychmiast.
+/// Streaming execution. Wykonuje pre-producer nody w toposorcie, napędza
+/// producenta strumienia (LLM, harness loop/subflow, addon stream block lub
+/// inline loop region — codex-style live token streaming), spawnuje finalizer i
+/// zwraca StreamingExecution natychmiast.
 pub async fn execute_streaming(
     db: DbPool,
     compiled: Arc<CompiledFlow>,
@@ -501,6 +1161,18 @@ pub async fn execute_streaming(
     let started = Instant::now();
     let initial_arc = Arc::new(initial);
     ctx.initial_envelope = initial_arc.clone();
+
+    // An inline loop region wired as the stream producer (its exit emits a
+    // `from_port="stream"` edge) streams every iteration's narration and the
+    // final answer token-by-token. The region runner drives the iterations
+    // inline and the post-producer blocking nodes (`persist_turn`, `output`) run
+    // over the fully accumulated turn once the stream settles.
+    if compiled
+        .stream_producer_region(adapters.as_ref())
+        .is_some()
+    {
+        return execute_streaming_region(db, compiled, initial_arc, ctx, adapters, started).await;
+    }
 
     let execution_id =
         create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
@@ -707,6 +1379,384 @@ pub async fn execute_streaming(
         stream,
         outcome: outcome_rx,
     })
+}
+
+/// Streaming dispatch for a flow whose stream producer is an inline loop region.
+/// Pre-producer nodes (positions before the region entry) run blocking in topo
+/// order; the region then streams every iteration's narration + final answer to
+/// the client live; once the stream settles, the post-producer blocking nodes
+/// (`persist_turn`, `output`) run over the fully accumulated turn so the durable
+/// history and outcome reflect the complete conversation. The whole tail runs in
+/// a spawned task so `StreamingExecution` returns immediately.
+async fn execute_streaming_region(
+    db: DbPool,
+    compiled: Arc<CompiledFlow>,
+    initial_arc: Arc<FlowEnvelope>,
+    mut ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+    started: Instant,
+) -> Result<StreamingExecution> {
+    let execution_id =
+        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
+    ctx.execution_id = execution_id;
+
+    let region = compiled
+        .stream_producer_region(adapters.as_ref())
+        .ok_or_else(|| anyhow!("execute_streaming_region called on a non-region flow"))?
+        .clone();
+    let producer_run_idx = region.entry_pos;
+
+    let n = compiled.execution_order.len();
+    let mut outputs: Vec<Option<Arc<FlowEnvelope>>> = vec![None; n];
+    let mut active_by_pos: Vec<Option<HashSet<String>>> = vec![None; n];
+    let mut trace: Vec<TraceStep> = Vec::with_capacity(n);
+
+    // Pre-producer topo pass (conversation_history, agent_context, …). Mirrors
+    // the generic streaming path: skip-gating, io-mapping seam, cancel/deadline.
+    for run_idx in 0..producer_run_idx {
+        if ctx.cancel_token.is_cancelled() {
+            return Err(anyhow!("cancelled"));
+        }
+        if let Some(dl) = ctx.effective_deadline() {
+            if Instant::now() >= dl {
+                return Err(anyhow!("deadline exceeded"));
+            }
+        }
+        let def_idx = compiled.execution_order[run_idx];
+        let node = &compiled.definition.nodes[def_idx];
+        if !node_has_live_input(&compiled, run_idx, &outputs, &active_by_pos) {
+            emit_node_started(&ctx, &node.id, &node.node_type);
+            emit_node_finished(&ctx, &node.id, &TraceStatus::Skipped);
+            trace.push(TraceStep {
+                node_id: node.id.clone(),
+                node_type: node.node_type.clone(),
+                started_at_ms: ctx.clock.now_ms(),
+                duration_ms: 0,
+                status: TraceStatus::Skipped,
+                usage: None,
+            });
+            active_by_pos[run_idx] = Some(HashSet::new());
+            continue;
+        }
+        let inputs = build_inputs(&compiled, run_idx, &outputs, &active_by_pos);
+        let adapter = adapters.get(&node.node_type).ok_or_else(|| {
+            anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+        })?;
+        let step_started = ctx.clock.now_ms();
+        let attempt_started = Instant::now();
+        emit_node_started(&ctx, &node.id, &node.node_type);
+        let inbound: &FlowEnvelope =
+            io_mapping_inbound(&inputs).unwrap_or_else(|| ctx.initial_envelope.as_ref());
+        let envelope = run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx)
+            .await
+            .map_err(|e| {
+                emit_node_finished(
+                    &ctx,
+                    &node.id,
+                    &TraceStatus::Error {
+                        message: e.to_string(),
+                    },
+                );
+                anyhow!("pre-producer node '{}' failed: {e}", node.id)
+            })?;
+        emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
+        let duration_ms = attempt_started.elapsed().as_millis() as u64;
+        let usage = take_node_usage(&ctx, &node.id);
+        trace.push(TraceStep {
+            node_id: node.id.clone(),
+            node_type: node.node_type.clone(),
+            started_at_ms: step_started,
+            duration_ms,
+            status: TraceStatus::Ok,
+            usage,
+        });
+        active_by_pos[run_idx] =
+            compute_active_ports(&compiled, adapters.as_ref(), run_idx, &envelope);
+        outputs[run_idx] = Some(Arc::new(envelope));
+    }
+
+    // Region seed = the region's single external input (entry inputs), falling
+    // back to the flow's initial envelope.
+    let seed_inputs = build_inputs(&compiled, producer_run_idx, &outputs, &active_by_pos);
+    let seed: FlowEnvelope = seed_inputs
+        .first()
+        .map(|i| (*i.envelope).clone())
+        .unwrap_or_else(|| (*initial_arc).clone());
+
+    let entry_def_idx = compiled.execution_order[region.entry_pos];
+    let producer_node_id = compiled.definition.nodes[entry_def_idx].id.clone();
+    let producer_node_type = compiled.definition.nodes[entry_def_idx].node_type.clone();
+    let producer_step_started = ctx.clock.now_ms();
+    emit_node_started(&ctx, &producer_node_id, &producer_node_type);
+
+    let ctx = Arc::new(ctx);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
+    let (outcome_tx, outcome_rx) = oneshot::channel::<FlowExecutionOutcome>();
+
+    tokio::spawn(run_region_stream_finalizer(RegionFinalizerInputs {
+        execution_id,
+        compiled,
+        adapters,
+        ctx,
+        region,
+        seed,
+        outputs,
+        active_by_pos,
+        trace,
+        outbound_tx,
+        outcome_tx,
+        db,
+        started,
+        producer_run_idx,
+        producer_node_id,
+        producer_node_type,
+        producer_step_started,
+    }));
+
+    let stream = futures::stream::unfold(outbound_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let stream: BoxStream<'static, Result<EnvelopeDelta>> = Box::pin(stream);
+    Ok(StreamingExecution {
+        stream,
+        outcome: outcome_rx,
+    })
+}
+
+struct RegionFinalizerInputs {
+    execution_id: i64,
+    compiled: Arc<CompiledFlow>,
+    adapters: Arc<AdapterRegistry>,
+    ctx: Arc<ExecutionContext>,
+    region: crate::flow_engine::cache::LoopRegion,
+    seed: FlowEnvelope,
+    outputs: Vec<Option<Arc<FlowEnvelope>>>,
+    active_by_pos: Vec<Option<HashSet<String>>>,
+    trace: Vec<TraceStep>,
+    outbound_tx: mpsc::Sender<Result<EnvelopeDelta>>,
+    outcome_tx: oneshot::Sender<FlowExecutionOutcome>,
+    db: DbPool,
+    started: Instant,
+    producer_run_idx: usize,
+    producer_node_id: String,
+    producer_node_type: String,
+    producer_step_started: u64,
+}
+
+/// Drives the region stream, runs post-producer blocking nodes over the
+/// accumulated turn, then builds + persists the outcome. Region iterations
+/// stream their narration live (forwarded through `outbound_tx`); the loop's
+/// final accumulated envelope (full `context.messages`) feeds `persist_turn` and
+/// `output` so the durable history and the outcome reflect the complete turn.
+async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
+    let RegionFinalizerInputs {
+        execution_id,
+        compiled,
+        adapters,
+        ctx,
+        region,
+        seed,
+        mut outputs,
+        mut active_by_pos,
+        mut trace,
+        outbound_tx,
+        outcome_tx,
+        db,
+        started,
+        producer_run_idx,
+        producer_node_id,
+        producer_node_type,
+        producer_step_started,
+    } = inputs;
+
+    let producer_attempt = Instant::now();
+    let mut last_usage: Option<TokenUsage> = None;
+    let mut last_finish: Option<FinishReason> = None;
+
+    let region_result = run_loop_region_streaming(
+        &compiled,
+        &adapters,
+        &ctx,
+        &region,
+        seed,
+        &outbound_tx,
+        &mut last_usage,
+        &mut last_finish,
+    )
+    .await;
+
+    let producer_duration_ms = producer_attempt.elapsed().as_millis() as u64;
+
+    let final_envelope = match region_result {
+        Ok(env) => {
+            emit_node_finished(&ctx, &producer_node_id, &TraceStatus::Ok);
+            trace.push(TraceStep {
+                node_id: producer_node_id.clone(),
+                node_type: producer_node_type.clone(),
+                started_at_ms: producer_step_started,
+                duration_ms: producer_duration_ms,
+                status: TraceStatus::Ok,
+                usage: last_usage.filter(|u| *u != TokenUsage::default()),
+            });
+            env
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            emit_node_finished(
+                &ctx,
+                &producer_node_id,
+                &TraceStatus::Error {
+                    message: msg.clone(),
+                },
+            );
+            trace.push(TraceStep {
+                node_id: producer_node_id.clone(),
+                node_type: producer_node_type.clone(),
+                started_at_ms: producer_step_started,
+                duration_ms: producer_duration_ms,
+                status: TraceStatus::Error {
+                    message: msg.clone(),
+                },
+                usage: last_usage.filter(|u| *u != TokenUsage::default()),
+            });
+            // The region already forwarded any backend error to the client; the
+            // outcome carries it for the audit row. No post-producer nodes run.
+            let cancelled = ctx.cancel_token.is_cancelled();
+            let finish = if cancelled {
+                FinishReason::Cancelled
+            } else {
+                FinishReason::Error
+            };
+            let outcome = FlowExecutionOutcome {
+                final_envelope: (*ctx.initial_envelope).clone(),
+                trace,
+                usage: TokenUsage::default(),
+                finish_reason: finish,
+                total_latency_ms: started.elapsed().as_millis() as i64,
+                error: Some(msg),
+            };
+            persist_execution(&db, execution_id, &outcome).await;
+            let _ = outcome_tx.send(outcome);
+            return;
+        }
+    };
+
+    // The region's output is stored at its entry slot (the contracted producer
+    // position), so post-producer nodes resolve their inputs through it exactly
+    // as the blocking scheduler's contraction does.
+    let final_arc = Arc::new(final_envelope);
+    outputs[producer_run_idx] = Some(final_arc.clone());
+    active_by_pos[producer_run_idx] =
+        compute_active_ports(&compiled, adapters.as_ref(), producer_run_idx, &final_arc);
+
+    // Run every post-producer blocking node (positions after the region, that
+    // are not region-internal members and not the terminal `output` sink) over
+    // the accumulated turn. `persist_turn` is the node that matters here; it
+    // writes the durable turn delta. The `output` sink never runs as a node on
+    // the streaming path — the stream IS the output.
+    let n = compiled.execution_order.len();
+    let mut post_error: Option<String> = None;
+    for run_idx in (producer_run_idx + 1)..n {
+        let def_idx = compiled.execution_order[run_idx];
+        let node = &compiled.definition.nodes[def_idx];
+        if node.node_type == "output" {
+            continue;
+        }
+        if compiled.position_is_region_internal(run_idx) {
+            continue;
+        }
+        if !node_has_live_input(&compiled, run_idx, &outputs, &active_by_pos) {
+            active_by_pos[run_idx] = Some(HashSet::new());
+            continue;
+        }
+        let inputs = build_inputs(&compiled, run_idx, &outputs, &active_by_pos);
+        let adapter = match adapters.get(&node.node_type) {
+            Some(a) => a,
+            None => {
+                post_error = Some(format!(
+                    "no adapter for post-producer node '{}' (type '{}')",
+                    node.id, node.node_type
+                ));
+                break;
+            }
+        };
+        let step_started = ctx.clock.now_ms();
+        let attempt = Instant::now();
+        emit_node_started(&ctx, &node.id, &node.node_type);
+        let inbound: &FlowEnvelope =
+            io_mapping_inbound(&inputs).unwrap_or_else(|| ctx.initial_envelope.as_ref());
+        match run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, &ctx).await {
+            Ok(env) => {
+                emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
+                trace.push(TraceStep {
+                    node_id: node.id.clone(),
+                    node_type: node.node_type.clone(),
+                    started_at_ms: step_started,
+                    duration_ms: attempt.elapsed().as_millis() as u64,
+                    status: TraceStatus::Ok,
+                    usage: take_node_usage(&ctx, &node.id),
+                });
+                active_by_pos[run_idx] =
+                    compute_active_ports(&compiled, adapters.as_ref(), run_idx, &env);
+                outputs[run_idx] = Some(Arc::new(env));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                emit_node_finished(
+                    &ctx,
+                    &node.id,
+                    &TraceStatus::Error {
+                        message: msg.clone(),
+                    },
+                );
+                trace.push(TraceStep {
+                    node_id: node.id.clone(),
+                    node_type: node.node_type.clone(),
+                    started_at_ms: step_started,
+                    duration_ms: attempt.elapsed().as_millis() as u64,
+                    status: TraceStatus::Error {
+                        message: msg.clone(),
+                    },
+                    usage: None,
+                });
+                post_error = Some(format!("post-producer node '{}' failed: {msg}", node.id));
+                break;
+            }
+        }
+    }
+
+    // Trailer: one terminal finish marker so the client's stream settles with a
+    // finish_reason (intermediate iteration finishes were suppressed).
+    let finish_reason = if post_error.is_some() {
+        FinishReason::Error
+    } else {
+        last_finish.unwrap_or(FinishReason::Stop)
+    };
+    let usage = last_usage.unwrap_or_default();
+    let trailer = EnvelopeDelta::Llm(crate::flow_engine::envelope::LlmStreamChunk {
+        choice_index: 0,
+        text_delta: String::new(),
+        reasoning_delta: None,
+        tool_calls: Vec::new(),
+        usage: Some(usage),
+        finish_reason: Some(finish_reason),
+        error: post_error.clone(),
+    });
+    let _ = outbound_tx.send(Ok(trailer)).await;
+    drop(outbound_tx);
+
+    trace.sort_by_key(|s| s.started_at_ms);
+    let aggregate_usage = aggregate_usage(&trace);
+    let outcome = FlowExecutionOutcome {
+        final_envelope: (*final_arc).clone(),
+        trace,
+        usage: aggregate_usage,
+        finish_reason,
+        total_latency_ms: started.elapsed().as_millis() as i64,
+        error: post_error,
+    };
+    persist_execution(&db, execution_id, &outcome).await;
+    let _ = outcome_tx.send(outcome);
 }
 
 struct FinalizerInputs {
@@ -940,9 +1990,13 @@ fn node_has_live_input(
     }
     edges.iter().any(|&edge_idx| {
         let edge = &compiled.definition.edges[edge_idx];
-        let Some(from_pos) = compiled.run_idx_by_id.get(edge.from.as_str()).copied() else {
+        let Some(raw_from) = compiled.run_idx_by_id.get(edge.from.as_str()).copied() else {
             return false;
         };
+        // Contraction: an edge out of a region member (the exit) reads the
+        // region's output, stored at the entry slot — same remap `build_inputs`
+        // applies, so liveness and input resolution agree on a region producer.
+        let from_pos = compiled.contracted_producer_pos(raw_from);
         if outputs.get(from_pos).map(|o| o.is_none()).unwrap_or(true) {
             return false;
         }
@@ -969,7 +2023,11 @@ fn build_inputs(
         .iter()
         .filter_map(|&edge_idx| {
             let edge = &compiled.definition.edges[edge_idx];
-            let from_pos = compiled.run_idx_by_id.get(edge.from.as_str()).copied()?;
+            let raw_from = compiled.run_idx_by_id.get(edge.from.as_str()).copied()?;
+            // Contraction: an edge out of a region member (the exit) reads the
+            // region's output, which is stored at the entry slot — the same
+            // owner remap the dependency graph applies.
+            let from_pos = compiled.contracted_producer_pos(raw_from);
             let envelope = outputs.get(from_pos)?.clone()?;
             let is_live = match active_ports.get(from_pos).and_then(|p| p.as_ref()) {
                 // None = wszystkie porty producenta aktywne (default adaptera).
@@ -2705,5 +3763,302 @@ mod harness_streaming_tests {
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
         assert_eq!(outcome.final_envelope.payload.as_text(), Some("FINAL(iter=2)"));
+    }
+}
+
+#[cfg(test)]
+mod loop_region_tests {
+    //! Inline loop region: a marked sub-DAG executed inline over ONE evolving
+    //! envelope by the executor, with a single `loop_back` edge closing the
+    //! cycle. The region runner stops on a final assistant turn without tool
+    //! calls, honours the iteration budget + cancel, and accumulates
+    //! conversation history across iterations.
+    use super::execute_blocking;
+    use crate::db::DbPool;
+    use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::envelope::{
+        ChatMessage, ChatRole, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmToolCall, NodeInput,
+    };
+    use crate::flow_engine::node_adapter::{
+        test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,
+    };
+    use crate::flow_engine::node_adapters::{OutputNodeAdapter, TriggerNodeAdapter};
+    use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use crate::flow_engine::validation::{validate, FlowValidationError};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Agent-iteration test double. Each run increments `meta.iter`, appends an
+    /// assistant message, and — until `meta.iter` reaches `stop_at` — gives that
+    /// assistant message a tool call so the loop keeps going. At `stop_at` the
+    /// assistant message has NO tool calls (the agent's final answer), which is
+    /// the region's structural stop signal. History accumulates in
+    /// `context.messages`.
+    struct AgentBodyAdapter {
+        stop_at: i64,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for AgentBodyAdapter {
+        fn node_type(&self) -> &str {
+            "region_test_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("full", FlowDataType::Any)]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let mut env = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+            let n = env.meta.get("iter").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+            env.meta.insert("iter".into(), serde_json::Value::from(n));
+
+            // A grace pass (loop_final_pass) always answers without tools.
+            let final_pass = env
+                .meta
+                .get("loop_final_pass")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut msg = ChatMessage::assistant(format!("turn {n}"));
+            if n < self.stop_at && !final_pass {
+                msg.tool_calls = Some(vec![LlmToolCall {
+                    id: format!("call-{n}"),
+                    name: "search.run".into(),
+                    arguments: "{}".into(),
+                }]);
+            }
+            env.context.messages.push(msg);
+            env.payload = FlowValue::Text(format!("turn {n}"));
+            Ok(env)
+        }
+    }
+
+    fn registry(stop_at: i64) -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(AgentBodyAdapter { stop_at }));
+        Arc::new(r)
+    }
+
+    fn db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        {
+            let conn = pool.lock().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+                [],
+            )
+            .expect("seed flow");
+        }
+        pool
+    }
+
+    /// Flow: trigger → [region body] → output, with a loop_back edge body→body.
+    /// The single-node region (entry == exit == body) is the minimal inline
+    /// loop. `max`/`final_pass` configure the region via the entry node config.
+    fn region_flow(max: i64, final_pass: bool) -> serde_json::Value {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "region_test_body", "region": "loop1",
+                 "config": {"loop_max_iterations": max, "loop_final_pass": final_pass}},
+                {"id": "o", "type": "output", "config": {"format": "text"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "b", "from_port": "text", "to_port": "in"},
+                {"from": "b", "to": "b", "from_port": "full", "to_port": "in", "kind": "loop_back"},
+                {"from": "b", "to": "o", "from_port": "full", "to_port": "text"}
+            ]
+        })
+    }
+
+    async fn run(flow: &serde_json::Value, stop_at: i64) -> FlowExecutionOutcome {
+        let reg = registry(stop_at);
+        let compiled =
+            Arc::new(CompiledFlow::from_json("0", &flow.to_string(), &reg).expect("compile"));
+        execute_blocking(db(), compiled, FlowEnvelope::empty(), stub_ctx(), reg)
+            .await
+            .expect("execute_blocking")
+    }
+
+    /// (f) compile must NOT reject a flow with a loop_back edge — the back edge
+    /// is excluded from the toposort, so the outer DAG stays acyclic.
+    #[test]
+    fn compile_accepts_loop_back_edge() {
+        let reg = registry(3);
+        let cf = CompiledFlow::from_json("0", &region_flow(25, false).to_string(), &reg)
+            .expect("loop_back flow must compile");
+        assert_eq!(cf.regions.len(), 1);
+        let region = &cf.regions[0];
+        assert_eq!(region.id, "loop1");
+        assert_eq!(region.entry_pos, region.exit_pos, "single-node region");
+        assert_eq!(region.max_iterations, 25);
+    }
+
+    /// (a) the region stops when the last assistant turn has no tool calls.
+    #[tokio::test]
+    async fn stops_on_assistant_without_tool_calls() {
+        let outcome = run(&region_flow(25, false), 3).await;
+        // 3 iterations: turns 1,2 carry tool calls; turn 3 has none → stop.
+        assert_eq!(
+            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_exit_reason")
+                .and_then(|v| v.as_str()),
+            Some("no_tool_calls")
+        );
+    }
+
+    /// (b) the iteration budget caps the loop when the agent never finishes.
+    #[tokio::test]
+    async fn max_iterations_caps_the_loop() {
+        // stop_at far above the budget → the body always emits tool calls.
+        let outcome = run(&region_flow(4, false), 1000).await;
+        assert_eq!(
+            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(4)
+        );
+        assert_eq!(
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_exit_reason")
+                .and_then(|v| v.as_str()),
+            Some("max_iterations")
+        );
+    }
+
+    /// final_pass runs one extra grace iteration after budget exhaustion; the
+    /// grace pass answers without tools and the signal is cleared afterwards.
+    #[tokio::test]
+    async fn final_pass_runs_one_extra_iteration() {
+        let outcome = run(&region_flow(2, true), 1000).await;
+        // 2 budgeted + 1 grace = 3 body runs.
+        assert_eq!(
+            outcome.final_envelope.meta.get("iter").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert!(outcome.final_envelope.meta.get("loop_final_pass").is_none());
+    }
+
+    /// (c) a cancelled region surfaces as a node error so the flow aborts.
+    #[tokio::test]
+    async fn cancelled_region_is_flow_error() {
+        let reg = registry(1000);
+        let compiled =
+            Arc::new(CompiledFlow::from_json("0", &region_flow(10, false).to_string(), &reg).expect("compile"));
+        let ctx = stub_ctx();
+        ctx.cancel_token.cancel();
+        let outcome = execute_blocking(db(), compiled, FlowEnvelope::empty(), ctx, reg)
+            .await
+            .expect("execute_blocking returns an outcome carrying the error");
+        assert!(
+            outcome.error.as_deref().is_some_and(|e| e.contains("cancelled")),
+            "expected a cancelled error, got: {:?}",
+            outcome.error
+        );
+    }
+
+    /// (d) conversation history accumulates across iterations in ONE envelope:
+    /// each iteration appends exactly one assistant message, so a 3-iteration
+    /// run leaves 3 assistant turns in order.
+    #[tokio::test]
+    async fn conversation_history_accumulates_across_iterations() {
+        let outcome = run(&region_flow(25, false), 3).await;
+        let assistant_turns: Vec<String> = outcome
+            .final_envelope
+            .context
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::Assistant)
+            .map(|m| m.text_or_default())
+            .collect();
+        assert_eq!(assistant_turns, vec!["turn 1", "turn 2", "turn 3"]);
+        // The final turn has no tool calls (the stop signal).
+        let last = outcome
+            .final_envelope
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Assistant)
+            .unwrap();
+        assert!(last.tool_calls.as_ref().map(|c| c.is_empty()).unwrap_or(true));
+    }
+
+    /// (e) R11 rejects a region whose external edge leaves at a non-exit node.
+    /// Region `r` = {a (entry), b (exit)}, back edge b→a. The external output
+    /// must leave from the exit `b`, but here it leaves from the entry `a` —
+    /// a boundary crossing R11 forbids. (R4 is satisfied: a and b each keep one
+    /// forward incoming edge, the loop_back not counted.)
+    #[test]
+    fn r11_rejects_external_edge_out_of_non_exit() {
+        let flow = json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "a", "type": "region_test_body", "region": "r", "config": {}},
+                {"id": "b", "type": "region_test_body", "region": "r", "config": {}},
+                {"id": "o", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t", "to": "a", "from_port": "text", "to_port": "in"},
+                {"from": "a", "to": "b", "from_port": "full", "to_port": "in"},
+                {"from": "b", "to": "a", "from_port": "full", "to_port": "in", "kind": "loop_back"},
+                // External edge OUT of a (entry, not the exit b) — illegal crossing.
+                {"from": "a", "to": "o", "from_port": "full", "to_port": "text"}
+            ]
+        });
+        let def = serde_json::from_str(&flow.to_string()).unwrap();
+        let reg = registry(3);
+        let err = validate(&def, &reg).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::InvalidLoopRegion { .. }),
+            "expected InvalidLoopRegion, got: {err:?}"
+        );
+    }
+
+    /// R11 rejects a region without a loop_back edge (no way to close the loop).
+    #[test]
+    fn r11_rejects_region_without_loop_back() {
+        let flow = json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "region_test_body", "region": "r", "config": {}},
+                {"id": "o", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t", "to": "b", "from_port": "text", "to_port": "in"},
+                {"from": "b", "to": "o", "from_port": "full", "to_port": "text"}
+            ]
+        });
+        let def = serde_json::from_str(&flow.to_string()).unwrap();
+        let reg = registry(3);
+        let err = validate(&def, &reg).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::InvalidLoopRegion { .. }),
+            "expected InvalidLoopRegion, got: {err:?}"
+        );
     }
 }

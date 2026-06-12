@@ -627,6 +627,9 @@ pub mod test_support {
         async fn append(&self, _s: &str, _m: ChatMessage) -> Result<()> {
             panic!("stub ConversationHistoryStore: append called");
         }
+        async fn append_batch(&self, _s: &str, _m: &[ChatMessage]) -> Result<()> {
+            panic!("stub ConversationHistoryStore: append_batch called");
+        }
     }
 
     pub struct StubAudit;

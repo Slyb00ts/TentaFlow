@@ -17057,6 +17057,104 @@ pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+// --- Conversation messages (durable history) ---
+
+fn row_to_conversation_message(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DbConversationMessage> {
+    Ok(DbConversationMessage {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        seq: row.get(2)?,
+        role: row.get(3)?,
+        content: row.get(4)?,
+        tool_calls: row.get(5)?,
+        tool_call_id: row.get(6)?,
+        name: row.get(7)?,
+        payload_ref: row.get(8)?,
+        payload_kind: row.get(9)?,
+        node_id: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
+/// Append a batch of messages to a session in one transaction. `seq` is the
+/// next per-session value (`MAX(seq)+1`) and increments across the batch, so a
+/// turn keeps its message order. UNIQUE(session_id, seq) makes a retried turn a
+/// no-op (`INSERT OR IGNORE`) instead of duplicating rows. Returns the number
+/// of rows actually inserted.
+pub fn insert_conversation_messages(
+    pool: &DbPool,
+    session_id: &str,
+    messages: &[NewConversationMessage<'_>],
+) -> Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let mut next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM conversation_messages WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    )?;
+    let mut inserted = 0usize;
+    for m in messages {
+        let affected = tx.execute(
+            "INSERT OR IGNORE INTO conversation_messages
+                (session_id, seq, role, content, tool_calls, tool_call_id, name,
+                 payload_ref, payload_kind, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                session_id,
+                next_seq,
+                m.role,
+                m.content,
+                m.tool_calls,
+                m.tool_call_id,
+                m.name,
+                m.payload_ref,
+                m.payload_kind,
+                m.node_id,
+            ],
+        )?;
+        inserted += affected;
+        next_seq += 1;
+    }
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// Last `limit` messages for a session in chronological order (`seq` ASC).
+/// Empty vec when the session has no history.
+pub fn recent_conversation_messages(
+    pool: &DbPool,
+    session_id: &str,
+    limit: u32,
+) -> Result<Vec<DbConversationMessage>> {
+    let conn = acquire(pool)?;
+    // Take the newest `limit` rows (seq DESC) then flip to chronological order
+    // so the caller receives oldest-first without loading the whole session.
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, session_id, seq, role, content, tool_calls, tool_call_id, name,
+                payload_ref, payload_kind, node_id, created_at
+         FROM (
+            SELECT * FROM conversation_messages
+            WHERE session_id = ?1
+            ORDER BY seq DESC
+            LIMIT ?2
+         )
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![session_id, limit],
+            row_to_conversation_message,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod shared_setting_allowlist_tests {
     use super::*;

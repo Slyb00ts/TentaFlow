@@ -37,11 +37,13 @@ use crate::flow_engine::executor::{execute_blocking, execute_streaming, Streamin
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
-    CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
-    MapNodeAdapter, MemoryNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter,
-    SessionContextNodeAdapter, SpeakerContextNodeAdapter, SttNodeAdapter, SubflowNodeAdapter,
-    ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
+    AwaitSubagentsNodeAdapter, CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
+    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
+    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
+    OutputNodeAdapter, PersistTurnNodeAdapter,
+    PiiFilterNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter,
+    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
+    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -225,9 +227,8 @@ impl FlowDispatcher {
         let pii_rules: Arc<dyn PiiRulesStore> = Arc::new(PiiRulesStoreImpl::new(db.clone()));
         let tts_cleaning: Arc<dyn TtsCleaningStore> =
             Arc::new(TtsCleaningStoreImpl::new(db.clone()));
-        let history: Arc<dyn ConversationHistoryStore> = Arc::new(ConversationHistoryImpl::new(
-            service_manager.conversation_cache.clone(),
-        ));
+        let history: Arc<dyn ConversationHistoryStore> =
+            Arc::new(ConversationHistoryImpl::new(db.clone()));
         let quic_finder = Arc::new(ServiceManagerQuicFinder::new(service_manager.clone()));
         let memory: Arc<dyn MemoryStore> = Arc::new(MemoryStoreImpl::new(quic_finder));
 
@@ -887,6 +888,9 @@ fn build_registry(
     let mut r = AdapterRegistry::new();
     let arcs: Vec<Arc<dyn NodeAdapter>> = vec![
         Arc::new(TriggerNodeAdapter::new()),
+        // Reactive entry: a flow keyed on a sub-agent completion event. Same
+        // entry shape as `trigger`; the reactor seeds its initial envelope.
+        Arc::new(OnSubagentCompleteNodeAdapter::new()),
         Arc::new(OutputNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
         Arc::new(CombineNodeAdapter::new()),
@@ -894,12 +898,19 @@ fn build_registry(
         Arc::new(EmbeddingsNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
+        Arc::new(PersistTurnNodeAdapter::new()),
         Arc::new(SessionContextNodeAdapter::new()),
         Arc::new(SpeakerContextNodeAdapter::new()),
         Arc::new(VisionNodeAdapter::new()),
         // ask_user (§3.13 C) — BPMN User Task: no dependency slot, it uses the
         // process-global interaction registry + run manager.
         Arc::new(AskUserNodeAdapter::new()),
+        // Deterministic background blocks (§3.3–3.5): await_subagents + subagent_
+        // status + interval reach the process-global AgentRunManager directly (no
+        // slot); only `spawn` needs the AgentService slot to resolve agent_id→name.
+        Arc::new(AwaitSubagentsNodeAdapter::new()),
+        Arc::new(SubagentStatusNodeAdapter::new()),
+        Arc::new(IntervalNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);
@@ -911,6 +922,9 @@ fn build_registry(
     r.register(Arc::new(AgentContextNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(ToolExecNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));
+    // `spawn` resolves an agent_id config to the agent's name through the service
+    // before delegating in the background (§3.3).
+    r.register(Arc::new(SpawnNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(CompactContextNodeAdapter::new()));
     // Harness §3.5 blocks 1/2/6/8: subflow + loop + map + agent all share the
     // SubflowRunnerSlot (filled by FlowDispatcher::new) — each runs another flow
@@ -981,6 +995,7 @@ mod tests {
             "embeddings",
             "memory",
             "conversation_history",
+            "persist_turn",
             "session_context",
             "speaker_context",
             "llm",
@@ -994,6 +1009,10 @@ mod tests {
             "map",
             "agent",
             "ask_user",
+            "spawn",
+            "await_subagents",
+            "subagent_status",
+            "interval",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }

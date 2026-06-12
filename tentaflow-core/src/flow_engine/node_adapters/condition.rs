@@ -302,6 +302,7 @@ mod tests {
             }),
             position: None,
             label: None,
+            region: None,
         }
     }
 
@@ -423,6 +424,7 @@ mod tests {
             config: serde_json::json!({ "expression": expr }),
             position: None,
             label: None,
+            region: None,
         }
     }
 
@@ -492,6 +494,7 @@ mod tests {
             }),
             position: None,
             label: None,
+            region: None,
         };
         let out = ConditionNodeAdapter
             .execute(&node, &inputs, &stub_ctx())

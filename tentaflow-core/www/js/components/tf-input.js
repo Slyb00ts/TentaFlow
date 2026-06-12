@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
   }
 
   constructor() {
@@ -164,7 +164,7 @@ class TfInput extends HTMLElement {
     else this._input.removeAttribute('name');
 
     // Pass-through dla atrybutow kontroli wprowadzania (mobilna klawiatura).
-    for (const attr of ['autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern']) {
+    for (const attr of ['autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'min', 'max', 'step']) {
       const v = this.getAttribute(attr);
       if (v !== null) this._input.setAttribute(attr, v);
       else this._input.removeAttribute(attr);

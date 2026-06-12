@@ -202,6 +202,7 @@ mod tests {
             config,
             position: None,
             label: None,
+            region: None,
         }
     }
 

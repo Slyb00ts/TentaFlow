@@ -36,6 +36,26 @@ class TfSelect extends HTMLElement {
     this.setAttribute('value', v ?? '');
   }
 
+  // Replaces the inner <select> options at runtime (the light-DOM <option>
+  // children are consumed at build time, so callers that fetch options async
+  // must use this instead of re-setting innerHTML). `list` is [{value,label}];
+  // `selected` keeps the current pick when present in the new list.
+  setOptions(list, selected) {
+    if (!this._select) this._build();
+    this._select.innerHTML = '';
+    for (const o of list || []) {
+      const opt = document.createElement('option');
+      opt.value = o.value ?? '';
+      opt.textContent = o.label ?? String(o.value ?? '');
+      if (o.disabled) opt.disabled = true;
+      this._select.appendChild(opt);
+    }
+    if (selected != null) {
+      this._select.value = String(selected);
+      this.setAttribute('value', String(selected));
+    }
+  }
+
   _build() {
     // przejmij <option> z light DOM i przenies do wewnetrznego <select>
     const options = Array.from(this.querySelectorAll('option'));

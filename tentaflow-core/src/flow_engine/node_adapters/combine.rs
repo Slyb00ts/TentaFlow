@@ -153,6 +153,7 @@ mod tests {
             config,
             position: None,
             label: None,
+            region: None,
         }
     }
 
@@ -190,6 +191,7 @@ mod tests {
             config: serde_json::json!({ "variable_merge_policy": policy }),
             position: None,
             label: None,
+            region: None,
         }
     }
 

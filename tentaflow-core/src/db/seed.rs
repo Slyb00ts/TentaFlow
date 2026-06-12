@@ -231,6 +231,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "",
         ),
         (
+            "on_subagent_complete",
+            "trigger",
+            "Po zakończeniu sub-agenta",
+            "Reaktywny punkt wejścia: flow startuje, gdy przebieg sub-agenta osiąga stan końcowy. Filtr zawęża reakcję do dzieci wskazanego agenta i/lub statusu",
+            r#"{"agent_id":"","match_status":"completed"}"#,
+            "bell",
+            r#"{"properties":{"agent_id":{"type":"string","title":"Agent","description":"Reaguj tylko na dzieci tego agenta (puste = dowolny, gdy ustawiony status)","dynamic_enum":{"source":"agents"}},"match_status":{"type":"string","title":"Status","description":"Reaguj tylko na ten stan końcowy","enum":[{"value":"completed","label":"Zakończony"},{"value":"failed","label":"Błąd"},{"value":"cancelled","label":"Anulowany"}],"default":"completed"}},"order":["agent_id","match_status"]}"#,
+        ),
+        (
             "llm",
             "service",
             "Model LLM",
@@ -339,6 +348,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             r#"{"properties":{"max_messages":{"type":"integer","title":"Maks. wiadomości","minimum":1,"maximum":200,"default":20},"session_id":{"type":"string","title":"Session ID (opcjonalnie)","description":"Pomiń aby użyć ctx.session_id"}},"order":["max_messages","session_id"]}"#,
         ),
         (
+            "persist_turn",
+            "transform",
+            "Zapis tury rozmowy",
+            "Trwale zapisuje deltę bieżącej tury (pytanie, odpowiedź modelu, wyniki narzędzi, multimodal) do historii konwersacji. Wstaw za blokiem 'Historia rozmowy' i na końcu tury; envelope przepuszcza bez zmian.",
+            r#"{}"#,
+            "save",
+            r#"{"properties":{"session_id":{"type":"string","title":"Session ID (opcjonalnie)","description":"Pomiń aby użyć ctx.session_id"}},"order":["session_id"]}"#,
+        ),
+        (
             "session_context",
             "transform",
             "Kontekst sesji",
@@ -427,6 +445,42 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             r#"{"threshold_percent":50,"protect_last_messages":4,"summary_model":""}"#,
             "minimize-2",
             r#"{"properties":{"threshold_percent":{"type":"integer","title":"Próg (% okna)","minimum":1,"maximum":100,"default":50,"description":"Powyżej tego udziału okna kontekstu uruchamia kompakcję"},"protect_last_messages":{"type":"integer","title":"Chroń ostatnie N wiadomości","minimum":0,"maximum":50,"default":4},"summary_model":{"type":"string","title":"Model streszczający","description":"Puste = model z meta","dynamic_enum":{"source":"models","category":"llm"}}},"order":["threshold_percent","protect_last_messages","summary_model"]}"#,
+        ),
+        (
+            "spawn",
+            "logic",
+            "Deleguj subagenta (tło)",
+            "Deterministycznie (z grafu, nie z modelu) uruchamia subagenta w tle. Zadanie jest interpolowalne wyrażeniem CEL nad envelope; identyfikatory uruchomień trafiają do zmiennej (domyślnie spawned_run_ids). Envelope przepuszcza bez zmian. Wymaga kontekstu przebiegu (po bloku 'Kontekst agenta')",
+            r#"{"agent_id":"","task":"","context":"","output_variable":"spawned_run_ids"}"#,
+            "users",
+            r#"{"properties":{"agent_id":{"type":"string","title":"Agent","description":"Subagent do uruchomienia w tle","dynamic_enum":{"source":"agents"}},"task":{"type":"string","title":"Zadanie","format":"textarea","description":"Cel dla subagenta (interpolowalny wyrażeniem CEL nad envelope)"},"context":{"type":"string","title":"Kontekst (opcjonalnie)","format":"textarea","description":"Dodatkowy tekst doklejany przed zadaniem"},"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"spawned_run_ids","description":"Zmienna flow z listą run_ids uruchomionych subagentów"}},"required":["agent_id","task"],"order":["agent_id","task","context","output_variable"]}"#,
+        ),
+        (
+            "await_subagents",
+            "logic",
+            "Czekaj na subagentów",
+            "Blokuje aż nazwane przebiegi subagentów się ustabilizują (lub minie timeout). Run_ids bierze ze zmiennej (domyślnie spawned_run_ids) albo z jawnej listy. Zwalnia permit współbieżności na czas czekania (anti-livelock). Wyniki trafiają do zmiennej (domyślnie subagent_results), payload dostaje skrócone podsumowanie",
+            r#"{"run_ids_var":"spawned_run_ids","timeout_secs":600,"mode":"all","output_variable":"subagent_results"}"#,
+            "hourglass",
+            r#"{"properties":{"run_ids_var":{"type":"string","title":"Zmienna z run_ids","default":"spawned_run_ids","description":"Skąd czytać listę run_ids (zostaw puste aby użyć jawnej listy run_ids)"},"timeout_secs":{"type":"integer","title":"Timeout (s)","minimum":1,"maximum":3600,"default":600},"mode":{"type":"string","title":"Tryb","enum":[{"value":"all","label":"Wszystkie (all)"},{"value":"any","label":"Pierwszy (any)"}],"default":"all","description":"all = czekaj aż wszystkie skończą; any = wróć po pierwszym ukończonym"},"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"subagent_results","description":"Zmienna flow z wynikami subagentów"}},"order":["run_ids_var","timeout_secs","mode","output_variable"]}"#,
+        ),
+        (
+            "subagent_status",
+            "logic",
+            "Status subagentów",
+            "Migawka statusów dzieci (NIE blokuje): zwraca tablicę {run_id,status} aktywnych subagentów do zmiennej (domyślnie subagent_status). Pusta tablica = wszystkie dzieci terminalne. Do użycia w regionie z blokiem 'Interwał' jako okresowe sprawdzanie. Envelope przepuszcza bez zmian",
+            r#"{"output_variable":"subagent_status"}"#,
+            "activity",
+            r#"{"properties":{"output_variable":{"type":"string","title":"Zmienna wyjściowa","default":"subagent_status","description":"Zmienna flow z tablicą {run_id,status} aktywnych subagentów"}},"order":["output_variable"]}"#,
+        ),
+        (
+            "interval",
+            "transform",
+            "Interwał",
+            "Bramka czasowa: usypia na podaną liczbę sekund, potem przepuszcza envelope. Sen jest przerywalny — honoruje cancel i deadline przebiegu, więc anulowany/wygasły przebieg wraca natychmiast. Do pętli pollingowej 'status → interwał → loop_back' bez busy-loop",
+            r#"{"seconds":10}"#,
+            "timer",
+            r#"{"properties":{"seconds":{"type":"number","title":"Sekundy","minimum":0.1,"maximum":3600,"default":10,"description":"Czas uśpienia bramki; przycinany do deadline'u przebiegu"}},"required":["seconds"],"order":["seconds"]}"#,
         ),
         (
             "ask_user",
@@ -816,6 +870,27 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
 /// Chat). Nie nadpisuje edycji uzytkownika — harness jest edytowalny w
 /// FlowBuilderze i uruchamiany tylko jako `subflow`/`loop`/`agent`/jawny invoke
 /// po id.
+/// flow_json of the single-graph "Agent Run" harness (§3.8 redesign): one flow
+/// with an inline `agent_turn` loop region replacing the former three subflow-
+/// linked graphs (…011/…012/…013). The region entry (`compact_context`) carries
+/// the region config (`loop_max_iterations`/`loop_final_pass`); `agent_context`
+/// overrides the budget at runtime via `meta.loop_max_iterations`. The back edge
+/// `tool_exec -> compact_context` (`kind:"loop_back"`) closes the loop without the
+/// outer DAG becoming cyclic. Shared by the seed insert and the migration UPDATE
+/// so both paths emit byte-identical JSON.
+pub fn agent_run_flow_json() -> String {
+    // Single-graph agent harness with the inline `agent_turn` loop region. The
+    // region exit (`x1` tool_exec) is the stream producer: its `stream` port
+    // carries the live token stream (sourced from the region's `llm` member) to
+    // `output(mode=stream)`, so every iteration's narration and the final answer
+    // stream token-by-token (codex-style). The region's `full` output feeds
+    // `persist_turn` on the blocking finalizer path, which the executor runs over
+    // the fully accumulated turn once the stream settles — the durable history
+    // and outcome reflect the complete conversation. `output.mode=stream` is the
+    // stream sink; the stream IS the output, so `output` never runs as a node.
+    r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"h1","type":"conversation_history","position":{"x":200,"y":0},"config":{"max_messages":20}},{"id":"c0","type":"agent_context","position":{"x":400,"y":0},"config":{"agent_id":"","from_vars":true}},{"id":"k1","type":"compact_context","position":{"x":600,"y":0},"config":{"threshold_percent":50,"protect_last_messages":4,"summary_model":"","loop_max_iterations":25,"loop_final_pass":true},"region":"agent_turn"},{"id":"m1","type":"llm","position":{"x":800,"y":0},"config":{"model":"","temperature":0.7,"max_tokens":4096,"stream":true},"region":"agent_turn"},{"id":"x1","type":"tool_exec","position":{"x":1000,"y":0},"config":{"max_result_chars":16000,"max_tool_calls_per_iteration":16},"region":"agent_turn"},{"id":"p1","type":"persist_turn","position":{"x":1200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":1400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"h1","from_port":"text","data_type":"text"},{"from_node":"h1","to_node":"c0"},{"from_node":"c0","to_node":"k1"},{"from_node":"k1","to_node":"m1","to_port":"in"},{"from_node":"m1","to_node":"x1","from_port":"full"},{"from_node":"x1","to_node":"k1","kind":"loop_back"},{"from_node":"x1","to_node":"p1","from_port":"full"},{"from_node":"x1","to_node":"o1","from_port":"stream","to_port":"text"},{"from_node":"p1","to_node":"o1","to_port":"text"}]}"#.to_string()
+}
+
 fn seed_harness_flows(conn: &Connection) -> Result<()> {
     // Graf Harness: trigger -> conversation_history -> agent_router -> subflow
     //               (Agent Run) -> output. Edge'y miedzy portami Any sa
@@ -827,35 +902,31 @@ fn seed_harness_flows(conn: &Connection) -> Result<()> {
         agent_run = AGENT_RUN_FLOW_ID
     );
 
-    // Graf Agent Run: trigger -> agent_context(from_vars) -> loop(body: Agent
-    //                 Iteration) -> output.
-    let agent_run_json = format!(
-        r#"{{"nodes":[{{"id":"t1","type":"trigger","position":{{"x":0,"y":0}},"config":{{}}}},{{"id":"c1","type":"agent_context","position":{{"x":220,"y":0}},"config":{{"agent_id":"","from_vars":true}}}},{{"id":"l1","type":"loop","position":{{"x":440,"y":0}},"config":{{"body_flow_id":"{iteration}","until":"has(meta.harness_done) && meta.harness_done == true","max_iterations":25,"final_pass":true}}}},{{"id":"o1","type":"output","position":{{"x":660,"y":0}},"config":{{"format":"text"}}}}],"edges":[{{"from_node":"t1","to_node":"c1","from_port":"text","data_type":"text"}},{{"from_node":"c1","to_node":"l1"}},{{"from_node":"l1","to_node":"o1","to_port":"text"}}]}}"#,
-        iteration = AGENT_ITERATION_FLOW_ID
-    );
+    let agent_run_json = agent_run_flow_json();
 
-    // Graf Agent Iteration: trigger -> compact_context -> llm(tools) ->
-    //                       tool_exec -> output. llm.in jest typu Text;
-    //                       compact_context.full (Any) jest kompatybilne.
+    // Legacy iteration body, kept so old subflow-style edits that still point at
+    // this id keep resolving. Unreachable through the resolver and no longer
+    // referenced by the new single-graph "Agent Run" (the loop is an inline
+    // region now, not a subflow). Retained only as legacy/read-only.
     let agent_iteration_json = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"k1","type":"compact_context","position":{"x":220,"y":0},"config":{"threshold_percent":50,"protect_last_messages":4,"summary_model":""}},{"id":"m1","type":"llm","position":{"x":440,"y":0},"config":{"model":"","temperature":0.7,"max_tokens":4096,"stream":false}},{"id":"x1","type":"tool_exec","position":{"x":660,"y":0},"config":{"max_result_chars":16000,"max_tool_calls_per_iteration":16}},{"id":"o1","type":"output","position":{"x":880,"y":0},"config":{"format":"text"}}],"edges":[{"from_node":"t1","to_node":"k1","from_port":"text","data_type":"text"},{"from_node":"k1","to_node":"m1","to_port":"in"},{"from_node":"m1","to_node":"x1","from_port":"full"},{"from_node":"x1","to_node":"o1","to_port":"text"}]}"#;
 
     let flows: &[(&str, &str, &str, &str)] = &[
         (
             HARNESS_FLOW_ID,
             "TentaFlow Harness",
-            "Harness agentowy: trigger -> conversation_history -> agent_router -> subflow(Agent Run) -> output. Nieosiagalny przez resolver; uzywany jako Sub Flow / jawny invoke.",
+            "LEGACY: harness agentowy trigger -> conversation_history -> agent_router -> subflow(Agent Run) -> output. Zastapiony przez jednografowy 'Agent Run' z inline loop region; nieuzywany przez resolver/agenta. Zachowany read-only.",
             harness_json.as_str(),
         ),
         (
             AGENT_RUN_FLOW_ID,
             "Agent Run",
-            "Petla agenta: trigger -> agent_context(from_vars) -> loop(body: Agent Iteration) -> output. Domyslny flow agenta (agents.flow_id NULL).",
+            "Pojedynczy graf agenta z inline loop region 'agent_turn': trigger -> conversation_history -> agent_context -> [region: compact_context -> llm(tools) -> tool_exec -loop_back-> compact_context] -> persist_turn -> output. Stop strukturalny (ostatni assistant bez tool_calls). Domyslny flow agenta (agents.flow_id NULL).",
             agent_run_json.as_str(),
         ),
         (
             AGENT_ITERATION_FLOW_ID,
             "Agent Iteration",
-            "Cialo iteracji: trigger -> compact_context -> llm(tools) -> tool_exec -> output. Edytowalne w FlowBuilderze.",
+            "LEGACY: cialo iteracji trigger -> compact_context -> llm(tools) -> tool_exec -> output. Zastapione przez inline loop region w 'Agent Run'; nieuzywane (agent_block woła AGENT_RUN_FLOW_ID). Zachowane read-only.",
             agent_iteration_json,
         ),
     ];
@@ -1073,10 +1144,24 @@ mod tests {
         assert_eq!(st_harness, None, "harness ma service_type NULL");
         assert_eq!(def_harness, 0, "harness nie jest domyslny");
 
+        // Single-graph "Agent Run" with the inline `agent_turn` loop region.
+        // The region exit (`tool_exec`) is the stream producer: its `stream`
+        // port feeds `output(mode=stream)` for live token streaming, while its
+        // `full` port feeds `persist_turn` — 9 edges total (the streaming wire is
+        // the extra edge over the blocking shape).
         let (_, def_run) = assert_dag(
             "Agent Run",
-            &["trigger", "agent_context", "loop", "output"],
-            3,
+            &[
+                "trigger",
+                "conversation_history",
+                "agent_context",
+                "compact_context",
+                "llm",
+                "tool_exec",
+                "persist_turn",
+                "output",
+            ],
+            9,
         );
         assert_eq!(def_run, 0);
 

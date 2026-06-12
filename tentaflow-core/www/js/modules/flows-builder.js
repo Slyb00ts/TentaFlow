@@ -190,6 +190,9 @@ const FlowBuilderScreen = {
       // Declared flow variables (flow_json.variables) feed the per-node
       // io-mapping editor (§3.12): output_mapping targets must be declared (R10).
       getFlowVariables: () => state.flowVariables || [],
+      // Lets the config panel ask the live graph for a node's loop-region role
+      // (entry/exit/member) so region-level loop config renders on the entry node.
+      getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       onLabelChange: (id, label) => { state.canvas.updateNodeLabel(id, label); },
       onPositionChange: (id, patch) => {
