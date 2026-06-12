@@ -29,11 +29,9 @@ const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
 /// floty. Wszystkie trzy maja `is_default=0` i `service_type=NULL` — sa celowo
 /// nieosiagalne przez resolver i uzywane tylko jako Sub Flow / cialo petli /
 /// jawny invoke.
-const HARNESS_FLOW_ID: &str = "00000000-0000-4000-8000-000000000011";
 /// Cialo petli harnessa — `agent_block::AGENT_RUN_FLOW_ID` wskazuje dokladnie to
 /// id jako domyslny flow agenta (gdy `agents.flow_id` jest NULL).
 const AGENT_RUN_FLOW_ID: &str = "00000000-0000-4000-8000-000000000012";
-const AGENT_ITERATION_FLOW_ID: &str = "00000000-0000-4000-8000-000000000013";
 
 /// Staly UUID systemowego agenta `general` (§3.8) — zeby harness dzialal
 /// out-of-the-box. `flow_id=NULL` => uzywa seedowanego "Agent Run".
@@ -219,6 +217,45 @@ fn seed_pii_rules(conn: &Connection) -> Result<()> {
 
 /// Seeduje domyslne szablony wezlow flow (paleta komponentow).
 fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
+    // Palette defaults for the agent/compaction/router blocks reuse the adapter
+    // `pub const`s as their seeded values, so a freshly dragged block already
+    // shows the working built-in prompts (empty config still falls back to the
+    // same text, but the user reads empty boxes as broken). Built with
+    // `serde_json::json!` to embed the multi-line prompts without hand-escaping.
+    use crate::flow_engine::node_adapters::agent_context::{
+        ANTI_INJECTION_NOTE, DELEGATED_RESULTS_TEMPLATE, SKILLS_TEMPLATE,
+    };
+    use crate::flow_engine::node_adapters::agent_router::ROUTER_SYSTEM_PROMPT;
+    use crate::flow_engine::node_adapters::compact_context::{
+        SUMMARY_PREFIX, SUMMARY_SUFFIX, SUMMARY_SYSTEM_PROMPT, UPDATE_SYSTEM_PROMPT,
+    };
+
+    let agent_context_default = serde_json::json!({
+        "agent_id": "",
+        "from_vars": false,
+        "skills_template": SKILLS_TEMPLATE,
+        "anti_injection_note": ANTI_INJECTION_NOTE,
+        "delegated_results_template": DELEGATED_RESULTS_TEMPLATE
+    })
+    .to_string();
+    let compact_context_default = serde_json::json!({
+        "threshold_percent": 50,
+        "protect_last_messages": 4,
+        "summary_model": "",
+        "summary_system_prompt": SUMMARY_SYSTEM_PROMPT,
+        "update_system_prompt": UPDATE_SYSTEM_PROMPT,
+        "summary_prefix": SUMMARY_PREFIX,
+        "summary_suffix": SUMMARY_SUFFIX
+    })
+    .to_string();
+    let agent_router_default = serde_json::json!({
+        "agent_ids": [],
+        "router_model": "",
+        "fallback_agent_id": "",
+        "system_prompt": ROUTER_SYSTEM_PROMPT
+    })
+    .to_string();
+
     // (node_type, category, label, description, default_config, icon, params_schema)
     let templates: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
         (
@@ -379,9 +416,9 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "service",
             "Kontekst agenta",
             "Ładuje definicję agenta: system prompt, indeks skilli, allowlistę narzędzi i sygnały pętli harnessa; tworzy przebieg agenta",
-            r#"{"agent_id":"","from_vars":false}"#,
+            agent_context_default.as_str(),
             "bot",
-            r#"{"properties":{"agent_id":{"type":"string","title":"Agent","description":"Wybierz agenta (puste = z vars przy from_vars)","dynamic_enum":{"source":"agents"}},"from_vars":{"type":"boolean","title":"Z vars (router)","description":"Bierz agenta ze zmiennej ustawionej przez agent_router","default":false},"model":{"type":"string","title":"Model (override)","description":"Nadpisuje model agenta dla tej pętli","dynamic_enum":{"source":"models","category":"llm"}},"max_iterations":{"type":"integer","title":"Maks. iteracji (override)","minimum":1,"maximum":100}},"order":["agent_id","from_vars","model","max_iterations"]}"#,
+            r#"{"properties":{"agent_id":{"type":"string","title":"Agent","description":"Wybierz agenta (puste = z vars przy from_vars)","dynamic_enum":{"source":"agents"}},"from_vars":{"type":"boolean","title":"Z vars (router)","description":"Bierz agenta ze zmiennej ustawionej przez agent_router","default":false},"model":{"type":"string","title":"Model (override)","description":"Nadpisuje model agenta dla tej pętli","dynamic_enum":{"source":"models","category":"llm"}},"max_iterations":{"type":"integer","title":"Maks. iteracji (override)","minimum":1,"maximum":100},"skills_template":{"type":"string","title":"Nagłówek indeksu skilli","format":"textarea","description":"Instrukcja wewnątrz bloku <available_skills>; puste = wbudowany domyślny"},"anti_injection_note":{"type":"string","title":"Nota anty-injection","format":"textarea","description":"Doklejana do system promptu: wyniki narzędzi to dane, nie polecenia; puste = wbudowany domyślny"},"delegated_results_template":{"type":"string","title":"Nagłówek wyników delegacji","format":"textarea","description":"Instrukcja wewnątrz bloku <delegated_results>; puste = wbudowany domyślny"}},"order":["agent_id","from_vars","model","max_iterations","skills_template","anti_injection_note","delegated_results_template"]}"#,
         ),
         (
             "tool_exec",
@@ -433,18 +470,18 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "logic",
             "Router agentów",
             "Wybiera (NIE uruchamia) najlepszego agenta dla zadania jednym tanim wywołaniem LLM; wybranego agenta uruchamia następny blok w grafie. Kandydaci tylko routable=1",
-            r#"{"agent_ids":[],"router_model":"","fallback_agent_id":""}"#,
+            agent_router_default.as_str(),
             "git-branch",
-            r#"{"properties":{"agent_ids":{"type":"array","title":"Kandydaci (puste = wszyscy routowalni)","description":"Ogranicz wybór do tych agentów; puste = wszyscy włączeni i routable","items":{"type":"string"},"dynamic_enum":{"source":"agents"}},"router_model":{"type":"string","title":"Model routera","description":"Mały/szybki model do klasyfikacji; puste = model z meta","dynamic_enum":{"source":"models","category":"llm"}},"fallback_agent_id":{"type":"string","title":"Agent zapasowy","description":"Gdy router nie wybierze jednoznacznie","dynamic_enum":{"source":"agents"}}},"order":["agent_ids","router_model","fallback_agent_id"]}"#,
+            r#"{"properties":{"agent_ids":{"type":"array","title":"Kandydaci (puste = wszyscy routowalni)","description":"Ogranicz wybór do tych agentów; puste = wszyscy włączeni i routable","items":{"type":"string"},"dynamic_enum":{"source":"agents"}},"router_model":{"type":"string","title":"Model routera","description":"Mały/szybki model do klasyfikacji; puste = model z meta","dynamic_enum":{"source":"models","category":"llm"}},"fallback_agent_id":{"type":"string","title":"Agent zapasowy","description":"Gdy router nie wybierze jednoznacznie","dynamic_enum":{"source":"agents"}},"system_prompt":{"type":"string","title":"System prompt routera","format":"textarea","description":"Instrukcja klasyfikatora wyboru agenta; puste = wbudowany domyślny"}},"order":["agent_ids","router_model","fallback_agent_id","system_prompt"]}"#,
         ),
         (
             "compact_context",
             "transform",
             "Kompakcja kontekstu",
             "Poniżej progu przepuszcza; powyżej streszcza środek rozmowy jednym wywołaniem LLM, chroniąc system prompt i najnowsze wiadomości (pełna dwufazowa kompakcja Hermes w fazie 7)",
-            r#"{"threshold_percent":50,"protect_last_messages":4,"summary_model":""}"#,
+            compact_context_default.as_str(),
             "minimize-2",
-            r#"{"properties":{"threshold_percent":{"type":"integer","title":"Próg (% okna)","minimum":1,"maximum":100,"default":50,"description":"Powyżej tego udziału okna kontekstu uruchamia kompakcję"},"protect_last_messages":{"type":"integer","title":"Chroń ostatnie N wiadomości","minimum":0,"maximum":50,"default":4},"summary_model":{"type":"string","title":"Model streszczający","description":"Puste = model z meta","dynamic_enum":{"source":"models","category":"llm"}}},"order":["threshold_percent","protect_last_messages","summary_model"]}"#,
+            r#"{"properties":{"threshold_percent":{"type":"integer","title":"Próg (% okna)","minimum":1,"maximum":100,"default":50,"description":"Powyżej tego udziału okna kontekstu uruchamia kompakcję"},"protect_last_messages":{"type":"integer","title":"Chroń ostatnie N wiadomości","minimum":0,"maximum":50,"default":4},"summary_model":{"type":"string","title":"Model streszczający","description":"Puste = model agenta","dynamic_enum":{"source":"models","category":"llm"}},"summary_system_prompt":{"type":"string","title":"System prompt streszczenia","format":"textarea","description":"Faza 2 (pierwsze streszczenie środka rozmowy); puste = wbudowany domyślny"},"update_system_prompt":{"type":"string","title":"System prompt aktualizacji","format":"textarea","description":"Re-kompakcja: aktualizuje poprzednie streszczenie w miejscu; puste = wbudowany domyślny"},"summary_prefix":{"type":"string","title":"Prefiks streszczenia","format":"textarea","description":"Marker referencyjny przed wstrzykniętym streszczeniem; puste = wbudowany domyślny"},"summary_suffix":{"type":"string","title":"Sufiks streszczenia","format":"textarea","description":"Marker zamykający blok streszczenia; puste = wbudowany domyślny"}},"order":["threshold_percent","protect_last_messages","summary_model","summary_system_prompt","update_system_prompt","summary_prefix","summary_suffix"]}"#,
         ),
         (
             "spawn",
@@ -888,46 +925,85 @@ pub fn agent_run_flow_json() -> String {
     // the fully accumulated turn once the stream settles — the durable history
     // and outcome reflect the complete conversation. `output.mode=stream` is the
     // stream sink; the stream IS the output, so `output` never runs as a node.
-    r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"h1","type":"conversation_history","position":{"x":200,"y":0},"config":{"max_messages":20}},{"id":"c0","type":"agent_context","position":{"x":400,"y":0},"config":{"agent_id":"","from_vars":true}},{"id":"k1","type":"compact_context","position":{"x":600,"y":0},"config":{"threshold_percent":50,"protect_last_messages":4,"summary_model":"","loop_max_iterations":25,"loop_final_pass":true},"region":"agent_turn"},{"id":"m1","type":"llm","position":{"x":800,"y":0},"config":{"model":"","temperature":0.7,"max_tokens":4096,"stream":true},"region":"agent_turn"},{"id":"x1","type":"tool_exec","position":{"x":1000,"y":0},"config":{"max_result_chars":16000,"max_tool_calls_per_iteration":16},"region":"agent_turn"},{"id":"p1","type":"persist_turn","position":{"x":1200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":1400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"h1","from_port":"text","data_type":"text"},{"from_node":"h1","to_node":"c0"},{"from_node":"c0","to_node":"k1"},{"from_node":"k1","to_node":"m1","to_port":"in"},{"from_node":"m1","to_node":"x1","from_port":"full"},{"from_node":"x1","to_node":"k1","kind":"loop_back"},{"from_node":"x1","to_node":"p1","from_port":"full"},{"from_node":"x1","to_node":"o1","from_port":"stream","to_port":"text"},{"from_node":"p1","to_node":"o1","to_port":"text"}]}"#.to_string()
+    //
+    // Built via `serde_json::json!` so the multi-line agent/compaction prompt
+    // defaults (sourced from the adapter `pub const`s — one source of truth, no
+    // hand-escaping) embed cleanly. Nodes are spaced 360px on x with y=0; with
+    // NODE_WIDTH=280 (canvas.js) that leaves an 80px gutter so blocks never
+    // overlap. The prompt fields are seeded with the SAME built-in defaults the
+    // adapters fall back to, so the user SEES the working values instead of empty
+    // boxes (empty would still work, but reads as broken).
+    use crate::flow_engine::node_adapters::agent_context::{
+        ANTI_INJECTION_NOTE, DELEGATED_RESULTS_TEMPLATE, SKILLS_TEMPLATE,
+    };
+    use crate::flow_engine::node_adapters::compact_context::{
+        SUMMARY_PREFIX, SUMMARY_SUFFIX, SUMMARY_SYSTEM_PROMPT, UPDATE_SYSTEM_PROMPT,
+    };
+
+    serde_json::json!({
+        "nodes": [
+            {"id": "t1", "type": "trigger", "position": {"x": 0, "y": 0}, "config": {}},
+            {"id": "h1", "type": "conversation_history", "position": {"x": 360, "y": 0},
+             "config": {"max_messages": 20}},
+            {"id": "c0", "type": "agent_context", "position": {"x": 720, "y": 0},
+             "config": {
+                 "agent_id": "",
+                 "from_vars": true,
+                 "skills_template": SKILLS_TEMPLATE,
+                 "anti_injection_note": ANTI_INJECTION_NOTE,
+                 "delegated_results_template": DELEGATED_RESULTS_TEMPLATE
+             }},
+            {"id": "k1", "type": "compact_context", "position": {"x": 1080, "y": 0},
+             "region": "agent_turn",
+             "config": {
+                 "threshold_percent": 50,
+                 "protect_last_messages": 4,
+                 "summary_model": "",
+                 "loop_max_iterations": 25,
+                 "loop_final_pass": true,
+                 "summary_system_prompt": SUMMARY_SYSTEM_PROMPT,
+                 "update_system_prompt": UPDATE_SYSTEM_PROMPT,
+                 "summary_prefix": SUMMARY_PREFIX,
+                 "summary_suffix": SUMMARY_SUFFIX
+             }},
+            {"id": "m1", "type": "llm", "position": {"x": 1440, "y": 0},
+             "region": "agent_turn",
+             "config": {"model": "", "temperature": 0.7, "max_tokens": 4096, "stream": true}},
+            {"id": "x1", "type": "tool_exec", "position": {"x": 1800, "y": 0},
+             "region": "agent_turn",
+             "config": {"max_result_chars": 16000, "max_tool_calls_per_iteration": 16}},
+            {"id": "p1", "type": "persist_turn", "position": {"x": 2160, "y": 0}, "config": {}},
+            {"id": "o1", "type": "output", "position": {"x": 2520, "y": 0},
+             "config": {"mode": "stream"}}
+        ],
+        "edges": [
+            {"from_node": "t1", "to_node": "h1", "from_port": "text", "data_type": "text"},
+            {"from_node": "h1", "to_node": "c0"},
+            {"from_node": "c0", "to_node": "k1"},
+            {"from_node": "k1", "to_node": "m1", "to_port": "in"},
+            {"from_node": "m1", "to_node": "x1", "from_port": "full"},
+            {"from_node": "x1", "to_node": "k1", "kind": "loop_back"},
+            {"from_node": "x1", "to_node": "p1", "from_port": "full"},
+            {"from_node": "x1", "to_node": "o1", "from_port": "stream", "to_port": "text"},
+            {"from_node": "p1", "to_node": "o1", "to_port": "text"}
+        ]
+    })
+    .to_string()
 }
 
 fn seed_harness_flows(conn: &Connection) -> Result<()> {
-    // Graf Harness: trigger -> conversation_history -> agent_router -> subflow
-    //               (Agent Run) -> output. Edge'y miedzy portami Any sa
-    //               kompatybilne (R8); ostatni edge wpina subflow.full do
-    //               output.text (Any kompatybilne z Text).
-    let harness_json = format!(
-        r#"{{"nodes":[{{"id":"t1","type":"trigger","position":{{"x":0,"y":0}},"config":{{}}}},{{"id":"h1","type":"conversation_history","position":{{"x":220,"y":0}},"config":{{"max_messages":20}}}},{{"id":"r1","type":"agent_router","position":{{"x":440,"y":0}},"config":{{"agent_ids":[],"router_model":"","fallback_agent_id":"{general}"}}}},{{"id":"s1","type":"subflow","position":{{"x":660,"y":0}},"config":{{"flow_id":"{agent_run}","timeout_ms":0}}}},{{"id":"o1","type":"output","position":{{"x":880,"y":0}},"config":{{"format":"text"}}}}],"edges":[{{"from_node":"t1","to_node":"h1","from_port":"text","data_type":"text"}},{{"from_node":"h1","to_node":"r1"}},{{"from_node":"r1","to_node":"s1"}},{{"from_node":"s1","to_node":"o1","to_port":"text"}}]}}"#,
-        general = GENERAL_AGENT_ID,
-        agent_run = AGENT_RUN_FLOW_ID
-    );
-
     let agent_run_json = agent_run_flow_json();
 
-    // Legacy iteration body, kept so old subflow-style edits that still point at
-    // this id keep resolving. Unreachable through the resolver and no longer
-    // referenced by the new single-graph "Agent Run" (the loop is an inline
-    // region now, not a subflow). Retained only as legacy/read-only.
-    let agent_iteration_json = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"k1","type":"compact_context","position":{"x":220,"y":0},"config":{"threshold_percent":50,"protect_last_messages":4,"summary_model":""}},{"id":"m1","type":"llm","position":{"x":440,"y":0},"config":{"model":"","temperature":0.7,"max_tokens":4096,"stream":false}},{"id":"x1","type":"tool_exec","position":{"x":660,"y":0},"config":{"max_result_chars":16000,"max_tool_calls_per_iteration":16}},{"id":"o1","type":"output","position":{"x":880,"y":0},"config":{"format":"text"}}],"edges":[{"from_node":"t1","to_node":"k1","from_port":"text","data_type":"text"},{"from_node":"k1","to_node":"m1","to_port":"in"},{"from_node":"m1","to_node":"x1","from_port":"full"},{"from_node":"x1","to_node":"o1","to_port":"text"}]}"#;
-
+    // Only the single-graph "Agent Run" is seeded now. The former legacy
+    // …011 (Harness) / …013 (Agent Iteration) flows are gone: the loop is an
+    // inline region inside Agent Run, not a subflow chain. Migration v73 deletes
+    // those rows from already-provisioned databases.
     let flows: &[(&str, &str, &str, &str)] = &[
-        (
-            HARNESS_FLOW_ID,
-            "TentaFlow Harness",
-            "LEGACY: harness agentowy trigger -> conversation_history -> agent_router -> subflow(Agent Run) -> output. Zastapiony przez jednografowy 'Agent Run' z inline loop region; nieuzywany przez resolver/agenta. Zachowany read-only.",
-            harness_json.as_str(),
-        ),
         (
             AGENT_RUN_FLOW_ID,
             "Agent Run",
-            "Pojedynczy graf agenta z inline loop region 'agent_turn': trigger -> conversation_history -> agent_context -> [region: compact_context -> llm(tools) -> tool_exec -loop_back-> compact_context] -> persist_turn -> output. Stop strukturalny (ostatni assistant bez tool_calls). Domyslny flow agenta (agents.flow_id NULL).",
+            "Single agent graph with an inline `agent_turn` loop region: trigger -> conversation_history -> agent_context -> [region: compact_context -> llm(tools) -> tool_exec -loop_back-> compact_context] -> persist_turn -> output. Structural stop (last assistant without tool_calls). Default agent flow (agents.flow_id NULL).",
             agent_run_json.as_str(),
-        ),
-        (
-            AGENT_ITERATION_FLOW_ID,
-            "Agent Iteration",
-            "LEGACY: cialo iteracji trigger -> compact_context -> llm(tools) -> tool_exec -> output. Zastapione przez inline loop region w 'Agent Run'; nieuzywane (agent_block woła AGENT_RUN_FLOW_ID). Zachowane read-only.",
-            agent_iteration_json,
         ),
     ];
 
@@ -1071,8 +1147,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 4,
-            "oczekiwane 4 flow (Default Chat + 3 harness), jest {}",
+            total, 2,
+            "oczekiwane 2 flow (Default Chat + Agent Run), jest {}",
             total
         );
 
@@ -1094,12 +1170,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![
-                "Agent Iteration".to_string(),
-                "Agent Run".to_string(),
-                "Default Chat".to_string(),
-                "TentaFlow Harness".to_string(),
-            ]
+            vec!["Agent Run".to_string(), "Default Chat".to_string(),]
         );
 
         // Sprawdz flow strukturalnie. service_type harnessa jest NULL, wiec
@@ -1130,20 +1201,6 @@ mod tests {
         assert_eq!(st.as_deref(), Some("chat"));
         assert_eq!(def, 1, "Default Chat jest domyslnym flow");
 
-        let (st_harness, def_harness) = assert_dag(
-            "TentaFlow Harness",
-            &[
-                "trigger",
-                "conversation_history",
-                "agent_router",
-                "subflow",
-                "output",
-            ],
-            4,
-        );
-        assert_eq!(st_harness, None, "harness ma service_type NULL");
-        assert_eq!(def_harness, 0, "harness nie jest domyslny");
-
         // Single-graph "Agent Run" with the inline `agent_turn` loop region.
         // The region exit (`tool_exec`) is the stream producer: its `stream`
         // port feeds `output(mode=stream)` for live token streaming, while its
@@ -1164,13 +1221,6 @@ mod tests {
             9,
         );
         assert_eq!(def_run, 0);
-
-        let (_, def_iter) = assert_dag(
-            "Agent Iteration",
-            &["trigger", "compact_context", "llm", "tool_exec", "output"],
-            4,
-        );
-        assert_eq!(def_iter, 0);
     }
 
     /// §3.8: systemowy agent `general` jest zaseedowany ze stalym UUID,
@@ -1213,7 +1263,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 4, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 2, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -1244,12 +1294,12 @@ mod tests {
         // Ponowny seed (jak przy kolejnym starcie) — nie moze wybuchnac.
         super::seed_default_flows(&conn).expect("ponowny seed po rename nie moze sie wywrocic");
 
-        // Nadal 4 flow (Default Chat zmieniony + 3 harness z db::init), bez
+        // Nadal 2 flow (Default Chat zmieniony + Agent Run z db::init), bez
         // duplikatu Default Chat: kanoniczny id zachowany, nazwa nie nadpisana.
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 4, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 2, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
@@ -1429,24 +1479,150 @@ mod tests {
         let rows: Vec<(String, String)> = {
             let conn = pool.lock().unwrap();
             let mut stmt = conn
-                .prepare("SELECT id, flow_json FROM flows WHERE id IN (?1, ?2, ?3)")
+                .prepare("SELECT id, flow_json FROM flows WHERE id = ?1")
                 .unwrap();
-            stmt.query_map(
-                rusqlite::params![
-                    super::HARNESS_FLOW_ID,
-                    super::AGENT_RUN_FLOW_ID,
-                    super::AGENT_ITERATION_FLOW_ID
-                ],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
+            stmt.query_map(rusqlite::params![super::AGENT_RUN_FLOW_ID], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .unwrap()
             .filter_map(Result::ok)
             .collect()
         };
-        assert_eq!(rows.len(), 3, "trzy flow harnessa musza istniec");
+        assert_eq!(rows.len(), 1, "Agent Run flow must exist");
         for (id, json) in &rows {
             CompiledFlow::from_json(id, json, &registry)
                 .unwrap_or_else(|e| panic!("flow '{}': kompilacja nie przechodzi: {:?}", id, e));
+        }
+    }
+
+    /// UX regression: the seeded Agent Run graph must (1) space nodes 360px on x
+    /// so blocks never overlap (NODE_WIDTH=280 in canvas.js) and (2) carry the
+    /// built-in prompt defaults inline so the user SEES working values instead of
+    /// empty config boxes that read as broken.
+    #[test]
+    fn agent_run_flow_is_spaced_and_filled() {
+        use crate::flow_engine::node_adapters::agent_context::ANTI_INJECTION_NOTE;
+        use crate::flow_engine::node_adapters::compact_context::SUMMARY_SYSTEM_PROMPT;
+
+        let json = super::agent_run_flow_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = parsed["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 8, "Agent Run has 8 nodes");
+
+        // Exact x coordinates, spaced 360 from 0 (NODE_WIDTH=280 → 80px gutter).
+        let xs: Vec<i64> = nodes
+            .iter()
+            .map(|n| n["position"]["x"].as_i64().unwrap())
+            .collect();
+        assert_eq!(xs, vec![0, 360, 720, 1080, 1440, 1800, 2160, 2520]);
+        // Every node sits on y=0 (single horizontal lane).
+        assert!(nodes.iter().all(|n| n["position"]["y"].as_i64() == Some(0)));
+
+        let cfg = |id: &str| -> &serde_json::Value {
+            &nodes
+                .iter()
+                .find(|n| n["id"] == id)
+                .unwrap_or_else(|| panic!("node {id} missing"))["config"]
+        };
+
+        // compact_context carries the real built-in summary prompt, not empty.
+        assert_eq!(
+            cfg("k1")["summary_system_prompt"].as_str(),
+            Some(SUMMARY_SYSTEM_PROMPT),
+            "compact_context must seed the built-in summary system prompt"
+        );
+        assert!(!cfg("k1")["summary_system_prompt"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+
+        // agent_context carries the anti-injection note default.
+        assert_eq!(
+            cfg("c0")["anti_injection_note"].as_str(),
+            Some(ANTI_INJECTION_NOTE),
+            "agent_context must seed the built-in anti-injection note"
+        );
+
+        // The model fields stay intentionally empty (= agent's model from meta).
+        assert_eq!(cfg("m1")["model"].as_str(), Some(""));
+        assert_eq!(cfg("k1")["summary_model"].as_str(), Some(""));
+    }
+
+    /// The palette templates for the agent/compaction/router blocks must seed the
+    /// same built-in prompt defaults, so a freshly dragged block is pre-filled
+    /// (not an empty box). Reads the upserted `default_config` straight from the
+    /// `flow_node_templates` table.
+    #[test]
+    fn palette_defaults_carry_built_in_prompts() {
+        use crate::flow_engine::node_adapters::agent_router::ROUTER_SYSTEM_PROMPT;
+        use crate::flow_engine::node_adapters::compact_context::SUMMARY_SYSTEM_PROMPT;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        let default_cfg = |node_type: &str| -> serde_json::Value {
+            let raw: String = conn
+                .query_row(
+                    "SELECT default_config FROM flow_node_templates WHERE node_type = ?1",
+                    rusqlite::params![node_type],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| panic!("template {node_type} missing"));
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        assert_eq!(
+            default_cfg("compact_context")["summary_system_prompt"].as_str(),
+            Some(SUMMARY_SYSTEM_PROMPT)
+        );
+        assert_eq!(
+            default_cfg("agent_router")["system_prompt"].as_str(),
+            Some(ROUTER_SYSTEM_PROMPT)
+        );
+        assert!(default_cfg("agent_context")["skills_template"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+    }
+
+    /// The shipped orchestration example graphs (`docs/examples/*.json`) must stay
+    /// live: they parse, validate (R1-R11) and compile through the real runtime
+    /// path. A dead example that silently rots is worse than none, so CI fails the
+    /// moment an adapter port/config or a validation rule moves out from under it.
+    #[test]
+    fn example_orchestration_graphs_validate_and_compile() {
+        use crate::flow_engine::cache::CompiledFlow;
+        use crate::flow_engine::dispatcher::build_registry_for_test;
+        use crate::flow_engine::types::FlowDefinition;
+        use crate::flow_engine::validation::validate;
+
+        let registry = build_registry_for_test();
+        let examples = [
+            (
+                "agent-orchestration-demo",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/docs/examples/agent-orchestration-demo.json"
+                ),
+            ),
+            (
+                "agent-on-complete-demo",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/docs/examples/agent-on-complete-demo.json"
+                ),
+            ),
+        ];
+
+        for (name, path) in examples {
+            let json = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("example '{name}': read {path}: {e}"));
+            let parsed: FlowDefinition = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("example '{name}': parse: {e}"));
+            validate(&parsed, &registry)
+                .unwrap_or_else(|e| panic!("example '{name}': validation: {e}"));
+            CompiledFlow::from_json(name, &json, &registry)
+                .unwrap_or_else(|e| panic!("example '{name}': compile: {e:?}"));
         }
     }
 }
