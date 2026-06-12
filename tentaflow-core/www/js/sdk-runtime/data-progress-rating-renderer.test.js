@@ -1,9 +1,12 @@
 // =============================================================================
-// Plik: sdk-runtime/data-progress-rating-renderer.test.js
-// Opis: Testy ProgressBar (0x021D) + RatingDisplay (0x021E) — chunk 3.3d-13.
+// File: sdk-runtime/data-progress-rating-renderer.test.js
+// Description: Tests for ProgressBar (0x021D) + RatingDisplay (0x021E)
+// renderers backed by the <tf-progress-bar> and <tf-rating> web components.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-progress-bar.js';
+import '../components/tf-rating.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -74,8 +77,8 @@ test('ProgressBar renderuje fill na podstawie value/max', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields()));
   document.body.appendChild(el);
-  const fill = el.querySelector('.tf-progress-bar__fill');
-  assertEq(fill.style.width, '40.00%');
+  const fill = el.querySelector('.tf-progress-bar-fill');
+  assertEq(fill.style.width, '40%');
   assertEq(el.getAttribute('aria-valuenow'), '40');
 });
 
@@ -86,7 +89,7 @@ test('ProgressBar clampuje value do [0, max]', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields()));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-progress-bar__fill').style.width, '100.00%');
+  assertEq(el.querySelector('.tf-progress-bar-fill').style.width, '100%');
 });
 
 test('ProgressBar variant=indeterminate ignoruje value, brak aria-valuenow', () => {
@@ -107,10 +110,10 @@ test('ProgressBar reaguje na patch value', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields()));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-progress-bar__fill').style.width, '10.00%');
+  assertEq(el.querySelector('.tf-progress-bar-fill').style.width, '10%');
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('v'), op: { kind: 'set', value: 75 } }] });
-  assertEq(el.querySelector('.tf-progress-bar__fill').style.width, '75.00%');
-  assertEq(el.querySelector('.tf-progress-bar__label').textContent, '75%');
+  assertEq(el.querySelector('.tf-progress-bar-fill').style.width, '75%');
+  assertEq(el.querySelector('.tf-progress-bar-label').textContent, '75%');
 });
 
 test('ProgressBar label BindRef override standard %', () => {
@@ -123,7 +126,7 @@ test('ProgressBar label BindRef override standard %', () => {
   const engine = makeEngine(store);
   const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields({ label: BOUND('lbl') })));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-progress-bar__label').textContent, '3/6 plików');
+  assertEq(el.querySelector('.tf-progress-bar-label').textContent, '3/6 plików');
 });
 
 test('ProgressBar value=NaN → aria-invalid + label —', () => {
@@ -135,7 +138,7 @@ test('ProgressBar value=NaN → aria-invalid + label —', () => {
   document.body.appendChild(el);
   store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('v'), op: { kind: 'set', value: NaN } }] });
   assertEq(el.getAttribute('aria-invalid'), 'true');
-  assertEq(el.querySelector('.tf-progress-bar__label').textContent, '—');
+  assertEq(el.querySelector('.tf-progress-bar-label').textContent, '—');
 });
 
 test('ProgressBar odrzuca max<=0', () => {
@@ -157,7 +160,7 @@ test('ProgressBar default max=1.0 gdy nie podano', () => {
   ];
   const el = engine.render(comp(PROGRESS_BAR_TAG, fields));
   document.body.appendChild(el);
-  assertEq(el.querySelector('.tf-progress-bar__fill').style.width, '50.00%');
+  assertEq(el.querySelector('.tf-progress-bar-fill').style.width, '50%');
 });
 
 // ============================================================================

@@ -8,7 +8,7 @@
 
 class TfFilterChips extends HTMLElement {
   static get observedAttributes() {
-    return ['mode'];
+    return ['mode', 'clearable'];
   }
 
   constructor() {
@@ -56,10 +56,18 @@ class TfFilterChips extends HTMLElement {
       return `<button class="tf-filter-chip${activeCls}" data-index="${i}" type="button">${iconHtml}<span>${f.label || ''}</span>${countHtml}</button>`;
     }).join('');
 
-    this._container.innerHTML = html;
+    const clearHtml = this.hasAttribute('clearable')
+      ? '<button class="tf-filter-chips__clear" type="button" aria-label="Wyczyść filtry">×</button>'
+      : '';
+
+    this._container.innerHTML = html + clearHtml;
   }
 
   _onClick(e) {
+    if (e.target.closest('.tf-filter-chips__clear')) {
+      this.dispatchEvent(new CustomEvent('clear', { bubbles: true }));
+      return;
+    }
     const btn = e.target.closest('.tf-filter-chip');
     if (!btn) return;
     const index = parseInt(btn.dataset.index, 10);

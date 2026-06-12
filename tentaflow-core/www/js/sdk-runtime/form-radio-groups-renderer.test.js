@@ -1,9 +1,12 @@
 // =============================================================================
-// Plik: sdk-runtime/form-radio-groups-renderer.test.js
-// Opis: Testy RadioGroup (0x030D) + RadioCardGroup (0x030E) — chunk 3.3c-7.
+// File: sdk-runtime/form-radio-groups-renderer.test.js
+// Description: Tests for RadioGroup (0x030D) + RadioCardGroup (0x030E) rendered
+// through the <tf-radio-group> / <tf-radio> web components (cards variant for
+// 0x030E). Components are imported so happy-dom upgrades them on mount.
 // =============================================================================
 
 import './_dom-test-harness.js';
+import '../components/tf-radio.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -52,6 +55,11 @@ function setup() {
   bootstrapSdkRuntime();
   document.body.innerHTML = '';
 }
+// tf-radio-group builds its light DOM in connectedCallback, so tests mount.
+function mount(el) {
+  document.body.appendChild(el);
+  return el;
+}
 
 function rOpt(v, lbl, opts = {}) {
   const f = [
@@ -79,72 +87,77 @@ function rcOpt(v, title, opts = {}) {
 // RadioGroup
 // ============================================================================
 
-test('RadioGroup renderuje radiogroup z N radio inputs', () => {
+test('RadioGroup renders tf-radio-group with N tf-radio children + radiogroup role', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A'), rOpt('b', 'B')]],
     [2, 'vertical'], [3, { kind: 'literal', value: 'Wybór' }], [4, 'default'],
-  ]));
-  assertEq(el.getAttribute('role'), 'radiogroup');
-  assertEq(el.querySelectorAll('input[type=radio]').length, 2);
+  ])));
+  assertEq(el.tagName.toLowerCase(), 'tf-radio-group');
+  assertEq(el.querySelectorAll('tf-radio').length, 2);
+  assert(el.querySelector('[role=radiogroup]') != null, 'expected radiogroup role on list wrap');
+  assertEq(el.querySelectorAll('tf-radio .tf-radio-label').length, 2);
 });
 
-test('RadioGroup wszystkie radio dzielą jednakowy name attr', () => {
+test('RadioGroup sets shared name attr on the group', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A'), rOpt('b', 'B')]],
     [2, 'horizontal'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
-  ]));
-  const radios = el.querySelectorAll('input[type=radio]');
-  const n1 = radios[0].getAttribute('name');
-  const n2 = radios[1].getAttribute('name');
-  assertEq(n1, n2);
+  ])));
+  assertEq(el.getAttribute('name'), 'tf-radio-group-c1');
 });
 
-test('RadioGroup reactive checked sync ze store', () => {
+test('RadioGroup reactive checked sync from store', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('r'), value: 'b' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A'), rOpt('b', 'B')]],
     [2, 'horizontal'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
-  ]));
-  const radios = el.querySelectorAll('input[type=radio]');
+  ])));
+  assertEq(el.getAttribute('value'), 'b');
+  const radios = el.querySelectorAll('tf-radio');
   assertEq(radios[0].checked, false);
   assertEq(radios[1].checked, true);
+  // Store patch flips the selection.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('r'), op: { kind: 'set', value: 'a' } }],
+  });
+  assertEq(el.getAttribute('value'), 'a');
+  assertEq(radios[0].checked, true);
+  assertEq(radios[1].checked, false);
 });
 
-test('RadioGroup click emituje change z SelectValue', () => {
+test('RadioGroup click emits change with SelectValue payload', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A'), rOpt('b', 'B')]],
     [2, 'horizontal'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
-  ]));
+  ])));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const radios = el.querySelectorAll('input[type=radio]');
-  radios[1].checked = true;
-  radios[1].dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  el.querySelectorAll('tf-radio')[1].querySelector('.tf-radio-label').click();
   assertEq(got, { value: 'b', kind: 'tstr' });
 });
 
-test('RadioGroup disabled opcja nie emituje change', () => {
+test('RadioGroup disabled option does not emit change', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A', { disabled: true }), rOpt('b', 'B')]],
     [2, 'horizontal'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
-  ]));
+  ])));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const radios = el.querySelectorAll('input[type=radio]');
+  const radios = el.querySelectorAll('tf-radio');
   assertEq(radios[0].hasAttribute('disabled'), true);
-  radios[0].checked = true;
-  radios[0].dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  radios[0].querySelector('.tf-radio-label').click();
   assertEq(got, null);
 });
 
@@ -157,7 +170,7 @@ test('RadioGroup duplicate option values throws', () => {
   ])));
 });
 
-test('RadioGroup pusta options throws', () => {
+test('RadioGroup empty options throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(RADIO_GROUP_TAG, [
@@ -166,15 +179,16 @@ test('RadioGroup pusta options throws', () => {
   ])));
 });
 
-test('RadioGroup orientation=vertical ustawia klasę', () => {
+test('RadioGroup orientation=vertical sets modifier classes + list hook', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A')]],
     [2, 'vertical'], [3, { kind: 'literal', value: 'W' }], [4, 'compact'],
-  ]));
+  ])));
   assert(el.classList.contains('tf-radio-group--vertical'));
   assert(el.classList.contains('tf-radio-group--density-compact'));
+  assert(el.querySelector('.tf-radio-group__list') != null, 'expected list hook for modifiers');
 });
 
 test('RadioGroup invalid orientation throws', () => {
@@ -186,7 +200,7 @@ test('RadioGroup invalid orientation throws', () => {
   ])));
 });
 
-test('RadioGroup bez label wymaga a11y.label', () => {
+test('RadioGroup without label requires a11y.label', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(RADIO_GROUP_TAG, [
@@ -195,15 +209,16 @@ test('RadioGroup bez label wymaga a11y.label', () => {
   ])));
 });
 
-test('RadioGroup z labelem ma aria-labelledby', () => {
+test('RadioGroup with label has aria-labelledby', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')], [1, [rOpt('a', 'A')]],
     [2, 'horizontal'], [3, { kind: 'literal', value: 'Lab' }], [4, 'default'],
-  ]));
-  const lblId = el.querySelector('.tf-radio-group__label').id;
-  assertEq(el.getAttribute('aria-labelledby'), lblId);
+  ])));
+  const lbl = el.querySelector('.tf-radio-group__label');
+  assertEq(lbl.textContent, 'Lab');
+  assertEq(el.getAttribute('aria-labelledby'), lbl.id);
 });
 
 test('RadioGroup unknown field throws', () => {
@@ -216,39 +231,44 @@ test('RadioGroup unknown field throws', () => {
   ])));
 });
 
-test('RadioGroup option z hint renderuje .tf-radio-group__item-hint', () => {
+test('RadioGroup option with hint renders .tf-radio__hint on tf-radio', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_GROUP_TAG, [
     [0, PATH('r')],
     [1, [rOpt('a', 'A', { hint: { kind: 'literal', value: 'pomocniczy' } })]],
     [2, 'vertical'], [3, { kind: 'literal', value: 'W' }], [4, 'default'],
-  ]));
-  assertEq(el.querySelector('.tf-radio-group__item-hint').textContent, 'pomocniczy');
+  ])));
+  const radio = el.querySelector('tf-radio');
+  assertEq(radio.getAttribute('hint'), 'pomocniczy');
+  assertEq(radio.querySelector('.tf-radio__hint').textContent, 'pomocniczy');
 });
 
 // ============================================================================
 // RadioCardGroup
 // ============================================================================
 
-test('RadioCardGroup renderuje N kart + columns CSS var', () => {
+test('RadioCardGroup renders N cards + columns CSS var on cards group', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')], [1, [rcOpt('a', 'Plan A'), rcOpt('b', 'Plan B'), rcOpt('c', 'Plan C')]],
     [2, 3], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'Plany' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'Plany' } } })));
+  assertEq(el.tagName.toLowerCase(), 'tf-radio-group');
+  assertEq(el.hasAttribute('cards'), true);
   assertEq(el.querySelectorAll('.tf-radio-card-group__card').length, 3);
+  assert(el.querySelector('.tf-radio-card-group[role=radiogroup]') != null);
   assertEq(el.style.getPropertyValue('--tf-radio-card-cols'), '3');
 });
 
-test('RadioCardGroup variant=feature ustawia klasę', () => {
+test('RadioCardGroup variant=feature sets class', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')], [1, [rcOpt('a', 'A')]],
     [2, 1], [3, 'feature'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   assert(el.classList.contains('tf-radio-card-group--variant-feature'));
 });
 
@@ -257,31 +277,30 @@ test('RadioCardGroup reactive selected highlight + checked', () => {
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('r'), value: 'b' }], state_revision: 0, truncated: false });
   const engine = makeEngine(store);
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')], [1, [rcOpt('a', 'A'), rcOpt('b', 'B')]],
     [2, 2], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   const cards = el.querySelectorAll('.tf-radio-card-group__card');
   assert(cards[1].classList.contains('tf-radio-card-group__card--selected'));
-  assertEq(cards[1].querySelector('input').checked, true);
+  assert(!cards[0].classList.contains('tf-radio-card-group__card--selected'));
+  assertEq(el.querySelectorAll('tf-radio')[1].checked, true);
 });
 
-test('RadioCardGroup click emituje change z SelectValue', () => {
+test('RadioCardGroup click emits change with SelectValue payload', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')], [1, [rcOpt('a', 'A'), rcOpt('b', 'B')]],
     [2, 2], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const inp = el.querySelectorAll('input[type=radio]')[1];
-  inp.checked = true;
-  inp.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  el.querySelectorAll('.tf-radio-card-group__card')[1].click();
   assertEq(got, { value: 'b', kind: 'tstr' });
 });
 
-test('RadioCardGroup option z badge renderuje .tf-inline-badge', () => {
+test('RadioCardGroup option with badge renders .tf-inline-badge', () => {
   setup();
   const engine = makeEngine();
   const badge = [
@@ -289,11 +308,11 @@ test('RadioCardGroup option z badge renderuje .tf-inline-badge', () => {
     [2, { kind: 'literal', value: 'NEW' }],
     [5, false],
   ];
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')],
     [1, [rcOpt('a', 'A', { badge })]],
     [2, 1], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   const bg = el.querySelector('.tf-inline-badge');
   assert(bg != null);
   assertEq(bg.querySelector('.tf-inline-badge__label').textContent, 'NEW');
@@ -301,18 +320,22 @@ test('RadioCardGroup option z badge renderuje .tf-inline-badge', () => {
   assert(bg.classList.contains('tf-inline-badge--tone-success'));
 });
 
-test('RadioCardGroup option z description', () => {
+test('RadioCardGroup option with description', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')],
     [1, [rcOpt('a', 'Free', { description: { kind: 'literal', value: '0 zł/mc' } })]],
     [2, 1], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   assertEq(el.querySelector('.tf-radio-card-group__description').textContent, '0 zł/mc');
+  // Icon and body land inside the card label as direct children.
+  const card = el.querySelector('.tf-radio-card-group__card');
+  assert(card.querySelector(':scope > .tf-radio-card-group__icon') != null);
+  assert(card.querySelector(':scope > .tf-radio-card-group__body') != null);
 });
 
-test('RadioCardGroup brak a11y.label throws', () => {
+test('RadioCardGroup missing a11y.label throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(RADIO_CARD_GROUP_TAG, [
@@ -348,7 +371,7 @@ test('RadioCardGroup duplicate option values throws', () => {
   ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
 });
 
-test('RadioCardGroup pusta options throws', () => {
+test('RadioCardGroup empty options throws', () => {
   setup();
   const engine = makeEngine();
   assertThrows(() => engine.render(comp(RADIO_CARD_GROUP_TAG, [
@@ -356,18 +379,18 @@ test('RadioCardGroup pusta options throws', () => {
   ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
 });
 
-test('RadioCardGroup disabled option nie emituje change', () => {
+test('RadioCardGroup disabled option does not emit change', () => {
   setup();
   const engine = makeEngine();
-  const el = engine.render(comp(RADIO_CARD_GROUP_TAG, [
+  const el = mount(engine.render(comp(RADIO_CARD_GROUP_TAG, [
     [0, PATH('r')], [1, [rcOpt('a', 'A', { disabled: true })]],
     [2, 1], [3, 'default'],
-  ], { a11y: { label: { kind: 'literal', value: 'X' } } }));
+  ], { a11y: { label: { kind: 'literal', value: 'X' } } })));
   let got = null;
   el.addEventListener('change', (e) => { got = e.detail; });
-  const inp = el.querySelector('input[type=radio]');
-  inp.checked = true;
-  inp.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  const card = el.querySelector('.tf-radio-card-group__card');
+  assert(card.classList.contains('tf-radio-card-group__card--disabled'));
+  card.click();
   assertEq(got, null);
 });
 

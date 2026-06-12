@@ -4,6 +4,11 @@
 // PageHeader (0x0002), SectionHeader (0x0004), Toolbar (0x0005),
 // StatGroup (0x000A), Inspector (0x000C) — chunk 3.3f.
 //
+// Header maps onto the dashboard <tf-detail-header> component; inline
+// badges/chips/tabs render as <tf-badge>/<tf-chip>/<tf-tabs>. PageHeader,
+// SectionHeader, Toolbar, StatGroup and Inspector stay structural (no tf-*
+// equivalent for the page chrome itself) with tf-* interactive children.
+//
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/molecules/page.rs,
 //           tentaflow-sdk-spec/src/protocol/ui/molecules/sections.rs.
 // =============================================================================
@@ -14,7 +19,6 @@ import {
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef, assertBindRef } from './bind-resolver.js';
 import {
-  TONES,
   requireEnum, requireBool, requireU8, requireString,
   assertOnlyKnownFields,
 } from './data-chart-shared.js';
@@ -25,12 +29,21 @@ import { SEGMENTED_CONTROL_TAG } from './action-bars-renderer.js';
 import { SELECT_TAG } from './form-select-renderer.js';
 
 const DENSITIES = new Set(['default', 'compact', 'comfortable']);
-const BADGE_VARIANTS = new Set(['dot', 'count', 'text', 'status', 'icon']);
-const CHIP_VARIANTS = new Set(['solid', 'soft', 'outline', 'removable', 'selectable', 'toggle']);
-const SPACINGS = new Set(['zero', 'xxs', 'xs', 'sm', 'md', 'lg', 'xl', 'xxl']);
 
 // SearchBox tag — 0x0307 per spec, no JS renderer export exists yet.
 const SEARCHBOX_TAG = 0x0307;
+
+// SDK tone → <tf-badge tone> attribute values.
+const BADGE_TONE_TO_TF = {
+  neutral: 'accent', primary: 'accent', success: 'success',
+  warning: 'warning', critical: 'danger', info: 'info', muted: 'accent',
+};
+// SDK tone → <tf-chip status> attribute values (same mapping the Chip
+// renderer in data-stat-labels-renderer.js uses).
+const CHIP_TONE_TO_STATUS = {
+  neutral: 'info', primary: 'accent', success: 'ok',
+  warning: 'warn', critical: 'err', info: 'info', muted: 'info',
+};
 
 function assertComponentTag(c, expectedTag, parent, field) {
   if (!c || typeof c !== 'object' || Array.isArray(c)) {
@@ -57,107 +70,80 @@ function applyTextBind(element, bindRef, ctx) {
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
 }
 
+// Reactive BindRef → attribute mirror; tf-* web components re-render via
+// attributeChangedCallback (label/value/count attributes).
+function applyAttrBind(element, attrName, bindRef, ctx) {
+  const apply = () => {
+    const v = resolveBindRef(bindRef, ctx.store);
+    element.setAttribute(attrName, v == null ? '' : String(v));
+  };
+  apply();
+  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
+}
+
+/// InlineBadge → <tf-badge>. Count (key 3) wins over label (key 2) as the
+/// pill value; the optional icon (key 4) is validated but tf-badge carries
+/// no icon so only validation side effects remain.
 function renderInlineBadge(raw, ctx) {
   if (raw == null || typeof raw !== 'object') return null;
-  const el = document.createElement('span');
-  el.classList.add('tf-inline-badge');
-  const variant = typeof raw[0] === 'string' ? raw[0] : 'dot';
+  const el = document.createElement('tf-badge');
   const tone = typeof raw[1] === 'string' ? raw[1] : 'neutral';
-  el.classList.add(`tf-inline-badge--variant-${variant}`);
-  el.classList.add(`tf-inline-badge--tone-${tone}`);
-  const label = raw[2];
-  if (label != null) {
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-inline-badge__label');
-    applyTextBind(labelEl, label, ctx);
-    el.appendChild(labelEl);
-  }
-  const count = raw[3];
-  if (count != null) {
-    const countEl = document.createElement('span');
-    countEl.classList.add('tf-inline-badge__count');
-    applyTextBind(countEl, count, ctx);
-    el.appendChild(countEl);
-  }
-  const icon = raw[4];
-  if (icon != null) {
-    const iconEl = renderIcon(icon, 'InlineBadge.icon');
-    iconEl.classList.add('tf-inline-badge__icon');
-    el.appendChild(iconEl);
-  }
-  if (raw[5] === true) el.classList.add('tf-inline-badge--pulse');
+  el.setAttribute('tone', BADGE_TONE_TO_TF[tone] || 'accent');
+  const valueBind = raw[3] != null ? raw[3] : raw[2];
+  if (valueBind != null) applyAttrBind(el, 'value', valueBind, ctx);
+  if (raw[4] != null) renderIcon(raw[4], 'InlineBadge.icon');
   return el;
 }
 
+/// InlineChip → <tf-chip>. Named icons map to the chip icon attribute;
+/// asset icons are validated but have no attribute representation.
 function renderInlineChip(raw, ctx) {
   if (raw == null || typeof raw !== 'object') return null;
-  const el = document.createElement('span');
-  el.classList.add('tf-inline-chip');
-  const variant = typeof raw[0] === 'string' ? raw[0] : 'solid';
+  const el = document.createElement('tf-chip');
   const tone = typeof raw[1] === 'string' ? raw[1] : 'neutral';
-  el.classList.add(`tf-inline-chip--variant-${variant}`);
-  el.classList.add(`tf-inline-chip--tone-${tone}`);
-  const label = raw[2];
-  if (label != null) {
-    const labelEl = document.createElement('span');
-    labelEl.classList.add('tf-inline-chip__label');
-    applyTextBind(labelEl, label, ctx);
-    el.appendChild(labelEl);
+  el.setAttribute('status', CHIP_TONE_TO_STATUS[tone] || 'info');
+  if (raw[2] != null) applyAttrBind(el, 'label', raw[2], ctx);
+  if (raw[3] != null) {
+    renderIcon(raw[3], 'InlineChip.icon');
+    if (raw[3].kind === 'named') el.setAttribute('icon', raw[3].name);
   }
-  const icon = raw[3];
-  if (icon != null) {
-    const iconEl = renderIcon(icon, 'InlineChip.icon');
-    iconEl.classList.add('tf-inline-chip__icon');
-    el.appendChild(iconEl);
-  }
-  if (raw[6] === true) el.classList.add('tf-inline-chip--removable');
+  if (raw[6] === true) el.setAttribute('removable', '');
   return el;
 }
 
+/// NavTab[] → <tf-tabs variant="underline"> with <tf-tab> children. Tab
+/// badges collapse to the tf-tab count attribute (count key 3, else label
+/// key 2 of the InlineBadge).
 function renderNavTabs(tabs, ctx, parent) {
   if (!Array.isArray(tabs) || tabs.length === 0) return null;
-  const nav = document.createElement('nav');
-  nav.classList.add('tf-molecule-tabs');
-  nav.setAttribute('role', 'tablist');
+  const tabsEl = document.createElement('tf-tabs');
+  tabsEl.setAttribute('variant', 'underline');
   for (const tab of tabs) {
     if (tab == null || typeof tab !== 'object') continue;
-    const btn = document.createElement('button');
-    btn.classList.add('tf-molecule-tabs__tab');
-    btn.setAttribute('role', 'tab');
-    btn.type = 'button';
+    const tabEl = document.createElement('tf-tab');
     const id = typeof tab[0] === 'string' ? tab[0] : '';
-    btn.dataset.tabId = id;
+    tabEl.id = id;
     const label = tab[1];
-    if (label != null) {
-      const labelEl = document.createElement('span');
-      labelEl.classList.add('tf-molecule-tabs__label');
-      applyTextBind(labelEl, label, ctx);
-      btn.appendChild(labelEl);
-    }
+    if (label != null) applyAttrBind(tabEl, 'label', label, ctx);
     const icon = tab[2];
     if (icon != null) {
-      const iconEl = renderIcon(icon, `${parent}.tabs.icon`);
-      iconEl.classList.add('tf-molecule-tabs__icon');
-      btn.prepend(iconEl);
+      renderIcon(icon, `${parent}.tabs.icon`);
+      if (icon.kind === 'named') tabEl.setAttribute('icon', icon.name);
     }
     const badge = tab[3];
-    if (badge != null) {
-      const badgeEl = renderInlineBadge(badge, ctx);
-      if (badgeEl) btn.appendChild(badgeEl);
+    if (badge != null && typeof badge === 'object') {
+      const countBind = badge[3] != null ? badge[3] : badge[2];
+      if (countBind != null) applyAttrBind(tabEl, 'count', countBind, ctx);
     }
-    if (tab[5] === true) {
-      btn.classList.add('tf-molecule-tabs__tab--locked');
-      btn.disabled = true;
-    }
-    nav.appendChild(btn);
+    if (tab[5] === true) tabEl.setAttribute('disabled', '');
+    tabsEl.appendChild(tabEl);
   }
-  return nav;
+  return tabsEl;
 }
 
 function renderBreadcrumbs(crumbs, ctx) {
   if (!Array.isArray(crumbs) || crumbs.length === 0) return null;
   const nav = document.createElement('nav');
-  nav.classList.add('tf-molecule-breadcrumbs');
   nav.setAttribute('aria-label', 'Breadcrumb');
   const ol = document.createElement('ol');
   ol.classList.add('tf-molecule-breadcrumbs__list');
@@ -186,9 +172,7 @@ function renderBreadcrumbs(crumbs, ctx) {
       el.setAttribute('aria-current', 'page');
     }
     if (icon != null) {
-      const iconEl = renderIcon(icon, 'BreadcrumbItem.icon');
-      iconEl.classList.add('tf-molecule-breadcrumbs__icon');
-      el.appendChild(iconEl);
+      el.appendChild(renderIcon(icon, 'BreadcrumbItem.icon'));
     }
     if (label != null) {
       const labelEl = document.createElement('span');
@@ -202,27 +186,25 @@ function renderBreadcrumbs(crumbs, ctx) {
   return nav;
 }
 
+/// FilterChipDef[] → clickable <tf-chip> pills (canonical chip component;
+/// labels go through textContent-safe attribute rendering).
 function renderFilterChips(filters, ctx) {
   if (!Array.isArray(filters) || filters.length === 0) return null;
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-molecule-filters');
   for (const f of filters) {
     if (f == null || typeof f !== 'object') continue;
-    const chip = document.createElement('button');
-    chip.classList.add('tf-molecule-filters__chip');
-    chip.type = 'button';
+    const chip = document.createElement('tf-chip');
+    chip.setAttribute('clickable', '');
+    chip.setAttribute('status', 'info');
     const id = typeof f[0] === 'string' ? f[0] : '';
     chip.dataset.filterId = id;
     const label = f[1];
-    if (label != null) {
-      const labelEl = document.createElement('span');
-      applyTextBind(labelEl, label, ctx);
-      chip.appendChild(labelEl);
-    }
+    if (label != null) applyAttrBind(chip, 'label', label, ctx);
     const icon = f[2];
     if (icon != null) {
-      const iconEl = renderIcon(icon, 'FilterChipDef.icon');
-      chip.prepend(iconEl);
+      renderIcon(icon, 'FilterChipDef.icon');
+      if (icon.kind === 'named') chip.setAttribute('icon', icon.name);
     }
     wrapper.appendChild(chip);
   }
@@ -230,7 +212,7 @@ function renderFilterChips(filters, ctx) {
 }
 
 // =============================================================================
-// Header (0x0001) — 7 fields
+// Header (0x0001) — 7 fields, maps onto <tf-detail-header>
 // =============================================================================
 
 export const HEADER_TAG = 0x0001;
@@ -254,66 +236,53 @@ function renderHeader(component, ctx) {
 
   assertComponentArrayTag(actionsRaw, BUTTON_TAG, 'Header', 'actions');
 
-  const wrapper = document.createElement('header');
-  wrapper.classList.add('tf-header', `tf-header--density-${density}`);
+  const el = document.createElement('tf-detail-header');
+  // tf-detail-header has a single canonical density; the validated value is
+  // kept as a state marker only.
+  el.setAttribute('data-density', density);
 
-  const iconEl = renderIcon(iconRaw, 'Header.icon');
-  iconEl.classList.add('tf-header__icon');
-  wrapper.appendChild(iconEl);
+  // renderIcon keeps full IconRef validation (named + asset); the component
+  // honours a slot="icon" child over its sprite icon attribute.
+  const iconSlot = document.createElement('span');
+  iconSlot.setAttribute('slot', 'icon');
+  iconSlot.appendChild(renderIcon(iconRaw, 'Header.icon'));
+  el.appendChild(iconSlot);
 
-  const content = document.createElement('div');
-  content.classList.add('tf-header__content');
+  applyAttrBind(el, 'title', titleBind, ctx);
+  if (subtitleBind != null) applyAttrBind(el, 'subtitle', subtitleBind, ctx);
 
-  const titleRow = document.createElement('div');
-  titleRow.classList.add('tf-header__title-row');
-
-  const titleEl = document.createElement('h1');
-  titleEl.classList.add('tf-header__title');
-  applyTextBind(titleEl, titleBind, ctx);
-  titleRow.appendChild(titleEl);
-
-  if (statusBadgeRaw != null) {
-    const badgeEl = renderInlineBadge(statusBadgeRaw, ctx);
-    if (badgeEl) {
-      badgeEl.classList.add('tf-header__badge');
-      titleRow.appendChild(badgeEl);
+  const hasChips = Array.isArray(metaChipsRaw) && metaChipsRaw.length > 0;
+  if (statusBadgeRaw != null || hasChips) {
+    const badges = document.createElement('span');
+    badges.setAttribute('slot', 'badges');
+    if (statusBadgeRaw != null) {
+      const badgeEl = renderInlineBadge(statusBadgeRaw, ctx);
+      if (badgeEl) badges.appendChild(badgeEl);
     }
-  }
-  content.appendChild(titleRow);
-
-  if (subtitleBind != null) {
-    const subtitleEl = document.createElement('p');
-    subtitleEl.classList.add('tf-header__subtitle');
-    applyTextBind(subtitleEl, subtitleBind, ctx);
-    content.appendChild(subtitleEl);
-  }
-
-  if (Array.isArray(metaChipsRaw) && metaChipsRaw.length > 0) {
-    const chipsRow = document.createElement('div');
-    chipsRow.classList.add('tf-header__chips');
-    for (const chipRaw of metaChipsRaw) {
-      const chipEl = renderInlineChip(chipRaw, ctx);
-      if (chipEl) chipsRow.appendChild(chipEl);
+    if (hasChips) {
+      for (const chipRaw of metaChipsRaw) {
+        const chipEl = renderInlineChip(chipRaw, ctx);
+        if (chipEl) badges.appendChild(chipEl);
+      }
     }
-    content.appendChild(chipsRow);
+    el.appendChild(badges);
   }
-
-  wrapper.appendChild(content);
 
   if (Array.isArray(actionsRaw) && actionsRaw.length > 0) {
-    const actionsEl = document.createElement('div');
-    actionsEl.classList.add('tf-header__actions');
+    const actions = document.createElement('span');
+    actions.setAttribute('slot', 'actions');
     for (const actionComp of actionsRaw) {
-      actionsEl.appendChild(ctx.renderChild(actionComp));
+      actions.appendChild(ctx.renderChild(actionComp));
     }
-    wrapper.appendChild(actionsEl);
+    el.appendChild(actions);
   }
 
-  return wrapper;
+  return el;
 }
 
 // =============================================================================
-// PageHeader (0x0002) — 5 fields
+// PageHeader (0x0002) — 5 fields, structural page chrome (breadcrumbs and a
+// tab strip have no place inside tf-detail-header; see class notes)
 // =============================================================================
 
 export const PAGE_HEADER_TAG = 0x0002;
@@ -510,7 +479,8 @@ function renderToolbar(component, ctx) {
 }
 
 // =============================================================================
-// StatGroup (0x000A) — 3 fields
+// StatGroup (0x000A) — 3 fields, grid of <tf-stat-card> (children render via
+// the registered StatCard renderer, so prop mapping lives in one place)
 // =============================================================================
 
 export const STAT_GROUP_TAG = 0x000A;
@@ -529,12 +499,12 @@ function renderStatGroup(component, ctx) {
 
   const wrapper = document.createElement('div');
   wrapper.classList.add('tf-stat-group', `tf-stat-group--density-${density}`);
+  // Column count is data-driven (u8 from the wire) so it cannot live in a
+  // static stylesheet; the mobile breakpoint overrides it with !important.
   wrapper.style.gridTemplateColumns = `repeat(${columns}, 1fr)`;
 
   for (const statComp of statsRaw) {
-    const el = ctx.renderChild(statComp);
-    el.classList.add('tf-stat-group__item');
-    wrapper.appendChild(el);
+    wrapper.appendChild(ctx.renderChild(statComp));
   }
 
   return wrapper;
@@ -582,11 +552,12 @@ function renderInspector(component, ctx) {
   }
 
   if (collapsible) {
-    const toggle = document.createElement('button');
+    const toggle = document.createElement('tf-button');
     toggle.classList.add('tf-inspector__toggle');
-    toggle.type = 'button';
+    toggle.setAttribute('variant', 'ghost');
+    toggle.setAttribute('size', 'sm');
+    toggle.setAttribute('label', '▸');
     toggle.setAttribute('aria-label', 'Toggle inspector');
-    toggle.textContent = '▸';
     toggle.addEventListener('click', () => {
       const collapsed = wrapper.classList.toggle('tf-inspector--collapsed');
       toggle.setAttribute('aria-expanded', String(!collapsed));

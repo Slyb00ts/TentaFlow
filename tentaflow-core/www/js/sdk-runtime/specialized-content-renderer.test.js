@@ -142,10 +142,38 @@ test('Carousel renders slides with navigation arrows', () => {
   assertEq(slides.length, 2, '2 slides');
   assert(!slides[0].classList.contains('tf-carousel__slide--hidden'), 'first visible');
   assert(slides[1].classList.contains('tf-carousel__slide--hidden'), 'second hidden');
-  assert(el.querySelector('.tf-carousel__arrow--prev') != null, 'prev arrow');
-  assert(el.querySelector('.tf-carousel__arrow--next') != null, 'next arrow');
+  const prevArrow = el.querySelector('.tf-carousel__arrow--prev');
+  const nextArrow = el.querySelector('.tf-carousel__arrow--next');
+  assert(prevArrow != null, 'prev arrow');
+  assert(nextArrow != null, 'next arrow');
+  assertEq(prevArrow.tagName, 'TF-BUTTON', 'prev arrow is tf-button');
+  assertEq(nextArrow.tagName, 'TF-BUTTON', 'next arrow is tf-button');
+  assertEq(prevArrow.getAttribute('aria-label'), 'Previous slide');
+  assertEq(nextArrow.getAttribute('aria-label'), 'Next slide');
   const indicators = el.querySelectorAll('.tf-carousel__indicator');
   assertEq(indicators.length, 2, '2 indicators');
+});
+
+test('Carousel arrow click emits slide_change with next index', () => {
+  setup();
+  const store = makeStore();
+  storeSetMulti(store,
+    PATH('slides'), ['a.jpg', 'b.jpg', 'c.jpg'],
+    PATH('idx'), 0,
+  );
+  const engine = makeEngine(store);
+  const el = engine.render(comp(CAROUSEL_TAG, [
+    [0, PATH('slides')], [1, PATH('idx')],
+    [2, false], [3, 0], [4, false], [5, false], [6, true], [7, 'arrows_only'],
+  ]));
+  document.body.appendChild(el);
+  let detail = null;
+  el.addEventListener('slide_change', (e) => { detail = e.detail; });
+  el.querySelector('.tf-carousel__arrow--next').dispatchEvent(new Event('click'));
+  assertEq(detail, { index: 1 }, 'next arrow emits index 1');
+  el.querySelector('.tf-carousel__arrow--prev').dispatchEvent(new Event('click'));
+  // current_index_path still reads 0 (host drives state), so prev clamps to 0.
+  assertEq(detail, { index: 0 }, 'prev arrow clamps at 0 without loop');
 });
 
 test('Carousel without arrows and indicators', () => {

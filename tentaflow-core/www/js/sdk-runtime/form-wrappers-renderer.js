@@ -1,15 +1,14 @@
 // =============================================================================
-// Plik: sdk-runtime/form-wrappers-renderer.js
-// Opis: Renderery container-typed komponentów Form — chunk 3.3c-8:
+// File: sdk-runtime/form-wrappers-renderer.js
+// Description: Renderers for the container-typed Form components:
 //   - FormField   (0x031A) — label+hint+error+required+child+layout
-//   - FormGroup   (0x031B) — collapsible group z optional title/description
-//   - FormSection (0x031C) — section z heavier heading + divider_top
+//   - FormGroup   (0x031B) — collapsible group with optional title/description
+//   - FormSection (0x031C) — section with heavier heading + divider_top
 //   - Form        (0x031D) — submit scope + validators + prevent_default_submit
 //
-// Wszystkie rekurencyjnie renderują child Component(s) przez ctx.renderChild
-// — engine zapewnia cleanup propagation. Form intercepts native form submit
-// dispatch + emit'uje `submit` event z scope_id (handlers per schema: submit,
-// reset).
+// All of them render child Component(s) recursively through ctx.renderChild —
+// the engine owns cleanup propagation. Form intercepts the native form submit
+// and emits `submit_form` / `reset_form` events carrying scope_id.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/form/wrappers.rs.
 // =============================================================================
@@ -21,7 +20,7 @@ import {
 import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
 
 // =============================================================================
-// Walidatory
+// Validators
 // =============================================================================
 
 const FORM_FIELD_LAYOUTS = new Set(['stacked', 'horizontal']);
@@ -30,7 +29,7 @@ const SPACING_TOKENS = new Set(['zero', 'xxs', 'xs', 'sm', 'md', 'lg', 'xl', 'xx
 const FORM_VALIDATOR_KINDS = new Set(['all_required', 'any_required', 'match', 'custom']);
 // scope_id grammar: [a-z0-9_-]+ length 1..=64 (mirror test_id).
 const SCOPE_ID_RE = /^[a-z0-9_-]+$/;
-// field_id grammar: takie same ograniczenia (component id allowlist).
+// field_id grammar: same constraints (component id allowlist).
 const FIELD_ID_RE = /^[a-z0-9_-]+$/;
 
 function requireEnum(v, set, ctx) {
@@ -71,23 +70,6 @@ function applyTextBind(element, bindRef, ctx) {
   };
   apply();
   ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
-}
-
-/// Reactive show/hide na BindRef boolowym. Brak BindRef → element zawsze
-/// widoczny.
-function applyVisibleBind(element, bindRef, ctx, defaultVisible) {
-  if (bindRef == null) {
-    element.hidden = !defaultVisible;
-    return () => defaultVisible;
-  }
-  let visible = false;
-  const apply = () => {
-    visible = resolveBindRef(bindRef, ctx.store) === true;
-    element.hidden = !visible;
-  };
-  apply();
-  ctx.registerCleanup(subscribeBindRef(bindRef, ctx.store, apply));
-  return () => visible;
 }
 
 // =============================================================================
@@ -143,8 +125,8 @@ function parseFormValidator(raw, ctx) {
   throw new TypeError(`${ctx}: unreachable`);
 }
 
-/// Walidacja Component shape (rekurencyjne dziecko). Engine sam waliduje
-/// pełniej przy render — tu sprawdzamy minimum że to obiekt z tag.
+/// Component shape validation (recursive child). The engine validates fully on
+/// render — here we only check the minimum: an object with a numeric tag.
 function assertComponentShape(c, ctx) {
   if (!c || typeof c !== 'object' || Array.isArray(c)) {
     throw new TypeError(`${ctx}: Component must be object`);
@@ -176,9 +158,9 @@ function renderFormField(component, ctx) {
   wrapper.classList.add(`tf-form-field--layout-${layout}`);
   if (required) wrapper.classList.add('tf-form-field--required');
 
-  // Label + child IDs sterowane przez aria-labelledby (rzeczywiste
-  // <label for=> wymagałoby znanego id child input'a; child może być dowolny
-  // wrapper-element, więc fallbackiem na aria-labelledby).
+  // Label/child association goes through aria-labelledby (a real <label for=>
+  // would require a known child input id; the child can be any wrapper
+  // element, so aria-labelledby is the reliable association).
   const labelEl = document.createElement('div');
   labelEl.classList.add('tf-form-field__label');
   const labelId = `tf-form-field-${component.id}-label`;
@@ -208,7 +190,6 @@ function renderFormField(component, ctx) {
     hint.setAttribute('id', hintId);
     applyTextBind(hint, hintBind, ctx);
     wrapper.appendChild(hint);
-    // Dodaj aria-describedby na child (jeśli child to interaktywny element).
     childEl.setAttribute('aria-describedby', hintId);
   }
 
@@ -221,9 +202,8 @@ function renderFormField(component, ctx) {
     const apply = () => {
       const v = resolveBindRef(errorBind, ctx.store);
       const text = typeof v === 'string' && v.length > 0 ? v : null;
-      // aria-describedby update — usuń errId (jeśli był) na clear,
-      // dodaj na set. Operacja set-based żeby uniknąć duplikatów przy
-      // wielokrotnych przejściach.
+      // aria-describedby update — drop errId on clear, add it on set.
+      // Set-based to avoid duplicates across repeated transitions.
       const current = childEl.getAttribute('aria-describedby');
       const ids = current ? current.split(/\s+/).filter(Boolean) : [];
       const filtered = ids.filter((id) => id !== errId);
@@ -278,8 +258,8 @@ function renderFormGroup(component, ctx) {
   childrenRaw.forEach((c, i) => assertComponentShape(c, `FormGroup.children[${i}]`));
   const spacing = requireEnum(ctx.readField(component.fields, 5), SPACING_TOKENS, 'FormGroup.spacing');
 
-  // collapsible=false z expanded BindRef'em jest sprzeczne — expanded ma
-  // sens tylko gdy collapsible=true.
+  // collapsible=false with an expanded BindRef is contradictory — expanded
+  // only makes sense when collapsible=true.
   if (!collapsible && expandedBind != null) {
     throw new TypeError('FormGroup.expanded only valid when collapsible=true');
   }
@@ -299,6 +279,10 @@ function renderFormGroup(component, ctx) {
     headerEl.classList.add('tf-form-group__header');
 
     if (collapsible) {
+      // Disclosure header, not an action button: tf-button forces .tf-btn
+      // styling and rebuilds its content from the label attribute, which
+      // would drop the reactive title element and the dedicated
+      // .tf-form-group__toggle chevron styling. Keep the structural button.
       toggleBtn = document.createElement('button');
       toggleBtn.setAttribute('type', 'button');
       toggleBtn.classList.add('tf-form-group__toggle');
@@ -350,14 +334,14 @@ function renderFormGroup(component, ctx) {
       ctx.registerCleanup(subscribeBindRef(expandedBind, ctx.store, applyExpanded));
     }
     if (toggleBtn) {
-      // Toggle bez BindRef'a → lokalny state (flip). Z BindRef'em →
-      // emit 'change' (write-back przez chunk 3.6). Bez expandedBind po
-      // prostu mutujemy DOM lokalnie.
+      // Toggle without a BindRef → local state flip. With a BindRef → emit
+      // 'toggle' (write-back handled by the dispatch layer). Without
+      // expandedBind we just mutate the DOM locally.
       const onClick = (e) => {
         e.preventDefault();
         if (expandedBind != null) {
-          // expandedBind przekazany w detail żeby chunk 3.6 / host wiedział
-          // dokąd write-back (BindRef::Bound.path).
+          // expandedBind is passed in detail so the dispatch layer / host
+          // knows where to write back (BindRef::Bound.path).
           wrapper.dispatchEvent(
             new (globalThis.CustomEvent || globalThis.Event)('toggle', {
               bubbles: false,
@@ -447,6 +431,15 @@ function renderFormSection(component, ctx) {
 export const FORM_TAG = 0x031D;
 const FORM_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
 
+// Form-level disabled targets native controls plus the tf-* form components
+// that observe `disabled` and propagate it to their internal controls.
+const FORM_CONTROL_SELECTOR = [
+  'input', 'button', 'select', 'textarea',
+  'tf-input', 'tf-textarea', 'tf-select', 'tf-combobox', 'tf-multiselect',
+  'tf-checkbox', 'tf-radio', 'tf-toggle', 'tf-slider', 'tf-segmented',
+  'tf-pin-input', 'tf-file-input', 'tf-color-input', 'tf-button',
+].join(', ');
+
 function renderForm(component, ctx) {
   assertOnlyKnownFields(component.fields, FORM_FIELD_KEYS, 'Form');
 
@@ -477,21 +470,22 @@ function renderForm(component, ctx) {
   wrapper.classList.add('tf-form');
   wrapper.classList.add(`tf-form--layout-${layout}`);
   wrapper.setAttribute('data-scope-id', scopeId);
-  // Natywne submit blokujemy gdy prevent_default_submit=true; user musi
-  // wywołać submit przez handler dispatch'a — Form NIE robi natywnego POST.
+  // Native submit is blocked when prevent_default_submit=true; submission goes
+  // through the handler dispatch — Form never performs a native POST.
   wrapper.setAttribute('novalidate', '');
 
-  // Render children FIRST — disabledBind apply() musi widzieć już-podpięte
-  // input/button/select/textarea żeby ustawić im disabled.
+  // Render children FIRST — the disabledBind apply() must see the already
+  // attached controls to set disabled on them.
   for (let i = 0; i < childrenRaw.length; i++) {
     wrapper.appendChild(ctx.renderChild(childrenRaw[i]));
   }
 
   let disabledActive = false;
   if (disabledBind != null) {
-    // Marker `data-tf-form-disabled` znaczy, że to MY (Form) ustawiliśmy
-    // disabled — przy flip OFF zdejmiemy TYLKO te wpisy, nie ruszając
-    // disabled ustawionego przez child renderery (per-pole binding'i).
+    // The `data-tf-form-disabled` marker means WE (Form) set disabled — on
+    // flip OFF only those entries are cleared, never disabled state owned by
+    // child renderers (per-field bindings). tf-* form components reflect
+    // their `disabled` attribute onto their internal native controls.
     const apply = () => {
       disabledActive = resolveBindRef(disabledBind, ctx.store) === true;
       if (disabledActive) {
@@ -501,16 +495,14 @@ function renderForm(component, ctx) {
         wrapper.removeAttribute('aria-disabled');
         wrapper.removeAttribute('data-disabled');
       }
-      const inputs = wrapper.querySelectorAll('input, button, select, textarea');
+      const inputs = wrapper.querySelectorAll(FORM_CONTROL_SELECTOR);
       inputs.forEach((i) => {
         if (disabledActive) {
-          // Nie nadpisujemy istniejącego disabled — gdy child ma własny
-          // disabled BindRef, nie chcemy go zniwelować przy flip OFF.
+          // Never override pre-existing disabled — when a child has its own
+          // disabled BindRef, flip OFF must not cancel it.
           if (!i.hasAttribute('disabled')) {
             i.setAttribute('disabled', '');
             i.setAttribute('data-tf-form-disabled', '');
-          } else if (!i.hasAttribute('data-tf-form-disabled')) {
-            // child już disabled przez własny binding — nie tagujemy.
           }
         } else if (i.hasAttribute('data-tf-form-disabled')) {
           i.removeAttribute('disabled');
@@ -553,8 +545,8 @@ function renderForm(component, ctx) {
   wrapper.addEventListener('reset', onReset);
   ctx.registerCleanup(() => wrapper.removeEventListener('reset', onReset));
 
-  // Expose validators metadata na data-* żeby chunk 3.6 / host mógł
-  // sięgnąć bez ponownego parsing'u.
+  // Expose validators metadata as data-* so the dispatch layer / host can
+  // read it without re-parsing.
   wrapper.setAttribute('data-validators-count', String(validators.length));
   for (let i = 0; i < validators.length; i++) {
     wrapper.setAttribute(`data-validator-${i}`, validators[i].kind);
@@ -564,7 +556,7 @@ function renderForm(component, ctx) {
 }
 
 // =============================================================================
-// Rejestracja
+// Registration
 // =============================================================================
 
 export function registerFormWrappersRenderers() {

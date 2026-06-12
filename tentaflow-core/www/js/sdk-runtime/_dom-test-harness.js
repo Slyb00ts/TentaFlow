@@ -29,16 +29,20 @@ const EXPORTED_GLOBALS = [
   'cancelAnimationFrame',
 ];
 
+// Only plain functions need `this` pinned to the window object. DOM classes
+// (HTMLElement, Event, ...) MUST be exposed unbound — a bound constructor has
+// no own `prototype`, which silently breaks custom elements that extend it
+// (no `style`, attributeChangedCallback never fires).
+const BOUND_FUNCTIONS = new Set([
+  'getComputedStyle',
+  'requestAnimationFrame',
+  'cancelAnimationFrame',
+]);
+
 for (const key of EXPORTED_GLOBALS) {
   const value = key === 'window' ? window : window[key];
   if (value === undefined) continue;
-  // Funkcje DOM przed bindem do `window` nie są tożsame z metodami;
-  // przypinamy zachowując `this` na window object.
-  if (typeof value === 'function' && key !== 'window') {
-    globalThis[key] = value.bind(window);
-  } else {
-    globalThis[key] = value;
-  }
+  globalThis[key] = BOUND_FUNCTIONS.has(key) ? value.bind(window) : value;
 }
 
 export function resetHarnessDocument() {

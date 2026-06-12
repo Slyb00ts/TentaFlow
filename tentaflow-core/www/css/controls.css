@@ -396,6 +396,23 @@ tf-window [slot="footer"] {
   color: var(--tf-text);
   transform: scale(1.05);
 }
+.tf-searchbox--variant-subtle {
+  background: transparent;
+  border-color: transparent;
+}
+.tf-searchbox--variant-subtle:hover { border-color: var(--tf-border); }
+.tf-searchbox--variant-subtle:focus-within {
+  background: var(--tf-bg-card);
+  border-color: var(--tf-accent-1);
+}
+.tf-searchbox--variant-prominent {
+  height: 48px;
+  padding: 0 48px 0 44px;
+}
+.tf-searchbox--variant-prominent:focus-within {
+  border-color: var(--tf-accent-1);
+  box-shadow: var(--tf-glow-accent);
+}
 
 /* =============================================================================
    tf-select
@@ -4391,6 +4408,13 @@ tf-skeleton {
 .tf-spacer--axis-both.tf-spacer--size-xl  { width: var(--tf-space-xl);  height: var(--tf-space-xl); }
 .tf-spacer--axis-both.tf-spacer--size-xxl { width: var(--tf-space-xxl); height: var(--tf-space-xxl); }
 
+/* ---------- tf-scroll-container (0x0112) ---------- */
+.tf-scroll-container { min-height: 0; }
+.tf-scroll-container--vertical   { overflow-y: auto; overflow-x: hidden; }
+.tf-scroll-container--horizontal { overflow-x: auto; overflow-y: hidden; }
+.tf-scroll-container--both       { overflow: auto; }
+.tf-scroll-container__header { position: sticky; top: 0; z-index: 1; }
+
 /* ---------- tf-tooltip (0x010F) ---------- */
 .tf-tooltip-wrapper { position: relative; display: inline-block; }
 .tf-tooltip {
@@ -5040,29 +5064,31 @@ tf-skeleton {
 .tf-button-group:not(.tf-button-group--attached) {
   gap: var(--tf-space-xs);
 }
-.tf-button-group--attached .tf-button {
+/* Children are <tf-button> hosts; the inner button carries .tf-btn,
+   so position matches on the host and the radius lands on the inner button. */
+.tf-button-group--attached tf-button .tf-btn {
   border-radius: 0;
 }
-.tf-button-group--attached.tf-button-group--orientation-horizontal .tf-button:first-child {
+.tf-button-group--attached.tf-button-group--orientation-horizontal tf-button:first-child .tf-btn {
   border-top-left-radius: var(--tf-radius-sm);
   border-bottom-left-radius: var(--tf-radius-sm);
 }
-.tf-button-group--attached.tf-button-group--orientation-horizontal .tf-button:last-child {
+.tf-button-group--attached.tf-button-group--orientation-horizontal tf-button:last-child .tf-btn {
   border-top-right-radius: var(--tf-radius-sm);
   border-bottom-right-radius: var(--tf-radius-sm);
 }
-.tf-button-group--attached.tf-button-group--orientation-vertical .tf-button:first-child {
+.tf-button-group--attached.tf-button-group--orientation-vertical tf-button:first-child .tf-btn {
   border-top-left-radius: var(--tf-radius-sm);
   border-top-right-radius: var(--tf-radius-sm);
 }
-.tf-button-group--attached.tf-button-group--orientation-vertical .tf-button:last-child {
+.tf-button-group--attached.tf-button-group--orientation-vertical tf-button:last-child .tf-btn {
   border-bottom-left-radius: var(--tf-radius-sm);
   border-bottom-right-radius: var(--tf-radius-sm);
 }
-.tf-button-group--attached.tf-button-group--orientation-horizontal .tf-button + .tf-button {
+.tf-button-group--attached.tf-button-group--orientation-horizontal tf-button + tf-button .tf-btn {
   border-left-width: 0;
 }
-.tf-button-group--attached.tf-button-group--orientation-vertical .tf-button + .tf-button {
+.tf-button-group--attached.tf-button-group--orientation-vertical tf-button + tf-button .tf-btn {
   border-top-width: 0;
 }
 
@@ -9031,6 +9057,7 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-iframe__blocked { padding: var(--tf-space-md); color: var(--tf-color-critical, #ef4444); text-align: center; }
 
 /* --- ImageGallery (0x060B) --- */
+.tf-image-gallery { display: grid; }
 .tf-image-gallery__cell { overflow: hidden; border-radius: var(--tf-radius-sm, 4px); position: relative; }
 .tf-image-gallery__cell--clickable { cursor: pointer; }
 .tf-image-gallery__cell--clickable:hover { opacity: 0.85; }
@@ -9060,7 +9087,7 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 
 /* --- PdfViewer (0x060D) --- */
 .tf-pdf-viewer { border: 1px solid var(--tf-border); border-radius: var(--tf-radius-md, 6px); overflow: hidden; }
-.tf-pdf-viewer__object { display: block; }
+.tf-pdf-viewer__object { display: block; width: 100%; height: 100%; }
 .tf-pdf-viewer__fallback { padding: var(--tf-space-md); text-align: center; color: var(--tf-text-3); }
 .tf-pdf-viewer__blocked { padding: var(--tf-space-md); color: var(--tf-color-critical, #ef4444); text-align: center; }
 
@@ -9126,6 +9153,7 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 0.8em;
   border: 1px solid var(--tf-border); border-radius: var(--tf-radius-md, 6px);
   background: var(--tf-color-surface, #fff);
+  overflow: auto;
 }
 .tf-log-viewer--density-compact .tf-log-viewer__entry { padding: 1px var(--tf-space-xs); }
 .tf-log-viewer--density-default .tf-log-viewer__entry { padding: var(--tf-space-xxs) var(--tf-space-xs); }

@@ -18,6 +18,8 @@ class TfDetailHeader extends HTMLElement {
     this._titleEl = null;
     this._subtitleEl = null;
     this._iconEl = null;
+    this._iconWrap = null;
+    this._slottedIcon = null;
     this._versionEl = null;
     this._badgesArea = null;
     this._actionsArea = null;
@@ -36,19 +38,25 @@ class TfDetailHeader extends HTMLElement {
     // Collect slot children before clearing
     const badgesSlot = this.querySelector(':scope > [slot="badges"]');
     const actionsSlot = this.querySelector(':scope > [slot="actions"]');
+    const iconSlot = this.querySelector(':scope > [slot="icon"]');
     this.innerHTML = '';
 
     const root = document.createElement('div');
     root.className = 'tf-detail-header';
 
-    // Icon circle
+    // Icon circle — a slotted icon (slot="icon") replaces the sprite <svg>
     const iconWrap = document.createElement('div');
     iconWrap.className = 'tf-detail-icon';
     const iconSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     iconSvg.classList.add('tf-detail-icon-svg');
     const useEl = document.createElementNS('http://www.w3.org/2000/svg', 'use');
     iconSvg.appendChild(useEl);
-    iconWrap.appendChild(iconSvg);
+    if (iconSlot) {
+      iconSlot.removeAttribute('slot');
+      iconWrap.appendChild(iconSlot);
+    } else {
+      iconWrap.appendChild(iconSvg);
+    }
 
     // Meta section
     const meta = document.createElement('div');
@@ -95,6 +103,8 @@ class TfDetailHeader extends HTMLElement {
 
     this._root = root;
     this._iconEl = iconSvg;
+    this._iconWrap = iconWrap;
+    this._slottedIcon = iconSlot;
     this._titleEl = titleEl;
     this._subtitleEl = subtitleEl;
     this._versionEl = versionEl;
@@ -112,11 +122,13 @@ class TfDetailHeader extends HTMLElement {
     this._subtitleEl.textContent = subtitle;
     this._subtitleEl.style.display = subtitle ? '' : 'none';
 
-    if (icon) {
+    if (this._slottedIcon) {
+      this._iconWrap.style.display = '';
+    } else if (icon) {
       this._iconEl.querySelector('use').setAttribute('href', `#i-${icon}`);
-      this._iconEl.parentElement.style.display = '';
+      this._iconWrap.style.display = '';
     } else {
-      this._iconEl.parentElement.style.display = 'none';
+      this._iconWrap.style.display = 'none';
     }
 
     this._versionEl.textContent = version;

@@ -2,6 +2,11 @@
 // File: tf-radio.js
 // Description: <tf-radio> radio button and <tf-radio-group> container. Group
 //              emits 'change' with detail.value when selection changes.
+//              Opt-in variants: `hint` attribute renders helper text under the
+//              label; `card` attribute on tf-radio (with `cards` on the group)
+//              renders the option as a selectable card whose light-DOM children
+//              become the card content; `orientation` on the group exposes the
+//              .tf-radio-group__list layout hooks for SDK modifier classes.
 // Example: <tf-radio-group name="color" value="red">
 //            <tf-radio value="red" label="Red"></tf-radio>
 //            <tf-radio value="blue" label="Blue"></tf-radio>
@@ -9,7 +14,7 @@
 // =============================================================================
 
 class TfRadio extends HTMLElement {
-  static get observedAttributes() { return ['value', 'label', 'disabled']; }
+  static get observedAttributes() { return ['value', 'label', 'hint', 'disabled']; }
 
   constructor() {
     super();
@@ -30,9 +35,13 @@ class TfRadio extends HTMLElement {
 
   get value() { return this.getAttribute('value') || ''; }
   get name() { return this.getAttribute('name') || ''; }
-  get checked() { return this._input?.classList.contains('checked') ?? false; }
+  get checked() { return this._input?.getAttribute('aria-checked') === 'true'; }
 
   _build() {
+    if (this.hasAttribute('card')) {
+      this._buildCard();
+      return;
+    }
     this.innerHTML = '';
     const label = document.createElement('label');
     label.className = 'tf-radio-label';
@@ -47,24 +56,60 @@ class TfRadio extends HTMLElement {
     const text = document.createElement('span');
     text.className = 'tf-radio-text';
 
+    const hint = document.createElement('span');
+    hint.className = 'tf-radio__hint';
+    hint.style.display = 'none';
+
     label.appendChild(input);
     label.appendChild(text);
+    label.appendChild(hint);
     this.appendChild(label);
     this._root = label;
     this._input = input;
     this._textEl = text;
+    this._hintEl = hint;
+  }
+
+  // Card variant keeps renderer-provided light-DOM children (icon, title,
+  // description, badge) and wraps them in a .tf-radio-card-group__card label.
+  _buildCard() {
+    const content = Array.from(this.childNodes);
+    const label = document.createElement('label');
+    label.className = 'tf-radio-card-group__card';
+    label.addEventListener('click', this._onClick);
+    label.addEventListener('keydown', this._onKey);
+
+    const input = document.createElement('span');
+    input.className = 'tf-radio-card-group__input';
+    input.setAttribute('role', 'radio');
+    input.setAttribute('tabindex', '0');
+
+    label.appendChild(input);
+    for (const node of content) label.appendChild(node);
+    this.appendChild(label);
+    this._root = label;
+    this._input = input;
+    this._textEl = null;
+    this._hintEl = null;
   }
 
   _update() {
-    const labelText = this.getAttribute('label') || '';
     const disabled = this.hasAttribute('disabled');
     const group = this.closest('tf-radio-group');
     const selected = group ? group.value === this.value : false;
 
-    this._textEl.textContent = labelText;
-    this._input.classList.toggle('checked', selected);
+    if (this.hasAttribute('card')) {
+      this._root.classList.toggle('tf-radio-card-group__card--selected', selected);
+      this._root.classList.toggle('tf-radio-card-group__card--disabled', disabled);
+    } else {
+      this._textEl.textContent = this.getAttribute('label') || '';
+      const hintText = this.getAttribute('hint') || '';
+      this._hintEl.textContent = hintText;
+      this._hintEl.style.display = hintText ? '' : 'none';
+      this._input.classList.toggle('checked', selected);
+      this._root.classList.toggle('disabled', disabled);
+    }
     this._input.setAttribute('aria-checked', String(selected));
-    this._root.classList.toggle('disabled', disabled);
 
     if (disabled) {
       this._input.setAttribute('tabindex', '-1');
@@ -131,7 +176,15 @@ class TfRadioGroup extends HTMLElement {
     label.style.display = labelText ? '' : 'none';
 
     const wrap = document.createElement('div');
-    wrap.className = 'tf-radio-group';
+    if (this.hasAttribute('cards')) {
+      wrap.className = 'tf-radio-card-group';
+    } else {
+      wrap.className = 'tf-radio-group';
+      // SDK RadioGroup orientation/density modifiers live on the host and
+      // target .tf-radio-group__list descendants; expose the hook only when
+      // the opt-in attribute is present so dashboard markup stays unchanged.
+      if (this.hasAttribute('orientation')) wrap.classList.add('tf-radio-group__list');
+    }
     wrap.setAttribute('role', 'radiogroup');
 
     this.prepend(label);

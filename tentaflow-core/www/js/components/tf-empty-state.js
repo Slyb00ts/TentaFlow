@@ -14,6 +14,7 @@ class TfEmptyState extends HTMLElement {
     this._root = null;
     this._actionSlot = null;
     this._slotContent = null;
+    this._slottedIcon = null;
   }
 
   connectedCallback() {
@@ -26,6 +27,11 @@ class TfEmptyState extends HTMLElement {
   }
 
   _build() {
+    // A child with slot="icon" (e.g. an externally rendered <svg>/<img>)
+    // takes over the icon area; captured before the action sweep below.
+    this._slottedIcon = this.querySelector(':scope > [slot="icon"]');
+    if (this._slottedIcon) this._slottedIcon.remove();
+
     // Capture slotted content (action buttons)
     this._slotContent = document.createDocumentFragment();
     while (this.firstChild) {
@@ -37,6 +43,10 @@ class TfEmptyState extends HTMLElement {
 
     this._iconEl = document.createElement('div');
     this._iconEl.className = 'tf-empty-state-icon';
+    if (this._slottedIcon) {
+      this._slottedIcon.removeAttribute('slot');
+      this._iconEl.appendChild(this._slottedIcon);
+    }
     el.appendChild(this._iconEl);
 
     this._titleEl = document.createElement('div');
@@ -61,7 +71,9 @@ class TfEmptyState extends HTMLElement {
     const title = this.getAttribute('title') || '';
     const message = this.getAttribute('message') || '';
 
-    if (icon) {
+    if (this._slottedIcon) {
+      this._iconEl.style.display = '';
+    } else if (icon) {
       this._iconEl.innerHTML =
         `<svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="/img/icons.svg#icon-${icon}"/></svg>`;
       this._iconEl.style.display = '';

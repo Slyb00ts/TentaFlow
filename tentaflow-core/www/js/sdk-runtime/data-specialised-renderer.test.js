@@ -1,6 +1,6 @@
 // =============================================================================
-// Plik: sdk-runtime/data-specialised-renderer.test.js
-// Opis: Testy CalendarMonth (0x0223), Image (0x0224), VisuallyHidden
+// File: sdk-runtime/data-specialised-renderer.test.js
+// Description: Tests for CalendarMonth (0x0223), Image (0x0224), VisuallyHidden
 // (0x0225), LiveRegionComponent (0x0226) — chunk 3.3d-15.
 // =============================================================================
 
@@ -72,7 +72,7 @@ function calFields({
   return f;
 }
 
-test('CalendarMonth renderuje 7-kolumnowy grid z day buttons', () => {
+test('CalendarMonth renders 7-column grid with day buttons', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CALENDAR_MONTH_TAG, calFields()));
@@ -82,7 +82,7 @@ test('CalendarMonth renderuje 7-kolumnowy grid z day buttons', () => {
   assertEq(dayBtns.length, 31);
 });
 
-test('CalendarMonth first_day=sunday ma Su jako pierwszy dow', () => {
+test('CalendarMonth first_day=sunday has Su as first dow', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CALENDAR_MONTH_TAG, calFields({ firstDay: 'sunday' })));
@@ -91,7 +91,7 @@ test('CalendarMonth first_day=sunday ma Su jako pierwszy dow', () => {
   assertEq(dows[0].textContent, 'Su');
 });
 
-test('CalendarMonth first_day=monday ma Mo jako pierwszy dow', () => {
+test('CalendarMonth first_day=monday has Mo as first dow', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CALENDAR_MONTH_TAG, calFields()));
@@ -100,7 +100,7 @@ test('CalendarMonth first_day=monday ma Mo jako pierwszy dow', () => {
   assertEq(dows[0].textContent, 'Mo');
 });
 
-test('CalendarMonth show_week_numbers renderuje week-no cells', () => {
+test('CalendarMonth show_week_numbers renders week-no cells', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(CALENDAR_MONTH_TAG, calFields({ showWeekNumbers: true })));
@@ -124,7 +124,7 @@ test('CalendarMonth events_path marks day with has-event', () => {
   assert(day15.classList.contains('tf-calendar__day--tone-success'));
 });
 
-test('CalendarMonth reaguje na patch month', () => {
+test('CalendarMonth reacts to month patch', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('m'), value: '2026-01' }], state_revision: 0, truncated: false });
@@ -166,7 +166,7 @@ function imgFields({
   return f;
 }
 
-test('Image renderuje <img> z src i alt', () => {
+test('Image renders <img> with src and alt', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(IMAGE_TAG, imgFields()));
@@ -177,7 +177,7 @@ test('Image renderuje <img> z src i alt', () => {
   assert(img.src.includes('example.com'));
 });
 
-test('Image fit=contain ustawia object-fit', () => {
+test('Image fit=contain sets object-fit', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(IMAGE_TAG, imgFields({ fit: 'contain' })));
@@ -185,7 +185,7 @@ test('Image fit=contain ustawia object-fit', () => {
   assertEq(el.querySelector('img').style.objectFit, 'contain');
 });
 
-test('Image lazy_load=true ustawia loading=lazy', () => {
+test('Image lazy_load=true sets loading=lazy', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(IMAGE_TAG, imgFields({ lazyLoad: true })));
@@ -193,7 +193,7 @@ test('Image lazy_load=true ustawia loading=lazy', () => {
   assertEq(el.querySelector('img').loading, 'lazy');
 });
 
-test('Image clickable=true dodaje role=button', () => {
+test('Image clickable=true adds role=button', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(IMAGE_TAG, imgFields({ clickable: true })));
@@ -202,7 +202,7 @@ test('Image clickable=true dodaje role=button', () => {
   assert(el.classList.contains('tf-image--clickable'));
 });
 
-test('Image radius=pill dodaje klasę', () => {
+test('Image radius=pill adds the class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(IMAGE_TAG, imgFields({ radius: 'pill' })));
@@ -218,7 +218,7 @@ test('Image javascript: src rejected', () => {
   assert(!el.querySelector('img').hasAttribute('src'));
 });
 
-test('Image reaguje na patch src_ref', () => {
+test('Image reacts to src_ref patch', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('s'), value: 'a.png' }], state_revision: 0, truncated: false });
@@ -272,7 +272,7 @@ function vhFields({ content = LIT('SR-only text'), asLive = null } = {}) {
   return f;
 }
 
-test('VisuallyHidden renderuje span z CSS clip class', () => {
+test('VisuallyHidden renders span with CSS clip class', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(VISUALLY_HIDDEN_TAG, vhFields()));
@@ -298,7 +298,7 @@ test('VisuallyHidden as_live=off does not add aria-live', () => {
   assert(el.getAttribute('aria-live') == null);
 });
 
-test('VisuallyHidden reaguje na patch content', () => {
+test('VisuallyHidden reacts to content patch', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('t'), value: 'old' }], state_revision: 0, truncated: false });
@@ -325,7 +325,7 @@ function lrFields({
   return f;
 }
 
-test('LiveRegion renderuje aria-live + content', () => {
+test('LiveRegion renders aria-live + content', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(LIVE_REGION_TAG, lrFields()));
@@ -357,7 +357,7 @@ test('LiveRegion rejects politeness=off (spec narrows to polite/assertive)', () 
   assertThrows(() => engine.render(comp(LIVE_REGION_TAG, lrFields({ politeness: 'off' }))));
 });
 
-test('LiveRegion reaguje na patch content', () => {
+test('LiveRegion reacts to content patch', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({ entries: [{ path: PATH('msg'), value: 'Loading...' }], state_revision: 0, truncated: false });
@@ -369,13 +369,13 @@ test('LiveRegion reaguje na patch content', () => {
   assertEq(el.querySelector('.tf-live-region__content').textContent, 'Done');
 });
 
-test('LiveRegion odrzuca clear_after_ms ujemne', () => {
+test('LiveRegion rejects negative clear_after_ms', () => {
   setup();
   const engine = makeEngine(makeStore());
   assertThrows(() => engine.render(comp(LIVE_REGION_TAG, lrFields({ clearAfterMs: -1 }))));
 });
 
-test('LiveRegion odrzuca clear_after_ms > u32 max', () => {
+test('LiveRegion rejects clear_after_ms > u32 max', () => {
   setup();
   const engine = makeEngine(makeStore());
   assertThrows(() => engine.render(comp(LIVE_REGION_TAG, lrFields({ clearAfterMs: 0xFFFFFFFF + 1 }))));
