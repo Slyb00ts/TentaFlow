@@ -815,46 +815,6 @@ impl Supervisor {
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
 
-    /// Decrypted, node-local credentials for a local external-provider service,
-    /// read from its `services.config_json`. Returns `None` when the service is
-    /// not an external provider, carries no key, or decryption fails. Used only
-    /// to build this node's BackendClient handle — the key never leaves the node
-    /// (it is absent from the broadcast `ServiceInfo`). For OpenAI subscription
-    /// auth (`auth_mode = "subscription"`) the key is the pasted Codex auth blob
-    /// and the handle is redirected to the ChatGPT Responses backend.
-    fn external_provider_creds(
-        &self,
-        service_id: i64,
-    ) -> Option<crate::services::handles_cache::ExternalProviderCreds> {
-        let row = {
-            let conn = self.db.lock().ok()?;
-            crate::services_repo::services::get(&conn, service_id).ok()??
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&row.config_json).ok()?;
-        let raw = parsed.get("api_key").and_then(|v| v.as_str())?;
-        let key = self.settings_cipher.decrypt(raw).ok()?;
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            return None;
-        }
-        let mut creds = crate::services::handles_cache::ExternalProviderCreds {
-            api_key: key,
-            request_format: None,
-            endpoint_override: None,
-        };
-        let subscription = parsed
-            .get("auth_mode")
-            .and_then(|v| v.as_str())
-            .map(|m| m.eq_ignore_ascii_case("subscription"))
-            .unwrap_or(false);
-        if subscription && row.engine_id.eq_ignore_ascii_case("openai") {
-            creds.request_format = Some("codex".to_string());
-            creds.endpoint_override =
-                Some(crate::services::backend::codex::CHATGPT_CODEX_RESPONSES_URL.to_string());
-        }
-        Some(creds)
-    }
-
     // ---- Mesh registry + live handles reconcile ---------------------------
 
     /// Refresh the local entry of the mesh services registry from SQLite, then
@@ -949,11 +909,23 @@ impl Supervisor {
         // Fix: porownaj endpoint signature; gdy rozni sie od desired,
         // shutdown old + insert new.
         for ((node_id, service_id), svc) in desired.into_iter() {
+            // External cloud providers: resolve this node's decrypted API key
+            // BEFORE the signature compare — subscription creds can override
+            // the endpoint (OpenAI ChatGPT plan → Codex Responses URL), and a
+            // signature computed from the bare ServiceInfo would either miss
+            // a creds-less cached handle (same URL → skip forever, requests
+            // go out unauthenticated) or flag the correct creds-built handle
+            // as drifted (override URL → rebuild every tick).
+            let creds = if svc.node_id == self.local_node_id && svc.deploy_method == "external" {
+                external_provider_creds(&self.db, &self.settings_cipher, service_id)
+            } else {
+                None
+            };
             let existing_signature = self
                 .live_handles
                 .get(&node_id, service_id)
                 .map(|h| h.endpoint_signature());
-            let desired_signature = handle_endpoint_signature(&svc);
+            let desired_signature = handle_endpoint_signature(&svc, creds.as_ref());
             if existing_signature.as_deref() == Some(desired_signature.as_str()) {
                 continue;
             }
@@ -972,15 +944,6 @@ impl Supervisor {
                     svc.engine_id
                 );
             }
-            // External cloud providers: resolve this node's decrypted API key so
-            // the BackendClient can authenticate. Only for locally-owned external
-            // services — remote ones are reached over the mesh and keep their key
-            // on the owning node.
-            let creds = if svc.node_id == self.local_node_id && svc.deploy_method == "external" {
-                self.external_provider_creds(service_id)
-            } else {
-                None
-            };
             let handle = match build_handle(&svc, creds) {
                 Ok(h) => h,
                 Err(e) => {
@@ -1257,14 +1220,71 @@ async fn update_runtime_detached(
 /// Aktualizuje progress_message przez `services_repo::update_progress_message`.
 /// `None` = wyczyść message (Running success / Failed cleanup). Erroram
 /// w spawn_blocking nie reagujemy — heartbeat to best-effort UX.
+/// Decrypted, node-local credentials for a local external-provider service,
+/// read from its `services.config_json`. Returns `None` when the service is
+/// not an external provider, carries no key, or decryption fails. Used only
+/// to build the owning node's BackendClient handle — the key never leaves the
+/// node (it is absent from the broadcast `ServiceInfo`). For OpenAI
+/// subscription auth (`auth_mode = "subscription"`) the key is the Codex auth
+/// blob and the handle is redirected to the ChatGPT Responses backend. Free
+/// function (not a Supervisor method) because the deploy handler must resolve
+/// the same creds when it seeds the live handle right after a deploy.
+pub(crate) fn external_provider_creds(
+    db: &crate::db::DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    service_id: i64,
+) -> Option<crate::services::handles_cache::ExternalProviderCreds> {
+    let row = {
+        let conn = db.lock().ok()?;
+        crate::services_repo::services::get(&conn, service_id).ok()??
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&row.config_json).ok()?;
+    let raw = parsed.get("api_key").and_then(|v| v.as_str())?;
+    let key = settings_cipher.decrypt(raw).ok()?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    let mut creds = crate::services::handles_cache::ExternalProviderCreds {
+        api_key: key,
+        request_format: None,
+        endpoint_override: None,
+    };
+    let subscription = parsed
+        .get("auth_mode")
+        .and_then(|v| v.as_str())
+        .map(|m| m.eq_ignore_ascii_case("subscription"))
+        .unwrap_or(false);
+    if subscription && row.engine_id.eq_ignore_ascii_case("openai") {
+        creds.request_format = Some("codex".to_string());
+        creds.endpoint_override =
+            Some(crate::services::backend::codex::CHATGPT_CODEX_RESPONSES_URL.to_string());
+    }
+    Some(creds)
+}
+
 /// Sygnatura endpointu dla `tentaflow_protocol::ServiceInfo` —
 /// odpowiednik `BackendHandle::endpoint_signature()`. Pozwala wykryć że
 /// serwis dostal nowy port (CUDA OOM crash + respawn z innym portem
 /// alokatora) i `live_handles` cached musi zostać przebudowany.
-fn handle_endpoint_signature(svc: &tentaflow_protocol::ServiceInfo) -> String {
+/// `creds` musi być TYM SAMYM zestawem, który pójdzie do `build_handle` —
+/// subscription endpoint_override zmienia URL klienta, więc sygnatura liczona
+/// bez niego nigdy nie zgadza się z handle'em zbudowanym z credami.
+fn handle_endpoint_signature(
+    svc: &tentaflow_protocol::ServiceInfo,
+    creds: Option<&crate::services::handles_cache::ExternalProviderCreds>,
+) -> String {
     match svc.transport.as_str() {
         "http_direct" | "external_http" => {
-            format!("http:{}", svc.endpoint_url.as_deref().unwrap_or(""))
+            let url = creds
+                .and_then(|c| c.endpoint_override.as_deref())
+                .or(svc.endpoint_url.as_deref())
+                .unwrap_or("");
+            let auth = match creds {
+                Some(c) if !c.api_key.is_empty() => "#auth",
+                _ => "",
+            };
+            format!("http:{}{}", url, auth)
         }
         "sidecar_quic" => format!(
             "quic:quic://127.0.0.1:{}",
