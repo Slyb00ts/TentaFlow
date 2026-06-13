@@ -666,7 +666,20 @@ function renderTable(component, ctx) {
         const rawVal = readRowField(row, col.field_path);
         const formatted = formatCellValue(rawVal, col.render, col.format, ctx.locale);
         if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
-          flat[col.id] = { label: formatted, status: 'info' };
+          // A chip cell may carry an explicit tone: when the raw cell value is
+          // an object with `status`/`tone` (e.g. { label, status, dot }), honor
+          // it so status pills/risk badges render their mockup colors instead of
+          // a flat 'info'. Plain scalar cells keep the neutral default.
+          if (rawVal && typeof rawVal === 'object' && !Array.isArray(rawVal)
+              && (rawVal.status != null || rawVal.tone != null)) {
+            flat[col.id] = {
+              label: rawVal.label != null ? String(rawVal.label) : formatted,
+              status: String(rawVal.status != null ? rawVal.status : rawVal.tone),
+              dot: rawVal.dot === true,
+            };
+          } else {
+            flat[col.id] = { label: formatted, status: 'info' };
+          }
         } else {
           flat[col.id] = formatted;
         }
