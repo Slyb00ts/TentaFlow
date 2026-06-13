@@ -1708,6 +1708,620 @@ pub fn audit_consumer_revoked_by_manifest_within_tx(
     Ok(())
 }
 
+// =============================================================================
+// F1a §6.6 — direct model access control (visibility / consumers / uses_model).
+// Mirrors the alias subtree above for the free-form `model_id` key. Models are
+// 2-state only (`restricted` default / `public`); there is no `private` level
+// because there is no per-model owner addon to scope it to.
+// =============================================================================
+
+/// Sets per-model visibility (upsert). `visibility` must be `restricted` or
+/// `public`; anything else is rejected by the SQLite CHECK constraint.
+/// Mirrors `set_alias_visibility_within_tx`.
+pub fn set_model_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    visibility: &str,
+    updated_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_visibility (model_id, visibility, updated_at, updated_by_user_id) \
+         VALUES (?1, ?2, strftime('%s','now'), ?3) \
+         ON CONFLICT(model_id) DO UPDATE SET \
+             visibility = excluded.visibility, \
+             updated_at = excluded.updated_at, \
+             updated_by_user_id = excluded.updated_by_user_id",
+        rusqlite::params![model_id, visibility, updated_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Adds (or restores) a consumer grant for a `restricted` model. UNIQUE
+/// `(model_id, consumer_addon_id)` keeps the row stable across reinstalls;
+/// an admin-revoked grant (revoked_at set) is restored only through this
+/// helper. Mirrors `add_alias_consumer_within_tx`.
+pub fn add_model_consumer_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    consumer_addon_id: &str,
+    granted_by_user_id: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_consumers \
+            (model_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
+         VALUES (?1, ?2, ?3, strftime('%s','now'), NULL) \
+         ON CONFLICT(model_id, consumer_addon_id) DO UPDATE SET \
+             granted_by_user_id = excluded.granted_by_user_id, \
+             granted_at = strftime('%s','now'), \
+             revoked_at = NULL",
+        rusqlite::params![model_id, consumer_addon_id, granted_by_user_id],
+    )?;
+    Ok(())
+}
+
+/// Revokes a consumer grant by stamping `revoked_at` (soft delete — the
+/// timeline must survive so the admin Access panel can show "granted then
+/// revoked"). No-op when the grant does not exist. Returns true when a row
+/// transitioned from active to revoked. Mirrors the alias consumer timeline.
+pub fn revoke_model_consumer_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    consumer_addon_id: &str,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "UPDATE model_consumers \
+            SET revoked_at = strftime('%s','now') \
+          WHERE model_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+        rusqlite::params![model_id, consumer_addon_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Reads the current visibility for a model. Absence of a row defaults to
+/// `restricted` (closed by default — same policy the SQL DEFAULT enforces).
+pub fn lookup_model_visibility_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+) -> Result<String> {
+    let visibility: String = tx
+        .query_row(
+            "SELECT visibility FROM model_visibility WHERE model_id = ?1",
+            rusqlite::params![model_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "restricted".to_string());
+    Ok(visibility)
+}
+
+/// Returns whether `consumer_addon_id` has a non-revoked grant for `model_id`.
+/// Mirrors `has_alias_consumer_grant_within_tx`.
+pub fn has_model_consumer_grant_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    consumer_addon_id: &str,
+) -> Result<bool> {
+    let row: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM model_consumers \
+             WHERE model_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+            rusqlite::params![model_id, consumer_addon_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
+}
+
+/// Computes the grant_status for an `addon_uses_model` row from the current
+/// visibility / consumer-grant state. `public` → auto_granted; `restricted`
+/// with a grant → granted; `restricted` without a grant → pending. There is
+/// no model owner concept, so no auto-grant by ownership. Mirrors
+/// `compute_uses_alias_status_within_tx`.
+pub fn compute_uses_model_status_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    consumer_addon_id: &str,
+) -> Result<&'static str> {
+    let visibility = lookup_model_visibility_within_tx(tx, model_id)?;
+    Ok(match visibility.as_str() {
+        "public" => "auto_granted",
+        // 'restricted' (and any unexpected value) gates on the consumer list.
+        _ => {
+            if has_model_consumer_grant_within_tx(tx, model_id, consumer_addon_id)? {
+                "granted"
+            } else {
+                "pending"
+            }
+        }
+    })
+}
+
+/// Re-evaluates every `addon_uses_model` row whose `model_target_name =
+/// model_id` and writes the new status. Called after a visibility change or
+/// a consumer grant/revoke so dependent declarations flip
+/// pending↔granted/auto_granted. Returns `(addon_id, before, after)` tuples
+/// for transitions only. Mirrors `reconcile_uses_alias_for_alias_within_tx`.
+#[allow(clippy::type_complexity)]
+pub fn reconcile_uses_model_for_model_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = tx.prepare(
+        "SELECT addon_id, grant_status FROM addon_uses_model WHERE model_target_name = ?1",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![model_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut transitions = Vec::new();
+    for (consumer, before) in rows {
+        let after = compute_uses_model_status_within_tx(tx, model_id, &consumer)?;
+        if after != before.as_str() {
+            let decided_at: Option<i64> = if after == "pending" {
+                None
+            } else {
+                Some(now_unix())
+            };
+            tx.execute(
+                "UPDATE addon_uses_model \
+                    SET grant_status = ?1, grant_decided_at = ?2 \
+                  WHERE addon_id = ?3 AND model_target_name = ?4",
+                rusqlite::params![after, decided_at, consumer, model_id],
+            )?;
+            transitions.push((consumer, before, after.to_string()));
+        }
+    }
+    Ok(transitions)
+}
+
+/// Writes one risk-class-A audit row for an `addon_uses_model` reconciliation
+/// transition. Mirrors `audit_reconcile_uses_alias_within_tx`.
+pub fn audit_reconcile_uses_model_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    consumer_addon_id: &str,
+    model_id: &str,
+    before: &str,
+    after: &str,
+) -> Result<()> {
+    let details = serde_json::json!({
+        "model": model_id,
+        "before": before,
+        "after": after,
+    })
+    .to_string();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let hash_input = crate::audit::chain::AuditRowHashInput {
+        user_id: None,
+        addon_id: Some(consumer_addon_id),
+        instance_id: None,
+        action: "uses_model.reconcile",
+        resource: None,
+        resource_type: Some("model"),
+        resource_id: Some(model_id),
+        result: Some("reconciled"),
+        error_message: None,
+        details: Some(&details),
+        ip_address: None,
+        node_id: None,
+        severity: Some("info"),
+        risk_class: "A",
+        related_claim_id: None,
+        request_id: None,
+        timestamp: &timestamp,
+    };
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&*tx, &hash_input)?;
+    tx.execute(
+        "INSERT INTO audit_log \
+            (timestamp, user_id, addon_id, action, resource_type, resource_id, \
+             result, error_message, severity, risk_class, details, prev_hash, hash) \
+         VALUES (?1, NULL, ?2, 'uses_model.reconcile', \
+                 'model', ?3, 'reconciled', NULL, 'info', 'A', ?4, ?5, ?6)",
+        rusqlite::params![
+            timestamp,
+            consumer_addon_id,
+            model_id,
+            details,
+            prev_hash,
+            hash
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records one `model_visibility_changes` audit row (before/after JSON
+/// snapshots). `change_type` ∈ {visibility_change, consumer_grant,
+/// consumer_revoke}. Mirrors how `model_alias_changes` rows are written.
+pub fn record_model_visibility_change_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    model_id: &str,
+    changed_by_user_id: Option<i64>,
+    changed_by_addon_id: Option<&str>,
+    before_snapshot: Option<&str>,
+    after_snapshot: Option<&str>,
+    change_type: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO model_visibility_changes \
+            (model_id, changed_by_user_id, changed_by_addon_id, before_snapshot, \
+             after_snapshot, change_type, reason, ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'))",
+        rusqlite::params![
+            model_id,
+            changed_by_user_id,
+            changed_by_addon_id,
+            before_snapshot,
+            after_snapshot,
+            change_type,
+            reason
+        ],
+    )?;
+    Ok(())
+}
+
+// ---- List helpers consumed by the admin Access UI (M12b / M16b) -------------
+
+/// Lists every model that has an explicit visibility row. Models without a row
+/// are implicitly `restricted` and are not enumerated here (the UI seeds them
+/// from the catalog/services list and overlays this map).
+pub fn list_model_visibility(pool: &DbPool) -> Result<Vec<DbModelVisibility>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT model_id, visibility, updated_at, updated_by_user_id \
+         FROM model_visibility ORDER BY model_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DbModelVisibility {
+                model_id: r.get(0)?,
+                visibility: r.get(1)?,
+                updated_at: r.get(2)?,
+                updated_by_user_id: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Full consumer grant timeline for a model (active and revoked rows).
+pub fn list_model_consumers(pool: &DbPool, model_id: &str) -> Result<Vec<DbAccessConsumer>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT consumer_addon_id, granted_by_user_id, granted_at, revoked_at \
+         FROM model_consumers WHERE model_id = ?1 ORDER BY granted_at",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![model_id], |r| {
+            Ok(DbAccessConsumer {
+                addon_id: r.get(0)?,
+                granted_by_user_id: r.get(1)?,
+                granted_at: r.get(2)?,
+                revoked_at: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `[[uses_model]]` declaration of an addon with its reconciled status.
+pub fn list_addon_uses_model(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonUses>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT addon_id, model_target_name, required, reason, grant_status, grant_decided_at \
+         FROM addon_uses_model WHERE addon_id = ?1 ORDER BY model_target_name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id], |r| {
+            Ok(DbAddonUses {
+                addon_id: r.get(0)?,
+                target: r.get(1)?,
+                required: r.get::<_, i64>(2)? != 0,
+                reason: r.get(3)?,
+                grant_status: r.get(4)?,
+                grant_decided_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Reverse view: every addon declaring it consumes `model_id`, with status.
+/// Used by the model detail panel ("who uses this model").
+pub fn list_model_consumed_by(pool: &DbPool, model_id: &str) -> Result<Vec<DbAddonUses>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT addon_id, model_target_name, required, reason, grant_status, grant_decided_at \
+         FROM addon_uses_model WHERE model_target_name = ?1 ORDER BY addon_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![model_id], |r| {
+            Ok(DbAddonUses {
+                addon_id: r.get(0)?,
+                target: r.get(1)?,
+                required: r.get::<_, i64>(2)? != 0,
+                reason: r.get(3)?,
+                grant_status: r.get(4)?,
+                grant_decided_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Full consumer grant timeline for an alias (active and revoked rows).
+/// Mirror of `list_model_consumers` for the alias subtree (M16b needs it).
+pub fn list_alias_consumers(pool: &DbPool, alias_id: i64) -> Result<Vec<DbAccessConsumer>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT consumer_addon_id, granted_by_user_id, granted_at, revoked_at \
+         FROM model_alias_consumers WHERE alias_id = ?1 ORDER BY granted_at",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![alias_id], |r| {
+            Ok(DbAccessConsumer {
+                addon_id: r.get(0)?,
+                granted_by_user_id: r.get(1)?,
+                granted_at: r.get(2)?,
+                revoked_at: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `[[uses_alias]]` declaration of an addon with its grant_status.
+/// Mirror of `list_addon_uses_model` for the alias subtree (M12b needs it).
+pub fn list_addon_uses_alias(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonUses>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT addon_id, alias_target_name, required, reason, grant_status, grant_decided_at \
+         FROM addon_uses_alias WHERE addon_id = ?1 ORDER BY alias_target_name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id], |r| {
+            Ok(DbAddonUses {
+                addon_id: r.get(0)?,
+                target: r.get(1)?,
+                required: r.get::<_, i64>(2)? != 0,
+                reason: r.get(3)?,
+                grant_status: r.get(4)?,
+                grant_decided_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// ---- Pool-level orchestration (mutation + reconcile + audit in one tx) ------
+// Each entrypoint runs the privileged change, reconciles dependent
+// `addon_uses_*` rows, and writes both the per-transition audit rows and the
+// change-log row inside a single transaction so the dashboard can never read a
+// half-applied state.
+
+/// Sets model visibility, reconciles dependent `addon_uses_model`, and records
+/// the change. Returns the list of `(addon_id, before, after)` transitions.
+#[allow(clippy::type_complexity)]
+pub fn set_model_visibility_audited(
+    pool: &DbPool,
+    model_id: &str,
+    visibility: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    if visibility != "restricted" && visibility != "public" {
+        anyhow::bail!("model visibility must be 'restricted' or 'public'");
+    }
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let before = lookup_model_visibility_within_tx(&tx, model_id)?;
+    set_model_visibility_within_tx(&tx, model_id, visibility, user_id)?;
+    let transitions = reconcile_uses_model_for_model_within_tx(&tx, model_id)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_model_within_tx(&tx, addon, model_id, b, a)?;
+    }
+    let before_snap = serde_json::json!({ "visibility": before }).to_string();
+    let after_snap = serde_json::json!({ "visibility": visibility }).to_string();
+    record_model_visibility_change_within_tx(
+        &tx,
+        model_id,
+        user_id,
+        None,
+        Some(&before_snap),
+        Some(&after_snap),
+        "visibility_change",
+        None,
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
+/// Grants a model consumer, reconciles, and records the change.
+#[allow(clippy::type_complexity)]
+pub fn grant_model_consumer_audited(
+    pool: &DbPool,
+    model_id: &str,
+    consumer_addon_id: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    add_model_consumer_within_tx(&tx, model_id, consumer_addon_id, user_id)?;
+    let transitions = reconcile_uses_model_for_model_within_tx(&tx, model_id)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_model_within_tx(&tx, addon, model_id, b, a)?;
+    }
+    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" })
+        .to_string();
+    record_model_visibility_change_within_tx(
+        &tx,
+        model_id,
+        user_id,
+        Some(consumer_addon_id),
+        None,
+        Some(&after_snap),
+        "consumer_grant",
+        None,
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
+/// Revokes a model consumer (soft delete), reconciles, and records the change.
+#[allow(clippy::type_complexity)]
+pub fn revoke_model_consumer_audited(
+    pool: &DbPool,
+    model_id: &str,
+    consumer_addon_id: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    revoke_model_consumer_within_tx(&tx, model_id, consumer_addon_id)?;
+    let transitions = reconcile_uses_model_for_model_within_tx(&tx, model_id)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_model_within_tx(&tx, addon, model_id, b, a)?;
+    }
+    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" })
+        .to_string();
+    record_model_visibility_change_within_tx(
+        &tx,
+        model_id,
+        user_id,
+        Some(consumer_addon_id),
+        None,
+        Some(&after_snap),
+        "consumer_revoke",
+        None,
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
+/// Sets alias visibility (by alias id), reconciles dependent
+/// `addon_uses_alias`, and writes one audit row per transition plus the alias
+/// change-log row. Returns `(addon_id, before, after)` transitions.
+#[allow(clippy::type_complexity)]
+pub fn set_alias_visibility_audited(
+    pool: &DbPool,
+    alias_id: i64,
+    visibility: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    if !matches!(visibility, "private" | "restricted" | "public") {
+        anyhow::bail!("alias visibility must be 'private', 'restricted' or 'public'");
+    }
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let alias_name: String = tx
+        .query_row(
+            "SELECT alias FROM model_aliases WHERE id = ?1",
+            rusqlite::params![alias_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("alias id {} not found", alias_id))?;
+    let before = tx
+        .query_row(
+            "SELECT visibility FROM model_alias_visibility WHERE alias_id = ?1",
+            rusqlite::params![alias_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "private".to_string());
+    set_alias_visibility_within_tx(&tx, alias_id, visibility, user_id)?;
+    let transitions = reconcile_uses_alias_for_alias_within_tx(&tx, &alias_name)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_alias_within_tx(&tx, addon, &alias_name, b, a)?;
+    }
+    let before_snap = serde_json::json!({ "visibility": before }).to_string();
+    let after_snap = serde_json::json!({ "visibility": visibility }).to_string();
+    tx.execute(
+        "INSERT INTO model_alias_changes \
+            (alias_id, alias_name, changed_by_user_id, before_snapshot, after_snapshot, change_type, ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'suggested_default_change', strftime('%s','now'))",
+        rusqlite::params![alias_id, alias_name, user_id, before_snap, after_snap],
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
+/// Grants an alias consumer (by alias id), reconciles, and records the change.
+#[allow(clippy::type_complexity)]
+pub fn grant_alias_consumer_audited(
+    pool: &DbPool,
+    alias_id: i64,
+    consumer_addon_id: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let alias_name: String = tx
+        .query_row(
+            "SELECT alias FROM model_aliases WHERE id = ?1",
+            rusqlite::params![alias_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("alias id {} not found", alias_id))?;
+    add_alias_consumer_within_tx(&tx, alias_id, consumer_addon_id, user_id)?;
+    let transitions = reconcile_uses_alias_for_alias_within_tx(&tx, &alias_name)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_alias_within_tx(&tx, addon, &alias_name, b, a)?;
+    }
+    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" })
+        .to_string();
+    tx.execute(
+        "INSERT INTO model_alias_changes \
+            (alias_id, alias_name, changed_by_user_id, after_snapshot, change_type, ts) \
+         VALUES (?1, ?2, ?3, ?4, 'suggested_default_change', strftime('%s','now'))",
+        rusqlite::params![alias_id, alias_name, user_id, after_snap],
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
+/// Revokes an alias consumer (soft delete by alias id), reconciles, records.
+#[allow(clippy::type_complexity)]
+pub fn revoke_alias_consumer_audited(
+    pool: &DbPool,
+    alias_id: i64,
+    consumer_addon_id: &str,
+    user_id: Option<i64>,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let alias_name: String = tx
+        .query_row(
+            "SELECT alias FROM model_aliases WHERE id = ?1",
+            rusqlite::params![alias_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("alias id {} not found", alias_id))?;
+    tx.execute(
+        "UPDATE model_alias_consumers \
+            SET revoked_at = strftime('%s','now') \
+          WHERE alias_id = ?1 AND consumer_addon_id = ?2 AND revoked_at IS NULL",
+        rusqlite::params![alias_id, consumer_addon_id],
+    )?;
+    let transitions = reconcile_uses_alias_for_alias_within_tx(&tx, &alias_name)?;
+    for (addon, b, a) in &transitions {
+        audit_reconcile_uses_alias_within_tx(&tx, addon, &alias_name, b, a)?;
+    }
+    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" })
+        .to_string();
+    tx.execute(
+        "INSERT INTO model_alias_changes \
+            (alias_id, alias_name, changed_by_user_id, after_snapshot, change_type, ts) \
+         VALUES (?1, ?2, ?3, ?4, 'suggested_default_change', strftime('%s','now'))",
+        rusqlite::params![alias_id, alias_name, user_id, after_snap],
+    )?;
+    tx.commit()?;
+    Ok(transitions)
+}
+
 /// Raw insert into `model_aliases` — bypasses chain check, JSON validation,
 /// alias-name collision. Available **only** in test builds so product code
 /// physically cannot reach it. Tests use it to seed known-CSV / known-empty
@@ -18254,3 +18868,206 @@ mod chunk_c_visibility_consumer_tests {
         assert_eq!(targets[0].node_id, "node-authority-write");
     }
 }
+
+#[cfg(test)]
+mod model_access_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn create_test_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test db")
+    }
+
+    /// Reads the reconciled grant_status of an `addon_uses_model` row.
+    fn uses_model_status(db: &DbPool, addon: &str, model: &str) -> Option<String> {
+        let conn = acquire(db).unwrap();
+        conn.query_row(
+            "SELECT grant_status FROM addon_uses_model WHERE addon_id = ?1 AND model_target_name = ?2",
+            rusqlite::params![addon, model],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn count_model_visibility_changes(db: &DbPool, model: &str) -> i64 {
+        let conn = acquire(db).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM model_visibility_changes WHERE model_id = ?1",
+            rusqlite::params![model],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn set_model_visibility_persists_and_defaults_restricted() {
+        let db = create_test_db();
+        // Absent row defaults to restricted.
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            assert_eq!(lookup_model_visibility_within_tx(&tx, "m1").unwrap(), "restricted");
+            tx.commit().unwrap();
+        }
+        set_model_visibility_audited(&db, "m1", "public", None).unwrap();
+        let rows = list_model_visibility(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model_id, "m1");
+        assert_eq!(rows[0].visibility, "public");
+        assert_eq!(count_model_visibility_changes(&db, "m1"), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_model_visibility() {
+        let db = create_test_db();
+        assert!(set_model_visibility_audited(&db, "m1", "private", None).is_err());
+    }
+
+    #[test]
+    fn grant_and_revoke_consumer_keeps_timeline() {
+        let db = create_test_db();
+        grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        let active = list_model_consumers(&db, "m1").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].addon_id, "addon-a");
+        assert!(active[0].revoked_at.is_none());
+
+        revoke_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        let after = list_model_consumers(&db, "m1").unwrap();
+        // Soft delete — the row stays as a revoked tombstone.
+        assert_eq!(after.len(), 1);
+        assert!(after[0].revoked_at.is_some());
+
+        // Re-grant clears revoked_at on the same row (no duplicate).
+        grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        let regranted = list_model_consumers(&db, "m1").unwrap();
+        assert_eq!(regranted.len(), 1);
+        assert!(regranted[0].revoked_at.is_none());
+    }
+
+    #[test]
+    fn compute_status_transitions() {
+        let db = create_test_db();
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            // restricted (default) + no grant → pending
+            assert_eq!(
+                compute_uses_model_status_within_tx(&tx, "m1", "addon-a").unwrap(),
+                "pending"
+            );
+            tx.commit().unwrap();
+        }
+        set_model_visibility_audited(&db, "m1", "public", None).unwrap();
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            // public → auto_granted
+            assert_eq!(
+                compute_uses_model_status_within_tx(&tx, "m1", "addon-a").unwrap(),
+                "auto_granted"
+            );
+            tx.commit().unwrap();
+        }
+        set_model_visibility_audited(&db, "m1", "restricted", None).unwrap();
+        grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            // restricted + grant → granted
+            assert_eq!(
+                compute_uses_model_status_within_tx(&tx, "m1", "addon-a").unwrap(),
+                "granted"
+            );
+            tx.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn reconcile_flips_uses_model_on_grant_and_revoke() {
+        let db = create_test_db();
+        // Consumer declares it uses a restricted (default) model → pending.
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let status =
+                upsert_uses_model_within_tx(&tx, "addon-a", "m1", true, "needs it").unwrap();
+            tx.commit().unwrap();
+            assert_eq!(status, "pending");
+        }
+        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("pending"));
+
+        // Granting a consumer reconciles pending → granted with audit rows.
+        let transitions = grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        assert_eq!(transitions, vec![("addon-a".into(), "pending".into(), "granted".into())]);
+        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("granted"));
+
+        // Revoking flips it back to pending.
+        let transitions = revoke_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        assert_eq!(transitions, vec![("addon-a".into(), "granted".into(), "pending".into())]);
+        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("pending"));
+
+        // Going public auto-grants without a consumer row.
+        let transitions = set_model_visibility_audited(&db, "m1", "public", None).unwrap();
+        assert_eq!(
+            transitions,
+            vec![("addon-a".into(), "pending".into(), "auto_granted".into())]
+        );
+        assert_eq!(
+            uses_model_status(&db, "addon-a", "m1").as_deref(),
+            Some("auto_granted")
+        );
+    }
+
+    #[test]
+    fn reconcile_writes_audit_rows() {
+        let db = create_test_db();
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            upsert_uses_model_within_tx(&tx, "addon-a", "m1", true, "needs it").unwrap();
+            tx.commit().unwrap();
+        }
+        grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
+        let conn = acquire(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'uses_model.reconcile' AND addon_id = ?1",
+                rusqlite::params!["addon-a"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn alias_list_helpers_return_timeline() {
+        let db = create_test_db();
+        let alias_id =
+            create_model_alias_unchecked(&db, "my-alias", "target-model", None, None).unwrap();
+        // Declare a consumer-side use and a restricted visibility.
+        {
+            let conn = acquire(&db).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            set_alias_visibility_within_tx(&tx, alias_id, "restricted", None).unwrap();
+            upsert_uses_alias_within_tx(&tx, "addon-a", "my-alias", true, "needs it").unwrap();
+            tx.commit().unwrap();
+        }
+        let uses = list_addon_uses_alias(&db, "addon-a").unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].target, "my-alias");
+        assert_eq!(uses[0].grant_status, "pending");
+
+        grant_alias_consumer_audited(&db, alias_id, "addon-a", None).unwrap();
+        let consumers = list_alias_consumers(&db, alias_id).unwrap();
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].addon_id, "addon-a");
+        assert!(consumers[0].revoked_at.is_none());
+
+        // Reconcile flipped the uses_alias row to granted.
+        let uses = list_addon_uses_alias(&db, "addon-a").unwrap();
+        assert_eq!(uses[0].grant_status, "granted");
+    }
+}
+

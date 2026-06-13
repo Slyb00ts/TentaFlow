@@ -65,6 +65,40 @@ pub struct DbModelAlias {
     pub strategy: Option<String>,
 }
 
+/// One row of per-model visibility (`model_visibility`). `model_id` is a
+/// free-form string key (no `models` table to FK against in v0.6.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbModelVisibility {
+    pub model_id: String,
+    pub visibility: String,
+    pub updated_at: i64,
+    pub updated_by_user_id: Option<i64>,
+}
+
+/// One consumer-grant row of `model_consumers` / `model_alias_consumers`
+/// with the full grant timeline. `revoked_at = None` means the grant is
+/// active; a non-null value marks an admin-revoked grant kept as a tombstone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAccessConsumer {
+    pub addon_id: String,
+    pub granted_by_user_id: Option<i64>,
+    pub granted_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+/// One consumer-side `[[uses_model]]` / `[[uses_alias]]` declaration with its
+/// reconciled grant state. Drives the addon Access tab and install wizard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAddonUses {
+    pub addon_id: String,
+    /// Alias name or model id the addon declared it needs.
+    pub target: String,
+    pub required: bool,
+    pub reason: String,
+    pub grant_status: String,
+    pub grant_decided_at: Option<i64>,
+}
+
 /// Klaster nodow mesh
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCluster {

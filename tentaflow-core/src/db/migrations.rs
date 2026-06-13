@@ -412,6 +412,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "agent_run_filled_defaults",
             MigrationStep::Rust(rewrite_agent_run_to_inline_region),
         ),
+        (
+            75,
+            "model_visibility_changes",
+            MigrationStep::Sql(MODEL_VISIBILITY_CHANGES),
+        ),
     ]
 }
 
@@ -916,6 +921,11 @@ fn intentionally_local_integers() -> Vec<IntentionalLocalInteger> {
             "model_alias_changes",
             "changed_by_user_id",
             "model_aliases change-log user attribution, no FK constraint",
+        ),
+        l(
+            "model_visibility_changes",
+            "changed_by_user_id",
+            "model access change-log user attribution, no FK constraint",
         ),
         l(
             "deployments",
@@ -3595,6 +3605,29 @@ CREATE TABLE model_alias_changes (
 );
 CREATE INDEX idx_alias_changes_alias ON model_alias_changes(alias_id);
 CREATE INDEX idx_alias_changes_user_ts ON model_alias_changes(changed_by_user_id, ts);
+"#;
+
+// F1a §6.6 — change history for direct model access control, mirroring
+// `model_alias_changes` for the model subtree. Records visibility flips and
+// consumer grant/revoke events as before/after JSON snapshots so the admin
+// Access panel can render an audit trail (compliance F1a §6.2.Y).
+// `model_id` is free-form TEXT (no `models` table to FK against); no FK on
+// the changer either (audit row must survive addon/user deletion).
+const MODEL_VISIBILITY_CHANGES: &str = r#"
+CREATE TABLE model_visibility_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL,
+    changed_by_user_id INTEGER,
+    changed_by_addon_id TEXT,
+    before_snapshot TEXT,
+    after_snapshot TEXT,
+    change_type TEXT NOT NULL CHECK(change_type IN
+        ('visibility_change','consumer_grant','consumer_revoke')),
+    reason TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX idx_model_visibility_changes_model ON model_visibility_changes(model_id);
+CREATE INDEX idx_model_visibility_changes_user_ts ON model_visibility_changes(changed_by_user_id, ts);
 "#;
 
 // F1a §6.5 — wykonanie migracji per-addon SQL storage. PRIMARY KEY

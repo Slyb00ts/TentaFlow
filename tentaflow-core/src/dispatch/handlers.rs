@@ -4276,6 +4276,473 @@ pub async fn deploy_vllm_recommend(
     ))
 }
 
+// =============================================================================
+// F1a §6.6 — model / alias access control (admin-only).
+// Visibility, consumer grants, and per-addon access reconciliation. Every
+// mutation runs through a repository orchestrator that reconciles dependent
+// `addon_uses_*` rows and writes the audit + change-log inside one tx.
+// =============================================================================
+
+/// Maps repository `(addon, before, after)` transition tuples to the wire type.
+fn to_access_transitions(
+    transitions: Vec<(String, String, String)>,
+) -> Vec<tentaflow_protocol::AccessTransition> {
+    transitions
+        .into_iter()
+        .map(|(addon_id, before, after)| tentaflow_protocol::AccessTransition {
+            addon_id,
+            before,
+            after,
+        })
+        .collect()
+}
+
+#[handler(variant = "AliasConsumerListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn alias_consumer_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AliasConsumerListRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AliasConsumerListRequest")),
+    };
+    let rows = repository::list_alias_consumers(&ctx.state.db, payload.alias_id).map_err(db_err)?;
+    let consumers = rows
+        .into_iter()
+        .map(|c| tentaflow_protocol::AccessConsumerEntry {
+            addon_id: c.addon_id,
+            granted_by_user_id: c.granted_by_user_id,
+            granted_at: Some(c.granted_at as u64),
+            revoked_at: c.revoked_at.map(|v| v as u64),
+        })
+        .collect();
+    Ok(MessageBody::AliasConsumerListResponseBody(
+        tentaflow_protocol::AliasConsumerListResponse {
+            alias_id: payload.alias_id,
+            consumers,
+        },
+    ))
+}
+
+#[handler(variant = "AliasConsumerGrantRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn alias_consumer_grant(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AliasConsumerGrantRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AliasConsumerGrantRequest")),
+    };
+    let transitions =
+        repository::grant_alias_consumer_audited(&ctx.state.db, payload.alias_id, &payload.addon_id, None)
+            .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "alias.consumer.grant",
+        Some(&format!("alias:{}", payload.alias_id)),
+        Some(&payload.addon_id),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "AliasConsumerRevokeRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn alias_consumer_revoke(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AliasConsumerRevokeRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AliasConsumerRevokeRequest")),
+    };
+    let transitions = repository::revoke_alias_consumer_audited(
+        &ctx.state.db,
+        payload.alias_id,
+        &payload.addon_id,
+        None,
+    )
+    .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "alias.consumer.revoke",
+        Some(&format!("alias:{}", payload.alias_id)),
+        Some(&payload.addon_id),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "AliasVisibilitySetRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn alias_visibility_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AliasVisibilitySetRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AliasVisibilitySetRequest")),
+    };
+    if !matches!(payload.visibility.as_str(), "private" | "restricted" | "public") {
+        return Err(ProtocolError::bad_request(
+            "visibility must be private/restricted/public",
+        ));
+    }
+    let transitions = repository::set_alias_visibility_audited(
+        &ctx.state.db,
+        payload.alias_id,
+        &payload.visibility,
+        None,
+    )
+    .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "alias.visibility.set",
+        Some(&format!("alias:{}", payload.alias_id)),
+        Some(&payload.visibility),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "ModelVisibilityListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_visibility_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let rows = repository::list_model_visibility(&ctx.state.db).map_err(db_err)?;
+    let models = rows
+        .into_iter()
+        .map(|m| tentaflow_protocol::ModelVisibilityEntry {
+            model_id: m.model_id,
+            visibility: m.visibility,
+        })
+        .collect();
+    Ok(MessageBody::ModelVisibilityListResponseBody(
+        tentaflow_protocol::ModelVisibilityListResponse { models },
+    ))
+}
+
+#[handler(variant = "ModelVisibilitySetRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_visibility_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelVisibilitySetRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ModelVisibilitySetRequest")),
+    };
+    if !matches!(payload.visibility.as_str(), "restricted" | "public") {
+        return Err(ProtocolError::bad_request(
+            "model visibility must be restricted/public",
+        ));
+    }
+    let transitions = repository::set_model_visibility_audited(
+        &ctx.state.db,
+        &payload.model_id,
+        &payload.visibility,
+        None,
+    )
+    .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "model.visibility.set",
+        Some(&format!("model:{}", payload.model_id)),
+        Some(&payload.visibility),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "ModelConsumerListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_consumer_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelConsumerListRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ModelConsumerListRequest")),
+    };
+    let rows =
+        repository::list_model_consumers(&ctx.state.db, &payload.model_id).map_err(db_err)?;
+    let consumers = rows
+        .into_iter()
+        .map(|c| tentaflow_protocol::AccessConsumerEntry {
+            addon_id: c.addon_id,
+            granted_by_user_id: c.granted_by_user_id,
+            granted_at: Some(c.granted_at as u64),
+            revoked_at: c.revoked_at.map(|v| v as u64),
+        })
+        .collect();
+    Ok(MessageBody::ModelConsumerListResponseBody(
+        tentaflow_protocol::ModelConsumerListResponse {
+            model_id: payload.model_id.clone(),
+            consumers,
+        },
+    ))
+}
+
+#[handler(variant = "ModelConsumerGrantRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_consumer_grant(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelConsumerGrantRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ModelConsumerGrantRequest")),
+    };
+    let transitions = repository::grant_model_consumer_audited(
+        &ctx.state.db,
+        &payload.model_id,
+        &payload.addon_id,
+        None,
+    )
+    .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "model.consumer.grant",
+        Some(&format!("model:{}", payload.model_id)),
+        Some(&payload.addon_id),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "ModelConsumerRevokeRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_consumer_revoke(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelConsumerRevokeRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ModelConsumerRevokeRequest")),
+    };
+    let transitions = repository::revoke_model_consumer_audited(
+        &ctx.state.db,
+        &payload.model_id,
+        &payload.addon_id,
+        None,
+    )
+    .map_err(db_err)?;
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "model.consumer.revoke",
+        Some(&format!("model:{}", payload.model_id)),
+        Some(&payload.addon_id),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
+#[handler(variant = "AddonAccessListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_access_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonAccessListRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonAccessListRequest")),
+    };
+    let alias_rows =
+        repository::list_addon_uses_alias(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
+    let model_rows =
+        repository::list_addon_uses_model(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
+
+    // The reader transaction resolves the current owner visibility of each
+    // target so the UI can explain a `pending` row without a second lookup.
+    let mut conn = crate::db::repository::acquire_for_baseline(&ctx.state.db).map_err(db_err)?;
+    let tx = conn.transaction().map_err(db_err)?;
+    let uses_alias = alias_rows
+        .into_iter()
+        .map(|r| {
+            let owner_visibility =
+                match repository::lookup_alias_visibility_within_tx(&tx, &r.target) {
+                    Ok(Some((_, v))) => v,
+                    // Owner addon not installed yet → no visibility row.
+                    Ok(None) => "private".to_string(),
+                    Err(_) => "private".to_string(),
+                };
+            tentaflow_protocol::AddonUsesEntry {
+                target: r.target,
+                required: r.required,
+                reason: r.reason,
+                grant_status: r.grant_status,
+                owner_visibility,
+            }
+        })
+        .collect();
+    let uses_model = model_rows
+        .into_iter()
+        .map(|r| {
+            let owner_visibility = repository::lookup_model_visibility_within_tx(&tx, &r.target)
+                .unwrap_or_else(|_| "restricted".to_string());
+            tentaflow_protocol::AddonUsesEntry {
+                target: r.target,
+                required: r.required,
+                reason: r.reason,
+                grant_status: r.grant_status,
+                owner_visibility,
+            }
+        })
+        .collect();
+    tx.commit().map_err(db_err)?;
+
+    Ok(MessageBody::AddonAccessListResponseBody(
+        tentaflow_protocol::AddonAccessListResponse {
+            addon_id: payload.addon_id.clone(),
+            uses_alias,
+            uses_model,
+        },
+    ))
+}
+
+#[handler(variant = "AddonAccessDecisionRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_access_decision(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonAccessDecisionRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonAccessDecisionRequest")),
+    };
+    let approve = match payload.decision.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return Err(ProtocolError::bad_request("decision must be approve/deny")),
+    };
+    let transitions = match payload.kind.as_str() {
+        "alias" => {
+            // The decision keys on the alias name; resolve it to the row id the
+            // consumer-grant orchestrator needs.
+            let alias_id = {
+                let conn =
+                    crate::db::repository::acquire_for_baseline(&ctx.state.db).map_err(db_err)?;
+                conn.query_row(
+                    "SELECT id FROM model_aliases WHERE alias = ?1",
+                    rusqlite::params![payload.target],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            };
+            let Some(alias_id) = alias_id else {
+                return Err(ProtocolError::not_found(format!(
+                    "alias '{}' not found",
+                    payload.target
+                )));
+            };
+            if approve {
+                repository::grant_alias_consumer_audited(
+                    &ctx.state.db,
+                    alias_id,
+                    &payload.addon_id,
+                    None,
+                )
+            } else {
+                repository::revoke_alias_consumer_audited(
+                    &ctx.state.db,
+                    alias_id,
+                    &payload.addon_id,
+                    None,
+                )
+            }
+            .map_err(db_err)?
+        }
+        "model" => {
+            if approve {
+                repository::grant_model_consumer_audited(
+                    &ctx.state.db,
+                    &payload.target,
+                    &payload.addon_id,
+                    None,
+                )
+            } else {
+                repository::revoke_model_consumer_audited(
+                    &ctx.state.db,
+                    &payload.target,
+                    &payload.addon_id,
+                    None,
+                )
+            }
+            .map_err(db_err)?
+        }
+        _ => return Err(ProtocolError::bad_request("kind must be alias/model")),
+    };
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        if approve {
+            "addon.access.approve"
+        } else {
+            "addon.access.deny"
+        },
+        Some(&format!("{}:{}", payload.kind, payload.target)),
+        Some(&payload.addon_id),
+    );
+    Ok(MessageBody::AccessMutationResponseBody(
+        tentaflow_protocol::AccessMutationResponse {
+            ok: true,
+            transitions: to_access_transitions(transitions),
+        },
+    ))
+}
+
 /// Generyczny auto-tuner — zwraca typed `parameters` mape per silnik.
 /// Wizard JS pre-filluje formularz (`tf-parameter-form`) z tej mapy.
 /// Dispatch po `engine_id`:

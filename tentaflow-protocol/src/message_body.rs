@@ -2929,6 +2929,152 @@ pub struct DeployVllmRecommendResponse {
     pub at_limit: bool,
 }
 
+// =============================================================================
+// F1a §6.6 — model / alias access control (visibility + consumer grants +
+// per-addon `uses_*` declarations). Wire contract for the admin Access UI.
+// =============================================================================
+
+/// One consumer grant row in the access timeline (alias or model). `revoked_at`
+/// = None ⇒ the grant is currently active; a value marks an admin-revoked
+/// grant kept as a tombstone. Timestamps are Unix seconds (u64 — JS BigInt
+/// validators tolerate them).
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AccessConsumerEntry {
+    pub addon_id: String,
+    pub granted_by_user_id: Option<i64>,
+    pub granted_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+}
+
+/// One per-addon `[[uses_alias]]` / `[[uses_model]]` declaration row with its
+/// reconciled grant state. `owner_visibility` is the current visibility of the
+/// target (`private`/`restricted`/`public` for aliases; `restricted`/`public`
+/// for models) so the Access tab can explain WHY a row is pending.
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonUsesEntry {
+    pub target: String,
+    pub required: bool,
+    pub reason: String,
+    pub grant_status: String,
+    pub owner_visibility: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AliasConsumerListRequest {
+    pub alias_id: i64,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AliasConsumerListResponse {
+    pub alias_id: i64,
+    pub consumers: Vec<AccessConsumerEntry>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AliasConsumerGrantRequest {
+    pub alias_id: i64,
+    pub addon_id: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AliasConsumerRevokeRequest {
+    pub alias_id: i64,
+    pub addon_id: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AliasVisibilitySetRequest {
+    pub alias_id: i64,
+    /// One of `private` / `restricted` / `public`.
+    pub visibility: String,
+}
+
+/// Shared response for every access mutation (grant/revoke/visibility set,
+/// alias and model). `transitions` lists the dependent `addon_uses_*` rows
+/// whose `grant_status` flipped as a side effect, so the UI can refresh them
+/// without a second round-trip.
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AccessMutationResponse {
+    pub ok: bool,
+    pub transitions: Vec<AccessTransition>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AccessTransition {
+    pub addon_id: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelVisibilityEntry {
+    pub model_id: String,
+    /// `restricted` (default) or `public`.
+    pub visibility: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelVisibilityListResponse {
+    pub models: Vec<ModelVisibilityEntry>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelVisibilitySetRequest {
+    pub model_id: String,
+    /// `restricted` or `public`.
+    pub visibility: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelConsumerListRequest {
+    pub model_id: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelConsumerListResponse {
+    pub model_id: String,
+    pub consumers: Vec<AccessConsumerEntry>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelConsumerGrantRequest {
+    pub model_id: String,
+    pub addon_id: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelConsumerRevokeRequest {
+    pub model_id: String,
+    pub addon_id: String,
+}
+
+/// Install-wizard / addon Access-tab view: every access declaration of one
+/// addon (aliases + models) with reconciled grant state.
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonAccessListRequest {
+    pub addon_id: String,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonAccessListResponse {
+    pub addon_id: String,
+    pub uses_alias: Vec<AddonUsesEntry>,
+    pub uses_model: Vec<AddonUsesEntry>,
+}
+
+/// Admin approve/deny of one access declaration of an addon. `kind` selects the
+/// subtree (`alias`/`model`), `target` is the alias name or model id, and
+/// `decision` is `approve` (→ grant a consumer row) or `deny` (→ revoke it).
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonAccessDecisionRequest {
+    pub addon_id: String,
+    /// `alias` or `model`.
+    pub kind: String,
+    pub target: String,
+    /// `approve` or `deny`.
+    pub decision: String,
+}
+
 /// Ask the server which host port a fresh deploy would be assigned (the first
 /// free port in the services range, skipping leased / OS-bound / docker-bound
 /// ports). The deploy wizard pre-fills the editable port field with it.
@@ -5077,6 +5223,26 @@ pub enum MessageBody {
     NimCatalogListResponseBody(NimCatalogListResponse),
     DeployVllmRecommendRequestBody(DeployVllmRecommendRequest),
     DeployVllmRecommendResponseBody(DeployVllmRecommendResponse),
+
+    // ---- Model / alias access control (F1a §6.6) ----
+    AliasConsumerListRequestBody(AliasConsumerListRequest),
+    AliasConsumerListResponseBody(AliasConsumerListResponse),
+    AliasConsumerGrantRequestBody(AliasConsumerGrantRequest),
+    AliasConsumerRevokeRequestBody(AliasConsumerRevokeRequest),
+    AliasVisibilitySetRequestBody(AliasVisibilitySetRequest),
+    ModelVisibilityListRequest,
+    ModelVisibilityListResponseBody(ModelVisibilityListResponse),
+    ModelVisibilitySetRequestBody(ModelVisibilitySetRequest),
+    ModelConsumerListRequestBody(ModelConsumerListRequest),
+    ModelConsumerListResponseBody(ModelConsumerListResponse),
+    ModelConsumerGrantRequestBody(ModelConsumerGrantRequest),
+    ModelConsumerRevokeRequestBody(ModelConsumerRevokeRequest),
+    AddonAccessListRequestBody(AddonAccessListRequest),
+    AddonAccessListResponseBody(AddonAccessListResponse),
+    AddonAccessDecisionRequestBody(AddonAccessDecisionRequest),
+    /// Shared response for every access grant/revoke/visibility-set mutation.
+    AccessMutationResponseBody(AccessMutationResponse),
+
     SuggestServicePortRequestBody(SuggestServicePortRequest),
     SuggestServicePortResponseBody(SuggestServicePortResponse),
     EngineRecommendRequestBody(EngineRecommendRequest),
