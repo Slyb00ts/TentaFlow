@@ -290,6 +290,130 @@ pub fn delete_camera(id: &str) -> Result<u64, AbiError> {
 }
 
 // =============================================================================
+// Profiles CRUD
+// =============================================================================
+
+/// An analytic profile row as persisted in SQLite. `cameras` is a JSON array of
+/// camera ids; `schedule` is a free-form schedule label/blob.
+#[derive(Debug, Clone)]
+pub struct ProfileRow {
+    pub id: String,
+    pub name: String,
+    pub flow_id: String,
+    pub risk_class: String,
+    pub schedule: String,
+    pub cameras: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Fields needed to create a profile. id/timestamps are filled by
+/// `insert_profile`.
+#[derive(Debug, Clone)]
+pub struct NewProfile {
+    pub name: String,
+    pub flow_id: String,
+    pub risk_class: String,
+    pub schedule: String,
+    pub cameras: String,
+    pub enabled: bool,
+}
+
+const PROFILE_COLS: &str =
+    "id, name, flow_id, risk_class, schedule, cameras, enabled, created_at, updated_at";
+
+fn row_to_profile(r: &Row) -> ProfileRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    ProfileRow {
+        id: g(0).as_str().into(),
+        name: g(1).as_str().into(),
+        flow_id: g(2).as_str().into(),
+        risk_class: g(3).as_str().into(),
+        schedule: g(4).as_str().into(),
+        cameras: g(5).as_str().into(),
+        enabled: g(6).as_i64() != 0,
+        created_at: g(7).as_i64(),
+        updated_at: g(8).as_i64(),
+    }
+}
+
+/// Lists all analytic profiles ordered by name.
+pub fn list_profiles() -> Result<Vec<ProfileRow>, AbiError> {
+    let sql = alloc::format!("SELECT {PROFILE_COLS} FROM profiles ORDER BY name");
+    let rows = query(&sql, &[])?;
+    Ok(rows.iter().map(row_to_profile).collect())
+}
+
+/// Fetches a single profile by id, or None.
+pub fn get_profile(id: &str) -> Result<Option<ProfileRow>, AbiError> {
+    let sql = alloc::format!("SELECT {PROFILE_COLS} FROM profiles WHERE id = ?1");
+    let rows = query(&sql, &[SqlValue::Text(id.into())])?;
+    Ok(rows.first().map(row_to_profile))
+}
+
+/// Inserts a new profile, returning its generated id. created_at/updated_at are
+/// stamped from the authoritative SQLite clock.
+pub fn insert_profile(p: &NewProfile) -> Result<String, AbiError> {
+    let id = generate_id("prof");
+    let now = now_secs();
+    exec(
+        "INSERT INTO profiles \
+         (id, name, flow_id, risk_class, schedule, cameras, enabled, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(p.name.clone()),
+            SqlValue::Text(p.flow_id.clone()),
+            SqlValue::Text(p.risk_class.clone()),
+            SqlValue::Text(p.schedule.clone()),
+            SqlValue::Text(p.cameras.clone()),
+            SqlValue::I64(i64::from(p.enabled)),
+            SqlValue::I64(now),
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Updates an existing profile in place; bumps updated_at.
+pub fn update_profile(p: &ProfileRow) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "UPDATE profiles SET name = ?2, flow_id = ?3, risk_class = ?4, schedule = ?5, \
+         cameras = ?6, enabled = ?7, updated_at = ?8 WHERE id = ?1",
+        &[
+            SqlValue::Text(p.id.clone()),
+            SqlValue::Text(p.name.clone()),
+            SqlValue::Text(p.flow_id.clone()),
+            SqlValue::Text(p.risk_class.clone()),
+            SqlValue::Text(p.schedule.clone()),
+            SqlValue::Text(p.cameras.clone()),
+            SqlValue::I64(i64::from(p.enabled)),
+            SqlValue::I64(now),
+        ],
+    )
+}
+
+/// Flips a profile's enabled flag to `enabled`; bumps updated_at. Returns rows
+/// affected (0 if the profile did not exist).
+pub fn toggle_profile(id: &str, enabled: bool) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "UPDATE profiles SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::I64(i64::from(enabled)),
+            SqlValue::I64(now),
+        ],
+    )
+}
+
+/// Deletes a profile by id. Returns rows affected (0 if it did not exist).
+pub fn delete_profile(id: &str) -> Result<u64, AbiError> {
+    exec("DELETE FROM profiles WHERE id = ?1", &[SqlValue::Text(id.into())])
+}
+
+// =============================================================================
 // Dashboard aggregates (read-only)
 // =============================================================================
 
