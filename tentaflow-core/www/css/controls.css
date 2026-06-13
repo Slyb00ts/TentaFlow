@@ -325,6 +325,49 @@ tf-window [slot="footer"] {
 }
 .tf-input-wrap:focus-within .tf-input-icon { color: var(--tf-accent-1); }
 
+/* ---------- tf-input adornments — trailing icon + prefix/suffix text ---------- */
+/* Trailing icon: mirror of the leading .tf-input-icon, pinned to the right. */
+.tf-input-wrap .tf-input-icon-trailing {
+  left: auto;
+  right: 12px;
+}
+.tf-input-wrap-has-trailing-icon .tf-input {
+  padding-right: 40px;
+}
+
+/* Prefix / suffix inline text adornments (e.g. "$", "kg"). */
+.tf-input-prefix,
+.tf-input-suffix {
+  display: inline-flex;
+  align-items: center;
+  color: var(--tf-text-3);
+  font-size: 13px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.tf-input-prefix {
+  position: absolute;
+  left: 12px;
+}
+.tf-input-suffix {
+  position: absolute;
+  right: 12px;
+}
+/* Make room for the adornments inside the field. */
+.tf-input-wrap-has-prefix .tf-input {
+  padding-left: 32px;
+}
+.tf-input-wrap-has-suffix .tf-input {
+  padding-right: 32px;
+}
+/* When both a trailing icon and a suffix are present, stack them. */
+.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input-icon-trailing {
+  right: 40px;
+}
+.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input {
+  padding-right: 64px;
+}
+
 /* =============================================================================
    tf-searchbox
    ============================================================================= */
@@ -4743,6 +4786,85 @@ tf-skeleton {
 .tf-accordion__item--expanded .tf-accordion__header::after { transform: rotate(180deg); }
 .tf-accordion__body { padding: 0 var(--tf-space-md) var(--tf-space-md); }
 
+/* ---------- tf-sidebar (0x010A) + tf-tabs content panel (0x010B) ---------- */
+/* tf-tabs (the tab strip) already has its own styles above; only the Sidebar
+   shell and the Tabs content region are added here. */
+.tf-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  background: var(--tf-bg-card);
+  border-right: 1px solid var(--tf-border);
+}
+.tf-sidebar__header,
+.tf-sidebar__footer {
+  flex: 0 0 auto;
+}
+.tf-sidebar__nav {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xxs);
+  padding: var(--tf-space-xs);
+  list-style: none;
+  margin: 0;
+}
+.tf-sidebar__item {
+  display: flex;
+}
+.tf-sidebar__link {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  width: 100%;
+  padding: var(--tf-space-sm) var(--tf-space-md);
+  border: none;
+  background: transparent;
+  border-radius: var(--tf-radius-md);
+  color: var(--tf-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tf-sidebar__link:hover {
+  background: var(--tf-bg-card-hover);
+}
+.tf-sidebar__link[aria-current="page"],
+.tf-sidebar__link.is-active {
+  background: var(--tf-bg-accent);
+  color: var(--tf-accent-1);
+  font-weight: 600;
+}
+.tf-sidebar__link[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tf-sidebar__label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tf-sidebar__sub {
+  list-style: none;
+  margin: 0;
+  padding-left: var(--tf-space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xxs);
+}
+.tf-sidebar--collapsed .tf-sidebar__label,
+.tf-sidebar--collapsed .tf-sidebar__sub {
+  display: none;
+}
+.tf-tabs-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 /* =============================================================================
    tf-nav-tabs (0x010C) — chunk 3.3a-4
    ============================================================================= */
@@ -4796,39 +4918,11 @@ tf-skeleton {
 }
 
 /* =============================================================================
-   tf-breadcrumb (0x0110) + tf-pagination (0x0111) — chunk 3.3a-5
+   tf-pagination (0x0111) — chunk 3.3a-5.
+   Breadcrumb (0x0110) renders through the <tf-breadcrumb> web component
+   (.tf-breadcrumb / .tf-breadcrumb-item / .tf-breadcrumb-sep CSS above); the
+   old .tf-breadcrumb__* BEM styles were removed.
    ============================================================================= */
-.tf-breadcrumb {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-}
-.tf-breadcrumb__list {
-  display: flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  padding: 0;
-  margin: 0;
-  list-style: none;
-  min-width: 0;
-}
-.tf-breadcrumb__item { display: inline-flex; align-items: center; min-width: 0; }
-.tf-breadcrumb__item--current { font-weight: 600; }
-.tf-breadcrumb__item--ellipsis { color: var(--tf-text-3); }
-.tf-breadcrumb__link {
-  color: inherit;
-  text-decoration: none;
-  padding: var(--tf-space-xxs) var(--tf-space-xs);
-  border-radius: var(--tf-radius-sm);
-}
-.tf-breadcrumb__link[role="link"] { cursor: pointer; }
-.tf-breadcrumb__link[role="link"]:hover { background: var(--tf-bg-subtle); }
-.tf-breadcrumb__separator {
-  color: var(--tf-text-3);
-  list-style: none;
-  user-select: none;
-}
-
 .tf-pagination {
   display: flex;
   align-items: center;
@@ -4944,6 +5038,22 @@ tf-skeleton {
 .tf-button--tone-warning.tf-button--variant-tertiary  { color: var(--tf-warning); }
 .tf-button--tone-critical.tf-button--variant-tertiary { color: var(--tf-danger); }
 .tf-button--tone-info.tf-button--variant-tertiary     { color: var(--tf-info); }
+
+/* tones — extend the tone accent to ghost/link variants. Solid variants
+   (primary/secondary/destructive) keep their own colour; tone only tints the
+   text-only variants (tertiary/ghost/link). */
+.tf-button--tone-success.tf-button--variant-ghost,
+.tf-button--tone-success.tf-button--variant-link   { color: var(--tf-success); }
+.tf-button--tone-warning.tf-button--variant-ghost,
+.tf-button--tone-warning.tf-button--variant-link   { color: var(--tf-warning); }
+.tf-button--tone-critical.tf-button--variant-ghost,
+.tf-button--tone-critical.tf-button--variant-link  { color: var(--tf-danger); }
+.tf-button--tone-info.tf-button--variant-ghost,
+.tf-button--tone-info.tf-button--variant-link      { color: var(--tf-info); }
+.tf-button--tone-primary.tf-button--variant-ghost,
+.tf-button--tone-primary.tf-button--variant-link   { color: var(--tf-accent-1); }
+.tf-button--tone-muted.tf-button--variant-ghost,
+.tf-button--tone-muted.tf-button--variant-link     { color: var(--tf-text-3); }
 
 /* loading state — spinner CSS-only przez pseudo-element */
 .tf-button--loading .tf-button__label { visibility: hidden; }
@@ -5634,294 +5744,14 @@ tf-skeleton {
 }
 
 /* ============================================================================
-   tf-multiselect (0x0304) — chunk 3.3c-3b
+   tf-autocomplete (0x0306) — chunk 3.3c-3c.
+   MultiSelect (0x0304) renders through the <tf-multiselect> web component
+   (.tf-multiselect-* single-dash CSS above); the old .tf-multiselect__* BEM
+   styles were removed.
+   Combobox (0x0305) renders through the <tf-combobox> web component
+   (.tf-combobox-* single-dash CSS above); the old .tf-combobox__* BEM styles
+   were removed.
    ============================================================================ */
-.tf-multiselect {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--tf-space-xs);
-  font: inherit;
-}
-.tf-multiselect__label {
-  font-size: 0.9em;
-  color: var(--tf-text);
-  font-weight: 500;
-}
-.tf-multiselect__trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  padding: 0.3em 0.5em;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  text-align: left;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-.tf-multiselect--size-sm .tf-multiselect__trigger { padding: 0.25em 0.4em; font-size: 0.85em; }
-.tf-multiselect--size-lg .tf-multiselect__trigger { padding: 0.4em 0.65em; font-size: 1.1em; }
-.tf-multiselect__trigger:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 2px;
-}
-.tf-multiselect__trigger[data-disabled] { opacity: 0.5; cursor: not-allowed; }
-.tf-multiselect__chips {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 0.25em;
-  flex: 1 1 auto;
-  min-width: 0;
-  align-items: center;
-}
-.tf-multiselect__chips--empty { min-height: 1.4em; }
-.tf-multiselect__placeholder { color: var(--tf-text-3); }
-.tf-multiselect__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.2em;
-  padding: 0.1em 0.35em;
-  background: var(--tf-accent-glow);
-  color: var(--tf-accent-1);
-  border-radius: 0.75em;
-  font-size: 0.85em;
-  line-height: 1.4;
-}
-.tf-multiselect__chip-remove {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-  padding: 0 0.1em;
-  line-height: 1;
-}
-.tf-multiselect__chip-remove:hover { color: var(--tf-danger); }
-.tf-multiselect__clear,
-.tf-multiselect__caret {
-  flex: 0 0 auto;
-  background: transparent;
-  border: 0;
-  color: inherit;
-  font: inherit;
-  padding: 0 0.15em;
-  cursor: pointer;
-}
-.tf-multiselect__clear { color: var(--tf-text-3); }
-.tf-multiselect__clear:hover { color: var(--tf-text); }
-.tf-multiselect__caret { pointer-events: none; color: var(--tf-text-3); }
-.tf-multiselect--open .tf-multiselect__caret { transform: rotate(180deg); }
-
-.tf-multiselect__popover {
-  position: absolute;
-  top: calc(100% + 2px);
-  left: 0;
-  right: 0;
-  z-index: 100;
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-  max-height: 18rem;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.tf-multiselect--virtualize .tf-multiselect__popover { max-height: 26rem; }
-.tf-multiselect__search {
-  border: 0;
-  border-bottom: 1px solid var(--tf-border);
-  padding: 0.4em 0.6em;
-  font: inherit;
-  outline: 0;
-  background: transparent;
-}
-.tf-multiselect__select-all {
-  border: 0;
-  border-bottom: 1px solid var(--tf-border);
-  background: var(--tf-bg-3);
-  padding: 0.35em 0.6em;
-  font: inherit;
-  cursor: pointer;
-  text-align: left;
-  color: var(--tf-accent-1);
-  font-weight: 500;
-}
-.tf-multiselect__select-all[disabled] {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-.tf-multiselect__listbox {
-  list-style: none;
-  margin: 0;
-  padding: 0.25em 0;
-  overflow-y: auto;
-  flex: 1 1 auto;
-}
-.tf-multiselect__option {
-  display: flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  padding: 0.4em 0.6em;
-  cursor: pointer;
-  user-select: none;
-}
-.tf-multiselect__option:hover,
-.tf-multiselect__option--active {
-  background: var(--tf-bg-3);
-}
-.tf-multiselect__option--selected { color: var(--tf-accent-1); }
-.tf-multiselect__option--disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-.tf-multiselect__option-check {
-  display: inline-block;
-  width: 1em;
-  text-align: center;
-  color: var(--tf-accent-1);
-  font-weight: 700;
-}
-.tf-multiselect__option-label { flex: 1 1 auto; }
-.tf-multiselect__option-description {
-  font-size: 0.85em;
-  color: var(--tf-text-3);
-}
-.tf-multiselect__group { display: block; }
-.tf-multiselect__group-header {
-  padding: 0.4em 0.6em 0.2em;
-  font-size: 0.8em;
-  font-weight: 600;
-  color: var(--tf-text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.tf-multiselect__group-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-/* ============================================================================
-   tf-combobox (0x0305) + tf-autocomplete (0x0306) — chunk 3.3c-3c
-   ============================================================================ */
-.tf-combobox {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--tf-space-xs);
-  font: inherit;
-}
-.tf-combobox__label {
-  font-size: 0.9em;
-  color: var(--tf-text);
-  font-weight: 500;
-}
-.tf-combobox__field {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  padding: 0 var(--tf-space-sm);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-.tf-combobox__field:focus-within {
-  border-color: var(--tf-accent-1);
-  box-shadow: 0 0 0 3px var(--tf-accent-glow);
-}
-.tf-combobox__input {
-  flex: 1 1 auto;
-  border: 0;
-  outline: 0;
-  background: transparent;
-  font: inherit;
-  color: inherit;
-  min-width: 0;
-  padding: 0.4em 0;
-}
-.tf-combobox--size-sm .tf-combobox__input { padding: 0.25em 0; font-size: 0.85em; }
-.tf-combobox--size-lg .tf-combobox__input { padding: 0.55em 0; font-size: 1.1em; }
-.tf-combobox__input[disabled] {
-  cursor: not-allowed;
-  color: var(--tf-text-3);
-}
-.tf-combobox__clear,
-.tf-combobox__caret {
-  flex: 0 0 auto;
-  background: transparent;
-  border: 0;
-  color: inherit;
-  font: inherit;
-  padding: 0 0.15em;
-  cursor: pointer;
-}
-.tf-combobox__clear { color: var(--tf-text-3); }
-.tf-combobox__clear:hover { color: var(--tf-text); }
-.tf-combobox__caret { color: var(--tf-text-3); }
-.tf-combobox--open .tf-combobox__caret { transform: rotate(180deg); }
-
-.tf-combobox__popover {
-  position: absolute;
-  top: calc(100% + 2px);
-  left: 0;
-  right: 0;
-  z-index: 100;
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-  max-height: 16rem;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-.tf-combobox--virtualize .tf-combobox__popover { max-height: 24rem; }
-.tf-combobox__listbox {
-  list-style: none;
-  margin: 0;
-  padding: 0.25em 0;
-  overflow-y: auto;
-  flex: 1 1 auto;
-}
-.tf-combobox__option {
-  display: flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  padding: 0.4em 0.6em;
-  cursor: pointer;
-  user-select: none;
-}
-.tf-combobox__option:hover,
-.tf-combobox__option--active {
-  background: var(--tf-bg-3);
-}
-.tf-combobox__option[aria-selected="true"] {
-  background: var(--tf-accent-glow);
-  color: var(--tf-accent-1);
-}
-.tf-combobox__option--disabled { opacity: 0.4; cursor: not-allowed; }
-.tf-combobox__option-label { flex: 1 1 auto; }
-.tf-combobox__option-description {
-  font-size: 0.85em;
-  color: var(--tf-text-3);
-}
-.tf-combobox__group { display: block; }
-.tf-combobox__group-header {
-  padding: 0.4em 0.6em 0.2em;
-  font-size: 0.8em;
-  font-weight: 600;
-  color: var(--tf-text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.tf-combobox__group-list { list-style: none; margin: 0; padding: 0; }
-
 .tf-autocomplete {
   display: flex;
   flex-direction: column;
@@ -5946,6 +5776,79 @@ tf-skeleton {
 .tf-autocomplete__input:focus-visible {
   border-color: var(--tf-accent-1);
   box-shadow: 0 0 0 3px var(--tf-accent-glow);
+}
+
+/* ---------- tf-tag-input (0x0308) ---------- */
+/* Chip row + inline free-text entry. Chip visuals come from .tf-chip / .tf-tag;
+   only the wrapper flow is defined here. */
+.tf-tag-input {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--tf-space-xxs);
+  padding: var(--tf-space-xxs) var(--tf-space-xs);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-bg-input);
+}
+.tf-tag-input-chips {
+  display: contents;
+}
+.tf-tag-input-entry {
+  flex: 1 1 6rem;
+  min-width: 6rem;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: var(--tf-space-xxs);
+}
+.tf-tag-input-entry:disabled {
+  cursor: not-allowed;
+}
+
+/* ---------- tf-mention-input (0x0309) ---------- */
+/* Textarea + anchored suggestion popover. Option rows reuse the combobox
+   popover look where possible. */
+.tf-mention-input {
+  position: relative;
+  display: block;
+}
+.tf-mention-input-area {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 3.5rem;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-bg-input);
+  color: inherit;
+  font: inherit;
+  padding: var(--tf-space-xs);
+}
+.tf-mention-input-popover {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  top: 100%;
+  min-width: 12rem;
+  max-height: 14rem;
+  overflow-y: auto;
+  margin-top: var(--tf-space-xxs);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-bg-input);
+  box-shadow: var(--tf-shadow-lg);
+}
+.tf-mention-input-option {
+  padding: var(--tf-space-xxs) var(--tf-space-xs);
+  cursor: pointer;
+}
+.tf-mention-input-option.active,
+.tf-mention-input-option:hover {
+  background: var(--tf-bg-card-hover);
 }
 
 /* ============================================================================
@@ -6964,33 +6867,10 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 }
 
 /* ============================================================================
-   tf-list (0x0212) + tf-empty-state (0x0003 — tymczasowo) — chunk 3.3d-5
+   tf-empty-state (0x0003 — tymczasowo) — chunk 3.3d-5.
+   List (0x0212) renders through the <tf-list> web component (.tf-list-item* CSS
+   above); the old .tf-list__* BEM renderer styles were removed.
    ============================================================================ */
-.tf-list { font: inherit; }
-.tf-list__items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
-.tf-list--density-compact     .tf-list__items { gap: 0; }
-.tf-list--density-default     .tf-list__items { gap: 0.25rem; }
-.tf-list--density-comfortable .tf-list__items { gap: 0.5rem; }
-.tf-list__item {
-  padding: 0.5em 0.75em;
-  cursor: pointer;
-  border-radius: var(--tf-radius-sm, 0.25rem);
-}
-.tf-list__item:hover { background: var(--tf-bg-3); }
-.tf-list__item:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: -2px;
-}
-.tf-list--divider .tf-list__item { border-bottom: 1px solid var(--tf-border); }
-.tf-list--divider .tf-list__item:last-child { border-bottom: 0; }
-.tf-list--virtualize .tf-list__items { contain: content; }
-.tf-list__more {
-  padding: 0.5em 0.75em;
-  color: var(--tf-text-3);
-  font-size: 0.85em;
-  text-align: center;
-}
-
 .tf-empty-state {
   display: flex;
   flex-direction: column;
@@ -7002,27 +6882,6 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 }
 .tf-empty-state--variant-compact { padding: var(--tf-space-md); gap: var(--tf-space-xs); }
 .tf-empty-state--variant-illustrated { padding: var(--tf-space-xl); }
-.tf-empty-state__icon {
-  font-size: 2rem;
-  color: var(--tf-text-3);
-}
-.tf-empty-state--variant-illustrated .tf-empty-state__icon { font-size: 4rem; }
-.tf-empty-state__heading {
-  font-size: 1.1em;
-  font-weight: 600;
-  color: var(--tf-text);
-  margin: 0;
-}
-.tf-empty-state__message {
-  font-size: 0.95em;
-  margin: 0;
-  max-width: 40ch;
-}
-.tf-empty-state__actions {
-  display: inline-flex;
-  gap: var(--tf-space-sm);
-  margin-top: var(--tf-space-xs);
-}
 
 /* ============================================================================
    tf-table (0x0211) — chunk 3.3d-6
@@ -7070,6 +6929,50 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   font: inherit;
   font-size: 0.85em;
 }
+
+/* ---------- tf-table extras (0x0211) — sticky columns, expandable rows, select-all ---------- */
+/* tf-table applies the functional sticky positioning inline (position/left/
+   z-index); these rules are visual polish only — the features work without them. */
+/* Sticky columns: opaque background so scrolled cells don't show through, and a
+   subtle right edge to separate the pinned region from scrolling content. */
+.tf-table__sticky-col {
+  background: var(--tf-bg-card);
+}
+td.tf-table__sticky-col, th.tf-table__sticky-col {
+  box-shadow: 1px 0 0 0 var(--tf-border);
+}
+
+/* Expand toggle column: narrow, centered chevron button. */
+.tf-table__expand-col { width: 2.5rem; }
+.tf-table__expand-cell { width: 2.5rem; text-align: center; }
+.tf-table__expand-toggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 0.25rem;
+  color: var(--tf-text-2);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+}
+.tf-table__expand-toggle:hover { background: var(--tf-bg-card-hover); }
+.tf-table__expand-toggle:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 1px;
+}
+
+/* Expansion region: spans the full row, indented detail panel. */
+.tf-table__expansion-row > .tf-table__expansion-cell {
+  padding: 0;
+  background: var(--tf-bg-subtle);
+}
+.tf-table__expanded-region {
+  padding: var(--tf-space-sm) var(--tf-space-md);
+}
+
+/* Select-all checkbox sits inline before the first header label. */
+.tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
 
 /* ============================================================================
    tf-sparkline (0x0215) — chunk 3.3d-7
@@ -8557,27 +8460,10 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 }
 
 /* =============================================================================
-   tf-header (0x0001) + tf-page-header (0x0002) + tf-section-header (0x0004)
-   + tf-toolbar (0x0005) + tf-stat-group (0x000A) + tf-inspector (0x000C)
-   — chunk 3.3f (page molecules)
+   tf-page-header (0x0002) + tf-section-header (0x0004) + tf-toolbar (0x0005)
+   + tf-stat-group (0x000A) + tf-inspector (0x000C) — chunk 3.3f (page molecules).
+   Header (0x0001) renders through <tf-detail-header> (no .tf-header* CSS).
    ============================================================================= */
-
-/* --- Header (0x0001) --- */
-.tf-header {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--tf-space-md);
-  padding: var(--tf-space-md) 0;
-}
-.tf-header--density-compact  { padding: var(--tf-space-sm) 0; gap: var(--tf-space-sm); }
-.tf-header--density-comfortable { padding: var(--tf-space-lg) 0; gap: var(--tf-space-lg); }
-.tf-header__icon { flex: 0 0 auto; width: 2em; height: 2em; }
-.tf-header__content { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: var(--tf-space-xxs); }
-.tf-header__title-row { display: flex; align-items: center; gap: var(--tf-space-sm); }
-.tf-header__title { margin: 0; font-size: 1.25rem; font-weight: 600; }
-.tf-header__subtitle { margin: 0; color: var(--tf-text-3); font-size: 0.9em; }
-.tf-header__chips { display: flex; flex-wrap: wrap; gap: var(--tf-space-xs); }
-.tf-header__actions { display: flex; align-items: center; gap: var(--tf-space-sm); flex: 0 0 auto; }
 
 /* --- PageHeader (0x0002) --- */
 .tf-page-header {
@@ -8703,27 +8589,6 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-inline-badge--pulse { animation: tf-badge-pulse 1.5s ease-in-out infinite; }
 @keyframes tf-badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-/* --- InlineChip (shared) --- */
-.tf-inline-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xxs);
-  font-size: 0.85em;
-  padding: var(--tf-space-xxs) var(--tf-space-sm);
-  border-radius: var(--tf-radius-pill);
-  white-space: nowrap;
-}
-.tf-inline-chip--variant-solid   { background: var(--tf-bg-muted); }
-.tf-inline-chip--variant-soft    { background: var(--tf-bg-subtle); }
-.tf-inline-chip--variant-outline { background: transparent; border: 1px solid currentColor; }
-.tf-inline-chip--tone-neutral  { color: var(--tf-text-3); }
-.tf-inline-chip--tone-primary  { color: var(--tf-accent-1); }
-.tf-inline-chip--tone-success  { color: var(--tf-success); }
-.tf-inline-chip--tone-warning  { color: var(--tf-warning); }
-.tf-inline-chip--tone-critical { color: var(--tf-danger); }
-.tf-inline-chip--tone-info     { color: var(--tf-info); }
-.tf-inline-chip--tone-muted    { color: var(--tf-text-3); }
-
 /* --- Molecule breadcrumbs + tabs + filters (shared inline types) --- */
 .tf-molecule-breadcrumbs__list {
   display: flex;
@@ -8745,30 +8610,6 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 .tf-molecule-breadcrumbs__link[role="link"] { cursor: pointer; }
 .tf-molecule-breadcrumbs__link[role="link"]:hover { background: var(--tf-bg-subtle); }
 .tf-molecule-breadcrumbs__separator { color: var(--tf-text-3); user-select: none; }
-
-.tf-molecule-tabs {
-  display: flex;
-  gap: var(--tf-space-xs);
-  border-bottom: 1px solid var(--tf-bg-muted);
-}
-.tf-molecule-tabs__tab {
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: var(--tf-space-sm) var(--tf-space-md);
-  padding-bottom: calc(var(--tf-space-sm) - 2px);
-  cursor: pointer;
-  font: inherit;
-  color: inherit;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-}
-.tf-molecule-tabs__tab:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 2px;
-}
-.tf-molecule-tabs__tab--locked { opacity: 0.5; cursor: not-allowed; }
 
 .tf-molecule-filters {
   display: flex;
@@ -8909,11 +8750,6 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
   text-align: center;
 }
 .tf-empty-state--variant-compact { padding: var(--tf-space-md); gap: var(--tf-space-sm); }
-.tf-empty-state--variant-illustrated .tf-empty-state__icon { width: 6em; height: 6em; }
-.tf-empty-state__icon { width: 3em; height: 3em; opacity: 0.5; }
-.tf-empty-state__heading { margin: 0; font-size: 1.1rem; font-weight: 600; }
-.tf-empty-state__message { margin: 0; color: var(--tf-text-3); font-size: 0.9em; max-width: 32em; }
-.tf-empty-state__actions { display: flex; gap: var(--tf-space-sm); }
 
 /* --- ErrorBoundary (0x0008) --- */
 .tf-error-boundary {

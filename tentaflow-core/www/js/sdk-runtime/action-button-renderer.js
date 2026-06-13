@@ -88,13 +88,8 @@ function renderButton(component, ctx) {
   if (labelBind == null) {
     throw new TypeError('Button.label must be BindRef');
   }
-  // icon_leading / icon_trailing — IconRef wymaga icon registry z chunka
-  // 3.3d. Renderer odrzuca explicitnie obecność tych pól zamiast cicho
-  // ignorować.
-  if (ctx.readField(component.fields, 3) != null) {
-  }
-  if (ctx.readField(component.fields, 4) != null) {
-  }
+  const iconLeadingRaw = ctx.readField(component.fields, 3);
+  const iconTrailingRaw = ctx.readField(component.fields, 4);
   const size = requireEnum(
     ctx.readField(component.fields, 5),
     BUTTON_SIZES,
@@ -115,9 +110,25 @@ function renderButton(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', VARIANT_MAP[variant] || 'primary');
+  // Tone + variant host classes drive the tone-aware accent CSS
+  // (`.tf-button--tone-*` / `.tf-button--variant-*` in controls.css), mirroring
+  // the LinkButton/Fab convention. Without these the validated tone had no
+  // visual effect.
+  btn.classList.add(`tf-button--variant-${variant}`);
+  btn.classList.add(`tf-button--tone-${tone}`);
   const mappedSize = SIZE_MAP[size];
   if (mappedSize) btn.setAttribute('size', mappedSize);
   if (fullWidth) btn.style.width = '100%';
+
+  // Named IconRef → tf-button icon attributes (leading via "icon", trailing via
+  // "trailing-icon"), the same mapping action-link-fab uses. Asset/non-named
+  // IconRefs have no attribute path and are left unrendered.
+  if (iconLeadingRaw != null && iconLeadingRaw.kind === 'named' && iconLeadingRaw.name) {
+    btn.setAttribute('icon', iconLeadingRaw.name);
+  }
+  if (iconTrailingRaw != null && iconTrailingRaw.kind === 'named' && iconTrailingRaw.name) {
+    btn.setAttribute('trailing-icon', iconTrailingRaw.name);
+  }
 
   // Label binding — reactive label attribute on tf-button.
   const applyLabel = () => {

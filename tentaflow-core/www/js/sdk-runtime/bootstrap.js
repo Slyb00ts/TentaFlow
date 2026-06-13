@@ -15,6 +15,7 @@ import { registerLayoutContainersRenderers } from './layout-containers-renderers
 import { registerLayoutCardsRenderers } from './layout-cards-renderers.js';
 import { registerLayoutNavRenderers } from './layout-nav-renderers.js';
 import { registerLayoutBreadcrumbPaginationRenderers } from './layout-nav-breadcrumb-pagination.js';
+import { registerLayoutSidebarTabsRenderers } from './layout-sidebar-tabs-renderer.js';
 import { registerActionButtonRenderer } from './action-button-renderer.js';
 import { registerActionIconButtonRenderer } from './action-icon-button-renderer.js';
 import { registerActionLinkFabRenderers } from './action-link-fab-renderer.js';
@@ -31,6 +32,7 @@ import { registerFormRangeNumericRenderers } from './form-range-numeric-renderer
 import { registerFormFileColorRenderers } from './form-file-color-renderer.js';
 import { registerFormRadioGroupsRenderers } from './form-radio-groups-renderer.js';
 import { registerFormWrappersRenderers } from './form-wrappers-renderer.js';
+import { registerFormTagMentionRenderers } from './form-tag-mention-renderer.js';
 import { registerDataTextRenderers } from './data-text-renderer.js';
 import { registerDataStatLabelsRenderers } from './data-stat-labels-renderer.js';
 import { registerDataAvatarListsRenderers } from './data-avatar-lists-renderer.js';
@@ -64,6 +66,7 @@ export function bootstrapSdkRuntime() {
   registerLayoutCardsRenderers();
   registerLayoutNavRenderers();
   registerLayoutBreadcrumbPaginationRenderers();
+  registerLayoutSidebarTabsRenderers();
   registerActionButtonRenderer();
   registerActionIconButtonRenderer();
   registerActionLinkFabRenderers();
@@ -80,6 +83,7 @@ export function bootstrapSdkRuntime() {
   registerFormFileColorRenderers();
   registerFormRadioGroupsRenderers();
   registerFormWrappersRenderers();
+  registerFormTagMentionRenderers();
   registerDataTextRenderers();
   registerDataStatLabelsRenderers();
   registerDataAvatarListsRenderers();
@@ -106,5 +110,6 @@ export function bootstrapSdkRuntime() {
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback: KOMPLETNE (14/14).
   // 3.3f Molecules: KOMPLETNE (12/12). 3.3g Specialized: KOMPLETNE (14/14).
-  // 3.3a-5b (Sidebar + Tabs) wymaga slot manager z chunka 3.5.
+  // 3.3a-5b Sidebar (0x010A) + Tabs (0x010B): registered (slot-driven).
+  // Form TagInput (0x0308) + MentionInput (0x0309): registered.
 }

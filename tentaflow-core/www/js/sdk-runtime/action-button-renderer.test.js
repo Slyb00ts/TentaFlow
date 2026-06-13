@@ -226,9 +226,7 @@ test('Button: explicit disabled=true overrides loading=false', () => {
 // Spec compliance
 // ============================================================================
 
-// Current renderer contract: icon_leading/icon_trailing are read but neither
-// rendered nor rejected (empty if-blocks in renderButton) — see bug report.
-test('Button accepts but does not render icon_leading/icon_trailing', () => {
+test('Button maps named icon_leading/icon_trailing to tf-button attrs', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -239,8 +237,43 @@ test('Button accepts but does not render icon_leading/icon_trailing', () => {
     ])
   );
   assertEq(el.tagName, 'TF-BUTTON');
+  assertEq(el.getAttribute('icon'), 'star');
+  assertEq(el.getAttribute('trailing-icon'), 'arrow_right');
+});
+
+test('Button without icon fields sets no icon attributes', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BUTTON_TAG, VALID));
   assertEq(el.getAttribute('icon'), null);
-  assertEq(el.children.length, 0);
+  assertEq(el.getAttribute('trailing-icon'), null);
+});
+
+test('Button tone + variant emit host classes for tone-aware CSS', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BUTTON_TAG, [
+      [0, 'tertiary'], [1, 'success'], [2, { kind: 'literal', value: 'OK' }],
+      [5, 'md'], [6, false], [9, 'default'],
+    ])
+  );
+  assert(el.classList.contains('tf-button--variant-tertiary'));
+  assert(el.classList.contains('tf-button--tone-success'));
+});
+
+test('Button each valid tone produces matching tone class', () => {
+  for (const tone of ['neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted']) {
+    setup();
+    const engine = makeEngine();
+    const el = engine.render(
+      comp(BUTTON_TAG, [
+        [0, 'primary'], [1, tone], [2, { kind: 'literal', value: 'X' }],
+        [5, 'md'], [6, false], [9, 'default'],
+      ])
+    );
+    assert(el.classList.contains(`tf-button--tone-${tone}`), `missing tone class for ${tone}`);
+  }
 });
 
 test('Button rejects invalid tone', () => {

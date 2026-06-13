@@ -2,8 +2,9 @@
 // Plik: sdk-runtime/data-table-renderer.js
 // Opis: Renderer Table (0x0211) — uses <tf-table> + <tf-column> web components.
 // Columns mapped to <tf-column> children, data set via .rows property.
-// Sort, pagination, selection, bulk actions, row actions, empty state,
-// expandable rows — all SDK features preserved with reactive bindings.
+// Sort, pagination, selection (incl. select-all), bulk actions, row actions,
+// row double-click, sticky columns, expandable rows, empty state — all SDK
+// features wired with reactive bindings.
 //
 // Spec ref: tentaflow-sdk-spec/src/protocol/ui/data/tables.rs Table +
 // inline.rs (TableColumn, TablePagination, TableColumnWidth).
@@ -428,7 +429,11 @@ function renderTable(component, ctx) {
   // Create <tf-table> web component
   const tfTable = document.createElement('tf-table');
   if (sortable) tfTable.setAttribute('sortable', '');
-  if (selectMode !== 'none') tfTable.setAttribute('selectable', '');
+  // selectable carries the mode so tf-table only shows the select-all header
+  // affordance in multi mode (single selection has no "all" semantics).
+  if (selectMode !== 'none') tfTable.setAttribute('selectable', selectMode);
+  // sticky_columns: pin the first N columns (component-side positioning).
+  if (stickyColumns > 0) tfTable.stickyColumns = stickyColumns;
 
   // Wrapper div for additional SDK features (bulk actions, pagination, empty state)
   const wrapper = document.createElement('div');
@@ -463,6 +468,9 @@ function renderTable(component, ctx) {
     // The `sort` event then carries the spec-mandated column_id directly.
     tfCol.setAttribute('key', col.id);
     if (sortable && col.sortable) tfCol.setAttribute('sortable', '');
+    // TableColumn.sticky_left pins this individual column (in addition to the
+    // table-level sticky_columns prefix count).
+    if (col.sticky_left) tfCol.setAttribute('sticky', '');
     if (col.render === 'number' || col.render === 'currency' || col.render === 'percent' || col.render === 'bytes') {
       tfCol.setAttribute('renderer', 'num');
       tfCol.setAttribute('align', 'num');
@@ -587,6 +595,23 @@ function renderTable(component, ctx) {
 
   if (rowActionDescriptors.length > 0) {
     tfTable.rowActions = (row) => buildRowActionsElement(row);
+  }
+
+  // Expandable rows: tf-table renders the toggle + inserted expansion <tr>;
+  // the renderer supplies the expansion region as a slot/child area tagged with
+  // the SDK template id + the real row id so the template system can fill it.
+  if (rowExpandable) {
+    tfTable.expandable = true;
+    // Key expansion state by the stable row id so it follows the row across
+    // sort/page changes instead of sticking to a visible index.
+    tfTable.rowKey = ROW_KEY_PROP;
+    tfTable.expandRenderer = (row) => {
+      const region = document.createElement('div');
+      region.classList.add('tf-table__expanded-region');
+      region.setAttribute('data-template-id', expandedRowTemplateId);
+      try { region.setAttribute('data-row-id', extractRowId(row)); } catch { /* row key absent */ }
+      return region;
+    };
   }
 
   const readAllRows = () => {
@@ -788,6 +813,64 @@ function renderTable(component, ctx) {
   };
   tfTable.addEventListener('row-click', onRowClick);
   ctx.registerCleanup(() => tfTable.removeEventListener('row-click', onRowClick));
+
+  // row_double_click → SDK event carrying the REAL row key (ROW_KEY_PROP),
+  // mirroring row_click so a column shadowing row_key_field can't clobber it.
+  const onRowDblClick = (e) => {
+    const { row, index } = e.detail || {};
+    if (!row) return;
+    const rowId = typeof row[ROW_KEY_PROP] === 'string' ? row[ROW_KEY_PROP] : `row-${index}`;
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('row_double_click', {
+        bubbles: false,
+        detail: { row_id: rowId },
+      })
+    );
+  };
+  tfTable.addEventListener('row-dblclick', onRowDblClick);
+  ctx.registerCleanup(() => tfTable.removeEventListener('row-dblclick', onRowDblClick));
+
+  // Expandable rows: tf-table toggles locally and reports expand/collapse; the
+  // renderer re-emits the spec expand/collapse event with row id + template id.
+  if (rowExpandable) {
+    const onRowExpand = (e) => {
+      const { row, index, expanded } = e.detail || {};
+      if (!row) return;
+      const rowId = typeof row[ROW_KEY_PROP] === 'string' ? row[ROW_KEY_PROP] : `row-${index}`;
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)(expanded ? 'expand' : 'collapse', {
+          bubbles: false,
+          detail: { row_id: rowId, template_id: expandedRowTemplateId },
+        })
+      );
+    };
+    tfTable.addEventListener('row-expand', onRowExpand);
+    ctx.registerCleanup(() => tfTable.removeEventListener('row-expand', onRowExpand));
+  }
+
+  // Select-all (multi only): toggle every CURRENTLY VISIBLE row's id, emitting
+  // selection_change with the full id list or an empty list.
+  if (selectMode === 'multi') {
+    const onSelectAll = (e) => {
+      const checked = !!(e.detail && e.detail.selected);
+      // readVisibleRows() returns RAW SDK rows, so the key lives under
+      // rowKeyField (transformRows hasn't run); ROW_KEY_PROP only exists on
+      // transformed rows. Read the raw key and keep only string ids.
+      const ids = checked
+        ? readVisibleRows()
+          .map((r) => (r != null && typeof r === 'object' ? r[rowKeyField] : undefined))
+          .filter((id) => typeof id === 'string')
+        : [];
+      wrapper.dispatchEvent(
+        new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
+          bubbles: false,
+          detail: { selected_ids: ids, mode: selectMode, select_all: checked },
+        })
+      );
+    };
+    tfTable.addEventListener('select-all', onSelectAll);
+    ctx.registerCleanup(() => tfTable.removeEventListener('select-all', onSelectAll));
+  }
 
   rebuild();
   ctx.registerCleanup(ctx.store.subscribe(rowsPath, rebuild));

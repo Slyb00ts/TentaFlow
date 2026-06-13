@@ -4,6 +4,7 @@
 // =============================================================================
 
 import './_dom-test-harness.js';
+import { TfSparkline } from '../components/tf-sparkline.js';
 import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
@@ -61,10 +62,11 @@ function sparklineFields({
   ];
 }
 
-// tf-sparkline draws on <canvas> (no 2D context in happy-dom), so the
-// component module is intentionally NOT imported: <tf-sparkline> stays an
-// un-upgraded element and the renderer's property writes (.points, .color,
-// .fill, .height) are asserted directly as the renderer→component contract.
+// tf-sparkline is imported so <tf-sparkline> upgrades and its property
+// accessors (.points/.color/.fill/.height/.variant) round-trip. Rendered
+// wrappers are NOT mounted, so the component stays disconnected and never hits
+// the (null) happy-dom canvas 2D context. The bar-vs-line DRAW difference is
+// proven separately below with a recording 2D-context stub.
 
 test('Sparkline line variant binds points + sizing to tf-sparkline', () => {
   setup();
@@ -98,7 +100,7 @@ test('Sparkline area variant sets fill=true', () => {
   assertEq(el.querySelector('tf-sparkline').fill, true);
 });
 
-test('Sparkline bar variant keeps fill=false and sets variant class', () => {
+test('Sparkline bar variant keeps fill=false, sets variant class + property', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -111,6 +113,71 @@ test('Sparkline bar variant keeps fill=false and sets variant class', () => {
   const spark = el.querySelector('tf-sparkline');
   assertEq(spark.fill, false);
   assertEq(spark.points.length, 5);
+  // The component variant property distinguishes bar from line — previously the
+  // renderer only flipped a CSS class and both drew an identical line.
+  assertEq(spark.variant, 'bar');
+});
+
+test('Sparkline line/area variant properties differ from bar', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('data'), value: [1, 2, 3] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const line = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'line' })));
+  const area = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'area' })));
+  const bar = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
+  assertEq(line.querySelector('tf-sparkline').variant, 'line');
+  assertEq(area.querySelector('tf-sparkline').variant, 'area');
+  assertEq(bar.querySelector('tf-sparkline').variant, 'bar');
+});
+
+test('Sparkline sets role=img and a descriptive aria-label', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('data'), value: [1, 5, 3] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
+  const spark = el.querySelector('tf-sparkline');
+  assertEq(spark.getAttribute('role'), 'img');
+  const label = spark.getAttribute('aria-label');
+  assert(label && label.includes('bar'), 'aria-label mentions variant');
+  assert(label.includes('min 1') && label.includes('max 5'), 'aria-label has min/max');
+});
+
+test('Sparkline a11y.label overrides synthesized aria-label', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('data'), value: [1, 2, 3] },
+      { path: PATH('lbl'), value: 'CPU usage trend' },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields(), {
+    a11y: { label: { kind: 'bound', path: PATH('lbl') } },
+  }));
+  assertEq(el.querySelector('tf-sparkline').getAttribute('aria-label'), 'CPU usage trend');
+});
+
+test('Sparkline empty data still has aria-label', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('data'), value: [] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(SPARKLINE_TAG, sparklineFields({ variant: 'bar' })));
+  const label = el.querySelector('tf-sparkline').getAttribute('aria-label');
+  assert(label && label.includes('no data'), 'empty aria-label present');
 });
 
 test('Sparkline show_min_max renderuje min/max badges', () => {
@@ -236,6 +303,68 @@ test('Sparkline unknown field throws', () => {
   assertThrows(() => engine.render(comp(SPARKLINE_TAG, [
     ...sparklineFields(), [99, 'x'],
   ])));
+});
+
+// ============================================================================
+// Component draw — bar variant draws bars, line variant strokes a path
+// ============================================================================
+
+// Recording 2D context stub: counts the calls that distinguish a bar chart
+// (fillRect per point) from a line chart (single beginPath/stroke).
+function recordingCtx() {
+  const calls = { fillRect: 0, stroke: 0, beginPath: 0, lineTo: 0, moveTo: 0 };
+  const rects = [];
+  return {
+    calls, rects,
+    clearRect() {},
+    beginPath() { calls.beginPath++; },
+    moveTo() { calls.moveTo++; },
+    lineTo() { calls.lineTo++; },
+    stroke() { calls.stroke++; },
+    closePath() {},
+    arc() {},
+    fill() {},
+    fillRect(x, y, w, h) { calls.fillRect++; rects.push({ x, y, w, h }); },
+    set strokeStyle(_v) {}, set lineWidth(_v) {},
+    set fillStyle(_v) {}, set globalAlpha(_v) {},
+  };
+}
+
+function drawWith(variant, points) {
+  const el = new TfSparkline();
+  const ctx = recordingCtx();
+  // Inject a canvas whose 2D context is our recorder (happy-dom returns null).
+  el._canvas = {
+    width: 0, height: 0, style: {},
+    getContext() { return ctx; },
+  };
+  Object.defineProperty(el, 'clientWidth', { value: 120, configurable: true });
+  el._variant = variant;
+  el._points = points;
+  el._render();
+  return ctx;
+}
+
+test('Sparkline component bar variant draws one fillRect per point', () => {
+  const ctx = drawWith('bar', [1, 2, 3, 4]);
+  assertEq(ctx.calls.fillRect, 4);
+  assertEq(ctx.calls.stroke, 0);
+});
+
+test('Sparkline component line variant strokes a path, no fillRect', () => {
+  const ctx = drawWith('line', [1, 2, 3, 4]);
+  assertEq(ctx.calls.fillRect, 0);
+  assert(ctx.calls.stroke >= 1, 'line variant must stroke');
+  assert(ctx.calls.lineTo >= 1, 'line variant must build a path');
+});
+
+test('Sparkline component bar and line draws differ measurably', () => {
+  const bar = drawWith('bar', [5, 1, 9, 3]);
+  const line = drawWith('line', [5, 1, 9, 3]);
+  assert(bar.calls.fillRect > 0 && line.calls.fillRect === 0,
+    'bar uses fillRect, line does not');
+  assert(line.calls.stroke > 0 && bar.calls.stroke === 0,
+    'line strokes, bar does not');
 });
 
 // ---- report ----

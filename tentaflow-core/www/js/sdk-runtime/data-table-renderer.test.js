@@ -871,6 +871,363 @@ test('Table bez row_actions nie ustawia buildera akcji', () => {
   assertEq(tfTable.rowActions, null);
 });
 
+// ============================================================================
+// Row double-click (row_double_click)
+// ============================================================================
+
+test('Table row double-click re-emits row_double_click with row_id', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+  })));
+  const sr = mount(el);
+  let got = null;
+  el.addEventListener('row_double_click', (e) => { got = e.detail; });
+  sr.querySelector('tbody tr').dispatchEvent(
+    new (globalThis.CustomEvent)('dblclick', { bubbles: true })
+  );
+  assertEq(got, { row_id: 'r1' });
+});
+
+test('Table double-click carries REAL row key when column shadows row_key_field', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'real-1', display_id: 'PRETTY-1' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id', field: 'display_id' })],
+  })));
+  const sr = mount(el);
+  let got = null;
+  el.addEventListener('row_double_click', (e) => { got = e.detail; });
+  sr.querySelector('tbody tr').dispatchEvent(
+    new (globalThis.CustomEvent)('dblclick', { bubbles: true })
+  );
+  assertEq(got, { row_id: 'real-1' });
+});
+
+test('Table double-click on header does not emit row_double_click', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] },
+      { path: PATH('sort'), value: null },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name', sortable: true })],
+    sortable: true,
+    sortByBind: { kind: 'bound', path: PATH('sort') },
+  })));
+  const sr = mount(el);
+  let got = null;
+  el.addEventListener('row_double_click', (e) => { got = e.detail; });
+  sr.querySelector('thead th').dispatchEvent(
+    new (globalThis.CustomEvent)('dblclick', { bubbles: true })
+  );
+  assertEq(got, null);
+});
+
+// ============================================================================
+// Sticky columns
+// ============================================================================
+
+test('Table sticky_columns pins first N header + body cells', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', a: '1', b: '2', c: '3' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'a', field: 'a' }), col({ id: 'b', field: 'b' }), col({ id: 'c', field: 'c' })],
+    stickyColumns: 2,
+  })));
+  const sr = mount(el);
+  const ths = sr.querySelectorAll('thead th');
+  assert(ths[0].classList.contains('tf-table__sticky-col'), 'col0 header sticky');
+  assert(ths[1].classList.contains('tf-table__sticky-col'), 'col1 header sticky');
+  assert(!ths[2].classList.contains('tf-table__sticky-col'), 'col2 header NOT sticky');
+  assertEq(ths[0].style.position, 'sticky');
+  assertEq(ths[0].style.left, '0px');
+  assertEq(ths[1].style.left, '160px');
+  const tds = sr.querySelectorAll('tbody tr td');
+  assert(tds[0].classList.contains('tf-table__sticky-col'), 'col0 body sticky');
+  assert(tds[1].classList.contains('tf-table__sticky-col'), 'col1 body sticky');
+  assert(!tds[2].classList.contains('tf-table__sticky-col'), 'col2 body NOT sticky');
+});
+
+test('Table per-column sticky_left pins that column independently', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', a: '1', b: '2' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'a', field: 'a' }), col({ id: 'b', field: 'b', sticky: true })],
+    stickyColumns: 0,
+  })));
+  assertEq(el.querySelectorAll('tf-column')[1].getAttribute('sticky'), '');
+  const sr = mount(el);
+  const ths = sr.querySelectorAll('thead th');
+  assert(!ths[0].classList.contains('tf-table__sticky-col'), 'col0 not sticky');
+  assert(ths[1].classList.contains('tf-table__sticky-col'), 'col1 sticky via sticky_left');
+});
+
+// ============================================================================
+// Expandable rows
+// ============================================================================
+
+test('Table row_expandable renders expand toggle column', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowExpandable: true,
+    expandedRowTemplateId: 'row_detail',
+  })));
+  const sr = mount(el);
+  assert(sr.querySelector('thead .tf-table__expand-col') != null, 'expand header col');
+  assert(sr.querySelector('tbody .tf-table__expand-toggle') != null, 'expand toggle');
+  // No expansion row until toggled.
+  assertEq(sr.querySelectorAll('.tf-table__expansion-row').length, 0);
+});
+
+test('Table expand toggle inserts expansion region + emits expand then collapse', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowExpandable: true,
+    expandedRowTemplateId: 'row_detail',
+  })));
+  const sr = mount(el);
+  const events = [];
+  el.addEventListener('expand', (e) => { events.push(['expand', e.detail]); });
+  el.addEventListener('collapse', (e) => { events.push(['collapse', e.detail]); });
+  const toggle = sr.querySelector('.tf-table__expand-toggle');
+  toggle.click();
+  const region = sr.querySelector('.tf-table__expansion-row .tf-table__expanded-region');
+  assert(region != null, 'expansion region rendered');
+  assertEq(region.getAttribute('data-template-id'), 'row_detail');
+  assertEq(region.getAttribute('data-row-id'), 'r1');
+  assertEq(events[0], ['expand', { row_id: 'r1', template_id: 'row_detail' }]);
+  // Collapse: toggle again (button rebuilt after expand, re-query).
+  sr.querySelector('.tf-table__expand-toggle').click();
+  assertEq(sr.querySelectorAll('.tf-table__expansion-row').length, 0);
+  assertEq(events[1], ['collapse', { row_id: 'r1', template_id: 'row_detail' }]);
+});
+
+test('Table expansion follows the row across a sort, not the visible index', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1', name: 'B' }, { id: 'r2', name: 'A' }] },
+      { path: PATH('sort'), value: null },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name', field: 'name', sortable: true })],
+    sortable: true,
+    sortByBind: { kind: 'bound', path: PATH('sort') },
+    rowExpandable: true,
+    expandedRowTemplateId: 'row_detail',
+  })));
+  const sr = mount(el);
+  // Expand the first VISIBLE row (r1, "B"), which sits at index 0.
+  const firstDataRow = sr.querySelectorAll('tbody tr')[0];
+  assertEq(firstDataRow.querySelector('td.tf-table__expand-cell + td').textContent, 'B');
+  firstDataRow.querySelector('.tf-table__expand-toggle').click();
+  assertEq(sr.querySelector('.tf-table__expansion-row .tf-table__expanded-region')
+    .getAttribute('data-row-id'), 'r1');
+
+  // Sort ascending: r2 ("A") becomes the first data row, r1 ("B") second. The
+  // expansion must still belong to r1, now rendered after the second data row —
+  // index-keyed state would instead jump the panel to r2 at index 0.
+  sr.querySelector('th.sortable').click();
+  const rows = Array.from(sr.querySelectorAll('tbody tr'));
+  // Order: [r2 data][r1 data][r1 expansion]
+  assertEq(rows[0].querySelector('td.tf-table__expand-cell + td').textContent, 'A');
+  assertEq(rows[1].querySelector('td.tf-table__expand-cell + td').textContent, 'B');
+  assert(rows[2].classList.contains('tf-table__expansion-row'), 'expansion is the 3rd row');
+  assertEq(rows[2].querySelector('.tf-table__expanded-region').getAttribute('data-row-id'), 'r1');
+  // Exactly one expansion row exists (the panel did not duplicate or move to r2).
+  assertEq(sr.querySelectorAll('.tf-table__expansion-row').length, 1);
+});
+
+test('Table expansion is dropped when its row leaves the visible set', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }, { id: 'r2', name: 'B' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name', field: 'name' })],
+    rowExpandable: true,
+    expandedRowTemplateId: 'row_detail',
+  })));
+  const sr = mount(el);
+  // Expand r2 (second row).
+  sr.querySelectorAll('.tf-table__expand-toggle')[1].click();
+  assertEq(sr.querySelector('.tf-table__expansion-row .tf-table__expanded-region')
+    .getAttribute('data-row-id'), 'r2');
+  // Remove r2 from the data set — its expansion must disappear.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('rows'), op: { kind: 'set', value: [{ id: 'r1', name: 'A' }] } }],
+  });
+  assertEq(sr.querySelectorAll('.tf-table__expansion-row').length, 0);
+});
+
+test('Table expand toggle click does not emit row_click', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [{ path: PATH('rows'), value: [{ id: 'r1', name: 'A' }] }],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'name' })],
+    rowExpandable: true,
+    expandedRowTemplateId: 'row_detail',
+  })));
+  const sr = mount(el);
+  let rowClicked = null;
+  el.addEventListener('row_click', (e) => { rowClicked = e.detail; });
+  sr.querySelector('.tf-table__expand-toggle').click();
+  assertEq(rowClicked, null);
+});
+
+// ============================================================================
+// Select-all
+// ============================================================================
+
+test('Table multi-select renders select-all checkbox in first header', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1' }, { id: 'r2' }] },
+      { path: PATH('sel'), value: [] },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+  })));
+  const sr = mount(el);
+  assert(sr.querySelector('thead .tf-table__select-all') != null, 'select-all checkbox present');
+});
+
+test('Table single-select does NOT render select-all checkbox', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1' }] },
+      { path: PATH('sel'), value: null },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'single',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+  })));
+  const sr = mount(el);
+  assertEq(sr.querySelector('.tf-table__select-all'), null);
+});
+
+test('Table select-all check selects all visible row ids; uncheck clears', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }] },
+      { path: PATH('sel'), value: [] },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+  })));
+  const sr = mount(el);
+  let got = null;
+  el.addEventListener('selection_change', (e) => { got = e.detail; });
+  const cb = sr.querySelector('.tf-table__select-all');
+  cb.checked = true;
+  cb.dispatchEvent(new (globalThis.CustomEvent)('change', { bubbles: true, detail: { checked: true } }));
+  assertEq(got, { selected_ids: ['r1', 'r2', 'r3'], mode: 'multi', select_all: true });
+  cb.checked = false;
+  cb.dispatchEvent(new (globalThis.CustomEvent)('change', { bubbles: true, detail: { checked: false } }));
+  assertEq(got, { selected_ids: [], mode: 'multi', select_all: false });
+});
+
+test('Table select-all respects pagination — only visible page ids', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: [{ id: 'r1' }, { id: 'r2' }, { id: 'r3' }, { id: 'r4' }] },
+      { path: PATH('sel'), value: [] },
+      { path: PATH('page'), value: 1 },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'multi',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+    pagination: [[0, 2], [1, PATH('page')], [2, false]],
+  })));
+  const sr = mount(el);
+  let got = null;
+  el.addEventListener('selection_change', (e) => { got = e.detail; });
+  const cb = sr.querySelector('.tf-table__select-all');
+  cb.checked = true;
+  cb.dispatchEvent(new (globalThis.CustomEvent)('change', { bubbles: true, detail: { checked: true } }));
+  assertEq(got.selected_ids, ['r1', 'r2']);
+});
+
 // ---- report ----
 function reportResults() {
   let pass = 0, fail = 0;

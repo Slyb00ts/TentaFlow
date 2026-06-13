@@ -57,8 +57,12 @@ class TfSelect extends HTMLElement {
   }
 
   _build() {
-    // przejmij <option> z light DOM i przenies do wewnetrznego <select>
-    const options = Array.from(this.querySelectorAll('option'));
+    // Przejmij top-level <option> ORAZ <optgroup> z light DOM zachowujac ich
+    // kolejnosc i strukture grupowania. Wczesniej `querySelectorAll('option')`
+    // splaszczalo grupy, gubiac etykiety <optgroup> w finalnym UI.
+    const topLevel = Array.from(this.children).filter(
+      (n) => n.tagName === 'OPTION' || n.tagName === 'OPTGROUP'
+    );
     this.innerHTML = '';
 
     // Reuse the tf-input group/label structure so an optional label looks and
@@ -75,7 +79,7 @@ class TfSelect extends HTMLElement {
 
     const select = document.createElement('select');
     select.className = 'tf-select';
-    options.forEach((opt) => select.appendChild(opt));
+    topLevel.forEach((node) => select.appendChild(node));
     select.addEventListener('change', this._onChange);
 
     wrap.appendChild(select);

@@ -307,6 +307,16 @@ test('Select groups render <optgroup> with labels + grouped options', () => {
   assertEq(opts.length, 2);
   assertEq(opts[0].value, 'tstr:a');
   assertEq(opts[1].value, 'tstr:c');
+  // Group label headers must survive in the inner native <select> — tf-select
+  // previously flattened <optgroup> on mount, dropping the labels from the UI.
+  const innerGroups = el.querySelectorAll('select optgroup');
+  assertEq(innerGroups.length, 2);
+  assertEq(innerGroups[0].getAttribute('label'), 'Owoce');
+  assertEq(innerGroups[1].getAttribute('label'), 'Warzywa');
+  // Each option stays nested under its group, not hoisted to select root.
+  assertEq(innerGroups[0].querySelector('option').value, 'tstr:a');
+  assertEq(innerGroups[1].querySelector('option').value, 'tstr:c');
+  assertEq(el.querySelectorAll('select > option').length, 0);
 });
 
 test('Select option with unknown group_id throws', () => {

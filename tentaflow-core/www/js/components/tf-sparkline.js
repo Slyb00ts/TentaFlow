@@ -12,6 +12,7 @@ class TfSparkline extends HTMLElement {
     this._color = null;
     this._fill = false;
     this._showDots = false;
+    this._variant = 'line';
     this._canvas = null;
   }
 
@@ -28,10 +29,17 @@ class TfSparkline extends HTMLElement {
   }
 
   set points(value) { this._points = Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : []; if (this.isConnected) this._render(); }
+  get points() { return this._points; }
   set color(value) { this._color = value || null; if (this.isConnected) this._render(); }
+  get color() { return this._color; }
   set fill(value) { this._fill = Boolean(value); if (this.isConnected) this._render(); }
+  get fill() { return this._fill; }
   set showDots(value) { this._showDots = Boolean(value); if (this.isConnected) this._render(); }
+  get showDots() { return this._showDots; }
   set height(value) { const n = Number(value); if (Number.isFinite(n) && n > 0) this._height = n; if (this.isConnected) this._render(); }
+  get height() { return this._height; }
+  set variant(value) { this._variant = (value === 'bar' || value === 'area') ? value : 'line'; if (this.isConnected) this._render(); }
+  get variant() { return this._variant; }
 
   _resolveColor() {
     const role = this._color || 'primary';
@@ -49,15 +57,34 @@ class TfSparkline extends HTMLElement {
     cv.width = w;
     cv.height = h;
     const ctx = cv.getContext('2d');
+    if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
     const pts = this._points;
-    if (pts.length < 2) return;
-    const min = Math.min(...pts);
-    const max = Math.max(...pts);
+    const color = this._resolveColor();
+    const min = pts.length ? Math.min(...pts) : 0;
+    const max = pts.length ? Math.max(...pts) : 0;
     const range = max - min || 1;
     const pad = 2;
+
+    // Bars: jeden slupek na punkt, wysokosc proporcjonalna do wartosci. Linia i
+    // area sa rysowane wspolna sciezka ponizej.
+    if (this._variant === 'bar') {
+      if (pts.length < 1) return;
+      ctx.fillStyle = color;
+      const gap = pts.length > 1 ? 1 : 0;
+      const slotW = (w - pad * 2) / pts.length;
+      const barW = Math.max(1, slotW - gap);
+      pts.forEach((v, i) => {
+        const bh = ((v - min) / range) * (h - pad * 2);
+        const x = pad + i * slotW + (slotW - barW) / 2;
+        const y = h - pad - bh;
+        ctx.fillRect(x, y, barW, Math.max(1, bh));
+      });
+      return;
+    }
+
+    if (pts.length < 2) return;
     const stepX = (w - pad * 2) / (pts.length - 1);
-    const color = this._resolveColor();
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
     ctx.beginPath();

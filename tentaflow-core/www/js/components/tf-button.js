@@ -36,7 +36,7 @@ const VARIANT_CLASS = {
 
 class TfButton extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'size', 'icon', 'disabled', 'type', 'label'];
+    return ['variant', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label'];
   }
 
   constructor() {
@@ -115,6 +115,12 @@ class TfButton extends HTMLElement {
         body = mEnd[1];
         trailSvg = mEnd[2];
       }
+    }
+    // Atrybut "trailing-icon" wygrywa nad wykrytym koncowym <svg> w tresci —
+    // emitujemy ikone ze spritu po tekscie (np. strzalka, check).
+    const trailingIcon = safeIconName(this.getAttribute('trailing-icon'));
+    if (trailingIcon) {
+      trailSvg = `<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-${trailingIcon}"/></svg>`;
     }
     const hasText = body && body.trim().length > 0;
     return iconSvg + (hasText ? `<span>${body}</span>` : '') + trailSvg;
