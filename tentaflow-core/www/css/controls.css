@@ -301,6 +301,27 @@ tf-window [slot="footer"] {
 }
 .tf-input.tf-input-error { border-color: var(--tf-danger); }
 .tf-input.tf-input-error:focus { box-shadow: var(--tf-glow-danger); }
+
+/* When wrapped, the wrap owns the border/background/ring so [icon][prefix]
+   [input][suffix][icon] read as one field. The inner control goes transparent
+   and borderless; the wrap pads. Bare .tf-input (no wrap) keeps its own border
+   above. */
+.tf-input-wrap .tf-input {
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  box-shadow: none;
+  min-height: 0;
+  padding: 10px 0;
+}
+.tf-input-wrap .tf-input:hover,
+.tf-input-wrap .tf-input:focus,
+.tf-input-wrap .tf-input.tf-input-error,
+.tf-input-wrap .tf-input.tf-input-error:focus {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
 .tf-input-group .tf-hint {
   font-size: 11px;
   color: var(--tf-text-3);
@@ -310,44 +331,68 @@ tf-window [slot="footer"] {
   color: var(--tf-danger);
 }
 
+/* The wrap is the field: it owns border, background, radius and focus ring, and
+   lays out [leading-icon][prefix][input][suffix][trailing-icon] in one box. */
 .tf-input-wrap {
-  position: relative;
   display: flex;
   align-items: center;
+  gap: 0;
+  padding: 0 14px;
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  min-height: 40px;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.25s ease;
 }
-/* Adornments are absolutely positioned over the field; the input reserves
-   horizontal space only for the adornments actually present (via has-* classes),
-   so prefix/placeholder/suffix never overlap. A plain input keeps its base
-   .tf-input padding. */
+.tf-input-wrap:hover { border-color: var(--tf-border-hover); }
+.tf-input-wrap:focus-within {
+  border-color: var(--tf-accent-1);
+  background: var(--tf-bg-card);
+  box-shadow: var(--tf-glow-accent);
+}
+.tf-input-wrap.tf-input-wrap-error { border-color: var(--tf-danger); }
+.tf-input-wrap.tf-input-wrap-error:focus-within { box-shadow: var(--tf-glow-danger); }
+.tf-input-wrap.tf-input-wrap-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* DOM append order in tf-input.js is prefix, input, suffix, leading-icon,
+   trailing-icon, so flex `order` restores the visual sequence
+   [leading-icon][prefix][input][suffix][trailing-icon]. */
+.tf-input-wrap .tf-input-icon { order: 0; }
+.tf-input-wrap .tf-input-prefix { order: 1; }
+.tf-input-wrap .tf-input { order: 2; }
+.tf-input-wrap .tf-input-suffix { order: 3; }
+.tf-input-wrap .tf-input-icon-trailing { order: 4; }
+
+/* Icons are in-flow affixes inside the field, vertically centered. */
 .tf-input-wrap .tf-input-icon {
-  position: absolute;
-  left: 12px;
+  flex: 0 0 auto;
   width: 16px;
   height: 16px;
+  margin-right: 10px;
   color: var(--tf-text-3);
   pointer-events: none;
   transition: color 0.15s;
 }
+/* Trailing icon hugs the right edge after the control. */
+.tf-input-wrap .tf-input-icon-trailing {
+  margin-right: 0;
+  margin-left: 10px;
+}
 .tf-input-wrap:focus-within .tf-input-icon { color: var(--tf-accent-1); }
 
-/* Leading icon reserves room on the left. */
-.tf-input-wrap-has-icon .tf-input {
-  padding-left: 40px;
+/* The control fills the remaining space between affixes. */
+.tf-input-wrap .tf-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
+/* Multiline control grows the field vertically; pin affixes to the top edge. */
+.tf-input-wrap:has(textarea.tf-input) { align-items: flex-start; }
+.tf-input-wrap textarea.tf-input { resize: vertical; }
 
-/* Trailing icon: mirror of the leading .tf-input-icon, pinned to the right. */
-.tf-input-wrap .tf-input-icon-trailing {
-  left: auto;
-  right: 12px;
-}
-.tf-input-wrap-has-trailing-icon .tf-input {
-  padding-right: 40px;
-}
-
-/* Prefix / suffix inline text adornments (e.g. "$", "kg"). They are in-flow
-   flex children of the wrap (not absolutely positioned), so an adornment of any
-   length reserves its own width and the input flows after/before it instead of
-   overlapping. The input takes the remaining space (flex: 1). */
+/* Prefix / suffix muted in-field text affixes (e.g. "$", "kg"). */
 .tf-input-prefix,
 .tf-input-suffix {
   display: inline-flex;
@@ -358,31 +403,8 @@ tf-window [slot="footer"] {
   pointer-events: none;
   white-space: nowrap;
 }
-.tf-input-prefix { padding-left: 12px; }
-.tf-input-suffix { padding-right: 12px; }
-.tf-input-wrap-has-prefix .tf-input,
-.tf-input-wrap-has-suffix .tf-input {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-/* With an in-flow prefix the input owns the left edge — drop its default left
-   padding so the caret sits right after the adornment, and add a small gap. */
-.tf-input-wrap-has-prefix .tf-input {
-  padding-left: 8px;
-}
-.tf-input-wrap-has-suffix .tf-input {
-  padding-right: 8px;
-}
-/* When a leading icon coexists with a prefix the icon is still absolute at
-   12px, so the prefix starts after it. */
-.tf-input-wrap-has-icon.tf-input-wrap-has-prefix .tf-input-prefix {
-  padding-left: 36px;
-}
-/* When both a trailing icon (absolute, right:12px) and an in-flow suffix are
-   present, push the suffix left so it clears the icon. */
-.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input-suffix {
-  padding-right: 32px;
-}
+.tf-input-prefix { margin-right: 6px; }
+.tf-input-suffix { margin-left: 6px; }
 
 /* =============================================================================
    tf-searchbox
@@ -1747,8 +1769,11 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   transition-duration: 0.08s;
 }
 
-/* Inputs: multi-layer glow bloom + pulse on first focus */
-.tf-input:focus {
+/* Inputs: multi-layer glow bloom + pulse on first focus. Bare inputs glow on
+   :focus; wrapped fields glow on the wrap (:focus-within) since it owns the
+   border, while the inner control stays flat. */
+.tf-input:focus,
+.tf-input-wrap:focus-within {
   box-shadow:
     0 0 0 1px var(--tf-accent-1),
     0 0 12px rgba(99, 102, 241, 0.5),
@@ -1757,13 +1782,21 @@ tf-chip[clickable]:focus-visible > .tf-chip {
     0 0 90px rgba(99, 102, 241, 0.04) !important;
   animation: tf-input-glow-pulse 2s ease-in-out 1;
 }
-.tf-input.tf-input-error:focus {
+.tf-input.tf-input-error:focus,
+.tf-input-wrap.tf-input-wrap-error:focus-within {
   box-shadow:
     0 0 0 1px var(--tf-danger),
     0 0 12px rgba(239, 68, 68, 0.5),
     0 0 28px rgba(239, 68, 68, 0.3),
     0 0 56px rgba(239, 68, 68, 0.12) !important;
   animation: tf-input-error-glow-pulse 2s ease-in-out 1;
+}
+/* Wrapped inner control stays flat in every state — the wrap carries the ring.
+   Placed after the glow rules so it wins on source order for equal specificity. */
+.tf-input-wrap .tf-input:focus,
+.tf-input-wrap .tf-input.tf-input-error:focus {
+  box-shadow: none !important;
+  animation: none;
 }
 @keyframes tf-input-glow-pulse {
   0%  { box-shadow: 0 0 0 1px var(--tf-accent-1), 0 0 8px rgba(99, 102, 241, 0.3); }

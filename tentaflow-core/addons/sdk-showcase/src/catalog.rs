@@ -9,8 +9,21 @@
 
 use tentaflow_sdk_spec::protocol::ui::bind::{BindRef, PathSegment, StatePath};
 use tentaflow_sdk_spec::protocol::ui::component::{Component, FieldMap};
-use tentaflow_sdk_spec::protocol::ui::data::Text;
+use tentaflow_sdk_spec::protocol::ui::data::{
+    AreaChart, BarChart, Gauge, Heatmap, LineChart, PieChart, ProgressBar, RatingDisplay,
+    Sparkline, StackedBar, Text,
+};
+use tentaflow_sdk_spec::protocol::ui::inline::{
+    ChartAxis, ChartLegend, ChartSeries, ChartTooltip, GaugeThreshold, HeatmapColumn, HeatmapRow,
+    HeatmapScale, StackSegment,
+};
 use tentaflow_sdk_spec::protocol::ui::layout::Stack;
+use tentaflow_sdk_spec::protocol::ui::slot::StateEntry;
+use tentaflow_sdk_spec::protocol::ui::tokens::{
+    AreaStacking, BarStacking, ChartAxisScale, ChartLegendAlign, ChartLegendPosition,
+    ChartOrientation, ChartSeriesStyle, ChartZoomMode, GaugeVariant, HeatmapLegendPosition,
+    PieVariant, ProgressSize, ProgressVariant, RatingPrecision, RatingVariant, SparklineVariant,
+};
 use tentaflow_sdk_spec::protocol::ui::schema::{
     section, ComponentMeta, ALL_COMPONENTS, ALL_ENUMS, ALL_INLINE_STRUCTS, ALL_TAGGED_UNIONS,
 };
@@ -147,6 +160,14 @@ fn sample_component(meta: &ComponentMeta, depth: u32, ctr: &mut u64) -> Componen
     if depth > MAX_DEPTH {
         return text_leaf("nested sample", ctr);
     }
+    // Chart / data-viz components read their plotted data from `StatePath`s (or
+    // need multi-point inline structures). The generic field walker would emit a
+    // single placeholder point or an unseeded path, so the chart renders blank.
+    // Hand-build a representative, multi-point sample whose data paths line up
+    // with the entries returned by `chart_state_entries`.
+    if let Some(comp) = chart_sample(meta.tag, ctr) {
+        return comp;
+    }
     let mut entries: Vec<(u8, Value)> = Vec::new();
     for f in meta.fields {
         // Optional BindRefs are included: several renderers require at least
@@ -192,6 +213,389 @@ fn text_leaf(content: &str, ctr: &mut u64) -> Component {
     }
     .into_component(format!("demo-leaf-{}", ctr))
     .expect("Text leaf encode")
+}
+
+// =============================================================================
+// Chart / data-viz samples — multi-point so the catalog actually plots
+// =============================================================================
+
+/// Root key for every seeded chart data path. The `data` tab SlotContent
+/// state_overlay (see `chart_state_entries`) writes the points/slices/cells
+/// arrays under `["charts", <key>]`, and the chart samples reference the same
+/// paths so the renderers read real data instead of an empty array.
+const CHART_ROOT: &str = "charts";
+
+fn chart_path(key: &str) -> StatePath {
+    StatePath::new(vec![
+        PathSegment::Key(CHART_ROOT.into()),
+        PathSegment::Key(key.into()),
+    ])
+}
+
+/// Fixed data-path keys (one per series / data source). Kept in lockstep with
+/// `chart_state_entries`.
+const PATH_LINE_A: &str = "line_a";
+const PATH_LINE_B: &str = "line_b";
+const PATH_BAR_A: &str = "bar_a";
+const PATH_BAR_B: &str = "bar_b";
+const PATH_AREA_A: &str = "area_a";
+const PATH_AREA_B: &str = "area_b";
+const PATH_SPARK: &str = "spark";
+const PATH_PIE: &str = "pie";
+const PATH_HEATMAP: &str = "heatmap_cells";
+
+/// Builds a chart/data-viz sample for one tag, or `None` when the tag is not a
+/// special-cased chart (the generic walker then handles it).
+fn chart_sample(tag: u16, ctr: &mut u64) -> Option<Component> {
+    *ctr += 1;
+    let id = |name: &str| format!("demo-{}-{}", name, ctr);
+    let comp = match tag {
+        Sparkline::TAG => Sparkline {
+            data_path: chart_path(PATH_SPARK),
+            variant: SparklineVariant::Line,
+            tone: Tone::Primary,
+            width_px: 160,
+            height_px: 40,
+            show_min_max: true,
+        }
+        .into_component(id("sparkline"))
+        .expect("Sparkline sample encode"),
+        LineChart::TAG => LineChart {
+            series: vec![
+                chart_series("line-a", "Requests", PATH_LINE_A, Tone::Primary),
+                chart_series("line-b", "Errors", PATH_LINE_B, Tone::Critical),
+            ],
+            x_axis: category_axis(),
+            y_axis: linear_axis(),
+            legend: legend(),
+            tooltip: tooltip(),
+            zoom: ChartZoomMode::None,
+            brush: false,
+            height_px: 220,
+        }
+        .into_component(id("linechart"))
+        .expect("LineChart sample encode"),
+        BarChart::TAG => BarChart {
+            series: vec![
+                chart_series("bar-a", "This week", PATH_BAR_A, Tone::Primary),
+                chart_series("bar-b", "Last week", PATH_BAR_B, Tone::Info),
+            ],
+            x_axis: category_axis(),
+            y_axis: linear_axis(),
+            orientation: ChartOrientation::Vertical,
+            stacking: BarStacking::None,
+            legend: legend(),
+            height_px: 220,
+        }
+        .into_component(id("barchart"))
+        .expect("BarChart sample encode"),
+        AreaChart::TAG => AreaChart {
+            series: vec![
+                chart_series("area-a", "CPU", PATH_AREA_A, Tone::Primary),
+                chart_series("area-b", "Memory", PATH_AREA_B, Tone::Success),
+            ],
+            x_axis: category_axis(),
+            y_axis: linear_axis(),
+            legend: legend(),
+            tooltip: tooltip(),
+            zoom: ChartZoomMode::None,
+            brush: false,
+            height_px: 220,
+            stacking: AreaStacking::Stacked,
+            opacity: 0.4,
+        }
+        .into_component(id("areachart"))
+        .expect("AreaChart sample encode"),
+        PieChart::TAG => PieChart {
+            data_path: chart_path(PATH_PIE),
+            variant: PieVariant::Donut,
+            show_labels: true,
+            show_legend: true,
+            max_segments: 6,
+            height_px: 220,
+        }
+        .into_component(id("piechart"))
+        .expect("PieChart sample encode"),
+        StackedBar::TAG => StackedBar {
+            segments: vec![
+                stack_segment("used", "Used", 48.0, Tone::Primary),
+                stack_segment("reserved", "Reserved", 24.0, Tone::Warning),
+                stack_segment("free", "Free", 28.0, Tone::Success),
+            ],
+            total: BindRef::Literal(Value::F64(100.0)),
+            show_legend: true,
+            show_percentages: true,
+            height_px: 40,
+        }
+        .into_component(id("stackedbar"))
+        .expect("StackedBar sample encode"),
+        Heatmap::TAG => Heatmap {
+            rows: heatmap_rows(),
+            columns: heatmap_columns(),
+            cells_path: chart_path(PATH_HEATMAP),
+            scale: HeatmapScale::Linear {
+                min: 0.0,
+                max: 100.0,
+                color_from: Tone::Info,
+                color_to: Tone::Critical,
+            },
+            legend_position: HeatmapLegendPosition::TopRight,
+            cell_size_px: 28,
+            tooltip: true,
+        }
+        .into_component(id("heatmap"))
+        .expect("Heatmap sample encode"),
+        Gauge::TAG => Gauge {
+            value: BindRef::Literal(Value::F64(72.0)),
+            min: 0.0,
+            max: 100.0,
+            thresholds: vec![
+                gauge_threshold(60.0, Tone::Warning),
+                gauge_threshold(85.0, Tone::Critical),
+            ],
+            variant: GaugeVariant::Arc,
+            label: Some(BindRef::Literal(Value::Text("Throughput".into()))),
+            format: None,
+            size_px: 160,
+        }
+        .into_component(id("gauge"))
+        .expect("Gauge sample encode"),
+        ProgressBar::TAG => ProgressBar {
+            value: BindRef::Literal(Value::F64(72.0)),
+            max: 100.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: true,
+            label: None,
+            size: ProgressSize::Md,
+        }
+        .into_component(id("progressbar"))
+        .expect("ProgressBar sample encode"),
+        RatingDisplay::TAG => RatingDisplay {
+            value: BindRef::Literal(Value::F64(3.5)),
+            max: 5,
+            variant: RatingVariant::Stars,
+            show_value: true,
+            precision: RatingPrecision::Half,
+        }
+        .into_component(id("ratingdisplay"))
+        .expect("RatingDisplay sample encode"),
+        _ => return None,
+    };
+    Some(with_chart_a11y(comp))
+}
+
+/// Interactive-less charts still need an accessible name (the generic path adds
+/// one for every other sample); mirror that so the catalog stays uniform.
+fn with_chart_a11y(mut comp: Component) -> Component {
+    comp.a11y = Some(Accessibility {
+        label: Some(BindRef::Literal(Value::Text("Sample chart".into()))),
+        ..Accessibility::default()
+    });
+    comp
+}
+
+fn chart_series(id: &str, name: &str, path_key: &str, tone: Tone) -> ChartSeries {
+    ChartSeries {
+        id: id.into(),
+        name: BindRef::Literal(Value::Text(name.into())),
+        data_path: chart_path(path_key),
+        tone: Some(tone),
+        style: ChartSeriesStyle::Solid,
+        show_in_legend: true,
+    }
+}
+
+fn category_axis() -> ChartAxis {
+    ChartAxis {
+        label: None,
+        format: None,
+        min: None,
+        max: None,
+        ticks: None,
+        scale: ChartAxisScale::Category,
+    }
+}
+
+fn linear_axis() -> ChartAxis {
+    ChartAxis {
+        label: None,
+        format: None,
+        min: None,
+        max: None,
+        ticks: None,
+        scale: ChartAxisScale::Linear,
+    }
+}
+
+fn legend() -> ChartLegend {
+    ChartLegend {
+        position: ChartLegendPosition::Bottom,
+        alignment: ChartLegendAlign::Center,
+    }
+}
+
+fn tooltip() -> ChartTooltip {
+    ChartTooltip {
+        enabled: true,
+        format: None,
+    }
+}
+
+fn stack_segment(id: &str, label: &str, value: f64, tone: Tone) -> StackSegment {
+    StackSegment {
+        id: id.into(),
+        value: BindRef::Literal(Value::F64(value)),
+        label: Some(BindRef::Literal(Value::Text(label.into()))),
+        tone,
+    }
+}
+
+fn gauge_threshold(value: f64, tone: Tone) -> GaugeThreshold {
+    GaugeThreshold {
+        value,
+        tone,
+        label: None,
+    }
+}
+
+/// Five day-of-week rows / seven hour columns for the heatmap grid (7x5 cells).
+const HEATMAP_ROW_IDS: &[(&str, &str)] = &[
+    ("mon", "Mon"),
+    ("tue", "Tue"),
+    ("wed", "Wed"),
+    ("thu", "Thu"),
+    ("fri", "Fri"),
+];
+const HEATMAP_COL_IDS: &[(&str, &str)] = &[
+    ("h08", "08"),
+    ("h10", "10"),
+    ("h12", "12"),
+    ("h14", "14"),
+    ("h16", "16"),
+    ("h18", "18"),
+    ("h20", "20"),
+];
+
+fn heatmap_rows() -> Vec<HeatmapRow> {
+    HEATMAP_ROW_IDS
+        .iter()
+        .map(|(id, label)| HeatmapRow {
+            id: (*id).into(),
+            label: BindRef::Literal(Value::Text((*label).into())),
+        })
+        .collect()
+}
+
+fn heatmap_columns() -> Vec<HeatmapColumn> {
+    HEATMAP_COL_IDS
+        .iter()
+        .map(|(id, label)| HeatmapColumn {
+            id: (*id).into(),
+            label: BindRef::Literal(Value::Text((*label).into())),
+        })
+        .collect()
+}
+
+/// State entries seeding every chart data path referenced by the chart samples.
+/// Returned to the `data` tab SlotContent so the renderers read real numbers and
+/// the catalog plots meaningful curves/slices/cells instead of blank frames.
+pub fn chart_state_entries() -> Vec<StateEntry> {
+    let mut entries = Vec::new();
+
+    // Line: two diverging category series (x = weekday label, y varies).
+    entries.push(point_series(PATH_LINE_A, &[12.0, 19.0, 14.0, 23.0, 28.0, 21.0, 31.0]));
+    entries.push(point_series(PATH_LINE_B, &[3.0, 5.0, 2.0, 7.0, 4.0, 6.0, 3.0]));
+
+    // Bar: two week-over-week category series.
+    entries.push(point_series(PATH_BAR_A, &[40.0, 55.0, 48.0, 62.0, 51.0, 70.0]));
+    entries.push(point_series(PATH_BAR_B, &[33.0, 47.0, 41.0, 50.0, 44.0, 58.0]));
+
+    // Area: two stacked utilisation series.
+    entries.push(point_series(PATH_AREA_A, &[22.0, 28.0, 35.0, 30.0, 42.0, 38.0]));
+    entries.push(point_series(PATH_AREA_B, &[15.0, 18.0, 20.0, 26.0, 24.0, 30.0]));
+
+    // Sparkline: bare numeric array (no x/y objects).
+    entries.push(StateEntry {
+        path: chart_path(PATH_SPARK),
+        value: number_array(&[4.0, 8.0, 6.0, 11.0, 9.0, 14.0, 12.0, 16.0]),
+    });
+
+    // Pie: four labelled slices with distinct tones.
+    entries.push(StateEntry {
+        path: chart_path(PATH_PIE),
+        value: pie_slices(),
+    });
+
+    // Heatmap: 7x5 grid of varied cell values addressed by row_id/col_id.
+    entries.push(StateEntry {
+        path: chart_path(PATH_HEATMAP),
+        value: heatmap_cells(),
+    });
+
+    entries
+}
+
+/// `Array<{x: <weekday>, y: <value>}>` for a line/bar/area series.
+fn point_series(key: &str, ys: &[f64]) -> StateEntry {
+    const X_LABELS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let points = ys
+        .iter()
+        .enumerate()
+        .map(|(i, y)| {
+            let x = X_LABELS.get(i).copied().unwrap_or("?");
+            Value::Map(vec![
+                (Value::Text("x".into()), Value::Text(x.into())),
+                (Value::Text("y".into()), Value::F64(*y)),
+            ])
+        })
+        .collect();
+    StateEntry {
+        path: chart_path(key),
+        value: Value::Array(points),
+    }
+}
+
+fn number_array(ns: &[f64]) -> Value {
+    Value::Array(ns.iter().map(|n| Value::F64(*n)).collect())
+}
+
+/// `Array<{id, label, value, tone}>` for the pie chart.
+fn pie_slices() -> Value {
+    let slice = |id: &str, label: &str, value: f64, tone: &str| {
+        Value::Map(vec![
+            (Value::Text("id".into()), Value::Text(id.into())),
+            (Value::Text("label".into()), Value::Text(label.into())),
+            (Value::Text("value".into()), Value::F64(value)),
+            (Value::Text("tone".into()), Value::Text(tone.into())),
+        ])
+    };
+    Value::Array(vec![
+        slice("ssd", "SSD", 42.0, "primary"),
+        slice("hdd", "HDD", 28.0, "info"),
+        slice("cache", "Cache", 18.0, "success"),
+        slice("other", "Other", 12.0, "warning"),
+    ])
+}
+
+/// `Array<{row_id, col_id, value}>` covering every cell of the 7x5 grid.
+fn heatmap_cells() -> Value {
+    let mut cells = Vec::with_capacity(HEATMAP_ROW_IDS.len() * HEATMAP_COL_IDS.len());
+    for (r, (row_id, _)) in HEATMAP_ROW_IDS.iter().enumerate() {
+        for (c, (col_id, _)) in HEATMAP_COL_IDS.iter().enumerate() {
+            // Deterministic, varied surface peaking around mid-day mid-week.
+            let value = 10.0
+                + ((r as f64) * 7.0)
+                + ((c as f64) * 11.0)
+                + (((r + c) % 3) as f64) * 9.0;
+            cells.push(Value::Map(vec![
+                (Value::Text("row_id".into()), Value::Text((*row_id).into())),
+                (Value::Text("col_id".into()), Value::Text((*col_id).into())),
+                (Value::Text("value".into()), Value::F64(value.min(100.0))),
+            ]));
+        }
+    }
+    Value::Array(cells)
 }
 
 // =============================================================================

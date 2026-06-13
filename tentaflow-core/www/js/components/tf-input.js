@@ -216,6 +216,9 @@ class TfInput extends HTMLElement {
 
     const baseClass = error ? 'tf-input tf-input-error' : 'tf-input';
     this._input.className = baseClass;
+    // The wrap carries the field border/ring, so mirror error + disabled there.
+    this._wrap.classList.toggle('tf-input-wrap-error', !!error);
+    this._wrap.classList.toggle('tf-input-wrap-disabled', disabled);
 
     if (icon) {
       this._iconEl.style.display = '';
