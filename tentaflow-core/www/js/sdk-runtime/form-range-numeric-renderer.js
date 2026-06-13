@@ -222,8 +222,8 @@ function renderSlider(component, ctx) {
 
   // Wrapper holds tf-slider + optional label + optional value badge.
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-slider');
-  wrapper.classList.add(`tf-slider--tone-${tone}`);
+  wrapper.classList.add('tf-slider-control');
+  wrapper.classList.add(`tf-slider-control--tone-${tone}`);
 
   let labelEl = null;
   if (labelBind != null) {
