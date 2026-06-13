@@ -288,6 +288,10 @@ fn text_sample(field: &str) -> String {
         return "demo-id".into();
     }
     match field {
+        // MentionInput.trigger_chars entries must each be a single character
+        // (renderer validates `t.length === 1`); a human-readable sample would
+        // abort the whole Form tab render.
+        "trigger_chars" => "@".into(),
         // CodeBlock validates the language tag grammar.
         "language" => "rust".into(),
         // Image sources must actually load in the browser (a dead https URL

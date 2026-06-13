@@ -24,6 +24,7 @@ module.exports = defineConfig({
     { name: 'm15-wizard', testMatch: 'm15-install-wizard.spec.js' },
     { name: 'f1c-addon-ui', testMatch: 'addon-ui-iframe.spec.js' },
     { name: 'sdk-showcase-panel', testMatch: 'sdk-showcase-panel.spec.js' },
+    { name: 'sdk-showcase-components', testMatch: 'sdk-showcase-components.spec.js' },
     { name: 'tentavision-panel', testMatch: 'tentavision-panel.spec.js' },
   ],
 });
