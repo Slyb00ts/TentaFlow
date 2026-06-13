@@ -14,6 +14,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 
 import { VisibilityTab } from '/js/modules/addons/visibility.js';
 import { PermissionsTab } from '/js/modules/addons/permissions.js';
+import { AccessTab } from '/js/modules/addons/access.js';
 import { OAuthConfigTab } from '/js/modules/addons/oauth-config.js';
 import { LinkedAccountsTab } from '/js/modules/addons/linked-accounts.js';
 import { SettingsTab } from '/js/modules/addons/settings.js';
@@ -816,6 +817,7 @@ function renderDetail() {
       adminOnly: true,
       count: linkedCount > 0 ? String(linkedCount) : null,
     },
+    { id: 'access', icon: 'shield', label: I18n.t('addons.tab_access'), adminOnly: true },
     { id: 'bindings', icon: 'external-link', label: I18n.t('addons.tab_bindings'), adminOnly: true },
     { id: 'resources', icon: 'chip', label: I18n.t('addons.tab_resources'), adminOnly: true },
     { id: 'network', icon: 'globe', label: I18n.t('addons.tab_network'), adminOnly: true },
@@ -920,7 +922,9 @@ function renderDetailHeader(d) {
 }
 
 async function switchTab(tabId) {
-  // Tabs visible to non-admins.
+  // Tabs visible to non-admins. 'access' stays admin-only because its data
+  // endpoint (addonAccessListRequest) is backend #[policy(Admin)]; a non-admin
+  // read-only access endpoint is a future backend follow-up.
   const nonAdminTabs = new Set(['tools']);
   if (!isAdmin && !nonAdminTabs.has(tabId)) {
     tabId = 'tools';
@@ -947,6 +951,12 @@ async function switchTab(tabId) {
     const addonName = currentAddonDetail?.name || currentAddonId;
     await PermissionsTab.mount(body, currentAddonId, addonName);
     activeTabController = PermissionsTab;
+    return;
+  }
+  if (tabId === 'access') {
+    const addonName = currentAddonDetail?.name || currentAddonId;
+    await AccessTab.mount(body, currentAddonId, { addonName, isAdmin });
+    activeTabController = AccessTab;
     return;
   }
   if (tabId === 'oauth') {

@@ -1,0 +1,94 @@
+/* ============================================================================
+ * services-access.css — access-control panels for the Services screen.
+ * Drives M16b (alias visibility + consumers) and M8b (model visibility +
+ * consumers). Rendered by js/modules/services/access.js, expanded under an
+ * alias row (aliases tab) or model row (models tab).
+ * ============================================================================ */
+
+.svc-alias-access-wrap,
+.svc-model-access-row > td {
+  padding: 0;
+}
+
+.svc-access-panel {
+  background: var(--bg);
+  border-left: 3px solid var(--accent-1);
+  padding: 16px 18px;
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 14px;
+}
+.svc-model-access-row > td { background: var(--bg); }
+.svc-model-access-row .svc-access-panel { margin: 0; }
+
+.svc-access-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; font-weight: 700; color: var(--text);
+}
+.svc-access-head svg { width: 16px; height: 16px; color: var(--accent-2); }
+.svc-access-name {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  color: var(--accent-2); font-size: 13px;
+}
+
+/* Visibility segmented + descriptive hint */
+.svc-access-vis { display: flex; flex-direction: column; gap: 6px; }
+.svc-access-vis-label {
+  font-size: 11.5px; font-weight: 600; color: var(--text-2);
+}
+.svc-access-vis tf-segmented { width: 100%; }
+.svc-access-vis-hint {
+  font-size: 10.5px; color: var(--text-3); line-height: 1.5;
+}
+
+/* Consumers header */
+.svc-access-consumers-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 4px;
+}
+.svc-access-consumers-title {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12.5px; font-weight: 700; color: var(--text);
+}
+.svc-access-consumers-title svg { width: 14px; height: 14px; color: var(--text-3); }
+.svc-access-count {
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px; padding: 1px 8px; border-radius: 12px;
+  background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border);
+}
+
+/* Consumer table */
+.svc-access-table { width: 100%; }
+.svc-access-table .svc-access-addon {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 700;
+  background: rgba(167, 139, 250, 0.15); color: var(--accent-2);
+}
+.svc-access-table .svc-access-addon svg { width: 12px; height: 12px; }
+.svc-access-by, .svc-access-when {
+  font-size: 11px; color: var(--text-3);
+}
+.svc-access-actions { text-align: right; white-space: nowrap; }
+.svc-access-btn-pair { display: inline-flex; gap: 6px; }
+.svc-access-row-revoked { opacity: 0.6; }
+
+/* Loading / empty / error states */
+.svc-access-loading {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--text-3); font-size: 12.5px; padding: 14px 4px;
+}
+.svc-access-loading svg { width: 14px; height: 14px; animation: svc-access-spin 0.9s linear infinite; }
+@keyframes svc-access-spin { to { transform: rotate(360deg); } }
+.svc-access-empty {
+  color: var(--text-3); font-size: 12.5px; padding: 14px 4px;
+}
+.svc-access-error {
+  color: var(--danger); font-size: 12.5px; padding: 10px 12px;
+  background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius-sm);
+}
+
+@media (max-width: 880px) {
+  .svc-access-panel { padding: 12px; }
+}

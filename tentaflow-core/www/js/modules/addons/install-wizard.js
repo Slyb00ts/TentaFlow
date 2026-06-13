@@ -1,10 +1,10 @@
 // =============================================================================
 // File: modules/addons/install-wizard.js
 // Description: Generic install wizard launched from addon detail or registry.
-//              Six steps total; this chunk implements steps 1-3 fully
-//              (Permissions, Storage, Aliases). Steps 4-6 (Flow templates,
-//              Legal profile, First camera) are placeholders pending F1a+
-//              backend work. The wizard renders inside a tf-window modal.
+//              Seven steps total; steps 1-5 implemented (Permissions, Storage,
+//              Aliases, External access, Cameras). Steps 6-7 (Legal profile,
+//              First camera) are placeholders pending backend work. The wizard
+//              renders inside a tf-window modal.
 //              Final "Install" issues addonInstallConfigureRequest (flagged
 //              as missing — UI calls it but backend handler will need to be
 //              added before this wizard is wired to the registry flow).
@@ -44,7 +44,20 @@ export function openInstallWizard(opts = {}) {
     },
     // Step 3 — aliases: alias_name -> {enabled: bool, target: string}
     aliases: new Map(),
-    // Step 4 — discovered ONVIF cameras
+    // Step 4 — external access (uses_alias / uses_model grants to other addons'
+    // resources). Populated from addonAccessListRequest; null until loaded.
+    access: {
+      loading: false,
+      error: null,
+      loaded: false,
+      // Array of normalized entries: {kind, target, required, reason,
+      // grantStatus, ownerVisibility, pending}
+      items: [],
+    },
+    // Whether the current installer is an admin — only admins may approve/reject
+    // restricted access grants. Resolved lazily via authMeRequest.
+    isAdmin: false,
+    // Step 5 — discovered ONVIF cameras
     cameras: {
       discovered: [],
       added: new Map(),
@@ -103,6 +116,78 @@ export function openInstallWizard(opts = {}) {
   // Background-load the existing alias list so Step 3 can compute conflicts
   // against actual server state instead of trusting the manifest hint.
   loadExistingAliases();
+  // Resolve admin role up front so the Access step can gate approve/reject.
+  detectInstallerRole();
+  // Background-load external access declarations so Step 4 has live grant
+  // statuses (the manifest only carries declarations, not grant state).
+  loadAccessList();
+}
+
+async function detectInstallerRole() {
+  try {
+    const me = await ApiBinary.one('authMeRequest');
+    state.isAdmin = String(me?.role || '').toLowerCase() === 'admin';
+  } catch (_) {
+    state.isAdmin = false;
+  }
+  if (state.currentStep === 4) renderStep();
+}
+
+// Normalizes one access entry from either the wire response or the manifest,
+// tolerating both snake_case and camelCase field names.
+function normalizeAccessEntry(kind, e) {
+  return {
+    kind,
+    target: e.target || e.alias || e.model || e.name || '',
+    required: !!(e.required ?? e.is_required),
+    reason: e.reason || e.description || '',
+    grantStatus: e.grantStatus || e.grant_status || 'pending',
+    ownerVisibility: e.ownerVisibility || e.owner_visibility || 'restricted',
+    // True while an approve/reject decision is in flight for this entry.
+    pending: false,
+  };
+}
+
+async function loadAccessList() {
+  if (!state.addonId) {
+    // Fresh install from a manifest with no server-side addonId yet: fall back
+    // to manifest declarations so the step still renders the requested uses.
+    state.access.items = manifestAccessItems();
+    state.access.loaded = true;
+    if (state.currentStep === 4) renderStep();
+    return;
+  }
+  state.access.loading = true;
+  state.access.error = null;
+  if (state.currentStep === 4) renderStep();
+  try {
+    const resp = await ApiBinary.one('addonAccessListRequest', { addonId: state.addonId });
+    const aliases = Array.isArray(resp?.usesAlias) ? resp.usesAlias : [];
+    const models = Array.isArray(resp?.usesModel) ? resp.usesModel : [];
+    state.access.items = [
+      ...aliases.map((e) => normalizeAccessEntry('alias', e)),
+      ...models.map((e) => normalizeAccessEntry('model', e)),
+    ];
+    state.access.loaded = true;
+  } catch (err) {
+    state.access.error = `${I18n.t('install_wizard.access_err_load')}: ${err?.message || err}`;
+    state.access.items = manifestAccessItems();
+    state.access.loaded = true;
+  } finally {
+    state.access.loading = false;
+    if (state.currentStep === 4) renderStep();
+    updateFooter();
+  }
+}
+
+function manifestAccessItems() {
+  const m = state.manifest || {};
+  const aliases = Array.isArray(m.uses_alias || m.usesAlias) ? (m.uses_alias || m.usesAlias) : [];
+  const models = Array.isArray(m.uses_model || m.usesModel) ? (m.uses_model || m.usesModel) : [];
+  return [
+    ...aliases.map((e) => normalizeAccessEntry('alias', e)),
+    ...models.map((e) => normalizeAccessEntry('model', e)),
+  ];
 }
 
 async function loadExistingAliases() {
@@ -235,6 +320,7 @@ function renderProgress() {
     { n: 4, label: I18n.t('install_wizard.step4') },
     { n: 5, label: I18n.t('install_wizard.step5') },
     { n: 6, label: I18n.t('install_wizard.step6') },
+    { n: 7, label: I18n.t('install_wizard.step7') },
   ];
   return `
     <div class="install-progress">
@@ -256,9 +342,10 @@ function renderStepBody() {
     case 1: return renderPermissionsStep();
     case 2: return renderStorageStep();
     case 3: return renderAliasesStep();
-    case 4: return renderCamerasStep();
-    case 5:
+    case 4: return renderAccessStep();
+    case 5: return renderCamerasStep();
     case 6:
+    case 7:
       return renderPlaceholderStep(state.currentStep);
     default:
       return '';
@@ -267,14 +354,17 @@ function renderStepBody() {
 
 function renderFooter() {
   const canBack = state.currentStep > 1;
-  const isLast = state.currentStep === 6;
+  const isLast = state.currentStep === 7;
   const ok = canAdvance();
   const nextLabel = isLast
     ? I18n.t('install_wizard.install')
     : I18n.t('install_wizard.next');
+  // Surface why advance is blocked (Access step: a required grant is denied or
+  // blocked private) so the disabled button is not a dead end.
+  const blockMsg = advanceBlockMessage();
   return `
     <tf-button variant="ghost" data-wizard-back ${canBack ? '' : 'disabled'}>${escapeHtml(I18n.t('install_wizard.back'))}</tf-button>
-    <div class="spacer" style="flex:1"></div>
+    ${blockMsg ? `<div class="wizard-foot-block">${escapeHtml(blockMsg)}</div>` : '<div class="spacer" style="flex:1"></div>'}
     <tf-button variant="primary" icon="${isLast ? 'check' : 'chevron-right'}" data-wizard-next ${ok ? '' : 'disabled'}>${escapeHtml(nextLabel)}</tf-button>
   `;
 }
@@ -483,7 +573,162 @@ function renderAliasesStep() {
   `;
 }
 
-// --- Step 4: Discovered cameras (ONVIF) ------------------------------------
+// --- Step 4: External access (uses_alias / uses_model) ----------------------
+
+// Effective grant status after applying owner visibility:
+//  - public visibility OR grantStatus granted/auto_granted -> 'granted'
+//  - private visibility -> 'blocked' (no installer-side approval possible)
+//  - restricted + pending -> 'pending' (admin may approve/reject)
+//  - restricted + denied -> 'denied'
+function effectiveGrant(it) {
+  if (it.ownerVisibility === 'public' || it.grantStatus === 'auto_granted' || it.grantStatus === 'granted') {
+    return 'granted';
+  }
+  if (it.ownerVisibility === 'private') return 'blocked';
+  if (it.grantStatus === 'denied') return 'denied';
+  return 'pending';
+}
+
+// A required entry blocks the wizard when its effective grant is denied or
+// blocked-private. Optional entries never block, regardless of grant.
+function accessEntryBlocks(it) {
+  if (!it.required) return false;
+  const g = effectiveGrant(it);
+  return g === 'denied' || g === 'blocked';
+}
+
+function renderAccessStep() {
+  const a = state.access;
+  const header = `
+    <h2 class="wizard-section-title">${escapeHtml(I18n.t('install_wizard.step4_title'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(I18n.t('install_wizard.step4_sub'))}</p>
+  `;
+
+  if (a.loading) {
+    return `
+      ${header}
+      <div class="wizard-cameras-state">
+        <svg class="icon spin"><use href="#i-refresh"/></svg>
+        <span>${escapeHtml(I18n.t('install_wizard.access_loading'))}</span>
+      </div>
+    `;
+  }
+
+  if (!Array.isArray(a.items) || a.items.length === 0) {
+    return `
+      ${header}
+      ${a.error ? `<div class="wizard-warning"><svg class="icon"><use href="#i-alert"/></svg>${escapeHtml(a.error)}</div>` : ''}
+      <div class="addons-empty">${escapeHtml(I18n.t('install_wizard.access_none'))}</div>
+    `;
+  }
+
+  const errorBanner = a.error
+    ? `<div class="wizard-warning"><svg class="icon"><use href="#i-alert"/></svg>${escapeHtml(a.error)}</div>`
+    : '';
+
+  const rows = a.items.map((it, idx) => renderAccessCard(it, idx)).join('');
+  return `
+    ${header}
+    ${errorBanner}
+    <div class="wizard-access-list">${rows}</div>
+  `;
+}
+
+function renderAccessCard(it, idx) {
+  const eff = effectiveGrant(it);
+  const reqBadge = it.required
+    ? `<tf-chip status="err">${escapeHtml(I18n.t('install_wizard.access_required'))}</tf-chip>`
+    : `<tf-chip status="info">${escapeHtml(I18n.t('install_wizard.access_optional'))}</tf-chip>`;
+  const visStatus = ({ public: 'ok', restricted: 'warn', private: 'err' })[it.ownerVisibility] || 'info';
+  const visBadge = `<tf-chip status="${visStatus}">${escapeHtml(I18n.t('install_wizard.access_vis_' + it.ownerVisibility))}</tf-chip>`;
+  const kindBadge = `<tf-chip status="info">${escapeHtml(I18n.t('install_wizard.access_kind_' + it.kind))}</tf-chip>`;
+
+  let actionBlock = '';
+  if (eff === 'granted') {
+    actionBlock = `
+      <tf-status-pill status="ok" icon="check" label="${escapeAttr(I18n.t('install_wizard.access_auto_granted'))}"></tf-status-pill>
+    `;
+  } else if (eff === 'blocked') {
+    actionBlock = `
+      <tf-status-pill status="err" icon="lock" label="${escapeAttr(I18n.t('install_wizard.access_blocked_private'))}"></tf-status-pill>
+    `;
+  } else if (eff === 'denied') {
+    // Restricted + denied: admins may re-approve, non-admins see read-only.
+    actionBlock = state.isAdmin
+      ? `
+        <tf-status-pill status="err" icon="x" label="${escapeAttr(I18n.t('install_wizard.access_denied'))}"></tf-status-pill>
+        <tf-button size="sm" variant="primary" data-role="access-approve" data-idx="${idx}" ${it.pending ? 'disabled' : ''}>${escapeHtml(I18n.t('install_wizard.access_approve'))}</tf-button>
+      `
+      : `<tf-status-pill status="err" icon="x" label="${escapeAttr(I18n.t('install_wizard.access_denied'))}"></tf-status-pill>`;
+  } else {
+    // pending (restricted)
+    actionBlock = state.isAdmin
+      ? `
+        <tf-button size="sm" variant="primary" data-role="access-approve" data-idx="${idx}" ${it.pending ? 'disabled' : ''}>${escapeHtml(I18n.t('install_wizard.access_approve'))}</tf-button>
+        <tf-button size="sm" variant="ghost" data-role="access-reject" data-idx="${idx}" ${it.pending ? 'disabled' : ''}>${escapeHtml(I18n.t('install_wizard.access_reject'))}</tf-button>
+      `
+      : `<tf-status-pill status="warn" icon="info" label="${escapeAttr(I18n.t('install_wizard.access_pending_readonly'))}"></tf-status-pill>`;
+  }
+
+  const blocks = accessEntryBlocks(it);
+  return `
+    <div class="wizard-access-row ${blocks ? 'is-blocked' : ''}" data-idx="${idx}">
+      <div class="wizard-access-main">
+        <div class="wizard-access-head">
+          <span class="mono wizard-access-id">${escapeHtml(it.target)}</span>
+          ${kindBadge}
+          ${visBadge}
+          ${reqBadge}
+        </div>
+        ${it.reason ? `<div class="wizard-access-reason">${escapeHtml(it.reason)}</div>` : ''}
+        ${blocks ? `<div class="wizard-access-blockmsg">${escapeHtml(I18n.t('install_wizard.access_required_blocked'))}</div>` : ''}
+      </div>
+      <div class="wizard-access-side">${actionBlock}</div>
+    </div>
+  `;
+}
+
+async function submitAccessDecision(idx, decision) {
+  const it = state.access.items[idx];
+  if (!it || it.pending) return;
+  if (!state.isAdmin) return;
+  it.pending = true;
+  renderStep();
+  try {
+    const resp = await ApiBinary.action('addonAccessDecisionRequest', {
+      addonId: state.addonId,
+      kind: it.kind,
+      target: it.target,
+      decision,
+    });
+    if (!resp?.ok) throw new Error(resp?.error || 'access_decision_failed');
+    // Reflect the transition locally so gating updates without a reload.
+    it.grantStatus = decision === 'approve' ? 'granted' : 'denied';
+    toast(I18n.t(decision === 'approve' ? 'install_wizard.access_approved_toast' : 'install_wizard.access_rejected_toast'), 'success');
+  } catch (err) {
+    toast(`${I18n.t('install_wizard.access_decision_error')}: ${err?.message || err}`, 'error');
+  } finally {
+    it.pending = false;
+    renderStep();
+  }
+}
+
+function attachAccessStepHandlers(root) {
+  root.querySelectorAll('[data-role="access-approve"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.idx);
+      if (Number.isInteger(idx)) submitAccessDecision(idx, 'approve');
+    });
+  });
+  root.querySelectorAll('[data-role="access-reject"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.idx);
+      if (Number.isInteger(idx)) submitAccessDecision(idx, 'deny');
+    });
+  });
+}
+
+// --- Step 5: Discovered cameras (ONVIF) ------------------------------------
 
 function renderCamerasStep() {
   const c = state.cameras;
@@ -792,7 +1037,7 @@ function attachCamerasStepHandlers(root) {
     loadDiscoveredCameras();
   });
   root.querySelector('[data-role="cameras-skip"]')?.addEventListener('click', () => {
-    if (state.currentStep < 6) {
+    if (state.currentStep < 7) {
       state.currentStep += 1;
       renderStep();
     }
@@ -919,6 +1164,8 @@ function attachStepHandlers(root) {
       });
     });
   } else if (state.currentStep === 4) {
+    attachAccessStepHandlers(root);
+  } else if (state.currentStep === 5) {
     attachCamerasStepHandlers(root);
   }
 }
@@ -932,7 +1179,7 @@ function attachFooterHandlers(root) {
   });
   root.querySelector('[data-wizard-next]')?.addEventListener('click', async () => {
     if (!canAdvance()) return;
-    if (state.currentStep === 6) {
+    if (state.currentStep === 7) {
       await finalizeInstall();
       return;
     }
@@ -968,7 +1215,25 @@ function canAdvance() {
     }
     return true;
   }
+  if (state.currentStep === 4) {
+    // Block advance if any REQUIRED access entry is denied or blocked-private.
+    // Optional unmet uses are always allowed through.
+    for (const it of state.access.items) {
+      if (accessEntryBlocks(it)) return false;
+    }
+    return true;
+  }
   return true;
+}
+
+// Inline message shown next to a disabled Next/Install button explaining why
+// advance is blocked. Currently only the Access step produces one.
+function advanceBlockMessage() {
+  if (state.currentStep !== 4) return '';
+  const blocked = state.access.items.filter(accessEntryBlocks);
+  if (blocked.length === 0) return '';
+  const targets = blocked.map((it) => it.target).join(', ');
+  return I18n.t('install_wizard.access_advance_blocked').replace('{targets}', targets);
 }
 
 async function finalizeInstall() {

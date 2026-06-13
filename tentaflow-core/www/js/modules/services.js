@@ -18,6 +18,7 @@ import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
+import * as Access from '/js/modules/services/access.js';
 
 let services = [];
 let aliases = [];
@@ -41,6 +42,14 @@ let aliasEditingId = null;
 // Per-alias staged edit state: { targetModel, strategy, fallbackTargets[] }.
 // Keyed by alias id so opening another row resets cleanly.
 let aliasEditDraft = null;
+// M16b: id of the alias whose access panel (visibility + consumers) is expanded,
+// or null. M8b mirrors this with modelAccessId for the Models tab. Both are
+// single-open (one panel at a time) to keep the lazy consumer fetch cheap.
+let aliasAccessId = null;
+let modelAccessId = null;
+// Per-model visibility map keyed by modelId — merged from modelVisibilityListRequest
+// over the modelListRequest catalog (default 'restricted' when a model is absent).
+let modelVisibility = new Map();
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -100,6 +109,10 @@ const ServicesScreen = {
     meshNodes = [];
     unifiedModels = [];
     modelsCache = [];
+    modelVisibility = new Map();
+    aliasAccessId = null;
+    modelAccessId = null;
+    Access.clearAccessCache();
   },
 };
 
@@ -107,12 +120,13 @@ const ServicesScreen = {
 
 async function loadAll() {
   try {
-    const [svc, al, nodes, unified, models] = await Promise.all([
+    const [svc, al, nodes, unified, models, modelVis] = await Promise.all([
       ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []),
       ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.one('modelVisibilityListRequest').catch(() => null),
       ManifestStore.init().catch(() => false),
     ]);
     services = Array.isArray(svc) ? svc : [];
@@ -120,6 +134,7 @@ async function loadAll() {
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
     modelsCache = Array.isArray(models) ? models : [];
+    setModelVisibility(modelVis);
     // Legacy unified merge feeds the per-node models[] still consumed by the
     // Mesh detail page; the Models tab itself reads from modelsCache.
     mergeUnifiedModelsIntoNodes();
@@ -129,6 +144,25 @@ async function loadAll() {
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
   }
+}
+
+// Rebuild the modelId→visibility map from a modelVisibilityListRequest response.
+// Models absent from the response default to 'restricted' at read time (see
+// modelVisibilityFor), so we only store the explicit overrides here.
+function setModelVisibility(resp) {
+  modelVisibility = new Map();
+  const list = Array.isArray(resp?.models) ? resp.models : [];
+  for (const m of list) {
+    const mid = m.modelId || m.model_id || m.id;
+    const v = String(m.visibility || '').toLowerCase();
+    if (mid && (v === 'restricted' || v === 'public')) {
+      modelVisibility.set(String(mid), v);
+    }
+  }
+}
+
+function modelVisibilityFor(modelId) {
+  return modelVisibility.get(String(modelId)) || 'restricted';
 }
 
 async function loadForCurrentTab() {
@@ -148,12 +182,14 @@ async function loadForCurrentTab() {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
       patchAliasesTab();
     } else if (currentTab === 'models') {
-      const [nodes, models] = await Promise.all([
+      const [nodes, models, modelVis] = await Promise.all([
         ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
         ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+        ApiBinary.one('modelVisibilityListRequest').catch(() => null),
       ]);
       meshNodes = nodes || [];
       modelsCache = Array.isArray(models) ? models : [];
+      if (modelVis) setModelVisibility(modelVis);
       patchModelsTab();
     }
     updateSubtitle();
@@ -306,6 +342,39 @@ function bindTabEvents() {
   body.querySelectorAll('[data-new-alias]').forEach((b) => {
     b.onclick = () => openAliasModal(null);
   });
+
+  // Access panels (M16b alias / M8b model) — visibility segmented + grant/revoke.
+  Access.bindAccessEvents(body, {
+    rerender: () => (currentTab === 'aliases' ? patchAliasesTab() : patchModelsTab()),
+    onVisibilityChanged: (scope, id, visibility) => {
+      // Mirror the new visibility onto the owning row data so the collapsed chip
+      // updates even when the row scrolls out of the patched access panel.
+      if (scope === 'model') {
+        if (visibility) modelVisibility.set(String(id), visibility);
+      }
+      // Alias visibility lives in Access.effectiveVisibility cache; nothing to
+      // mirror onto the alias row object here.
+    },
+  });
+
+  // Models tab — access toggle button.
+  body.querySelectorAll('[data-model-access]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const id = b.dataset.modelAccess;
+      const wasOpen = modelAccessId === id;
+      modelAccessId = wasOpen ? null : id;
+      patchModelsTab();
+      if (!wasOpen && !Access.hasConsumerCache('model', id)) {
+        Access.loadConsumers('model', id, () => patchModelsTab(), {
+          onVisibilityChanged: (scope, mid, visibility) => {
+            if (visibility) modelVisibility.set(String(mid), visibility);
+            patchModelsTab();
+          },
+        });
+      }
+    };
+  });
 }
 
 function bindAliasFilterChips(root) {
@@ -365,6 +434,23 @@ function bindAliasRowActions(root) {
     b.onclick = (e) => {
       e.stopPropagation();
       deleteAlias(parseInt(b.dataset.aliasDelete, 10), b.dataset.aliasName);
+    };
+  });
+  root.querySelectorAll('[data-alias-access]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const id = parseInt(b.dataset.aliasAccess, 10);
+      const wasOpen = aliasAccessId === id;
+      aliasAccessId = wasOpen ? null : id;
+      patchAliasesTab();
+      // Lazily fetch the consumer list the first time a panel opens.
+      if (!wasOpen && !Access.hasConsumerCache('alias', id)) {
+        // Resolve the alias's real visibility from the consumer-list response
+        // when it carries one, so the 'unknown' chip/segmented become definite.
+        Access.loadConsumers('alias', id, () => patchAliasesTab(), {
+          onVisibilityChanged: () => patchAliasesTab(),
+        });
+      }
     };
   });
   root.querySelectorAll('[data-alias-toggle]').forEach((tg) => {
@@ -1021,6 +1107,17 @@ function renderAliasRow(a) {
   ].filter(Boolean).join(' ');
   const isEditing = aliasEditingId === a.id;
   const editPanel = isEditing ? renderAliasInlineEdit(a) : '';
+  const isAccess = aliasAccessId === a.id;
+  // Access panel reflects the effective (optimistically-mirrored) visibility so
+  // the collapsed-row chip and the expanded segmented stay in sync. When the
+  // alias's real visibility is not loaded (the list endpoint omits it) this is
+  // 'unknown' — rendered as a muted chip, never a false 'restricted'.
+  const effVis = Access.effectiveVisibility('alias', a.id, vis.value);
+  const accessPanel = isAccess
+    ? `<div class="svc-alias-access-wrap" data-access-wrap="alias-${escapeAttr(a.id)}">
+         ${Access.renderConsumerPanel('alias', a.id, a.alias, effVis)}
+       </div>`
+    : '';
 
   return `
     <div class="${rowClasses}" data-key="alias-${escapeAttr(a.id)}">
@@ -1033,14 +1130,22 @@ function renderAliasRow(a) {
       <div class="svc-alias-target">${primary}${fallbackText}</div>
       <div><span class="svc-alias-strategy">${escapeHtml(strategyText)}</span></div>
       <div>
-        <span class="svc-alias-vis ${vis.value}" title="${escapeAttr(I18n.t('services.alias_visibility_pending_label'))}">
-          ${sprite(vis.icon)}${escapeHtml(vis.label)}
-        </span>
+        ${effVis === 'unknown'
+          ? `<span class="svc-alias-vis unknown muted" title="${escapeAttr(I18n.t('services.alias_visibility_unknown'))}">
+               ${sprite('question')}${escapeHtml(I18n.t('services.alias_visibility_unknown'))}
+             </span>`
+          : `<span class="svc-alias-vis ${escapeAttr(effVis)}" title="${escapeAttr(I18n.t(`services.alias_visibility_${effVis}`))}">
+               ${sprite(Access.visibilityIcon(effVis))}${escapeHtml(I18n.t(`services.alias_visibility_${effVis}`))}
+             </span>`}
       </div>
       <div>
         <tf-toggle ${a.is_active ? 'checked' : ''} data-alias-toggle="${escapeAttr(a.id)}"></tf-toggle>
       </div>
       <div class="svc-alias-actions">
+        <tf-button variant="ghost" size="sm" icon="${isAccess ? 'chevron-down' : 'users'}"
+                   class="${isAccess ? 'svc-alias-access-open' : ''}"
+                   data-alias-access="${escapeAttr(a.id)}"
+                   title="${escapeAttr(I18n.t('services.access_panel_title'))}"></tf-button>
         <tf-button variant="ghost" size="sm" icon="${isEditing ? 'chevron-down' : 'edit'}"
                    data-alias-edit="${escapeAttr(a.id)}"
                    title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>
@@ -1051,6 +1156,7 @@ function renderAliasRow(a) {
       </div>
     </div>
     ${editPanel}
+    ${accessPanel}
   `;
 }
 
@@ -1293,14 +1399,16 @@ function renderModelsTab() {
     `;
   }
   return `
-    <table class="data-table">
+    <table class="data-table svc-model-table">
       <thead>
         <tr>
           <th>${escapeHtml(I18n.t('services.model_col_alias'))}</th>
           <th>${escapeHtml(I18n.t('services.model_col_kind'))}</th>
           <th>${escapeHtml(I18n.t('services.model_col_backend'))}</th>
           <th>${escapeHtml(I18n.t('services.model_col_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.alias_col_visibility'))}</th>
           <th>${escapeHtml(I18n.t('services.model_col_nodes'))}</th>
+          <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
         </tr>
       </thead>
       <tbody>
@@ -1311,19 +1419,40 @@ function renderModelsTab() {
 }
 
 function renderModelRow(m) {
+  // Models are identified on the access wire by their alias/model name. The
+  // table dedups by (alias|backend), but visibility + consumers are keyed on the
+  // model id alone, so the first matching row carries the access controls.
+  const modelId = m.alias;
   const key = `${m.alias}|${m.backend}|${m.kind}`;
   const statusChip = m.loaded
     ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.model_loaded'))}</span>`
     : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.model_unloaded'))}</span>`;
   const nodeBadges = m.nodes.map((n) => `<span class="scope-chip mesh-read">${escapeHtml(n)}</span>`).join(' ');
+  const effVis = Access.effectiveVisibility('model', modelId, modelVisibilityFor(modelId));
+  const isAccess = modelAccessId === modelId;
+  const visChip = `<span class="svc-alias-vis ${escapeAttr(effVis)}">${sprite(Access.visibilityIcon(effVis))}${escapeHtml(I18n.t(`services.alias_visibility_${effVis}`))}</span>`;
+  const accessRow = isAccess
+    ? `<tr data-key="model-access-${escapeAttr(key)}" class="svc-model-access-row">
+         <td colspan="7" data-access-wrap="model-${escapeAttr(modelId)}">
+           ${Access.renderConsumerPanel('model', modelId, modelId, effVis)}
+         </td>
+       </tr>`
+    : '';
   return `
     <tr data-key="model-${escapeAttr(key)}">
       <td data-label="${escapeAttr(I18n.t('services.model_col_alias'))}"><strong>${escapeHtml(m.alias)}</strong></td>
       <td data-label="${escapeAttr(I18n.t('services.model_col_kind'))}"><span class="scope-chip ${typeChipClass(m.kind)}">${escapeHtml(m.kind.toUpperCase() || '—')}</span></td>
       <td data-label="${escapeAttr(I18n.t('services.model_col_backend'))}"><code style="font-size:11px;">${escapeHtml(m.backend || '—')}</code></td>
       <td data-label="${escapeAttr(I18n.t('services.model_col_status'))}">${statusChip}</td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_visibility'))}">${visChip}</td>
       <td data-label="${escapeAttr(I18n.t('services.model_col_nodes'))}">${nodeBadges}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
+        <tf-button variant="ghost" size="sm" icon="${isAccess ? 'chevron-down' : 'users'}"
+                   data-model-access="${escapeAttr(modelId)}"
+                   title="${escapeAttr(I18n.t('services.access_panel_title'))}"></tf-button>
+      </td>
     </tr>
+    ${accessRow}
   `;
 }
 
