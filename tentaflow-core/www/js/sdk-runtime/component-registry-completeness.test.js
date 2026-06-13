@@ -187,10 +187,6 @@ const CATALOG_TAGS = new Map([
 // RENDERER_NOT_IMPLEMENTED skip-list in
 // tentaflow-core/addons/sdk-showcase/src/catalog.rs.
 const KNOWN_MISSING = new Set([
-  0x010A, // Sidebar
-  0x010B, // Tabs
-  0x0308, // TagInput
-  0x0309, // MentionInput
   0x0601, // Canvas2D
   0x0602, // WebGLSurface
   0x0603, // WGPUSurface

@@ -328,6 +328,83 @@ test('Input leading_icon sets icon attr and inner icon hook', () => {
   assertEq(el.querySelector('use').getAttribute('href'), '#i-search');
 });
 
+test('Input trailing_icon sets trailing-icon attr + inner trailing icon hook', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    6: { kind: 'named', name: 'check' },
+  }))));
+  assertEq(el.getAttribute('trailing-icon'), 'check');
+  const trailing = el.querySelector('.tf-input-icon-trailing');
+  assert(trailing != null, 'trailing icon element must exist');
+  assertEq(trailing.style.display, '');
+  assertEq(trailing.querySelector('use').getAttribute('href'), '#i-check');
+  assert(el.querySelector('.tf-input-wrap').classList.contains('tf-input-wrap-has-trailing-icon'));
+});
+
+test('Input leading + trailing icons coexist', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    5: { kind: 'named', name: 'search' },
+    6: { kind: 'named', name: 'close' },
+  }))));
+  assertEq(el.getAttribute('icon'), 'search');
+  assertEq(el.getAttribute('trailing-icon'), 'close');
+  assertEq(el.querySelector('.tf-input-icon:not(.tf-input-icon-trailing)').querySelector('use').getAttribute('href'), '#i-search');
+  assertEq(el.querySelector('.tf-input-icon-trailing').querySelector('use').getAttribute('href'), '#i-close');
+});
+
+test('Input prefix + suffix adornments render reactively', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({
+    entries: [
+      { path: PATH('q'), value: '' },
+      { path: PATH('sfx'), value: 'kg' },
+    ],
+    state_revision: 0, truncated: false,
+  });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    7: { kind: 'literal', value: '$' },
+    8: { kind: 'bound', path: PATH('sfx') },
+  }))));
+  const prefix = el.querySelector('.tf-input-prefix');
+  const suffix = el.querySelector('.tf-input-suffix');
+  assert(prefix != null && suffix != null, 'prefix/suffix elements must exist');
+  assertEq(el.getAttribute('prefix'), '$');
+  assertEq(prefix.textContent, '$');
+  assertEq(prefix.style.display, '');
+  assertEq(suffix.textContent, 'kg');
+  assertEq(suffix.style.display, '');
+  assert(el.querySelector('.tf-input-wrap').classList.contains('tf-input-wrap-has-prefix'));
+  assert(el.querySelector('.tf-input-wrap').classList.contains('tf-input-wrap-has-suffix'));
+  // Suffix is reactive — a store push updates the adornment text.
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('sfx'), op: { kind: 'set', value: 'lb' } }],
+  });
+  assertEq(suffix.textContent, 'lb');
+});
+
+test('Input without prefix/suffix/trailing-icon keeps adornments hidden', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assertEq(el.hasAttribute('prefix'), false);
+  assertEq(el.hasAttribute('suffix'), false);
+  assertEq(el.hasAttribute('trailing-icon'), false);
+  assertEq(el.querySelector('.tf-input-prefix').style.display, 'none');
+  assertEq(el.querySelector('.tf-input-suffix').style.display, 'none');
+  assertEq(el.querySelector('.tf-input-icon-trailing').style.display, 'none');
+});
+
 test('Input placeholder + hint attrs are reactive', () => {
   setup();
   const store = makeStore();

@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
   }
 
   constructor() {
@@ -22,6 +22,9 @@ class TfInput extends HTMLElement {
     this._errorEl = null;
     this._wrap = null;
     this._iconEl = null;
+    this._trailingIconEl = null;
+    this._prefixEl = null;
+    this._suffixEl = null;
     this._slotObserver = null;
     this._hasSlotLabel = false;
     this._onInput = this._onInput.bind(this);
@@ -105,8 +108,38 @@ class TfInput extends HTMLElement {
     const useEl = document.createElementNS('http://www.w3.org/2000/svg', 'use');
     iconEl.appendChild(useEl);
 
+    // Trailing icon (po prawej stronie inputa). Osobny <svg use> jak leading.
+    const trailingIconEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    trailingIconEl.classList.add('tf-input-icon', 'tf-input-icon-trailing');
+    trailingIconEl.setAttribute('width', '16');
+    trailingIconEl.setAttribute('height', '16');
+    trailingIconEl.setAttribute('fill', 'none');
+    trailingIconEl.setAttribute('stroke', 'currentColor');
+    trailingIconEl.setAttribute('stroke-width', '2');
+    trailingIconEl.setAttribute('stroke-linecap', 'round');
+    trailingIconEl.setAttribute('stroke-linejoin', 'round');
+    trailingIconEl.setAttribute('aria-hidden', 'true');
+    trailingIconEl.style.display = 'none';
+    trailingIconEl.appendChild(
+      document.createElementNS('http://www.w3.org/2000/svg', 'use')
+    );
+
+    // Adornments tekstowe — prefix przed inputem, suffix po nim.
+    const prefixEl = document.createElement('span');
+    prefixEl.className = 'tf-input-prefix';
+    prefixEl.setAttribute('aria-hidden', 'true');
+    prefixEl.style.display = 'none';
+
+    const suffixEl = document.createElement('span');
+    suffixEl.className = 'tf-input-suffix';
+    suffixEl.setAttribute('aria-hidden', 'true');
+    suffixEl.style.display = 'none';
+
+    wrap.appendChild(prefixEl);
     wrap.appendChild(input);
+    wrap.appendChild(suffixEl);
     wrap.appendChild(iconEl);
+    wrap.appendChild(trailingIconEl);
     group.appendChild(wrap);
 
     const hint = document.createElement('span');
@@ -124,6 +157,9 @@ class TfInput extends HTMLElement {
     this._input = input;
     this._wrap = wrap;
     this._iconEl = iconEl;
+    this._trailingIconEl = trailingIconEl;
+    this._prefixEl = prefixEl;
+    this._suffixEl = suffixEl;
     this._hintEl = hint;
     this._errorEl = err;
   }
@@ -192,6 +228,26 @@ class TfInput extends HTMLElement {
       this._input.style.paddingLeft = '14px';
     }
     if (icon) this._input.style.paddingLeft = '';
+
+    const trailingIcon = this.getAttribute('trailing-icon');
+    if (trailingIcon) {
+      this._trailingIconEl.style.display = '';
+      this._trailingIconEl.querySelector('use').setAttribute('href', `#i-${trailingIcon}`);
+      this._wrap.classList.add('tf-input-wrap-has-trailing-icon');
+    } else {
+      this._trailingIconEl.style.display = 'none';
+      this._wrap.classList.remove('tf-input-wrap-has-trailing-icon');
+    }
+
+    const prefix = this.getAttribute('prefix') || '';
+    this._prefixEl.textContent = prefix;
+    this._prefixEl.style.display = prefix ? '' : 'none';
+    this._wrap.classList.toggle('tf-input-wrap-has-prefix', !!prefix);
+
+    const suffix = this.getAttribute('suffix') || '';
+    this._suffixEl.textContent = suffix;
+    this._suffixEl.style.display = suffix ? '' : 'none';
+    this._wrap.classList.toggle('tf-input-wrap-has-suffix', !!suffix);
 
     this._hintEl.textContent = hint;
     this._hintEl.style.display = hint && !error ? '' : 'none';

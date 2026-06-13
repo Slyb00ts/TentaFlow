@@ -238,14 +238,22 @@ function renderInput(component, ctx) {
   if (inputMode != null) el.setAttribute('inputmode', inputMode);
   if (hasRequired) el.setAttribute('required', '');
 
-  // tf-input icon support (leading only — component attr "icon")
+  // tf-input icon support. Named IconRef → component attribute (leading via
+  // "icon", trailing via "trailing-icon"). Asset/non-named IconRefs have no
+  // attribute path, so they are not surfaced here (parity with action-link-fab
+  // where only named icons map to the tf-button icon attribute).
   if (leadingIconRaw != null && typeof leadingIconRaw === 'object' && leadingIconRaw.name) {
     el.setAttribute('icon', leadingIconRaw.name);
+  }
+  if (trailingIconRaw != null && typeof trailingIconRaw === 'object' && trailingIconRaw.name) {
+    el.setAttribute('trailing-icon', trailingIconRaw.name);
   }
 
   applyAttrReactive(el, 'label', labelBind, ctx);
   applyAttrReactive(el, 'placeholder', placeholderBind, ctx);
   applyAttrReactive(el, 'hint', hintBind, ctx);
+  applyAttrReactive(el, 'prefix', prefixBind, ctx);
+  applyAttrReactive(el, 'suffix', suffixBind, ctx);
 
   if (errorBind != null) {
     const applyError = () => {

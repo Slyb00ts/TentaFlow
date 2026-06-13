@@ -1,8 +1,9 @@
 // =============================================================================
 // Plik: tf-table.js
 // Opis: Komponent <tf-table sortable selectable> z <tf-column key="..." label
-//       renderer="text|chip|num" sortable>. Properties .rows (array) + .columns
-//       (computed z dzieci). Emituje "row-click" i "sort".
+//       renderer="text|chip|num" sortable sticky>. Properties .rows (array) +
+//       .columns (computed z dzieci). Emituje "row-click", "row-dblclick",
+//       "sort", "select-all" i "row-expand".
 //       Mobile (<=720px): td otrzymuja data-label dla widoku kart.
 // Przyklad:
 //   const t = document.createElement('tf-table');
@@ -19,6 +20,11 @@ class TfColumn extends HTMLElement {
   }
 }
 customElements.define('tf-column', TfColumn);
+
+// Szerokosc komorek sticky uzywana do skladania offsetu `left` kolejnych
+// przypietych kolumn. Bez znanego layoutu tabela nie zna realnych szerokosci,
+// wiec stosujemy stala bazowa — wystarczy do wizualnego przypiecia bez nakladki.
+const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
@@ -40,7 +46,24 @@ class TfTable extends HTMLElement {
     // returned element (e.g. a kebab tf-menu). Cells are rebuilt on every
     // render so the element stays bound to its current row object.
     this._rowActions = null;
+    // Count of leading columns pinned with position:sticky. Per-column sticky
+    // flags (<tf-column sticky>) extend this for explicitly marked columns.
+    this._stickyColumns = 0;
+    // When true, a leading expand toggle column is rendered; clicking it emits
+    // "row-expand" and renders the builder output in an inserted expansion row.
+    this._expandable = false;
+    // Optional expansion-region builder: (row, index) => Element | null.
+    this._expandRenderer = null;
+    // Optional row-object field holding a STABLE per-row identity. When set,
+    // expansion state is keyed by that id so sort/page changes do not move the
+    // expansion panel to whatever row now sits at a given visible index. When
+    // unset the table falls back to keying expansion by visible row index.
+    this._rowKey = null;
+    // Expanded rows, keyed by stable row identity (see _rowIdentity).
+    this._expandedRows = new Set();
     this._onClick = this._onClick.bind(this);
+    this._onDblClick = this._onDblClick.bind(this);
+    this._onChange = this._onChange.bind(this);
   }
 
   connectedCallback() {
@@ -67,6 +90,44 @@ class TfTable extends HTMLElement {
     this._render();
   }
 
+  get stickyColumns() { return this._stickyColumns; }
+  set stickyColumns(n) {
+    const count = Number.isInteger(n) && n > 0 ? n : 0;
+    this._stickyColumns = count;
+    this._lastColsSig = null;
+    this._render();
+  }
+
+  get expandable() { return this._expandable; }
+  set expandable(v) {
+    this._expandable = !!v;
+    this._lastColsSig = null;
+    this._render();
+  }
+
+  get expandRenderer() { return this._expandRenderer; }
+  set expandRenderer(fn) {
+    this._expandRenderer = typeof fn === 'function' ? fn : null;
+    this._render();
+  }
+
+  get rowKey() { return this._rowKey; }
+  set rowKey(field) {
+    this._rowKey = typeof field === 'string' && field.length > 0 ? field : null;
+    this._render();
+  }
+
+  // Stable identity for a row. Uses the configured rowKey field when present and
+  // the value is a string/number; otherwise falls back to the visible index so
+  // tables without a key keep their previous index-based expansion behaviour.
+  _rowIdentity(row, idx) {
+    if (this._rowKey != null && row != null && typeof row === 'object') {
+      const v = row[this._rowKey];
+      if (typeof v === 'string' || typeof v === 'number') return `k:${v}`;
+    }
+    return `i:${idx}`;
+  }
+
   get columns() {
     return Array.from(this.querySelectorAll('tf-column')).map((c) => ({
       key: c.getAttribute('key') || '',
@@ -74,7 +135,32 @@ class TfTable extends HTMLElement {
       sortable: c.hasAttribute('sortable'),
       renderer: (c.getAttribute('renderer') || 'text').toLowerCase(),
       align: (c.getAttribute('align') || '').toLowerCase(),
+      sticky: c.hasAttribute('sticky'),
     }));
+  }
+
+  // Indeksy kolumn (sposrod realnie renderowanych <td>, BEZ kolumny expand)
+  // ktore maja byc przypiete: pierwsze N (stickyColumns) plus per-kolumna sticky.
+  _stickyColumnIndices(cols) {
+    const set = new Set();
+    for (let i = 0; i < cols.length; i += 1) {
+      if (i < this._stickyColumns || cols[i].sticky) set.add(i);
+    }
+    return set;
+  }
+
+  // Offset `left` dla i-tej przypietej kolumny danych. Kolumna expand (gdy jest)
+  // zajmuje pierwsza pozycje, wiec kolumny danych zaczynaja sie za nia.
+  _stickyLeft(colIndex) {
+    const lead = this._expandable ? STICKY_COLUMN_WIDTH : 0;
+    return `${lead + colIndex * STICKY_COLUMN_WIDTH}px`;
+  }
+
+  _applySticky(cell, colIndex) {
+    cell.classList.add('tf-table__sticky-col');
+    cell.style.position = 'sticky';
+    cell.style.left = this._stickyLeft(colIndex);
+    cell.style.zIndex = '1';
   }
 
   _build() {
@@ -91,6 +177,8 @@ class TfTable extends HTMLElement {
     this._shadow.appendChild(wrap);
 
     table.addEventListener('click', this._onClick);
+    table.addEventListener('dblclick', this._onDblClick);
+    table.addEventListener('change', this._onChange);
 
     this._wrap = wrap;
     this._table = table;
@@ -102,19 +190,47 @@ class TfTable extends HTMLElement {
   // unikac rebuildu thead przy kazdym set rows / sort. thead trzymamy
   // wylacznie dla ARIA i sortowania, nie zalezy od liczby wierszy.
   _columnsSignature(cols) {
-    return cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}`).join('');
+    const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}`).join('');
+    const selectAll = this._isMultiSelect() ? 'S' : '';
+    return `${this._stickyColumns}#${this._expandable ? 'E' : ''}${selectAll}#${sig}`;
+  }
+
+  // Select-all afordancja istnieje tylko w trybie wielokrotnego wyboru, czyli
+  // gdy tabela jest selectable z atrybutem selectable="multi" (lub bez wartosci).
+  _isMultiSelect() {
+    if (!this.hasAttribute('selectable')) return false;
+    const mode = (this.getAttribute('selectable') || '').toLowerCase();
+    return mode === '' || mode === 'multi';
   }
 
   _renderThead(cols, sortableTable) {
     const tr = document.createElement('tr');
-    cols.forEach((col) => {
+    const stickySet = this._stickyColumnIndices(cols);
+    if (this._expandable) {
+      const expTh = document.createElement('th');
+      expTh.className = 'tf-table__expand-col';
+      expTh.setAttribute('aria-label', 'Rozwin');
+      tr.appendChild(expTh);
+    }
+    cols.forEach((col, i) => {
       const th = document.createElement('th');
-      th.textContent = col.label;
+      // Select-all afordancja siedzi w naglowku pierwszej kolumny danych (bez
+      // dodatkowej kolumny), wiec liczba kolumn naglowka == liczba kolumn danych.
+      if (i === 0 && this._isMultiSelect()) {
+        const cb = document.createElement('tf-checkbox');
+        cb.className = 'tf-table__select-all';
+        cb.setAttribute('aria-label', 'Zaznacz wszystkie');
+        th.appendChild(cb);
+        th.appendChild(document.createTextNode(col.label));
+      } else {
+        th.textContent = col.label;
+      }
       if (col.align === 'num' || col.renderer === 'num') th.classList.add('num');
       if (sortableTable && col.sortable) {
         th.classList.add('sortable');
         th.dataset.key = col.key;
       }
+      if (stickySet.has(i)) this._applySticky(th, i);
       tr.appendChild(th);
     });
     if (this._rowActions) {
@@ -140,6 +256,13 @@ class TfTable extends HTMLElement {
   // burzyc. Eliminuje pelen rebuild tbody przy kazdym set rows / sort i
   // pozwala browserowi zachowac focus/selection w komorkach.
   _renderTbody(cols, rows) {
+    // Tabela rozwijalna wstawia dodatkowe wiersze ekspansji miedzy wierszami
+    // danych, wiec recykling po indeksie sie nie zgadza — odbudowujemy w calosci.
+    // To NIE jest sciezka czestego odswiezania (rozwijalne tabele sa rzadkie).
+    if (this._expandable) {
+      this._renderTbodyExpandable(cols, rows);
+      return;
+    }
     const tbody = this._tbody;
     const existingRows = tbody.children;
     const target = rows.length;
@@ -167,13 +290,67 @@ class TfTable extends HTMLElement {
     }
   }
 
+  _renderTbodyExpandable(cols, rows) {
+    const tbody = this._tbody;
+    // Drop expansion state for identities no longer present in the visible row
+    // set — a removed/filtered row naturally loses its expansion.
+    const presentIds = new Set(rows.map((row, idx) => this._rowIdentity(row, idx)));
+    for (const id of [...this._expandedRows]) {
+      if (!presentIds.has(id)) this._expandedRows.delete(id);
+    }
+    const frag = document.createDocumentFragment();
+    const leadSpan = this._expandable ? 1 : 0;
+    const totalSpan = leadSpan + cols.length + (this._rowActions ? 1 : 0);
+    rows.forEach((row, idx) => {
+      frag.appendChild(this._buildRow(cols, row, idx));
+      const rowId = this._rowIdentity(row, idx);
+      if (this._expandedRows.has(rowId)) {
+        const exTr = document.createElement('tr');
+        exTr.className = 'tf-table__expansion-row';
+        exTr.dataset.expansionFor = String(idx);
+        const exTd = document.createElement('td');
+        exTd.className = 'tf-table__expansion-cell';
+        exTd.colSpan = totalSpan;
+        let content = null;
+        if (this._expandRenderer) {
+          try { content = this._expandRenderer(row, idx); } catch { content = null; }
+        }
+        if (content instanceof Node) exTd.appendChild(content);
+        exTr.appendChild(exTd);
+        frag.appendChild(exTr);
+      }
+    });
+    tbody.replaceChildren(frag);
+  }
+
+  // Wstawia wiodaca komorke toggle ekspansji (jedyna kolumna wiodaca w body).
+  // Select-all jest tylko w naglowku, wiec body NIE ma kolumny wyboru.
+  _appendLeadingCells(rtr, row, idx) {
+    if (this._expandable) {
+      const expTd = document.createElement('td');
+      expTd.className = 'tf-table__expand-cell';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tf-table__expand-toggle';
+      const expanded = this._expandedRows.has(this._rowIdentity(row, idx));
+      btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      btn.setAttribute('aria-label', expanded ? 'Zwin' : 'Rozwin');
+      btn.textContent = expanded ? '▾' : '▸';
+      expTd.appendChild(btn);
+      rtr.appendChild(expTd);
+    }
+  }
+
   _buildRow(cols, row, idx) {
     const rtr = document.createElement('tr');
     rtr.dataset.idx = String(idx);
-    cols.forEach((col) => {
+    const stickySet = this._stickyColumnIndices(cols);
+    this._appendLeadingCells(rtr, row, idx);
+    cols.forEach((col, i) => {
       const td = document.createElement('td');
       td.dataset.label = col.label;
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
+      if (stickySet.has(i)) this._applySticky(td, i);
       this._writeCell(td, col, row[col.key]);
       rtr.appendChild(td);
     });
@@ -188,27 +365,20 @@ class TfTable extends HTMLElement {
 
   _updateRowCells(tr, cols, row, idx) {
     const tds = tr.children;
+    // Sciezka recyklingu dziala tylko gdy _expandable === false, a select-all
+    // siedzi w naglowku — body nie ma kolumn wiodacych, wiec td[i] == kolumna i.
     const expected = cols.length + (this._rowActions ? 1 : 0);
     if (tds.length !== expected) {
       // Liczba kolumn sie zmienila (np. wlaczono row actions) — odbuduj wiersz.
-      tr.replaceChildren();
-      cols.forEach((col) => {
-        const fresh = document.createElement('td');
-        fresh.dataset.label = col.label;
-        if (col.renderer === 'num' || col.align === 'num') fresh.classList.add('num');
-        this._writeCell(fresh, col, row[col.key]);
-        tr.appendChild(fresh);
-      });
-      if (this._rowActions) {
-        const actTd = document.createElement('td');
-        actTd.className = 'tf-table__actions-cell';
-        this._writeActionsCell(actTd, row, idx);
-        tr.appendChild(actTd);
-      }
+      const rebuilt = this._buildRow(cols, row, idx);
+      tr.replaceChildren(...rebuilt.childNodes);
       return;
     }
+    const stickySet = this._stickyColumnIndices(cols);
     for (let i = 0; i < cols.length; i += 1) {
-      this._writeCell(tds[i], cols[i], row[cols[i].key]);
+      const td = tds[i];
+      if (stickySet.has(i)) this._applySticky(td, i);
+      this._writeCell(td, cols[i], row[cols[i].key]);
     }
     if (this._rowActions) {
       // Recyklowany wiersz wskazuje teraz na inny obiekt row — odbuduj
@@ -299,11 +469,21 @@ class TfTable extends HTMLElement {
       this._render();
       return;
     }
+    // Toggle ekspansji nie wyzwala row-click/selection — emituje wlasny event.
+    const toggle = e.target.closest('.tf-table__expand-toggle');
+    if (toggle) {
+      e.stopPropagation();
+      const tr = toggle.closest('tbody tr');
+      const idx = tr ? parseInt(tr.dataset.idx, 10) : NaN;
+      if (Number.isInteger(idx)) this._toggleExpansion(idx);
+      return;
+    }
     // Klik w komorce akcji nie wyzwala row-click/selection — menu obsluguje
     // wlasne zdarzenia per pozycja.
     if (e.target.closest('.tf-table__actions-cell')) return;
     const tr = e.target.closest('tbody tr');
-    if (!tr) return;
+    // Wiersz ekspansji nie jest wierszem danych — ignoruj.
+    if (!tr || tr.classList.contains('tf-table__expansion-row')) return;
     const idx = parseInt(tr.dataset.idx, 10);
     if (this.hasAttribute('selectable')) {
       tr.classList.toggle('selected');
@@ -313,6 +493,45 @@ class TfTable extends HTMLElement {
       bubbles: true,
       detail: { row, index: idx, selected: tr.classList.contains('selected') },
     }));
+  }
+
+  _onDblClick(e) {
+    if (e.target.closest('th')) return;
+    if (e.target.closest('.tf-table__actions-cell')) return;
+    if (e.target.closest('.tf-table__expand-toggle')) return;
+    const tr = e.target.closest('tbody tr');
+    if (!tr || tr.classList.contains('tf-table__expansion-row')) return;
+    const idx = parseInt(tr.dataset.idx, 10);
+    if (!Number.isInteger(idx)) return;
+    const row = this._sortedRows()[idx];
+    this.dispatchEvent(new CustomEvent('row-dblclick', {
+      bubbles: true,
+      detail: { row, index: idx },
+    }));
+  }
+
+  // Select-all checkbox (tf-checkbox emituje natywny "change" z .checked).
+  _onChange(e) {
+    const target = e.target;
+    if (!target || !target.classList || !target.classList.contains('tf-table__select-all')) return;
+    const checked = !!target.checked;
+    this.dispatchEvent(new CustomEvent('select-all', {
+      bubbles: true,
+      detail: { selected: checked },
+    }));
+  }
+
+  _toggleExpansion(idx) {
+    const row = this._sortedRows()[idx];
+    const rowId = this._rowIdentity(row, idx);
+    const willExpand = !this._expandedRows.has(rowId);
+    if (willExpand) this._expandedRows.add(rowId);
+    else this._expandedRows.delete(rowId);
+    this.dispatchEvent(new CustomEvent('row-expand', {
+      bubbles: true,
+      detail: { row, index: idx, expanded: willExpand },
+    }));
+    this._render();
   }
 }
 

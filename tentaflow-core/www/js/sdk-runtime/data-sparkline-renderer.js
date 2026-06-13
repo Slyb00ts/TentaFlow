@@ -10,6 +10,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
+import { resolveBindRef } from './bind-resolver.js';
 
 const SPARKLINE_VARIANTS = new Set(['line', 'area', 'bar']);
 const TONES = new Set(['neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted']);
@@ -86,9 +87,17 @@ function renderSparkline(component, ctx) {
   const sparkline = document.createElement('tf-sparkline');
   sparkline.style.width = `${widthPx}px`;
   sparkline.color = TONE_TO_COLOR[tone] || 'primary';
+  // `variant` drives the draw mode: 'bar' renders discrete bars, 'area' fills
+  // under the line, 'line' is the plain stroke. `fill` is kept in sync so the
+  // area path still fills.
+  sparkline.variant = variant;
   sparkline.fill = (variant === 'area');
   sparkline.showDots = false;
   sparkline.height = heightPx;
+  // Canvas has no intrinsic semantics — expose the chart to assistive tech as
+  // an image with a descriptive label (a11y.label wins, else synthesized).
+  sparkline.setAttribute('role', 'img');
+  const a11yLabelRef = component.a11y != null ? component.a11y.label : null;
   wrapper.appendChild(sparkline);
 
   let minBadge = null;
@@ -117,21 +126,41 @@ function renderSparkline(component, ctx) {
     return arr.filter((n) => typeof n === 'number' && Number.isFinite(n));
   };
 
+  const applyAriaLabel = (data, min, max) => {
+    let text = null;
+    if (a11yLabelRef != null) {
+      const v = resolveBindRef(a11yLabelRef, ctx.store);
+      if (typeof v === 'string' && v.trim().length > 0) text = v;
+    }
+    if (text == null) {
+      text = data.length === 0
+        ? `${variant} sparkline, no data`
+        : `${variant} sparkline, ${data.length} points, min ${formatStat(min)}, max ${formatStat(max)}`;
+    }
+    sparkline.setAttribute('aria-label', text);
+  };
+
   const rebuild = () => {
     const data = readData();
     sparkline.points = data;
+
+    let min = null, max = null;
+    if (data.length > 0) {
+      min = data[0]; max = data[0];
+      for (const n of data) { if (n < min) min = n; if (n > max) max = n; }
+    }
 
     if (showMinMax) {
       if (data.length === 0) {
         minBadge.textContent = '';
         maxBadge.textContent = '';
       } else {
-        let min = data[0], max = data[0];
-        for (const n of data) { if (n < min) min = n; if (n > max) max = n; }
         minBadge.textContent = formatStat(min);
         maxBadge.textContent = formatStat(max);
       }
     }
+
+    applyAriaLabel(data, min, max);
   };
   rebuild();
   ctx.registerCleanup(ctx.store.subscribe(dataPath, rebuild));

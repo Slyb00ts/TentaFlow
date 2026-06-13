@@ -72,6 +72,8 @@ import './tf-line-chart.js';
 import './tf-area-chart.js';
 import './tf-bar-chart.js';
 import './tf-pie-chart.js';
+import './tf-tag-input.js';
+import './tf-mention-input.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -139,3 +141,5 @@ export { TfLineChart } from './tf-line-chart.js';
 export { TfAreaChart } from './tf-area-chart.js';
 export { TfBarChart } from './tf-bar-chart.js';
 export { TfPieChart } from './tf-pie-chart.js';
+export { TfTagInput } from './tf-tag-input.js';
+export { TfMentionInput } from './tf-mention-input.js';

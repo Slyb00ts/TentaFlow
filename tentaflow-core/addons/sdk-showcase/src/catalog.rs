@@ -33,10 +33,6 @@ const MAX_DEPTH: u32 = 4;
 /// tentaflow-core/www/js/sdk-runtime/component-registry-completeness.test.js
 /// and may only SHRINK (remove a tag here once its JS renderer ships).
 const RENDERER_NOT_IMPLEMENTED: &[u16] = &[
-    0x010A, // Sidebar
-    0x010B, // Tabs
-    0x0308, // TagInput
-    0x0309, // MentionInput
     0x0601, // Canvas2D
     0x0602, // WebGLSurface
     0x0603, // WGPUSurface
