@@ -209,7 +209,7 @@ fn sample_value(wire: &str, field: &str, depth: u32, ctr: &mut u64) -> Value {
         return Value::Array(vec![sample_value(inner, field, depth, ctr)]);
     }
     if let Some(name) = strip_generic(wire, "Enum<") {
-        return enum_sample(name);
+        return enum_sample(name, field);
     }
     if let Some(name) = strip_generic(wire, "Inline<") {
         return inline_sample(name, depth, ctr);
@@ -336,11 +336,17 @@ fn uint_sample(field: &str) -> u64 {
 // Enum / inline-struct / tagged-union sampling
 // =============================================================================
 
-fn enum_sample(name: &str) -> Value {
+fn enum_sample(name: &str, field: &str) -> Value {
     // LiveRegion's first variant is "off", but the LiveRegion component
     // renderer only accepts polite/assertive for politeness.
     if name == "LiveRegion" {
         return Value::Text("polite".into());
+    }
+    // FabPosition's first variant is "bottom_right", which pins the FAB to a
+    // fixed screen corner — in the inline catalog that escapes the sample slot
+    // and floats over the page. Render it in-flow instead.
+    if name == "FabPosition" && field == "position" {
+        return Value::Text("inline".into());
     }
     ALL_ENUMS
         .iter()

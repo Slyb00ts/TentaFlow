@@ -96,6 +96,7 @@ function renderIconButton(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', VARIANT_MAP[variant] || 'primary');
+  btn.setAttribute('tone', tone);
   const mappedSize = SIZE_MAP[size];
   if (mappedSize) btn.setAttribute('size', mappedSize);
   if (iconName) btn.setAttribute('icon', iconName);

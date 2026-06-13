@@ -88,8 +88,8 @@ test('Button renders <tf-button> with mapped variant + label attribute', () => {
   // SDK size 'lg' has no tf-button size mapping (md/lg are default).
   assertEq(el.getAttribute('size'), null);
   assertEq(el.getAttribute('label'), 'Save');
-  // full_width=true is applied as inline width on the host.
-  assertEq(el.style.width, '100%');
+  // full_width=true sets the full-width attribute (mapped to inner .tf-btn).
+  assert(el.hasAttribute('full-width'));
 });
 
 test('Button maps SDK xs/sm sizes to tf-button size=sm', () => {
@@ -104,7 +104,7 @@ test('Button maps SDK xs/sm sizes to tf-button size=sm', () => {
   // SDK 'tertiary' maps to tf-button variant="ghost".
   assertEq(el.getAttribute('variant'), 'ghost');
   assertEq(el.getAttribute('size'), 'sm');
-  assertEq(el.style.width, '');
+  assert(!el.hasAttribute('full-width'));
 });
 
 test('Button label updates reactively from BindRef', () => {
@@ -249,7 +249,7 @@ test('Button without icon fields sets no icon attributes', () => {
   assertEq(el.getAttribute('trailing-icon'), null);
 });
 
-test('Button tone + variant emit host classes for tone-aware CSS', () => {
+test('Button maps variant + tone to host attributes (no host classes)', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -258,11 +258,13 @@ test('Button tone + variant emit host classes for tone-aware CSS', () => {
       [5, 'md'], [6, false], [9, 'default'],
     ])
   );
-  assert(el.classList.contains('tf-button--variant-tertiary'));
-  assert(el.classList.contains('tf-button--tone-success'));
+  assertEq(el.getAttribute('variant'), 'ghost');
+  assertEq(el.getAttribute('tone'), 'success');
+  assert(!el.classList.contains('tf-button--variant-tertiary'));
+  assert(!el.classList.contains('tf-button--tone-success'));
 });
 
-test('Button each valid tone produces matching tone class', () => {
+test('Button each valid tone produces matching tone attribute', () => {
   for (const tone of ['neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted']) {
     setup();
     const engine = makeEngine();
@@ -272,7 +274,7 @@ test('Button each valid tone produces matching tone class', () => {
         [5, 'md'], [6, false], [9, 'default'],
       ])
     );
-    assert(el.classList.contains(`tf-button--tone-${tone}`), `missing tone class for ${tone}`);
+    assertEq(el.getAttribute('tone'), tone, `missing tone attr for ${tone}`);
   }
 });
 

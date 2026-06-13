@@ -224,10 +224,7 @@ class TfInput extends HTMLElement {
     } else {
       this._iconEl.style.display = 'none';
       this._wrap.classList.remove('tf-input-wrap-has-icon');
-      // gdy brak ikony — usuwamy padding-left narzucony przez .tf-input-wrap
-      this._input.style.paddingLeft = '14px';
     }
-    if (icon) this._input.style.paddingLeft = '';
 
     const trailingIcon = this.getAttribute('trailing-icon');
     if (trailingIcon) {

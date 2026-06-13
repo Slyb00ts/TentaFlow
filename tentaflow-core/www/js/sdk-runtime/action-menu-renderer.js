@@ -337,6 +337,9 @@ function renderMenu(component, ctx) {
 
   const menu = document.createElement('tf-menu');
   menu.setAttribute('open', '');
+  // Standalone (non-popover) Menu: render the panel in normal flow instead of
+  // the default absolute-positioned dropdown, so it sits inside the wrapper.
+  menu.classList.add('tf-menu--inline');
   wrapper.appendChild(menu);
 
   const ctrl = buildMenuItems(items, ctx, menu);
