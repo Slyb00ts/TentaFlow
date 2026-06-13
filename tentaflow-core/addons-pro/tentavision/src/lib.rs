@@ -3383,6 +3383,26 @@ fn camera_row_fps(c: &db::CameraRow) -> String {
 
 /// Builds one Table row as a `Value::Map` keyed by the column field paths.
 /// `camera_id` is the row key the Table uses to scope per-row actions.
+/// Builds a toned chip cell value `{ label, status }`. The data-table renderer
+/// honors `status` for chip columns so status pills / risk badges render their
+/// mockup colors (ok=green, warn=amber, err=red, muted=grey) instead of a flat
+/// neutral tone.
+fn chip_cell(label: &str, status: &str) -> Value {
+    Value::Map(vec![
+        (Value::Text("label".into()), Value::Text(label.to_string())),
+        (Value::Text("status".into()), Value::Text(status.to_string())),
+    ])
+}
+
+/// Maps a persisted camera status to a chip label + tone.
+fn camera_status_cell(status: &str) -> Value {
+    match status {
+        "online" => chip_cell("online", "ok"),
+        "offline" => chip_cell("offline", "err"),
+        other => chip_cell(other, "warn"),
+    }
+}
+
 fn camera_table_row_value(c: &db::CameraRow) -> Value {
     let location = if c.location.trim().is_empty() { "\u{2014}".to_string() } else { c.location.clone() };
     let detectors = if c.detectors.trim().is_empty() { "\u{2014}".to_string() } else { c.detectors.clone() };
@@ -3391,7 +3411,7 @@ fn camera_table_row_value(c: &db::CameraRow) -> Value {
         (Value::Text("name".into()), Value::Text(c.name.clone())),
         (Value::Text("location".into()), Value::Text(location)),
         (Value::Text("addr".into()), Value::Text(camera_row_addr(c))),
-        (Value::Text("status".into()), Value::Text(c.status.clone())),
+        (Value::Text("status".into()), camera_status_cell(&c.status)),
         (Value::Text("detectors".into()), Value::Text(detectors)),
         (Value::Text("fps".into()), Value::Text(camera_row_fps(c))),
     ];
@@ -4160,6 +4180,17 @@ fn build_profile_camera_assignment(cameras: &[db::CameraRow], assigned: &[String
 }
 
 /// One profile-library Table row keyed by `profile_id`.
+/// Maps an analytical-profile risk class to a chip tone (A=green, B=amber,
+/// C=red), matching the mockup's `.risk` badge colors.
+fn profile_risk_cell(risk: &str) -> Value {
+    match risk {
+        "A" => chip_cell("A", "ok"),
+        "B" => chip_cell("B", "warn"),
+        "C" => chip_cell("C", "err"),
+        other => chip_cell(if other.is_empty() { "—" } else { other }, "info"),
+    }
+}
+
 fn profile_table_row_value(p: &db::ProfileRow, camera_count: usize) -> Value {
     let flow = if p.flow_id.is_empty() { "—".to_string() } else { p.flow_id.clone() };
     let schedule = if p.schedule.is_empty() { "—".to_string() } else { p.schedule.clone() };
@@ -4167,10 +4198,10 @@ fn profile_table_row_value(p: &db::ProfileRow, camera_count: usize) -> Value {
         (Value::Text("profile_id".into()), Value::Text(p.id.clone())),
         (Value::Text("name".into()), Value::Text(p.name.clone())),
         (Value::Text("flow".into()), Value::Text(flow)),
-        (Value::Text("risk".into()), Value::Text(p.risk_class.clone())),
+        (Value::Text("risk".into()), profile_risk_cell(&p.risk_class)),
         (Value::Text("cameras".into()), Value::Text(alloc::format!("{}", camera_count))),
         (Value::Text("schedule".into()), Value::Text(schedule)),
-        (Value::Text("enabled".into()), Value::Text(if p.enabled { "tak".into() } else { "nie".into() })),
+        (Value::Text("enabled".into()), if p.enabled { chip_cell("TAK", "ok") } else { chip_cell("NIE", "muted") }),
     ];
     Value::Map(entries)
 }
