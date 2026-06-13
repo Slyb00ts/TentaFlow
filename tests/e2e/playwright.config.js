@@ -27,5 +27,6 @@ module.exports = defineConfig({
     { name: 'sdk-showcase-components', testMatch: 'sdk-showcase-components.spec.js' },
     { name: 'tentavision-panel', testMatch: 'tentavision-panel.spec.js' },
     { name: 'tentavision-cameras', testMatch: 'tentavision-cameras.spec.js' },
+    { name: 'tentavision-dashboard', testMatch: 'tentavision-dashboard.spec.js' },
   ],
 });
