@@ -10,6 +10,8 @@ static BUILD_TS: &str = "20260526-1210";
 
 extern crate alloc;
 
+mod db;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -1785,6 +1787,11 @@ impl PanelState {
 
 static STATE: Mutex<PanelState> = Mutex::new(PanelState::new());
 
+/// Rows computed by `build_cameras_content` and handed to `render_panel` so the
+/// cameras Table mounts with its rows already in the slot's state_overlay
+/// snapshot (avoids a first empty rebuild that would flash the empty-state).
+static PENDING_CAMERA_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
     f(&mut guard)
@@ -2010,7 +2017,22 @@ fn render_panel(panel_id: &str) {
     };
     // Send "content" first so the host has the Modal (and thus the dynamic
     // body/footer slot containers) in the DOM before we push their content.
-    send_slot_content("content", content);
+    // The cameras panel seeds its table rows via the slot's state_overlay so
+    // the Table mounts with rows already in the store snapshot — otherwise its
+    // first rebuild sees an empty rows_path and leaves the empty-state visible.
+    if panel_id == "cameras" {
+        let overlay = PENDING_CAMERA_ROWS
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .map(|rows| vec![StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
+                value: rows,
+            }]);
+        send_slot_content_with_overlay("content", content, overlay);
+    } else {
+        send_slot_content("content", content);
+    }
 
     // When the "Add camera" wizard is open on the cameras panel, fill the
     // Modal's body/footer slots. These must be sent AFTER "content" so their
@@ -2319,48 +2341,48 @@ fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, retention, fps, profile, user, pass) = with_state(|s| (
+    let (target, name, fps, profile, source_type) = with_state(|s| (
         s.discover.resolve_target(),
         s.discover.name.trim().to_string(),
-        s.discover.retention_or_default().to_string(),
         s.discover.fps_value(),
         s.discover.profile_or_default().to_string(),
-        s.discover.cred_user.clone(),
-        s.discover.cred_pass.clone(),
+        s.discover.source_type,
     ));
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 60 {
         return submit_fail("Nazwa musi mieć 1–60 znaków.", "invalid name");
     }
-    let (vendor, url, profile_token) = match target {
+    let (vendor, url, _profile_token) = match target {
         Ok(t) => t,
         Err(msg) => return submit_fail(msg, "invalid target"),
     };
-    let credentials_b64 = match build_credentials_b64(&vendor, &user, &pass) {
-        Ok(c) => c,
-        Err(msg) => return submit_fail(msg, "invalid credentials"),
+
+    // Persist the camera to SQLite — the cameras list reads exclusively from
+    // there, so the row survives panel reopen and process restart. The URL is
+    // routed into onvif_url / rtsp_url depending on the chosen source type so
+    // later tabs (live, zones) can pick the right transport.
+    let (onvif_url, rtsp_url) = match source_type {
+        Some(SourceType::Onvif) => (url.clone(), String::new()),
+        _ => (String::new(), url.clone()),
     };
-    let spec = CameraAddInput {
-        display_name: name,
-        vendor,
-        url,
-        target_fps: Some(fps),
-        resolution_width: None,
-        resolution_height: None,
-        retention_class: Some(retention),
-        profile: Some(profile),
-        credentials_b64,
-        onvif_profile_token: profile_token,
+    let new_cam = db::NewCamera {
+        name: name.clone(),
+        location: profile.clone(),
+        rtsp_url,
+        onvif_url,
+        status: "offline".into(),
+        fps: i64::from(fps),
+        detectors: vendor,
     };
-    match camera_add(spec) {
-        Ok(result) => {
-            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", result.camera_id)); });
+    match db::insert_camera(&new_cam) {
+        Ok(id) => {
+            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", id)); });
             // Close the modal and refresh the camera list so the new camera
             // appears. render_panel re-sends the "cameras" content fragment
             // without the modal, which is the intended end state on success.
             render_panel("cameras");
-            json!({"ok":true,"camera_id":result.camera_id})
+            json!({"ok":true,"camera_id":id})
         }
         Err(e) => submit_fail(&alloc::format!("Błąd dodawania: {}", abi_message(e)), &alloc::format!("{}", e)),
     }
@@ -2370,9 +2392,8 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     with_state(|s| s.clear_messages());
     if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
-    if !is_valid_camera_id(&camera_id) { with_state(|s| { s.error_message = Some("Niepoprawny identyfikator kamery.".to_string()); }); return json!({"ok":false,"error":"invalid camera_id"}); }
-    match camera_remove(&camera_id) {
-        Ok(()) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
+    match db::delete_camera(&camera_id) {
+        Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
@@ -2787,7 +2808,7 @@ fn build_live_content() -> Component {
 }
 
 fn build_cameras_content() -> Component {
-    let list_result = camera_list();
+    let list_result = db::list_cameras();
     let messages = build_messages_section();
     let (add_visible, filter) = with_state(|s| (s.add_form_visible, s.cameras_filter.clone()));
 
@@ -2825,8 +2846,8 @@ fn build_cameras_content() -> Component {
     ]);
     children.push(toolbar);
 
-    // A host error (permission/DB/supervisor) must never be masked as "no
-    // cameras"; surface the real reason and stop rendering the list.
+    // A DB/permission error must never be masked as "no cameras"; surface the
+    // real reason and stop rendering the list.
     let cameras = match list_result {
         Ok(c) => c,
         Err(e) => {
@@ -2835,11 +2856,11 @@ fn build_cameras_content() -> Component {
         }
     };
 
-    // Filter counts derived from live camera status.
+    // Filter counts derived from persisted camera status.
     let total = cameras.len();
     let online = cameras.iter().filter(|c| c.status == "online").count();
     let offline = cameras.iter().filter(|c| c.status == "offline").count();
-    let warnings = cameras.iter().filter(|c| camera_has_warning(c)).count();
+    let warnings = cameras.iter().filter(|c| camera_row_has_warning(c)).count();
 
     let active_filter = if filter.is_empty() { "all" } else { &filter };
     let sub_tabs = filter_chips(
@@ -2861,19 +2882,19 @@ fn build_cameras_content() -> Component {
         children.push(build_add_camera_modal());
     }
 
-    let filtered: Vec<&CameraInfoOut> = cameras
+    let filtered: Vec<&db::CameraRow> = cameras
         .iter()
         .filter(|c| match active_filter {
             "online" => c.status == "online",
             "offline" => c.status == "offline",
-            "warnings" => camera_has_warning(c),
+            "warnings" => camera_row_has_warning(c),
             _ => true,
         })
         .collect();
 
     // A delete-confirmation bar appears above the table once a row is selected.
     if let Some(pending) = with_state(|s| s.camera_pending_remove.clone()) {
-        if cameras.iter().any(|c| c.camera_id == pending) {
+        if cameras.iter().any(|c| c.id == pending) {
             children.push(build_camera_remove_confirm(&pending, &cameras));
         } else {
             with_state(|s| s.camera_pending_remove = None);
@@ -2886,11 +2907,13 @@ fn build_cameras_content() -> Component {
         // double container (a stray white frame around the content).
         children.push(empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras")));
     } else {
-        // Push the filtered, host-derived rows into panel state under the
-        // Table's rows_path; the Table renderer reads them reactively. An empty
-        // filtered set renders the Table's own empty_state.
+        // Stash the filtered rows (read from SQLite) for render_panel to seed
+        // into the content slot's state_overlay under the Table's rows_path, so
+        // the Table mounts with rows present in its first store snapshot.
         let rows: Vec<Value> = filtered.iter().map(|c| camera_table_row_value(c)).collect();
-        send_state_patch("cameras_rows", Value::Array(rows));
+        if let Ok(mut g) = PENDING_CAMERA_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
         // Table carries its own surface styling; an extra Outlined Card here
         // would nest a white frame around it, unlike the dashboard layout.
         children.push(build_cameras_table());
@@ -2899,21 +2922,36 @@ fn build_cameras_content() -> Component {
     stack_v(children)
 }
 
+/// A camera is "warning" when its persisted status is neither cleanly online
+/// nor offline (e.g. "degraded").
+fn camera_row_has_warning(c: &db::CameraRow) -> bool {
+    c.status != "online" && c.status != "offline"
+}
+
+/// Renders the persisted address: ONVIF url if present, else RTSP url.
+fn camera_row_addr(c: &db::CameraRow) -> String {
+    let addr = if !c.onvif_url.trim().is_empty() { &c.onvif_url } else { &c.rtsp_url };
+    if addr.trim().is_empty() { "\u{2014}".to_string() } else { redact_url_for_display(addr) }
+}
+
+/// FPS cell: configured target fps, or em-dash when 0.
+fn camera_row_fps(c: &db::CameraRow) -> String {
+    if c.fps > 0 { alloc::format!("{}", c.fps) } else { "\u{2014}".to_string() }
+}
+
 /// Builds one Table row as a `Value::Map` keyed by the column field paths.
 /// `camera_id` is the row key the Table uses to scope per-row actions.
-fn camera_table_row_value(c: &CameraInfoOut) -> Value {
-    let fps = camera_fps_display(c);
-    let (diag, _diag_tone) = camera_diagnostics(c);
-    let profile = if c.profile.trim().is_empty() { "\u{2014}".to_string() } else { c.profile.clone() };
+fn camera_table_row_value(c: &db::CameraRow) -> Value {
+    let location = if c.location.trim().is_empty() { "\u{2014}".to_string() } else { c.location.clone() };
+    let detectors = if c.detectors.trim().is_empty() { "\u{2014}".to_string() } else { c.detectors.clone() };
     let entries: Vec<(Value, Value)> = vec![
-        (Value::Text("camera_id".into()), Value::Text(c.camera_id.clone())),
-        (Value::Text("name".into()), Value::Text(c.display_name.clone())),
-        (Value::Text("vendor".into()), Value::Text(c.vendor.clone())),
-        (Value::Text("addr".into()), Value::Text(redact_url_for_display(&c.url))),
+        (Value::Text("camera_id".into()), Value::Text(c.id.clone())),
+        (Value::Text("name".into()), Value::Text(c.name.clone())),
+        (Value::Text("location".into()), Value::Text(location)),
+        (Value::Text("addr".into()), Value::Text(camera_row_addr(c))),
         (Value::Text("status".into()), Value::Text(c.status.clone())),
-        (Value::Text("profile".into()), Value::Text(profile)),
-        (Value::Text("fps".into()), Value::Text(fps)),
-        (Value::Text("diag".into()), Value::Text(diag)),
+        (Value::Text("detectors".into()), Value::Text(detectors)),
+        (Value::Text("fps".into()), Value::Text(camera_row_fps(c))),
     ];
     Value::Map(entries)
 }
@@ -2936,19 +2974,12 @@ fn camera_table_column(id: &str, header: &str, render: ColumnRender) -> TableCol
 fn build_cameras_table() -> Component {
     let columns = vec![
         camera_table_column("name", "Nazwa", ColumnRender::Text),
-        camera_table_column("vendor", "Vendor / Protokół", ColumnRender::Text),
+        camera_table_column("location", "Lokalizacja", ColumnRender::Text),
         camera_table_column("addr", "Adres", ColumnRender::Text),
         camera_table_column("status", "Status", ColumnRender::Chip),
-        camera_table_column("profile", "Profil", ColumnRender::Text),
+        camera_table_column("detectors", "Detektory", ColumnRender::Text),
         camera_table_column("fps", "FPS", ColumnRender::Text),
-        camera_table_column("diag", "Diagnostyka", ColumnRender::Text),
     ];
-
-    let empty = empty_state(
-        "Brak kamer dla filtra",
-        Some("Zmień filtr, aby zobaczyć pozostałe kamery."),
-        Some("cameras"),
-    );
 
     // The per-row "⋯" menu carries the deletion action. The Table renderer
     // injects the row key into the menu-item action params as both `row_id`
@@ -2972,7 +3003,7 @@ fn build_cameras_table() -> Component {
         sticky_header: true,
         sticky_columns: 0,
         pagination: None,
-        empty_state: Some(empty),
+        empty_state: None,
         row_actions: vec![remove_action],
         bulk_actions: vec![],
         virtualize: false,
@@ -2983,11 +3014,11 @@ fn build_cameras_table() -> Component {
 
 /// Confirmation bar for deleting the selected camera. Usuń dispatches
 /// `camera-remove` with the explicit `camera_id`; Anuluj clears the selection.
-fn build_camera_remove_confirm(camera_id: &str, cameras: &[CameraInfoOut]) -> Component {
+fn build_camera_remove_confirm(camera_id: &str, cameras: &[db::CameraRow]) -> Component {
     let name = cameras
         .iter()
-        .find(|c| c.camera_id == camera_id)
-        .map(|c| c.display_name.as_str())
+        .find(|c| c.id == camera_id)
+        .map(|c| c.name.as_str())
         .unwrap_or(camera_id);
 
     let mut params = CborMap::default();
