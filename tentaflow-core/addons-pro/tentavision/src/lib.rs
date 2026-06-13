@@ -1847,6 +1847,10 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
     let panel_id = read_guest_string(panel_id_ptr, panel_id_len);
     PANEL_EPOCH.store(epoch as u64, core::sync::atomic::Ordering::Relaxed);
     log::info(&alloc::format!("TentaVision: on_panel_open panel='{}' epoch={}", panel_id, epoch));
+    // A fresh panel open starts a new view context; carrying a transient
+    // success/error banner over from the previous session would surface stale
+    // toasts (e.g. "Kamera dodana") on an unrelated tab.
+    with_state(|s| s.clear_messages());
     send_initial_shell();
     let target = if panel_id.is_empty() { "overview" } else { &panel_id };
     render_panel(target);
@@ -2030,6 +2034,16 @@ fn render_panel(panel_id: &str) {
                 value: rows,
             }]);
         send_slot_content_with_overlay("content", content, overlay);
+    } else if panel_id == "overview" {
+        // Seed the activity heatmap's cells into the slot snapshot so the
+        // Heatmap mounts with its data already in the store (same pattern as the
+        // cameras Table). Without this, `heatmap_cells` is undefined on first
+        // paint and every cell renders at level 0.
+        let overlay = vec![StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("heatmap_cells".into())]),
+            value: heatmap_cells_value(),
+        }];
+        send_slot_content_with_overlay("content", content, Some(overlay));
     } else {
         send_slot_content("content", content);
     }
@@ -2610,33 +2624,50 @@ fn build_nav_tab_items(_active: &str) -> Vec<NavTab> {
 // =============================================================================
 
 fn build_overview_content() -> Component {
-    let cameras = camera_list().unwrap_or_default();
-    let total_cams = cameras.len();
-    let online_cams = cameras.iter().filter(|c| c.status == "online").count();
-    let offline_cams = total_cams.saturating_sub(online_cams);
+    let messages = build_messages_section();
 
-    let (cam_val, cam_note) = if total_cams == 0 {
-        ("22 / 24".to_string(), "2 offline (C-12, C-19)".to_string())
+    // KPI tiles — every number is computed from SQLite.
+    let total_cams = db::count_cameras().unwrap_or(0);
+    let online_cams = db::count_online_cameras().unwrap_or(0);
+    let offline_cams = (total_cams - online_cams).max(0);
+    let active_detectors = db::count_active_profiles().unwrap_or(0);
+    let alarms_24h = db::count_alarms_last_24h().unwrap_or(0);
+    let critical_24h = db::count_critical_alarms_last_24h().unwrap_or(0);
+
+    let cam_val = alloc::format!("{} / {}", online_cams, total_cams);
+    let cam_note = if total_cams == 0 {
+        "Brak skonfigurowanych kamer".to_string()
+    } else if offline_cams > 0 {
+        alloc::format!("{} offline", offline_cams)
     } else {
-        (alloc::format!("{} / {}", online_cams, total_cams),
-         if offline_cams > 0 { alloc::format!("{} offline", offline_cams) } else { "wszystkie online".to_string() })
+        "wszystkie online".to_string()
     };
+    let alarms_note = if critical_24h > 0 {
+        alloc::format!("{} krytycznych", critical_24h)
+    } else {
+        "brak krytycznych".to_string()
+    };
+    let alarms_tone = if critical_24h > 0 { "danger" } else { "success" };
 
     let kpi_row = grid(4, vec![
-        stat_card(&cam_val, "Aktywne kamery", Some(&cam_note), Some("cameras"), Some("success")),
-        stat_card("8", "Aktywne detektory", None, Some("brain"), Some("accent")),
-        stat_card("147", "Alarmy 24h", Some("▲ 23% vs. wczoraj · 3 critical"), Some("bell"), Some("danger")),
+        stat_card(&cam_val, "Aktywne kamery", Some(&cam_note), Some("cameras"),
+                  Some(if offline_cams > 0 { "warning" } else { "success" })),
+        stat_card(&alloc::format!("{}", active_detectors), "Aktywne detektory", None, Some("brain"), Some("accent")),
+        stat_card(&alloc::format!("{}", alarms_24h), "Alarmy 24h", Some(&alarms_note), Some("bell"), Some(alarms_tone)),
         stat_card("68%", "GPU / latencja p95", Some("1.2 s"), Some("cpu"), Some("success")),
     ]);
 
-    let recent_alarms = card_with_icon_action("Ostatnie alarmy", "bell", Some("Wszystkie 147 >"), vec![
-        stack_v(vec![
-            build_alarm_row("D2 · podejrzenie agresji", "C-04 wjazd", "12:43:21", "danger"),
-            build_alarm_row("D1 · nieczytelna tablica ADR", "C-01 brama", "12:38:04", "warning"),
-            build_alarm_row("D3 · pozostawiony bagaż > 90s", "C-07 peron", "12:31:55", "warning"),
-            build_alarm_row("D6 · pojazd w strefie zakazu", "C-15 magazyn", "12:22:09", "info"),
-        ]),
-    ]);
+    // Latest alarms — newest first, joined with the camera name.
+    let recent = db::list_recent_alarms(6).unwrap_or_default();
+    let alarms_body = if recent.is_empty() {
+        // No outer card: empty_state sits straight inside the section card body.
+        empty_state("Brak alarmów", Some("Gdy analityka wykryje zdarzenie, pojawi się tutaj."), Some("bell"))
+    } else {
+        let rows: Vec<Component> = recent.iter().map(build_alarm_card).collect();
+        stack_v_gap("sm", rows)
+    };
+    let alarms_header_label = alloc::format!("Wszystkie {} >", alarms_24h);
+    let recent_alarms = card_with_icon_action("Ostatnie alarmy", "bell", Some(&alarms_header_label), vec![alarms_body]);
 
     let runtime = card_with_icon("Stan natywnego runtime", "cpu", vec![
         build_runtime_table(),
@@ -2646,24 +2677,101 @@ fn build_overview_content() -> Component {
 
     let heatmap_card = build_activity_heatmap();
 
-    let messages = build_messages_section();
-
     stack_v(vec![messages, kpi_row, two_col, heatmap_card])
 }
 
-fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Component {
-    let severity_label = match severity {
-        "danger" => "krytyczne",
-        "warning" => "ostrzeżenie",
-        "info" => "info",
-        _ => severity,
-    };
+/// Maps an alarm severity token to a badge variant. Persisted severities are
+/// `critical` / `warning` / `info`; anything else degrades to a neutral info pill.
+fn alarm_severity_variant(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "danger",
+        "warning" => "warning",
+        _ => "info",
+    }
+}
 
+fn alarm_severity_label(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "krytyczne",
+        "warning" => "ostrzeżenie",
+        _ => "info",
+    }
+}
+
+/// Formats a unix timestamp as HH:MM:SS in UTC. The dashboard only needs the
+/// clock face for the "latest alarms" list; a full date column lives in the
+/// Alarms tab.
+fn format_alarm_time(ts: i64) -> String {
+    if ts <= 0 {
+        return "—".into();
+    }
+    let secs_in_day = ts.rem_euclid(86_400);
+    let h = secs_in_day / 3600;
+    let m = (secs_in_day % 3600) / 60;
+    let s = secs_in_day % 60;
+    alloc::format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+/// Static alarm row used by the Alarms tab (a later tab-by-tab effort). The
+/// dashboard uses `build_alarm_card` with real `db::AlarmRow` data instead.
+fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Component {
     let title_text = text_styled(title, "body_strong");
     let meta_row = stack_h_gap("sm", vec![
         chip_with_icon(camera, "category", "cameras"),
         chip_with_icon(time, "category", "clock"),
-        badge(severity_label, severity),
+        badge(alarm_severity_label(match severity { "danger" => "critical", other => other }), severity),
+    ]);
+    let center = stack_v_gap("xs", vec![title_text, meta_row]);
+    let action = ButtonComp {
+        variant: ButtonVariant::Ghost,
+        tone: Tone::Neutral,
+        label: lit("Otwórz"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Default,
+    }.into_component(next_id()).expect("Button");
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Md,
+        justify: FlexJustify::SpaceBetween,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::NoWrap,
+        children: vec![center, action],
+        padding: Some(Spacing::Sm),
+        background: None,
+        radius: None,
+    }.into_component(next_id()).expect("Flex")
+}
+
+fn build_alarm_card(a: &db::AlarmRow) -> Component {
+    // Title: detector type + message, falling back to whichever is present.
+    let title = if !a.kind.is_empty() && !a.message.is_empty() {
+        alloc::format!("{} · {}", a.kind, a.message)
+    } else if !a.message.is_empty() {
+        a.message.clone()
+    } else if !a.kind.is_empty() {
+        a.kind.clone()
+    } else {
+        "Zdarzenie".into()
+    };
+    let camera_label = if !a.camera_name.is_empty() {
+        a.camera_name.clone()
+    } else if !a.camera_id.is_empty() {
+        a.camera_id.clone()
+    } else {
+        "—".into()
+    };
+    let variant = alarm_severity_variant(&a.severity);
+
+    let title_text = text_styled(&title, "body_strong");
+    let meta_row = stack_h_gap("sm", vec![
+        chip_with_icon(&camera_label, "category", "cameras"),
+        chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
+        badge(alarm_severity_label(&a.severity), variant),
     ]);
     let center = stack_v_gap("xs", vec![title_text, meta_row]);
 
@@ -2751,23 +2859,88 @@ fn build_runtime_table() -> Component {
     ])
 }
 
+const HEATMAP_COLS: usize = 24;
+/// Cap the number of camera rows so a large fleet does not produce an unwieldy
+/// grid; the dashboard heatmap is an at-a-glance overview, not the Alarms tab.
+const HEATMAP_MAX_ROWS: usize = 12;
+
+/// The cameras shown as heatmap rows, in stable display order (by name). Shared
+/// by `build_activity_heatmap` (labels) and `heatmap_cells_value` (data) so row
+/// indices line up with the `rN` ids the heatmap helper generates.
+fn heatmap_camera_rows() -> Vec<db::CameraRow> {
+    let mut cams = db::list_cameras().unwrap_or_default();
+    cams.truncate(HEATMAP_MAX_ROWS);
+    cams
+}
+
 fn build_activity_heatmap() -> Component {
-    const ROWS: usize = 8;
-    const COLS: usize = 24;
-    let row_labels = vec!["C-01 brama","C-04 wjazd","C-07 peron","C-09 hala","C-12 magazyn","C-15 parking","C-18 dok","C-22 wjazd-2"];
-    let col_labels: Vec<&str> = (0..COLS).map(|h| if h % 2 == 0 { match h { 0=>"0",2=>"2",4=>"4",6=>"6",8=>"8",10=>"10",12=>"12",14=>"14",16=>"16",18=>"18",20=>"20",22=>"22",_=>"" } } else { "" }).collect();
-    let values: Vec<Vec<f64>> = (0..ROWS).map(|r| {
-        let boost = if r == 1 { 1.4 } else { 1.0 };
-        (0..COLS).map(|h| {
-            let peak = if h > 7 && h < 18 { 1.0 } else { 0.2 };
-            let seed = (r as f64 * 24.0 + h as f64) * 12.9898;
-            let noise = (seed.sin() * 43758.5453).fract().abs();
-            (peak * noise * boost).clamp(0.0, 1.0)
-        }).collect()
-    }).collect();
+    let cams = heatmap_camera_rows();
+    let col_labels: Vec<&str> = (0..HEATMAP_COLS)
+        .map(|h| match h {
+            0 => "0", 2 => "2", 4 => "4", 6 => "6", 8 => "8", 10 => "10",
+            12 => "12", 14 => "14", 16 => "16", 18 => "18", 20 => "20", 22 => "22",
+            _ => "",
+        })
+        .collect();
+
+    if cams.is_empty() {
+        // No cameras → no rows to chart; keep a clean empty state rather than an
+        // empty zero-row grid the renderer would draw as a bare header strip.
+        return card_with_icon(
+            "Mapa cieplna aktywności · ostatnie 24h × kamera",
+            "dashboard",
+            vec![empty_state("Brak danych aktywności", Some("Dodaj kamery, aby zbierać aktywność 24h."), Some("dashboard"))],
+        );
+    }
+
+    let row_labels: Vec<&str> = cams.iter().map(|c| c.name.as_str()).collect();
+    // Values come from the store via `heatmap_cells`; the literal grid passed
+    // here is unused by the renderer (the helper ignores `_values`), so pass an
+    // empty placeholder of the right shape.
+    let values: Vec<Vec<f64>> = Vec::new();
     card_with_icon("Mapa cieplna aktywności · ostatnie 24h × kamera", "dashboard", vec![
-        heatmap(ROWS as u32, COLS as u32, values, row_labels, col_labels),
+        heatmap(cams.len() as u32, HEATMAP_COLS as u32, values, row_labels, col_labels),
     ])
+}
+
+/// Builds the `heatmap_cells` store value (`[{row_id, col_id, value}]`) from the
+/// real per-camera-per-hour alarm aggregate. `value` is normalized to 0..1 so
+/// the linear scale + tf-heatmap level buckets light up; the busiest cell in the
+/// window maps to 1.0. Cameras/hours with no alarms are emitted as 0 so the grid
+/// is fully populated (no blank rows), matching the mockup's dense look.
+fn heatmap_cells_value() -> Value {
+    let cams = heatmap_camera_rows();
+    if cams.is_empty() {
+        return Value::Array(Vec::new());
+    }
+    let buckets = db::alarm_heatmap_last_24h().unwrap_or_default();
+    let row_index: alloc::collections::BTreeMap<&str, usize> =
+        cams.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+
+    // Dense count grid [row][hour], then normalize by the global max.
+    let mut counts = alloc::vec![[0i64; HEATMAP_COLS]; cams.len()];
+    let mut max_count = 0i64;
+    for b in &buckets {
+        if let Some(&r) = row_index.get(b.camera_id.as_str()) {
+            let h = (b.hour_offset as usize).min(HEATMAP_COLS - 1);
+            counts[r][h] += b.count;
+            max_count = max_count.max(counts[r][h]);
+        }
+    }
+    let denom = if max_count > 0 { max_count as f64 } else { 1.0 };
+
+    let mut cells: Vec<Value> = Vec::with_capacity(cams.len() * HEATMAP_COLS);
+    for (r, row) in counts.iter().enumerate() {
+        for (h, &c) in row.iter().enumerate() {
+            let value = (c as f64) / denom;
+            cells.push(Value::Map(vec![
+                (Value::Text("row_id".into()), Value::Text(alloc::format!("r{}", r))),
+                (Value::Text("col_id".into()), Value::Text(alloc::format!("c{}", h))),
+                (Value::Text("value".into()), Value::F64(value)),
+            ]));
+        }
+    }
+    Value::Array(cells)
 }
 
 fn build_messages_section() -> Component {

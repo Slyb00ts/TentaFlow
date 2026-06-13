@@ -288,3 +288,142 @@ pub fn update_camera(c: &CameraRow) -> Result<u64, AbiError> {
 pub fn delete_camera(id: &str) -> Result<u64, AbiError> {
     exec("DELETE FROM cameras WHERE id = ?1", &[SqlValue::Text(id.into())])
 }
+
+// =============================================================================
+// Dashboard aggregates (read-only)
+// =============================================================================
+
+/// Returns the first column of the first row as an i64 (for COUNT() queries),
+/// or 0 when the result set is empty.
+fn scalar_i64(sql: &str, params: &[SqlValue]) -> Result<i64, AbiError> {
+    let rows = query(sql, params)?;
+    Ok(rows.first().and_then(|r| r.first()).map(SqlValue::as_i64).unwrap_or(0))
+}
+
+/// Total number of configured cameras.
+pub fn count_cameras() -> Result<i64, AbiError> {
+    scalar_i64("SELECT COUNT(*) FROM cameras", &[])
+}
+
+/// Number of cameras whose last known status is `online`.
+pub fn count_online_cameras() -> Result<i64, AbiError> {
+    scalar_i64("SELECT COUNT(*) FROM cameras WHERE status = 'online'", &[])
+}
+
+/// Number of alarms raised in the last 24 hours (ts >= now - 86400).
+pub fn count_alarms_last_24h() -> Result<i64, AbiError> {
+    scalar_i64(
+        "SELECT COUNT(*) FROM alarms WHERE ts >= unixepoch() - 86400",
+        &[],
+    )
+}
+
+/// Number of critical alarms in the last 24 hours.
+pub fn count_critical_alarms_last_24h() -> Result<i64, AbiError> {
+    scalar_i64(
+        "SELECT COUNT(*) FROM alarms WHERE severity = 'critical' AND ts >= unixepoch() - 86400",
+        &[],
+    )
+}
+
+/// Number of analytic profiles that are enabled (active detectors).
+pub fn count_active_profiles() -> Result<i64, AbiError> {
+    scalar_i64("SELECT COUNT(*) FROM profiles WHERE enabled = 1", &[])
+}
+
+/// An alarm row joined with its camera's display name for the dashboard list.
+#[derive(Debug, Clone)]
+pub struct AlarmRow {
+    pub id: String,
+    pub camera_id: String,
+    pub camera_name: String,
+    pub severity: String,
+    pub kind: String,
+    pub message: String,
+    pub ts: i64,
+}
+
+/// Lists the most recent alarms (newest first), left-joining the camera name so
+/// the card can show a friendly label instead of the raw camera id.
+pub fn list_recent_alarms(limit: i64) -> Result<Vec<AlarmRow>, AbiError> {
+    let sql = "SELECT a.id, a.camera_id, COALESCE(c.name, ''), a.severity, a.type, a.message, a.ts \
+               FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
+               ORDER BY a.ts DESC LIMIT ?1";
+    let rows = query(sql, &[SqlValue::I64(limit)])?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+            AlarmRow {
+                id: g(0).as_str().into(),
+                camera_id: g(1).as_str().into(),
+                camera_name: g(2).as_str().into(),
+                severity: g(3).as_str().into(),
+                kind: g(4).as_str().into(),
+                message: g(5).as_str().into(),
+                ts: g(6).as_i64(),
+            }
+        })
+        .collect())
+}
+
+/// One aggregated heatmap bucket: alarm count for a camera in a given hour
+/// offset (0 = oldest of the 24h window, 23 = current hour).
+#[derive(Debug, Clone)]
+pub struct AlarmHeatBucket {
+    pub camera_id: String,
+    pub hour_offset: i64,
+    pub count: i64,
+}
+
+/// Aggregates alarm counts per camera per hour over the last 24h. `hour_offset`
+/// is `(alarm_hour - window_start_hour)` clamped to 0..=23, so column 23 is the
+/// current hour. Cameras with zero alarms simply do not appear here; the caller
+/// fills the rest of the grid with zero cells.
+pub fn alarm_heatmap_last_24h() -> Result<Vec<AlarmHeatBucket>, AbiError> {
+    // unixepoch() - 86400 is the window start; integer-divide both the alarm ts
+    // and the window start by 3600 to bucket into whole hours, then subtract.
+    let sql = "SELECT camera_id, \
+               CAST((ts / 3600) - ((unixepoch() - 86400) / 3600) AS INTEGER) AS hour_offset, \
+               COUNT(*) AS cnt \
+               FROM alarms \
+               WHERE ts >= unixepoch() - 86400 \
+               GROUP BY camera_id, hour_offset";
+    let rows = query(sql, &[])?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+            AlarmHeatBucket {
+                camera_id: g(0).as_str().into(),
+                hour_offset: g(1).as_i64().clamp(0, 23),
+                count: g(2).as_i64(),
+            }
+        })
+        .collect())
+}
+
+/// Inserts an alarm. Used by the dashboard's own seeding flow / future analytics
+/// integration. created with status='new'. Returns the generated id.
+pub fn insert_alarm(
+    camera_id: &str,
+    severity: &str,
+    kind: &str,
+    message: &str,
+    ts: i64,
+) -> Result<String, AbiError> {
+    let id = generate_id("alm");
+    exec(
+        "INSERT INTO alarms (id, camera_id, severity, type, message, thumb_ref, ts, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 'new')",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(camera_id.into()),
+            SqlValue::Text(severity.into()),
+            SqlValue::Text(kind.into()),
+            SqlValue::Text(message.into()),
+            SqlValue::I64(ts),
+        ],
+    )?;
+    Ok(id)
+}
