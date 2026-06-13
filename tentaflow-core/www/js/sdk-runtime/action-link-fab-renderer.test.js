@@ -63,7 +63,7 @@ function setup() {
 // LinkButton (0x0404)
 // ============================================================================
 
-test('LinkButton renders <tf-button variant=ghost> with tone/underline classes', () => {
+test('LinkButton renders <tf-button variant=ghost> with tone attr + underline class', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -76,7 +76,8 @@ test('LinkButton renders <tf-button variant=ghost> with tone/underline classes',
   document.body.appendChild(el);
   assertEq(el.tagName, 'TF-BUTTON');
   assertEq(el.getAttribute('variant'), 'ghost');
-  assert(el.classList.contains('tf-link-button--tone-primary'));
+  assertEq(el.getAttribute('tone'), 'primary');
+  assert(!el.classList.contains('tf-link-button--tone-primary'));
   assert(el.classList.contains('tf-link-button--underline-hover'));
   assertEq(el.getAttribute('label'), 'Otwórz');
 });
@@ -171,7 +172,7 @@ test('LinkButton rejects unknown field key', () => {
 // Link (0x0405)
 // ============================================================================
 
-test('Link renders <tf-button role=link> with tone/underline classes', () => {
+test('Link renders <tf-button role=link> with tone attr + underline class', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(
@@ -184,7 +185,8 @@ test('Link renders <tf-button role=link> with tone/underline classes', () => {
   assertEq(el.tagName, 'TF-BUTTON');
   assertEq(el.getAttribute('role'), 'link');
   assertEq(el.getAttribute('variant'), 'ghost');
-  assert(el.classList.contains('tf-link--tone-info'));
+  assertEq(el.getAttribute('tone'), 'info');
+  assert(!el.classList.contains('tf-link--tone-info'));
   assert(el.classList.contains('tf-link--underline-hover'));
   assertEq(el.getAttribute('label'), 'Zobacz');
 });
@@ -271,8 +273,9 @@ test('Fab renders <tf-button> with icon attr + position class; icon-only require
   document.body.appendChild(el);
   assertEq(el.tagName, 'TF-BUTTON');
   assertEq(el.getAttribute('variant'), 'primary');
+  assertEq(el.getAttribute('tone'), 'primary');
   assert(el.classList.contains('tf-fab'));
-  assert(el.classList.contains('tf-fab--tone-primary'));
+  assert(!el.classList.contains('tf-fab--tone-primary'));
   assert(el.classList.contains('tf-fab--size-md'));
   assert(el.classList.contains('tf-fab--position-bottom_right'));
   // Named icon maps to tf-button icon attribute (no child icon element).

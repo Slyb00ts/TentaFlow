@@ -76,7 +76,7 @@ function renderLinkButton(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'ghost');
-  btn.classList.add(`tf-link-button--tone-${tone}`);
+  btn.setAttribute('tone', tone);
   btn.classList.add(`tf-link-button--underline-${underline}`);
 
   // Leading icon via tf-button icon attribute or rendered element
@@ -129,7 +129,7 @@ function renderLink(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'ghost');
-  btn.classList.add(`tf-link--tone-${tone}`);
+  btn.setAttribute('tone', tone);
   btn.classList.add(`tf-link--underline-${underline}`);
   btn.setAttribute('role', 'link');
 
@@ -185,9 +185,9 @@ function renderFab(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'primary');
+  btn.setAttribute('tone', tone);
   if (size === 'sm') btn.setAttribute('size', 'sm');
   btn.classList.add('tf-fab');
-  btn.classList.add(`tf-fab--tone-${tone}`);
   btn.classList.add(`tf-fab--size-${size}`);
   btn.classList.add(`tf-fab--position-${position}`);
 

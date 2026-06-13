@@ -73,11 +73,6 @@ tf-select {
   display: block;
   width: 100%;
 }
-tf-button {
-  display: inline-flex;
-  vertical-align: middle;
-}
-
 /* Sloty tf-window (footer + actions) — auto-flex z gapem, bez koniecznosci
    inline-style w kazdym uzyciu. Wyrownanie pionowe + 10px gap miedzy
    przyciskami. */
@@ -244,12 +239,22 @@ tf-window [slot="footer"] {
   outline: 2px solid var(--tf-accent-1);
   outline-offset: 2px;
 }
+.tf-btn-full-width { width: 100%; }
 
-/* magnetic offset ustawiany dynamicznie przez JS */
-.tf-btn[data-magnet] {
-  transform: translate(var(--tf-magnet-x, 0), var(--tf-magnet-y, 0));
-  transition: transform 0.18s var(--tf-spring-smooth), box-shadow 0.2s ease, filter 0.15s ease;
-}
+/* tones — tint only the text-only variants (ghost/outline/danger). Solid
+   variants (primary/secondary/danger-solid/success) keep their own colour. */
+.tf-btn.tf-btn-ghost.tf-btn--tone-success,
+.tf-btn.tf-btn-outline.tf-btn--tone-success { color: var(--tf-success); }
+.tf-btn.tf-btn-ghost.tf-btn--tone-warning,
+.tf-btn.tf-btn-outline.tf-btn--tone-warning { color: var(--tf-warning); }
+.tf-btn.tf-btn-ghost.tf-btn--tone-critical,
+.tf-btn.tf-btn-outline.tf-btn--tone-critical { color: var(--tf-danger); }
+.tf-btn.tf-btn-ghost.tf-btn--tone-info,
+.tf-btn.tf-btn-outline.tf-btn--tone-info { color: var(--tf-info); }
+.tf-btn.tf-btn-ghost.tf-btn--tone-primary,
+.tf-btn.tf-btn-outline.tf-btn--tone-primary { color: var(--tf-accent-1); }
+.tf-btn.tf-btn-ghost.tf-btn--tone-muted,
+.tf-btn.tf-btn-outline.tf-btn--tone-muted { color: var(--tf-text-3); }
 
 /* =============================================================================
    tf-input
@@ -310,10 +315,10 @@ tf-window [slot="footer"] {
   display: flex;
   align-items: center;
 }
-.tf-input-wrap .tf-input {
-  padding-left: 40px;
-  padding-right: 12px;
-}
+/* Adornments are absolutely positioned over the field; the input reserves
+   horizontal space only for the adornments actually present (via has-* classes),
+   so prefix/placeholder/suffix never overlap. A plain input keeps its base
+   .tf-input padding. */
 .tf-input-wrap .tf-input-icon {
   position: absolute;
   left: 12px;
@@ -325,7 +330,11 @@ tf-window [slot="footer"] {
 }
 .tf-input-wrap:focus-within .tf-input-icon { color: var(--tf-accent-1); }
 
-/* ---------- tf-input adornments — trailing icon + prefix/suffix text ---------- */
+/* Leading icon reserves room on the left. */
+.tf-input-wrap-has-icon .tf-input {
+  padding-left: 40px;
+}
+
 /* Trailing icon: mirror of the leading .tf-input-icon, pinned to the right. */
 .tf-input-wrap .tf-input-icon-trailing {
   left: auto;
@@ -335,37 +344,44 @@ tf-window [slot="footer"] {
   padding-right: 40px;
 }
 
-/* Prefix / suffix inline text adornments (e.g. "$", "kg"). */
+/* Prefix / suffix inline text adornments (e.g. "$", "kg"). They are in-flow
+   flex children of the wrap (not absolutely positioned), so an adornment of any
+   length reserves its own width and the input flows after/before it instead of
+   overlapping. The input takes the remaining space (flex: 1). */
 .tf-input-prefix,
 .tf-input-suffix {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   color: var(--tf-text-3);
   font-size: 13px;
   pointer-events: none;
   white-space: nowrap;
 }
-.tf-input-prefix {
-  position: absolute;
-  left: 12px;
+.tf-input-prefix { padding-left: 12px; }
+.tf-input-suffix { padding-right: 12px; }
+.tf-input-wrap-has-prefix .tf-input,
+.tf-input-wrap-has-suffix .tf-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
-.tf-input-suffix {
-  position: absolute;
-  right: 12px;
-}
-/* Make room for the adornments inside the field. */
+/* With an in-flow prefix the input owns the left edge — drop its default left
+   padding so the caret sits right after the adornment, and add a small gap. */
 .tf-input-wrap-has-prefix .tf-input {
-  padding-left: 32px;
+  padding-left: 8px;
 }
 .tf-input-wrap-has-suffix .tf-input {
+  padding-right: 8px;
+}
+/* When a leading icon coexists with a prefix the icon is still absolute at
+   12px, so the prefix starts after it. */
+.tf-input-wrap-has-icon.tf-input-wrap-has-prefix .tf-input-prefix {
+  padding-left: 36px;
+}
+/* When both a trailing icon (absolute, right:12px) and an in-flow suffix are
+   present, push the suffix left so it clears the icon. */
+.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input-suffix {
   padding-right: 32px;
-}
-/* When both a trailing icon and a suffix are present, stack them. */
-.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input-icon-trailing {
-  right: 40px;
-}
-.tf-input-wrap-has-trailing-icon.tf-input-wrap-has-suffix .tf-input {
-  padding-right: 64px;
 }
 
 /* =============================================================================
@@ -1265,6 +1281,40 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   transform: translateY(0) scale(1);
   filter: blur(0);
   pointer-events: auto;
+}
+/* Inline standalone menu (e.g. SDK Menu component without a trigger): the panel
+   lives in normal flow inside its host instead of floating as an absolute
+   dropdown. controls.css is adopted into the tf-menu shadow root, so
+   :host-context targets the host's inline modifier from inside the shadow. */
+:host-context(.tf-menu--inline) .tf-menu {
+  position: static;
+  opacity: 1;
+  transform: none;
+  filter: none;
+  pointer-events: auto;
+  box-shadow: none;
+}
+:host-context(.tf-menu--inline) .tf-menu .tf-menu-item {
+  opacity: 1;
+  transform: none;
+}
+.tf-menu--inline { display: block; }
+/* Standalone inline menu keeps a menu's natural width and left-aligns instead of
+   stretching to fill a stretch container. */
+.tf-menu-standalone {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  align-self: flex-start;
+  min-width: 200px;
+  max-width: 320px;
+}
+/* The menu items are slotted (light DOM) descendants, so the shadow's
+   `.tf-menu.open .tf-menu-item` reveal rule cannot reach them when the panel is
+   rendered inline. Reveal them here in the document scope for the inline menu. */
+.tf-menu--inline .tf-menu-item {
+  opacity: 1;
+  transform: none;
 }
 .tf-menu-item {
   display: flex;
@@ -5055,193 +5105,57 @@ tf-skeleton {
 /* =============================================================================
    tf-button (0x0401) — chunk 3.3b-1
    ============================================================================= */
+/* Host <tf-button> is layout-neutral: the real, styled button is the inner
+   .tf-btn. The host only provides inline-flex layout; variant/tone/size are
+   handled on .tf-btn (see tf-button.js + the .tf-btn* rules above). */
 .tf-button {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--tf-space-xs);
-  background: transparent;
-  border: 1px solid transparent;
-  cursor: pointer;
-  font: inherit;
-  font-weight: 500;
-  border-radius: var(--tf-radius-sm);
-  white-space: nowrap;
-  user-select: none;
-  position: relative;
+  vertical-align: middle;
 }
-.tf-button:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 2px;
-}
-.tf-button[disabled] {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.tf-button--full-width { width: 100%; }
-
-/* sizes */
-.tf-button--size-xs { padding: var(--tf-space-xxs) var(--tf-space-xs); font-size: 0.75rem; }
-.tf-button--size-sm { padding: var(--tf-space-xs) var(--tf-space-sm);  font-size: 0.875rem; }
-.tf-button--size-md { padding: var(--tf-space-sm) var(--tf-space-md);  font-size: 1rem; }
-.tf-button--size-lg { padding: var(--tf-space-md) var(--tf-space-lg);  font-size: 1.125rem; }
-
-/* densities */
-.tf-button--density-compact { padding-block: var(--tf-space-xxs); }
-.tf-button--density-comfortable { padding-block: var(--tf-space-md); }
-
-/* variants */
-.tf-button--variant-primary {
-  background: var(--tf-accent-1);
-  color: var(--tf-text);
-}
-.tf-button--variant-secondary {
-  background: var(--tf-bg-subtle);
-  color: inherit;
-  border-color: currentColor;
-}
-.tf-button--variant-tertiary {
-  background: transparent;
-  color: var(--tf-accent-1);
-}
-.tf-button--variant-ghost {
-  background: transparent;
-  color: inherit;
-}
-.tf-button--variant-ghost:hover { background: var(--tf-bg-subtle); }
-.tf-button--variant-destructive {
-  background: var(--tf-danger);
-  color: var(--tf-text);
-}
-.tf-button--variant-link {
-  background: transparent;
-  color: var(--tf-accent-1);
-  text-decoration: underline;
-  padding-inline: var(--tf-space-xs);
-}
-
-/* tones — variant gets a tone-aware accent (subtle, only for tertiary/ghost) */
-.tf-button--tone-success.tf-button--variant-tertiary  { color: var(--tf-success); }
-.tf-button--tone-warning.tf-button--variant-tertiary  { color: var(--tf-warning); }
-.tf-button--tone-critical.tf-button--variant-tertiary { color: var(--tf-danger); }
-.tf-button--tone-info.tf-button--variant-tertiary     { color: var(--tf-info); }
-
-/* tones — extend the tone accent to ghost/link variants. Solid variants
-   (primary/secondary/destructive) keep their own colour; tone only tints the
-   text-only variants (tertiary/ghost/link). */
-.tf-button--tone-success.tf-button--variant-ghost,
-.tf-button--tone-success.tf-button--variant-link   { color: var(--tf-success); }
-.tf-button--tone-warning.tf-button--variant-ghost,
-.tf-button--tone-warning.tf-button--variant-link   { color: var(--tf-warning); }
-.tf-button--tone-critical.tf-button--variant-ghost,
-.tf-button--tone-critical.tf-button--variant-link  { color: var(--tf-danger); }
-.tf-button--tone-info.tf-button--variant-ghost,
-.tf-button--tone-info.tf-button--variant-link      { color: var(--tf-info); }
-.tf-button--tone-primary.tf-button--variant-ghost,
-.tf-button--tone-primary.tf-button--variant-link   { color: var(--tf-accent-1); }
-.tf-button--tone-muted.tf-button--variant-ghost,
-.tf-button--tone-muted.tf-button--variant-link     { color: var(--tf-text-3); }
-
-/* loading state — spinner CSS-only przez pseudo-element */
-.tf-button--loading .tf-button__label { visibility: hidden; }
-.tf-button--loading::after {
-  content: '';
-  position: absolute;
-  width: 1em;
-  height: 1em;
-  border: 2px solid currentColor;
-  border-radius: 50%;
-  border-top-color: transparent;
-  animation: tf-button-spin 0.7s linear infinite;
-}
-@keyframes tf-button-spin { to { transform: rotate(360deg); } }
 
 /* =============================================================================
    tf-link-button (0x0404) — chunk 3.3b-3
    ============================================================================= */
-.tf-link-button {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xs);
-  background: transparent;
-  border: 0;
-  padding: var(--tf-space-xxs) var(--tf-space-xs);
-  cursor: pointer;
-  font: inherit;
-  color: var(--tf-accent-1);
-  border-radius: var(--tf-radius-sm);
-}
-.tf-link-button:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 2px;
-}
-.tf-link-button--underline-always { text-decoration: underline; }
-.tf-link-button--underline-never  { text-decoration: none; }
-.tf-link-button--underline-hover  { text-decoration: none; }
-.tf-link-button--underline-hover:hover { text-decoration: underline; }
-.tf-link-button--tone-primary  { color: var(--tf-accent-1); }
-.tf-link-button--tone-success  { color: var(--tf-success); }
-.tf-link-button--tone-warning  { color: var(--tf-warning); }
-.tf-link-button--tone-critical { color: var(--tf-danger); }
-.tf-link-button--tone-info     { color: var(--tf-info); }
-.tf-link-button--tone-muted    { color: var(--tf-text-3); }
-.tf-link-button--tone-neutral  { color: inherit; }
+/* Link-button host is layout-only; the inner ghost .tf-btn paints + carries
+   tone. Underline modifiers target the real button. */
+.tf-link-button { display: inline-flex; }
+.tf-link-button--underline-always .tf-btn { text-decoration: underline; }
+.tf-link-button--underline-never .tf-btn  { text-decoration: none; }
+.tf-link-button--underline-hover .tf-btn  { text-decoration: none; }
+.tf-link-button--underline-hover:hover .tf-btn { text-decoration: underline; }
 .tf-link-button__icon { width: 1em; height: 1em; flex: 0 0 auto; }
 
 /* =============================================================================
    tf-link (0x0405) — chunk 3.3b-3
    ============================================================================= */
-.tf-link {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--tf-space-xxs);
-  color: var(--tf-accent-1);
-}
-.tf-link:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 2px;
-}
-.tf-link--underline-always { text-decoration: underline; }
-.tf-link--underline-never  { text-decoration: none; }
-.tf-link--underline-hover  { text-decoration: none; }
-.tf-link--underline-hover:hover { text-decoration: underline; }
-.tf-link--tone-primary  { color: var(--tf-accent-1); }
-.tf-link--tone-success  { color: var(--tf-success); }
-.tf-link--tone-warning  { color: var(--tf-warning); }
-.tf-link--tone-critical { color: var(--tf-danger); }
-.tf-link--tone-info     { color: var(--tf-info); }
-.tf-link--tone-muted    { color: var(--tf-text-3); }
-.tf-link--tone-neutral  { color: inherit; }
+/* Link host is layout-only; the inner ghost .tf-btn paints + carries tone.
+   Underline modifiers target the real button. */
+.tf-link { display: inline-flex; }
+.tf-link--underline-always .tf-btn { text-decoration: underline; }
+.tf-link--underline-never .tf-btn  { text-decoration: none; }
+.tf-link--underline-hover .tf-btn  { text-decoration: none; }
+.tf-link--underline-hover:hover .tf-btn { text-decoration: underline; }
 .tf-link__icon { width: 1em; height: 1em; flex: 0 0 auto; }
 
 /* =============================================================================
    tf-fab (0x040C) — chunk 3.3b-3
    ============================================================================= */
-.tf-fab {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--tf-space-sm);
-  background: var(--tf-accent-1);
-  color: var(--tf-text);
-  border: 0;
+/* Fab host is layout-only (shape, size, position); the inner .tf-btn-primary
+   paints. The inner button is stretched to fill the host and made round. */
+/* A FAB is always its own intrinsic size — never stretch when it happens to be
+   a flex child of a stretch container. */
+.tf-fab { display: inline-flex; flex: 0 0 auto; align-self: flex-start; }
+.tf-fab .tf-btn {
+  width: 100%;
+  height: 100%;
   border-radius: var(--tf-radius-pill);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
-  cursor: pointer;
-  font: inherit;
-  font-weight: 500;
-}
-.tf-fab:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 3px;
 }
 .tf-fab--size-sm { width: 40px; height: 40px; font-size: 1rem; }
 .tf-fab--size-md { width: 56px; height: 56px; font-size: 1.25rem; }
 .tf-fab--size-lg { width: 64px; height: 64px; font-size: 1.5rem; }
-.tf-fab--extended {
-  width: auto;
-  padding-inline: var(--tf-space-md);
-}
+.tf-fab--extended { width: auto; }
+.tf-fab--extended .tf-btn { padding-inline: var(--tf-space-md); }
 .tf-fab--position-bottom_right {
   position: fixed; bottom: var(--tf-space-lg); right: var(--tf-space-lg);
   z-index: 800;
@@ -5251,15 +5165,6 @@ tf-skeleton {
   z-index: 800;
 }
 .tf-fab--position-inline { position: relative; }
-.tf-fab--tone-primary   { background: var(--tf-accent-1); }
-.tf-fab--tone-success   { background: var(--tf-success); }
-.tf-fab--tone-warning   { background: var(--tf-warning); }
-.tf-fab--tone-critical  { background: var(--tf-danger); }
-.tf-fab--tone-info      { background: var(--tf-info); }
-.tf-fab--tone-muted     { background: var(--tf-text-3); }
-.tf-fab--tone-neutral   { background: var(--tf-bg-inverse); }
-.tf-fab__icon { width: 1em; height: 1em; }
-.tf-fab__label { white-space: nowrap; }
 
 /* =============================================================================
    tf-button-group (0x0403) — chunk 3.3b-4

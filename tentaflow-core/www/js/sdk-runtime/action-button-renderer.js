@@ -110,15 +110,12 @@ function renderButton(component, ctx) {
 
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', VARIANT_MAP[variant] || 'primary');
-  // Tone + variant host classes drive the tone-aware accent CSS
-  // (`.tf-button--tone-*` / `.tf-button--variant-*` in controls.css), mirroring
-  // the LinkButton/Fab convention. Without these the validated tone had no
-  // visual effect.
-  btn.classList.add(`tf-button--variant-${variant}`);
-  btn.classList.add(`tf-button--tone-${tone}`);
+  // Tone is passed as an attribute; tf-button maps it onto the inner .tf-btn so
+  // only the real button is painted (host stays layout-neutral).
+  btn.setAttribute('tone', tone);
   const mappedSize = SIZE_MAP[size];
   if (mappedSize) btn.setAttribute('size', mappedSize);
-  if (fullWidth) btn.style.width = '100%';
+  if (fullWidth) btn.setAttribute('full-width', '');
 
   // Named IconRef → tf-button icon attributes (leading via "icon", trailing via
   // "trailing-icon"), the same mapping action-link-fab uses. Asset/non-named
