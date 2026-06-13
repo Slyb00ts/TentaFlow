@@ -687,3 +687,174 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     }
     alloc::format!("{:016x}", h)
 }
+
+/// Builds the exact chain-hash material `insert_audit` hashes, so verification
+/// recomputes the identical digest. Any drift between these two would make the
+/// chain falsely report as broken.
+fn audit_hash_material(
+    prev_hash: &str,
+    ts: i64,
+    actor: &str,
+    action: &str,
+    target: &str,
+    before: &str,
+    after: &str,
+) -> String {
+    alloc::format!("{prev_hash}|{ts}|{actor}|{action}|{target}|{before}|{after}")
+}
+
+/// One audit-log entry, decoded from the append-only hash-chained table.
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub id: String,
+    pub ts: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub before: String,
+    pub after: String,
+    pub hash: String,
+    pub prev_hash: String,
+}
+
+const AUDIT_COLS: &str = "id, ts, actor, action, target, before, after, hash, prev_hash";
+
+fn row_to_audit(r: &Row) -> AuditRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    AuditRow {
+        id: g(0).as_str().into(),
+        ts: g(1).as_i64(),
+        actor: g(2).as_str().into(),
+        action: g(3).as_str().into(),
+        target: g(4).as_str().into(),
+        before: g(5).as_str().into(),
+        after: g(6).as_str().into(),
+        hash: g(7).as_str().into(),
+        prev_hash: g(8).as_str().into(),
+    }
+}
+
+/// Lists audit entries newest-first, with optional case-insensitive substring
+/// filters on actor/action and an inclusive `since`/`until` unix-second window.
+/// Empty filter strings (and a 0 bound) mean "no constraint on that column".
+/// `limit <= 0` lists all matching rows.
+pub fn list_audit(
+    limit: i64,
+    actor: &str,
+    action: &str,
+    since: i64,
+    until: i64,
+) -> Result<Vec<AuditRow>, AbiError> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<SqlValue> = Vec::new();
+    if !actor.trim().is_empty() {
+        clauses.push(alloc::format!("LOWER(actor) LIKE ?{}", params.len() + 1));
+        params.push(SqlValue::Text(alloc::format!("%{}%", actor.trim().to_lowercase())));
+    }
+    if !action.trim().is_empty() {
+        clauses.push(alloc::format!("LOWER(action) LIKE ?{}", params.len() + 1));
+        params.push(SqlValue::Text(alloc::format!("%{}%", action.trim().to_lowercase())));
+    }
+    if since > 0 {
+        clauses.push(alloc::format!("ts >= ?{}", params.len() + 1));
+        params.push(SqlValue::I64(since));
+    }
+    if until > 0 {
+        clauses.push(alloc::format!("ts <= ?{}", params.len() + 1));
+        params.push(SqlValue::I64(until));
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        alloc::format!("WHERE {}", clauses.join(" AND "))
+    };
+    let limit_sql = if limit > 0 {
+        alloc::format!(" LIMIT ?{}", params.len() + 1)
+    } else {
+        String::new()
+    };
+    if limit > 0 {
+        params.push(SqlValue::I64(limit));
+    }
+    let sql = alloc::format!(
+        "SELECT {AUDIT_COLS} FROM audit_log {where_sql} ORDER BY ts DESC, id DESC{limit_sql}"
+    );
+    let rows = query(&sql, &params)?;
+    Ok(rows.iter().map(row_to_audit).collect())
+}
+
+/// Total number of audit entries (unfiltered) — drives the header counter.
+pub fn count_audit() -> Result<i64, AbiError> {
+    scalar_i64("SELECT COUNT(*) FROM audit_log", &[])
+}
+
+/// Outcome of a full chain re-verification.
+#[derive(Debug, Clone)]
+pub struct ChainStatus {
+    /// True when every row's stored hash matches the recomputed FNV-1a digest
+    /// AND each row's prev_hash equals the previous row's stored hash.
+    pub ok: bool,
+    /// Number of rows checked (genesis-to-head).
+    pub checked: i64,
+    /// 0-based index (oldest = 0) of the first row that fails verification, or
+    /// None when the chain is intact. Only meaningful when `ok == false`.
+    pub first_broken_index: Option<i64>,
+}
+
+/// Recomputes the hash chain genesis-to-head and confirms it is intact. For each
+/// row (oldest first) it (1) recomputes `fnv1a(prev_hash + payload)` and checks
+/// it equals the stored `hash`, and (2) checks `prev_hash` links to the prior
+/// row's stored hash (genesis links to the empty string). Returns the first
+/// 0-based index that breaks, so a silent row edit is pinpointed, not just flagged.
+pub fn verify_audit_chain() -> Result<ChainStatus, AbiError> {
+    // Oldest-first so prev_hash linkage can be checked sequentially.
+    let sql = alloc::format!("SELECT {AUDIT_COLS} FROM audit_log ORDER BY ts ASC, id ASC");
+    let rows: Vec<AuditRow> = query(&sql, &[])?.iter().map(row_to_audit).collect();
+    let mut expected_prev = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        let recomputed = fnv1a_hex(
+            audit_hash_material(
+                &row.prev_hash, row.ts, &row.actor, &row.action, &row.target,
+                &row.before, &row.after,
+            )
+            .as_bytes(),
+        );
+        if recomputed != row.hash || row.prev_hash != expected_prev {
+            return Ok(ChainStatus { ok: false, checked: rows.len() as i64, first_broken_index: Some(i as i64) });
+        }
+        expected_prev = row.hash.clone();
+    }
+    Ok(ChainStatus { ok: true, checked: rows.len() as i64, first_broken_index: None })
+}
+
+// =============================================================================
+// Settings (key/value)
+// =============================================================================
+
+/// Reads a setting value by key, or None when it is absent.
+pub fn get_setting(key: &str) -> Result<Option<String>, AbiError> {
+    let rows = query("SELECT value FROM settings WHERE key = ?1", &[SqlValue::Text(key.into())])?;
+    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+}
+
+/// Reads a setting as i64, falling back to `default` when absent or unparsable.
+pub fn get_setting_i64(key: &str, default: i64) -> i64 {
+    match get_setting(key) {
+        Ok(Some(s)) => s.trim().parse::<i64>().unwrap_or(default),
+        _ => default,
+    }
+}
+
+/// Upserts a setting key/value, stamping updated_at from the SQLite clock.
+pub fn set_setting(key: &str, value: &str) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+        &[
+            SqlValue::Text(key.into()),
+            SqlValue::Text(value.into()),
+            SqlValue::I64(now),
+        ],
+    )
+}

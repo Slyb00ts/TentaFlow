@@ -1431,6 +1431,11 @@ struct AuditState {
     query: String,
     expanded_id: Option<String>,
     cursor: Option<String>,
+    /// Risk class ("A"/"B"/"C") whose retention card is currently in edit mode,
+    /// or None when no card is being edited.
+    retention_editing: Option<String>,
+    /// Working draft for the in-edit retention input (days as typed).
+    retention_draft: String,
 }
 
 impl AuditState {
@@ -1438,7 +1443,8 @@ impl AuditState {
         Self {
             date_preset: String::new(), users: Vec::new(), actions: Vec::new(),
             risk_class: String::new(), result: String::new(), query: String::new(),
-            expanded_id: None, cursor: None,
+            expanded_id: None, cursor: None, retention_editing: None,
+            retention_draft: String::new(),
         }
     }
     fn clear_filters(&mut self) {
@@ -2163,6 +2169,25 @@ fn render_panel(panel_id: &str) {
             value: Value::Text(note),
         }];
         send_slot_content_with_overlay("content", content, Some(overlay));
+    } else if panel_id == "audit" {
+        // Seed the audit filter search box and, when a retention card is being
+        // edited, its bound number input so both mount with the current values.
+        let (query, editing, draft) = with_state(|s| (
+            s.audit.query.clone(),
+            s.audit.retention_editing.clone(),
+            s.audit.retention_draft.clone(),
+        ));
+        let mut entries = vec![StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("audit_search".into())]),
+            value: Value::Text(query),
+        }];
+        if let Some(class) = editing {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key(alloc::format!("retention_input_{}", class.to_lowercase()))]),
+                value: Value::Text(draft),
+            });
+        }
+        send_slot_content_with_overlay("content", content, Some(entries));
     } else if panel_id == "overview" {
         // Seed the activity heatmap's cells into the slot snapshot so the
         // Heatmap mounts with its data already in the store (same pattern as the
@@ -2251,9 +2276,14 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "zone-type-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("detection").to_string(); with_state(|s| { let sel = s.zones.selected_zone_id.clone(); if let Some(id) = sel { if let Some(z) = s.zones.find_zone_mut(&id) { z.zone_type = v; } } }); json!({"ok":true}) }
         "zone-confidence-change" => { let v = params.get("value").and_then(|x| x.as_f64()).unwrap_or(0.6); with_state(|s| { let sel = s.zones.selected_zone_id.clone(); if let Some(id) = sel { if let Some(z) = s.zones.find_zone_mut(&id) { z.min_confidence = v; } } }); json!({"ok":true}) }
         "zone-canvas-pointer" => handle_zone_canvas_pointer(params),
-        "audit-filter-change" => { with_state(|s| { let id = params.get("id").and_then(|x| x.as_str()).unwrap_or(""); match id { "date_preset" => s.audit.date_preset = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), "query" => s.audit.query = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), _ => {} } }); json!({"ok":true}) }
-        "audit-clear-filters" => { with_state(|s| s.audit.clear_filters()); json!({"ok":true}) }
-        "audit-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.audit.expanded_id = if id.is_empty() || s.audit.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); json!({"ok":true}) }
+        "audit-filter-change" => { with_state(|s| { let id = params.get("id").and_then(|x| x.as_str()).unwrap_or(""); match id { "date_preset" => s.audit.date_preset = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), "query" => s.audit.query = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), _ => {} } }); render_panel("audit"); json!({"ok":true}) }
+        "audit-clear-filters" => { with_state(|s| s.audit.clear_filters()); render_panel("audit"); json!({"ok":true}) }
+        "audit-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.audit.expanded_id = if id.is_empty() || s.audit.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); render_panel("audit"); json!({"ok":true}) }
+        "audit-retention-edit" => handle_audit_retention_edit(params),
+        "audit-retention-cancel" => { with_state(|s| { s.audit.retention_editing = None; s.clear_messages(); }); render_panel("audit"); json!({"ok":true}) }
+        "audit-retention-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.audit.retention_draft = v); json!({"ok":true}) }
+        "audit-retention-save" => handle_audit_retention_save(params),
+        "audit-doc-generate" => { let kind = params.get("kind").and_then(|x| x.as_str()).unwrap_or("dokument").to_string(); with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Generowanie dokumentu '{}' zostanie podłączone do backendu zgodności.", kind.to_uppercase())); }); render_panel("audit"); json!({"ok":true}) }
         "evidence-tab-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("active").to_string(); with_state(|s| { s.evidence.tab = match v.as_str() { "archive" => EvidenceTab::Archive, "all" => EvidenceTab::All, _ => EvidenceTab::Active }; }); json!({"ok":true}) }
         "evidence-open" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("evidence_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.evidence.drawer_open_id = if id.is_empty() { None } else { Some(id) }; if s.evidence.drawer_tab.is_empty() { s.evidence.drawer_tab = "summary".into(); } }); json!({"ok":true}) }
         "evidence-close-drawer" => { with_state(|s| { s.evidence.drawer_open_id = None; }); json!({"ok":true}) }
@@ -2751,6 +2781,60 @@ fn handle_alarm_decide(params: &JsonValue) -> JsonValue {
         Err(e) => {
             with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu decyzji: {}", abi_message(e))));
             render_panel("alarms");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Enters retention edit mode for a class, seeding the draft with the current
+/// (override-or-default) value so the input mounts pre-filled.
+fn handle_audit_retention_edit(params: &JsonValue) -> JsonValue {
+    let class = params.get("class").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+    let default = RETENTION_DEFAULTS.iter().find(|(c, _, _)| *c == class).map(|(_, _, d)| *d).unwrap_or(183);
+    let current = retention_days(&class, default);
+    with_state(|s| {
+        s.clear_messages();
+        s.audit.retention_editing = if class.is_empty() { None } else { Some(class.clone()) };
+        s.audit.retention_draft = alloc::format!("{}", current);
+    });
+    render_panel("audit");
+    json!({"ok":true})
+}
+
+/// Persists a retention override (db::set_setting), enforcing the 183-day
+/// compliance floor for the audit log, then leaves edit mode.
+fn handle_audit_retention_save(params: &JsonValue) -> JsonValue {
+    let class = params.get("class").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+    with_state(|s| s.clear_messages());
+    let draft = with_state(|s| s.audit.retention_draft.clone());
+    let days: i64 = match draft.trim().parse() {
+        Ok(d) if d >= 183 => d,
+        Ok(_) => {
+            with_state(|s| s.error_message = Some("Retencja nie może być krótsza niż 183 dni (wymóg zgodności).".into()));
+            render_panel("audit");
+            return json!({"ok":false,"error":"below floor"});
+        }
+        Err(_) => {
+            with_state(|s| s.error_message = Some("Podaj liczbę dni.".into()));
+            render_panel("audit");
+            return json!({"ok":false,"error":"not a number"});
+        }
+    };
+    match db::set_setting(&retention_setting_key(&class), &alloc::format!("{}", days)) {
+        Ok(_) => {
+            let before = serde_json::to_string(&json!({"class": class})).unwrap_or_default();
+            let after = serde_json::to_string(&json!({"class": class, "retention_days": days})).unwrap_or_default();
+            let _ = db::insert_audit(ALARM_OPERATOR, "retention_change", &retention_setting_key(&class), &before, &after);
+            with_state(|s| {
+                s.audit.retention_editing = None;
+                s.success_message = Some(alloc::format!("Zapisano retencję klasy {}: {} dni.", class, days));
+            });
+            render_panel("audit");
+            json!({"ok":true,"days":days})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu retencji: {}", abi_message(e))));
+            render_panel("audit");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
     }
@@ -4928,34 +5012,301 @@ fn build_zones_content() -> Component {
     stack_v(vec![messages, toolbar, main_area])
 }
 
+/// Default retention (in days) per risk class. Compliance floor for the audit
+/// log itself is 183 days; these per-class defaults sit above it for the highest
+/// classes and are user-overridable through the retention cards.
+const RETENTION_DEFAULTS: &[(&str, &str, i64)] = &[
+    ("A", "Niskie ryzyko", 730),
+    ("B", "Średnie ryzyko", 365),
+    ("C", "Wysokie ryzyko", 183),
+];
+
+/// Settings key for a class's retention override (e.g. `retention_class_a_days`).
+fn retention_setting_key(class: &str) -> String {
+    alloc::format!("retention_class_{}_days", class.to_lowercase())
+}
+
+/// Resolves the effective retention for a class: the persisted override if set,
+/// otherwise the compiled-in default.
+fn retention_days(class: &str, default: i64) -> i64 {
+    db::get_setting_i64(&retention_setting_key(class), default)
+}
+
 fn build_audit_content() -> Component {
     let messages = build_messages_section();
-    let toolbar = stack_h(vec![
+    let (query, expanded_id, editing) = with_state(|s| (
+        s.audit.query.clone(),
+        s.audit.expanded_id.clone(),
+        s.audit.retention_editing.clone(),
+    ));
+
+    // Header: title + live chain-integrity chip computed from real rows.
+    let chain = db::verify_audit_chain();
+    let total = db::count_audit().unwrap_or(0);
+    let chain_chip = match &chain {
+        Ok(c) if c.ok => chip_toned_icon("Łańcuch zweryfikowany", "success", "check"),
+        Ok(c) => chip_toned_icon(
+            &alloc::format!("Łańcuch uszkodzony (#{} )", c.first_broken_index.map(|i| i + 1).unwrap_or(0)),
+            "critical", "alert",
+        ),
+        Err(_) => chip_toned_icon("Weryfikacja niedostępna", "warning", "alert"),
+    };
+    let header = stack_h(vec![
         heading(2, "Audyt i RODO"),
-        button("Wyczyść filtry", "audit-clear-filters", "ghost"),
-        button("Eksport", "audit-export", "secondary"),
+        chip_toned(&alloc::format!("{} wpisów", total), if total > 0 { "info" } else { "muted" }),
+        chain_chip,
     ]);
-    let fixture_rows: &[(&str, &str, &str, &str, &str, &str)] = &[
-        ("ae-001", "2026-05-19T17:42:11Z", "admin", "addon-install", "B", "success"),
-        ("ae-002", "2026-05-19T17:30:42Z", "admin", "camera-add", "C", "success"),
-        ("ae-003", "2026-05-19T16:55:03Z", "operator1", "evidence-create", "C", "success"),
-        ("ae-004", "2026-05-19T16:21:08Z", "viewer1", "frame-pickup", "C", "success"),
-        ("ae-005", "2026-05-19T15:48:55Z", "admin", "settings-modify", "B", "success"),
-        ("ae-009", "2026-05-19T11:20:33Z", "anon", "login", "A", "denied"),
-    ];
-    let cols = vec![
-        Value::Text("Czas".into()), Value::Text("Użytkownik".into()),
-        Value::Text("Akcja".into()), Value::Text("Ryzyko".into()),
-        Value::Text("Wynik".into()),
-    ];
-    let rows: Vec<Value> = fixture_rows.iter().map(|(_, ts, user, action, risk, result)| {
-        Value::Array(vec![
-            Value::Text((*ts).into()), Value::Text((*user).into()),
-            Value::Text((*action).into()), Value::Text((*risk).into()),
-            Value::Text((*result).into()),
+
+    // Retention-per-risk-class cards (real values from settings, with an inline
+    // edit affordance that persists via db::set_setting).
+    let retention_cards: Vec<Component> = RETENTION_DEFAULTS.iter()
+        .map(|(class, label, default)| build_retention_card(class, label, retention_days(class, *default), editing.as_deref() == Some(*class)))
+        .collect();
+    let mut retention_children = vec![heading(3, "Retencja per klasa ryzyka")];
+    retention_children.push(grid(3, retention_cards));
+    retention_children.push(text_styled("Minimalna retencja logu audytu wymagana przez RODO/AI Act to 183 dni.", "caption"));
+    let retention_section = card(None, retention_children);
+
+    // Hash-chain log — real rows, newest first, with optional substring filter.
+    let entries = db::list_audit(200, &query, "", 0, 0).unwrap_or_default();
+    let log_body = if entries.is_empty() {
+        empty_state(
+            "Brak wpisów audytu",
+            Some("Każda decyzja operatora (np. w Centrum alarmów) zapisuje tu odporny na manipulację wpis hash-chain."),
+            Some("shield"),
+        )
+    } else {
+        let rows: Vec<Component> = entries.iter()
+            .map(|e| build_audit_row(e, expanded_id.as_deref() == Some(e.id.as_str())))
+            .collect();
+        stack_v_gap("xs", rows)
+    };
+    let mut log_children = vec![stack_h(vec![
+        heading(3, "Hash-chain audit log (WORM)"),
+        audit_search_input(),
+        if query.is_empty() { divider() } else { button("Wyczyść filtry", "audit-clear-filters", "ghost") },
+    ])];
+    log_children.push(log_body);
+    log_children.push(text_styled(
+        "Każdy wpis łączy się hashem (FNV-1a) z poprzednim — append-only, edycja wiersza zrywa łańcuch.",
+        "caption",
+    ));
+    let log_section = card(None, log_children);
+
+    // Document generator (placeholders — render per mockup, no backend yet).
+    let doc_section = card(None, vec![
+        heading(3, "Generator dokumentów"),
+        grid(3, vec![
+            build_doc_card("DPIA", "Data Protection Impact Assessment", "Szablon RODO art. 35 — deployment, detektory, retencja.", "dpia"),
+            build_doc_card("FRIA", "Fundamental Rights Impact Assessment", "Szablon AI Act art. 27 — wymagany dla klasy C (high-risk).", "fria"),
+            build_doc_card("Klauzula informacyjna", "Tabliczka monitoring + AI", "PDF zgodny z wytycznymi UODO · PL/EN/UA.", "signage"),
+        ]),
+    ]);
+
+    stack_v(vec![messages, header, retention_section, log_section, doc_section])
+}
+
+/// One retention card: class badge, label, day count, and either an "Edytuj"
+/// button or (when in edit mode) a bound number input + Zapisz/Anuluj.
+fn build_retention_card(class: &str, label: &str, days: i64, editing: bool) -> Component {
+    let tone = match class { "A" => "success", "B" => "warning", "C" => "critical", _ => "info" };
+    let head = stack_h_gap("xs", vec![
+        chip_toned(class, tone),
+        text_styled(label, "overline"),
+    ]);
+    let body: Component = if editing {
+        let mut params = CborMap::default();
+        params.0.push(("class".into(), Value::Text(class.into())));
+        let save = button_with_params("Zapisz", "audit-retention-save", "primary", params);
+        let mut cancel_params = CborMap::default();
+        cancel_params.0.push(("class".into(), Value::Text(class.into())));
+        let cancel = button_with_params("Anuluj", "audit-retention-cancel", "ghost", cancel_params);
+        stack_v_gap("xs", vec![
+            retention_input(class),
+            stack_h_gap("xs", vec![save, cancel]),
         ])
-    }).collect();
-    stack_v(vec![messages, toolbar, card(None, vec![table(cols, rows)])])
+    } else {
+        let mut params = CborMap::default();
+        params.0.push(("class".into(), Value::Text(class.into())));
+        stack_v_gap("xs", vec![
+            heading(2, &alloc::format!("{} dni", days)),
+            button_with_params("Edytuj", "audit-retention-edit", "ghost", params),
+        ])
+    };
+    card(None, vec![head, body])
+}
+
+/// Number input for a retention edit, bound to a per-class store key seeded with
+/// the current value when the card enters edit mode.
+fn retention_input(class: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let key = alloc::format!("retention_input_{}", class.to_lowercase());
+    let mut comp = Input {
+        r#type: InputType::Number,
+        bind_path: StatePath::new(vec![PathSegment::Key(key.clone())]),
+        placeholder: Some(lit("dni")),
+        label: Some(lit("Retencja (dni, min. 183)")),
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }.into_component(&key).expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("class".into(), Value::Text(class.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "audit-retention-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// One audit-log entry, rendered as a clickable card. Collapsed: time, actor,
+/// action chip, target, truncated chain hash. Expanded: prev/this hash + the
+/// before/after JSON snapshots that prove what changed.
+fn build_audit_row(e: &db::AuditRow, expanded: bool) -> Component {
+    let action_chip = chip_toned(&e.action, audit_action_tone(&e.action));
+    let mut expand_params = CborMap::default();
+    expand_params.0.push(("id".into(), Value::Text(e.id.clone())));
+    let toggle = button_with_params(
+        if expanded { "Zwiń" } else { "Szczegóły" },
+        "audit-row-expand",
+        "ghost",
+        expand_params,
+    );
+    let head = stack_h_gap("xs", vec![
+        text_styled(&format_alarm_datetime(e.ts), "mono"),
+        text_styled(if e.actor.is_empty() { "system" } else { &e.actor }, "body_strong"),
+        action_chip,
+        text_styled(&audit_target_label(e), "caption"),
+        text_styled(&truncate_hash(&e.hash), "mono"),
+        toggle,
+    ]);
+
+    let mut children = vec![head];
+    if expanded {
+        children.push(divider());
+        children.push(key_value(vec![
+            ("Cel", e.target.as_str()),
+            ("Hash", e.hash.as_str()),
+            ("Poprzedni hash", if e.prev_hash.is_empty() { "(genesis)" } else { e.prev_hash.as_str() }),
+        ]));
+        children.push(text_styled("Przed:", "overline"));
+        children.push(text_styled(if e.before.is_empty() { "—" } else { &e.before }, "code"));
+        children.push(text_styled("Po:", "overline"));
+        children.push(text_styled(if e.after.is_empty() { "—" } else { &e.after }, "code"));
+    }
+
+    Card {
+        variant: if expanded { CardVariant::Filled } else { CardVariant::Outlined },
+        padding: Spacing::Sm,
+        gap: Spacing::Sm,
+        radius: RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::None,
+        accent: None,
+        children,
+        interactive: false,
+        clickable: false,
+    }.into_component(next_id()).expect("Card")
+}
+
+/// Action → chip tone. Decisions/grants are highlighted; purges/denials are red.
+fn audit_action_tone(action: &str) -> &'static str {
+    match action {
+        "alarm_decision" => "warning",
+        "retention_change" => "info",
+        a if a.contains("purge") || a.contains("delete") || a.contains("deny") => "critical",
+        _ => "muted",
+    }
+}
+
+/// Friendly target label for the collapsed row: short id when the target looks
+/// like a generated id, otherwise the raw target.
+fn audit_target_label(e: &db::AuditRow) -> String {
+    if e.target.is_empty() {
+        "—".into()
+    } else if e.target.contains('-') {
+        alloc::format!("cel: {}", short_id(&e.target))
+    } else {
+        alloc::format!("cel: {}", e.target)
+    }
+}
+
+/// Truncates a chain hash to the mockup's `prefix…suffix` monospace form.
+fn truncate_hash(hash: &str) -> String {
+    if hash.len() <= 12 {
+        hash.to_string()
+    } else {
+        alloc::format!("{}…{}", &hash[..4], &hash[hash.len() - 4..])
+    }
+}
+
+/// Search box for the audit log, bound to `audit_search` and dispatching the
+/// existing `audit-filter-change` (id=query) action on input.
+fn audit_search_input() -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: InputType::Search,
+        bind_path: StatePath::new(vec![PathSegment::Key("audit_search".into())]),
+        placeholder: Some(lit("Filtruj po operatorze lub akcji...")),
+        label: None,
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("search"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }.into_component("audit_search").expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("id".into(), Value::Text("query".into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "audit-filter-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    with_a11y_label(comp, "Filtruj audyt")
+}
+
+/// One document-generator card (DPIA/FRIA/signage). The generate button is a
+/// placeholder action surfaced through a toast until a backend generator exists.
+fn build_doc_card(title: &str, subtitle: &str, desc: &str, kind: &str) -> Component {
+    let mut params = CborMap::default();
+    params.0.push(("kind".into(), Value::Text(kind.into())));
+    card(None, vec![
+        stack_h_gap("xs", vec![chip_toned_icon(title, "info", "shield"), text_styled(subtitle, "body_strong")]),
+        text_styled(desc, "caption"),
+        button_with_params("Generuj", "audit-doc-generate", "primary", params),
+    ])
 }
 
 fn build_evidence_content() -> Component {
