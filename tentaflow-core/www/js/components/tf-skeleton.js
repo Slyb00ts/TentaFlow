@@ -34,8 +34,11 @@ class TfSkeleton extends HTMLElement {
 
   _update() {
     const variant = this.getAttribute('variant') || 'rect';
-    const width = this.getAttribute('width');
-    const height = this.getAttribute('height');
+    // Bare numeric attrs (width="40") are treated as px so they yield a valid
+    // CSS length; explicit units (e.g. "60%", "2rem") pass through unchanged.
+    const toLen = (v) => (v != null && /^\d+(\.\d+)?$/.test(v) ? `${v}px` : v);
+    const width = toLen(this.getAttribute('width'));
+    const height = toLen(this.getAttribute('height'));
     const lines = parseInt(this.getAttribute('lines') || '3', 10);
 
     this._wrap.innerHTML = '';

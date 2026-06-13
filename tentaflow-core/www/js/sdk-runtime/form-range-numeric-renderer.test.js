@@ -75,7 +75,7 @@ test('Slider renders <tf-slider> with min/max/step attrs + inner range input', (
     [4, { kind: 'literal', value: 'Vol' }],
     [5, true], [8, 'primary'],
   ])));
-  assert(el.classList.contains('tf-slider--tone-primary'));
+  assert(el.classList.contains('tf-slider-control--tone-primary'));
   assertEq(el.querySelector('.tf-slider__label').textContent, 'Vol');
   const slider = el.querySelector('tf-slider');
   assertEq(slider.getAttribute('min'), '0');

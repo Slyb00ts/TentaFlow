@@ -750,10 +750,10 @@ if (kv) kv.entries = [
 
 const table = document.getElementById('demo-table');
 if (table) table.rows = [
-  { camera: 'C-01', location: 'Brama główna', status: 'Online', fps: 30, detectors: 'D1, D2' },
-  { camera: 'C-04', location: 'Wjazd północny', status: 'Online', fps: 25, detectors: 'D1, D3, D5' },
-  { camera: 'C-12', location: 'Magazyn', status: 'Offline', fps: 0, detectors: '—' },
-  { camera: 'C-15', location: 'Parking', status: 'Online', fps: 30, detectors: 'D6' },
+  { camera: 'C-01', location: 'Brama główna', status: { status: 'ok', label: 'Online', dot: true }, fps: 30, detectors: 'D1, D2' },
+  { camera: 'C-04', location: 'Wjazd północny', status: { status: 'ok', label: 'Online', dot: true }, fps: 25, detectors: 'D1, D3, D5' },
+  { camera: 'C-12', location: 'Magazyn', status: { status: 'err', label: 'Offline', dot: true }, fps: 0, detectors: '—' },
+  { camera: 'C-15', location: 'Parking', status: { status: 'ok', label: 'Online', dot: true }, fps: 30, detectors: 'D6' },
 ];
 
 const list = document.getElementById('demo-list');

@@ -5918,7 +5918,10 @@ tf-skeleton {
    tf-slider / tf-range-slider / tf-slider-row / tf-numeric / tf-currency
    chunk 3.3c-5
    ============================================================================ */
-.tf-slider,
+/* tf-slider-control is the SDK-runtime wrapper around an inner <tf-slider>; it
+   intentionally does NOT reuse the bare .tf-slider class, which styles the
+   native range <input> itself (display:flex would break the native thumb). */
+.tf-slider-control,
 .tf-slider-row,
 .tf-range-slider,
 .tf-numeric,
@@ -5952,12 +5955,12 @@ tf-skeleton {
   flex: 1 1 auto;
   accent-color: var(--tf-accent-1);
 }
-.tf-slider--tone-success .tf-slider__input,
+.tf-slider-control--tone-success .tf-slider__input,
 .tf-slider-row--tone-success .tf-slider-row__input,
 .tf-range-slider--tone-success .tf-range-slider__input {
   accent-color: var(--tf-success);
 }
-.tf-slider--tone-critical .tf-slider__input,
+.tf-slider-control--tone-critical .tf-slider__input,
 .tf-slider-row--tone-critical .tf-slider-row__input,
 .tf-range-slider--tone-critical .tf-range-slider__input {
   accent-color: var(--tf-danger);
