@@ -65,7 +65,7 @@ function renderCalendarMonth(component, ctx) {
   const firstDay = requireEnum(ctx.readField(component.fields, 3), DAYS_OF_WEEK, 'CalendarMonth.first_day_of_week');
 
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-calendar');
+  wrapper.classList.add('tf-calendar-month');
   wrapper.setAttribute('role', 'grid');
   wrapper.setAttribute('aria-label', 'Calendar');
 

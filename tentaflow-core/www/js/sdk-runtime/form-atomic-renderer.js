@@ -163,7 +163,7 @@ function renderToggle(component, ctx) {
   );
 
   const wrapper = document.createElement('label');
-  wrapper.classList.add('tf-toggle');
+  wrapper.classList.add('tf-toggle-field');
   wrapper.classList.add(`tf-toggle--size-${size}`);
   wrapper.classList.add(`tf-toggle--tone-${tone}`);
   wrapper.classList.add(`tf-toggle--label-${labelPosition}`);

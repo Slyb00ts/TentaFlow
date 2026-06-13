@@ -178,23 +178,23 @@ function spinnerFields({
   return f;
 }
 
-test('Spinner renders <tf-spinner> with size attribute and tone class', () => {
+test('Spinner renders <tf-spinner> with size and tone attributes', () => {
   setup();
   const engine = makeEngine(makeStore());
   const el = engine.render(comp(SPINNER_TAG, spinnerFields({ size: 'lg', tone: 'success' })));
   document.body.appendChild(el);
   assertEq(el.tagName, 'TF-SPINNER');
   assertEq(el.getAttribute('size'), 'lg');
-  assert(el.classList.contains('tf-spinner--tone-success'));
+  assertEq(el.getAttribute('tone'), 'success');
 });
 
-test('Spinner variant maps to a modifier class on the host', () => {
+test('Spinner variant maps to a variant attribute on the host', () => {
   setup();
   const engine = makeEngine(makeStore());
   for (const variant of ['default', 'ring', 'dots', 'bars']) {
     const el = engine.render(comp(SPINNER_TAG, spinnerFields({ variant })));
     document.body.appendChild(el);
-    assert(el.classList.contains(`tf-spinner--${variant}`), `variant ${variant}`);
+    assertEq(el.getAttribute('variant'), variant, `variant ${variant}`);
   }
 });
 

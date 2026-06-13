@@ -168,7 +168,7 @@ function renderAvatar(component, ctx) {
   const tone = toneRaw == null ? null : requireEnum(toneRaw, TONES, 'Avatar.tone');
 
   const wrapper = document.createElement('span');
-  wrapper.classList.add('tf-avatar');
+  wrapper.classList.add('tf-avatar-block');
   wrapper.classList.add(`tf-avatar--size-${size}`);
   wrapper.classList.add(`tf-avatar--shape-${shape}`);
   if (tone) wrapper.classList.add(`tf-avatar--tone-${tone}`);
@@ -266,7 +266,7 @@ function renderAvatarGroup(component, ctx) {
   if (overflow > 0) {
     const more = document.createElement('span');
     more.classList.add('tf-avatar-group__more');
-    more.classList.add('tf-avatar');
+    more.classList.add('tf-avatar-block');
     more.classList.add(`tf-avatar--size-${size}`);
     more.classList.add('tf-avatar--shape-circle');
     more.setAttribute('aria-label', `${overflow} more`);
@@ -392,7 +392,7 @@ function renderTimeline(component, ctx) {
   const groupByDay = requireBool(ctx.readField(component.fields, 4), 'Timeline.group_by_day');
 
   const wrapper = document.createElement('ol');
-  wrapper.classList.add('tf-timeline');
+  wrapper.classList.add('tf-timeline-track');
   wrapper.classList.add(`tf-timeline--${orientation}`);
   wrapper.classList.add(`tf-timeline--density-${density}`);
 

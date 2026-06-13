@@ -698,6 +698,8 @@ fn text_sample(field: &str) -> String {
         "trigger_chars" => "@".into(),
         // CodeBlock validates the language tag grammar.
         "language" => "rust".into(),
+        // CalendarMonth.month is validated as YYYY-MM by its renderer.
+        "month" => "2026-06".into(),
         // Image sources must actually load in the browser (a dead https URL
         // produces ERR_NAME_NOT_RESOLVED console noise) — use an inline 1x1
         // PNG, which the asset-src validators accept.
