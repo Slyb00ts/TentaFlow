@@ -1271,6 +1271,23 @@ fn toggle(label: &str, field_id: &str) -> Component {
     }.into_component(field_id).expect("Toggle")
 }
 
+/// Single-handle slider bound to `field_id`, showing its current value. Used by
+/// the profiles builder's quick-params (FPS sampling, detection confidence).
+fn slider(label: &str, field_id: &str, min: f64, max: f64, step: f64) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Slider;
+    Slider {
+        bind_path: StatePath::new(vec![PathSegment::Key(field_id.into())]),
+        min,
+        max,
+        step,
+        label: Some(lit(label)),
+        show_value: true,
+        format: None,
+        marks: None,
+        tone: Tone::Primary,
+    }.into_component(field_id).expect("Slider")
+}
+
 fn filter_chips(items: Vec<FilterChipDef>, _active: &str) -> Component {
     FilterChipsComp {
         chips: items,
@@ -1583,13 +1600,79 @@ impl ZonesState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProfilesView { Grid, List }
+/// State for the Profiles tab. `category` holds the active risk-class filter
+/// chip (A/B/C; empty = all). The remaining fields back the analytic-profile
+/// builder form (left/right of the mockup): a draft profile being created or the
+/// snapshot of the profile under edit. `builder_visible` gates whether the
+/// builder section is shown above the library table.
+struct ProfilesState {
+    category: String,
+    builder_visible: bool,
+    // id of the profile being edited; None = creating a new one.
+    editing_id: Option<String>,
+    // id of the profile selected for deletion (arms the confirm bar).
+    pending_remove: Option<String>,
+    // Builder form fields.
+    name: String,
+    flow_id: String,
+    risk_class: String,
+    schedule: String,
+    fps: f64,
+    min_confidence: f64,
+    // Selected camera ids assigned to the profile.
+    cameras: Vec<String>,
+}
 
-struct ProfilesState { view_mode: ProfilesView, category: String }
 impl ProfilesState {
-    const fn new() -> Self { Self { view_mode: ProfilesView::Grid, category: String::new() } }
-    fn category_or_all(&self) -> &str { if self.category.is_empty() { "all" } else { &self.category } }
+    const fn new() -> Self {
+        Self {
+            category: String::new(),
+            builder_visible: false,
+            editing_id: None,
+            pending_remove: None,
+            name: String::new(),
+            flow_id: String::new(),
+            risk_class: String::new(),
+            schedule: String::new(),
+            fps: 5.0,
+            min_confidence: 0.65,
+            cameras: Vec::new(),
+        }
+    }
+
+    fn category_or_all(&self) -> &str {
+        if self.category.is_empty() { "all" } else { &self.category }
+    }
+
+    /// Resets the builder form to a clean "create" draft.
+    fn reset_form(&mut self) {
+        self.editing_id = None;
+        self.name.clear();
+        self.flow_id = "tv-realtime-adr".into();
+        self.risk_class = "A".into();
+        self.schedule = "24/7".into();
+        self.fps = 5.0;
+        self.min_confidence = 0.65;
+        self.cameras.clear();
+    }
+
+    /// Loads an existing profile row into the builder for editing.
+    fn load_for_edit(&mut self, p: &db::ProfileRow, camera_ids: Vec<String>) {
+        self.editing_id = Some(p.id.clone());
+        self.name = p.name.clone();
+        self.flow_id = if p.flow_id.is_empty() { "tv-realtime-adr".into() } else { p.flow_id.clone() };
+        self.risk_class = if p.risk_class.is_empty() { "A".into() } else { p.risk_class.clone() };
+        self.schedule = if p.schedule.is_empty() { "24/7".into() } else { p.schedule.clone() };
+        self.cameras = camera_ids;
+    }
+
+    fn toggle_camera(&mut self, id: &str) {
+        if let Some(pos) = self.cameras.iter().position(|c| c == id) {
+            self.cameras.remove(pos);
+        } else {
+            self.cameras.push(id.to_string());
+        }
+    }
 }
 
 struct AlarmsState { selected_id: Option<String>, severity_filter: String, sound_muted: bool }
@@ -1791,6 +1874,10 @@ static STATE: Mutex<PanelState> = Mutex::new(PanelState::new());
 /// cameras Table mounts with its rows already in the slot's state_overlay
 /// snapshot (avoids a first empty rebuild that would flash the empty-state).
 static PENDING_CAMERA_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
+/// Same mechanism as `PENDING_CAMERA_ROWS` but for the profiles library Table:
+/// rows seeded into the slot's state_overlay so the Table mounts populated.
+static PENDING_PROFILE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
@@ -2034,6 +2121,21 @@ fn render_panel(panel_id: &str) {
                 value: rows,
             }]);
         send_slot_content_with_overlay("content", content, overlay);
+    } else if panel_id == "profiles" {
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_PROFILE_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("profiles_rows".into())]),
+                value: rows,
+            });
+        }
+        // When the builder is open, seed the bound form keys so the inputs,
+        // selects and sliders mount with the draft / edited profile's values.
+        if with_state(|s| s.profiles.builder_visible) {
+            entries.extend(profile_builder_overlay());
+        }
+        let overlay = if entries.is_empty() { None } else { Some(entries) };
+        send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "overview" {
         // Seed the activity heatmap's cells into the slot snapshot so the
         // Heatmap mounts with its data already in the store (same pattern as the
@@ -2088,9 +2190,17 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
             render_panel(&target);
             json!({"ok":true, "panel_id": target})
         }
-        "profile-view-toggle" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or(""); with_state(|s| { s.profiles.view_mode = if v == "list" { ProfilesView::List } else { ProfilesView::Grid }; }); json!({"ok":true}) }
-        "profile-filter-category" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.profiles.category = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
-        "profile-add-show" => { with_state(|s| { s.success_message = Some("Kreator profilu — wkrótce (wymaga backendu profili).".into()); }); json!({"ok":true}) }
+        "profiles-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.profiles.category = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
+        "profile-add-show" => { with_state(|s| { s.clear_messages(); s.profiles.builder_visible = true; s.profiles.pending_remove = None; s.profiles.reset_form(); }); render_panel("profiles"); json!({"ok":true}) }
+        "profile-builder-cancel" => { with_state(|s| { s.profiles.builder_visible = false; s.profiles.editing_id = None; s.clear_messages(); }); render_panel("profiles"); json!({"ok":true}) }
+        "profile-field-change" => handle_profile_field_change(params),
+        "profile-camera-toggle" => { let id = params.get("camera_id").and_then(|x| x.as_str()).or_else(|| params.get("row_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); if !id.is_empty() { with_state(|s| s.profiles.toggle_camera(&id)); } render_panel("profiles"); json!({"ok":true}) }
+        "profile-add-submit" => handle_profile_add_submit(),
+        "profile-edit" => handle_profile_edit(params),
+        "profile-toggle-enabled" => handle_profile_toggle_enabled(params),
+        "profile-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("profile_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.profiles.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("profiles"); json!({"ok":true}) }
+        "profile-remove-cancel" => { with_state(|s| { s.profiles.pending_remove = None; s.clear_messages(); }); render_panel("profiles"); json!({"ok":true}) }
+        "profile-remove" => handle_profile_remove(params),
         "alarm-select" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.alarms.selected_id = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
         "alarm-acknowledge" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| { s.success_message = Some(alloc::format!("Potwierdzono alarm {}.", id)); }); json!({"ok":true}) }
         "alarm-acknowledge-all" => { with_state(|s| { s.success_message = Some("Potwierdzono wszystkie niepotwierdzone.".into()); s.alarms.selected_id = None; }); json!({"ok":true}) }
@@ -2409,6 +2519,165 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     match db::delete_camera(&camera_id) {
         Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+// =============================================================================
+// Profile action handlers
+// =============================================================================
+
+/// Mirrors a single builder field into backend profile state on change. The
+/// value also lives in the store via the input's bind_path, so this only keeps
+/// the backend authoritative for submit. Sliders carry a numeric value; text /
+/// select fields carry a string.
+fn handle_profile_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value_str = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value_num = params.get("value").and_then(|v| v.as_f64());
+    with_state(|s| match field {
+        "profile_name" => { if let Some(v) = value_str { s.profiles.name = v; } }
+        "profile_flow_id" => { if let Some(v) = value_str { s.profiles.flow_id = v; } }
+        "profile_risk_class" => { if let Some(v) = value_str { s.profiles.risk_class = v; } }
+        "profile_schedule" => { if let Some(v) = value_str { s.profiles.schedule = v; } }
+        "profile_fps" => { if let Some(v) = value_num { s.profiles.fps = v; } }
+        "profile_min_conf" => { if let Some(v) = value_num { s.profiles.min_confidence = v; } }
+        _ => {}
+    });
+    json!({"ok":true})
+}
+
+/// Creates a new profile (or updates the one under edit) from the builder form.
+fn handle_profile_add_submit() -> JsonValue {
+    let (editing_id, name, flow_id, risk_class, schedule, cameras) = with_state(|s| (
+        s.profiles.editing_id.clone(),
+        s.profiles.name.trim().to_string(),
+        s.profiles.flow_id.trim().to_string(),
+        s.profiles.risk_class.trim().to_string(),
+        s.profiles.schedule.trim().to_string(),
+        s.profiles.cameras.clone(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    if name.is_empty() || name.chars().count() > 60 {
+        with_state(|s| s.error_message = Some("Nazwa profilu musi mieć 1–60 znaków.".into()));
+        render_panel("profiles");
+        return json!({"ok":false,"error":"invalid name"});
+    }
+    let cameras_json = serde_json::to_string(&cameras).unwrap_or_else(|_| "[]".into());
+
+    let result = match editing_id {
+        Some(id) => {
+            // Edit in place: re-read the row for its timestamps, then update.
+            match db::get_profile(&id) {
+                Ok(Some(mut row)) => {
+                    row.name = name.clone();
+                    row.flow_id = flow_id;
+                    row.risk_class = risk_class;
+                    row.schedule = schedule;
+                    row.cameras = cameras_json;
+                    db::update_profile(&row).map(|_| id)
+                }
+                Ok(None) => {
+                    with_state(|s| s.error_message = Some("Profil nie istnieje.".into()));
+                    render_panel("profiles");
+                    return json!({"ok":false,"error":"not found"});
+                }
+                Err(e) => Err(e),
+            }
+        }
+        None => {
+            let new_profile = db::NewProfile {
+                name: name.clone(),
+                flow_id,
+                risk_class,
+                schedule,
+                cameras: cameras_json,
+                enabled: true,
+            };
+            db::insert_profile(&new_profile)
+        }
+    };
+
+    match result {
+        Ok(id) => {
+            with_state(|s| {
+                s.profiles.builder_visible = false;
+                s.profiles.editing_id = None;
+                s.success_message = Some(alloc::format!("Profil zapisany ({}).", id));
+            });
+            render_panel("profiles");
+            json!({"ok":true,"profile_id":id})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu profilu: {}", abi_message(e))));
+            render_panel("profiles");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Opens the builder pre-filled with the selected profile's persisted values.
+fn handle_profile_edit(params: &JsonValue) -> JsonValue {
+    let id = params.get("row_id").and_then(|v| v.as_str())
+        .or_else(|| params.get("profile_id").and_then(|v| v.as_str()))
+        .unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty profile_id"});
+    }
+    match db::get_profile(&id) {
+        Ok(Some(row)) => {
+            let camera_ids = parse_profile_cameras(&row.cameras);
+            with_state(|s| {
+                s.clear_messages();
+                s.profiles.pending_remove = None;
+                s.profiles.builder_visible = true;
+                s.profiles.load_for_edit(&row, camera_ids);
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
+        Ok(None) => { with_state(|s| s.error_message = Some("Profil nie istnieje.".into())); render_panel("profiles"); json!({"ok":false,"error":"not found"}) }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Flips the selected profile's enabled flag (drives the Dashboard "Aktywne
+/// detektory" KPI, which counts profiles WHERE enabled = 1).
+fn handle_profile_toggle_enabled(params: &JsonValue) -> JsonValue {
+    let id = params.get("row_id").and_then(|v| v.as_str())
+        .or_else(|| params.get("profile_id").and_then(|v| v.as_str()))
+        .unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty profile_id"});
+    }
+    with_state(|s| s.clear_messages());
+    match db::get_profile(&id) {
+        Ok(Some(row)) => {
+            let next = !row.enabled;
+            match db::toggle_profile(&id, next) {
+                Ok(_) => {
+                    with_state(|s| s.success_message = Some(if next { "Profil włączony.".into() } else { "Profil wyłączony.".into() }));
+                    render_panel("profiles");
+                    json!({"ok":true,"enabled":next})
+                }
+                Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+            }
+        }
+        Ok(None) => { with_state(|s| s.error_message = Some("Profil nie istnieje.".into())); render_panel("profiles"); json!({"ok":false,"error":"not found"}) }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+fn handle_profile_remove(params: &JsonValue) -> JsonValue {
+    let id = params.get("profile_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        with_state(|s| s.error_message = Some("Wybierz profil do usunięcia.".into()));
+        return json!({"ok":false,"error":"empty profile_id"});
+    }
+    match db::delete_profile(&id) {
+        Ok(_) => { with_state(|s| { s.profiles.pending_remove = None; s.success_message = Some("Profil usunięty.".into()); }); render_panel("profiles"); json!({"ok":true}) }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
 }
 
@@ -3750,29 +4019,381 @@ fn build_search_content() -> Component {
     stack_v(vec![messages, toolbar, search_input, results])
 }
 
+/// Input bound to a store key that also mirrors its value into backend profile
+/// state on every keystroke (tagged `field`), so submit validation reads the
+/// authoritative value even if the user clicks "Zapisz" before blur.
+fn profile_input(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "profile-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Select bound to a store key that mirrors its picked value into backend
+/// profile state on change (tagged `field`).
+fn profile_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    let mut comp = select(label, options, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "profile-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Slider bound to a store key that mirrors its value into backend profile state
+/// on change (tagged `field`).
+fn profile_slider(label: &str, field: &str, min: f64, max: f64, step: f64) -> Component {
+    let mut comp = slider(label, field, min, max, step);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "profile-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Risk-class badge matching the mockup tones: A = success (green), B = warning
+/// (amber), C = critical (red); anything else = neutral.
+fn risk_badge(risk_class: &str) -> Component {
+    let tone = match risk_class {
+        "A" => "success",
+        "B" => "warning",
+        "C" => "danger",
+        _ => "info",
+    };
+    let label = if risk_class.is_empty() { "—" } else { risk_class };
+    chip_toned(label, match tone { "danger" => "critical", other => other })
+}
+
+/// Available analytic Flows the profile can bind to. In the mockup this list is
+/// filtered to Flows that expose TentaVision vision capabilities; here it is a
+/// stable set the builder writes verbatim into `flow_id`.
+fn profile_flow_options() -> Vec<SelectOption> {
+    ["tv-realtime-adr", "tv-realtime-public", "tv-security-night", "tv-anpr", "tv-reid-historical"]
+        .iter()
+        .map(|f| SelectOption {
+            value: SelectValue::Text((*f).into()),
+            label: lit(f),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        })
+        .collect()
+}
+
+fn profile_risk_options() -> Vec<SelectOption> {
+    [("A", "A — bezosobowe / długa retencja"), ("B", "B — średnie ryzyko"), ("C", "C — wrażliwe / krótka retencja")]
+        .iter()
+        .map(|(v, l)| SelectOption {
+            value: SelectValue::Text((*v).into()),
+            label: lit(l),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        })
+        .collect()
+}
+
+fn profile_schedule_options() -> Vec<SelectOption> {
+    ["24/7", "06:00–22:00", "22:00–06:00", "04:30–24:00"]
+        .iter()
+        .map(|s| SelectOption {
+            value: SelectValue::Text((*s).into()),
+            label: lit(s),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        })
+        .collect()
+}
+
+/// Renders the camera-assignment list: every real camera from SQLite as a
+/// toggle button. Assigned cameras show a "success" status chip; clicking a row
+/// toggles membership via `profile-camera-toggle`.
+fn build_profile_camera_assignment(cameras: &[db::CameraRow], assigned: &[String]) -> Component {
+    if cameras.is_empty() {
+        return empty_state(
+            "Brak kamer",
+            Some("Dodaj kamerę w zakładce Kamery, aby przypisać ją do profilu."),
+            Some("cameras"),
+        );
+    }
+    let rows: Vec<Component> = cameras
+        .iter()
+        .map(|c| {
+            let is_on = assigned.iter().any(|a| a == &c.id);
+            let mut params = CborMap::default();
+            params.0.push(("camera_id".into(), Value::Text(c.id.clone())));
+            let label = if is_on { alloc::format!("✓ {}", c.name) } else { c.name.clone() };
+            let variant = if is_on { "primary" } else { "secondary" };
+            let toggle_btn = button_with_params(&label, "profile-camera-toggle", variant, params);
+            let status = chip_toned(&c.status, if c.status == "online" { "success" } else { "warning" });
+            stack_h(vec![toggle_btn, status])
+        })
+        .collect();
+    stack_v_gap("sm", rows)
+}
+
+/// One profile-library Table row keyed by `profile_id`.
+fn profile_table_row_value(p: &db::ProfileRow, camera_count: usize) -> Value {
+    let flow = if p.flow_id.is_empty() { "—".to_string() } else { p.flow_id.clone() };
+    let schedule = if p.schedule.is_empty() { "—".to_string() } else { p.schedule.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("profile_id".into()), Value::Text(p.id.clone())),
+        (Value::Text("name".into()), Value::Text(p.name.clone())),
+        (Value::Text("flow".into()), Value::Text(flow)),
+        (Value::Text("risk".into()), Value::Text(p.risk_class.clone())),
+        (Value::Text("cameras".into()), Value::Text(alloc::format!("{}", camera_count))),
+        (Value::Text("schedule".into()), Value::Text(schedule)),
+        (Value::Text("enabled".into()), Value::Text(if p.enabled { "tak".into() } else { "nie".into() })),
+    ];
+    Value::Map(entries)
+}
+
+fn profile_table_column(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable: true,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
+}
+
+fn build_profiles_table() -> Component {
+    let columns = vec![
+        profile_table_column("name", "Nazwa", ColumnRender::Text),
+        profile_table_column("flow", "Flow", ColumnRender::Text),
+        profile_table_column("risk", "Klasa", ColumnRender::Chip),
+        profile_table_column("cameras", "Kamery", ColumnRender::Text),
+        profile_table_column("schedule", "Harmonogram", ColumnRender::Text),
+        profile_table_column("enabled", "Aktywny", ColumnRender::Chip),
+    ];
+
+    // Per-row actions: edit opens the builder pre-filled, toggle flips enabled,
+    // and Usuń arms the delete-confirmation bar (the real delete runs from it).
+    let edit_action = button("Edytuj", "profile-edit", "secondary");
+    let toggle_action = button("Włącz/wyłącz", "profile-toggle-enabled", "ghost");
+    let remove_action = button("Usuń", "profile-row-select", "destructive");
+
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("profiles_rows".into())]),
+        row_key_field: "profile_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![edit_action, toggle_action, remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// Confirmation bar for deleting the selected profile.
+fn build_profile_remove_confirm(profile_id: &str, profiles: &[db::ProfileRow]) -> Component {
+    let name = profiles
+        .iter()
+        .find(|p| p.id == profile_id)
+        .map(|p| p.name.as_str())
+        .unwrap_or(profile_id);
+    let mut params = CborMap::default();
+    params.0.push(("profile_id".into(), Value::Text(profile_id.into())));
+    let confirm_btn = button_with_params("Usuń", "profile-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "profile-remove-cancel", "ghost");
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć profil \"{}\"?", name), "body_strong"),
+        text("Tej operacji nie można cofnąć."),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// The analytic-profile builder: left column (Flow + quick params), right column
+/// (profile config + camera assignment). Mirrors the m04 mockup's `.col-2`.
+fn build_profile_builder(cameras: &[db::CameraRow]) -> Component {
+    let (name, flow_id, risk_class, schedule, assigned, editing) = with_state(|s| (
+        s.profiles.name.clone(),
+        s.profiles.flow_id.clone(),
+        s.profiles.risk_class.clone(),
+        s.profiles.schedule.clone(),
+        s.profiles.cameras.clone(),
+        s.profiles.editing_id.is_some(),
+    ));
+
+    // LEFT: Flow assignment + quick params (overrides to Flow inputs).
+    let left = card(Some("Flow przypisany do profilu"), vec![
+        text("Lista Flow filtrowana do tych, które używają capabilities TentaVision (vision.detect, vision.ocr, video.recording)."),
+        profile_select("Flow", profile_flow_options(), "profile_flow_id"),
+        heading(4, "Quick params — overrides do Flow inputs"),
+        profile_slider("FPS sampling kamery", "profile_fps", 1.0, 15.0, 1.0),
+        profile_slider("Min. próg detekcji", "profile_min_conf", 0.0, 1.0, 0.05),
+        text("Quick params zapisują się jako overrides do inputs Flow. Aby zmienić strukturę grafu — otwórz w FlowBuilder."),
+    ]);
+
+    // RIGHT: profile config + camera assignment.
+    let right = card(Some("Konfiguracja profilu"), vec![
+        profile_input("Nazwa", "np. ADR-brama", "profile_name"),
+        profile_select("Klasa ryzyka", profile_risk_options(), "profile_risk_class"),
+        stack_h(vec![text("Aktualna klasa:"), risk_badge(&risk_class)]),
+        profile_select("Harmonogram", profile_schedule_options(), "profile_schedule"),
+        heading(4, "Kamery w profilu"),
+        build_profile_camera_assignment(cameras, &assigned),
+    ]);
+
+    let _ = (name, flow_id, schedule);
+
+    let save_label = if editing { "Zapisz zmiany" } else { "Utwórz profil" };
+    let actions = stack_h(vec![
+        button(save_label, "profile-add-submit", "primary"),
+        button("Anuluj", "profile-builder-cancel", "ghost"),
+    ]);
+
+    card(None, vec![
+        grid(2, vec![left, right]),
+        actions,
+    ])
+}
+
 fn build_profiles_content() -> Component {
     let messages = build_messages_section();
-    let category = with_state(|s| s.profiles.category_or_all().to_string());
+    let list_result = db::list_profiles();
+    let (category, builder_visible) = with_state(|s| (s.profiles.category_or_all().to_string(), s.profiles.builder_visible));
+
+    let mut children = vec![messages];
+
     let chips = filter_chips(
         vec![
-            FilterChipDef { id: "all".into(), label: lit("all"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "person".into(), label: lit("person"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "vehicle".into(), label: lit("vehicle"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "face".into(), label: lit("face"), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "all".into(), label: lit("Wszystkie"), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "A".into(), label: lit("Klasa A"), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "B".into(), label: lit("Klasa B"), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "C".into(), label: lit("Klasa C"), icon: None, badge: None, count_path: None },
         ],
         &category,
     );
     let toolbar = stack_h(vec![
         heading(2, "Profile analityczne"),
         chips,
-        button("Dodaj profil", "profile-add-show", "primary"),
+        button("Nowy profil", "profile-add-show", "primary"),
     ]);
-    let placeholder_grid = grid(3, vec![
-        card(Some("Profil #1"), vec![avatar("P1", "lg"), text("Osoba — pracownik")]),
-        card(Some("Profil #2"), vec![avatar("P2", "lg"), text("Pojazd — ADR")]),
-        card(Some("Profil #3"), vec![avatar("P3", "lg"), text("Twarz — VIP")]),
-    ]);
-    stack_v(vec![messages, toolbar, placeholder_grid])
+    children.push(toolbar);
+
+    // A DB/permission error must never be masked as "no profiles".
+    let profiles = match list_result {
+        Ok(p) => p,
+        Err(e) => {
+            children.push(alert(&alloc::format!("Nie udało się pobrać profili: {}", abi_message(e)), "critical"));
+            return stack_v(children);
+        }
+    };
+
+    // Cameras for the builder's assignment list and the library's per-row count.
+    let cameras = db::list_cameras().unwrap_or_default();
+
+    if builder_visible {
+        children.push(build_profile_builder(&cameras));
+    }
+
+    // Delete-confirmation bar above the table once a row is armed.
+    if let Some(pending) = with_state(|s| s.profiles.pending_remove.clone()) {
+        if profiles.iter().any(|p| p.id == pending) {
+            children.push(build_profile_remove_confirm(&pending, &profiles));
+        } else {
+            with_state(|s| s.profiles.pending_remove = None);
+        }
+    }
+
+    let active_filter = if category == "all" { "" } else { category.as_str() };
+    let filtered: Vec<&db::ProfileRow> = profiles
+        .iter()
+        .filter(|p| active_filter.is_empty() || p.risk_class == active_filter)
+        .collect();
+
+    if profiles.is_empty() {
+        children.push(empty_state(
+            "Brak profili analitycznych",
+            Some("Utwórz pierwszy profil: wybierz Flow, klasę ryzyka i przypisz kamery."),
+            Some("brain"),
+        ));
+    } else {
+        let rows: Vec<Value> = filtered
+            .iter()
+            .map(|p| profile_table_row_value(p, profile_camera_count(p)))
+            .collect();
+        if let Ok(mut g) = PENDING_PROFILE_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
+        children.push(build_profiles_table());
+    }
+
+    stack_v(children)
+}
+
+/// Parses a profile's `cameras` JSON array into a list of camera ids.
+fn parse_profile_cameras(cameras_json: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(cameras_json).unwrap_or_default()
+}
+
+/// Number of cameras assigned to a profile (length of its `cameras` JSON array).
+fn profile_camera_count(p: &db::ProfileRow) -> usize {
+    parse_profile_cameras(&p.cameras).len()
+}
+
+/// Seeds the builder's bound store keys from current backend profile state so
+/// the form mounts with the draft (create) or loaded (edit) values in place.
+fn profile_builder_overlay() -> Vec<StateEntry> {
+    with_state(|s| {
+        let p = &s.profiles;
+        let key = |k: &str, v: Value| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(k.into())]),
+            value: v,
+        };
+        vec![
+            key("profile_name", Value::Text(p.name.clone())),
+            key("profile_flow_id", Value::Text(p.flow_id.clone())),
+            key("profile_risk_class", Value::Text(p.risk_class.clone())),
+            key("profile_schedule", Value::Text(p.schedule.clone())),
+            key("profile_fps", Value::F64(p.fps)),
+            key("profile_min_conf", Value::F64(p.min_confidence)),
+        ]
+    })
 }
 
 fn build_reid_content() -> Component {
