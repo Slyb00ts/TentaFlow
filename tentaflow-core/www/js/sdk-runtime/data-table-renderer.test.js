@@ -124,8 +124,10 @@ test('Table renders tf-table + tf-column with shadow thead/tbody', () => {
   assertEq(sr.querySelectorAll('thead th').length, 1);
   assertEq(sr.querySelector('thead th').textContent, 'Name');
   assertEq(sr.querySelectorAll('tbody tr').length, 2);
-  assert(el.classList.contains('tf-table--variant-default'));
-  assert(el.classList.contains('tf-table--density-default'));
+  // variant/density now ride as attributes on the inner <tf-table> (mirrored
+  // into its shadow table), not as classes on the light-DOM shell wrapper.
+  assertEq(el.querySelector('tf-table').getAttribute('variant'), 'default');
+  assertEq(el.querySelector('tf-table').getAttribute('density'), 'default');
 });
 
 test('Table cell content resolved from nested field_path', () => {
@@ -738,7 +740,9 @@ test('Table sticky_header adds wrapper class, BigInt sticky_columns accepted', (
     stickyHeader: true,
     stickyColumns: 1n,
   })));
-  assert(el.classList.contains('tf-table--sticky-header'));
+  // sticky-header is a modifier on the light-DOM shell wrapper (renamed from
+  // the old .tf-table-* class that collided with the real <table>).
+  assert(el.classList.contains('tf-table-shell--sticky-header'));
 });
 
 // ============================================================================
