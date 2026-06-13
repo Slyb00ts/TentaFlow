@@ -1484,65 +1484,31 @@ impl EvidenceState {
 }
 
 struct SettingsState {
-    tab: String,
-    fields: Vec<(String, String)>,
-    notification_channel: String,
-    selected_addon_id: String,
-    access_overrides: Vec<AccessOverride>,
-}
-
-#[derive(Clone)]
-struct AccessOverride {
-    addon_id: String,
-    role: String,
-    permission: String,
-    granted: bool,
+    // Working edits keyed by the stable setting key (see the SETTINGS field
+    // catalog). A key present here overrides what was loaded from the DB until
+    // the user saves; on save every entry is written via db::set_setting and the
+    // buffer is cleared.
+    edits: Vec<(String, String)>,
 }
 
 impl SettingsState {
     const fn new() -> Self {
-        Self {
-            tab: String::new(), fields: Vec::new(), notification_channel: String::new(),
-            selected_addon_id: String::new(), access_overrides: Vec::new(),
-        }
+        Self { edits: Vec::new() }
     }
-    fn tab_or_default(&self) -> &str {
-        if self.tab.is_empty() { "general" } else { &self.tab }
-    }
-    fn notification_channel_or_default(&self) -> &str {
-        if self.notification_channel.is_empty() { "slack" } else { &self.notification_channel }
-    }
-    fn selected_addon_or_default(&self) -> &str {
-        if self.selected_addon_id.is_empty() { "tentavision" } else { &self.selected_addon_id }
-    }
-    fn field(&self, tab: &str, field_id: &str) -> Option<&str> {
-        let key = alloc::format!("{}::{}", tab, field_id);
-        self.fields.iter().find(|(k, _)| k == &key).map(|(_, v)| v.as_str())
-    }
-    fn set_field(&mut self, tab: &str, field_id: &str, value: String) {
-        let key = alloc::format!("{}::{}", tab, field_id);
-        if let Some(slot) = self.fields.iter_mut().find(|(k, _)| k == &key) {
+    /// Records a pending edit for `key` (overwrites any prior pending value).
+    fn set_edit(&mut self, key: &str, value: String) {
+        if let Some(slot) = self.edits.iter_mut().find(|(k, _)| k == key) {
             slot.1 = value;
         } else {
-            self.fields.push((key, value));
+            self.edits.push((key.into(), value));
         }
     }
-    fn access_granted(&self, addon_id: &str, role: &str, permission: &str) -> Option<bool> {
-        self.access_overrides.iter()
-            .find(|o| o.addon_id == addon_id && o.role == role && o.permission == permission)
-            .map(|o| o.granted)
+    /// Returns the pending edit for `key`, if any.
+    fn edit(&self, key: &str) -> Option<&str> {
+        self.edits.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
-    fn set_access(&mut self, addon_id: &str, role: &str, permission: &str, granted: bool) {
-        if let Some(o) = self.access_overrides.iter_mut().find(|o| {
-            o.addon_id == addon_id && o.role == role && o.permission == permission
-        }) {
-            o.granted = granted;
-        } else {
-            self.access_overrides.push(AccessOverride {
-                addon_id: addon_id.to_string(), role: role.to_string(),
-                permission: permission.to_string(), granted,
-            });
-        }
+    fn clear_edits(&mut self) {
+        self.edits.clear();
     }
 }
 
@@ -2188,6 +2154,11 @@ fn render_panel(panel_id: &str) {
             });
         }
         send_slot_content_with_overlay("content", content, Some(entries));
+    } else if panel_id == "settings" {
+        // Seed every settings control's bound store key from the DB (or default,
+        // or the pending edit) so each field mounts showing its current value
+        // and persists across reopen / process restart.
+        send_slot_content_with_overlay("content", content, Some(settings_overlay()));
     } else if panel_id == "overview" {
         // Seed the activity heatmap's cells into the slot snapshot so the
         // Heatmap mounts with its data already in the store (same pattern as the
@@ -2287,10 +2258,9 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "evidence-tab-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("active").to_string(); with_state(|s| { s.evidence.tab = match v.as_str() { "archive" => EvidenceTab::Archive, "all" => EvidenceTab::All, _ => EvidenceTab::Active }; }); json!({"ok":true}) }
         "evidence-open" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("evidence_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.evidence.drawer_open_id = if id.is_empty() { None } else { Some(id) }; if s.evidence.drawer_tab.is_empty() { s.evidence.drawer_tab = "summary".into(); } }); json!({"ok":true}) }
         "evidence-close-drawer" => { with_state(|s| { s.evidence.drawer_open_id = None; }); json!({"ok":true}) }
-        "settings-tab-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("tab_id").and_then(|x| x.as_str())).unwrap_or("general").to_string(); with_state(|s| s.settings.tab = v); json!({"ok":true}) }
-        "settings-field-change" => { let tab = params.get("tab").and_then(|x| x.as_str()).unwrap_or("general").to_string(); let field = params.get("field").and_then(|x| x.as_str()).or_else(|| params.get("id").and_then(|x| x.as_str())).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| { if field == "notification_channel" { s.settings.notification_channel = value.clone(); }
-                if !field.is_empty() { s.settings.set_field(&tab, &field, value); } }); json!({"ok":true}) }
-        "settings-save" => { let tab = params.get("tab").and_then(|x| x.as_str()).unwrap_or("general").to_string(); with_state(|s| { s.success_message = Some(alloc::format!("Zapis ustawień '{}' — wymaga settings_set_v1.", tab)); }); json!({"ok":true}) }
+        "settings-field-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, value)); } json!({"ok":true}) }
+        "settings-toggle-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let on = params.get("value").and_then(|x| x.as_bool()).or_else(|| params.get("checked").and_then(|x| x.as_bool())).unwrap_or(false); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, if on { "1".into() } else { "0".into() })); } json!({"ok":true}) }
+        "settings-save" => handle_settings_save(),
         "onboarding-next" => { with_state(|s| { if s.onboarding.step < 3 { s.onboarding.step += 1; } }); json!({"ok":true}) }
         "onboarding-prev" => { with_state(|s| { if s.onboarding.step > 0 { s.onboarding.step -= 1; } }); json!({"ok":true}) }
         "onboarding-finish" => { with_state(|s| { s.success_message = Some("Onboarding zakończony.".into()); }); json!({"ok":true}) }
@@ -2788,6 +2758,84 @@ fn handle_alarm_decide(params: &JsonValue) -> JsonValue {
 
 /// Enters retention edit mode for a class, seeding the draft with the current
 /// (override-or-default) value so the input mounts pre-filled.
+/// Persists every pending settings edit via db::set_setting, validating numeric
+/// fields, then appends ONE audit_log summary row (action `settings_change`)
+/// listing the changed keys with redacted before/after snapshots so secrets
+/// never land in the chain. Clears the edit buffer and shows a success banner.
+fn handle_settings_save() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    let edits = with_state(|s| s.settings.edits.clone());
+    if edits.is_empty() {
+        with_state(|s| s.success_message = Some("Brak zmian do zapisania.".into()));
+        render_panel("settings");
+        return json!({"ok":true,"changed":0});
+    }
+
+    // Validate numeric fields before writing anything (all-or-nothing on parse).
+    for (key, value) in &edits {
+        if let Some(f) = settings_all_fields().find(|f| f.key == key) {
+            if f.kind == SettingKind::Number && value.trim().parse::<i64>().is_err() {
+                with_state(|s| s.error_message = Some(alloc::format!("Pole '{}' wymaga liczby.", f.label)));
+                render_panel("settings");
+                return json!({"ok":false,"error":"not a number"});
+            }
+        }
+    }
+
+    let mut changed: Vec<(String, String, String)> = Vec::new();
+    for (key, value) in &edits {
+        let prev = db::get_setting(key).ok().flatten().unwrap_or_default();
+        if prev == *value {
+            continue;
+        }
+        match db::set_setting(key, value) {
+            Ok(_) => changed.push((key.clone(), prev, value.clone())),
+            Err(e) => {
+                with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu '{}': {}", key, abi_message(e))));
+                render_panel("settings");
+                return json!({"ok":false,"error":alloc::format!("{}",e)});
+            }
+        }
+    }
+
+    if changed.is_empty() {
+        with_state(|s| { s.settings.clear_edits(); s.success_message = Some("Ustawienia bez zmian.".into()); });
+        render_panel("settings");
+        return json!({"ok":true,"changed":0});
+    }
+
+    // One summary audit row. before/after carry per-key snapshots with secret
+    // values redacted so the hash-chain never stores credentials in clear text.
+    let secret = |key: &str| settings_all_fields()
+        .find(|f| f.key == key)
+        .map(|f| f.kind == SettingKind::Secret)
+        .unwrap_or(false);
+    let redact = |key: &str, v: &str| -> JsonValue {
+        if v.is_empty() { json!("") }
+        else if secret(key) { json!("<redacted>") }
+        else { json!(v) }
+    };
+    let before: serde_json::Map<String, JsonValue> = changed.iter()
+        .map(|(k, prev, _)| (k.clone(), redact(k, prev))).collect();
+    let after: serde_json::Map<String, JsonValue> = changed.iter()
+        .map(|(k, _, next)| (k.clone(), redact(k, next))).collect();
+    let _ = db::insert_audit(
+        ALARM_OPERATOR,
+        "settings_change",
+        &alloc::format!("{} ustawień", changed.len()),
+        &serde_json::to_string(&JsonValue::Object(before)).unwrap_or_default(),
+        &serde_json::to_string(&JsonValue::Object(after)).unwrap_or_default(),
+    );
+
+    let count = changed.len();
+    with_state(|s| {
+        s.settings.clear_edits();
+        s.success_message = Some(alloc::format!("Zapisano {} ustawień.", count));
+    });
+    render_panel("settings");
+    json!({"ok":true,"changed":count})
+}
+
 fn handle_audit_retention_edit(params: &JsonValue) -> JsonValue {
     let class = params.get("class").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
     let default = RETENTION_DEFAULTS.iter().find(|(c, _, _)| *c == class).map(|(_, _, d)| *d).unwrap_or(183);
@@ -5341,47 +5389,311 @@ fn build_evidence_content() -> Component {
     stack_v(vec![messages, toolbar, card(None, vec![table(cols, rows)])])
 }
 
+/// The kind of a settings field — drives both the rendered control and how the
+/// stored "1"/"0" or free-text value is decoded back into the bound store key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingKind {
+    Text,
+    Secret,
+    Number,
+    Toggle,
+    Select,
+}
+
+/// One configurable setting: stable storage `key`, its UI `label`, the control
+/// `kind`, the default applied on first run (empty DB), and (for Select) the
+/// list of `(value, label)` options. Every field reads from / writes to the
+/// settings table via db::get_setting / db::set_setting under `key`.
+struct SettingField {
+    key: &'static str,
+    label: &'static str,
+    kind: SettingKind,
+    default: &'static str,
+    options: &'static [(&'static str, &'static str)],
+}
+
+const fn sf(key: &'static str, label: &'static str, kind: SettingKind, default: &'static str) -> SettingField {
+    SettingField { key, label, kind, default, options: &[] }
+}
+
+const fn sf_select(key: &'static str, label: &'static str, default: &'static str, options: &'static [(&'static str, &'static str)]) -> SettingField {
+    SettingField { key, label, kind: SettingKind::Select, default, options }
+}
+
+const INFERENCE_BACKENDS: &[(&str, &str)] = &[
+    ("tensorrt", "TensorRT 9.x (GPU)"),
+    ("openvino", "OpenVINO (CPU/iGPU)"),
+    ("onnx", "ONNX Runtime (CPU fallback)"),
+];
+
+const BACKPRESSURE_POLICIES: &[(&str, &str)] = &[
+    ("drop_frame", "Drop frame (preferowane dla Tier 2)"),
+    ("queue", "Kolejkuj klatki (Tier 0/1)"),
+    ("block", "Blokuj producenta"),
+];
+
+const HSM_DEVICES: &[(&str, &str)] = &[
+    ("yubihsm2", "Yubikey HSM2"),
+    ("softhsm", "SoftHSM (dev)"),
+];
+
+const ANCHORING_MODES: &[(&str, &str)] = &[
+    ("disabled", "Wyłączone"),
+    ("ots_btc", "BTC mainnet (OpenTimestamps)"),
+];
+
+const LEGAL_PROFILES: &[(&str, &str)] = &[
+    ("commercial_private", "Komercja prywatna (D4 zablokowany)"),
+    ("public_transport", "Transport publiczny — operator"),
+    ("airport_station", "Lotnisko / dworzec — operator"),
+    ("authorized_services", "Służby uprawnione (wymaga manifestu)"),
+];
+
+/// Storage & retention section.
+const STORAGE_FIELDS: &[SettingField] = &[
+    sf("storage_recordings_dir", "Lokalizacja nagrań", SettingKind::Text, "/mnt/tentavision/recordings"),
+    sf("storage_disk_limit", "Limit dyskowy", SettingKind::Text, "4 TB"),
+    sf("storage_vector_index_dir", "Lokalizacja indeksu wektorów", SettingKind::Text, "/mnt/tentavision/qdrant"),
+    sf("storage_worm_bucket", "WORM bucket (S3-immutable)", SettingKind::Text, "s3://tentavision-worm/audit"),
+    sf("storage_retention_a_days", "Retencja klasa A (dni)", SettingKind::Number, "30"),
+    sf("storage_retention_b_days", "Retencja klasa B (dni)", SettingKind::Number, "14"),
+    sf("storage_retention_c_days", "Retencja klasa C (dni)", SettingKind::Number, "7"),
+];
+
+/// Inference runtime section.
+const RUNTIME_FIELDS: &[SettingField] = &[
+    sf_select("runtime_backend", "Backend", "tensorrt", INFERENCE_BACKENDS),
+    sf("runtime_max_concurrent_models", "Maks. równoczesnych modeli", SettingKind::Number, "6"),
+    sf_select("runtime_backpressure", "Backpressure policy", "drop_frame", BACKPRESSURE_POLICIES),
+    sf("runtime_batch_size", "Rozmiar batcha", SettingKind::Number, "8"),
+    sf("runtime_warmup_enabled", "Model warmup (200 inferencji)", SettingKind::Toggle, "1"),
+    sf("runtime_hot_reload_enabled", "Hot reload (A/B shadow, rollback < 60s)", SettingKind::Toggle, "1"),
+];
+
+/// Notifications & integrations section.
+const NOTIFY_FIELDS: &[SettingField] = &[
+    sf("notify_webhook_enabled", "Webhook → flow-engine", SettingKind::Toggle, "1"),
+    sf("notify_webhook_url", "Webhook URL", SettingKind::Secret, "https://flow.tentaflow.local/hook/tentavision"),
+    sf("notify_sms_enabled", "SMS (Twilio)", SettingKind::Toggle, "0"),
+    sf("notify_sms_target", "SMS numer", SettingKind::Secret, ""),
+    sf("notify_email_enabled", "Email (alarmy krytyczne)", SettingKind::Toggle, "1"),
+    sf("notify_email_target", "Email odbiorcy", SettingKind::Text, "dyspozytor@depo-warszawa.pl"),
+    sf("notify_slack_enabled", "Slack", SettingKind::Toggle, "0"),
+    sf("notify_slack_channel", "Slack channel", SettingKind::Text, "#tentavision-alerts"),
+    sf("notify_webpush_enabled", "Web push (operator)", SettingKind::Toggle, "1"),
+    sf("notify_quiet_hours_enabled", "Wyciszanie nocne 22:00–06:00", SettingKind::Toggle, "0"),
+];
+
+/// Licenses & keys section.
+const LICENSE_FIELDS: &[SettingField] = &[
+    sf("license_pro_key", "TentaVision Pro license", SettingKind::Secret, ""),
+    sf_select("license_hsm_device", "HSM device", "softhsm", HSM_DEVICES),
+    sf("license_tsa_url", "TSA RFC 3161", SettingKind::Text, "https://freetsa.org/tsr"),
+    sf_select("license_anchoring", "Anchoring blockchain", "disabled", ANCHORING_MODES),
+    sf("license_vault_rotation_days", "Camera vault rotacja (dni)", SettingKind::Number, "90"),
+];
+
+/// Returns the persisted value for a field, applying its pending edit (if the
+/// user changed it this session) over the stored DB value over its default.
+fn setting_value(f: &SettingField) -> String {
+    if let Some(v) = with_state(|s| s.settings.edit(f.key).map(|x| x.to_string())) {
+        return v;
+    }
+    db::get_setting(f.key).ok().flatten().unwrap_or_else(|| f.default.to_string())
+}
+
+/// Renders one settings field as the control matching its kind, bound to a store
+/// key (`set_<key>`) seeded from the DB via the panel's state_overlay.
+fn settings_control(f: &SettingField) -> Component {
+    let store_key = alloc::format!("set_{}", f.key);
+    match f.kind {
+        SettingKind::Text => settings_text_input(f.label, &store_key, f.key, false),
+        SettingKind::Secret => settings_text_input(f.label, &store_key, f.key, true),
+        SettingKind::Number => settings_number_input(f.label, &store_key, f.key),
+        SettingKind::Toggle => settings_toggle(f.label, &store_key, f.key),
+        SettingKind::Select => {
+            let opts: Vec<SelectOption> = f.options.iter().map(|(v, l)| SelectOption {
+                value: SelectValue::Text((*v).into()),
+                label: lit(l),
+                icon: None, disabled: false, group_id: None, description: None,
+            }).collect();
+            settings_select(f.label, opts, &store_key, f.key)
+        }
+    }
+}
+
+/// Text/secret input committing each keystroke to the in-WASM edit buffer via
+/// `settings-field-change` (tagged with the setting key), so values survive tab
+/// switches before the explicit save.
+fn settings_text_input(label: &str, store_key: &str, setting_key: &str, secret: bool) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: if secret { InputType::Password } else { InputType::Text },
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
+        placeholder: None,
+        label: Some(lit(label)),
+        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
+        validators: vec![], max_length: None, min_length: None, pattern: None,
+        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        size: InputSize::Md,
+    }.into_component(store_key).expect("Input");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "settings-field-change".into(),
+            params: settings_key_params(setting_key),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Number input committing to the edit buffer on each change.
+fn settings_number_input(label: &str, store_key: &str, setting_key: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: InputType::Number,
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
+        placeholder: None,
+        label: Some(lit(label)),
+        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
+        validators: vec![], max_length: None, min_length: None, pattern: None,
+        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        size: InputSize::Md,
+    }.into_component(store_key).expect("Input");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "settings-field-change".into(),
+            params: settings_key_params(setting_key),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Select committing the picked value to the edit buffer on change.
+fn settings_select(label: &str, options: Vec<SelectOption>, store_key: &str, setting_key: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Select;
+    let mut comp = Select {
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
+        options, placeholder: None, label: Some(lit(label)),
+        searchable: false, clearable: false, virtualize: false,
+        disabled: None, size: InputSize::Md, groups: None,
+    }.into_component(store_key).expect("Select");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "settings-field-change".into(),
+            params: settings_key_params(setting_key),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Toggle committing "1"/"0" to the edit buffer on change.
+fn settings_toggle(label: &str, store_key: &str, setting_key: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Toggle;
+    let mut comp = Toggle {
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
+        label: Some(lit(label)),
+        hint: None, size: ToggleSize::Md, tone: Tone::Primary, disabled: None,
+        label_position: TogglePosition::Trailing,
+    }.into_component(store_key).expect("Toggle");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "settings-toggle-change".into(),
+            params: settings_key_params(setting_key),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+fn settings_key_params(setting_key: &str) -> CborMap {
+    let mut params = CborMap::default();
+    params.0.push(("key".into(), Value::Text(setting_key.into())));
+    params
+}
+
+/// Seeds the bound store keys for every settings field from the DB (or default,
+/// or the pending edit) so each control mounts showing its current value.
+/// Toggles seed a real bool; everything else seeds text.
+fn settings_overlay() -> Vec<StateEntry> {
+    let mut entries = Vec::new();
+    for f in settings_all_fields() {
+        let value = setting_value(f);
+        let store_key = alloc::format!("set_{}", f.key);
+        let v = if f.kind == SettingKind::Toggle {
+            Value::Bool(value.trim() == "1")
+        } else {
+            Value::Text(value)
+        };
+        entries.push(StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(store_key)]),
+            value: v,
+        });
+    }
+    entries
+}
+
+/// All settings fields across every section, in render order.
+fn settings_all_fields() -> impl Iterator<Item = &'static SettingField> {
+    STORAGE_FIELDS.iter()
+        .chain(RUNTIME_FIELDS.iter())
+        .chain(NOTIFY_FIELDS.iter())
+        .chain(LICENSE_FIELDS.iter())
+        .chain(LEGAL_FIELDS.iter())
+}
+
+/// Legal/deployment profile section (single Select, AI-Act gated).
+const LEGAL_FIELDS: &[SettingField] = &[
+    sf_select("legal_profile", "Aktywny profil deployment", "commercial_private", LEGAL_PROFILES),
+];
+
+/// Builds one section card: a heading plus its fields rendered as controls.
+fn settings_section_card(title: &str, fields: &[SettingField]) -> Component {
+    let mut children = vec![heading(3, title)];
+    for f in fields {
+        children.push(settings_control(f));
+    }
+    card(None, children)
+}
+
 fn build_settings_content() -> Component {
     let messages = build_messages_section();
-    let active_tab = with_state(|s| s.settings.tab_or_default().to_string());
-    let tabs = filter_chips(
-        vec![
-            FilterChipDef { id: "general".into(), label: lit("general"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "storage".into(), label: lit("storage"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "notifications".into(), label: lit("notifications"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "access".into(), label: lit("access"), icon: None, badge: None, count_path: None },
-        ],
-        &active_tab,
-    );
-    let toolbar = stack_h(vec![heading(2, "Ustawienia"), tabs]);
-    let content = match active_tab.as_str() {
-        "general" => card(Some("Ogólne"), vec![
-            key_value(vec![
-                ("Wersja", "0.0.1"),
-                ("Deployment", "depo-warszawa-pn"),
-                ("Licencja", "enterprise"),
-            ]),
-            button("Zapisz", "settings-save", "primary"),
-        ]),
-        "storage" => card(Some("Przechowywanie"), vec![
-            key_value(vec![
-                ("Retencja wideo", "30 dni"),
-                ("Retencja metadanych", "365 dni"),
-                ("Retencja audit log", "1825 dni"),
-            ]),
-            button("Zapisz", "settings-save", "primary"),
-        ]),
-        "notifications" => card(Some("Powiadomienia"), vec![
-            text("Kanał powiadomień: Slack / Email / Webhook"),
-            button("Zapisz", "settings-save", "primary"),
-        ]),
-        "access" => card(Some("Kontrola dostępu"), vec![
-            text("Matryca uprawnień per addon / rola — wkrótce."),
-            button("Zapisz", "settings-save", "primary"),
-        ]),
-        _ => empty_state("Nieznana zakładka", None, None),
-    };
-    stack_v(vec![messages, toolbar, content])
+    let header = stack_h(vec![
+        heading(2, "Ustawienia TentaVision"),
+        chip_toned("konfiguracja per-deployment", "muted"),
+    ]);
+
+    let grid_cards = grid(2, vec![
+        settings_section_card("Storage i retencja", STORAGE_FIELDS),
+        settings_section_card("Inference runtime", RUNTIME_FIELDS),
+        settings_section_card("Powiadomienia i integracje", NOTIFY_FIELDS),
+        settings_section_card("Licencje i klucze", LICENSE_FIELDS),
+    ]);
+
+    // Legal/AI-Act profile — distinct card with a guardrail note.
+    let mut legal_children = vec![heading(3, "Profil prawny i AI Act")];
+    for f in LEGAL_FIELDS {
+        legal_children.push(settings_control(f));
+    }
+    legal_children.push(text_styled(
+        "Zmiana profilu wymaga podpisu DPO + zapisu w hash-chain audit. Profil determinuje dostępność detektorów klasy C (D4).",
+        "caption",
+    ));
+    let legal_card = card(None, legal_children);
+
+    let save_bar = stack_h(vec![button("Zapisz zmiany", "settings-save", "primary")]);
+
+    stack_v(vec![messages, header, grid_cards, legal_card, save_bar])
 }
 
 fn build_onboarding_content() -> Component {
