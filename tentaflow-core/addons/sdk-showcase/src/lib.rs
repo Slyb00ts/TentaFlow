@@ -966,16 +966,24 @@ fn send_panel_shell() {
 fn send_tab_content(tab: &str) {
     let fragment = build_tab_content(tab);
 
+    let mut state_overlay = vec![StateEntry {
+        path: state_path("active_tab"),
+        value: CborValue::Text(tab.into()),
+    }];
+    // The Data tab hosts the chart/data-viz catalog samples, which read their
+    // plotted points/slices/cells from `["charts", ...]` state paths. Seed that
+    // data alongside the fragment so the charts render real curves, not blanks.
+    if tab == "data" {
+        state_overlay.extend(catalog::chart_state_entries());
+    }
+
     let slot_content = SlotContent {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
         panel_epoch: panel_epoch(),
         slot_id: SLOT_ID.into(),
         fragment,
-        state_overlay: Some(vec![StateEntry {
-            path: state_path("active_tab"),
-            value: CborValue::Text(tab.into()),
-        }]),
+        state_overlay: Some(state_overlay),
     };
 
     send_ui(&UiPayload::SlotContent(slot_content));
