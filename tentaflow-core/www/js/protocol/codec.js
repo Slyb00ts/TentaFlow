@@ -748,6 +748,138 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AliasConsumerListRequest { aliasId } */
+  aliasConsumerListRequest(correlationId, { aliasId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAliasConsumerListRequest(Number(aliasId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AliasConsumerGrantRequest { aliasId, addonId } */
+  aliasConsumerGrantRequest(correlationId, { aliasId, addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAliasConsumerGrantRequest(Number(aliasId), addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AliasConsumerRevokeRequest { aliasId, addonId } */
+  aliasConsumerRevokeRequest(correlationId, { aliasId, addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAliasConsumerRevokeRequest(Number(aliasId), addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AliasVisibilitySetRequest { aliasId, visibility } */
+  aliasVisibilitySetRequest(correlationId, { aliasId, visibility }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAliasVisibilitySetRequest(Number(aliasId), visibility);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelVisibilityListRequest — all models with their visibility. */
+  modelVisibilityListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelVisibilityListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelVisibilitySetRequest { modelId, visibility } */
+  modelVisibilitySetRequest(correlationId, { modelId, visibility }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelVisibilitySetRequest(modelId, visibility);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConsumerListRequest { modelId } */
+  modelConsumerListRequest(correlationId, { modelId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConsumerListRequest(modelId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConsumerGrantRequest { modelId, addonId } */
+  modelConsumerGrantRequest(correlationId, { modelId, addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConsumerGrantRequest(modelId, addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConsumerRevokeRequest { modelId, addonId } */
+  modelConsumerRevokeRequest(correlationId, { modelId, addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConsumerRevokeRequest(modelId, addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonAccessListRequest { addonId } */
+  addonAccessListRequest(correlationId, { addonId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonAccessListRequest(addonId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonAccessDecisionRequest { addonId, kind, target, decision } */
+  addonAccessDecisionRequest(correlationId, { addonId, kind, target, decision }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonAccessDecisionRequest(addonId, kind, target, decision);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ModelInstallRequest { modelId, sourceRepo } */
   modelInstallRequest(correlationId, { modelId, sourceRepo }, sequence = 1) {
     assertReady();

@@ -34,7 +34,11 @@ use tentaflow_protocol::{
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
         AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVisibilityListRequest,
-        AddonVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest,
+        AddonVisibilitySetRequest, AddonAccessDecisionRequest, AddonAccessListRequest,
+        AliasConsumerGrantRequest, AliasConsumerListRequest, AliasConsumerRevokeRequest,
+        AliasVisibilitySetRequest, ModelConsumerGrantRequest, ModelConsumerListRequest,
+        ModelConsumerRevokeRequest, ModelVisibilitySetRequest,
+        ApiKeyCreateRequest, AuthLoginRequest,
         BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
@@ -2618,6 +2622,146 @@ pub fn encode_settings_update_batch(
     .map_err(|e| JsError::new(&e))
 }
 
+// --- Model / alias access control (F1a §6.6) ------------------------------
+
+/// MessageBody::AliasConsumerListRequest { alias_id }.
+#[wasm_bindgen(js_name = encodeAliasConsumerListRequest)]
+pub fn encode_alias_consumer_list_request(alias_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AliasConsumerListRequestBody(
+        AliasConsumerListRequest {
+            alias_id: alias_id as i64,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AliasConsumerGrantRequest { alias_id, addon_id }.
+#[wasm_bindgen(js_name = encodeAliasConsumerGrantRequest)]
+pub fn encode_alias_consumer_grant_request(
+    alias_id: f64,
+    addon_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AliasConsumerGrantRequestBody(
+        AliasConsumerGrantRequest {
+            alias_id: alias_id as i64,
+            addon_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AliasConsumerRevokeRequest { alias_id, addon_id }.
+#[wasm_bindgen(js_name = encodeAliasConsumerRevokeRequest)]
+pub fn encode_alias_consumer_revoke_request(
+    alias_id: f64,
+    addon_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AliasConsumerRevokeRequestBody(
+        AliasConsumerRevokeRequest {
+            alias_id: alias_id as i64,
+            addon_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AliasVisibilitySetRequest { alias_id, visibility }.
+#[wasm_bindgen(js_name = encodeAliasVisibilitySetRequest)]
+pub fn encode_alias_visibility_set_request(
+    alias_id: f64,
+    visibility: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AliasVisibilitySetRequestBody(
+        AliasVisibilitySetRequest {
+            alias_id: alias_id as i64,
+            visibility,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelVisibilityListRequest (unit variant).
+#[wasm_bindgen(js_name = encodeModelVisibilityListRequest)]
+pub fn encode_model_visibility_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelVisibilityListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelVisibilitySetRequest { model_id, visibility }.
+#[wasm_bindgen(js_name = encodeModelVisibilitySetRequest)]
+pub fn encode_model_visibility_set_request(
+    model_id: String,
+    visibility: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelVisibilitySetRequestBody(
+        ModelVisibilitySetRequest {
+            model_id,
+            visibility,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelConsumerListRequest { model_id }.
+#[wasm_bindgen(js_name = encodeModelConsumerListRequest)]
+pub fn encode_model_consumer_list_request(model_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelConsumerListRequestBody(
+        ModelConsumerListRequest { model_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelConsumerGrantRequest { model_id, addon_id }.
+#[wasm_bindgen(js_name = encodeModelConsumerGrantRequest)]
+pub fn encode_model_consumer_grant_request(
+    model_id: String,
+    addon_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelConsumerGrantRequestBody(
+        ModelConsumerGrantRequest { model_id, addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelConsumerRevokeRequest { model_id, addon_id }.
+#[wasm_bindgen(js_name = encodeModelConsumerRevokeRequest)]
+pub fn encode_model_consumer_revoke_request(
+    model_id: String,
+    addon_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelConsumerRevokeRequestBody(
+        ModelConsumerRevokeRequest { model_id, addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonAccessListRequest { addon_id }.
+#[wasm_bindgen(js_name = encodeAddonAccessListRequest)]
+pub fn encode_addon_access_list_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonAccessListRequestBody(
+        AddonAccessListRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonAccessDecisionRequest { addon_id, kind, target, decision }.
+#[wasm_bindgen(js_name = encodeAddonAccessDecisionRequest)]
+pub fn encode_addon_access_decision_request(
+    addon_id: String,
+    kind: String,
+    target: String,
+    decision: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonAccessDecisionRequestBody(
+        AddonAccessDecisionRequest {
+            addon_id,
+            kind,
+            target,
+            decision,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 // =============================================================================
 // MessageBody decode (zwraca JS object z variant tag + polami)
 // =============================================================================
@@ -2698,6 +2842,71 @@ fn set_optional_string(obj: &js_sys::Object, key: &str, value: Option<String>) {
     if let Some(value) = value {
         set(obj, key, value.into());
     }
+}
+
+/// Build a JS object from one `AccessConsumerEntry` (alias/model consumer grant
+/// row). Optional fields become `null` when `None`. Both camelCase and
+/// snake_case keys are emitted, mirroring the ModelListResponse precedent.
+fn access_consumer_entry_to_js(c: &tentaflow_protocol::AccessConsumerEntry) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "addonId", c.addon_id.clone().into());
+    set(&o, "addon_id", c.addon_id.clone().into());
+    match c.granted_by_user_id {
+        Some(v) => {
+            set(&o, "grantedByUserId", v.into());
+            set(&o, "granted_by_user_id", v.into());
+        }
+        None => {
+            set(&o, "grantedByUserId", JsValue::NULL);
+            set(&o, "granted_by_user_id", JsValue::NULL);
+        }
+    }
+    match c.granted_at {
+        Some(v) => {
+            set(&o, "grantedAt", v.into());
+            set(&o, "granted_at", v.into());
+        }
+        None => {
+            set(&o, "grantedAt", JsValue::NULL);
+            set(&o, "granted_at", JsValue::NULL);
+        }
+    }
+    match c.revoked_at {
+        Some(v) => {
+            set(&o, "revokedAt", v.into());
+            set(&o, "revoked_at", v.into());
+        }
+        None => {
+            set(&o, "revokedAt", JsValue::NULL);
+            set(&o, "revoked_at", JsValue::NULL);
+        }
+    }
+    o.into()
+}
+
+/// Build a JS object from one `AddonUsesEntry` (per-addon `uses_alias` /
+/// `uses_model` declaration with reconciled grant state).
+fn addon_uses_entry_to_js(u: &tentaflow_protocol::AddonUsesEntry) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "target", u.target.clone().into());
+    set(&o, "required", u.required.into());
+    set(&o, "reason", u.reason.clone().into());
+    set(&o, "grantStatus", u.grant_status.clone().into());
+    set(&o, "grant_status", u.grant_status.clone().into());
+    set(&o, "ownerVisibility", u.owner_visibility.clone().into());
+    set(&o, "owner_visibility", u.owner_visibility.clone().into());
+    o.into()
+}
+
+/// Build a JS object from one `AccessTransition` (dependent `uses_*` row whose
+/// grant_status flipped as a side effect of a mutation).
+fn access_transition_to_js(t: &tentaflow_protocol::AccessTransition) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "addonId", t.addon_id.clone().into());
+    set(&o, "addon_id", t.addon_id.clone().into());
+    set(&o, "before", t.before.clone().into());
+    set(&o, "after", t.after.clone().into());
+    o.into()
 }
 
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
@@ -6722,6 +6931,130 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "ok", resp.ok.into());
             set(&obj, "cleared", resp.cleared.into());
             set(&obj, "message", resp.message.into());
+        }
+        MessageBody::AliasConsumerListRequestBody(r) => {
+            set(&obj, "variant", "AliasConsumerListRequest".into());
+            set(&obj, "aliasId", r.alias_id.into());
+            set(&obj, "alias_id", r.alias_id.into());
+        }
+        MessageBody::AliasConsumerListResponseBody(r) => {
+            set(&obj, "variant", "AliasConsumerListResponse".into());
+            set(&obj, "aliasId", r.alias_id.into());
+            set(&obj, "alias_id", r.alias_id.into());
+            let arr = js_sys::Array::new();
+            for c in &r.consumers {
+                arr.push(&access_consumer_entry_to_js(c));
+            }
+            set(&obj, "consumers", arr.into());
+        }
+        MessageBody::AliasConsumerGrantRequestBody(r) => {
+            set(&obj, "variant", "AliasConsumerGrantRequest".into());
+            set(&obj, "aliasId", r.alias_id.into());
+            set(&obj, "alias_id", r.alias_id.into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+        }
+        MessageBody::AliasConsumerRevokeRequestBody(r) => {
+            set(&obj, "variant", "AliasConsumerRevokeRequest".into());
+            set(&obj, "aliasId", r.alias_id.into());
+            set(&obj, "alias_id", r.alias_id.into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+        }
+        MessageBody::AliasVisibilitySetRequestBody(r) => {
+            set(&obj, "variant", "AliasVisibilitySetRequest".into());
+            set(&obj, "aliasId", r.alias_id.into());
+            set(&obj, "alias_id", r.alias_id.into());
+            set(&obj, "visibility", r.visibility.into());
+        }
+        MessageBody::ModelVisibilityListRequest => {
+            set(&obj, "variant", "ModelVisibilityListRequest".into());
+        }
+        MessageBody::ModelVisibilityListResponseBody(r) => {
+            set(&obj, "variant", "ModelVisibilityListResponse".into());
+            let arr = js_sys::Array::new();
+            for m in &r.models {
+                let item = js_sys::Object::new();
+                set(&item, "modelId", m.model_id.clone().into());
+                set(&item, "model_id", m.model_id.clone().into());
+                set(&item, "visibility", m.visibility.clone().into());
+                arr.push(&item.into());
+            }
+            set(&obj, "models", arr.into());
+        }
+        MessageBody::ModelVisibilitySetRequestBody(r) => {
+            set(&obj, "variant", "ModelVisibilitySetRequest".into());
+            set(&obj, "modelId", r.model_id.clone().into());
+            set(&obj, "model_id", r.model_id.into());
+            set(&obj, "visibility", r.visibility.into());
+        }
+        MessageBody::ModelConsumerListRequestBody(r) => {
+            set(&obj, "variant", "ModelConsumerListRequest".into());
+            set(&obj, "modelId", r.model_id.clone().into());
+            set(&obj, "model_id", r.model_id.into());
+        }
+        MessageBody::ModelConsumerListResponseBody(r) => {
+            set(&obj, "variant", "ModelConsumerListResponse".into());
+            set(&obj, "modelId", r.model_id.clone().into());
+            set(&obj, "model_id", r.model_id.into());
+            let arr = js_sys::Array::new();
+            for c in &r.consumers {
+                arr.push(&access_consumer_entry_to_js(c));
+            }
+            set(&obj, "consumers", arr.into());
+        }
+        MessageBody::ModelConsumerGrantRequestBody(r) => {
+            set(&obj, "variant", "ModelConsumerGrantRequest".into());
+            set(&obj, "modelId", r.model_id.clone().into());
+            set(&obj, "model_id", r.model_id.into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+        }
+        MessageBody::ModelConsumerRevokeRequestBody(r) => {
+            set(&obj, "variant", "ModelConsumerRevokeRequest".into());
+            set(&obj, "modelId", r.model_id.clone().into());
+            set(&obj, "model_id", r.model_id.into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+        }
+        MessageBody::AddonAccessListRequestBody(r) => {
+            set(&obj, "variant", "AddonAccessListRequest".into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+        }
+        MessageBody::AddonAccessListResponseBody(r) => {
+            set(&obj, "variant", "AddonAccessListResponse".into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+            let alias_arr = js_sys::Array::new();
+            for u in &r.uses_alias {
+                alias_arr.push(&addon_uses_entry_to_js(u));
+            }
+            set(&obj, "usesAlias", alias_arr.clone().into());
+            set(&obj, "uses_alias", alias_arr.into());
+            let model_arr = js_sys::Array::new();
+            for u in &r.uses_model {
+                model_arr.push(&addon_uses_entry_to_js(u));
+            }
+            set(&obj, "usesModel", model_arr.clone().into());
+            set(&obj, "uses_model", model_arr.into());
+        }
+        MessageBody::AddonAccessDecisionRequestBody(r) => {
+            set(&obj, "variant", "AddonAccessDecisionRequest".into());
+            set(&obj, "addonId", r.addon_id.clone().into());
+            set(&obj, "addon_id", r.addon_id.into());
+            set(&obj, "kind", r.kind.into());
+            set(&obj, "target", r.target.into());
+            set(&obj, "decision", r.decision.into());
+        }
+        MessageBody::AccessMutationResponseBody(r) => {
+            set(&obj, "variant", "AccessMutationResponse".into());
+            set(&obj, "ok", r.ok.into());
+            let arr = js_sys::Array::new();
+            for t in &r.transitions {
+                arr.push(&access_transition_to_js(t));
+            }
+            set(&obj, "transitions", arr.into());
         }
         MessageBody::UiChannelCbor(bytes) => {
             set(&obj, "variant", "UiChannelCbor".into());
