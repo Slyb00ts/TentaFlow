@@ -28,7 +28,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable'];
+    return ['sortable', 'selectable', 'variant', 'density'];
   }
 
   constructor() {
@@ -423,6 +423,7 @@ class TfTable extends HTMLElement {
 
   _render() {
     if (!this._thead) return;
+    this._syncTableModifiers();
     const cols = this.columns;
     const sortableTable = this.hasAttribute('sortable');
     const sig = this._columnsSignature(cols);
@@ -435,6 +436,20 @@ class TfTable extends HTMLElement {
 
     const rows = this._sortedRows();
     this._renderTbody(cols, rows);
+  }
+
+  // Mirror the `variant`/`density` attributes onto the real shadow <table> as
+  // BEM modifier classes. controls.css is adopted into the shadow root, so
+  // `.tf-table--variant-*` / `.tf-table--density-*` rules reach this table's
+  // th/td/tbody directly — light-DOM descendant selectors cannot pierce here.
+  _syncTableModifiers() {
+    if (!this._table) return;
+    const classes = ['tf-table'];
+    const variant = this.getAttribute('variant');
+    if (variant) classes.push(`tf-table--variant-${variant}`);
+    const density = this.getAttribute('density');
+    if (density) classes.push(`tf-table--density-${density}`);
+    this._table.className = classes.join(' ');
   }
 
   _sortedRows() {

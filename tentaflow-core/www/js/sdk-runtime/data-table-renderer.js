@@ -429,19 +429,25 @@ function renderTable(component, ctx) {
   // Create <tf-table> web component
   const tfTable = document.createElement('tf-table');
   if (sortable) tfTable.setAttribute('sortable', '');
+  // variant/density must reach the real <table> inside tf-table's shadow root,
+  // so they go on the component (which mirrors them onto the shadow table),
+  // NOT on the light-DOM shell where they could never style the table.
+  tfTable.setAttribute('variant', variant);
+  tfTable.setAttribute('density', density);
   // selectable carries the mode so tf-table only shows the select-all header
   // affordance in multi mode (single selection has no "all" semantics).
   if (selectMode !== 'none') tfTable.setAttribute('selectable', selectMode);
   // sticky_columns: pin the first N columns (component-side positioning).
   if (stickyColumns > 0) tfTable.stickyColumns = stickyColumns;
 
-  // Wrapper div for additional SDK features (bulk actions, pagination, empty state)
+  // Wrapper div for additional SDK features (bulk actions, pagination, empty
+  // state). It is NOT `.tf-table` — that class belongs to the real <table>
+  // emitted by the tf-table component; reusing it here would override the
+  // table's `display: table`. The shell stacks toolbar/table/empty/pagination.
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-table');
-  wrapper.classList.add(`tf-table--variant-${variant}`);
-  wrapper.classList.add(`tf-table--density-${density}`);
-  if (stickyHeader) wrapper.classList.add('tf-table--sticky-header');
-  if (virtualize) wrapper.classList.add('tf-table--virtualize');
+  wrapper.classList.add('tf-table-shell');
+  if (stickyHeader) wrapper.classList.add('tf-table-shell--sticky-header');
+  if (virtualize) wrapper.classList.add('tf-table-shell--virtualize');
 
   // Bulk actions toolbar
   let bulkToolbar = null;

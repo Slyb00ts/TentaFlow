@@ -1066,6 +1066,93 @@ tf-tabs {
   }
 }
 
+/* tf-table variant/density modifiers — applied by tf-table.js to the real
+   shadow <table class="tf-table tf-table--variant-* tf-table--density-*">, so
+   these descend into the table's own th/td/tbody (NOT a wrapper). */
+.tf-table--variant-striped tbody tr:nth-child(even) { background: var(--tf-bg-3); }
+.tf-table--variant-borderless tbody tr + tr td { border-top: 0; }
+.tf-table--density-compact th,
+.tf-table--density-compact td { padding: 6px 10px; }
+.tf-table--density-comfortable th,
+.tf-table--density-comfortable td { padding: 16px 18px; }
+
+/* =============================================================================
+   tf-table-shell (Table 0x0211 SDK renderer) — light-DOM wrapper stacking the
+   bulk-actions toolbar, the <tf-table> component, the empty state and the
+   pagination footer. Distinct from .tf-table (the real <table>) on purpose:
+   reusing that class here overrode the table's `display: table`.
+   ============================================================================= */
+.tf-table-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs);
+  font: inherit;
+}
+.tf-table__bulk-actions {
+  display: flex;
+  gap: var(--tf-space-xs);
+  padding: var(--tf-space-xs);
+  background: var(--accent-bg-soft, rgba(30, 64, 175, 0.08));
+  border-radius: var(--tf-radius-sm, 0.25rem);
+}
+.tf-table__empty-state { text-align: center; }
+.tf-table__pagination {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm);
+  justify-content: flex-end;
+  padding: var(--tf-space-xs);
+}
+.tf-table__page-btn {
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0.2em 0.6em;
+  cursor: pointer;
+  font: inherit;
+}
+.tf-table__page-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+.tf-table__page-info { font-variant-numeric: tabular-nums; color: var(--tf-text-3); font-size: 0.9em; }
+.tf-table__page-size {
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+  padding: 0.2em 0.4em;
+  font: inherit;
+  font-size: 0.85em;
+}
+
+/* tf-table extras — sticky columns, expandable rows, select-all. tf-table.js
+   applies the functional sticky positioning inline (position/left/z-index);
+   these rules are visual polish only — the features work without them. */
+.tf-table__sticky-col { background: var(--tf-bg-card); }
+td.tf-table__sticky-col,
+th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
+.tf-table__expand-col { width: 2.5rem; }
+.tf-table__expand-cell { width: 2.5rem; text-align: center; }
+.tf-table__expand-toggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 0.25rem;
+  color: var(--tf-text-2);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+}
+.tf-table__expand-toggle:hover { background: var(--tf-bg-card-hover); }
+.tf-table__expand-toggle:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 1px;
+}
+.tf-table__expansion-row > .tf-table__expansion-cell {
+  padding: 0;
+  background: var(--tf-bg-subtle);
+}
+.tf-table__expanded-region { padding: var(--tf-space-sm) var(--tf-space-md); }
+.tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
+
 /* =============================================================================
    tf-chip
    ============================================================================= */
@@ -6882,97 +6969,6 @@ button.tf-chip { cursor: pointer; border: 0; font: inherit; }
 }
 .tf-empty-state--variant-compact { padding: var(--tf-space-md); gap: var(--tf-space-xs); }
 .tf-empty-state--variant-illustrated { padding: var(--tf-space-xl); }
-
-/* ============================================================================
-   tf-table (0x0211) — chunk 3.3d-6
-   ============================================================================ */
-.tf-table { display: flex; flex-direction: column; gap: var(--tf-space-xs); font: inherit; }
-.tf-table__bulk-actions { display: flex; gap: var(--tf-space-xs); padding: var(--tf-space-xs); background: var(--accent-bg-soft, rgba(30,64,175,0.08)); border-radius: var(--tf-radius-sm, 0.25rem); }
-.tf-table__scroll { overflow: auto; max-width: 100%; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm, 0.25rem); }
-.tf-table__table { width: 100%; border-collapse: separate; border-spacing: 0; }
-.tf-table__th, .tf-table__td { padding: 0.5em 0.75em; text-align: start; border-bottom: 1px solid var(--tf-border); }
-.tf-table--variant-borderless .tf-table__th, .tf-table--variant-borderless .tf-table__td { border-bottom: 0; }
-.tf-table--variant-striped .tf-table__tbody .tf-table__tr:nth-child(even) { background: var(--tf-bg-3); }
-.tf-table--density-compact .tf-table__th, .tf-table--density-compact .tf-table__td { padding: 0.25em 0.5em; }
-.tf-table--density-comfortable .tf-table__th, .tf-table--density-comfortable .tf-table__td { padding: 0.75em 1em; }
-.tf-table__thead--sticky { position: sticky; top: 0; z-index: 1; background: var(--tf-bg-input); }
-.tf-table__th { font-weight: 600; background: var(--tf-bg-input); color: var(--tf-text); }
-.tf-table__th--align-center, .tf-table__td--align-center { text-align: center; }
-.tf-table__th--align-end, .tf-table__td--align-end { text-align: end; }
-.tf-table__th--sortable { cursor: pointer; user-select: none; }
-.tf-table__th--sortable:hover { background: var(--tf-bg-3); }
-.tf-table__th-sort { margin-left: 0.4em; color: var(--tf-text-3); font-size: 0.8em; }
-.tf-table__th--sticky-left, .tf-table__td--sticky-left { position: sticky; left: 0; background: inherit; z-index: 1; }
-.tf-table__th-select, .tf-table__td-select { width: 2.5em; text-align: center; }
-.tf-table__th-actions, .tf-table__td-actions { text-align: end; white-space: nowrap; }
-.tf-table__row-action { margin-left: 0.25em; }
-.tf-table__tr--selected { background: var(--tf-accent-glow) !important; }
-.tf-table__tr { cursor: pointer; }
-.tf-table__tr:hover { background: var(--tf-bg-3); }
-.tf-table__empty-state { text-align: center; }
-.tf-table__pagination { display: flex; align-items: center; gap: var(--tf-space-sm); justify-content: flex-end; padding: var(--tf-space-xs); }
-.tf-table__page-btn {
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  padding: 0.2em 0.6em;
-  cursor: pointer;
-  font: inherit;
-}
-.tf-table__page-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
-.tf-table__page-info { font-variant-numeric: tabular-nums; color: var(--tf-text-3); font-size: 0.9em; }
-.tf-table__page-size {
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-  padding: 0.2em 0.4em;
-  font: inherit;
-  font-size: 0.85em;
-}
-
-/* ---------- tf-table extras (0x0211) — sticky columns, expandable rows, select-all ---------- */
-/* tf-table applies the functional sticky positioning inline (position/left/
-   z-index); these rules are visual polish only — the features work without them. */
-/* Sticky columns: opaque background so scrolled cells don't show through, and a
-   subtle right edge to separate the pinned region from scrolling content. */
-.tf-table__sticky-col {
-  background: var(--tf-bg-card);
-}
-td.tf-table__sticky-col, th.tf-table__sticky-col {
-  box-shadow: 1px 0 0 0 var(--tf-border);
-}
-
-/* Expand toggle column: narrow, centered chevron button. */
-.tf-table__expand-col { width: 2.5rem; }
-.tf-table__expand-cell { width: 2.5rem; text-align: center; }
-.tf-table__expand-toggle {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  font-size: 0.9em;
-  line-height: 1;
-  padding: 0.25rem;
-  color: var(--tf-text-2);
-  border-radius: var(--tf-radius-sm, 0.25rem);
-}
-.tf-table__expand-toggle:hover { background: var(--tf-bg-card-hover); }
-.tf-table__expand-toggle:focus-visible {
-  outline: 2px solid var(--tf-accent-1);
-  outline-offset: 1px;
-}
-
-/* Expansion region: spans the full row, indented detail panel. */
-.tf-table__expansion-row > .tf-table__expansion-cell {
-  padding: 0;
-  background: var(--tf-bg-subtle);
-}
-.tf-table__expanded-region {
-  padding: var(--tf-space-sm) var(--tf-space-md);
-}
-
-/* Select-all checkbox sits inline before the first header label. */
-.tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
 
 /* ============================================================================
    tf-sparkline (0x0215) — chunk 3.3d-7
