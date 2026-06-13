@@ -100,6 +100,12 @@ class TfBarChart extends TfCartesianChart {
     if (this._stacking === 'none') {
       const baseDomain = computeDomains(seriesPoints, { ...this._xAxis, scale: 'category' }, this._yAxis);
       yDomain = baseDomain.ys;
+      // Bars encode magnitude from a zero baseline, so the axis must include 0
+      // (unlike line/area, where computeDomains may start at the data min).
+      // Without this, bars shorter than the auto-computed min render with zero/
+      // negative height and vanish. Honor an explicit yAxis.min/max override.
+      if (this._yAxis.min == null && yDomain.min > 0) yDomain.min = 0;
+      if (this._yAxis.max == null && yDomain.max < 0) yDomain.max = 0;
     } else {
       const totals = new Array(categories.length).fill(0);
       const catIdx = new Map(categories.map((c, i) => [typeof c === 'string' ? `s:${c}` : `n:${c}`, i]));
