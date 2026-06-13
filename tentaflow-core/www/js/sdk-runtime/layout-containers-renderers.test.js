@@ -352,7 +352,7 @@ test('Stack renders children + optional padding', () => {
   assert(el.classList.contains('tf-stack--align-center'));
   assert(el.classList.contains('tf-stack--padding-md'));
   assertEq(el.children.length, 1);
-  assert(el.children[0].classList.contains('tf-divider'));
+  assert(el.children[0].classList.contains('tf-divider-rule'));
 });
 
 test('Stack rejects invalid align', () => {

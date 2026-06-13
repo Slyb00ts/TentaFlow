@@ -143,7 +143,7 @@ test('Divider renders div with semantic classes', () => {
     ])
   );
   assertEq(el.tagName, 'DIV');
-  assert(el.classList.contains('tf-divider'));
+  assert(el.classList.contains('tf-divider-rule'));
   assert(el.classList.contains('tf-divider--horizontal'));
   assert(el.classList.contains('tf-divider--subtle'));
   assert(el.classList.contains('tf-divider--spacing-md'));

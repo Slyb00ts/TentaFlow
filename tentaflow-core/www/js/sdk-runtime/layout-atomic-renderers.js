@@ -77,7 +77,7 @@ function renderDivider(component, ctx) {
   const labelBind = ctx.readField(component.fields, 3); // Option<BindRef>
 
   const el = document.createElement('div');
-  el.classList.add('tf-divider');
+  el.classList.add('tf-divider-rule');
   el.classList.add(`tf-divider--${orientation}`);
   el.classList.add(`tf-divider--${variant}`);
   el.classList.add(`tf-divider--spacing-${spacing}`);

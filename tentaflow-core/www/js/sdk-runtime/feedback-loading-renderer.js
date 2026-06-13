@@ -121,10 +121,11 @@ function renderSpinner(component, ctx) {
 
   if (labelBind != null) assertBindRef(labelBind, 'Spinner.label');
 
-  // <tf-spinner> supports size attribute (xs, sm, md, lg, xl)
+  // <tf-spinner> renders the variant subtree from size/variant/tone attributes.
   const spinner = document.createElement('tf-spinner');
   spinner.setAttribute('size', size);
-  spinner.classList.add(`tf-spinner--tone-${tone}`, `tf-spinner--${variant}`);
+  spinner.setAttribute('variant', variant);
+  spinner.setAttribute('tone', tone);
 
   // Reactive screen-reader label
   if (labelBind != null) {
