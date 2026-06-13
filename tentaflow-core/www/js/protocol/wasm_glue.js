@@ -295,6 +295,49 @@ export function decodeUiPayload(cbor_bytes) {
 }
 
 /**
+ * MessageBody::AddonAccessDecisionRequest { addon_id, kind, target, decision }.
+ * @param {string} addon_id
+ * @param {string} kind
+ * @param {string} target
+ * @param {string} decision
+ * @returns {Uint8Array}
+ */
+export function encodeAddonAccessDecisionRequest(addon_id, kind, target, decision) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(target, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(decision, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonAccessDecisionRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * MessageBody::AddonAccessListRequest { addon_id }.
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAddonAccessListRequest(addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonAccessListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::AddonAdminOnlySetRequest { addon_id, admin_only }.
  * @param {string} addon_id
  * @param {boolean} admin_only
@@ -1263,6 +1306,75 @@ export function encodeAgentsUpsertRequest(agent_json) {
     const ptr0 = passStringToWasm0(agent_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeAgentsUpsertRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::AliasConsumerGrantRequest { alias_id, addon_id }.
+ * @param {number} alias_id
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAliasConsumerGrantRequest(alias_id, addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAliasConsumerGrantRequest(alias_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::AliasConsumerListRequest { alias_id }.
+ * @param {number} alias_id
+ * @returns {Uint8Array}
+ */
+export function encodeAliasConsumerListRequest(alias_id) {
+    const ret = wasm.encodeAliasConsumerListRequest(alias_id);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::AliasConsumerRevokeRequest { alias_id, addon_id }.
+ * @param {number} alias_id
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAliasConsumerRevokeRequest(alias_id, addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAliasConsumerRevokeRequest(alias_id, ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::AliasVisibilitySetRequest { alias_id, visibility }.
+ * @param {number} alias_id
+ * @param {string} visibility
+ * @returns {Uint8Array}
+ */
+export function encodeAliasVisibilitySetRequest(alias_id, visibility) {
+    const ptr0 = passStringToWasm0(visibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAliasVisibilitySetRequest(alias_id, ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -3238,6 +3350,63 @@ export function encodeModelAliasUpdateRequest(id, alias, target_model, is_active
 }
 
 /**
+ * MessageBody::ModelConsumerGrantRequest { model_id, addon_id }.
+ * @param {string} model_id
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeModelConsumerGrantRequest(model_id, addon_id) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelConsumerGrantRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::ModelConsumerListRequest { model_id }.
+ * @param {string} model_id
+ * @returns {Uint8Array}
+ */
+export function encodeModelConsumerListRequest(model_id) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelConsumerListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ModelConsumerRevokeRequest { model_id, addon_id }.
+ * @param {string} model_id
+ * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeModelConsumerRevokeRequest(model_id, addon_id) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelConsumerRevokeRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::ModelDeleteRequest { model_id }.
  * @param {string} model_id
  * @returns {Uint8Array}
@@ -3303,6 +3472,40 @@ export function encodeModelListRequest() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * MessageBody::ModelVisibilityListRequest (unit variant).
+ * @returns {Uint8Array}
+ */
+export function encodeModelVisibilityListRequest() {
+    const ret = wasm.encodeModelVisibilityListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::ModelVisibilitySetRequest { model_id, visibility }.
+ * @param {string} model_id
+ * @param {string} visibility
+ * @returns {Uint8Array}
+ */
+export function encodeModelVisibilitySetRequest(model_id, visibility) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(visibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelVisibilitySetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
 }
 
 /**
