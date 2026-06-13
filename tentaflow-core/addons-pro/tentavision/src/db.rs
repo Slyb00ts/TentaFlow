@@ -455,7 +455,9 @@ pub fn count_active_profiles() -> Result<i64, AbiError> {
     scalar_i64("SELECT COUNT(*) FROM profiles WHERE enabled = 1", &[])
 }
 
-/// An alarm row joined with its camera's display name for the dashboard list.
+/// An alarm row joined with its camera's display name. Carries the full decision
+/// lifecycle (status / decided_by / decided_at) so the Alarm Center can render
+/// both the feed and the detail/workflow panel from a single fetch.
 #[derive(Debug, Clone)]
 pub struct AlarmRow {
     pub id: String,
@@ -464,31 +466,110 @@ pub struct AlarmRow {
     pub severity: String,
     pub kind: String,
     pub message: String,
+    pub thumb_ref: String,
     pub ts: i64,
+    pub status: String,
+    pub decided_by: String,
+    pub decided_at: i64,
 }
 
 /// Lists the most recent alarms (newest first), left-joining the camera name so
 /// the card can show a friendly label instead of the raw camera id.
 pub fn list_recent_alarms(limit: i64) -> Result<Vec<AlarmRow>, AbiError> {
-    let sql = "SELECT a.id, a.camera_id, COALESCE(c.name, ''), a.severity, a.type, a.message, a.ts \
-               FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
-               ORDER BY a.ts DESC LIMIT ?1";
-    let rows = query(sql, &[SqlValue::I64(limit)])?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
-            AlarmRow {
-                id: g(0).as_str().into(),
-                camera_id: g(1).as_str().into(),
-                camera_name: g(2).as_str().into(),
-                severity: g(3).as_str().into(),
-                kind: g(4).as_str().into(),
-                message: g(5).as_str().into(),
-                ts: g(6).as_i64(),
-            }
-        })
-        .collect())
+    let sql = alloc::format!(
+        "SELECT {ALARM_COLS} FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
+         ORDER BY a.ts DESC LIMIT ?1"
+    );
+    let rows = query(&sql, &[SqlValue::I64(limit)])?;
+    Ok(rows.iter().map(row_to_alarm).collect())
+}
+
+/// Column list (with the camera-name join) shared by every alarm SELECT so the
+/// row decoder stays in lockstep with the query shape.
+const ALARM_COLS: &str =
+    "a.id, a.camera_id, COALESCE(c.name, ''), a.severity, a.type, a.message, \
+     a.thumb_ref, a.ts, a.status, a.decided_by, a.decided_at";
+
+fn row_to_alarm(r: &Row) -> AlarmRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    AlarmRow {
+        id: g(0).as_str().into(),
+        camera_id: g(1).as_str().into(),
+        camera_name: g(2).as_str().into(),
+        severity: g(3).as_str().into(),
+        kind: g(4).as_str().into(),
+        message: g(5).as_str().into(),
+        thumb_ref: g(6).as_str().into(),
+        ts: g(7).as_i64(),
+        status: g(8).as_str().into(),
+        decided_by: g(9).as_str().into(),
+        decided_at: g(10).as_i64(),
+    }
+}
+
+/// Fetches a single alarm (with its camera name) by id, or None.
+pub fn get_alarm(id: &str) -> Result<Option<AlarmRow>, AbiError> {
+    let sql = alloc::format!(
+        "SELECT {ALARM_COLS} FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
+         WHERE a.id = ?1"
+    );
+    let rows = query(&sql, &[SqlValue::Text(id.into())])?;
+    Ok(rows.first().map(row_to_alarm))
+}
+
+/// Lists alarms (newest first) with optional severity and status filters. An
+/// empty filter string means "no constraint on that column"; `status_open`
+/// collapses the two undecided states (`new`/`acknowledged`) into one feed view.
+pub fn list_alarms(severity: &str, status: &str, status_open: bool) -> Result<Vec<AlarmRow>, AbiError> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<SqlValue> = Vec::new();
+    if !severity.is_empty() {
+        clauses.push(alloc::format!("a.severity = ?{}", params.len() + 1));
+        params.push(SqlValue::Text(severity.into()));
+    }
+    if status_open {
+        clauses.push("a.status IN ('new', 'acknowledged')".into());
+    } else if !status.is_empty() {
+        clauses.push(alloc::format!("a.status = ?{}", params.len() + 1));
+        params.push(SqlValue::Text(status.into()));
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        alloc::format!("WHERE {}", clauses.join(" AND "))
+    };
+    let sql = alloc::format!(
+        "SELECT {ALARM_COLS} FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
+         {where_sql} ORDER BY a.ts DESC"
+    );
+    let rows = query(&sql, &params)?;
+    Ok(rows.iter().map(row_to_alarm).collect())
+}
+
+/// Number of alarms matching the open-feed view (undecided) or a concrete status.
+pub fn count_alarms(status_open: bool, status: &str) -> Result<i64, AbiError> {
+    if status_open {
+        scalar_i64("SELECT COUNT(*) FROM alarms WHERE status IN ('new','acknowledged')", &[])
+    } else if status.is_empty() {
+        scalar_i64("SELECT COUNT(*) FROM alarms", &[])
+    } else {
+        scalar_i64("SELECT COUNT(*) FROM alarms WHERE status = ?1", &[SqlValue::Text(status.into())])
+    }
+}
+
+/// Records an operator decision: writes the new status + operator + decision time
+/// onto the alarm row. Returns rows affected (0 if the alarm did not exist).
+pub fn update_alarm_status(id: &str, status: &str, decided_by: &str) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "UPDATE alarms SET status = ?2, decided_by = ?3, decided_at = ?4 WHERE id = ?1",
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::Text(status.into()),
+            SqlValue::Text(decided_by.into()),
+            SqlValue::I64(now),
+        ],
+    )
 }
 
 /// One aggregated heatmap bucket: alarm count for a camera in a given hour
@@ -550,4 +631,59 @@ pub fn insert_alarm(
         ],
     )?;
     Ok(id)
+}
+
+// =============================================================================
+// Audit log (append-only, hash-chained)
+// =============================================================================
+
+/// Appends one tamper-evident audit entry. The hash chains over the previous
+/// entry's hash plus this row's payload, so the Audit tab can later verify the
+/// chain. `before`/`after` carry JSON snapshots of the changed state.
+pub fn insert_audit(
+    actor: &str,
+    action: &str,
+    target: &str,
+    before: &str,
+    after: &str,
+) -> Result<String, AbiError> {
+    let id = generate_id("aud");
+    let ts = now_secs();
+    let prev_hash = query("SELECT hash FROM audit_log ORDER BY ts DESC, id DESC LIMIT 1", &[])?
+        .first()
+        .and_then(|r| r.first())
+        .map(SqlValue::as_str)
+        .unwrap_or("")
+        .to_string();
+    // Cheap, deterministic FNV-1a chain hash over prev_hash + payload. Not a
+    // cryptographic digest, but enough to make silent row edits detectable.
+    let material = alloc::format!(
+        "{prev_hash}|{ts}|{actor}|{action}|{target}|{before}|{after}"
+    );
+    let hash = fnv1a_hex(material.as_bytes());
+    exec(
+        "INSERT INTO audit_log (id, ts, actor, action, target, before, after, hash, prev_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::I64(ts),
+            SqlValue::Text(actor.into()),
+            SqlValue::Text(action.into()),
+            SqlValue::Text(target.into()),
+            SqlValue::Text(before.into()),
+            SqlValue::Text(after.into()),
+            SqlValue::Text(hash),
+            SqlValue::Text(prev_hash),
+        ],
+    )?;
+    Ok(id)
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    alloc::format!("{:016x}", h)
 }

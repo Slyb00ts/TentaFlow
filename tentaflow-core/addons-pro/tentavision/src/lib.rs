@@ -1675,10 +1675,28 @@ impl ProfilesState {
     }
 }
 
-struct AlarmsState { selected_id: Option<String>, severity_filter: String, sound_muted: bool }
+/// `status_view` is the left-feed tab: "open" (undecided), "all", or "closed"
+/// (decided). `severity_filter` further narrows by severity. `note` is the
+/// operator's draft note for the selected alarm, mirrored from the textarea.
+struct AlarmsState {
+    selected_id: Option<String>,
+    severity_filter: String,
+    status_view: String,
+    note: String,
+    sound_muted: bool,
+}
 impl AlarmsState {
-    const fn new() -> Self { Self { selected_id: None, severity_filter: String::new(), sound_muted: false } }
+    const fn new() -> Self {
+        Self {
+            selected_id: None,
+            severity_filter: String::new(),
+            status_view: String::new(),
+            note: String::new(),
+            sound_muted: false,
+        }
+    }
     fn severity_or_all(&self) -> &str { if self.severity_filter.is_empty() { "all" } else { &self.severity_filter } }
+    fn status_or_open(&self) -> &str { if self.status_view.is_empty() { "open" } else { &self.status_view } }
 }
 
 struct SearchState {
@@ -2136,6 +2154,15 @@ fn render_panel(panel_id: &str) {
         }
         let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
+    } else if panel_id == "alarms" {
+        // Seed the operator-note textarea's bound key so it mounts with the
+        // current draft note (cleared on selection change).
+        let note = with_state(|s| s.alarms.note.clone());
+        let overlay = vec![StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("alarm_note".into())]),
+            value: Value::Text(note),
+        }];
+        send_slot_content_with_overlay("content", content, Some(overlay));
     } else if panel_id == "overview" {
         // Seed the activity heatmap's cells into the slot snapshot so the
         // Heatmap mounts with its data already in the store (same pattern as the
@@ -2201,10 +2228,13 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "profile-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("profile_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.profiles.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("profiles"); json!({"ok":true}) }
         "profile-remove-cancel" => { with_state(|s| { s.profiles.pending_remove = None; s.clear_messages(); }); render_panel("profiles"); json!({"ok":true}) }
         "profile-remove" => handle_profile_remove(params),
-        "alarm-select" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.alarms.selected_id = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
-        "alarm-acknowledge" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| { s.success_message = Some(alloc::format!("Potwierdzono alarm {}.", id)); }); json!({"ok":true}) }
-        "alarm-acknowledge-all" => { with_state(|s| { s.success_message = Some("Potwierdzono wszystkie niepotwierdzone.".into()); s.alarms.selected_id = None; }); json!({"ok":true}) }
-        "alarm-filter-severity" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.alarms.severity_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
+        "alarm-select" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.clear_messages(); s.alarms.selected_id = if id.is_empty() { None } else { Some(id) }; s.alarms.note.clear(); }); render_panel("alarms"); json!({"ok":true}) }
+        "alarm-status-view" => { let v = params.get("view").and_then(|x| x.as_str()).unwrap_or("open").to_string(); with_state(|s| { s.alarms.status_view = if v == "open" { String::new() } else { v }; }); render_panel("alarms"); json!({"ok":true}) }
+        "alarm-filter-severity" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.alarms.severity_filter = if v == "all" { String::new() } else { v }; }); render_panel("alarms"); json!({"ok":true}) }
+        "alarm-note-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.alarms.note = v); json!({"ok":true}) }
+        "alarm-decide" => handle_alarm_decide(params),
+        "alarm-acknowledge-all" => handle_alarm_acknowledge_all(),
+        "alarm-simulate" => handle_alarm_simulate(),
         "alarm-mute-sound" => { with_state(|s| { s.alarms.sound_muted = !s.alarms.sound_muted; }); json!({"ok":true}) }
         "search-query-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.search.query = v); json!({"ok":true}) }
         "search-submit" => { let v = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()); with_state(|s| { if let Some(q) = v { s.search.query = q; } s.search.submitted = true; }); json!({"ok":true}) }
@@ -2681,6 +2711,105 @@ fn handle_profile_remove(params: &JsonValue) -> JsonValue {
     }
 }
 
+// =============================================================================
+// Alarm action handlers
+// =============================================================================
+
+/// Display label for the deciding operator. No host identity fn exists in this
+/// addon ABI yet, so decisions are attributed to the first-line operator role.
+const ALARM_OPERATOR: &str = "operator I linii";
+
+/// Records an operator decision on an alarm: persists the new status + operator
+/// + decision time, writes a hash-chained audit-log entry (before/after status),
+/// then re-renders so the feed and detail reflect the decision.
+fn handle_alarm_decide(params: &JsonValue) -> JsonValue {
+    let id = params.get("alarm_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let decision = params.get("decision").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() || !matches!(decision.as_str(), "confirmed" | "dismissed" | "escalated") {
+        with_state(|s| s.error_message = Some("Nieprawidłowa decyzja alarmu.".into()));
+        return json!({"ok":false,"error":"bad decision"});
+    }
+    // Capture the prior status so the audit trail records the real transition.
+    let before = db::get_alarm(&id).ok().flatten().map(|a| a.status).unwrap_or_default();
+    match db::update_alarm_status(&id, &decision, ALARM_OPERATOR) {
+        Ok(0) => {
+            with_state(|s| s.error_message = Some("Alarm nie istnieje.".into()));
+            render_panel("alarms");
+            json!({"ok":false,"error":"not found"})
+        }
+        Ok(_) => {
+            let note = with_state(|s| s.alarms.note.clone());
+            let after_json = serde_json::to_string(&json!({"status": decision, "note": note})).unwrap_or_default();
+            let before_json = serde_json::to_string(&json!({"status": before})).unwrap_or_default();
+            // Audit-log linkage: the future Audit tab reads this hash-chained row.
+            let _ = db::insert_audit(ALARM_OPERATOR, "alarm_decision", &id, &before_json, &after_json);
+            with_state(|s| s.success_message = Some(alloc::format!("Zapisano decyzję: {}.", alarm_status_long(&decision))));
+            render_panel("alarms");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu decyzji: {}", abi_message(e))));
+            render_panel("alarms");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Acknowledges every open (new) alarm in one pass, auditing the bulk action.
+fn handle_alarm_acknowledge_all() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    let open = db::list_alarms("", "", true).unwrap_or_default();
+    let mut n = 0u64;
+    for a in &open {
+        if a.status == "new" {
+            if db::update_alarm_status(&a.id, "acknowledged", ALARM_OPERATOR).unwrap_or(0) > 0 {
+                let _ = db::insert_audit(
+                    ALARM_OPERATOR, "alarm_decision", &a.id,
+                    &serde_json::to_string(&json!({"status": "new"})).unwrap_or_default(),
+                    &serde_json::to_string(&json!({"status": "acknowledged"})).unwrap_or_default(),
+                );
+                n += 1;
+            }
+        }
+    }
+    with_state(|s| s.success_message = Some(alloc::format!("Przyjęto {} alarmów.", n)));
+    render_panel("alarms");
+    json!({"ok":true,"acknowledged":n})
+}
+
+/// Dev/test affordance: raises a synthetic alarm against a real camera so the
+/// read → decision → persistence workflow is fully exercisable from the UI.
+/// Cycles severity (critical/warning/info) across calls for visual variety.
+fn handle_alarm_simulate() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    let cameras = db::list_cameras().unwrap_or_default();
+    let Some(cam) = cameras.first() else {
+        with_state(|s| s.error_message = Some("Dodaj najpierw kamerę, aby zasymulować alarm.".into()));
+        render_panel("alarms");
+        return json!({"ok":false,"error":"no cameras"});
+    };
+    let total = db::count_alarms(false, "").unwrap_or(0);
+    let (severity, kind, message) = match total % 3 {
+        0 => ("critical", "agresja", "podejrzenie agresji przy wjeździe"),
+        1 => ("warning", "ADR", "nieczytelna tablica ADR"),
+        _ => ("info", "pojazd", "pojazd w strefie zakazu"),
+    };
+    let ts = db::now_secs();
+    match db::insert_alarm(&cam.id, severity, kind, message, ts) {
+        Ok(id) => {
+            with_state(|s| { s.alarms.selected_id = Some(id); s.success_message = Some("Zasymulowano alarm testowy.".into()); });
+            render_panel("alarms");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd symulacji: {}", abi_message(e))));
+            render_panel("alarms");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
 /// Runs ONVIF discovery. The discovered camera cards are a genuinely dynamic
 /// list (count + per-row click handlers), so this re-sends the `add_camera_body`
 /// fragment — the only wizard action besides modal open that does. The
@@ -2981,40 +3110,6 @@ fn format_alarm_time(ts: i64) -> String {
     alloc::format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-/// Static alarm row used by the Alarms tab (a later tab-by-tab effort). The
-/// dashboard uses `build_alarm_card` with real `db::AlarmRow` data instead.
-fn build_alarm_row(title: &str, camera: &str, time: &str, severity: &str) -> Component {
-    let title_text = text_styled(title, "body_strong");
-    let meta_row = stack_h_gap("sm", vec![
-        chip_with_icon(camera, "category", "cameras"),
-        chip_with_icon(time, "category", "clock"),
-        badge(alarm_severity_label(match severity { "danger" => "critical", other => other }), severity),
-    ]);
-    let center = stack_v_gap("xs", vec![title_text, meta_row]);
-    let action = ButtonComp {
-        variant: ButtonVariant::Ghost,
-        tone: Tone::Neutral,
-        label: lit("Otwórz"),
-        icon_leading: None,
-        icon_trailing: None,
-        size: ButtonSize::Sm,
-        full_width: false,
-        disabled: None,
-        loading: None,
-        density: Density::Default,
-    }.into_component(next_id()).expect("Button");
-    Flex {
-        direction: FlexDirection::Row,
-        gap: Spacing::Md,
-        justify: FlexJustify::SpaceBetween,
-        align: FlexAlign::Center,
-        wrap: FlexWrap::NoWrap,
-        children: vec![center, action],
-        padding: Some(Spacing::Sm),
-        background: None,
-        radius: None,
-    }.into_component(next_id()).expect("Flex")
-}
 
 fn build_alarm_card(a: &db::AlarmRow) -> Component {
     // Title: detector type + message, falling back to whichever is present.
@@ -3998,29 +4093,333 @@ fn build_wizard_step_metadata() -> Component {
     ])
 }
 
+/// The Alarm Center (m05): left = real-time alarm feed with status/severity
+/// filters, right = the selected alarm's detail + decision workflow. Everything
+/// renders from `db::list_alarms` / `db::get_alarm`; decisions persist through
+/// `db::update_alarm_status` + an audit-log entry.
 fn build_alarms_content() -> Component {
-    let severity = with_state(|s| s.alarms.severity_or_all().to_string());
     let messages = build_messages_section();
-    let chips = filter_chips(
-        vec![
-            FilterChipDef { id: "all".into(), label: lit("all"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "critical".into(), label: lit("critical"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "warning".into(), label: lit("warning"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "info".into(), label: lit("info"), icon: None, badge: None, count_path: None },
-        ],
-        &severity,
-    );
-    let toolbar = stack_h(vec![
-        heading(2, "Alarmy"),
-        chips,
+    let (severity, status_view, selected_id) = with_state(|s| (
+        s.alarms.severity_or_all().to_string(),
+        s.alarms.status_or_open().to_string(),
+        s.alarms.selected_id.clone(),
+    ));
+
+    // Header: title + live severity counts + the "simulate alarm" test button.
+    let open_count = db::count_alarms(true, "").unwrap_or(0);
+    let crit_open = db::list_alarms("critical", "", true).map(|v| v.len()).unwrap_or(0);
+    let header = stack_h(vec![
+        heading(2, "Centrum alarmów"),
+        chip_toned(&alloc::format!("{} otwartych", open_count), if open_count > 0 { "warning" } else { "muted" }),
+        chip_toned(&alloc::format!("{} krytycznych", crit_open), if crit_open > 0 { "critical" } else { "muted" }),
+        button_with_icon("Symuluj alarm", "alarm-simulate", "primary", "bell"),
         button("Potwierdź wszystkie", "alarm-acknowledge-all", "secondary"),
     ]);
-    let alarm_rows = vec![
-        build_alarm_row("D2 · podejrzenie agresji", "C-04 wjazd", "12:43:21", "danger"),
-        build_alarm_row("D1 · nieczytelna tablica ADR (UN 1203)", "C-01 brama", "12:38:04", "warning"),
-        build_alarm_row("D3 · pozostawiony bagaż > 90s", "C-07 peron", "12:31:55", "warning"),
-    ];
-    stack_v(core::iter::once(messages).chain(core::iter::once(toolbar)).chain(alarm_rows).collect())
+
+    // Feed query per view: open collapses new+acknowledged, closed lists decided
+    // rows, all lists everything (no status constraint).
+    let sev = if severity == "all" { "" } else { severity.as_str() };
+    let alarms = match status_view.as_str() {
+        "closed" => list_closed_alarms(sev),
+        "all" => db::list_alarms(sev, "", false),
+        _ => db::list_alarms(sev, "", true),
+    };
+
+    let alarms = match alarms {
+        Ok(a) => a,
+        Err(e) => {
+            return stack_v(vec![messages, header, alert(&alloc::format!("Nie udało się pobrać alarmów: {}", abi_message(e)), "critical")]);
+        }
+    };
+
+    // LEFT — status tabs (counts) + severity chips + the card feed.
+    let total_count = db::count_alarms(false, "").unwrap_or(0);
+    let closed_count = (total_count - open_count).max(0);
+    let status_tabs = stack_h_gap("xs", vec![
+        alarm_status_tab("Niepotwierdzone", "open", &status_view, open_count),
+        alarm_status_tab("Wszystkie", "all", &status_view, total_count),
+        alarm_status_tab("Zamknięte", "closed", &status_view, closed_count),
+    ]);
+    let severity_chips = stack_h_gap("xs", vec![
+        alarm_severity_chip("Wszystkie", "all", &severity),
+        alarm_severity_chip("critical", "critical", &severity),
+        alarm_severity_chip("warning", "warning", &severity),
+        alarm_severity_chip("info", "info", &severity),
+    ]);
+
+    let feed_body = if alarms.is_empty() {
+        empty_state("Brak alarmów", Some("Gdy analityka wykryje zdarzenie, pojawi się tutaj. Użyj przycisku Symuluj alarm do testu."), Some("bell"))
+    } else {
+        let cards: Vec<Component> = alarms.iter()
+            .map(|a| build_alarm_feed_card(a, selected_id.as_deref() == Some(a.id.as_str())))
+            .collect();
+        stack_v_gap("sm", cards)
+    };
+    let left = stack_v(vec![status_tabs, severity_chips, feed_body]);
+
+    // RIGHT — detail panel for the selected alarm (or a prompt to pick one).
+    let detail = match selected_id.as_deref().and_then(|id| db::get_alarm(id).ok().flatten()) {
+        Some(a) => build_alarm_detail(&a),
+        None => card(None, vec![empty_state(
+            "Wybierz alarm",
+            Some("Kliknij kartę alarmu po lewej, aby zobaczyć klip, klatki i podjąć decyzję."),
+            Some("info"),
+        )]),
+    };
+
+    let split = grid(2, vec![left, detail]);
+    stack_v(vec![messages, header, split])
+}
+
+/// Closed-feed query: decided alarms (confirmed/dismissed/escalated), optionally
+/// narrowed by severity. Uses `list_alarms` per-status and merges by ts desc.
+fn list_closed_alarms(severity: &str) -> Result<Vec<db::AlarmRow>, AbiError> {
+    let mut out: Vec<db::AlarmRow> = Vec::new();
+    for st in ["confirmed", "dismissed", "escalated"] {
+        out.extend(db::list_alarms(severity, st, false)?);
+    }
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    Ok(out)
+}
+
+/// A left-feed status tab rendered as a toned chip button (selected = primary).
+fn alarm_status_tab(label: &str, view: &str, active: &str, count: i64) -> Component {
+    let lbl = alloc::format!("{} ({})", label, count);
+    let mut params = CborMap::default();
+    params.0.push(("view".into(), Value::Text(view.into())));
+    let variant = if active == view { "primary" } else { "ghost" };
+    button_with_params(&lbl, "alarm-status-view", variant, params)
+}
+
+/// A severity filter chip rendered as a toned button (selected = solid tone).
+fn alarm_severity_chip(label: &str, value: &str, active: &str) -> Component {
+    let mut params = CborMap::default();
+    params.0.push(("value".into(), Value::Text(value.into())));
+    let variant = if active == value { "primary" } else { "ghost" };
+    button_with_params(label, "alarm-filter-severity", variant, params)
+}
+
+/// Maps a persisted alarm status to a label + toned chip for the feed/detail.
+fn alarm_status_chip(status: &str) -> Component {
+    let (label, tone) = match status {
+        "confirmed" => ("potwierdzony", "critical"),
+        "dismissed" => ("fałszywy", "muted"),
+        "escalated" => ("eskalowany", "warning"),
+        "acknowledged" => ("przyjęty", "info"),
+        _ => ("nowy", "success"),
+    };
+    chip_toned(label, tone)
+}
+
+/// One alarm card in the left feed. Severity drives the chip tone (critical=red,
+/// warning=amber, info). The whole card is clickable → loads it into the detail.
+fn build_alarm_feed_card(a: &db::AlarmRow, selected: bool) -> Component {
+    let title = if !a.kind.is_empty() && !a.message.is_empty() {
+        alloc::format!("{} · {}", a.kind, a.message)
+    } else if !a.message.is_empty() {
+        a.message.clone()
+    } else if !a.kind.is_empty() {
+        a.kind.clone()
+    } else {
+        "Zdarzenie".into()
+    };
+    let camera_label = if !a.camera_name.is_empty() {
+        a.camera_name.clone()
+    } else if !a.camera_id.is_empty() {
+        a.camera_id.clone()
+    } else {
+        "—".into()
+    };
+    let sev_tone = alarm_severity_tone(&a.severity);
+    let meta = stack_h_gap("xs", vec![
+        chip_with_icon(&camera_label, "category", "cameras"),
+        chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
+        chip_toned(&a.severity, sev_tone),
+        alarm_status_chip(&a.status),
+    ]);
+    let body = stack_v_gap("xs", vec![text_styled(&title, "body_strong"), meta]);
+
+    let mut row_card = Card {
+        variant: if selected { CardVariant::Filled } else { CardVariant::Outlined },
+        padding: Spacing::Sm,
+        gap: Spacing::Sm,
+        radius: RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::None,
+        accent: Some(parse_tone(sev_tone)),
+        children: vec![body],
+        interactive: true,
+        clickable: true,
+    }.into_component(next_id()).expect("Card");
+    let mut params = CborMap::default();
+    params.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
+    row_card.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Click,
+        Handler::Backend {
+            action_id: "alarm-select".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    row_card
+}
+
+/// Severity → chip tone token. critical=red, warning=amber, anything else=info.
+fn alarm_severity_tone(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "critical",
+        "warning" => "warning",
+        _ => "info",
+    }
+}
+
+/// The right-hand alarm detail + decision workflow. Mirrors m05: clip placeholder,
+/// a frame timeline, a metadata table and the decision buttons + operator note.
+fn build_alarm_detail(a: &db::AlarmRow) -> Component {
+    let sev_tone = alarm_severity_tone(&a.severity);
+    let camera_label = if !a.camera_name.is_empty() { a.camera_name.clone() } else { a.camera_id.clone() };
+    let title_kind = if a.kind.is_empty() { "Zdarzenie".to_string() } else { a.kind.clone() };
+
+    let head = stack_h(vec![
+        chip_toned(&title_kind, sev_tone),
+        text_styled(&alloc::format!("{} · {}", camera_label, format_alarm_time(a.ts)), "caption"),
+        chip_toned(&alloc::format!("alarm {}", short_id(&a.id)), "muted"),
+        alarm_status_chip(&a.status),
+    ]);
+
+    // 30 s clip placeholder + a 10-frame timeline (the event frame highlighted).
+    let clip = card(None, vec![
+        stack_h(vec![
+            chip_toned_icon("Klip 30 s · 0:00 / 0:30", "info", "video"),
+        ]),
+    ]);
+    let frame_labels = ["−2s", "−1s", "EVT", "+1s", "+2s", "+3s", "+4s", "+5s", "+6s", "+7s"];
+    let frames: Vec<Component> = frame_labels.iter()
+        .map(|l| chip_toned(l, if *l == "EVT" { "primary" } else { "muted" }))
+        .collect();
+    let timeline = stack_h_gap("xs", frames);
+
+    // Metadata table — straight from the persisted alarm row.
+    let metadata = card(Some("Metadane"), vec![
+        key_value(vec![
+            ("Detektor", &title_kind),
+            ("Kamera", &camera_label),
+            ("Poziom", a.severity.as_str()),
+            ("Status", alarm_status_long(&a.status)),
+            ("Zgłoszono", &format_alarm_datetime(a.ts)),
+            ("Decyzja", &alarm_decision_note(a)),
+        ]),
+    ]);
+
+    // Decision workflow — buttons persist status + audit, note carries forward.
+    let mut confirm_p = CborMap::default();
+    confirm_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
+    confirm_p.0.push(("decision".into(), Value::Text("confirmed".into())));
+    let mut dismiss_p = CborMap::default();
+    dismiss_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
+    dismiss_p.0.push(("decision".into(), Value::Text("dismissed".into())));
+    let mut escalate_p = CborMap::default();
+    escalate_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
+    escalate_p.0.push(("decision".into(), Value::Text("escalated".into())));
+
+    let decision_buttons = stack_h_gap("sm", vec![
+        button_with_params("Potwierdź", "alarm-decide", "primary", confirm_p),
+        button_with_params("Fałszywy", "alarm-decide", "destructive", dismiss_p),
+        button_with_params("Eskaluj", "alarm-decide", "secondary", escalate_p),
+    ]);
+    let note = alarm_note_textarea();
+    let workflow = card(Some("Workflow"), vec![
+        text_styled("Decyzja operatora", "caption"),
+        decision_buttons,
+        note,
+    ]);
+
+    card(None, vec![head, clip, timeline, grid(2, vec![metadata, workflow])])
+}
+
+/// Operator-note textarea bound to the `alarm_note` store key.
+fn alarm_note_textarea() -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Textarea;
+    let mut comp = Textarea {
+        bind_path: StatePath::new(vec![PathSegment::Key("alarm_note".into())]),
+        placeholder: Some(lit("np. dwie osoby, kłótnia w pobliżu wjazdu — wysłano patrol...")),
+        label: Some(lit("Notatka operatora")),
+        hint: None,
+        validators: vec![],
+        max_length: Some(2000),
+        min_length: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+        rows: 3,
+        autoresize: true,
+        max_rows: Some(8),
+        monospace: false,
+    }.into_component("alarm_note").expect("Textarea");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text("note".into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "alarm-note-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+fn alarm_status_long(status: &str) -> &'static str {
+    match status {
+        "confirmed" => "Potwierdzony",
+        "dismissed" => "Fałszywy alarm",
+        "escalated" => "Eskalowany",
+        "acknowledged" => "Przyjęty",
+        _ => "Nowy (niepotwierdzony)",
+    }
+}
+
+/// Decision summary for the metadata table: operator + time, or a dash.
+fn alarm_decision_note(a: &db::AlarmRow) -> String {
+    if a.decided_at == 0 && a.decided_by.is_empty() {
+        return "—".into();
+    }
+    let who = if a.decided_by.is_empty() { "operator".to_string() } else { a.decided_by.clone() };
+    alloc::format!("{} · {}", who, format_alarm_datetime(a.decided_at))
+}
+
+/// Short, display-friendly id tail (the trailing counter segment).
+fn short_id(id: &str) -> String {
+    id.rsplit('-').next().unwrap_or(id).to_string()
+}
+
+/// Unix ts → "YYYY-MM-DD HH:MM" (UTC), good enough for the detail metadata.
+fn format_alarm_datetime(ts: i64) -> String {
+    if ts <= 0 {
+        return "—".into();
+    }
+    let days = ts / 86_400;
+    let (y, m, d) = civil_from_days(days);
+    let secs = ts.rem_euclid(86_400);
+    alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, secs / 3600, (secs % 3600) / 60)
+}
+
+/// Howard Hinnant's days→civil date algorithm (proleptic Gregorian, UTC).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn build_search_content() -> Component {
