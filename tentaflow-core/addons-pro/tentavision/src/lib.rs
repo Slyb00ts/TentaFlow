@@ -1384,16 +1384,18 @@ impl OnboardingState {
     }
 }
 
+/// State for the Bindings tab. The alias target choices themselves persist in the
+/// settings table (key `alias_map_<alias_id>`); this struct only holds ephemeral
+/// view state (which rows are expanded, the active status filter). The filter is
+/// pure view state, so it resets on reopen — the mappings do not.
 struct BindingsState {
     expanded_rows: Vec<String>,
-    filter_addon: Option<String>,
-    filter_type: Option<String>,
     filter_status: Option<String>,
 }
 
 impl BindingsState {
     const fn new() -> Self {
-        Self { expanded_rows: Vec::new(), filter_addon: None, filter_type: None, filter_status: None }
+        Self { expanded_rows: Vec::new(), filter_status: None }
     }
     fn toggle_expanded(&mut self, id: &str) {
         if let Some(idx) = self.expanded_rows.iter().position(|x| x == id) {
@@ -1402,12 +1404,13 @@ impl BindingsState {
             self.expanded_rows.push(id.to_string());
         }
     }
+    fn is_expanded(&self, id: &str) -> bool {
+        self.expanded_rows.iter().any(|x| x == id)
+    }
     fn has_any_filter(&self) -> bool {
-        self.filter_addon.is_some() || self.filter_type.is_some() || self.filter_status.is_some()
+        self.filter_status.is_some()
     }
     fn clear(&mut self) {
-        self.filter_addon = None;
-        self.filter_type = None;
         self.filter_status = None;
     }
 }
@@ -2272,6 +2275,11 @@ fn render_panel(panel_id: &str) {
             value: heatmap_cells_value(),
         }];
         send_slot_content_with_overlay("content", content, Some(overlay));
+    } else if panel_id == "bindings" {
+        // Seed each alias target Select's bound store key from the persisted
+        // mapping (or the alias's default) so every Select mounts showing its
+        // current target across reopen / process restart.
+        send_slot_content_with_overlay("content", content, Some(bindings_overlay()));
     } else {
         send_slot_content("content", content);
     }
@@ -2403,9 +2411,10 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "onboarding-next" => { with_state(|s| { if s.onboarding.step < 3 { s.onboarding.step += 1; } }); json!({"ok":true}) }
         "onboarding-prev" => { with_state(|s| { if s.onboarding.step > 0 { s.onboarding.step -= 1; } }); json!({"ok":true}) }
         "onboarding-finish" => { with_state(|s| { s.success_message = Some("Onboarding zakończony.".into()); }); json!({"ok":true}) }
-        "binding-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| s.bindings.toggle_expanded(&id)); json!({"ok":true}) }
-        "binding-filter-change" => { let id = params.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()).filter(|v| !v.is_empty()); with_state(|s| match id.as_str() { "addon" => s.bindings.filter_addon = value, "type" => s.bindings.filter_type = value, "status" => s.bindings.filter_status = value, _ => {} }); json!({"ok":true}) }
-        "binding-clear-filters" => { with_state(|s| s.bindings.clear()); json!({"ok":true}) }
+        "binding-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).or_else(|| params.get("alias_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.clear_messages(); s.bindings.toggle_expanded(&id); }); render_panel("bindings"); json!({"ok":true}) }
+        "binding-filter-change" => { let value = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).map(|s| s.to_string()).filter(|v| !v.is_empty() && v != "all"); with_state(|s| s.bindings.filter_status = value); render_panel("bindings"); json!({"ok":true}) }
+        "binding-clear-filters" => { with_state(|s| s.bindings.clear()); render_panel("bindings"); json!({"ok":true}) }
+        "binding-target-change" => handle_binding_target_change(params),
         _ => json!({"error": alloc::format!("unknown action '{}'", action)}),
     }
 }
@@ -7255,30 +7264,348 @@ fn build_onboarding_content() -> Component {
     stack_v(vec![messages, progress, step_content])
 }
 
+/// Actor recorded for binding (alias-mapping) audit entries.
+const BINDING_ACTOR: &str = "administrator";
+
+/// One AI alias the addon declares. `methods` are the service methods the addon
+/// invokes through this alias; `targets` is the allowlist of concrete services an
+/// admin may map it to (first entry is the default). `gated` marks aliases that
+/// stay locked behind a compliance grant regardless of the chosen target.
+struct AliasDef {
+    id: &'static str,
+    methods: &'static str,
+    targets: &'static [(&'static str, &'static str)],
+    gated: bool,
+    /// Whether this alias has no usable default target (admin must assign one).
+    needs_assignment: bool,
+}
+
+/// The 6 AI aliases TentaVision creates at install (mirrors the mockup). Each
+/// alias resolves to a concrete service chosen by the admin and persisted under
+/// `alias_map_<id>`.
+const ALIASES: &[AliasDef] = &[
+    AliasDef {
+        id: "tentavision-yolo",
+        methods: "detect · track",
+        targets: &[("yolo11m-detector", "yolo11m-detector"), ("yolo11s-detector", "yolo11s-detector"), ("yolo11n-cpu", "yolo11n-cpu")],
+        gated: false,
+        needs_assignment: false,
+    },
+    AliasDef {
+        id: "tentavision-ocr",
+        methods: "recognize · recognize_cropped",
+        targets: &[("ppocrv5-ocr", "ppocrv5-ocr"), ("parseq-adr", "parseq-adr")],
+        gated: false,
+        needs_assignment: false,
+    },
+    AliasDef {
+        id: "tentavision-action",
+        methods: "classify_window",
+        targets: &[("videomae-v2-rwf2k", "videomae-v2-rwf2k"), ("x3d-rwf2k", "x3d-rwf2k")],
+        gated: false,
+        needs_assignment: false,
+    },
+    AliasDef {
+        id: "tentavision-vlm",
+        methods: "embed · caption",
+        targets: &[("siglip2-vit-l14", "siglip2-vit-l14"), ("eva-clip-large", "eva-clip-large")],
+        gated: false,
+        needs_assignment: false,
+    },
+    AliasDef {
+        id: "tentavision-face-embed",
+        methods: "embed · gate: d4-historical",
+        targets: &[("adaface-r100", "adaface-r100"), ("arcface-r50", "arcface-r50")],
+        gated: true,
+        needs_assignment: false,
+    },
+    AliasDef {
+        id: "tentavision-reid",
+        methods: "embed · match · gate: d4-historical",
+        targets: &[("", "— nie ustawiony —"), ("osnet-x1", "osnet-x1"), ("solider-reid", "solider-reid")],
+        gated: true,
+        needs_assignment: true,
+    },
+];
+
+/// Store key holding the chosen target for an alias Select.
+fn alias_store_key(alias_id: &str) -> String {
+    alloc::format!("alias_target_{}", alias_id)
+}
+
+/// Settings key persisting an alias → service mapping.
+fn alias_setting_key(alias_id: &str) -> String {
+    alloc::format!("alias_map_{}", alias_id)
+}
+
+/// The effective target for an alias: the persisted mapping, else the alias's
+/// default (its first target entry).
+fn alias_target(a: &AliasDef) -> String {
+    if let Some(v) = db::get_setting(&alias_setting_key(a.id)).ok().flatten() {
+        return v;
+    }
+    a.targets.first().map(|(v, _)| (*v).to_string()).unwrap_or_default()
+}
+
+/// Resolves an alias to its (label, status-key) pair. Status is honest: a gated
+/// alias is "gated", an alias with an empty target is "unconfigured", otherwise
+/// the addon has no live service-health channel here, so a configured alias is
+/// reported as "assigned" (mapping persisted, awaiting a running backend) rather
+/// than a fabricated "online".
+fn alias_status_cell(a: &AliasDef, target: &str) -> (&'static str, &'static str) {
+    if target.trim().is_empty() {
+        ("nieprzypisany", "warn")
+    } else if a.gated {
+        ("gated", "err")
+    } else {
+        ("przypisany", "ok")
+    }
+}
+
 fn build_bindings_content() -> Component {
     let messages = build_messages_section();
-    let has_filter = with_state(|s| s.bindings.has_any_filter());
-    let toolbar = stack_h(vec![
-        heading(2, "Powiązania"),
-        if has_filter { button("Wyczyść filtry", "binding-clear-filters", "ghost") } else { divider() },
+    let (filter_status, has_filter) = with_state(|s| (s.bindings.filter_status.clone(), s.bindings.has_any_filter()));
+
+    let assigned = ALIASES.iter().filter(|a| !a.gated && !alias_target(a).trim().is_empty()).count();
+    let total = ALIASES.len();
+    let header = stack_h(vec![
+        heading(2, "Powiązania i magazyn"),
+        chip_toned(&alloc::format!("{}/{} aliasów aktywnych", assigned, total), "success"),
+        chip_toned("mapowanie wykonawcze addona", "muted"),
     ]);
 
-    let fixture: &[(&str, &str, &str, &str, &str)] = &[
-        ("b-001", "eureka", "tentavision", "data_source", "active"),
-        ("b-002", "contacts", "crm", "entity_lookup", "active"),
-        ("b-003", "tentavision", "scheduler", "cron_trigger", "paused"),
-    ];
-    let cols = vec![
-        Value::Text("Consumer".into()), Value::Text("Provider".into()),
-        Value::Text("Typ".into()), Value::Text("Status".into()),
-    ];
-    let rows: Vec<Value> = fixture.iter().map(|(_, consumer, provider, typ, status)| {
-        Value::Array(vec![
-            Value::Text((*consumer).into()), Value::Text((*provider).into()),
-            Value::Text((*typ).into()), Value::Text((*status).into()),
+    let mut children = vec![messages, header];
+
+    // 1. Built-in storage API status — REAL capability probes.
+    children.push(build_storage_status_card());
+
+    // 2. AI alias mappings — editable, persisted.
+    let toolbar = stack_h(vec![
+        heading(3, "Aliasy AI utworzone przez addon · 6 sztuk"),
+        if has_filter { button("Wyczyść filtr", "binding-clear-filters", "ghost") } else { divider() },
+    ]);
+    let active = filter_status.as_deref().unwrap_or("all");
+    let count_for = |st: &str| ALIASES.iter().filter(|a| {
+        let (_, tone) = alias_status_cell(a, &alias_target(a));
+        match st {
+            "ok" => tone == "ok",
+            "warn" => tone == "warn",
+            "err" => tone == "err",
+            _ => true,
+        }
+    }).count();
+    let status_chips = filter_chips(
+        vec![
+            FilterChipDef { id: "all".into(), label: lit(&alloc::format!("Wszystkie ({})", total)), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "ok".into(), label: lit(&alloc::format!("Przypisane ({})", count_for("ok"))), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "warn".into(), label: lit(&alloc::format!("Nieprzypisane ({})", count_for("warn"))), icon: None, badge: None, count_path: None },
+            FilterChipDef { id: "err".into(), label: lit(&alloc::format!("Gated ({})", count_for("err"))), icon: None, badge: None, count_path: None },
+        ],
+        active,
+    );
+
+    let mut alias_children: Vec<Component> = vec![toolbar, status_chips];
+    for a in ALIASES {
+        let target = alias_target(a);
+        let (_, tone) = alias_status_cell(a, &target);
+        let visible = match active {
+            "ok" => tone == "ok",
+            "warn" => tone == "warn",
+            "err" => tone == "err",
+            _ => true,
+        };
+        if visible {
+            alias_children.push(build_alias_row(a, &target));
+        }
+    }
+    children.push(card(None, alias_children));
+
+    stack_v(children)
+}
+
+/// Built-in storage API status panel. Every status is a REAL probe of the addon's
+/// own capabilities — never a hard-coded "ok".
+fn build_storage_status_card() -> Component {
+    // SQL: round-trip a trivial query through the host SQL bridge.
+    let (sql_label, sql_tone, sql_sub) = match db::query("SELECT 1", &[]) {
+        Ok(rows) if rows.first().and_then(|r| r.first()).map(db::SqlValue::as_i64) == Some(1) => {
+            ("dostępny", "ok", "SQLite · per-addon baza")
+        }
+        Ok(_) => ("nieoczekiwana odpowiedź", "warn", "SQLite · per-addon baza"),
+        Err(_) => ("błąd", "err", "SQLite · per-addon baza"),
+    };
+
+    // KV: write+read a probe key through the settings table (the addon's KV).
+    let kv_probe = "kv_probe";
+    let kv_token = alloc::format!("{}", db::now_secs());
+    let (kv_label, kv_tone, kv_sub) = match db::set_setting(kv_probe, &kv_token) {
+        Ok(_) => match db::get_setting(kv_probe) {
+            Ok(Some(v)) if v == kv_token => ("dostępny", "ok", "round-trip OK · tabela settings"),
+            Ok(_) => ("niespójny odczyt", "warn", "tabela settings"),
+            Err(_) => ("błąd odczytu", "err", "tabela settings"),
+        },
+        Err(_) => ("błąd zapisu", "err", "tabela settings"),
+    };
+
+    // Vector: this addon declares no vector host function / capability in its
+    // manifest, so report it honestly as unavailable rather than faking a count.
+    let (vec_label, vec_tone, vec_sub) = ("niedostępne", "muted", "brak host-fn / capability w manifeście");
+
+    // Recording: report configured recordings dir from settings + the granted
+    // recording.read permission.
+    let rec_dir = db::get_setting("storage_recordings_dir").ok().flatten().unwrap_or_default();
+    let (rec_label, rec_tone, rec_sub) = if rec_dir.trim().is_empty() {
+        ("nieskonfigurowane", "warn", "ustaw katalog w Ustawienia")
+    } else {
+        ("skonfigurowane", "ok", "recording.read · katalog ustawiony")
+    };
+
+    let cell = |title: &str, label: &str, tone: &str, sub: &str| -> Component {
+        card(None, vec![
+            text_styled(title, "overline"),
+            chip_toned(label, tone),
+            text_styled(sub, "caption"),
         ])
+    };
+
+    card(None, vec![
+        heading(3, "Storage — wbudowane API TentaFlow"),
+        grid(4, vec![
+            cell("KV store", kv_label, kv_tone, kv_sub),
+            cell("SQL · SQLite", sql_label, sql_tone, sql_sub),
+            cell("Vector store", vec_label, vec_tone, vec_sub),
+            cell("Recording", rec_label, rec_tone, &alloc::format!("{}{}", rec_sub, if rec_dir.trim().is_empty() { String::new() } else { alloc::format!(" · {}", rec_dir) })),
+        ]),
+    ])
+}
+
+/// One alias row: name + methods, a status chip, an editable target Select that
+/// persists on change, and an expandable detail block with the fallback chain.
+fn build_alias_row(a: &AliasDef, target: &str) -> Component {
+    let (status_label, status_tone) = alias_status_cell(a, target);
+    let expanded = with_state(|s| s.bindings.is_expanded(a.id));
+
+    let name_block = stack_v_gap("xxs", vec![
+        text_styled(a.id, "body_strong"),
+        text_styled(a.methods, "caption"),
+    ]);
+
+    let select = build_alias_target_select(a);
+
+    let mut params = CborMap::default();
+    params.0.push(("alias_id".into(), Value::Text(a.id.into())));
+    let expand_btn = button_with_params(
+        if expanded { "Zwiń" } else { "Szczegóły" },
+        "binding-row-expand",
+        "ghost",
+        params,
+    );
+
+    let header_row = stack_h(vec![
+        name_block,
+        select,
+        chip_toned(status_label, status_tone),
+        expand_btn,
+    ]);
+
+    let mut row_children = vec![header_row];
+    if expanded {
+        let fallbacks: Vec<&str> = a.targets.iter().skip(1).filter(|(v, _)| !v.is_empty()).map(|(v, _)| *v).collect();
+        let fallback_text = if fallbacks.is_empty() {
+            "brak fallbacku".to_string()
+        } else {
+            alloc::format!("fallback chain: {}", fallbacks.join(", "))
+        };
+        row_children.push(divider());
+        row_children.push(key_value(vec![
+            ("Alias", a.id),
+            ("Rozwiązuje na", if target.trim().is_empty() { "— nie ustawiony —" } else { target }),
+            ("Metody", a.methods),
+            ("Strategia", "first_available"),
+        ]));
+        row_children.push(text_styled(&fallback_text, "caption"));
+        if a.gated {
+            row_children.push(text_styled(
+                "Alias bramkowany (gate: d4-historical). Wybór targetu zapisuje się, ale wywołania wymagają aktywnego LegalGrant.",
+                "caption",
+            ));
+        }
+    }
+
+    card(None, row_children)
+}
+
+/// Target Select for one alias. Bound to `alias_target_<id>`, seeded from the
+/// persisted mapping, and committing the picked service on change via
+/// `binding-target-change` (tagged with the alias id).
+fn build_alias_target_select(a: &AliasDef) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Select;
+    let store_key = alias_store_key(a.id);
+    let options: Vec<SelectOption> = a.targets.iter().map(|(v, l)| SelectOption {
+        value: SelectValue::Text((*v).into()),
+        label: lit(l),
+        icon: None, disabled: false, group_id: None, description: None,
     }).collect();
-    stack_v(vec![messages, toolbar, card(None, vec![table(cols, rows)])])
+    let mut comp = Select {
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
+        options,
+        placeholder: None,
+        label: Some(lit("Target")),
+        searchable: false, clearable: false, virtualize: false,
+        disabled: None, size: InputSize::Md, groups: None,
+    }.into_component(&store_key).expect("Select");
+    let mut params = CborMap::default();
+    params.0.push(("alias_id".into(), Value::Text(a.id.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "binding-target-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Seeds each alias Select's bound store key from the persisted mapping (or the
+/// alias default) so the panel mounts with the current targets selected.
+fn bindings_overlay() -> Vec<StateEntry> {
+    ALIASES.iter().map(|a| StateEntry {
+        path: StatePath::new(vec![PathSegment::Key(alias_store_key(a.id))]),
+        value: Value::Text(alias_target(a)),
+    }).collect()
+}
+
+/// Persists a new alias → service mapping and records the before/after in the
+/// audit log. The mapping CHOICE persists regardless of whether a backing
+/// service is currently running (that is the real, durable part of a binding).
+fn handle_binding_target_change(params: &JsonValue) -> JsonValue {
+    let alias_id = params.get("alias_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let Some(alias) = ALIASES.iter().find(|a| a.id == alias_id) else {
+        return json!({"ok": false});
+    };
+    // Reject targets outside the alias's declared allowlist.
+    if !alias.targets.iter().any(|(v, _)| *v == value) {
+        with_state(|s| s.error_message = Some("Nieznany target dla aliasu.".into()));
+        render_panel("bindings");
+        return json!({"ok": false});
+    }
+    let before = alias_target(alias);
+    let key = alias_setting_key(&alias_id);
+    match db::set_setting(&key, &value) {
+        Ok(_) => {
+            let _ = db::insert_audit(BINDING_ACTOR, "binding_change", &alias_id, &before, &value);
+            let shown = if value.trim().is_empty() { "— nie ustawiony —".to_string() } else { value.clone() };
+            with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Alias {} → {} zapisany.", alias_id, shown)); });
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Nie udało się zapisać mapowania: {}", abi_message(e))));
+        }
+    }
+    render_panel("bindings");
+    json!({"ok": true})
 }
 
 fn redact_url_for_display(url: &str) -> String {
