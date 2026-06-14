@@ -18,6 +18,9 @@ pub mod nms;
 pub mod preprocessing;
 pub mod resize;
 
+#[cfg(feature = "inference-vision-gpu")]
+pub mod detector_rfdetr;
+
 pub mod hsemotion;
 pub mod movenet;
 pub mod scrfd;

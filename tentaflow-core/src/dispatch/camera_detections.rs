@@ -181,6 +181,12 @@ fn camera_detections_subscribe_handler(
         }
     };
 
+    // Production path: start the always-on RF-DETR analysis loop for this
+    // camera (idempotent — one task per camera regardless of subscribers).
+    // Real detections flow into `detection_bus` and out through this stream.
+    #[cfg(feature = "inference-vision-gpu")]
+    crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+
     // Dev/test only, behind the env flag (default off): when no real detector
     // publishes for this camera, spawn one synthetic source so the e2e suite
     // sees overlay data without deployed models. The registry keeps it to one

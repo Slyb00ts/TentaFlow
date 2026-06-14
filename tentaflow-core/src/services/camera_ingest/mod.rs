@@ -22,6 +22,9 @@ pub mod session;
 pub mod stream_publisher;
 pub mod supervisor;
 
+#[cfg(feature = "inference-vision-gpu")]
+pub mod vision_analysis;
+
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};
 pub use error::{CameraIngestError, Result};

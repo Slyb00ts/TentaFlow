@@ -235,8 +235,24 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
 /// path (see `tentaflow/src/main.rs`) so GStreamer pipelines stop before
 /// the router begins releasing locks.
 pub async fn shutdown_camera_supervisor_global() {
+    #[cfg(feature = "inference-vision-gpu")]
+    crate::services::camera_ingest::vision_analysis::drain();
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
+    }
+}
+
+/// Latest decoded RGB24 frame for a camera, taken from the running session's
+/// frame mailbox via the process-wide supervisor. `None` when the supervisor
+/// is not initialized, the camera is not registered, or no frame has landed
+/// yet. Used by the always-on vision analysis loop to pull frames without
+/// reaching into session internals.
+#[cfg(feature = "inference-vision-gpu")]
+pub async fn latest_frame_global(camera_id: &str) -> Option<(std::sync::Arc<[u8]>, u32, u32)> {
+    let sup = SUPERVISOR.get()?;
+    match sup.snapshot(camera_id).await {
+        Ok(snap) => Some((std::sync::Arc::from(snap.data), snap.width, snap.height)),
+        Err(_) => None,
     }
 }
 
