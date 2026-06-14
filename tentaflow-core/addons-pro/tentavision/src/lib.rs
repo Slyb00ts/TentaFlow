@@ -1371,16 +1371,46 @@ struct PanelState {
     bindings: BindingsState,
 }
 
+/// Ephemeral wizard progress. The OUTCOMES persist to the settings table /
+/// cameras table on finish; this struct only holds the in-flight selections so
+/// the user can move back and forth between steps before committing. None of it
+/// survives a panel close — a half-finished wizard restarts from step 0, which
+/// is the intended behaviour until `onboarding_completed` is written.
 struct OnboardingState {
     step: u8,
-    deployment_profile: Option<String>,
-    selected_models: Vec<String>,
-    notification_channel: Option<String>,
+    /// Chosen deployment role (key from ONBOARDING_ROLES), persisted on finish
+    /// under settings key `onboarding_role`.
+    role: Option<String>,
+    /// Chosen legal/AI-Act profile (key from LEGAL_PROFILES), persisted on finish
+    /// under settings key `legal_profile` — the SAME key the Settings tab uses.
+    legal_profile: Option<String>,
+    /// First-camera draft. On finish a real camera row is inserted via
+    /// db::insert_camera so it shows up in the Cameras tab.
+    camera_name: String,
+    camera_url: String,
+    /// Chosen detector preset (key from ONBOARDING_PRESETS), persisted on finish
+    /// under settings key `onboarding_presets`.
+    presets: Option<String>,
 }
 
 impl OnboardingState {
     const fn new() -> Self {
-        Self { step: 0, deployment_profile: None, selected_models: Vec::new(), notification_channel: None }
+        Self {
+            step: 0,
+            role: None,
+            legal_profile: None,
+            camera_name: String::new(),
+            camera_url: String::new(),
+            presets: None,
+        }
+    }
+    fn reset(&mut self) {
+        self.step = 0;
+        self.role = None;
+        self.legal_profile = None;
+        self.camera_name.clear();
+        self.camera_url.clear();
+        self.presets = None;
     }
 }
 
@@ -2280,6 +2310,9 @@ fn render_panel(panel_id: &str) {
         // mapping (or the alias's default) so every Select mounts showing its
         // current target across reopen / process restart.
         send_slot_content_with_overlay("content", content, Some(bindings_overlay()));
+    } else if panel_id == "onboarding" {
+        // Seed the first-camera inputs so step navigation keeps typed values.
+        send_slot_content_with_overlay("content", content, Some(onboarding_overlay()));
     } else {
         send_slot_content("content", content);
     }
@@ -2408,9 +2441,14 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "settings-field-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, value)); } json!({"ok":true}) }
         "settings-toggle-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let on = params.get("value").and_then(|x| x.as_bool()).or_else(|| params.get("checked").and_then(|x| x.as_bool())).unwrap_or(false); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, if on { "1".into() } else { "0".into() })); } json!({"ok":true}) }
         "settings-save" => handle_settings_save(),
-        "onboarding-next" => { with_state(|s| { if s.onboarding.step < 3 { s.onboarding.step += 1; } }); json!({"ok":true}) }
-        "onboarding-prev" => { with_state(|s| { if s.onboarding.step > 0 { s.onboarding.step -= 1; } }); json!({"ok":true}) }
-        "onboarding-finish" => { with_state(|s| { s.success_message = Some("Onboarding zakończony.".into()); }); json!({"ok":true}) }
+        "onboarding-next" => handle_onboarding_next(),
+        "onboarding-prev" => { with_state(|s| { s.clear_messages(); if s.onboarding.step > 0 { s.onboarding.step -= 1; } }); render_panel("onboarding"); json!({"ok":true}) }
+        "onboarding-pick-role" => handle_onboarding_pick("role", params),
+        "onboarding-pick-legal" => handle_onboarding_pick("legal", params),
+        "onboarding-pick-presets" => handle_onboarding_pick("presets", params),
+        "onboarding-field-change" => handle_onboarding_field_change(params),
+        "onboarding-finish" => handle_onboarding_finish(),
+        "onboarding-restart" => handle_onboarding_restart(),
         "binding-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).or_else(|| params.get("alias_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.clear_messages(); s.bindings.toggle_expanded(&id); }); render_panel("bindings"); json!({"ok":true}) }
         "binding-filter-change" => { let value = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).map(|s| s.to_string()).filter(|v| !v.is_empty() && v != "all"); with_state(|s| s.bindings.filter_status = value); render_panel("bindings"); json!({"ok":true}) }
         "binding-clear-filters" => { with_state(|s| s.bindings.clear()); render_panel("bindings"); json!({"ok":true}) }
@@ -3489,6 +3527,7 @@ fn build_nav_tab_items(_active: &str) -> Vec<NavTab> {
         ("audit", "Audyt i RODO", "audit"),
         ("evidence", "Eksport dowodowy", "evidence"),
         ("settings", "Ustawienia", "settings"),
+        ("onboarding", "Onboarding", "check"),
     ];
     entries.iter().map(|(id, label, icon)| {
         NavTab {
@@ -7232,36 +7271,408 @@ fn build_settings_content() -> Component {
     stack_v(vec![messages, header, grid_cards, legal_card, save_bar])
 }
 
+/// Number of wizard steps (role → legal → camera → presets).
+const ONBOARDING_STEPS: u8 = 4;
+
+/// Settings keys the wizard's outcomes persist to. `legal_profile` is shared with
+/// the Settings tab so the choice stays consistent across both screens.
+const KEY_ONBOARDING_ROLE: &str = "onboarding_role";
+const KEY_ONBOARDING_PRESETS: &str = "onboarding_presets";
+const KEY_ONBOARDING_COMPLETED: &str = "onboarding_completed";
+const KEY_ONBOARDING_COMPLETED_AT: &str = "onboarding_completed_at";
+const ONBOARDING_ACTOR: &str = "administrator";
+
+/// Deployment roles offered in step 1. Each is (key, title, description, icon).
+const ONBOARDING_ROLES: &[(&str, &str, &str, &str)] = &[
+    ("depo", "Depo / baza taboru", "Zajezdnie, bazy autobusowe, place manewrowe. Detekcja wjazdu/wyjazdu, ANPR, strefy.", "truck"),
+    ("office", "Biuro / kampus", "Wejścia, recepcje, korytarze. Kontrola dostępu, liczenie osób (anonimowo).", "home"),
+    ("retail", "Retail / handel", "Sklepy, galerie, parkingi. Analiza ruchu, kolejki, strefy ryzyka.", "package"),
+    ("custom", "Custom / inne", "Konfiguracja własna — wszystkie detektory dostępne wg profilu prawnego.", "settings"),
+];
+
+/// Detector presets offered in step 4. Each is (key, title, description).
+const ONBOARDING_PRESETS: &[(&str, &str, &str)] = &[
+    ("safety", "Bezpieczeństwo (D1+D3)", "Detekcja osób i pojazdów, strefy zakazane, alarmy obecności. Bez danych osobowych."),
+    ("traffic", "Ruch i ANPR (D1+D3+OCR)", "Detekcja, śledzenie, rozpoznawanie tablic. ANPR przez OCR alias."),
+    ("full", "Pełny (D1–D6 wg profilu)", "Wszystkie klasy detektorów dozwolone przez wybrany profil prawny."),
+];
+
+/// Looks up the display title for a stored role key.
+fn onboarding_role_label(key: &str) -> &str {
+    ONBOARDING_ROLES.iter().find(|(k, ..)| *k == key).map(|(_, t, ..)| *t).unwrap_or("—")
+}
+
+/// Looks up the display title for a stored legal-profile key (shared catalog).
+fn legal_profile_label(key: &str) -> &str {
+    LEGAL_PROFILES.iter().find(|(k, _)| *k == key).map(|(_, l)| *l).unwrap_or("—")
+}
+
+/// Looks up the display title for a stored preset key.
+fn onboarding_preset_label(key: &str) -> &str {
+    ONBOARDING_PRESETS.iter().find(|(k, ..)| *k == key).map(|(_, t, ..)| *t).unwrap_or("—")
+}
+
+/// True once the wizard has been finished (settings key `onboarding_completed`=1).
+fn onboarding_completed() -> bool {
+    db::get_setting(KEY_ONBOARDING_COMPLETED).ok().flatten().as_deref() == Some("1")
+}
+
+/// One selectable option card: title + description, with a primary "Wybierz"
+/// button (or a "Wybrane" success chip when it is the current selection). The
+/// select button carries the option key so the handler knows which was picked.
+fn onboarding_option_card(key: &str, title: &str, desc: &str, selected: bool, action: &str) -> Component {
+    let mut params = CborMap::default();
+    params.0.push(("key".into(), Value::Text(key.into())));
+    let action_row = if selected {
+        chip_toned("Wybrane", "success")
+    } else {
+        button_with_params("Wybierz", action, "secondary", params)
+    };
+    card(None, vec![
+        stack_h(vec![text_styled(title, "body_strong"), if selected { chip_toned("✓", "success") } else { divider() }]),
+        text_styled(desc, "caption"),
+        action_row,
+    ])
+}
+
+/// Reactive text input for a wizard field, committing each keystroke to backend
+/// onboarding state via `onboarding-field-change` (tagged with `field`).
+fn onboarding_input(label: &str, placeholder: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let store_key = alloc::format!("onb_{}", field);
+    let placeholder_ref = if placeholder.is_empty() { None } else { Some(lit(placeholder)) };
+    let mut comp = Input {
+        r#type: InputType::Text,
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
+        placeholder: placeholder_ref,
+        label: Some(lit(label)),
+        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
+        validators: vec![], max_length: None, min_length: None, pattern: None,
+        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        size: InputSize::Md,
+    }.into_component(&store_key).expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "onboarding-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Seeds the camera-step inputs from backend onboarding state so they keep their
+/// typed values when the user steps back and forth.
+fn onboarding_overlay() -> Vec<StateEntry> {
+    let (name, url) = with_state(|s| (s.onboarding.camera_name.clone(), s.onboarding.camera_url.clone()));
+    vec![
+        StateEntry { path: StatePath::new(vec![PathSegment::Key("onb_camera_name".into())]), value: Value::Text(name) },
+        StateEntry { path: StatePath::new(vec![PathSegment::Key("onb_camera_url".into())]), value: Value::Text(url) },
+    ]
+}
+
 fn build_onboarding_content() -> Component {
     let messages = build_messages_section();
-    let step = with_state(|s| s.onboarding.step);
+
+    // Already completed → show the persisted summary instead of the wizard.
+    if onboarding_completed() {
+        return build_onboarding_summary(messages);
+    }
+
+    let (step, role, legal, presets) = with_state(|s| (
+        s.onboarding.step,
+        s.onboarding.role.clone(),
+        s.onboarding.legal_profile.clone(),
+        s.onboarding.presets.clone(),
+    ));
+
+    let welcome = card(None, vec![
+        heading(1, "Witaj w TentaVision"),
+        text_styled("Skonfigurujmy addon dla Twojego wdrożenia. 4 kroki: rola → profil prawny (RODO/AI Act) → pierwsza kamera → presety detektorów.", "caption"),
+    ]);
+
     let steps_data: Vec<StepDef> = vec![
-        StepDef { id: "step0".into(), label: lit("Profil deploymentu"), optional: false, status: None, description: None },
-        StepDef { id: "step1".into(), label: lit("Wybór modeli"), optional: false, status: None, description: None },
-        StepDef { id: "step2".into(), label: lit("Powiadomienia"), optional: false, status: None, description: None },
-        StepDef { id: "step3".into(), label: lit("Podsumowanie"), optional: false, status: None, description: None },
+        StepDef { id: "step0".into(), label: lit("Rola wdrożenia"), optional: false, status: Some(lit(step_status(step, 0))), description: None },
+        StepDef { id: "step1".into(), label: lit("Profil prawny"), optional: false, status: Some(lit(step_status(step, 1))), description: None },
+        StepDef { id: "step2".into(), label: lit("Pierwsza kamera"), optional: false, status: Some(lit(step_status(step, 2))), description: None },
+        StepDef { id: "step3".into(), label: lit("Presety detektorów"), optional: false, status: Some(lit(step_status(step, 3))), description: None },
     ];
     let current_step_id = alloc::format!("step{}", step);
     let progress = step_progress(steps_data, &current_step_id);
-    let step_content = match step {
-        0 => card(Some("Krok 1: Profil deploymentu"), vec![
-            text("Wybierz profil: depo / biuro / retail / custom"),
-            button("Dalej", "onboarding-next", "primary"),
-        ]),
-        1 => card(Some("Krok 2: Modele"), vec![
-            text("Wybierz modele detekcji do załadowania."),
-            stack_h(vec![button("Wstecz", "onboarding-prev", "ghost"), button("Dalej", "onboarding-next", "primary")]),
-        ]),
-        2 => card(Some("Krok 3: Powiadomienia"), vec![
-            text("Skonfiguruj kanał powiadomień (Slack / Email / Webhook)."),
-            stack_h(vec![button("Wstecz", "onboarding-prev", "ghost"), button("Dalej", "onboarding-next", "primary")]),
-        ]),
-        _ => card(Some("Krok 4: Podsumowanie"), vec![
-            text("Wszystko gotowe. Kliknij 'Zakończ' aby rozpocząć."),
-            stack_h(vec![button("Wstecz", "onboarding-prev", "ghost"), button("Zakończ", "onboarding-finish", "primary")]),
-        ]),
+
+    let step_body = match step {
+        0 => build_onboarding_step_role(role.as_deref()),
+        1 => build_onboarding_step_legal(legal.as_deref()),
+        2 => build_onboarding_step_camera(),
+        _ => build_onboarding_step_presets(presets.as_deref()),
     };
-    stack_v(vec![messages, progress, step_content])
+
+    stack_v(vec![messages, welcome, progress, step_body])
+}
+
+/// StepProgress status token for step `idx` given the active `step`.
+fn step_status(step: u8, idx: u8) -> &'static str {
+    if idx < step { "complete" } else if idx == step { "current" } else { "pending" }
+}
+
+/// Step 1 — deployment role selection.
+fn build_onboarding_step_role(selected: Option<&str>) -> Component {
+    let mut children = vec![
+        heading(3, "Krok 1 — Rola wdrożenia"),
+        text_styled("Rola dobiera domyślne strefy, presety detektorów i sugerowany profil prawny. Możesz zmienić każdy element później.", "caption"),
+    ];
+    let mut options = Vec::new();
+    for (key, title, desc, _icon) in ONBOARDING_ROLES {
+        options.push(onboarding_option_card(key, title, desc, selected == Some(*key), "onboarding-pick-role"));
+    }
+    children.push(grid(2, options));
+    children.push(stack_h(vec![
+        divider(),
+        button("Dalej: profil prawny", "onboarding-next", "primary"),
+    ]));
+    card(None, children)
+}
+
+/// Step 2 — legal/AI-Act profile selection (shared `legal_profile` key).
+fn build_onboarding_step_legal(selected: Option<&str>) -> Component {
+    let mut children = vec![
+        heading(3, "Krok 2 — Profil prawny (RODO / AI Act)"),
+        text_styled("Profil determinuje dostępność detektorów klasy C (twarz, re-ID), domyślne retencje i wymagane dokumenty (DPIA, FRIA). Runtime egzekwuje gate na podstawie tego wyboru. Zapisywany pod tym samym kluczem co Ustawienia.", "caption"),
+    ];
+    let mut options = Vec::new();
+    for (key, label) in LEGAL_PROFILES {
+        options.push(onboarding_option_card(key, label, legal_profile_desc(key), selected == Some(*key), "onboarding-pick-legal"));
+    }
+    children.push(grid(2, options));
+    children.push(stack_h(vec![
+        button("Wstecz", "onboarding-prev", "ghost"),
+        button("Dalej: pierwsza kamera", "onboarding-next", "primary"),
+    ]));
+    card(None, children)
+}
+
+/// Short rationale shown under each legal profile option.
+fn legal_profile_desc(key: &str) -> &'static str {
+    match key {
+        "commercial_private" => "Logistyka, magazyny, parkingi, biura. Detektory bezosobowe i anonimowe. D4 (face/re-id) zablokowany.",
+        "public_transport" => "Spółka transportowa, terminal. D4 historyczne pod DPIA, real-time blokowany (AI Act Art. 5).",
+        "airport_station" => "Krytyczna infrastruktura. D4 w wąskim zakresie (LegalGrant + DPIA + FRIA). Pełny post-market monitoring.",
+        "authorized_services" => "Policja, prokuratura, SG. D4 real-time tylko pod aktywnym LegalGrant. Wymaga podpisanego manifestu.",
+        _ => "",
+    }
+}
+
+/// Step 3 — first camera. Inputs commit to backend state; insert happens on finish.
+fn build_onboarding_step_camera() -> Component {
+    card(None, vec![
+        heading(3, "Krok 3 — Pierwsza kamera"),
+        text_styled("Dodaj pierwsze źródło wideo. Po zakończeniu kreatora utworzymy realny wpis kamery — pojawi się na zakładce Kamery.", "caption"),
+        onboarding_input("Nazwa kamery", "np. Brama główna", "camera_name"),
+        onboarding_input("Adres RTSP", "rtsp://192.168.1.10:554/stream", "camera_url"),
+        stack_h(vec![
+            button("Wstecz", "onboarding-prev", "ghost"),
+            button("Dalej: presety", "onboarding-next", "primary"),
+        ]),
+    ])
+}
+
+/// Step 4 — detector presets + finish.
+fn build_onboarding_step_presets(selected: Option<&str>) -> Component {
+    let mut children = vec![
+        heading(3, "Krok 4 — Presety detektorów"),
+        text_styled("Wybierz zestaw startowy detektorów. Dostępność klas zależy od wybranego profilu prawnego.", "caption"),
+    ];
+    let mut options = Vec::new();
+    for (key, title, desc) in ONBOARDING_PRESETS {
+        options.push(onboarding_option_card(key, title, desc, selected == Some(*key), "onboarding-pick-presets"));
+    }
+    children.push(grid(2, options));
+    children.push(stack_h(vec![
+        button("Wstecz", "onboarding-prev", "ghost"),
+        button("Zakończ konfigurację", "onboarding-finish", "primary"),
+    ]));
+    card(None, children)
+}
+
+/// Completed-state summary read entirely from persisted settings, with a restart
+/// action. Shown whenever `onboarding_completed`=1 (survives reopen / restart).
+fn build_onboarding_summary(messages: Component) -> Component {
+    let role = db::get_setting(KEY_ONBOARDING_ROLE).ok().flatten().unwrap_or_default();
+    let legal = db::get_setting("legal_profile").ok().flatten().unwrap_or_default();
+    let presets = db::get_setting(KEY_ONBOARDING_PRESETS).ok().flatten().unwrap_or_default();
+    let at = db::get_setting(KEY_ONBOARDING_COMPLETED_AT).ok().flatten().unwrap_or_default();
+    let when = if at.trim().is_empty() { "—".to_string() } else { format_alarm_datetime(at.trim().parse::<i64>().unwrap_or(0)) };
+
+    let header = stack_h(vec![
+        heading(2, "Konfiguracja zakończona"),
+        chip_toned_icon("ukończono", "success", "check"),
+    ]);
+
+    let summary = card(None, vec![
+        heading(3, "Podsumowanie wdrożenia"),
+        key_value(vec![
+            ("Rola wdrożenia", onboarding_role_label(&role)),
+            ("Profil prawny", legal_profile_label(&legal)),
+            ("Preset detektorów", onboarding_preset_label(&presets)),
+            ("Ukończono", &when),
+        ]),
+        text_styled("Wartości odczytane z trwałych ustawień (settings). Profil prawny współdzielony z zakładką Ustawienia i bramką Re-ID.", "caption"),
+    ]);
+
+    let restart = card(None, vec![
+        text_styled("Możesz uruchomić kreator ponownie. Nie usuwa to istniejących kamer ani ustawień — pozwala przejść konfigurację od nowa.", "caption"),
+        button("Uruchom ponownie", "onboarding-restart", "ghost"),
+    ]);
+
+    stack_v(vec![messages, header, summary, restart])
+}
+
+/// Records an option pick (role / legal / presets) into the in-flight wizard
+/// state and re-renders so the chosen card shows "Wybrane".
+fn handle_onboarding_pick(kind: &str, params: &JsonValue) -> JsonValue {
+    let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if key.is_empty() {
+        return json!({"ok": false, "error": "empty key"});
+    }
+    with_state(|s| {
+        s.clear_messages();
+        match kind {
+            "role" => s.onboarding.role = Some(key.clone()),
+            "legal" => s.onboarding.legal_profile = Some(key.clone()),
+            "presets" => s.onboarding.presets = Some(key.clone()),
+            _ => {}
+        }
+    });
+    render_panel("onboarding");
+    json!({"ok": true})
+}
+
+/// Mirrors a first-camera input into wizard state on each keystroke.
+fn handle_onboarding_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    with_state(|s| match field {
+        "camera_name" => s.onboarding.camera_name = value,
+        "camera_url" => s.onboarding.camera_url = value,
+        _ => {}
+    });
+    json!({"ok": true})
+}
+
+/// Advances one step, validating the current step's required choice first.
+fn handle_onboarding_next() -> JsonValue {
+    let step = with_state(|s| s.onboarding.step);
+    let blocked: Option<&str> = with_state(|s| match step {
+        0 if s.onboarding.role.is_none() => Some("Wybierz rolę wdrożenia."),
+        1 if s.onboarding.legal_profile.is_none() => Some("Wybierz profil prawny."),
+        _ => None,
+    });
+    if let Some(msg) = blocked {
+        with_state(|s| { s.clear_messages(); s.error_message = Some(msg.into()); });
+        render_panel("onboarding");
+        return json!({"ok": false});
+    }
+    with_state(|s| { s.clear_messages(); if s.onboarding.step + 1 < ONBOARDING_STEPS { s.onboarding.step += 1; } });
+    render_panel("onboarding");
+    json!({"ok": true})
+}
+
+/// Commits every wizard outcome: settings (role, legal_profile, presets,
+/// completed flag + timestamp), a real first-camera row, and an audit entry.
+fn handle_onboarding_finish() -> JsonValue {
+    let (role, legal, presets, cam_name, cam_url) = with_state(|s| (
+        s.onboarding.role.clone(),
+        s.onboarding.legal_profile.clone(),
+        s.onboarding.presets.clone(),
+        s.onboarding.camera_name.trim().to_string(),
+        s.onboarding.camera_url.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    let Some(role) = role else {
+        with_state(|s| s.error_message = Some("Brak roli wdrożenia.".into()));
+        render_panel("onboarding");
+        return json!({"ok": false});
+    };
+    let Some(legal) = legal else {
+        with_state(|s| s.error_message = Some("Brak profilu prawnego.".into()));
+        render_panel("onboarding");
+        return json!({"ok": false});
+    };
+    let presets = presets.unwrap_or_else(|| "safety".to_string());
+
+    if cam_name.is_empty() || cam_name.chars().count() > 60 {
+        with_state(|s| { s.onboarding.step = 2; s.error_message = Some("Nazwa kamery musi mieć 1–60 znaków.".into()); });
+        render_panel("onboarding");
+        return json!({"ok": false});
+    }
+
+    // Persist outcomes. Any write failure aborts before flipping the completed
+    // flag, so a half-written onboarding never reports itself as done.
+    let writes: &[(&str, &str)] = &[
+        (KEY_ONBOARDING_ROLE, role.as_str()),
+        ("legal_profile", legal.as_str()),
+        (KEY_ONBOARDING_PRESETS, presets.as_str()),
+    ];
+    for (k, v) in writes {
+        if let Err(e) = db::set_setting(k, v) {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu ustawień: {}", abi_message(e))));
+            render_panel("onboarding");
+            return json!({"ok": false});
+        }
+    }
+
+    // Real first-camera row — same path as the cameras wizard, so it appears on
+    // the Cameras tab and survives reopen / restart.
+    let new_cam = db::NewCamera {
+        name: cam_name.clone(),
+        location: onboarding_role_label(&role).to_string(),
+        rtsp_url: cam_url.clone(),
+        onvif_url: String::new(),
+        status: "offline".into(),
+        fps: 0,
+        detectors: "onboarding".into(),
+    };
+    let cam_id = match db::insert_camera(&new_cam) {
+        Ok(id) => id,
+        Err(e) => {
+            with_state(|s| { s.onboarding.step = 2; s.error_message = Some(alloc::format!("Błąd dodawania kamery: {}", abi_message(e))); });
+            render_panel("onboarding");
+            return json!({"ok": false});
+        }
+    };
+
+    let ts = db::now_secs();
+    let _ = db::set_setting(KEY_ONBOARDING_COMPLETED_AT, &alloc::format!("{}", ts));
+    if let Err(e) = db::set_setting(KEY_ONBOARDING_COMPLETED, "1") {
+        with_state(|s| s.error_message = Some(alloc::format!("Błąd finalizacji: {}", abi_message(e))));
+        render_panel("onboarding");
+        return json!({"ok": false});
+    }
+
+    let after = alloc::format!("role={}; legal_profile={}; presets={}; camera={}", role, legal, presets, cam_id);
+    let _ = db::insert_audit(ONBOARDING_ACTOR, "onboarding_complete", "tentavision", "", &after);
+
+    with_state(|s| { s.onboarding.reset(); s.success_message = Some("Konfiguracja zakończona. Pierwsza kamera dodana.".into()); });
+    render_panel("onboarding");
+    json!({"ok": true, "camera_id": cam_id})
+}
+
+/// Clears the completed flag and restarts the wizard from step 0. Leaves existing
+/// cameras and settings intact — only re-opens the configuration flow.
+fn handle_onboarding_restart() -> JsonValue {
+    if let Err(e) = db::set_setting(KEY_ONBOARDING_COMPLETED, "0") {
+        with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e))));
+        render_panel("onboarding");
+        return json!({"ok": false});
+    }
+    with_state(|s| { s.onboarding.reset(); s.clear_messages(); });
+    render_panel("onboarding");
+    json!({"ok": true})
 }
 
 /// Actor recorded for binding (alias-mapping) audit entries.
