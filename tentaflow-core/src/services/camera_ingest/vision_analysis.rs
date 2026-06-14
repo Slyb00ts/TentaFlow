@@ -25,6 +25,7 @@ use tracing::{info, warn};
 use crate::services::detection_bus;
 use crate::vision::classifier_stan::StateClassifier;
 use crate::vision::detector_rfdetr::RfDetrDetector;
+use crate::vision::ocr_plate::PlateOcr;
 
 /// Analysis cadence. Starts conservative (2 fps) — always-on CV on CPU does
 /// not need full frame rate for placard/label tracking.
@@ -76,6 +77,32 @@ async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassifier>>> {
                 Ok(c) => Some(std::sync::Arc::new(Mutex::new(c))),
                 Err(e) => {
                     warn!("[vision_analysis] state classifier load failed, stan skipped: {e:#}");
+                    None
+                }
+            })
+            .await
+            .unwrap_or(None)
+        })
+        .await
+        .clone()
+}
+
+/// Process-wide plate OCR runner, loaded on first use with the same lazy
+/// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
+/// `None` for the process lifetime: detections still publish, just without
+/// `tekst` (OCR is skipped, never a crash).
+fn ocr() -> &'static OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> {
+    static OCR: OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> = OnceCell::const_new();
+    &OCR
+}
+
+async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
+    ocr()
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(|| match PlateOcr::load() {
+                Ok(o) => Some(std::sync::Arc::new(Mutex::new(o))),
+                Err(e) => {
+                    warn!("[vision_analysis] plate OCR load failed, tekst skipped: {e:#}");
                     None
                 }
             })
@@ -148,6 +175,8 @@ fn spawn_analysis(camera_id: String) -> tokio::task::JoinHandle<()> {
         };
         // Optional: a missing classifier just leaves `stan` empty.
         let classifier = get_classifier().await;
+        // Optional: a missing OCR runner just leaves `tekst` empty.
+        let ocr = get_ocr().await;
         info!("[vision_analysis] starting analysis loop for {camera_id}");
 
         let mut ticker = tokio::time::interval(ANALYSIS_INTERVAL);
@@ -170,35 +199,51 @@ fn spawn_analysis(camera_id: String) -> tokio::task::JoinHandle<()> {
             // into the blocking task so crops are cut from the full-res RGB.
             let detector = detector.clone();
             let classifier = classifier.clone();
+            let ocr = ocr.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let mut items = {
                     let mut guard = detector.lock().unwrap();
                     guard.detect(&rgb, w, h)?
                 };
 
-                if let Some(classifier) = classifier {
-                    let mut guard = classifier.lock().unwrap();
-                    for det in items.iter_mut() {
-                        if !wants_state(&det.klasa) {
-                            continue;
+                for det in items.iter_mut() {
+                    // bbox is [x, y, w, h] normalized 0..1 → pixels, clamped.
+                    let fw = w as f32;
+                    let fh = h as f32;
+                    let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
+                    let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
+                    let raw_cw = (det.bbox[2] * fw).round().max(0.0) as u32;
+                    let raw_ch = (det.bbox[3] * fh).round().max(0.0) as u32;
+                    let cw = raw_cw.min(w.saturating_sub(x0));
+                    let ch = raw_ch.min(h.saturating_sub(y0));
+                    if cw < 8 || ch < 8 {
+                        continue;
+                    }
+
+                    if wants_state(&det.klasa) {
+                        if let Some(classifier) = classifier.as_ref() {
+                            let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
+                            let mut guard = classifier.lock().unwrap();
+                            match guard.classify(&crop, cw, ch) {
+                                Ok(stany) => det.stan = stany,
+                                Err(e) => warn!(
+                                    "[vision_analysis] classify failed for {}: {e:#}",
+                                    det.klasa
+                                ),
+                            }
                         }
-                        // bbox is [x, y, w, h] normalized 0..1 → pixels, clamped.
-                        let fw = w as f32;
-                        let fh = h as f32;
-                        let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
-                        let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
-                        let raw_cw = (det.bbox[2] * fw).round().max(0.0) as u32;
-                        let raw_ch = (det.bbox[3] * fh).round().max(0.0) as u32;
-                        let cw = raw_cw.min(w.saturating_sub(x0));
-                        let ch = raw_ch.min(h.saturating_sub(y0));
-                        if cw < 8 || ch < 8 {
-                            continue;
-                        }
-                        let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
-                        match guard.classify(&crop, cw, ch) {
-                            Ok(stany) => det.stan = stany,
-                            Err(e) => {
-                                warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa)
+                    }
+
+                    if det.klasa == "tablica_rejestracyjna" {
+                        if let Some(ocr) = ocr.as_ref() {
+                            let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
+                            let mut guard = ocr.lock().unwrap();
+                            match guard.read(&crop, cw, ch) {
+                                Ok(Some(plate)) => det.tekst = Some(plate),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa)
+                                }
                             }
                         }
                     }

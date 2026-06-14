@@ -22,6 +22,8 @@ pub mod resize;
 pub mod classifier_stan;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
+#[cfg(feature = "inference-vision-gpu")]
+pub mod ocr_plate;
 
 pub mod hsemotion;
 pub mod movenet;
