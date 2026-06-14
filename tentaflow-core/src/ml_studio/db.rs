@@ -219,4 +219,7 @@ CREATE TABLE project_members (
     PRIMARY KEY (project_id, user_id)
 );
 CREATE INDEX idx_project_members_user ON project_members(user_id);
+INSERT OR IGNORE INTO project_members (project_id, user_id, role, status, invited_by)
+SELECT project_id, owner_user_id, 'owner', 'active', owner_user_id
+FROM projects WHERE owner_user_id IS NOT NULL AND owner_user_id != '';
 ";

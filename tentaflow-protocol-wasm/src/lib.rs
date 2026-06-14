@@ -7174,6 +7174,9 @@ fn ml_studio_summary_to_js(s: &tentaflow_protocol::MlStudioProjectSummary) -> js
     set(&item, "created_at", s.created_at.clone().into());
     set(&item, "updatedAt", s.updated_at.clone().into());
     set(&item, "updated_at", s.updated_at.clone().into());
+    set(&item, "role", s.role.clone().into());
+    set(&item, "isOwner", s.is_owner.into());
+    set(&item, "is_owner", s.is_owner.into());
     item
 }
 
