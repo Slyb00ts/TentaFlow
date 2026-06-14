@@ -80,6 +80,77 @@ impl ProjectType {
     }
 }
 
+/// Per-project membership role. The string slug is the stable value persisted
+/// in `project_members.role`. `owner` is the project creator (source of truth in
+/// `projects.owner_user_id`); `editor`/`viewer` are the roles an owner may grant
+/// through an invitation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectRole {
+    Owner,
+    Editor,
+    Viewer,
+}
+
+impl ProjectRole {
+    /// Stable machine slug stored in SQLite and carried on the wire.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ProjectRole::Owner => "owner",
+            ProjectRole::Editor => "editor",
+            ProjectRole::Viewer => "viewer",
+        }
+    }
+
+    /// Parses a machine slug back into a `ProjectRole`.
+    pub fn from_slug(slug: &str) -> Option<ProjectRole> {
+        match slug {
+            "owner" => Some(ProjectRole::Owner),
+            "editor" => Some(ProjectRole::Editor),
+            "viewer" => Some(ProjectRole::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Roles an owner may assign through an invitation or role change. Excludes
+    /// `owner`, which is fixed to the project creator.
+    pub fn from_grantable_slug(slug: &str) -> Option<ProjectRole> {
+        match ProjectRole::from_slug(slug) {
+            Some(ProjectRole::Editor) => Some(ProjectRole::Editor),
+            Some(ProjectRole::Viewer) => Some(ProjectRole::Viewer),
+            _ => None,
+        }
+    }
+}
+
+/// Membership lifecycle state. `active` members see and act on the project;
+/// `invited` members have a pending invitation they have not yet accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberStatus {
+    Active,
+    Invited,
+}
+
+impl MemberStatus {
+    /// Stable machine slug stored in SQLite and carried on the wire.
+    pub fn slug(self) -> &'static str {
+        match self {
+            MemberStatus::Active => "active",
+            MemberStatus::Invited => "invited",
+        }
+    }
+}
+
+/// One membership row from `project_members`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMember {
+    pub project_id: String,
+    pub user_id: String,
+    pub role: String,
+    pub status: String,
+    pub invited_by: String,
+    pub created_at: String,
+}
+
 /// Full project record as stored in `projects`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -101,4 +172,8 @@ pub struct ProjectSummary {
     pub project: Project,
     pub model_count: u32,
     pub dataset_count: u32,
+    /// Role of the requesting user within this project (`owner`/`editor`/`viewer`).
+    pub role: String,
+    /// Convenience flag: the requesting user is the project owner.
+    pub is_owner: bool,
 }

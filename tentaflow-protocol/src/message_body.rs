@@ -1086,6 +1086,10 @@ pub struct MlStudioProjectSummary {
     pub status: String,
     pub dataset_count: u32,
     pub model_count: u32,
+    /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
+    pub role: String,
+    /// Convenience flag for the UI: the requesting user owns this project.
+    pub is_owner: bool,
     pub created_at: String,
     pub updated_at: String,
     // Live training KPIs (progress/loss/ETA) come from training_runs in later slices
@@ -1144,6 +1148,63 @@ pub struct MlStudioProjectTypesListResponse {
     pub types: Vec<MlStudioProjectTypeInfo>,
 }
 
+/// One project membership row for the sharing screen (`p02-udostepnianie.html`):
+/// who is a member, with what role and whether their invitation is still pending.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMember {
+    pub user_id: String,
+    pub role: String,
+    pub status: String,
+    pub invited_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMembersListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMembersListResponse {
+    pub members: Vec<MlStudioProjectMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectInviteRequest {
+    pub project_id: String,
+    pub invitee_user_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectInviteResponse {
+    pub member: MlStudioProjectMember,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRemoveRequest {
+    pub project_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRemoveResponse {
+    pub project_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRoleSetRequest {
+    pub project_id: String,
+    pub user_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRoleSetResponse {
+    pub member: MlStudioProjectMember,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -1154,6 +1215,14 @@ pub enum MlStudioPayload {
     ProjectDetailResponse(MlStudioProjectDetailResponse),
     ProjectTypesListRequest(MlStudioProjectTypesListRequest),
     ProjectTypesListResponse(MlStudioProjectTypesListResponse),
+    ProjectMembersListRequest(MlStudioProjectMembersListRequest),
+    ProjectMembersListResponse(MlStudioProjectMembersListResponse),
+    ProjectInviteRequest(MlStudioProjectInviteRequest),
+    ProjectInviteResponse(MlStudioProjectInviteResponse),
+    ProjectMemberRemoveRequest(MlStudioProjectMemberRemoveRequest),
+    ProjectMemberRemoveResponse(MlStudioProjectMemberRemoveResponse),
+    ProjectMemberRoleSetRequest(MlStudioProjectMemberRoleSetRequest),
+    ProjectMemberRoleSetResponse(MlStudioProjectMemberRoleSetResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

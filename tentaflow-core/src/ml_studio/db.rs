@@ -114,7 +114,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 /// Ordered ML Studio schema migrations. `owner_user_id`/`org_id` are TEXT
 /// references to core identity (app-level, no SQL FK — different DB file).
-const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA), (2, PROJECT_MEMBERS)];
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -206,4 +206,17 @@ CREATE TABLE service_models (
     source            TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL DEFAULT 'available'
 );
+";
+
+const PROJECT_MEMBERS: &str = "
+CREATE TABLE project_members (
+    project_id TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    invited_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, user_id)
+);
+CREATE INDEX idx_project_members_user ON project_members(user_id);
 ";
