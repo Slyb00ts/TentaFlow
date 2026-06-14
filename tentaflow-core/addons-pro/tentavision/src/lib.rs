@@ -29,6 +29,7 @@ use tentaflow_sdk_spec::protocol::camera::{
     CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput,
     CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
     DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CAMERA_DEFAULT_ANALYSIS_FPS,
 };
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
@@ -1938,6 +1939,9 @@ struct DiscoverState {
     name: String,
     retention: String,
     fps: String,
+    // AI analysis FPS chosen in step 4 ("1"/"5"/"10"/"15"/"0"=unlimited).
+    // Committed from the analysis-FPS select; default "10" when unset.
+    analysis_fps: String,
     // Analytics profile chosen in step 4. Committed from the profile select so
     // the pick is authoritative on submit instead of a frontend-only value.
     profile: String,
@@ -1954,6 +1958,7 @@ impl DiscoverState {
             cred_user: String::new(), cred_pass: String::new(),
             test_result: None, testing: false,
             name: String::new(), retention: String::new(), fps: String::new(),
+            analysis_fps: String::new(),
             profile: String::new(),
             error_message: None,
         }
@@ -2022,6 +2027,25 @@ impl DiscoverState {
     }
     fn fps_value(&self) -> u32 {
         self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
+    }
+    /// AI analysis FPS for the chosen camera. `0` = unlimited (native cadence);
+    /// any out-of-ladder value falls back to the spec default (10).
+    fn analysis_fps_value(&self) -> u32 {
+        self.analysis_fps
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|f| *f <= 30)
+            .unwrap_or(CAMERA_DEFAULT_ANALYSIS_FPS)
+    }
+    /// Committed analysis FPS as a select-bound string, defaulting to "10".
+    fn analysis_fps_or_default(&self) -> String {
+        let v = self.analysis_fps.trim();
+        if v.is_empty() {
+            alloc::format!("{}", CAMERA_DEFAULT_ANALYSIS_FPS)
+        } else {
+            v.into()
+        }
     }
 }
 
@@ -2713,6 +2737,7 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
             "name" => s.discover.name = value,
             "retention" => s.discover.retention = value,
             "fps" => s.discover.fps = value,
+            "analysis_fps" => s.discover.analysis_fps = value,
             "profile" => s.discover.profile = value,
             _ => {}
         }
@@ -2833,10 +2858,11 @@ fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
+    let (target, name, fps, analysis_fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
         s.discover.resolve_target(),
         s.discover.name.trim().to_string(),
         s.discover.fps_value(),
+        s.discover.analysis_fps_value(),
         s.discover.profile_or_default().to_string(),
         s.discover.source_type,
         s.discover.cred_user.trim().to_string(),
@@ -2872,6 +2898,7 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
         profile: Some(profile.clone()),
         credentials_b64,
         onvif_profile_token: profile_token,
+        analysis_fps: Some(analysis_fps),
     };
     let added = match camera_add(input) {
         Ok(o) => o,
@@ -2900,6 +2927,7 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
         status: status.into(),
         fps: i64::from(fps),
         detectors: vendor,
+        analysis_fps: i64::from(analysis_fps),
     };
     match db::insert_camera_with_id(&added.camera_id, &new_cam) {
         Ok(()) => {
@@ -2960,6 +2988,7 @@ fn handle_camera_refresh_status() -> JsonValue {
                 profile: Some(c.location.clone()),
                 credentials_b64: None,
                 onvif_profile_token: None,
+                analysis_fps: Some(c.analysis_fps.clamp(0, 30) as u32),
             };
             if let Ok(added) = camera_add(input) {
                 let probed = match camera_test_connection(&vendor, &url) {
@@ -2974,6 +3003,7 @@ fn handle_camera_refresh_status() -> JsonValue {
                     status: probed.into(),
                     fps: c.fps,
                     detectors: c.detectors.clone(),
+                    analysis_fps: c.analysis_fps,
                 };
                 let _ = db::delete_camera(&c.id);
                 let _ = db::insert_camera_with_id(&added.camera_id, &rekeyed);
@@ -4404,6 +4434,16 @@ fn camera_row_fps(c: &db::CameraRow) -> String {
     if c.fps > 0 { alloc::format!("{}", c.fps) } else { "\u{2014}".to_string() }
 }
 
+/// Human-readable AI analysis FPS for the cameras table. `0` reads as
+/// "Bez limitu" (unlimited / native cadence).
+fn camera_row_analysis_fps(c: &db::CameraRow) -> String {
+    if c.analysis_fps <= 0 {
+        "Bez limitu".to_string()
+    } else {
+        alloc::format!("{}", c.analysis_fps)
+    }
+}
+
 /// Builds one Table row as a `Value::Map` keyed by the column field paths.
 /// `camera_id` is the row key the Table uses to scope per-row actions.
 /// Builds a toned chip cell value `{ label, status }`. The data-table renderer
@@ -4437,6 +4477,7 @@ fn camera_table_row_value(c: &db::CameraRow) -> Value {
         (Value::Text("status".into()), camera_status_cell(&c.status)),
         (Value::Text("detectors".into()), Value::Text(detectors)),
         (Value::Text("fps".into()), Value::Text(camera_row_fps(c))),
+        (Value::Text("analysis_fps".into()), Value::Text(camera_row_analysis_fps(c))),
     ];
     Value::Map(entries)
 }
@@ -4464,6 +4505,7 @@ fn build_cameras_table() -> Component {
         camera_table_column("status", "Status", ColumnRender::Chip),
         camera_table_column("detectors", "Detektory", ColumnRender::Text),
         camera_table_column("fps", "FPS", ColumnRender::Text),
+        camera_table_column("analysis_fps", "FPS analizy", ColumnRender::Text),
     ];
 
     // The per-row "⋯" menu carries the deletion action. The Table renderer
@@ -4640,6 +4682,9 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
     // Reflect the committed profile (defaulting to "default") so the select
     // shows the authoritative backend value rather than always resetting to it.
     pairs.push(("profile".into(), Value::Text(with_state(|s| s.discover.profile_or_default().to_string()))));
+    // Reflect the committed analysis FPS (defaulting to "10") so the select
+    // shows the authoritative backend value.
+    pairs.push(("analysis_fps".into(), Value::Text(with_state(|s| s.discover.analysis_fps_or_default()))));
     pairs
         .into_iter()
         .map(|(key, value)| StateEntry {
@@ -4978,13 +5023,20 @@ fn build_wizard_step_metadata() -> Component {
         SelectOption { value: SelectValue::Text("Unclassified".into()), label: lit("Niesklasyfikowana"), icon: None, disabled: false, group_id: None, description: None },
     ], "retention");
     let fps_input = wizard_input("Docelowe FPS", "15", "fps", false);
+    let analysis_fps_select = wizard_select("FPS analizy AI", vec![
+        SelectOption { value: SelectValue::Text("1".into()), label: lit("1 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("5".into()), label: lit("5 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("10".into()), label: lit("10 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("15".into()), label: lit("15 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("0".into()), label: lit("Bez limitu"), icon: None, disabled: false, group_id: None, description: None },
+    ], "analysis_fps");
     let profile_select = wizard_select("Profil analityczny", vec![
         SelectOption { value: SelectValue::Text("default".into()), label: lit("default"), icon: None, disabled: false, group_id: None, description: None },
     ], "profile");
 
     stack_v(vec![
         text("Uzupełnij metadane kamery przed jej dodaniem."),
-        grid(2, vec![name_input, retention_select, fps_input, profile_select]),
+        grid(2, vec![name_input, retention_select, fps_input, analysis_fps_select, profile_select]),
     ])
 }
 
@@ -9354,6 +9406,7 @@ fn handle_onboarding_finish() -> JsonValue {
         status: "offline".into(),
         fps: 0,
         detectors: "onboarding".into(),
+        analysis_fps: i64::from(CAMERA_DEFAULT_ANALYSIS_FPS),
     };
     let cam_id = match db::insert_camera(&new_cam) {
         Ok(id) => id,

@@ -84,6 +84,14 @@ fn retention_class_valid(rc: &str) -> bool {
     matches!(rc, "A" | "B" | "C" | "Unclassified")
 }
 
+/// Accepted AI analysis frame rates. The UI offers a fixed ladder
+/// (1/5/10/15/unlimited), but the host also tolerates any value in `0..=30`
+/// (`0` = unlimited / native cadence) so a future preset cannot be rejected
+/// by an over-tight allowlist.
+fn analysis_fps_valid(fps: u32) -> bool {
+    fps <= 30
+}
+
 // =============================================================================
 // String length + format validators
 // =============================================================================
@@ -790,8 +798,20 @@ pub fn camera_add_v1(
     // minimal payload behaves exactly like the old TOML path (30 / "C" /
     // "default").
     let target_fps = input.target_fps_or_default();
+    let analysis_fps = input.analysis_fps_or_default();
     let retention_class = input.retention_class_or_default();
     let profile = input.profile_or_default();
+    if !analysis_fps_valid(analysis_fps) {
+        audit(
+            caller.data(),
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("analysis_fps_out_of_range"),
+        );
+        return AbiError::Operation.as_i32();
+    }
     if let Err(reason) = validate_vendor(&input.vendor) {
         let err = if reason == "unsupported_vendor" {
             AbiError::CameraVendorUnsupported
@@ -1001,6 +1021,7 @@ pub fn camera_add_v1(
         &input.vendor,
         &input.url,
         target_fps as i64,
+        analysis_fps as i64,
         res_w,
         res_h,
         &retention_class,
@@ -1397,6 +1418,19 @@ pub fn camera_update_v1(
             return AbiError::Operation.as_i32();
         }
     }
+    if let Some(fps) = input.analysis_fps {
+        if !analysis_fps_valid(fps) {
+            audit(
+                caller.data(),
+                "camera.update",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("analysis_fps_out_of_range"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    }
     if let Some(rc) = input.retention_class.as_ref() {
         if let Err(reason) = validate_retention(rc) {
             audit(
@@ -1478,6 +1512,9 @@ pub fn camera_update_v1(
     if input.target_fps.is_some() {
         diff.push("target_fps");
     }
+    if input.analysis_fps.is_some() {
+        diff.push("analysis_fps");
+    }
     if input.resolution_width.is_some() {
         diff.push("resolution_width");
     }
@@ -1493,6 +1530,7 @@ pub fn camera_update_v1(
     let patch = CameraPatch {
         display_name: input.display_name.clone(),
         target_fps: input.target_fps.map(|v| v as i64),
+        analysis_fps: input.analysis_fps.map(|v| v as i64),
         resolution_width: input.resolution_width.map(|v| Some(v as i64)),
         resolution_height: input.resolution_height.map(|v| Some(v as i64)),
         retention_class: input.retention_class.clone(),
@@ -2658,8 +2696,20 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
     // minimal payload behaves exactly like the old TOML path (30 / "C" /
     // "default").
     let target_fps = input.target_fps_or_default();
+    let analysis_fps = input.analysis_fps_or_default();
     let retention_class = input.retention_class_or_default();
     let profile = input.profile_or_default();
+    if !analysis_fps_valid(analysis_fps) {
+        audit(
+            state,
+            "camera.add",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("analysis_fps_out_of_range"),
+        );
+        return AbiError::Operation.as_i32();
+    }
     if let Err(reason) = validate_vendor(&input.vendor) {
         let err = if reason == "unsupported_vendor" {
             AbiError::CameraVendorUnsupported
@@ -2863,6 +2913,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         &input.vendor,
         &input.url,
         target_fps as i64,
+        analysis_fps as i64,
         res_w,
         res_h,
         &retention_class,

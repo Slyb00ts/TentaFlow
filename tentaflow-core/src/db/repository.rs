@@ -17059,6 +17059,9 @@ pub struct CameraRow {
     pub url: String,
     pub profile: String,
     pub target_fps: i64,
+    /// Per-camera AI analysis frame rate honored by the always-on analysis
+    /// loop. `0` = unlimited (native cadence); default `10`.
+    pub analysis_fps: i64,
     pub resolution_width: Option<i64>,
     pub resolution_height: Option<i64>,
     pub retention_class: String,
@@ -17086,6 +17089,7 @@ pub struct CameraRow {
 pub struct CameraPatch {
     pub display_name: Option<String>,
     pub target_fps: Option<i64>,
+    pub analysis_fps: Option<i64>,
     pub resolution_width: Option<Option<i64>>,
     pub resolution_height: Option<Option<i64>>,
     pub retention_class: Option<String>,
@@ -17116,6 +17120,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         onvif_url: row.get(18)?,
         onvif_profile_token: row.get(19)?,
         metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
+        analysis_fps: row.get(21)?,
     })
 }
 
@@ -17124,7 +17129,7 @@ const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
-     onvif_url, onvif_profile_token, metadata_supported";
+     onvif_url, onvif_profile_token, metadata_supported, analysis_fps";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -17142,6 +17147,7 @@ pub fn insert_camera(
     vendor: &str,
     url: &str,
     target_fps: i64,
+    analysis_fps: i64,
     resolution_width: Option<i64>,
     resolution_height: Option<i64>,
     retention_class: &str,
@@ -17159,14 +17165,14 @@ pub fn insert_camera(
     conn.execute(
         "INSERT INTO cameras \
          (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
-          resolution_width, resolution_height, retention_class, status, status_message, \
-          fps_actual, last_frame_at, credentials_encrypted, onvif_url, onvif_profile_token, \
-          created_at, updated_at, org_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14, ?15)",
+          analysis_fps, resolution_width, resolution_height, retention_class, status, \
+          status_message, fps_actual, last_frame_at, credentials_encrypted, onvif_url, \
+          onvif_profile_token, created_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'starting', NULL, NULL, NULL, ?12, ?13, ?14, ?15, ?15, ?16)",
         rusqlite::params![
             camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
-            resolution_width, resolution_height, retention_class, credentials_encrypted,
-            onvif_url, onvif_profile_token, now, resolved_org,
+            analysis_fps, resolution_width, resolution_height, retention_class,
+            credentials_encrypted, onvif_url, onvif_profile_token, now, resolved_org,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -17400,6 +17406,24 @@ pub fn get_camera_for_addon(
     Ok(row)
 }
 
+/// Returns the configured AI analysis frame rate for one camera (`0` =
+/// unlimited / native cadence). Falls back to the default of `10` when the
+/// camera row is missing — the always-on analysis loop uses this to pace
+/// itself without a session context. Process-wide lookup (no org/addon
+/// filter): the loop runs per `camera_id` regardless of tenant.
+#[cfg(feature = "camera")]
+pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
+    let conn = acquire(pool)?;
+    let fps: Option<i64> = conn
+        .query_row(
+            "SELECT analysis_fps FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
+}
+
 /// Applies a partial update. Returns `Ok(false)` if no row matched
 /// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
 /// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
@@ -17425,6 +17449,10 @@ pub fn update_camera(
     }
     if let Some(v) = patch.target_fps {
         sets.push("target_fps = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.analysis_fps {
+        sets.push("analysis_fps = ?");
         params.push(Box::new(v));
     }
     if let Some(v) = patch.resolution_width {

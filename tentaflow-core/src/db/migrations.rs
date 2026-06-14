@@ -427,7 +427,26 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addons_installed_bundle_hash_column",
             MigrationStep::Rust(addons_add_installed_bundle_hash_column),
         ),
+        (
+            78,
+            "cameras_analysis_fps_column",
+            MigrationStep::Rust(cameras_add_analysis_fps_column),
+        ),
     ]
+}
+
+/// Adds `analysis_fps` to `cameras` — the per-camera AI analysis frame rate
+/// honored by the always-on vision analysis loop. `0` means unlimited (run at
+/// the native frame cadence); the default of `10` matches
+/// `CAMERA_DEFAULT_ANALYSIS_FPS`. Idempotent — guarded by a column probe so a
+/// re-run on an already-migrated database is a no-op.
+fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "analysis_fps")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN analysis_fps INTEGER NOT NULL DEFAULT 10;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Adds `installed_bundle_hash` to `addons` (the instance table). It records the
