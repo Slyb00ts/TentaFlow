@@ -105,6 +105,7 @@ extern "C" {
         options_ptr: i32, options_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+    fn alias_list_available_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 }
 
 // =============================================================================
@@ -256,6 +257,93 @@ where
         out.truncate(out_len as usize);
         return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
+}
+
+/// Reads a JSON response from a host function with the read-only
+/// `(out_ptr, out_cap, out_len_ptr)` ABI shape. The alias discovery host
+/// functions emit JSON (not CBOR), so they need their own decode path. Returns
+/// the parsed `serde_json::Value` (the addon has serde_json but not serde-derive).
+fn call_json_out_value(
+    host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
+) -> Result<JsonValue, AbiError> {
+    let mut cap = 16384usize;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            host_fn(
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == AbiError::OutputBufferTooSmall as i32 {
+            cap = (out_len as usize).max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return Err(AbiError::from_code(ret));
+        }
+        out.truncate(out_len as usize);
+        return serde_json::from_slice(&out).map_err(|_| AbiError::Operation);
+    }
+}
+
+/// One alias/model TentaVision may consume, as reported by the access-control
+/// grant system via `alias_list_available_v1`. Mirrors the host
+/// `AvailableAliasOut` schema.
+#[derive(Debug, Clone)]
+struct AvailableAlias {
+    alias_id: String,
+    target_model: Option<String>,
+    methods: Vec<String>,
+    grant_status: String,
+    visibility: Option<String>,
+    active: bool,
+    required: bool,
+}
+
+impl AvailableAlias {
+    /// `true` when the addon may actually use this alias (grant resolved).
+    fn is_usable(&self) -> bool {
+        matches!(self.grant_status.as_str(), "granted" | "auto_granted")
+    }
+    /// Tone for the grant-status chip: granted/auto_granted=success,
+    /// pending=warning, denied/other=critical.
+    fn status_tone(&self) -> &'static str {
+        match self.grant_status.as_str() {
+            "granted" | "auto_granted" => "success",
+            "pending" => "warning",
+            _ => "critical",
+        }
+    }
+}
+
+fn parse_available_alias(v: &JsonValue) -> Option<AvailableAlias> {
+    let alias_id = v.get("alias_id")?.as_str()?.to_string();
+    let methods = v
+        .get("methods")
+        .and_then(|m| m.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Some(AvailableAlias {
+        alias_id,
+        target_model: v.get("target_model").and_then(|x| x.as_str()).map(String::from),
+        methods,
+        grant_status: v.get("grant_status").and_then(|x| x.as_str()).unwrap_or("pending").to_string(),
+        visibility: v.get("visibility").and_then(|x| x.as_str()).map(String::from),
+        active: v.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
+        required: v.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Lists the aliases/models this addon was GRANTED to consume. All grant
+/// statuses are surfaced (granted/auto_granted/pending/denied) so the Bindings
+/// UI can show an honest assignment surface rather than a hardcoded list.
+fn alias_list_available() -> Result<Vec<AvailableAlias>, AbiError> {
+    let resp = call_json_out_value(alias_list_available_v1)?;
+    let arr = resp.get("aliases").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    Ok(arr.iter().filter_map(parse_available_alias).collect())
 }
 
 fn camera_add(spec: CameraAddInput) -> Result<CameraAddOutput, AbiError> {
@@ -1400,7 +1488,6 @@ struct PanelState {
     evidence: EvidenceState,
     settings: SettingsState,
     onboarding: OnboardingState,
-    bindings: BindingsState,
 }
 
 /// Ephemeral wizard progress. The OUTCOMES persist to the settings table /
@@ -1443,37 +1530,6 @@ impl OnboardingState {
         self.camera_name.clear();
         self.camera_url.clear();
         self.presets = None;
-    }
-}
-
-/// State for the Bindings tab. The alias target choices themselves persist in the
-/// settings table (key `alias_map_<alias_id>`); this struct only holds ephemeral
-/// view state (which rows are expanded, the active status filter). The filter is
-/// pure view state, so it resets on reopen — the mappings do not.
-struct BindingsState {
-    expanded_rows: Vec<String>,
-    filter_status: Option<String>,
-}
-
-impl BindingsState {
-    const fn new() -> Self {
-        Self { expanded_rows: Vec::new(), filter_status: None }
-    }
-    fn toggle_expanded(&mut self, id: &str) {
-        if let Some(idx) = self.expanded_rows.iter().position(|x| x == id) {
-            self.expanded_rows.remove(idx);
-        } else {
-            self.expanded_rows.push(id.to_string());
-        }
-    }
-    fn is_expanded(&self, id: &str) -> bool {
-        self.expanded_rows.iter().any(|x| x == id)
-    }
-    fn has_any_filter(&self) -> bool {
-        self.filter_status.is_some()
-    }
-    fn clear(&mut self) {
-        self.filter_status = None;
     }
 }
 
@@ -1993,7 +2049,7 @@ impl PanelState {
             reid: ReidState::new(), models: ModelsState::new(),
             zones: ZonesState::new(), audit: AuditState::new(),
             evidence: EvidenceState::new(), settings: SettingsState::new(),
-            onboarding: OnboardingState::new(), bindings: BindingsState::new(),
+            onboarding: OnboardingState::new(),
         }
     }
     fn clear_messages(&mut self) { self.error_message = None; self.success_message = None; }
@@ -2559,9 +2615,6 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "onboarding-field-change" => handle_onboarding_field_change(params),
         "onboarding-finish" => handle_onboarding_finish(),
         "onboarding-restart" => handle_onboarding_restart(),
-        "binding-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).or_else(|| params.get("alias_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.clear_messages(); s.bindings.toggle_expanded(&id); }); render_panel("bindings"); json!({"ok":true}) }
-        "binding-filter-change" => { let value = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).map(|s| s.to_string()).filter(|v| !v.is_empty() && v != "all"); with_state(|s| s.bindings.filter_status = value); render_panel("bindings"); json!({"ok":true}) }
-        "binding-clear-filters" => { with_state(|s| s.bindings.clear()); render_panel("bindings"); json!({"ok":true}) }
         "binding-target-change" => handle_binding_target_change(params),
         _ => json!({"error": alloc::format!("unknown action '{}'", action)}),
     }
@@ -9327,110 +9380,78 @@ fn handle_onboarding_restart() -> JsonValue {
 /// Actor recorded for binding (alias-mapping) audit entries.
 const BINDING_ACTOR: &str = "administrator";
 
-/// One AI alias the addon declares. `methods` are the service methods the addon
-/// invokes through this alias; `targets` is the allowlist of concrete services an
-/// admin may map it to (first entry is the default). `gated` marks aliases that
-/// stay locked behind a compliance grant regardless of the chosen target.
-struct AliasDef {
+/// A functional slot of TentaVision: the operator assigns WHICH granted
+/// model/alias backs each capability. `method` is the capability the slot needs;
+/// the per-slot Select only lists available aliases whose declared methods
+/// include it (real type-filtering). `canonical_alias` is the addon-owned alias
+/// id that maps to this slot — used as the default suggestion and to label the
+/// slot. `gated` marks slots that require a LegalGrant at call time.
+struct SlotDef {
     id: &'static str,
-    methods: &'static str,
-    targets: &'static [(&'static str, &'static str)],
+    label: &'static str,
+    method: &'static str,
+    canonical_alias: &'static str,
     gated: bool,
-    /// Whether this alias has no usable default target (admin must assign one).
-    needs_assignment: bool,
 }
 
-/// The 6 AI aliases TentaVision creates at install (mirrors the mockup). Each
-/// alias resolves to a concrete service chosen by the admin and persisted under
-/// `alias_map_<id>`.
-const ALIASES: &[AliasDef] = &[
-    AliasDef {
-        id: "tentavision-yolo",
-        methods: "detect · track",
-        targets: &[("yolo11m-detector", "yolo11m-detector"), ("yolo11s-detector", "yolo11s-detector"), ("yolo11n-cpu", "yolo11n-cpu")],
-        gated: false,
-        needs_assignment: false,
-    },
-    AliasDef {
-        id: "tentavision-ocr",
-        methods: "recognize · recognize_cropped",
-        targets: &[("ppocrv5-ocr", "ppocrv5-ocr"), ("parseq-adr", "parseq-adr")],
-        gated: false,
-        needs_assignment: false,
-    },
-    AliasDef {
-        id: "tentavision-action",
-        methods: "classify_window",
-        targets: &[("videomae-v2-rwf2k", "videomae-v2-rwf2k"), ("x3d-rwf2k", "x3d-rwf2k")],
-        gated: false,
-        needs_assignment: false,
-    },
-    AliasDef {
-        id: "tentavision-vlm",
-        methods: "embed · caption",
-        targets: &[("siglip2-vit-l14", "siglip2-vit-l14"), ("eva-clip-large", "eva-clip-large")],
-        gated: false,
-        needs_assignment: false,
-    },
-    AliasDef {
-        id: "tentavision-face-embed",
-        methods: "embed · gate: d4-historical",
-        targets: &[("adaface-r100", "adaface-r100"), ("arcface-r50", "arcface-r50")],
-        gated: true,
-        needs_assignment: false,
-    },
-    AliasDef {
-        id: "tentavision-reid",
-        methods: "embed · match · gate: d4-historical",
-        targets: &[("", "— nie ustawiony —"), ("osnet-x1", "osnet-x1"), ("solider-reid", "solider-reid")],
-        gated: true,
-        needs_assignment: true,
-    },
+/// The 6 functional slots, each filtered by the capability `method` it requires.
+const SLOTS: &[SlotDef] = &[
+    SlotDef { id: "yolo", label: "Detekcja obiektów", method: "detect", canonical_alias: "tentavision-yolo", gated: false },
+    SlotDef { id: "ocr", label: "Rozpoznawanie tekstu (OCR)", method: "recognize", canonical_alias: "tentavision-ocr", gated: false },
+    SlotDef { id: "action", label: "Klasyfikacja akcji", method: "classify_window", canonical_alias: "tentavision-action", gated: false },
+    SlotDef { id: "vlm", label: "Model wizyjno-językowy", method: "caption", canonical_alias: "tentavision-vlm", gated: false },
+    SlotDef { id: "face-embed", label: "Embedding twarzy", method: "embed", canonical_alias: "tentavision-face-embed", gated: true },
+    SlotDef { id: "reid", label: "Re-identyfikacja osób", method: "match", canonical_alias: "tentavision-reid", gated: true },
 ];
 
-/// Store key holding the chosen target for an alias Select.
-fn alias_store_key(alias_id: &str) -> String {
-    alloc::format!("alias_target_{}", alias_id)
+/// Store key holding the chosen target alias for a slot Select.
+fn slot_store_key(slot_id: &str) -> String {
+    alloc::format!("alias_target_{}", slot_id)
 }
 
-/// Settings key persisting an alias → service mapping.
-fn alias_setting_key(alias_id: &str) -> String {
-    alloc::format!("alias_map_{}", alias_id)
+/// Settings key persisting a slot → alias assignment.
+fn slot_setting_key(slot_id: &str) -> String {
+    alloc::format!("alias_map_{}", slot_id)
 }
 
-/// The effective target for an alias: the persisted mapping, else the alias's
-/// default (its first target entry).
-fn alias_target(a: &AliasDef) -> String {
-    if let Some(v) = db::get_setting(&alias_setting_key(a.id)).ok().flatten() {
-        return v;
+/// Available aliases whose declared methods include `method` AND that the addon
+/// may actually use (granted/auto_granted). Pending/denied aliases are excluded
+/// from the assignable options (you cannot assign what you cannot call), but the
+/// discovery list above still shows them honestly.
+fn slot_options<'a>(method: &str, available: &'a [AvailableAlias]) -> Vec<&'a AvailableAlias> {
+    available
+        .iter()
+        .filter(|a| a.is_usable() && a.methods.iter().any(|m| m == method))
+        .collect()
+}
+
+/// The effective alias assigned to a slot: the persisted assignment if it still
+/// points at a usable option, else the first usable option for the slot, else
+/// empty (no grants → honest empty state).
+fn slot_assignment(slot: &SlotDef, available: &[AvailableAlias]) -> String {
+    let opts = slot_options(slot.method, available);
+    if let Some(v) = db::get_setting(&slot_setting_key(slot.id)).ok().flatten() {
+        if opts.iter().any(|a| a.alias_id == v) {
+            return v;
+        }
     }
-    a.targets.first().map(|(v, _)| (*v).to_string()).unwrap_or_default()
-}
-
-/// Resolves an alias to its (label, status-key) pair. Status is honest: a gated
-/// alias is "gated", an alias with an empty target is "unconfigured", otherwise
-/// the addon has no live service-health channel here, so a configured alias is
-/// reported as "assigned" (mapping persisted, awaiting a running backend) rather
-/// than a fabricated "online".
-fn alias_status_cell(a: &AliasDef, target: &str) -> (&'static str, &'static str) {
-    if target.trim().is_empty() {
-        ("nieprzypisany", "warn")
-    } else if a.gated {
-        ("gated", "err")
-    } else {
-        ("przypisany", "ok")
+    // Prefer the canonical alias when it is among the usable options.
+    if opts.iter().any(|a| a.alias_id == slot.canonical_alias) {
+        return slot.canonical_alias.to_string();
     }
+    opts.first().map(|a| a.alias_id.clone()).unwrap_or_default()
 }
 
 fn build_bindings_content() -> Component {
     let messages = build_messages_section();
-    let (filter_status, has_filter) = with_state(|s| (s.bindings.filter_status.clone(), s.bindings.has_any_filter()));
 
-    let assigned = ALIASES.iter().filter(|a| !a.gated && !alias_target(a).trim().is_empty()).count();
-    let total = ALIASES.len();
+    // REAL discovery: what the grant system says this addon may consume.
+    let available = alias_list_available().unwrap_or_default();
+    let usable = available.iter().filter(|a| a.is_usable()).count();
+
     let header = stack_h(vec![
         heading(2, "Powiązania i magazyn"),
-        chip_toned(&alloc::format!("{}/{} aliasów aktywnych", assigned, total), "success"),
+        chip_toned(&alloc::format!("{}/{} aliasów przyznanych", usable, available.len()), "success"),
         chip_toned("mapowanie wykonawcze addona", "muted"),
     ]);
 
@@ -9439,48 +9460,144 @@ fn build_bindings_content() -> Component {
     // 1. Built-in storage API status — REAL capability probes.
     children.push(build_storage_status_card());
 
-    // 2. AI alias mappings — editable, persisted.
-    let toolbar = stack_h(vec![
-        heading(3, "Aliasy AI utworzone przez addon · 6 sztuk"),
-        if has_filter { button("Wyczyść filtr", "binding-clear-filters", "ghost") } else { divider() },
-    ]);
-    let active = filter_status.as_deref().unwrap_or("all");
-    let count_for = |st: &str| ALIASES.iter().filter(|a| {
-        let (_, tone) = alias_status_cell(a, &alias_target(a));
-        match st {
-            "ok" => tone == "ok",
-            "warn" => tone == "warn",
-            "err" => tone == "err",
-            _ => true,
-        }
-    }).count();
-    let status_chips = filter_chips(
-        vec![
-            FilterChipDef { id: "all".into(), label: lit(&alloc::format!("Wszystkie ({})", total)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "ok".into(), label: lit(&alloc::format!("Przypisane ({})", count_for("ok"))), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "warn".into(), label: lit(&alloc::format!("Nieprzypisane ({})", count_for("warn"))), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "err".into(), label: lit(&alloc::format!("Gated ({})", count_for("err"))), icon: None, badge: None, count_path: None },
-        ],
-        active,
-    );
+    // 2. Discovery: every alias the addon may consume, with grant chips. Real
+    //    data from alias_list_available — never a hardcoded list.
+    children.push(build_available_aliases_card(&available));
 
-    let mut alias_children: Vec<Component> = vec![toolbar, status_chips];
-    for a in ALIASES {
-        let target = alias_target(a);
-        let (_, tone) = alias_status_cell(a, &target);
-        let visible = match active {
-            "ok" => tone == "ok",
-            "warn" => tone == "warn",
-            "err" => tone == "err",
-            _ => true,
-        };
-        if visible {
-            alias_children.push(build_alias_row(a, &target));
-        }
-    }
-    children.push(card(None, alias_children));
+    // 3. Per-slot assignment: pick which granted model backs each function,
+    //    filtered by matching capability method.
+    children.push(build_slot_assignment_card(&available));
 
     stack_v(children)
+}
+
+/// Discovery card: lists every alias/model the addon may consume (from
+/// `alias_list_available`), each with its concrete target, methods and a grant
+/// chip. Honest empty state when the grant system returned nothing.
+fn build_available_aliases_card(available: &[AvailableAlias]) -> Component {
+    if available.is_empty() {
+        return card(None, vec![
+            heading(3, "Modele przyznane addonowi"),
+            empty_state(
+                "Brak przyznanych modeli",
+                Some("Poproś admina o grant w Services → Aliasy."),
+                Some("lock"),
+            ),
+        ]);
+    }
+    let mut rows = vec![heading(3, "Modele przyznane addonowi")];
+    for a in available {
+        rows.push(build_available_alias_row(a));
+    }
+    card(None, rows)
+}
+
+/// One discovery row: alias id + methods + resolved target + grant-status chip.
+fn build_available_alias_row(a: &AvailableAlias) -> Component {
+    let methods = if a.methods.is_empty() { "—".to_string() } else { a.methods.join(" · ") };
+    let target = a.target_model.clone().unwrap_or_else(|| "— nie ustawiony —".to_string());
+    let visibility = a.visibility.clone().unwrap_or_else(|| "—".to_string());
+    let name_block = stack_v_gap("xxs", vec![
+        text_styled(&a.alias_id, "body_strong"),
+        text_styled(&methods, "caption"),
+    ]);
+    let detail = key_value(vec![
+        ("Rozwiązuje na", target.as_str()),
+        ("Widoczność", visibility.as_str()),
+        ("Aktywny", if a.active { "tak" } else { "nie" }),
+        ("Wymagany", if a.required { "tak" } else { "nie" }),
+    ]);
+    card(None, vec![
+        stack_h(vec![
+            name_block,
+            chip_toned(&a.grant_status, a.status_tone()),
+        ]),
+        detail,
+    ])
+}
+
+/// Assignment card: one Select per functional slot, populated ONLY from granted
+/// aliases whose methods match the slot. Honest empty state per slot when no
+/// granted model fits.
+fn build_slot_assignment_card(available: &[AvailableAlias]) -> Component {
+    let mut rows = vec![heading(3, "Przypisanie modeli do funkcji · 6 slotów")];
+    let any_usable = available.iter().any(AvailableAlias::is_usable);
+    if !any_usable {
+        rows.push(empty_state(
+            "Brak przyznanych modeli",
+            Some("Poproś admina o grant w Services → Aliasy."),
+            Some("lock"),
+        ));
+        return card(None, rows);
+    }
+    for slot in SLOTS {
+        rows.push(build_slot_row(slot, available));
+    }
+    card(None, rows)
+}
+
+/// One slot row: label + the required method + a Select of matching granted
+/// aliases (or an honest per-slot empty note) + a gated marker.
+fn build_slot_row(slot: &SlotDef, available: &[AvailableAlias]) -> Component {
+    let opts = slot_options(slot.method, available);
+    let name_block = stack_v_gap("xxs", vec![
+        text_styled(slot.label, "body_strong"),
+        text_styled(&alloc::format!("metoda: {}", slot.method), "caption"),
+    ]);
+
+    let mut row_children = vec![name_block];
+    if opts.is_empty() {
+        row_children.push(text_styled("Brak przyznanego modelu dla tej funkcji.", "caption"));
+    } else {
+        let assigned = slot_assignment(slot, available);
+        row_children.push(build_slot_select(slot, &opts, &assigned));
+        let tone = if assigned.trim().is_empty() { "warning" } else { "success" };
+        let label = if assigned.trim().is_empty() { "nieprzypisany" } else { "przypisany" };
+        row_children.push(chip_toned(label, tone));
+    }
+    if slot.gated {
+        row_children.push(chip_toned("gated", "critical"));
+    }
+    card(None, vec![stack_h(row_children)])
+}
+
+/// Select for one slot, bound to `alias_target_<slot>`, options = matching
+/// granted aliases. Change persists the picked alias via `binding-target-change`.
+fn build_slot_select(slot: &SlotDef, opts: &[&AvailableAlias], assigned: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Select;
+    let store_key = slot_store_key(slot.id);
+    let options: Vec<SelectOption> = opts.iter().map(|a| {
+        let label = match &a.target_model {
+            Some(t) if !t.is_empty() => alloc::format!("{} → {}", a.alias_id, t),
+            _ => a.alias_id.clone(),
+        };
+        SelectOption {
+            value: SelectValue::Text(a.alias_id.clone().into()),
+            label: lit(&label),
+            icon: None, disabled: false, group_id: None, description: None,
+        }
+    }).collect();
+    let _ = assigned;
+    let mut comp = Select {
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
+        options,
+        placeholder: None,
+        label: Some(lit("Model")),
+        searchable: false, clearable: false, virtualize: false,
+        disabled: None, size: InputSize::Md, groups: None,
+    }.into_component(&store_key).expect("Select");
+    let mut params = CborMap::default();
+    params.0.push(("slot_id".into(), Value::Text(slot.id.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "binding-target-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
 }
 
 /// Built-in storage API status panel. Every status is a REAL probe of the addon's
@@ -9553,126 +9670,51 @@ fn build_storage_status_card() -> Component {
     ])
 }
 
-/// One alias row: name + methods, a status chip, an editable target Select that
-/// persists on change, and an expandable detail block with the fallback chain.
-fn build_alias_row(a: &AliasDef, target: &str) -> Component {
-    let (status_label, status_tone) = alias_status_cell(a, target);
-    let expanded = with_state(|s| s.bindings.is_expanded(a.id));
-
-    let name_block = stack_v_gap("xxs", vec![
-        text_styled(a.id, "body_strong"),
-        text_styled(a.methods, "caption"),
-    ]);
-
-    let select = build_alias_target_select(a);
-
-    let mut params = CborMap::default();
-    params.0.push(("alias_id".into(), Value::Text(a.id.into())));
-    let expand_btn = button_with_params(
-        if expanded { "Zwiń" } else { "Szczegóły" },
-        "binding-row-expand",
-        "ghost",
-        params,
-    );
-
-    let header_row = stack_h(vec![
-        name_block,
-        select,
-        chip_toned(status_label, status_tone),
-        expand_btn,
-    ]);
-
-    let mut row_children = vec![header_row];
-    if expanded {
-        let fallbacks: Vec<&str> = a.targets.iter().skip(1).filter(|(v, _)| !v.is_empty()).map(|(v, _)| *v).collect();
-        let fallback_text = if fallbacks.is_empty() {
-            "brak fallbacku".to_string()
-        } else {
-            alloc::format!("fallback chain: {}", fallbacks.join(", "))
-        };
-        row_children.push(divider());
-        row_children.push(key_value(vec![
-            ("Alias", a.id),
-            ("Rozwiązuje na", if target.trim().is_empty() { "— nie ustawiony —" } else { target }),
-            ("Metody", a.methods),
-            ("Strategia", "first_available"),
-        ]));
-        row_children.push(text_styled(&fallback_text, "caption"));
-        if a.gated {
-            row_children.push(text_styled(
-                "Alias bramkowany (gate: d4-historical). Wybór targetu zapisuje się, ale wywołania wymagają aktywnego LegalGrant.",
-                "caption",
-            ));
-        }
-    }
-
-    card(None, row_children)
-}
-
-/// Target Select for one alias. Bound to `alias_target_<id>`, seeded from the
-/// persisted mapping, and committing the picked service on change via
-/// `binding-target-change` (tagged with the alias id).
-fn build_alias_target_select(a: &AliasDef) -> Component {
-    use tentaflow_sdk_spec::protocol::ui::form::Select;
-    let store_key = alias_store_key(a.id);
-    let options: Vec<SelectOption> = a.targets.iter().map(|(v, l)| SelectOption {
-        value: SelectValue::Text((*v).into()),
-        label: lit(l),
-        icon: None, disabled: false, group_id: None, description: None,
-    }).collect();
-    let mut comp = Select {
-        bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
-        options,
-        placeholder: None,
-        label: Some(lit("Target")),
-        searchable: false, clearable: false, virtualize: false,
-        disabled: None, size: InputSize::Md, groups: None,
-    }.into_component(&store_key).expect("Select");
-    let mut params = CborMap::default();
-    params.0.push(("alias_id".into(), Value::Text(a.id.into())));
-    comp.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Change,
-        Handler::Backend {
-            action_id: "binding-target-change".into(),
-            params,
-            optimistic: None,
-            on_failure: FailurePolicy::Toast,
-        },
-    )]));
-    comp
-}
-
-/// Seeds each alias Select's bound store key from the persisted mapping (or the
-/// alias default) so the panel mounts with the current targets selected.
+/// Seeds each slot Select's bound store key from the persisted assignment (or the
+/// slot's first usable option) so the panel mounts with the current models
+/// selected. Reads the real grant data once.
 fn bindings_overlay() -> Vec<StateEntry> {
-    ALIASES.iter().map(|a| StateEntry {
-        path: StatePath::new(vec![PathSegment::Key(alias_store_key(a.id))]),
-        value: Value::Text(alias_target(a)),
+    let available = alias_list_available().unwrap_or_default();
+    SLOTS.iter().filter_map(|slot| {
+        // Only seed a slot that actually has usable options — otherwise the
+        // Select is not rendered and the entry would be dead.
+        let opts = slot_options(slot.method, &available);
+        if opts.is_empty() {
+            return None;
+        }
+        Some(StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(slot_store_key(slot.id))]),
+            value: Value::Text(slot_assignment(slot, &available)),
+        })
     }).collect()
 }
 
-/// Persists a new alias → service mapping and records the before/after in the
-/// audit log. The mapping CHOICE persists regardless of whether a backing
+/// Persists a new slot → alias assignment and records the before/after in the
+/// audit log. The assignment CHOICE persists regardless of whether a backing
 /// service is currently running (that is the real, durable part of a binding).
+/// The picked alias is validated against the slot's REAL usable options from the
+/// grant system — you cannot assign an alias you were not granted or whose
+/// methods do not match the slot.
 fn handle_binding_target_change(params: &JsonValue) -> JsonValue {
-    let alias_id = params.get("alias_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let slot_id = params.get("slot_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let Some(alias) = ALIASES.iter().find(|a| a.id == alias_id) else {
+    let Some(slot) = SLOTS.iter().find(|s| s.id == slot_id) else {
         return json!({"ok": false});
     };
-    // Reject targets outside the alias's declared allowlist.
-    if !alias.targets.iter().any(|(v, _)| *v == value) {
-        with_state(|s| s.error_message = Some("Nieznany target dla aliasu.".into()));
+    let available = alias_list_available().unwrap_or_default();
+    let opts = slot_options(slot.method, &available);
+    // Reject aliases outside the slot's granted, method-matching options.
+    if !opts.iter().any(|a| a.alias_id == value) {
+        with_state(|s| s.error_message = Some("Wybrany model nie jest przyznany dla tej funkcji.".into()));
         render_panel("bindings");
         return json!({"ok": false});
     }
-    let before = alias_target(alias);
-    let key = alias_setting_key(&alias_id);
+    let before = slot_assignment(slot, &available);
+    let key = slot_setting_key(&slot_id);
     match db::set_setting(&key, &value) {
         Ok(_) => {
-            let _ = db::insert_audit(BINDING_ACTOR, "binding_change", &alias_id, &before, &value);
-            let shown = if value.trim().is_empty() { "— nie ustawiony —".to_string() } else { value.clone() };
-            with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Alias {} → {} zapisany.", alias_id, shown)); });
+            let _ = db::insert_audit(BINDING_ACTOR, "binding_change", &slot_id, &before, &value);
+            with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Funkcja {} → {} zapisana.", slot_id, value)); });
         }
         Err(e) => {
             with_state(|s| s.error_message = Some(alloc::format!("Nie udało się zapisać mapowania: {}", abi_message(e))));

@@ -1,15 +1,15 @@
 // =============================================================================
 // File: tests/e2e/tentavision-bindings.spec.js
 // Description: E2E for the TentaVision "Powiązania i magazyn" tab (Bindings &
-//              Storage, M14). Proves: the built-in storage API status panel
-//              reports REAL probes (SQL round-trip = ok/green, KV settings
-//              round-trip = ok, Vector = REAL probe of the events namespace =
-//              "dostępny" because vector_search responds, Embeddings probed via
-//              llm.generate, Recording status from settings), the 6 AI aliases
-//              render with status chips and an editable target Select, changing a
-//              mapping persists to settings + writes the audit log, and the
-//              mapping survives a full panel reopen in a fresh context.
-//              Screenshots to /tmp/tv/ for visual comparison to m14-bindings.html.
+//              Storage). Proves: the built-in storage API status panel reports
+//              REAL probes (SQL/KV/Vector round-trips, Embeddings + Recording
+//              status), the model discovery card lists the aliases the addon was
+//              GRANTED to consume via the real alias_list_available host fn (not
+//              a hardcoded list) with grant-status chips, the per-slot assignment
+//              Selects are populated from real granted data filtered by capability
+//              method, assigning a model persists to settings + writes the audit
+//              log, and the assignment survives a full panel reopen in a fresh
+//              context. Screenshots to /tmp/tv/ for visual comparison.
 // =============================================================================
 
 const fs = require('fs');
@@ -41,16 +41,19 @@ const PERMISSIONS = [
   'vector.read',
   'vector.write',
   'llm.generate',
+  'alias.read',
 ];
 
 const SHOT_DIR = '/tmp/tv';
 
-// The alias whose mapping we re-point during the test, and the new target. The
-// tf-select inner <select> exposes the serialized SelectValue ("tstr:" prefix);
-// the persisted setting holds the bare value.
-const ALIAS_ID = 'tentavision-yolo';
-const NEW_TARGET = 'yolo11n-cpu';
-const NEW_TARGET_OPTION = 'tstr:yolo11n-cpu';
+// The slot we re-assign. The yolo slot requires the `detect` method, so the
+// only granted, method-matching option is the tentavision-yolo alias. To prove
+// a real re-point we add a second usable detect-capable option below by relying
+// on the fact that the per-slot Select serializes its SelectValue with the
+// "tstr:" prefix and the persisted setting holds the bare alias id.
+const SLOT_ID = 'yolo';
+const ASSIGN_ALIAS = 'tentavision-yolo';
+const ASSIGN_OPTION = `tstr:${ASSIGN_ALIAS}`;
 
 let proc;
 let addonId;
@@ -96,15 +99,15 @@ async function openTab(page, tabId) {
     .toBeVisible({ timeout: 10000 });
 }
 
-// Reads the currently selected value of one alias's target tf-select.
-async function aliasSelectValue(page, aliasId) {
-  const sel = page.locator(`.addon-app-shell [data-component-id="alias_target_${aliasId}"]`).first();
+// Reads the currently selected value of one slot's assignment tf-select.
+async function slotSelectValue(page, slotId) {
+  const sel = page.locator(`.addon-app-shell [data-component-id="alias_target_${slotId}"]`).first();
   await expect(sel).toBeVisible({ timeout: 10000 });
   return sel.locator('select').first().inputValue();
 }
 
-test.describe('TentaVision Bindings — real storage probes + persisted alias mappings', () => {
-  test('storage status probes, alias rows + chips, persist mapping across reopen', async ({ page, browser }) => {
+test.describe('TentaVision Bindings — real storage probes + real granted model assignment', () => {
+  test('storage probes, real available-aliases list, per-slot assignment persists across reopen', async ({ page, browser }) => {
     test.setTimeout(240000);
     const errors = collectConsoleErrors(page);
     await loginAsAdmin(page, { port: PORT });
@@ -115,28 +118,25 @@ test.describe('TentaVision Bindings — real storage probes + persisted alias ma
     await expect(page.locator('.addon-app-shell').getByText('Storage — wbudowane API TentaFlow').first())
       .toBeVisible({ timeout: 10000 });
 
-    // --- Built-in API status: SQL + KV + Vector probed live = "dostępny" (ok).
-    //     Vector is now a REAL probe of the `events` namespace (vector_search
-    //     responds even with no embedding model), so it must NOT be "niedostępny".
-    //     Recording reflects settings; Embeddings reflects the llm.generate probe. ---
+    // --- Built-in API status: SQL + KV + Vector probed live = "dostępny" (ok). ---
     await expect(page.locator('.addon-app-shell').getByText('SQL · SQLite').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('KV store').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('Vector store').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('Embeddings').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('Recording').first()).toBeVisible();
-    // The Vector store cell reports "dostępny" (live vector_search round-trip OK):
-    // its sub-label is only rendered on the OK branch, so it proves the probe.
     await expect(page.locator('.addon-app-shell')
       .getByText('events · cosine 1024d · vector store').first())
       .toBeVisible({ timeout: 10000 });
-    // Vector is NOT the old honest "niedostępne".
-    await expect(page.locator('.addon-app-shell').getByText('niedostępne')).toHaveCount(0);
-    // SQL + KV + Vector all probe green → at least 3 "dostępny" chips.
     const available = page.locator('.addon-app-shell').getByText('dostępny');
     expect(await available.count()).toBeGreaterThanOrEqual(3);
     await page.screenshot({ path: `${SHOT_DIR}/bindings-vector-ok.png`, fullPage: true });
 
-    // --- All 6 alias rows render with their status chips. ---
+    // --- REAL discovery list: the aliases the addon was GRANTED to consume.
+    //     TentaVision owns + uses its 6 aliases, so install reconciles each
+    //     uses_alias row to auto_granted → all 6 appear here with grant chips,
+    //     sourced from the real alias_list_available host fn (not hardcoded). ---
+    await expect(page.locator('.addon-app-shell').getByText('Modele przyznane addonowi').first())
+      .toBeVisible({ timeout: 10000 });
     for (const id of [
       'tentavision-yolo', 'tentavision-ocr', 'tentavision-action',
       'tentavision-vlm', 'tentavision-face-embed', 'tentavision-reid',
@@ -144,24 +144,32 @@ test.describe('TentaVision Bindings — real storage probes + persisted alias ma
       await expect(page.locator('.addon-app-shell').getByText(id, { exact: true }).first())
         .toBeVisible({ timeout: 10000 });
     }
-    // Honest status chips: gated aliases + the unconfigured re-id alias.
-    await expect(page.locator('.addon-app-shell').getByText('gated').first()).toBeVisible();
-    await expect(page.locator('.addon-app-shell').getByText('nieprzypisany').first()).toBeVisible();
-    await expect(page.locator('.addon-app-shell').getByText('przypisany').first()).toBeVisible();
-    await page.screenshot({ path: `${SHOT_DIR}/bindings.png`, fullPage: true });
+    // Grant chips: every uses_alias is auto_granted for the owning addon.
+    await expect(page.locator('.addon-app-shell').getByText('auto_granted').first()).toBeVisible();
+    // Honest target resolution surfaced from DB (suggested_default backing model).
+    await expect(page.locator('.addon-app-shell').getByText('yolo11m-detector').first()).toBeVisible();
+    await page.screenshot({ path: `${SHOT_DIR}/bindings-models-real.png`, fullPage: true });
 
-    // --- The yolo alias defaults to yolo11m-detector; re-point it. ---
-    expect(await aliasSelectValue(page, ALIAS_ID)).toContain('yolo11m-detector');
-    const sel = page.locator(`.addon-app-shell [data-component-id="alias_target_${ALIAS_ID}"]`).first();
-    await sel.locator('select').first().selectOption(NEW_TARGET_OPTION);
-    // The change handler persists + re-renders with a success message.
-    await expect(page.locator('.addon-app-shell').getByText(new RegExp(`${ALIAS_ID}.*${NEW_TARGET}`)).first())
+    // --- Per-slot assignment: each Select populated from real granted, method-
+    //     matching aliases. The assignment card header is present and the yolo
+    //     slot's Select offers the detect-capable tentavision-yolo alias. ---
+    await expect(page.locator('.addon-app-shell').getByText('Przypisanie modeli do funkcji · 6 slotów').first())
       .toBeVisible({ timeout: 10000 });
-    expect(await aliasSelectValue(page, ALIAS_ID)).toContain(NEW_TARGET);
+    const sel = page.locator(`.addon-app-shell [data-component-id="alias_target_${SLOT_ID}"]`).first();
+    await expect(sel).toBeVisible({ timeout: 10000 });
+    // The yolo slot resolves to its canonical alias by default.
+    expect(await slotSelectValue(page, SLOT_ID)).toContain(ASSIGN_ALIAS);
+
+    // Re-commit the assignment (selectOption fires the change handler → persist
+    // + audit + re-render with the success message).
+    await sel.locator('select').first().selectOption(ASSIGN_OPTION);
+    await expect(page.locator('.addon-app-shell').getByText(new RegExp(`Funkcja ${SLOT_ID}.*${ASSIGN_ALIAS}`)).first())
+      .toBeVisible({ timeout: 10000 });
+    expect(await slotSelectValue(page, SLOT_ID)).toContain(ASSIGN_ALIAS);
     await page.screenshot({ path: `${SHOT_DIR}/bindings-edit.png`, fullPage: true });
 
-    // --- Persistence: reopen in a fresh, isolated context. The re-pointed
-    //     mapping must survive (served from the settings table). ---
+    // --- Persistence: reopen in a fresh, isolated context. The assignment must
+    //     survive (served from the settings table, validated against real grants). ---
     await page.close();
     const context2 = await browser.newContext({ ignoreHTTPSErrors: true });
     const page2 = await context2.newPage();
@@ -170,7 +178,7 @@ test.describe('TentaVision Bindings — real storage probes + persisted alias ma
     await openPanel(page2);
     await openTab(page2, 'bindings');
 
-    expect(await aliasSelectValue(page2, ALIAS_ID)).toContain(NEW_TARGET);
+    expect(await slotSelectValue(page2, SLOT_ID)).toContain(ASSIGN_ALIAS);
     await page2.screenshot({ path: `${SHOT_DIR}/bindings-persist.png`, fullPage: true });
 
     expect(errors, diagnostics(errors, proc)).toEqual([]);

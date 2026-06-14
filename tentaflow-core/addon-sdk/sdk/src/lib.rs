@@ -356,6 +356,10 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    fn alias_list_available_v1(
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Camera API (F1a M1.W6) — camera ingest layer (fake_file vendor only
     /// in F1a). Payload format is CBOR for all inputs/outputs. Requires
     /// `cameras.read` / `cameras.write` / `cameras.snapshot` permissions.
@@ -1580,8 +1584,8 @@ pub mod prelude {
         service_request_call,
         sql_exec, sql_query, sql_query_one, sql_transaction,
         SqlValue, SqlRow, SqlExecResult,
-        alias_get, alias_list_owned,
-        AliasInfo,
+        alias_get, alias_list_owned, alias_list_available,
+        AliasInfo, AvailableAlias,
         camera_add, camera_list, camera_get, camera_update, camera_remove,
         camera_snapshot, camera_health, camera_discover, camera_test_connection,
         camera_credentials_rotate,
@@ -1668,6 +1672,80 @@ pub fn alias_list_owned() -> Result<Vec<AliasInfo>, AbiError> {
         if rc == 0 {
             buffer.truncate(out_len as usize);
             let resp: AliasListResponse =
+                serde_json::from_slice(&buffer).map_err(|_| AbiError::Operation)?;
+            return Ok(resp.aliases);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
+}
+
+/// Jeden alias/model, ktory addon MOZE konsumowac — wynik z systemu grantow
+/// dostepu (`[[uses_alias]]`). W przeciwienstwie do `AliasInfo` (aliasy, ktore
+/// addon STWORZYL), to opisuje aliasy, do ktorych addon dostal grant. Pola
+/// `target_model`/`visibility` sa `None` gdy alias jeszcze nie istnieje (owner
+/// niezainstalowany, status `pending`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AvailableAlias {
+    /// Nazwa aliasu zadeklarowana przez addon w `[[uses_alias]]`.
+    pub alias_id: String,
+    /// Konkretny model, na ktory alias sie rozwiazuje (gdy istnieje).
+    pub target_model: Option<String>,
+    /// Metody/zdolnosci (detect/recognize/embed/...) zadeklarowane przez owner.
+    pub methods: Vec<String>,
+    /// Strategia routingu aliasu (gdy istnieje).
+    pub strategy: Option<String>,
+    /// Status grantu: `granted` / `auto_granted` / `pending` / `denied`.
+    pub grant_status: String,
+    /// Widocznosc ustawiona przez owner (`private`/`restricted`/`public`).
+    pub visibility: Option<String>,
+    /// Czy rozwiazany alias jest aktywny.
+    pub active: bool,
+    /// Czy consumer zadeklarowal alias jako `required`.
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AvailableAliasResponse {
+    aliases: Vec<AvailableAlias>,
+}
+
+/// Zwraca aliasy/modele, ktore biezacy addon MOZE konsumowac — jego deklaracje
+/// `[[uses_alias]]` zlaczone z konkretnym modelem docelowym, metodami, strategia,
+/// widocznoscia i statusem grantu. Lista zawiera WSZYSTKIE statusy (granted/
+/// auto_granted/pending/denied), zeby UI mogl pokazac honest stan zamiast ukrywac
+/// nieprzyznane wpisy. Realny gate dostepu i tak dziala przy wywolaniu (resolve),
+/// wiec wpis `pending`/`denied` na liscie nie przyznaje dostepu.
+pub fn alias_list_available() -> Result<Vec<AvailableAlias>, AbiError> {
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            alias_list_available_v1(
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            let resp: AvailableAliasResponse =
                 serde_json::from_slice(&buffer).map_err(|_| AbiError::Operation)?;
             return Ok(resp.aliases);
         }

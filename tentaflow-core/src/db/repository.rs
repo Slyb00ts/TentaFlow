@@ -2095,6 +2095,48 @@ pub fn list_addon_uses_alias(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddo
     Ok(rows)
 }
 
+/// Discovery view for the addon-facing `alias_list_available_v1` host function:
+/// every `[[uses_alias]]` declaration of `addon_id` joined LEFT with the
+/// resolved `model_aliases` row and its visibility. A LEFT join is deliberate —
+/// a declaration whose owner addon is not installed yet stays `pending` with no
+/// alias row, and the addon should still see it (honest pending state) rather
+/// than have it silently vanish. `methods` is decoded from the JSON-array column
+/// written at owner-install time; a malformed/empty value yields an empty list.
+pub fn list_addon_available_aliases(
+    pool: &DbPool,
+    addon_id: &str,
+) -> Result<Vec<DbAvailableAlias>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT u.alias_target_name, u.required, u.grant_status, \
+                a.target_model, a.strategy, a.is_active, a.methods, v.visibility \
+         FROM addon_uses_alias u \
+         LEFT JOIN model_aliases a ON a.alias = u.alias_target_name \
+         LEFT JOIN model_alias_visibility v ON v.alias_id = a.id \
+         WHERE u.addon_id = ?1 \
+         ORDER BY u.alias_target_name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id], |r| {
+            let methods_json: Option<String> = r.get(6)?;
+            let active: Option<i64> = r.get(5)?;
+            Ok(DbAvailableAlias {
+                alias_id: r.get(0)?,
+                required: r.get::<_, i64>(1)? != 0,
+                grant_status: r.get(2)?,
+                target_model: r.get(3)?,
+                strategy: r.get(4)?,
+                active: active.unwrap_or(0) != 0,
+                methods: methods_json
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+                    .unwrap_or_default(),
+                visibility: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ---- Pool-level orchestration (mutation + reconcile + audit in one tx) ------
 // Each entrypoint runs the privileged change, reconciles dependent
 // `addon_uses_*` rows, and writes both the per-transition audit rows and the
@@ -2861,6 +2903,23 @@ pub fn create_or_reactivate_model_alias_within_tx(
     )?;
 
     Ok(alias_id)
+}
+
+/// Persists the capability `methods` of an alias as a JSON array string. Called
+/// at install time from the owner addon's `[[alias]].methods` declaration so
+/// consumers can later discover which capability (detect/recognize/embed/...)
+/// each granted alias serves. An empty slice writes `[]`. Idempotent.
+pub fn set_alias_methods_within_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias_id: i64,
+    methods: &[String],
+) -> Result<()> {
+    let json = serde_json::to_string(methods)?;
+    tx.execute(
+        "UPDATE model_aliases SET methods = ?1 WHERE id = ?2",
+        rusqlite::params![json, alias_id],
+    )?;
+    Ok(())
 }
 
 /// Sets the `is_active` flag on an alias selected by name.

@@ -885,6 +885,20 @@ impl AddonManager {
                     )
                 })?;
 
+            crate::db::repository::set_alias_methods_within_tx(
+                &tx,
+                alias_id,
+                &alias_spec.methods,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' alias '{}' methods write failed: {}",
+                    manifest.addon_id,
+                    alias_spec.id,
+                    e
+                )
+            })?;
+
             // Revoke manifest-granted consumers that were dropped from the
             // current manifest (reinstall path). Admin-granted rows
             // (`granted_by_user_id IS NOT NULL`) are preserved — only the
