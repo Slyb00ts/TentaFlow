@@ -422,7 +422,28 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_aliases_methods_column",
             MigrationStep::Rust(model_aliases_add_methods_column),
         ),
+        (
+            77,
+            "addons_installed_bundle_hash_column",
+            MigrationStep::Rust(addons_add_installed_bundle_hash_column),
+        ),
     ]
+}
+
+/// Adds `installed_bundle_hash` to `addons` (the instance table). It records the
+/// `addon_packages.bundle_hash` the instance was materialized from, so update
+/// detection can fire on a CONTENT change (manifest/wasm/migrations) even when
+/// the version string is unchanged — bundled addons routinely ship edits under
+/// the same version. Existing rows default to '' which reads as "older than any
+/// catalogued hash", so an instance correctly surfaces an available update after
+/// the next rebuild. Idempotent — guarded by a column probe.
+fn addons_add_installed_bundle_hash_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "addons", "installed_bundle_hash")? {
+        conn.execute_batch(
+            "ALTER TABLE addons ADD COLUMN installed_bundle_hash TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
 }
 
 /// Adds the `methods` column to `model_aliases`. Methods are declared in the

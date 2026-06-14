@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<!-- ===== Plik: rag02-chunking.html — Chunking + Embedding RAG: strategia chunkowania (metoda/rozmiar/overlap), podgląd fragmentów, model embeddingów z Biblioteki, opcjonalny reranker. ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Chunking + Embedding (RAG)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Callout „pochodzenie wartości” (zero magii) ----- */
+  .origin-callout {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .origin-callout .oc-ico {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    background: var(--gradient-accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .origin-callout .oc-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.9; }
+  .origin-callout .oc-title { font-size: 12.5px; font-weight: 800; margin-bottom: 3px; }
+  .origin-callout .oc-text { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  /* ----- Wyliczenie pochodzenia liczby fragmentów ----- */
+  .calc-box { display: flex; align-items: center; gap: 14px; padding: 14px 16px; flex-wrap: wrap;
+    background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); }
+  .calc-box .calc-eq { font-size: 15px; font-weight: 800; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .calc-box .calc-eq .op { color: var(--accent-2); font-size: 17px; }
+  .calc-box .calc-eq .term { background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 4px 10px; font-size: 13px; }
+  .calc-box .calc-res { margin-left: auto; text-align: right; }
+  .calc-box .calc-res .cr-val { font-size: 20px; font-weight: 800;
+    background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .calc-box .calc-res .cr-note { font-size: 10.5px; color: var(--text-3); }
+  /* ----- Podgląd fragmentu (chunk) ----- */
+  .chunk-card { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; }
+  .chunk-card .ck-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .chunk-card .ck-id { font-size: 10px; font-weight: 800; color: var(--accent-2);
+    background: var(--accent-glow); border-radius: 5px; padding: 2px 7px; font-family: ui-monospace, monospace; }
+  .chunk-card .ck-src { font-size: 10.5px; color: var(--text-3); }
+  .chunk-card .ck-text { font-size: 11.5px; color: var(--text-2); line-height: 1.6; }
+  .chunk-card .ck-foot { display: flex; gap: 12px; margin-top: 8px; font-size: 10px; color: var(--text-3); }
+  .chunk-card .ck-foot .mono { color: var(--info); }
+  /* ----- Model embeddingów (wybór z Biblioteki) ----- */
+  .emb-pick { display: flex; align-items: center; gap: 11px; padding: 11px 13px; border-radius: var(--radius-sm);
+    background: var(--bg-input); border: 1px solid var(--border); cursor: pointer; transition: all 0.15s; }
+  .emb-pick:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .emb-pick.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+  .emb-pick .ep-dot { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--border-hover); flex-shrink: 0; }
+  .emb-pick.selected .ep-dot { border-color: var(--accent-1); background: var(--accent-1); box-shadow: inset 0 0 0 3px var(--bg-2); }
+  .emb-pick .ep-name { font-size: 12.5px; font-weight: 700; }
+  .emb-pick .ep-meta { font-size: 10.5px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-scissors" viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-vector" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><path d="M2 17l10 5 10-5"/></symbol>
+  <symbol id="i-sort" viewBox="0 0 24 24"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Chunking + Embedding (RAG)</h1>
+  <p class="lead">
+    Sparsowana treść z kroku „Korpus” (<strong>640 stron</strong>) jest dzielona na fragmenty wg wybranej strategii,
+    a każdy fragment zamieniany na wektor przez <strong>model embeddingów z Biblioteki zasobów</strong>. Liczba
+    fragmentów <strong>nie jest wpisana z palca</strong> — wynika wprost z liczby stron × parametrów chunkowania,
+    co pokazujemy jako jawne wyliczenie.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-scissors"/></svg>Strategia = liczba fragmentów</h3>
+      <p>Metoda + rozmiar + overlap decydują, ile fragmentów powstanie z Twoich 640 stron.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-vector"/></svg>Model embeddingów z serwisu</h3>
+      <p>Lista modeli (bge-m3, nomic…) pochodzi z Biblioteki zasobów, capability = embedding.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Pochodzenie liczby</h3>
+      <p>„≈ 2 480 fragmentów” to policzony iloczyn stron i strategii — nie wartość magiczna.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">RAG2</span>
+    <h2>Chunking + Embedding — strategia, podgląd fragmentów, model wektorów (zakładka „Chunking”)</h2>
+    <div class="desc">Strategia chunkowania · podgląd chunków · model embeddingów + reranker.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Baza wiedzy ADR (RAG)”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Chunking</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Baza wiedzy ADR (RAG) <span class="chip accent"><span class="dot"></span>typ: RAG</span></div>
+            <div class="d-sub">Chunking · podział na fragmenty · embedding do wektorów</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Biblioteka zasobów</button>
+            <a class="btn btn-primary" href="rag03-indeks.html"><svg class="icon"><use href="#i-layers"/></svg>Dalej: Indeks</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Korpus</button>
+          <button class="tab active"><svg class="icon"><use href="#i-scissors"/></svg>Chunking</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Indeks</button>
+          <button class="tab"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-rocket"/></svg>Deploy</button>
+        </div>
+
+        <!-- Sekcja 1: Strategia chunkowania -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-scissors"/></svg>Strategia chunkowania</div>
+            <span class="hint">Decyduje, ile fragmentów powstanie z 640 stron</span>
+          </div>
+          <div class="grid-3">
+            <div class="field">
+              <label>Metoda podziału</label>
+              <div class="segmented" style="width:100%;">
+                <button>stały rozmiar</button>
+                <button class="active">wg nagłówków</button>
+                <button>semantyczny</button>
+              </div>
+              <span class="hint">Podział wg nagłówków (sekcje ADR) zachowuje kontekst paragrafu — dobry dla aktów prawnych.</span>
+            </div>
+            <div class="field">
+              <label>Rozmiar fragmentu (tokeny)</label>
+              <input class="input mono" value="512" />
+              <span class="hint">Maks. długość jednego fragmentu w tokenach. 512 = sensowny kompromis kontekst/precyzja.</span>
+            </div>
+            <div class="field">
+              <label>Overlap (tokeny)</label>
+              <input class="input mono" value="64" />
+              <span class="hint">Nakładka między sąsiednimi fragmentami, by nie urywać zdań na granicy.</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Callout pochodzenia + wyliczenie -->
+        <div class="origin-callout ml-enter ml-enter-2">
+          <div class="oc-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></div>
+          <div style="flex:1;">
+            <div class="oc-title">640 stron × strategia 512/64 → ≈ 2 480 fragmentów. Liczba wynika z treści i parametrów, nie z konfiguracji.</div>
+            <div class="oc-text">
+              Przyjmujemy ~520 tokenów treści na stronę (zmierzone z parsingu). Przy fragmencie 512 i overlapie 64
+              efektywny krok to 448 tokenów, więc na stronę przypada ~1,16 fragmentu, a po doliczeniu nakładek między
+              stronami daje to ≈ 2 480 fragmentów. Każda zmiana rozmiaru lub overlapu przeliczy tę wartość na żywo.
+            </div>
+          </div>
+        </div>
+
+        <div class="calc-box ml-enter ml-enter-2" style="margin-bottom:16px;">
+          <div class="calc-eq">
+            <span class="term">640 stron</span><span class="op">×</span>
+            <span class="term">~520 tok/str</span><span class="op">÷</span>
+            <span class="term">(512 − 64) krok</span>
+          </div>
+          <div class="calc-res">
+            <div class="cr-val">≈ 2 480 fragmentów</div>
+            <div class="cr-note">≈ 332 800 tokenów treści / 448 tokenów kroku</div>
+          </div>
+        </div>
+
+        <!-- Sekcja 2: Podgląd fragmentów -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Podgląd fragmentów — przykładowe chunki</div>
+            <span class="hint">3 z ≈ 2 480 · z licznikiem znaków / tokenów</span>
+          </div>
+          <div class="grid-3">
+            <div class="chunk-card">
+              <div class="ck-head">
+                <span class="ck-id">chunk #0001</span>
+                <span class="ck-src">RID_2025.pdf · str. 47</span>
+              </div>
+              <div class="ck-text">
+                5.3.1 Umieszczanie tablic ostrzegawczych. Cysterny przewożące materiały niebezpieczne muszą być
+                oznakowane pomarańczową tablicą z numerem rozpoznawczym zagrożenia (Kemler) w górnej części oraz
+                numerem UN w dolnej…
+              </div>
+              <div class="ck-foot"><span>1 842 znaków</span><span class="mono">498 tok</span></div>
+            </div>
+            <div class="chunk-card">
+              <div class="ck-head">
+                <span class="ck-id">chunk #0002</span>
+                <span class="ck-src">RID_2025.pdf · str. 47–48</span>
+              </div>
+              <div class="ck-text">
+                …numerem UN w dolnej części. Dla benzyny (UN 1203) numer rozpoznawczy zagrożenia to 33, oznaczający
+                materiał ciekły łatwopalny o temperaturze zapłonu poniżej 23 °C. Tablica musi być odblaskowa i
+                czytelna z odległości…
+              </div>
+              <div class="ck-foot"><span>1 760 znaków</span><span class="mono">512 tok</span></div>
+            </div>
+            <div class="chunk-card">
+              <div class="ck-head">
+                <span class="ck-id">chunk #0003</span>
+                <span class="ck-src">Oznakowanie_nalepki.md · sekcja 2</span>
+              </div>
+              <div class="ck-text">
+                Nalepka ostrzegawcza nr 3 (płomień na czerwonym tle) jest wymagana dla materiałów ciekłych zapalnych
+                klasy 3. Umieszcza się ją na obu bokach i z tyłu cysterny, o boku nie mniejszym niż 250 mm…
+              </div>
+              <div class="ck-foot"><span>1 504 znaków</span><span class="mono">421 tok</span></div>
+            </div>
+          </div>
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Każdy fragment niesie metadane źródła (dokument + strona/sekcja). Te metadane pojawią się później jako
+            <strong>cytowania</strong> w playgroundzie ewaluacji — dlatego oznaczamy je już na etapie chunkowania.
+          </div>
+        </section>
+
+        <!-- Sekcja 3: Model embeddingów -->
+        <section class="section-card ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-vector"/></svg>Model embeddingów — z Biblioteki zasobów (capability = embedding)</div>
+            <span class="hint">Lista filtrowana po zdolności „embedding”</span>
+          </div>
+          <div class="grid-3">
+            <div class="emb-pick selected">
+              <span class="ep-dot"></span>
+              <div style="flex:1;min-width:0;">
+                <div class="ep-name">bge-m3</div>
+                <div class="ep-meta">wektor 1024 · wielojęzyczny · dostępny w serwisie</div>
+              </div>
+              <span class="chip success"><span class="dot"></span>online</span>
+            </div>
+            <div class="emb-pick">
+              <span class="ep-dot"></span>
+              <div style="flex:1;min-width:0;">
+                <div class="ep-name">nomic-embed-text</div>
+                <div class="ep-meta">wektor 768 · EN · dostępny w serwisie</div>
+              </div>
+              <span class="chip info"><span class="dot"></span>dostępny</span>
+            </div>
+            <div class="emb-pick">
+              <span class="ep-dot"></span>
+              <div style="flex:1;min-width:0;">
+                <div class="ep-name">własny / HF repo</div>
+                <div class="ep-meta">wskaż model embeddingów z HuggingFace</div>
+              </div>
+              <span class="chip"><span class="dot"></span>konfiguracja</span>
+            </div>
+          </div>
+          <div class="grid-2 mt-md">
+            <div class="field">
+              <label>Wymiar wektora</label>
+              <input class="input mono" value="1024" readonly />
+              <span class="hint">Wymiar wynika z wybranego modelu (bge-m3 = 1024). To on określi wymiar indeksu w kroku „Indeks”.</span>
+            </div>
+            <div class="field">
+              <label>Status modelu w serwisie</label>
+              <div class="flex align-center gap-sm" style="padding-top:6px;">
+                <span class="status-pill online">online</span>
+                <span class="text-xs text-3">model uruchomiony jako serwis embeddingów — gotowy do wektoryzacji ≈ 2 480 fragmentów</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Sekcja 4: Reranker (opcjonalnie) -->
+        <section class="section-card ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-sort"/></svg>Reranker (opcjonalnie)</div>
+            <span class="hint">Poprawia kolejność wyników po wyszukaniu wektorowym</span>
+          </div>
+          <div class="flex align-center gap-md" style="margin-bottom:14px;">
+            <span class="toggle on"></span>
+            <div>
+              <div class="fw-700 text-sm">Włącz reranking wyników</div>
+              <div class="text-xs text-3">Po pobraniu top-N z indeksu reranker przesortowuje fragmenty wg trafności do pytania — podnosi recall@k i MRR.</div>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>Model rerankera (z Biblioteki, capability = reranker)</label>
+              <select class="select">
+                <option>bge-reranker-v2-m3 (dostępny w serwisie)</option>
+                <option>bge-reranker-large</option>
+                <option>bez rerankera</option>
+              </select>
+              <span class="hint">Cross-encoder ocenia parę (pytanie, fragment) dokładniej niż samo podobieństwo wektorów.</span>
+            </div>
+            <div class="field">
+              <label>Pobierz przed rerankingiem (top-N)</label>
+              <input class="input mono" value="20" />
+              <span class="hint">Indeks zwraca 20 kandydatów, reranker wybiera z nich finalne top_k = 5 (ustawiane w kroku Deploy).</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Nawigacja dół -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="rag01-korpus.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Korpus</a>
+          <div class="flex gap-md align-center">
+            <span class="text-xs text-3">Chunking → ≈ 2 480 fragmentów · bge-m3 (1024)</span>
+            <a class="btn btn-primary btn-lg" href="rag03-indeks.html">Dalej: Indeks HNSW<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

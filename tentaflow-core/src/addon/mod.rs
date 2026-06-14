@@ -1148,11 +1148,29 @@ impl AddonManager {
             crate::db::repository::get_addon_instance_package_ref(&self.db, addon_id)?
                 .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
         if current == target_version {
+            // Ta sama wersja: pomijamy TYLKO gdy tresc pakietu sie nie zmienila.
+            // Bundled addony czesto wypuszczaja zmiany pod tym samym numerem wersji
+            // — wtedy `bundle_hash` w katalogu rozni sie od zapisanego na instancji
+            // i przeladowanie tej samej wersji odswieza manifest (uprawnienia, storage).
+            let catalog_hash = crate::db::repository::get_package_bundle_hash(
+                &self.db,
+                &package_id,
+                target_version,
+            )?
+            .unwrap_or_default();
+            let installed_hash =
+                crate::db::repository::get_instance_installed_bundle_hash(&self.db, addon_id)?;
+            if catalog_hash.is_empty() || catalog_hash == installed_hash {
+                info!(
+                    "Instancja '{}' juz na wersji {} bez zmian tresci — pomijam update",
+                    addon_id, target_version
+                );
+                return Ok(());
+            }
             info!(
-                "Instancja '{}' juz na wersji {} — pomijam update",
+                "Instancja '{}' v{}: ta sama wersja, zmieniona tresc (bundle_hash) — przeladowuje",
                 addon_id, target_version
             );
-            return Ok(());
         }
         info!(
             "Hot-update instancji '{}': v{} -> v{}",

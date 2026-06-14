@@ -5162,16 +5162,30 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         } else {
             Some(a.category)
         };
-        // update_available: w katalogu jest nowsza wersja pakietu niz przypieta
-        // przez ta instancje (latest = pierwsza z list_package_versions).
+        // update_available: w katalogu jest nowsza WERSJA pakietu niz przypieta
+        // przez instancje (latest = pierwsza z list_package_versions), ALBO ta sama
+        // wersja ma inny `bundle_hash` (zmiana tresci manifest/wasm/migracje bez
+        // podbicia numeru — typowe dla addonow wbudowanych). Bez tego drugiego
+        // warunku edycja addona pod tym samym numerem wersji bylaby niewidoczna.
         let update_available = if a.package_id.is_empty() {
             false
         } else {
-            repository::list_package_versions(&ctx.state.db, &a.package_id)
+            let newer_version = repository::list_package_versions(&ctx.state.db, &a.package_id)
                 .map_err(db_err)?
                 .first()
                 .map(|latest| latest != &a.package_version)
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let content_changed = {
+                let catalog_hash =
+                    repository::get_package_bundle_hash(&ctx.state.db, &a.package_id, &a.package_version)
+                        .map_err(db_err)?
+                        .unwrap_or_default();
+                let installed_hash =
+                    repository::get_instance_installed_bundle_hash(&ctx.state.db, &a.addon_id)
+                        .map_err(db_err)?;
+                !catalog_hash.is_empty() && catalog_hash != installed_hash
+            };
+            newer_version || content_changed
         };
         let display_name = if a.display_name.is_empty() {
             a.name.clone()

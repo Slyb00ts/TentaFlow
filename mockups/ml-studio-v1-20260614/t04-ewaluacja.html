@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: t04-ewaluacja.html — Ewaluacja modelu na teście (metryki, macierz pomyłek,
+           per-klasa, ważność cech), wariant anomalii i deploy z manifestem TOML.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Ewaluacja i deploy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Macierz pomyłek 3×3 ----- */
+  .cm-grid { display: grid; grid-template-columns: 110px repeat(3, 1fr); gap: 4px; }
+  .cm-grid .cm-corner { font-size: 10px; color: var(--text-3); display: flex; align-items: flex-end; }
+  .cm-grid .cm-col { font-size: 11px; font-weight: 700; color: var(--text-2); text-align: center; padding-bottom: 4px; }
+  .cm-grid .cm-row { font-size: 11px; font-weight: 700; color: var(--text-2); display: flex; align-items: center; }
+  .cm-cell { aspect-ratio: 2.4 / 1; border-radius: var(--radius-sm); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; font-weight: 800; font-size: 15px; color: var(--text); }
+  .cm-cell .cm-sub { font-size: 9.5px; font-weight: 600; color: var(--text-2); }
+  .cm-cell.diag { color: white; }
+  /* ----- Poziomy bar ważności cech ----- */
+  .fi-row { display: grid; grid-template-columns: 110px 1fr 48px; gap: 12px; align-items: center; margin-bottom: 9px; }
+  .fi-row .fi-name { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 700; }
+  .fi-bar { height: 12px; border-radius: 6px; background: var(--bg-3); overflow: hidden; }
+  .fi-bar > span { display: block; height: 100%; background: var(--gradient-accent); border-radius: 6px; }
+  .fi-row .fi-val { font-family: ui-monospace, monospace; font-size: 11.5px; text-align: right; color: var(--text-2); font-weight: 700; }
+  /* ----- Suwak progu anomalii ----- */
+  .thr-slider { position: relative; height: 8px; border-radius: 4px;
+    background: linear-gradient(90deg, var(--success), var(--warning), var(--danger)); }
+  .thr-slider .thr-knob { position: absolute; top: 50%; left: 82%; width: 18px; height: 18px; border-radius: 50%;
+    background: white; transform: translate(-50%, -50%); border: 2px solid var(--accent-1); box-shadow: var(--shadow-sm); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-anomaly" viewBox="0 0 24 24"><path d="M3 12h3l2-7 4 14 3-9 2 2h4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+  <symbol id="i-trophy" viewBox="0 0 24 24"><path d="M6 9a6 6 0 0 0 12 0V3H6z"/><path d="M6 5H3a2 2 0 0 0 0 4h3"/><path d="M18 5h3a2 2 0 0 1 0 4h-3"/><line x1="9" y1="21" x2="15" y2="21"/><line x1="12" y1="15" x2="12" y2="21"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Ewaluacja i deploy</h1>
+  <p class="lead">
+    Ostatni krok: ocena wybranego modelu na <strong>zbiorze testowym</strong> (nigdy nie widzianym podczas treningu),
+    wyjaśnienie które cechy decydowały, oraz wdrożenie. Manifest TOML generowany na końcu opisuje dokładnie, co i jak
+    zostanie zserwowane.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-target"/></svg>Metryki na teście</h3>
+      <p>F1/Acc/ROC-AUC liczone na 15% danych odłożonych na sam koniec — uczciwa ocena.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Macierz i cechy</h3>
+      <p>Gdzie model myli klasy + które kolumny niosły sygnał (explainability).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-rocket"/></svg>Deploy z manifestem</h3>
+      <p>Lokalnie do <span class="mono">models/</span> + TOML albo zewnętrzny endpoint.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">T4</span>
+    <h2>Ewaluacja i deploy — metryki, macierz, ważność cech, manifest (zakładka „Ewaluacja”)</h2>
+    <div class="desc">stat-cards · macierz pomyłek · per-klasa · feature importance · anomalie · deploy.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Ocena ryzyka przesyłek ADR”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Ewaluacja</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-chart"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">WeightedEnsemble_L2 <span class="chip success"><span class="dot"></span>oceniony na teście</span></div>
+            <div class="d-sub">ryzyko-przesylki v1 · job am-2041 · test 15% (1 872 wiersze)</div>
+          </div>
+          <div class="d-actions">
+            <a class="btn btn-secondary" href="t03-leaderboard.html"><svg class="icon"><use href="#i-trophy"/></svg>Inny model</a>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-rocket"/></svg>Deploy do serwisu</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-target"/></svg>Cel i silnik</button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trening</button>
+          <button class="tab active"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele</button>
+        </div>
+
+        <!-- Metryki -->
+        <div class="grid-3 ml-enter ml-enter-1" style="margin-bottom:16px;">
+          <div class="stat-card"><div class="sc-lbl">F1 makro (na teście)</div><div class="sc-val">0.927</div><div class="sc-foot">średnia F1 po 3 klasach</div></div>
+          <div class="stat-card"><div class="sc-lbl">Accuracy</div><div class="sc-val">0.941</div><div class="sc-foot">1 761 / 1 872 trafień</div></div>
+          <div class="stat-card"><div class="sc-lbl">ROC-AUC (OvR)</div><div class="sc-val">0.978</div><div class="sc-foot">one-vs-rest, makro</div></div>
+        </div>
+
+        <div class="grid-2">
+          <!-- Macierz pomyłek -->
+          <section class="section-card ml-enter ml-enter-2">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-grid"/></svg>Macierz pomyłek (test)</div>
+              <span class="hint">wiersz = prawda · kolumna = predykcja</span>
+            </div>
+            <div class="cm-grid">
+              <div class="cm-corner">prawda \ predykcja</div>
+              <div class="cm-col">niskie</div><div class="cm-col">średnie</div><div class="cm-col">wysokie</div>
+
+              <div class="cm-row">niskie</div>
+              <div class="cm-cell diag heatmap-cell lvl-4">1002<span class="cm-sub">poprawne</span></div>
+              <div class="cm-cell heatmap-cell lvl-1">28</div>
+              <div class="cm-cell heatmap-cell">3</div>
+
+              <div class="cm-row">średnie</div>
+              <div class="cm-cell heatmap-cell lvl-1">34</div>
+              <div class="cm-cell diag heatmap-cell lvl-3">560<span class="cm-sub">poprawne</span></div>
+              <div class="cm-cell heatmap-cell lvl-1">24</div>
+
+              <div class="cm-row">wysokie</div>
+              <div class="cm-cell heatmap-cell">2</div>
+              <div class="cm-cell heatmap-cell lvl-1">20</div>
+              <div class="cm-cell diag heatmap-cell lvl-2">199<span class="cm-sub">poprawne</span></div>
+            </div>
+            <div class="text-xs text-3 mt-md">Najczęstsza pomyłka: 34 przesyłki „średnie” sklasyfikowane jako „niskie” — typowe dla sąsiednich klas ryzyka.</div>
+          </section>
+
+          <!-- Per-klasa -->
+          <section class="section-card ml-enter ml-enter-2">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-target"/></svg>Metryki per-klasa (test)</div>
+              <span class="hint">precision / recall / F1</span>
+            </div>
+            <table class="tf-table">
+              <thead><tr><th>Klasa</th><th>Precision</th><th>Recall</th><th>F1</th><th>Wsparcie</th></tr></thead>
+              <tbody>
+                <tr><td class="fw-700">niskie</td><td class="mono">0.965</td><td class="mono">0.970</td><td class="mono fw-700">0.967</td><td class="mono text-2">1 033</td></tr>
+                <tr><td class="fw-700">średnie</td><td class="mono">0.921</td><td class="mono">0.906</td><td class="mono fw-700">0.913</td><td class="mono text-2">618</td></tr>
+                <tr><td class="fw-700">wysokie</td><td class="mono">0.881</td><td class="mono">0.900</td><td class="mono fw-700">0.890</td><td class="mono text-2">221</td></tr>
+              </tbody>
+            </table>
+            <div class="text-xs text-3 mt-md">Klasa „wysokie” ma najniższe F1 — to najrzadsza klasa (221 wierszy w teście). Dlatego optymalizowaliśmy F1 makro, nie accuracy.</div>
+          </section>
+        </div>
+
+        <!-- Ważność cech -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-chart"/></svg>Ważność cech (explainability)</div>
+            <span class="hint">permutacyjna, na zbiorze testowym</span>
+          </div>
+          <p class="section-sub">Które kolumny niosły sygnał. Spadek F1 makro po przetasowaniu danej cechy = jej waga.</p>
+          <div style="max-width:620px;">
+            <div class="fi-row"><span class="fi-name">masa_kg</span><div class="fi-bar"><span style="width:100%"></span></div><span class="fi-val">0.284</span></div>
+            <div class="fi-row"><span class="fi-name">klasa_adr</span><div class="fi-bar"><span style="width:78%"></span></div><span class="fi-val">0.221</span></div>
+            <div class="fi-row"><span class="fi-name">temperatura</span><div class="fi-bar"><span style="width:54%"></span></div><span class="fi-val">0.153</span></div>
+            <div class="fi-row"><span class="fi-name">odleglosc_km</span><div class="fi-bar"><span style="width:41%"></span></div><span class="fi-val">0.116</span></div>
+            <div class="fi-row"><span class="fi-name">un</span><div class="fi-bar"><span style="width:33%"></span></div><span class="fi-val">0.094</span></div>
+            <div class="fi-row"><span class="fi-name">data_nadania</span><div class="fi-bar"><span style="width:18%"></span></div><span class="fi-val">0.051</span></div>
+            <div class="fi-row"><span class="fi-name">opis</span><div class="fi-bar"><span style="width:9%"></span></div><span class="fi-val">0.026</span></div>
+          </div>
+        </section>
+
+        <!-- WARIANT ANOMALIE -->
+        <section class="section-card ml-enter ml-enter-3" style="border-color:rgba(245,158,11,0.4);">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-anomaly"/></svg>Wariant: wykrywanie anomalii — czujniki temperatury cysterny</div>
+            <span class="chip warning"><span class="dot"></span>7 anomalii ponad próg 0.82</span>
+          </div>
+          <p class="section-sub">Jeśli silnikiem był IsolationForest (nie AutoML), ewaluacja wygląda inaczej: szereg czasowy ze scoringiem i progiem zamiast macierzy klas.</p>
+          <div class="chart-wrap">
+            <svg viewBox="0 0 640 200" preserveAspectRatio="none">
+              <g class="chart-grid">
+                <line x1="0" y1="50" x2="640" y2="50"/><line x1="0" y1="100" x2="640" y2="100"/><line x1="0" y1="150" x2="640" y2="150"/>
+              </g>
+              <rect class="anomaly-band" x="150" y="0" width="34" height="200"/>
+              <rect class="anomaly-band" x="430" y="0" width="40" height="200"/>
+              <path class="chart-line" stroke="#60a5fa" d="M0,120 L40,118 L80,124 L120,116 L160,60 L184,72 L220,118 L260,122 L300,114 L340,120 L380,116 L420,118 L450,40 L480,70 L520,120 L560,116 L600,122 L640,118"/>
+              <circle class="anomaly-dot" cx="165" cy="60" r="5"/>
+              <circle class="anomaly-dot" cx="452" cy="40" r="5"/>
+              <circle class="anomaly-dot" cx="480" cy="70" r="5"/>
+            </svg>
+            <div class="chart-legend">
+              <div class="lg"><span class="sw" style="background:#60a5fa"></span>temperatura (°C)</div>
+              <div class="lg"><span class="sw" style="background:var(--danger)"></span>wykryta anomalia</div>
+              <div class="lg"><span class="sw" style="background:rgba(239,68,68,0.25)"></span>okno alarmu</div>
+            </div>
+          </div>
+          <div class="slider-row mt-md" style="grid-template-columns:120px 1fr 70px;">
+            <span class="s-label">Próg anomalii</span>
+            <div class="thr-slider"><div class="thr-knob"></div></div>
+            <span class="s-val">0.82</span>
+          </div>
+          <div class="text-xs text-3">Przesuwanie progu zmienia liczbę alarmów: niżej = więcej (czulszy), wyżej = mniej, ale pewniejszych. Przy 0.82 → 7 anomalii.</div>
+        </section>
+
+        <!-- DEPLOY -->
+        <section class="section-card ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-rocket"/></svg>Deploy modelu</div>
+            <span class="hint">wybierz cel wdrożenia</span>
+          </div>
+          <div class="grid-2">
+            <div class="radio-card-grid" style="grid-template-columns:1fr;">
+              <div class="radio-card selected">
+                <span class="rc-badge">domyślne</span>
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Lokalnie do models/ + TOML</span></div>
+                <div class="rc-desc">Artefakt zapisany w katalogu modeli serwisu, manifest TOML rejestruje go w runtime. Bez zewnętrznych zależności.</div>
+              </div>
+              <div class="radio-card">
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Zewnętrzny endpoint</span></div>
+                <div class="rc-desc">Publikacja jako serwis HTTP z kluczem API. Wymaga dostępu z Biblioteki zasobów (Dostępy zewnętrzne).</div>
+              </div>
+            </div>
+            <div>
+              <div class="text-xs text-3 fw-700 mt-sm" style="text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Wygenerowany manifest</div>
+              <div class="code-block"><span class="c"># models/ryzyko-przesylki/model.toml</span>
+<span class="k">name</span>   = <span class="s">"ryzyko-przesylki"</span>
+<span class="k">version</span> = <span class="s">"v1"</span>
+<span class="k">engine</span> = <span class="s">"autogluon"</span>   <span class="c"># anomalie → "sklearn"</span>
+<span class="k">task</span>   = <span class="s">"tabular-classification"</span>
+<span class="k">target</span> = <span class="s">"ryzyko"</span>
+<span class="k">classes</span> = [<span class="s">"niskie"</span>, <span class="s">"srednie"</span>, <span class="s">"wysokie"</span>]
+<span class="k">artifact</span> = <span class="s">"WeightedEnsemble_L2.pkl"</span>
+<span class="k">source_job</span> = <span class="s">"am-2041"</span>
+
+[<span class="k">metrics</span>]
+<span class="k">f1_macro</span> = <span class="v">0.927</span>
+<span class="k">accuracy</span> = <span class="v">0.941</span></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Nawigacja -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="t03-leaderboard.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Leaderboard</a>
+          <div class="flex gap-md align-center">
+            <a class="btn btn-ghost" href="m07-model.html"><svg class="icon"><use href="#i-layers"/></svg>Rejestr modeli</a>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-rocket"/></svg>Deploy do serwisu</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

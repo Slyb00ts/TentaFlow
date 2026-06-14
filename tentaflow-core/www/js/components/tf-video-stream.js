@@ -285,6 +285,7 @@ class TfVideoStream extends HTMLElement {
     sourceBuffer.addEventListener('updateend', () => {
       this._appending = false;
       this._maybeTrimBuffer();
+      this._syncPlayhead();
       this._drainAppendQueue();
     });
     sourceBuffer.addEventListener('error', (e) => {
@@ -327,6 +328,37 @@ class TfVideoStream extends HTMLElement {
       // Inne bledy (np. zly init segment) — restart pipeline'u.
       this._resetMediaPipeline();
       this._scheduleResubscribe();
+    }
+  }
+
+  /// Keeps the playhead on the live edge. A live RTSP camera's fMP4 carries the
+  /// camera's own PTS timeline (often starting hundreds of seconds in), so the
+  /// element's initial currentTime=0 lands in an unbuffered gap and playback
+  /// never starts (stays paused at 0). Seek into the buffered range whenever the
+  /// playhead is outside it or has drifted too far behind, then resume playback.
+  _syncPlayhead() {
+    const v = this._video;
+    if (!v) return;
+    let ranges;
+    try {
+      ranges = this._sourceBuffer && this._sourceBuffer.buffered;
+    } catch (e) {
+      return;
+    }
+    if (!ranges || ranges.length === 0) return;
+    const start = ranges.start(0);
+    const end = ranges.end(ranges.length - 1);
+    const TARGET_LATENCY_SECS = 0.5;
+    if (v.currentTime < start || end - v.currentTime > KEEP_WINDOW_SECS) {
+      try {
+        v.currentTime = Math.max(start, end - TARGET_LATENCY_SECS);
+      } catch (e) {
+        // Not seekable yet — retry on the next updateend.
+      }
+    }
+    if (v.paused) {
+      const pr = v.play();
+      if (pr && typeof pr.catch === 'function') pr.catch(() => {});
     }
   }
 

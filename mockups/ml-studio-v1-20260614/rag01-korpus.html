@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<!-- ===== Plik: rag01-korpus.html — Korpus dokumentów RAG: źródła (upload/konektory) + parsing do czystego tekstu, lista dokumentów z pochodzeniem stron. ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Korpus dokumentów (RAG)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Callout „pochodzenie wartości” (zero magii) ----- */
+  .origin-callout {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .origin-callout .oc-ico {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    background: var(--gradient-accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .origin-callout .oc-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.9; }
+  .origin-callout .oc-title { font-size: 12.5px; font-weight: 800; margin-bottom: 3px; }
+  .origin-callout .oc-text { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  /* ----- Konektor źródła ----- */
+  .connector {
+    display: flex; align-items: center; gap: 10px; padding: 11px 13px;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .connector:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .connector .cn-ico { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+    background: var(--accent-glow); color: var(--accent-2);
+    display: flex; align-items: center; justify-content: center; }
+  .connector .cn-ico svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+  .connector .cn-name { font-size: 12.5px; font-weight: 700; }
+  .connector .cn-desc { font-size: 10.5px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-scissors" viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Korpus dokumentów (RAG)</h1>
+  <p class="lead">
+    Wgrywasz dokumenty wiedzy ADR, a system je <strong>parsuje do czystego tekstu</strong> (readability / PDF extract).
+    Liczba dokumentów i stron, którą tu zobaczysz, jest policzona z realnie sparsowanej treści — to ona zasili
+    następny krok (chunking). Żaden licznik nie jest predefiniowany: <strong>640 stron</strong> to suma stron
+    Twoich plików, nie wartość systemowa.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-upload"/></svg>Twoje dokumenty = źródło</h3>
+      <p>PDF / DOCX / MD / HTML lub konektor (URL, SharePoint, folder). Treść czytana wprost z plików.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-file"/></svg>Parsing → czysty tekst</h3>
+      <p>Każdy plik przechodzi ekstrakcję tekstu. Strony i status parsingu liczone realnie.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Pochodzenie liczb</h3>
+      <p>Fragmenty NIE powstają tu — powstaną w kroku „Chunking” z tej właśnie treści.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">RAG1</span>
+    <h2>Korpus dokumentów — źródła + parsing (zakładka „Korpus”)</h2>
+    <div class="desc">Stepper Źródła → Parsing · dropzone + konektory · tabela dokumentów.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Baza wiedzy ADR (RAG)”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Korpus</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Baza wiedzy ADR (RAG) <span class="chip accent"><span class="dot"></span>typ: RAG</span></div>
+            <div class="d-sub">Korpus · parsing dokumentów · przygotowanie do chunkowania</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Biblioteka zasobów</button>
+            <a class="btn btn-primary" href="rag02-chunking.html"><svg class="icon"><use href="#i-scissors"/></svg>Dalej: Chunking</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-book"/></svg>Korpus</button>
+          <button class="tab"><svg class="icon"><use href="#i-scissors"/></svg>Chunking</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Indeks</button>
+          <button class="tab"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-rocket"/></svg>Deploy</button>
+        </div>
+
+        <!-- Stepper wewnętrzny zakładki Korpus -->
+        <div class="stepper" style="max-width:520px;">
+          <div class="step done"><div class="num"><svg class="icon icon-sm" style="stroke-width:3"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Źródła</div><div class="s-desc">12 plików wgranych</div></div></div>
+          <div class="s-line done"></div>
+          <div class="step active"><div class="num">2</div><div class="s-meta"><div class="s-label">Parsing</div><div class="s-desc">aktywny</div></div></div>
+        </div>
+
+        <!-- Sekcja 1: Źródła dokumentów -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-upload"/></svg>Źródła dokumentów</div>
+            <span class="hint">Formaty: PDF · DOCX · MD · HTML</span>
+          </div>
+          <div class="grid-ml-1-2">
+            <div class="dropzone">
+              <div class="dz-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+              <div class="dz-title">Przeciągnij dokumenty lub kliknij</div>
+              <div class="dz-sub">Maks. 50 MB / plik · tekst wyciągany automatycznie</div>
+              <div class="dz-formats">
+                <span class="chip">.pdf</span><span class="chip">.docx</span><span class="chip">.md</span><span class="chip">.html</span>
+              </div>
+            </div>
+            <div class="flex col gap-md">
+              <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.07em;">Konektory źródeł</div>
+              <div class="connector">
+                <div class="cn-ico"><svg viewBox="0 0 24 24"><use href="#i-link"/></svg></div>
+                <div style="flex:1;min-width:0;">
+                  <div class="cn-name">URL / strona WWW</div>
+                  <div class="cn-desc">Pobranie i ekstrakcja treści (readability)</div>
+                </div>
+                <svg class="icon"><use href="#i-chevron"/></svg>
+              </div>
+              <div class="connector">
+                <div class="cn-ico"><svg viewBox="0 0 24 24"><use href="#i-cloud"/></svg></div>
+                <div style="flex:1;min-width:0;">
+                  <div class="cn-name">SharePoint</div>
+                  <div class="cn-desc">Biblioteka dokumentów (dostęp z vaultu)</div>
+                </div>
+                <svg class="icon"><use href="#i-chevron"/></svg>
+              </div>
+              <div class="connector">
+                <div class="cn-ico"><svg viewBox="0 0 24 24"><use href="#i-folder"/></svg></div>
+                <div style="flex:1;min-width:0;">
+                  <div class="cn-name">Folder współdzielony</div>
+                  <div class="cn-desc">Skan katalogu, synchronizacja przyrostowa</div>
+                </div>
+                <svg class="icon"><use href="#i-chevron"/></svg>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Callout pochodzenia -->
+        <div class="origin-callout ml-enter ml-enter-2">
+          <div class="oc-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></div>
+          <div>
+            <div class="oc-title">Parsing wyciąga czysty tekst (readability / PDF extract). Liczba fragmentów powstanie w następnym kroku z tej treści.</div>
+            <div class="oc-text">
+              Każdy wiersz tabeli poniżej to jeden dokument, który system odczytał i sparsował. Liczba stron jest
+              policzona z pliku (PDF: realne strony; DOCX/MD/HTML: strony szacowane z długości tekstu). Suma
+              <span class="mono">640 stron</span> z 12 dokumentów to bezpośredni materiał wejściowy do chunkowania —
+              dopiero strategia chunkowania zamieni te strony na fragmenty.
+            </div>
+          </div>
+        </div>
+
+        <!-- Sekcja 2: Lista sparsowanych dokumentów -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-file"/></svg>Wgrane dokumenty — sparsowane do tekstu</div>
+            <span class="hint">12 dokumentów · 640 stron łącznie</span>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr>
+                <th>Nazwa dokumentu</th><th>Typ</th><th>Strony</th><th>Status parsingu</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="mono fw-700">RID_2025.pdf</span><div class="text-xs text-3">Regulamin międzynar. przewozu kolejowego</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">310</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Umowa_ADR_2024.pdf</span><div class="text-xs text-3">Umowa europejska ADR — tekst główny</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">42</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Instrukcja_zaladunku.docx</span><div class="text-xs text-3">Procedura załadunku cystern</div></td>
+                <td><span class="chip">DOCX</span></td>
+                <td class="mono">18</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Tabela_A_towary.pdf</span><div class="text-xs text-3">Wykaz towarów niebezpiecznych (tabela A)</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">96</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Oznakowanie_nalepki.md</span><div class="text-xs text-3">Nalepki ostrzegawcze i tablice</div></td>
+                <td><span class="chip">MD</span></td>
+                <td class="mono">11</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Karty_charakterystyki.pdf</span><div class="text-xs text-3">SDS dla paliw — sekcje 1–16</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">64</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Procedury_awaryjne.docx</span><div class="text-xs text-3">Karty bezpieczeństwa kierowcy</div></td>
+                <td><span class="chip">DOCX</span></td>
+                <td class="mono">22</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Klasy_zagrozen.html</span><div class="text-xs text-3">Opis klas 1–9 (strona wewnętrzna)</div></td>
+                <td><span class="chip">HTML</span></td>
+                <td class="mono">9</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Wyposazenie_pojazdu.pdf</span><div class="text-xs text-3">Wymagane wyposażenie ADR</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">14</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Szkolenia_ADR.md</span><div class="text-xs text-3">Program szkolenia kierowców</div></td>
+                <td><span class="chip">MD</span></td>
+                <td class="mono">7</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Pakowanie_grupy.pdf</span><div class="text-xs text-3">Grupy pakowania I/II/III</div></td>
+                <td><span class="chip">PDF</span></td>
+                <td class="mono">28</td>
+                <td><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sparsowano</span></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">Wyjatki_LQ_EQ.docx</span><div class="text-xs text-3">Ilości ograniczone i wyłączone</div></td>
+                <td><span class="chip">DOCX</span></td>
+                <td class="mono">19</td>
+                <td><span class="chip warning"><span class="dot"></span>parsing 70%</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Razem: <strong class="text-2">12 dokumentów · 640 stron</strong> (suma kolumny „Strony”). Dokumenty PDF
+            parsowane przez ekstraktor warstwy tekstowej; DOCX/MD/HTML przez readability. Status „parsing 70%”
+            oznacza, że ostatni plik jest jeszcze przetwarzany — jego strony są już doliczone, fragmenty powstaną
+            po zakończeniu.
+          </div>
+        </section>
+
+        <!-- Nawigacja dół -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="p01-kreator-projekt.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Kreator projektu</a>
+          <div class="flex gap-md align-center">
+            <span class="text-xs text-3">Krok 2 z 2 (Parsing)</span>
+            <a class="btn btn-primary btn-lg" href="rag02-chunking.html">Dalej: Chunking + Embedding<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

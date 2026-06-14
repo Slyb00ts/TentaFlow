@@ -84,6 +84,13 @@ pub struct CameraConfig {
     /// resulting credentials onto `url` before handing the URL to
     /// GStreamer — `url` itself never persists credentials in plaintext.
     pub credentials_encrypted: Option<Vec<u8>>,
+    /// Ręczna nadpiska wyboru dekodera. `None` = automatyczny dobór wg
+    /// wykrytego sprzętu (domyślne, zalecane). Ustawienie konkretnego
+    /// wariantu wymusza go niezależnie od detekcji — przydatne do diagnostyki
+    /// lub gdy operator wie lepiej niż heurystyka. `Software` wymusza zawsze
+    /// działający fallback CPU. `CameraConfig` nie jest serializowany (brak
+    /// derive serde), więc default „None" jest wymuszany przez konstruktory.
+    pub decoder_override: Option<super::decoder_detect::HwDecoder>,
 }
 
 impl CameraConfig {
@@ -105,6 +112,7 @@ impl CameraConfig {
             resolution,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         }
     }
 }
@@ -564,6 +572,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::UnsupportedVendor(_)));
@@ -580,6 +589,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidUrl(_)));
@@ -595,6 +605,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::FileNotFound(_)));
@@ -616,6 +627,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::SymlinkNotAllowed(_)));
@@ -631,6 +643,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));
@@ -646,6 +659,7 @@ mod tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .unwrap_err();
         assert!(matches!(err, CameraIngestError::InvalidConfig(_)));

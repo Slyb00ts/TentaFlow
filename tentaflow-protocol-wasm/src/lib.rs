@@ -1504,6 +1504,54 @@ pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
+pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectsListRequest(
+            tentaflow_protocol::MlStudioProjectsListRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectTypesListRequest)]
+pub fn encode_ml_studio_project_types_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectTypesListRequest(
+            tentaflow_protocol::MlStudioProjectTypesListRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectCreateRequest)]
+pub fn encode_ml_studio_project_create_request(
+    name: String,
+    description: String,
+    project_type: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectCreateRequest(
+            tentaflow_protocol::MlStudioProjectCreateRequest {
+                name,
+                description,
+                project_type,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectDetailRequest)]
+pub fn encode_ml_studio_project_detail_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectDetailRequest(
+            tentaflow_protocol::MlStudioProjectDetailRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -3968,6 +4016,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "category", JsValue::NULL);
                 }
                 set(&item, "fileSizeBytes", a.file_size_bytes.clone().into());
+                set(&item, "packageId", a.package_id.into());
+                set(&item, "packageVersion", a.package_version.into());
+                set(&item, "displayName", a.display_name.into());
+                set(&item, "updateAvailable", a.update_available.into());
                 arr.push(&item.into());
             }
             set(&obj, "addons", arr.into());
@@ -7100,8 +7152,102 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "UiChannelCbor".into());
             set(&obj, "cbor", js_sys::Uint8Array::from(&bytes[..]).into());
         }
+        MessageBody::MlStudioBody(payload) => decode_ml_studio_payload(&obj, payload),
     }
     Ok(obj.into())
+}
+
+fn ml_studio_summary_to_js(s: &tentaflow_protocol::MlStudioProjectSummary) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "projectId", s.project_id.clone().into());
+    set(&item, "project_id", s.project_id.clone().into());
+    set(&item, "name", s.name.clone().into());
+    set(&item, "description", s.description.clone().into());
+    set(&item, "projectType", s.project_type.clone().into());
+    set(&item, "project_type", s.project_type.clone().into());
+    set(&item, "status", s.status.clone().into());
+    set(&item, "datasetCount", s.dataset_count.into());
+    set(&item, "dataset_count", s.dataset_count.into());
+    set(&item, "modelCount", s.model_count.into());
+    set(&item, "model_count", s.model_count.into());
+    set(&item, "createdAt", s.created_at.clone().into());
+    set(&item, "created_at", s.created_at.clone().into());
+    set(&item, "updatedAt", s.updated_at.clone().into());
+    set(&item, "updated_at", s.updated_at.clone().into());
+    item
+}
+
+fn ml_studio_detail_to_js(d: &tentaflow_protocol::MlStudioProjectDetail) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "projectId", d.project_id.clone().into());
+    set(&item, "project_id", d.project_id.clone().into());
+    set(&item, "name", d.name.clone().into());
+    set(&item, "description", d.description.clone().into());
+    set(&item, "projectType", d.project_type.clone().into());
+    set(&item, "project_type", d.project_type.clone().into());
+    set(&item, "status", d.status.clone().into());
+    set(&item, "ownerUserId", d.owner_user_id.clone().into());
+    set(&item, "owner_user_id", d.owner_user_id.clone().into());
+    set(&item, "orgId", d.org_id.clone().into());
+    set(&item, "org_id", d.org_id.clone().into());
+    set(&item, "modelCount", d.model_count.into());
+    set(&item, "model_count", d.model_count.into());
+    set(&item, "createdAt", d.created_at.clone().into());
+    set(&item, "created_at", d.created_at.clone().into());
+    set(&item, "updatedAt", d.updated_at.clone().into());
+    set(&item, "updated_at", d.updated_at.clone().into());
+    item
+}
+
+fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::MlStudioPayload) {
+    match payload {
+        tentaflow_protocol::MlStudioPayload::ProjectsListRequest(_) => {
+            set(obj, "variant", "MlStudioProjectsListRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectsListResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectsListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in &resp.projects {
+                arr.push(&ml_studio_summary_to_js(s));
+            }
+            set(obj, "projects", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectCreateRequest(req) => {
+            set(obj, "variant", "MlStudioProjectCreateRequest".into());
+            set(obj, "name", req.name.into());
+            set(obj, "description", req.description.into());
+            set(obj, "projectType", req.project_type.clone().into());
+            set(obj, "project_type", req.project_type.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectCreateResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectCreateResponse".into());
+            set(obj, "project", ml_studio_detail_to_js(&resp.project).into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectDetailRequest(req) => {
+            set(obj, "variant", "MlStudioProjectDetailRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectDetailResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectDetailResponse".into());
+            set(obj, "project", ml_studio_detail_to_js(&resp.project).into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectTypesListRequest(_) => {
+            set(obj, "variant", "MlStudioProjectTypesListRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectTypesListResponse".into());
+            let arr = js_sys::Array::new();
+            for t in &resp.types {
+                let item = js_sys::Object::new();
+                set(&item, "slug", t.slug.clone().into());
+                set(&item, "label", t.label.clone().into());
+                set(&item, "description", t.description.clone().into());
+                arr.push(&item);
+            }
+            set(obj, "types", arr.into());
+        }
+    }
 }
 
 fn localized_texts_to_js(items: Vec<tentaflow_protocol::ComplianceLocalizedText>) -> js_sys::Array {

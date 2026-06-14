@@ -12,10 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use image::imageops::FilterType;
 use tract_onnx::prelude::*;
 
 use super::preprocessing::{rgb_buf_to_image, rgb_to_nchw_imagenet};
+use super::resize::resize_rgb_image;
 use super::{EmotionClassifier, EmotionResult};
 
 const INPUT_SIZE: u32 = 224;
@@ -43,7 +43,8 @@ impl EmotionClassifier for HsemotionEngine {
     fn classify(&self, face_crop_rgb: &[u8], width: u32, height: u32) -> Result<EmotionResult> {
         let img = rgb_buf_to_image(face_crop_rgb, width, height)
             .ok_or_else(|| anyhow!("HSEmotion: invalid RGB buffer"))?;
-        let resized = image::imageops::resize(&img, INPUT_SIZE, INPUT_SIZE, FilterType::Triangle);
+        let resized = resize_rgb_image(&img, INPUT_SIZE, INPUT_SIZE)
+            .map_err(|e| anyhow!("HSEmotion: resize failed: {e}"))?;
         let nchw = rgb_to_nchw_imagenet(&resized);
 
         let input: Tensor = tract_ndarray::Array4::from_shape_vec(

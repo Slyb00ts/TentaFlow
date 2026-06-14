@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: t01-cel.html — Wybór kolumny-celu i typu zadania. Liczba klas to policzone
+           unikalne wartości z danych; pozostałe kolumny stają się cechami.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Cel i typ zadania</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Karty wyboru kolumny-celu ----- */
+  .target-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .target-card {
+    position: relative; background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px; cursor: pointer; transition: all 0.18s;
+  }
+  .target-card:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .target-card.selected { border-color: var(--accent-1); background: var(--accent-glow);
+    box-shadow: 0 0 0 1px var(--accent-1); }
+  .target-card .tg-name { font-family: ui-monospace, monospace; font-size: 12.5px; font-weight: 800; }
+  .target-card .tg-meta { font-size: 10.5px; color: var(--text-3); margin-top: 3px; }
+  .target-card .tg-dot { position: absolute; top: 12px; right: 12px; width: 15px; height: 15px;
+    border-radius: 50%; border: 2px solid var(--border-hover); transition: all 0.18s; }
+  .target-card.selected .tg-dot { border-color: var(--accent-1); background: var(--accent-1);
+    box-shadow: inset 0 0 0 3px var(--bg-input); }
+  .type-pill { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px;
+    border-radius: 10px; font-size: 9.5px; font-weight: 800; }
+  .type-pill.kat  { background: rgba(167,139,250,0.13); color: var(--accent-2); }
+  .type-pill.licz { background: rgba(96,165,250,0.13); color: var(--info); }
+  .type-pill.data { background: rgba(34,197,94,0.13); color: var(--success); }
+  .type-pill.tekst{ background: var(--bg-3); color: var(--text-2); }
+  /* ----- Callout wykrytego celu ----- */
+  .detect-box {
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius); padding: 16px 18px;
+  }
+  .detect-box .db-head { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+  .detect-box .db-head .icon { color: var(--accent-2); width: 17px; height: 17px; }
+  .detect-box .db-head .t { font-size: 13px; font-weight: 800; }
+  .class-line { display: grid; grid-template-columns: 130px 1fr 90px; gap: 12px; align-items: center;
+    padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .class-line:last-of-type { border-bottom: 0; }
+  .class-line .cl-name { font-weight: 700; font-size: 12.5px; }
+  .class-line .cl-bar { height: 8px; border-radius: 4px; background: var(--bg-3); overflow: hidden; }
+  .class-line .cl-bar > span { display: block; height: 100%; background: var(--gradient-accent); border-radius: 4px; }
+  .class-line .cl-count { font-family: ui-monospace, monospace; font-size: 12px; text-align: right; color: var(--text-2); font-weight: 700; }
+  /* ----- Wiersz cechy ----- */
+  .feat-row { display: flex; align-items: center; gap: 11px; padding: 9px 12px;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 6px; }
+  .feat-row.excluded { opacity: 0.55; }
+  .feat-row .fr-name { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Cel i typ zadania</h1>
+  <p class="lead">
+    Jedyna decyzja na tym ekranie: <strong>którą kolumnę model ma przewidywać</strong>. Po wyborze system odczytuje
+    z danych jej typ i liczbę unikalnych wartości — i stąd bierze się „3 klasy”. Pozostałe kolumny automatycznie
+    stają się cechami.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-target"/></svg>Wybierasz cel</h3>
+      <p>Klikasz kolumnę-cel z listy wykrytych kolumn. To jedyna konieczna decyzja.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-zap"/></svg>Klasy = unikalne wartości</h3>
+      <p>„3 klasy” = policzone unikalne wartości w kolumnie. Kolumna ciągła → regresja.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-layers"/></svg>Reszta → cechy</h3>
+      <p>Pozostałe kolumny stają się cechami automatycznie; ID wykluczane domyślnie.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">T1</span>
+    <h2>Cel i typ zadania — wybór kolumny-celu (zakładka „Cel i silnik”)</h2>
+    <div class="desc">Karty kolumn · auto-detekcja typu i klas · cechy · typ zadania.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Ocena ryzyka przesyłek ADR”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Cel i silnik</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-target"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Ocena ryzyka przesyłek ADR <span class="chip accent"><span class="dot"></span>typ: tabelaryczne</span></div>
+            <div class="d-sub">Cel · wybór kolumny do przewidywania i typu zadania</div>
+          </div>
+          <div class="d-actions">
+            <a class="btn btn-secondary" href="t-dane.html"><svg class="icon"><use href="#i-database"/></svg>Wróć do danych</a>
+            <a class="btn btn-primary" href="t02-silnik.html"><svg class="icon"><use href="#i-cpu"/></svg>Dalej: Silnik</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab active"><svg class="icon"><use href="#i-target"/></svg>Cel i silnik</button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trening</button>
+          <button class="tab"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele</button>
+        </div>
+
+        <!-- Wybór kolumny-celu -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-target"/></svg>Wybierz kolumnę-cel (co model ma przewidywać)</div>
+            <span class="hint">9 kolumn z profilu · kliknij jedną</span>
+          </div>
+          <p class="section-sub">To jedyna decyzja jaką podejmujesz — którą wartość model ma zgadywać. Lista pochodzi z profilu danych (zakładka Dane).</p>
+          <div class="target-grid">
+            <div class="target-card selected">
+              <div class="tg-dot"></div>
+              <div class="tg-name">ryzyko</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill kat">kategoria</span><span class="text-xs text-3">3 unikalne</span></div>
+            </div>
+            <div class="target-card">
+              <div class="tg-dot"></div>
+              <div class="tg-name">masa_kg</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill licz">liczba ciągła</span><span class="text-xs text-3">8 461 unikalnych</span></div>
+            </div>
+            <div class="target-card">
+              <div class="tg-dot"></div>
+              <div class="tg-name">klasa_adr</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill kat">kategoria</span><span class="text-xs text-3">6 unikalnych</span></div>
+            </div>
+            <div class="target-card">
+              <div class="tg-dot"></div>
+              <div class="tg-name">un</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill kat">kategoria</span><span class="text-xs text-3">43 unikalne</span></div>
+            </div>
+            <div class="target-card">
+              <div class="tg-dot"></div>
+              <div class="tg-name">temperatura</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill licz">liczba</span><span class="text-xs text-3">2 187 unikalnych</span></div>
+            </div>
+            <div class="target-card">
+              <div class="tg-dot"></div>
+              <div class="tg-name">odleglosc_km</div>
+              <div class="flex gap-sm mt-sm"><span class="type-pill licz">liczba</span><span class="text-xs text-3">5 612 unikalnych</span></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- KLUCZOWY callout: wykryto z danych -->
+        <section class="detect-box ml-enter ml-enter-2">
+          <div class="db-head">
+            <svg class="icon"><use href="#i-zap"/></svg>
+            <span class="t">Wykryto automatycznie: typ KATEGORIA, 3 unikalne klasy</span>
+          </div>
+          <p class="text-sm text-2" style="margin-bottom:12px;line-height:1.6">
+            System odczytał zawartość kolumny <span class="mono fw-700">ryzyko</span> i znalazł 3 różne wartości.
+            Liczności poniżej są policzone wprost z 12 480 wierszy:
+          </p>
+          <div style="max-width:480px;">
+            <div class="class-line">
+              <span class="cl-name">niskie</span>
+              <div class="cl-bar"><span style="width:100%"></span></div>
+              <span class="cl-count">6 890</span>
+            </div>
+            <div class="class-line">
+              <span class="cl-name">średnie</span>
+              <div class="cl-bar"><span style="width:60%"></span></div>
+              <span class="cl-count">4 120</span>
+            </div>
+            <div class="class-line">
+              <span class="cl-name">wysokie</span>
+              <div class="cl-bar"><span style="width:21%"></span></div>
+              <span class="cl-count">1 470</span>
+            </div>
+          </div>
+          <div class="mt-md text-sm" style="line-height:1.7">
+            <span class="fw-800" style="color:var(--accent-2)">→ klasyfikacja wieloklasowa (3 klasy).</span>
+            <span class="text-2">Gdybyś wskazał <span class="mono">masa_kg</span> (liczba ciągła) → byłaby to regresja.
+            Liczba klas nie jest ustawieniem systemu — to liczba unikalnych wartości w Twojej kolumnie.</span>
+          </div>
+        </section>
+
+        <!-- Pozostałe kolumny → cechy -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Pozostałe kolumny → cechy (automatycznie)</div>
+            <span class="hint">8 cech · możesz wykluczyć</span>
+          </div>
+          <p class="section-sub">Każda kolumna poza celem trafia do modelu jako cecha. Wyłącz te, których nie chcesz używać.</p>
+          <div class="grid-2">
+            <div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">masa_kg</span> <span class="type-pill licz">liczba</span></div></div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">klasa_adr</span> <span class="type-pill kat">kategoria</span></div></div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">un</span> <span class="type-pill kat">kategoria</span></div></div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">temperatura</span> <span class="type-pill licz">liczba</span></div></div>
+            </div>
+            <div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">odleglosc_km</span> <span class="type-pill licz">liczba</span></div></div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">data_nadania</span> <span class="type-pill data">data</span></div></div>
+              <div class="feat-row"><div class="toggle on"></div><div style="flex:1"><span class="fr-name">opis</span> <span class="type-pill tekst">tekst</span></div></div>
+              <div class="feat-row excluded">
+                <div class="toggle"></div>
+                <div style="flex:1"><span class="fr-name">id_przesylki</span> <span class="type-pill tekst">tekst · ID</span></div>
+                <span class="chip warning">auto-wykluczone (ID)</span>
+              </div>
+            </div>
+          </div>
+          <div class="text-xs text-3 mt-md">
+            <span class="mono">id_przesylki</span> wykluczono automatycznie: unikalny na każdy wiersz (12 480/12 480) — nie niesie sygnału, modelowi nie pomaga.
+          </div>
+        </section>
+
+        <!-- Typ zadania -->
+        <section class="section-card ml-enter ml-enter-4">
+          <h3><svg class="icon"><use href="#i-cpu"/></svg>Typ zadania</h3>
+          <div class="grid-ml-1-2">
+            <div class="field">
+              <label>Typ zadania (auto-zasugerowany)</label>
+              <select class="select">
+                <option>klasyfikacja wieloklasowa</option>
+                <option>regresja</option>
+                <option>klasyfikacja binarna</option>
+              </select>
+              <span class="hint">Zasugerowane na podstawie celu <span class="mono">ryzyko</span> (kategoria, 3 klasy). Zmień ręcznie tylko jeśli wiesz, że detekcja typu była błędna.</span>
+            </div>
+            <div class="flex col gap-md" style="justify-content:center;">
+              <div class="flex gap-md align-center">
+                <span class="chip accent"><svg class="icon"><use href="#i-target"/></svg>cel: ryzyko</span>
+                <span class="chip info">3 klasy</span>
+                <span class="chip">7 cech aktywnych</span>
+              </div>
+              <div class="text-xs text-3">Te wartości przenoszą się do następnego kroku (Silnik) i do joba treningowego bez zmian.</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Nawigacja -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="t-dane.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Dane</a>
+          <a class="btn btn-primary btn-lg" href="t02-silnik.html">Dalej: Silnik i konfiguracja<svg class="icon"><use href="#i-chevron"/></svg></a>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

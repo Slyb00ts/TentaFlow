@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<!-- ===== Plik: rag04-eval.html — Ewaluacja + Playground + Deploy RAG: zestaw pytań testowych, metryki retrieval (recall@k/MRR/nDCG), playground z cytowaniem fragmentów, deploy endpointu RAG (manifest TOML). ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Ewaluacja + Deploy (RAG)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Callout „pochodzenie wartości” (zero magii) ----- */
+  .origin-callout {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .origin-callout .oc-ico {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    background: var(--gradient-accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .origin-callout .oc-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.9; }
+  .origin-callout .oc-title { font-size: 12.5px; font-weight: 800; margin-bottom: 3px; }
+  .origin-callout .oc-text { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  /* ----- Playground: pytanie + odpowiedź + cytowania ----- */
+  .pg-q { display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+    background: var(--bg-input); border: 1px solid var(--border-hover); border-radius: var(--radius-sm); }
+  .pg-q .pg-q-ico { color: var(--accent-2); }
+  .pg-q input { background: transparent; border: 0; outline: none; color: var(--text); flex: 1; font-size: 13px; font-weight: 600; }
+  .pg-answer { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px; margin-top: 12px; font-size: 12.5px; line-height: 1.7; color: var(--text); }
+  .pg-answer sup { color: var(--accent-2); font-weight: 800; font-size: 10px; }
+  /* ----- Cytat (przypis) ----- */
+  .cite { display: flex; gap: 11px; padding: 11px 13px; background: var(--bg-input);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent-1); border-radius: var(--radius-sm); }
+  .cite .cite-n { width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+    background: var(--accent-glow); color: var(--accent-2); font-weight: 800; font-size: 11px;
+    display: flex; align-items: center; justify-content: center; }
+  .cite .cite-src { font-size: 11px; font-weight: 700; color: var(--text-2); margin-bottom: 3px;
+    display: flex; align-items: center; gap: 6px; }
+  .cite .cite-src .mono { color: var(--info); }
+  .cite .cite-text { font-size: 11px; color: var(--text-3); line-height: 1.55; }
+  .cite .cite-score { margin-left: auto; font-size: 10px; font-weight: 800; color: var(--success);
+    font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-scissors" viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Ewaluacja + Playground + Deploy (RAG)</h1>
+  <p class="lead">
+    Indeks z poprzedniego kroku odpytujemy <strong>zestawem pytań testowych</strong> i liczymy metryki retrieval na
+    realnych trafieniach — każda metryka jest średnią po <strong>48 pytaniach</strong>. Playground pokazuje odpowiedź
+    z <strong>cytowaniem fragmentów</strong> (dokument + strona), więc nic nie jest „wymyślone”. Na końcu wdrażasz
+    endpoint RAG z manifestem opisującym dokładnie embedding, indeks i reranker.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-search"/></svg>48 pytań = źródło metryk</h3>
+      <p>recall@5, MRR i nDCG@10 to średnie policzone na 48 pytaniach z odpowiedziami referencyjnymi.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-book"/></svg>Odpowiedź z cytowaniem</h3>
+      <p>Każda odpowiedź wskazuje fragmenty źródłowe (dokument + strona) jak przypisy — zero halucynacji bez źródła.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-rocket"/></svg>Manifest = pełna receptura</h3>
+      <p>Deploy zapisuje embedding=bge-m3, index=hnsw, reranker, top_k — endpoint odtwarza dokładnie ten pipeline.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">RAG4</span>
+    <h2>Ewaluacja + Playground + Deploy — metryki retrieval, cytowania, endpoint (zakładka „Ewaluacja”)</h2>
+    <div class="desc">Zestaw pytań · stat-cards metryk · playground z cytatami · deploy + manifest TOML.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Baza wiedzy ADR (RAG)”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Ewaluacja</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Baza wiedzy ADR (RAG) <span class="chip accent"><span class="dot"></span>typ: RAG</span></div>
+            <div class="d-sub">Ewaluacja · metryki retrieval · playground · deploy endpointu</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Biblioteka zasobów</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-rocket"/></svg>Deploy endpoint</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Korpus</button>
+          <button class="tab"><svg class="icon"><use href="#i-scissors"/></svg>Chunking</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Indeks</button>
+          <button class="tab active"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-rocket"/></svg>Deploy</button>
+        </div>
+
+        <!-- Sekcja 1: Zestaw pytań testowych -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-search"/></svg>Zestaw pytań testowych</div>
+            <span class="hint">48 pytań z odpowiedziami referencyjnymi</span>
+          </div>
+          <div class="grid-ml-1-2">
+            <div class="dropzone">
+              <div class="dz-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+              <div class="dz-title">Wgraj zestaw pytań (JSONL / CSV)</div>
+              <div class="dz-sub">pary: pytanie + oczekiwany fragment / odpowiedź referencyjna</div>
+              <div class="dz-formats">
+                <span class="chip">.jsonl</span><span class="chip">.csv</span>
+              </div>
+            </div>
+            <div class="flex col gap-md">
+              <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.07em;">Aktywny zestaw</div>
+              <div class="flex align-center gap-md" style="padding:11px 13px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);">
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>48 pytań</span>
+                <div style="flex:1;min-width:0;">
+                  <div class="fw-700 text-sm">pytania_adr_eval.jsonl</div>
+                  <div class="text-xs text-3 mono">48 par pytanie → fragment referencyjny</div>
+                </div>
+              </div>
+              <button class="btn btn-secondary"><svg class="icon"><use href="#i-zap"/></svg>Wygeneruj pytania z korpusu (LLM)</button>
+              <div class="text-xs text-3" style="line-height:1.6">
+                Możesz wgrać własne pytania albo wygenerować je z korpusu: LLM tworzy pytania i wskazuje fragment
+                źródłowy jako odpowiedź referencyjną. To te 48 par jest podstawą metryk poniżej.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Sekcja 2: Metryki retrieval (stat-cards) -->
+        <section class="section-card ml-enter ml-enter-2">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-chart"/></svg>Metryki retrieval — średnie na 48 pytaniach</div>
+            <span class="hint">Liczone z trafień indeksu względem fragmentów referencyjnych</span>
+          </div>
+          <div class="grid-3">
+            <div class="stat-card">
+              <div class="sc-lbl">recall@5</div>
+              <div class="sc-val">0.92</div>
+              <div class="sc-foot">44 / 48 pytań: fragment ref. w top-5</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-lbl">MRR</div>
+              <div class="sc-val">0.81</div>
+              <div class="sc-foot">średnia 1/pozycja pierwszego trafienia</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-lbl">nDCG@10</div>
+              <div class="sc-val">0.86</div>
+              <div class="sc-foot">jakość rankingu top-10 (z rerankerem)</div>
+            </div>
+          </div>
+          <div class="origin-callout" style="margin-top:14px;margin-bottom:0;">
+            <div class="oc-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></div>
+            <div>
+              <div class="oc-title">recall@5 = 0.92, bo dla 44 z 48 pytań poprawny fragment znalazł się w pierwszej piątce wyników.</div>
+              <div class="oc-text">
+                Każda metryka to średnia po tych samych 48 pytaniach z <span class="mono">pytania_adr_eval.jsonl</span>.
+                MRR uśrednia odwrotność pozycji pierwszego trafnego fragmentu; nDCG@10 ocenia jakość rankingu top-10 po
+                rerankingu (bge-reranker). Zmiana zestawu pytań przeliczy wszystkie trzy wartości.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Sekcja 3: Playground z cytowaniem -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-search"/></svg>Playground — odpowiedź z cytowaniem fragmentów</div>
+            <span class="hint">top_k = 5 · embedding bge-m3 · reranker on</span>
+          </div>
+          <div class="pg-q">
+            <svg class="icon pg-q-ico"><use href="#i-search"/></svg>
+            <input value="Jak oznakować cysternę z benzyną?" />
+            <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-zap"/></svg>Zapytaj</button>
+          </div>
+
+          <div class="pg-answer">
+            Cysternę z benzyną (UN 1203) oznacza się pomarańczową tablicą z numerem rozpoznawczym zagrożenia
+            <strong>33</strong> w górnej części i numerem <strong>UN 1203</strong> w dolnej<sup>[1]</sup>. Tablica musi
+            być odblaskowa i czytelna<sup>[2]</sup>. Dodatkowo wymagana jest nalepka ostrzegawcza nr <strong>3</strong>
+            (płomień na czerwonym tle) umieszczona na obu bokach i z tyłu cysterny<sup>[3]</sup>.
+          </div>
+
+          <div class="text-xs text-3 fw-700 mt-md" style="text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">
+            Cytowane fragmenty (źródło odpowiedzi)
+          </div>
+          <div class="flex col gap-md">
+            <div class="cite">
+              <span class="cite-n">1</span>
+              <div style="flex:1;min-width:0;">
+                <div class="cite-src"><svg class="icon icon-sm"><use href="#i-book"/></svg><span class="mono">RID_2025.pdf</span> · str. 47–48 · chunk #0002</div>
+                <div class="cite-text">…numerem UN w dolnej części. Dla benzyny (UN 1203) numer rozpoznawczy zagrożenia to 33, oznaczający materiał ciekły łatwopalny o temperaturze zapłonu poniżej 23 °C…</div>
+              </div>
+              <span class="cite-score">0.94</span>
+            </div>
+            <div class="cite">
+              <span class="cite-n">2</span>
+              <div style="flex:1;min-width:0;">
+                <div class="cite-src"><svg class="icon icon-sm"><use href="#i-book"/></svg><span class="mono">RID_2025.pdf</span> · str. 47 · chunk #0001</div>
+                <div class="cite-text">5.3.1 Umieszczanie tablic ostrzegawczych. Cysterny przewożące materiały niebezpieczne muszą być oznakowane pomarańczową tablicą… Tablica musi być odblaskowa i czytelna z odległości…</div>
+              </div>
+              <span class="cite-score">0.89</span>
+            </div>
+            <div class="cite">
+              <span class="cite-n">3</span>
+              <div style="flex:1;min-width:0;">
+                <div class="cite-src"><svg class="icon icon-sm"><use href="#i-book"/></svg><span class="mono">Oznakowanie_nalepki.md</span> · sekcja 2 · chunk #0003</div>
+                <div class="cite-text">Nalepka ostrzegawcza nr 3 (płomień na czerwonym tle) jest wymagana dla materiałów ciekłych zapalnych klasy 3. Umieszcza się ją na obu bokach i z tyłu cysterny…</div>
+              </div>
+              <span class="cite-score">0.85</span>
+            </div>
+          </div>
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Każde zdanie odpowiedzi ma przypis <sup>[n]</sup> wskazujący fragment, z którego pochodzi — dokument,
+            strona i numer chunku z kroku Chunking. Wynik obok cytatu to score rerankera (trafność do pytania).
+          </div>
+        </section>
+
+        <!-- Sekcja 4: Deploy -->
+        <section class="section-card ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-rocket"/></svg>Deploy — endpoint RAG</div>
+            <span class="hint">Manifest opisuje dokładnie pipeline z poprzednich kroków</span>
+          </div>
+          <div class="radio-card-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">
+            <div class="radio-card selected">
+              <span class="rc-badge">domyślne</span>
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Lokalnie (w tym węźle)</span></div>
+              <div class="rc-desc">Endpoint dostępny przez protokół binarny TentaFlow. Indeks i modele zostają na tym węźle.</div>
+            </div>
+            <div class="radio-card">
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Zewnętrznie (REST /v1)</span></div>
+              <div class="rc-desc">Endpoint OpenAI-kompatybilny dla aplikacji zewnętrznych. Auth: API key (Bearer).</div>
+            </div>
+          </div>
+
+          <div class="code-block"><span class="c"># manifest endpointu RAG — odtwarza pipeline z kroków Korpus → Chunking → Indeks</span>
+<span class="k">type</span> = <span class="s">"rag-endpoint"</span>
+<span class="k">name</span> = <span class="s">"baza-wiedzy-adr"</span>
+
+<span class="c">[corpus]</span>
+<span class="k">documents</span> = <span class="v">12</span>      <span class="c"># z kroku Korpus</span>
+<span class="k">pages</span> = <span class="v">640</span>
+
+<span class="c">[chunking]</span>
+<span class="k">strategy</span> = <span class="s">"by_headings"</span>
+<span class="k">chunk_size</span> = <span class="v">512</span>
+<span class="k">overlap</span> = <span class="v">64</span>
+<span class="k">chunks</span> = <span class="v">2480</span>      <span class="c"># policzone z 640 stron × strategii</span>
+
+<span class="c">[embedding]</span>
+<span class="k">model</span> = <span class="s">"bge-m3"</span>     <span class="c"># z Biblioteki zasobów (capability=embedding)</span>
+<span class="k">dim</span> = <span class="v">1024</span>
+
+<span class="c">[index]</span>
+<span class="k">backend</span> = <span class="s">"hnsw"</span>      <span class="c"># vector_*</span>
+<span class="k">m</span> = <span class="v">16</span>
+<span class="k">ef_construction</span> = <span class="v">200</span>
+
+<span class="c">[reranker]</span>
+<span class="k">enabled</span> = <span class="v">true</span>
+<span class="k">model</span> = <span class="s">"bge-reranker-v2-m3"</span>
+
+<span class="c">[retrieval]</span>
+<span class="k">top_k</span> = <span class="v">5</span>
+<span class="k">fetch_before_rerank</span> = <span class="v">20</span></div>
+
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Manifest nie zawiera ani jednej wartości spoza wcześniejszych kroków: 12 dokumentów / 640 stron (Korpus),
+            2 480 fragmentów i bge-m3 (Chunking), hnsw M=16/ef=200 (Indeks), top_k=5 + reranker (ten ekran). Endpoint
+            odtwarza dokładnie ten sam pipeline przy każdym zapytaniu.
+          </div>
+        </section>
+
+        <!-- Nawigacja dół -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="rag03-indeks.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Indeks</a>
+          <div class="flex gap-md align-center">
+            <span class="text-xs text-3">recall@5 0.92 · MRR 0.81 · nDCG@10 0.86 (48 pytań)</span>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-rocket"/></svg>Deploy endpoint</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

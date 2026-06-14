@@ -1062,6 +1062,100 @@ pub enum SchedulerPayload {
     JobRunNowResponse(SchedulerJobRunNowResponse),
 }
 
+// ----- ML Studio screen (UserSession) -----
+
+/// One ML Studio project type with a stable machine slug and a Polish UI label.
+/// The slug is what flows/handlers branch on; the label is what the wizard
+/// shows. Six types are fixed by the product (recognition, ft_llm,
+/// ft_vision_audio, tabular_anomaly, rag, distillation).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectTypeInfo {
+    pub slug: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// Compact project row for the projects list screen (`p00-projekty.html`):
+/// identity, type/status badges and the model-count KPI.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectSummary {
+    pub project_id: String,
+    pub name: String,
+    pub description: String,
+    pub project_type: String,
+    pub status: String,
+    pub dataset_count: u32,
+    pub model_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    // Live training KPIs (progress/loss/ETA) come from training_runs in later slices
+}
+
+/// Full project record returned by the detail screen.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectDetail {
+    pub project_id: String,
+    pub name: String,
+    pub description: String,
+    pub project_type: String,
+    pub status: String,
+    pub owner_user_id: String,
+    pub org_id: String,
+    pub model_count: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectsListRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectsListResponse {
+    pub projects: Vec<MlStudioProjectSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectCreateRequest {
+    pub name: String,
+    pub description: String,
+    pub project_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectCreateResponse {
+    pub project: MlStudioProjectDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectDetailRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectDetailResponse {
+    pub project: MlStudioProjectDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectTypesListRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectTypesListResponse {
+    pub types: Vec<MlStudioProjectTypeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum MlStudioPayload {
+    ProjectsListRequest(MlStudioProjectsListRequest),
+    ProjectsListResponse(MlStudioProjectsListResponse),
+    ProjectCreateRequest(MlStudioProjectCreateRequest),
+    ProjectCreateResponse(MlStudioProjectCreateResponse),
+    ProjectDetailRequest(MlStudioProjectDetailRequest),
+    ProjectDetailResponse(MlStudioProjectDetailResponse),
+    ProjectTypesListRequest(MlStudioProjectTypesListRequest),
+    ProjectTypesListResponse(MlStudioProjectTypesListResponse),
+}
+
 // ----- Skills registry (Harness plan §3.2) -----
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -5030,6 +5124,9 @@ pub enum MessageBody {
 
     // ----- Scheduler -----
     SchedulerBody(SchedulerPayload),
+
+    // ----- ML Studio -----
+    MlStudioBody(MlStudioPayload),
 
     // ----- Skills registry -----
     SkillsBody(SkillsPayload),

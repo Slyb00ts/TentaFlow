@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: p01-kreator-projekt.html
+     Opis: Kreator nowego projektu (wizard). Aktywny Krok 2 — wybór typu projektu,
+           który determinuje dalsze kroki. Stepper + pola formularzy + helper text.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Kreator projektu</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Karty wyboru typu projektu (krok 2) ----- */
+  .type-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .type-card {
+    position: relative; background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px; cursor: pointer; transition: all 0.18s;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .type-card:hover { border-color: var(--border-hover); background: var(--bg-card); transform: translateY(-2px); }
+  .type-card.selected { border-color: var(--accent-1); background: var(--accent-glow);
+    box-shadow: 0 0 0 1px var(--accent-1), var(--glow-indigo); }
+  .type-card .tc-ico {
+    width: 40px; height: 40px; border-radius: var(--radius-sm);
+    background: var(--accent-glow); display: flex; align-items: center; justify-content: center;
+    color: var(--accent-2);
+  }
+  .type-card.selected .tc-ico { background: var(--gradient-accent); color: white; }
+  .type-card .tc-ico svg { width: 20px; height: 20px; stroke: currentColor; fill: none;
+    stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+  .type-card .tc-name { font-size: 13.5px; font-weight: 800; }
+  .type-card .tc-desc { font-size: 11px; color: var(--text-2); line-height: 1.55; }
+  .type-card .tc-check {
+    position: absolute; top: 12px; right: 12px; width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--border-hover); display: flex; align-items: center; justify-content: center;
+  }
+  .type-card.selected .tc-check { border-color: var(--accent-1); background: var(--accent-1); }
+  .type-card.selected .tc-check svg { width: 11px; height: 11px; stroke: white; stroke-width: 3; fill: none; }
+  .type-card:not(.selected) .tc-check svg { display: none; }
+
+  /* Panel „co dalej” — pokazuje że typ determinuje kroki */
+  .next-steps {
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius); padding: 14px 16px;
+  }
+  .next-steps .ns-title { font-size: 12px; font-weight: 800; color: var(--accent-2);
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 8px;
+    display: flex; align-items: center; gap: 7px; }
+  .next-steps .ns-flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .next-steps .ns-pill { font-size: 11.5px; font-weight: 700; padding: 5px 11px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 14px; color: var(--text); }
+  .next-steps .ns-arrow { color: var(--accent-2); }
+  .next-steps .ns-arrow svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2.5; }
+
+  /* Te same klasy używane też poza .next-steps (box „mapa ścieżek”) — reguły bazowe */
+  .ns-flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ns-pill { font-size: 11.5px; font-weight: 700; padding: 5px 11px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 14px; color: var(--text); }
+  .ns-arrow { color: var(--accent-2); display: inline-flex; flex: 0 0 auto; }
+  .ns-arrow svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2.5; }
+  .flex.col { flex-direction: column; align-items: stretch; }
+
+  .wizard-foot { display: flex; align-items: center; justify-content: space-between;
+    margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+  <symbol id="i-shrink" viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Kreator nowego projektu</h1>
+  <p class="lead">
+    Wizard krok po kroku tworzy projekt od zera. <strong>Krok 2 (Typ projektu) jest kluczowy</strong> — wybrany typ
+    determinuje dalsze kroki kreatora oraz całe „wnętrze” projektu (np. rozpoznawanie → schemat klas i atrybutów;
+    fine-tuning → model bazowy i metoda). Każdy krok ma realne pola i tekst pomocniczy „co tu zrobić i dlaczego”.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-check"/></svg>Widoczne kroki</h3>
+      <p>Stepper „Krok 2/4”, nawigacja Wstecz / Dalej. Każdy krok = osobny formularz.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Typ determinuje resztę</h3>
+      <p>Panel „Co dalej” pokazuje, jak wybrany typ zmienia kolejne kroki kreatora.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Pomoc kontekstowa</h3>
+      <p>Pod każdym polem helper text wyjaśnia po co ono jest i jak wpływa na projekt.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">P1</span>
+    <h2>Kreator projektu — Krok 2: Typ projektu (aktywny)</h2>
+    <div class="desc">Stepper · karty typów · panel „co dalej” · Wstecz / Dalej.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Nowy projekt</span>
+        </div>
+
+        <div class="section-card">
+          <!-- Stepper -->
+          <div class="stepper">
+            <div class="step done">
+              <div class="num"><svg class="icon icon-sm" style="stroke:currentColor;fill:none;stroke-width:3"><use href="#i-check"/></svg></div>
+              <div class="s-meta"><div class="s-label">Nazwa i opis</div><div class="s-desc">Krok 1</div></div>
+            </div>
+            <div class="s-line done"></div>
+            <div class="step active">
+              <div class="num">2</div>
+              <div class="s-meta"><div class="s-label">Typ projektu</div><div class="s-desc">Krok 2 — aktywny</div></div>
+            </div>
+            <div class="s-line"></div>
+            <div class="step">
+              <div class="num">3</div>
+              <div class="s-meta"><div class="s-label">Dane i źródła</div><div class="s-desc">Krok 3</div></div>
+            </div>
+            <div class="s-line"></div>
+            <div class="step">
+              <div class="num">4</div>
+              <div class="s-meta"><div class="s-label">Schemat / model</div><div class="s-desc">Krok 4</div></div>
+            </div>
+          </div>
+
+          <!-- Podsumowanie kroku 1 (zwinięte, by pokazać ciągłość) -->
+          <div class="section-card" style="background:var(--bg-input);margin-bottom:16px;padding:12px 14px;">
+            <div class="flex align-center gap-md">
+              <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>Krok 1 wypełniony</span>
+              <div class="text-sm"><strong>Nazwa:</strong> „Rozpoznawanie znaków na cysternach” ·
+                <span class="text-3">Opis: detekcja tablic ADR i nalepek z bramy wjazdowej</span></div>
+              <button class="btn btn-ghost btn-sm ml-auto">Edytuj krok 1</button>
+            </div>
+          </div>
+
+          <h3><svg class="icon"><use href="#i-grid"/></svg>Krok 2 — Wybierz typ projektu</h3>
+          <p class="section-sub">
+            Typ określa, co projekt potrafi i jakie będą kolejne kroki. Wybierz jedną kartę — np.
+            <strong>Rozpoznawanie obrazu</strong> dla wykrywania obiektów na zdjęciach (jak cysterny ADR),
+            albo <strong>Fine-tuning LLM</strong> dla dotrenowania modelu językowego (jak Guard).
+          </p>
+
+          <div class="type-grid">
+            <div class="type-card selected">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-image"/></svg></div>
+              <div class="tc-name">Rozpoznawanie obrazu</div>
+              <div class="tc-desc">Detekcja obiektów / klas na zdjęciach z atrybutami (OCR, klasyfikatory).
+                Kolejny krok → <strong>schemat klas i atrybutów</strong>. Modele: RF-DETR, OWLv2, Qwen-VL.</div>
+            </div>
+            <div class="type-card">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-tune"/></svg></div>
+              <div class="tc-name">Fine-tuning LLM</div>
+              <div class="tc-desc">Dotrenowanie modelu językowego (klasyfikacja, asystent). Kolejny krok →
+                <strong>model bazowy + metoda</strong>. QLoRA / LoRA / DoRA / Full. Wzór: Guard.</div>
+            </div>
+            <div class="type-card">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-mic"/></svg></div>
+              <div class="tc-name">Fine-tuning vision / audio / obraz</div>
+              <div class="tc-desc">Dotrenowanie modeli wizyjnych, mowy (Whisper) lub generacji obrazu (diffusers).
+                Kolejny krok → model bazowy modalności.</div>
+            </div>
+            <div class="type-card">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-table"/></svg></div>
+              <div class="tc-name">ML tabelaryczne + anomalie</div>
+              <div class="tc-desc">AutoML na danych tabelarycznych, klasyfikacja/regresja, wykrywanie anomalii
+                (IsolationForest / PyOD). Kolejny krok → mapowanie kolumn → role.</div>
+            </div>
+            <div class="type-card">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+              <div class="tc-name">RAG</div>
+              <div class="tc-desc">Wyszukiwanie i odpowiedzi z cytowaniem na bazie własnego korpusu (HNSW + reranker).
+                Kolejny krok → źródła dokumentów + chunkowanie.</div>
+            </div>
+            <div class="type-card">
+              <div class="tc-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></div>
+              <div class="tc-ico"><svg viewBox="0 0 24 24"><use href="#i-shrink"/></svg></div>
+              <div class="tc-name">Destylacja</div>
+              <div class="tc-desc">Model-nauczyciel (większy, z serwisu) uczy mniejszego ucznia. Kolejny krok →
+                wybór nauczyciela + ucznia + zbiór promptów.</div>
+            </div>
+          </div>
+
+          <!-- Panel pokazujący że wybór typu zmienia kroki -->
+          <div class="next-steps mt-md">
+            <div class="ns-title"><svg class="icon icon-sm"><use href="#i-info"/></svg>Co dalej dla typu „Rozpoznawanie obrazu”</div>
+            <div class="ns-flow">
+              <span class="ns-pill">Krok 3 · Dane (zdjęcia)</span>
+              <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+              <span class="ns-pill">Schemat: klasy + atrybuty (OCR, lookup, klasyfikatory)</span>
+              <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+              <span class="ns-pill">Anotacja → Pre-label modelem → Trening</span>
+            </div>
+            <p class="text-xs text-3 mt-sm">Gdybyś wybrał „Fine-tuning LLM”, krok 3 prowadziłby do
+              „Model bazowy + metoda treningu (QLoRA…)” zamiast danych zdjęć.</p>
+          </div>
+
+          <!-- Mapa: każdy typ prowadzi gdzie indziej (ilustracja, nie linki) -->
+          <div class="section-card" style="background:var(--bg-input);margin-top:16px;margin-bottom:0;">
+            <h3><svg class="icon"><use href="#i-info"/></svg>Typ determinuje resztę — mapa ścieżek</h3>
+            <p class="section-sub">Każdy typ projektu prowadzi do innych kroków. To ilustracja — „Dalej” uruchamia
+              ścieżkę aktywnego typu (Rozpoznawanie obrazu → Dane zdjęcia).</p>
+            <div class="flex col gap-md">
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">Rozpoznawanie obrazu</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Dane (zdjęcia)</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Schemat</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Anotacja</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Trening</span>
+              </div>
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">Fine-tuning LLM</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Model bazowy</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Dane</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Metoda</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Trening</span>
+              </div>
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">ML tabelaryczne + anomalie</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Dane (profil)</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Cel i silnik</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Trening</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Ewaluacja</span>
+              </div>
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">RAG</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Korpus</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Chunking</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Indeks</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Ewaluacja</span>
+              </div>
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">Destylacja</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Nauczyciel + uczeń</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Prompty</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Generacja + trening</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Porównanie</span>
+              </div>
+              <div class="ns-flow">
+                <span class="chip accent" style="min-width:170px;justify-content:flex-start;">Fine-tuning vision/audio/obraz</span>
+                <span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Model</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Dane</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Metoda</span><span class="ns-arrow"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+                <span class="ns-pill">Trening</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Nawigacja wizarda -->
+          <div class="wizard-foot">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz</button>
+            <div class="flex gap-md align-center">
+              <span class="text-xs text-3">Krok 2 z 4</span>
+              <a class="btn btn-primary btn-lg" href="a-dane.html">Dalej: Dane (zdjęcia)<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

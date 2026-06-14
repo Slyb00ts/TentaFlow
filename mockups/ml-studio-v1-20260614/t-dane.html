@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: t-dane.html — Dane projektu tabelarycznego: import źródeł + profil danych
+           czytany wprost z nagłówków pliku (każda kolumna ma wykryte pochodzenie).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Dane projektu (profilowanie)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Callout „pochodzenie wartości” (zero magii) ----- */
+  .origin-callout {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .origin-callout .oc-ico {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    background: var(--gradient-accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .origin-callout .oc-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.9; }
+  .origin-callout .oc-title { font-size: 12.5px; font-weight: 800; margin-bottom: 3px; }
+  .origin-callout .oc-text { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  /* ----- Wykryty typ kolumny (pigułka) ----- */
+  .type-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
+    border-radius: 11px; font-size: 10.5px; font-weight: 800; }
+  .type-pill.kat  { background: rgba(167,139,250,0.13); color: var(--accent-2); }
+  .type-pill.licz { background: rgba(96,165,250,0.13); color: var(--info); }
+  .type-pill.data { background: rgba(34,197,94,0.13); color: var(--success); }
+  .type-pill.tekst{ background: var(--bg-3); color: var(--text-2); }
+  /* ----- Mini-rozkład tekstowy (pasek udziału) ----- */
+  .dist { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--bg-3); min-width: 120px; }
+  .dist span { height: 100%; }
+  .dist .d1 { background: var(--accent-1); } .dist .d2 { background: var(--accent-2); }
+  .dist .d3 { background: var(--info); } .dist .d4 { background: var(--text-3); }
+  .miss-ok   { color: var(--success); font-weight: 700; }
+  .miss-warn { color: var(--warning); font-weight: 700; }
+  /* ----- Wgrane źródło ----- */
+  .source-row { display: flex; align-items: center; gap: 12px; padding: 11px 14px;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .source-row .sr-ico { width: 34px; height: 34px; border-radius: 8px; flex-shrink: 0;
+    background: rgba(34,197,94,0.12); color: var(--success);
+    display: flex; align-items: center; justify-content: center; }
+  .source-row .sr-ico svg { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Dane projektu (profilowanie)</h1>
+  <p class="lead">
+    Wgrywasz plik, a system <strong>czyta jego nagłówki</strong> i tworzy profil: każda kolumna z wykrytym typem,
+    liczbą unikalnych wartości i % braków. Nic nie jest predefiniowane — wszystko, co zobaczysz w dalszych krokach
+    (kolumny, klasy, liczniki), pochodzi z TEGO profilu Twoich danych.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-upload"/></svg>Twój plik = źródło prawdy</h3>
+      <p>xlsx / csv / parquet / json. Kolumny i typy odczytane wprost z pliku, nie z konfiguracji systemu.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-table"/></svg>Profil każdej kolumny</h3>
+      <p>Typ, unikalne wartości, % braków, mini-rozkład. To podstawa wyboru celu i cech.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Pochodzenie wartości</h3>
+      <p>„3 klasy ryzyka” w następnym kroku to policzone unikalne wartości z tej tabeli — nie magia.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D2</span>
+    <h2>Dane projektu — import źródła i profil kolumn (zakładka „Dane”)</h2>
+    <div class="desc">Stepper Źródło → Profil · dropzone · tabela profilu kolumn.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Ocena ryzyka przesyłek ADR”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Dane</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-table"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Ocena ryzyka przesyłek ADR <span class="chip accent"><span class="dot"></span>typ: tabelaryczne</span></div>
+            <div class="d-sub">Dane · profilowanie źródła · przygotowanie do wyboru celu</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Biblioteka zasobów</button>
+            <a class="btn btn-primary" href="t01-cel.html"><svg class="icon"><use href="#i-target"/></svg>Dalej: Cel</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-target"/></svg>Cel i silnik</button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trening</button>
+          <button class="tab"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele</button>
+        </div>
+
+        <!-- Stepper wewnętrzny zakładki Dane -->
+        <div class="stepper" style="max-width:520px;">
+          <div class="step done"><div class="num"><svg class="icon icon-sm" style="stroke-width:3"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Źródło</div><div class="s-desc">plik wgrany</div></div></div>
+          <div class="s-line done"></div>
+          <div class="step active"><div class="num">2</div><div class="s-meta"><div class="s-label">Profil</div><div class="s-desc">aktywny</div></div></div>
+        </div>
+
+        <!-- Sekcja 1: Źródło danych -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-upload"/></svg>Źródło danych</div>
+            <span class="hint">Formaty: xlsx · csv · parquet · json</span>
+          </div>
+          <div class="grid-ml-1-2">
+            <div class="dropzone">
+              <div class="dz-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+              <div class="dz-title">Przeciągnij plik lub kliknij</div>
+              <div class="dz-sub">Maks. 200 MB · pierwszy wiersz = nagłówki kolumn</div>
+              <div class="dz-formats">
+                <span class="chip">.xlsx</span><span class="chip">.csv</span><span class="chip">.parquet</span><span class="chip">.json</span>
+              </div>
+            </div>
+            <div class="flex col gap-md">
+              <div class="text-xs text-3 fw-700" style="text-transform:uppercase;letter-spacing:0.07em;">Wgrane źródła</div>
+              <div class="source-row">
+                <div class="sr-ico"><svg viewBox="0 0 24 24"><use href="#i-file"/></svg></div>
+                <div style="flex:1;min-width:0;">
+                  <div class="fw-700 text-sm">przesylki_adr.xlsx</div>
+                  <div class="text-xs text-3 mono">12 480 wierszy · 9 kolumn · 3.8 MB</div>
+                </div>
+                <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>sprofilowane</span>
+              </div>
+              <div class="text-xs text-3" style="line-height:1.6">
+                Plik wczytany przez konektor <span class="mono">calamine</span> (xlsx). Profil poniżej powstał z odczytu
+                nagłówków i próbki 12 480 wierszy — bez żadnych założeń systemu.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Callout pochodzenia -->
+        <div class="origin-callout ml-enter ml-enter-2">
+          <div class="oc-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></div>
+          <div>
+            <div class="oc-title">Kolumny i ich typy są CZYTANE z Twojego pliku — nic nie jest predefiniowane przez system. To Twoje dane.</div>
+            <div class="oc-text">
+              Każdy wiersz tabeli poniżej to jedna kolumna z <span class="mono">przesylki_adr.xlsx</span>. Typ, liczba
+              unikalnych wartości i % braków zostały policzone z zawartości pliku. W kolejnym kroku wybierzesz spośród
+              nich kolumnę-cel, a liczba „klas” to po prostu liczba unikalnych wartości w tej kolumnie.
+            </div>
+          </div>
+        </div>
+
+        <!-- Sekcja 2: Profil danych -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-table"/></svg>Profil danych — wykryto z nagłówków pliku</div>
+            <span class="hint">9 kolumn · 12 480 wierszy</span>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr>
+                <th>Kolumna</th><th>Typ wykryty</th><th>Unikalne</th><th>% braków</th><th>Mini-rozkład</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="mono fw-700">id_przesylki</span><div class="text-xs text-3">identyfikator</div></td>
+                <td><span class="type-pill tekst">tekst · ID</span></td>
+                <td class="mono">12 480</td>
+                <td class="miss-ok mono">0,0%</td>
+                <td><div class="dist"><span class="d4" style="width:100%"></span></div><div class="text-xs text-3 mt-sm">unikalny na wiersz</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">opis</span><div class="text-xs text-3">treść swobodna</div></td>
+                <td><span class="type-pill tekst">tekst</span></td>
+                <td class="mono">11 902</td>
+                <td class="miss-ok mono">0,3%</td>
+                <td><div class="dist"><span class="d4" style="width:100%"></span></div><div class="text-xs text-3 mt-sm">wysoka kardynalność</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">masa_kg</span><div class="text-xs text-3">wartość ciągła</div></td>
+                <td><span class="type-pill licz">liczba · ciągła</span></td>
+                <td class="mono">8 461</td>
+                <td class="miss-ok mono">0,1%</td>
+                <td><div class="dist"><span class="d3" style="width:32%"></span><span class="d1" style="width:44%"></span><span class="d2" style="width:24%"></span></div><div class="text-xs text-3 mt-sm">0,2 – 24 800 kg</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">klasa_adr</span><div class="text-xs text-3">klasa zagrożenia</div></td>
+                <td><span class="type-pill kat">kategoria</span></td>
+                <td class="mono">6</td>
+                <td class="miss-ok mono">0,0%</td>
+                <td><div class="dist"><span class="d1" style="width:38%"></span><span class="d2" style="width:24%"></span><span class="d3" style="width:20%"></span><span class="d4" style="width:18%"></span></div><div class="text-xs text-3 mt-sm">6 unikalnych klas</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">un</span><div class="text-xs text-3">numer UN</div></td>
+                <td><span class="type-pill kat">kategoria</span></td>
+                <td class="mono">43</td>
+                <td class="miss-warn mono">1,9%</td>
+                <td><div class="dist"><span class="d1" style="width:22%"></span><span class="d2" style="width:18%"></span><span class="d3" style="width:30%"></span><span class="d4" style="width:30%"></span></div><div class="text-xs text-3 mt-sm">40+ unikalnych kodów</div></td>
+              </tr>
+              <tr style="background:rgba(99,102,241,0.06);">
+                <td><span class="mono fw-700">ryzyko</span><div class="text-xs" style="color:var(--accent-2)">kandydat na cel</div></td>
+                <td><span class="type-pill kat">kategoria</span></td>
+                <td class="mono">3</td>
+                <td class="miss-ok mono">0,0%</td>
+                <td><div class="dist"><span class="d1" style="width:55%"></span><span class="d2" style="width:33%"></span><span class="d3" style="width:12%"></span></div><div class="text-xs text-3 mt-sm">niskie · średnie · wysokie</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">data_nadania</span><div class="text-xs text-3">znacznik czasu</div></td>
+                <td><span class="type-pill data">data</span></td>
+                <td class="mono">9 040</td>
+                <td class="miss-ok mono">0,0%</td>
+                <td><div class="dist"><span class="d3" style="width:100%"></span></div><div class="text-xs text-3 mt-sm">2024-01 – 2026-05</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">temperatura</span><div class="text-xs text-3">odczyt czujnika</div></td>
+                <td><span class="type-pill licz">liczba</span></td>
+                <td class="mono">2 187</td>
+                <td class="miss-warn mono">4,2%</td>
+                <td><div class="dist"><span class="d3" style="width:28%"></span><span class="d1" style="width:50%"></span><span class="d2" style="width:22%"></span></div><div class="text-xs text-3 mt-sm">−24 – +41 °C</div></td>
+              </tr>
+              <tr>
+                <td><span class="mono fw-700">odleglosc_km</span><div class="text-xs text-3">dystans trasy</div></td>
+                <td><span class="type-pill licz">liczba</span></td>
+                <td class="mono">5 612</td>
+                <td class="miss-ok mono">0,2%</td>
+                <td><div class="dist"><span class="d1" style="width:46%"></span><span class="d2" style="width:34%"></span><span class="d3" style="width:20%"></span></div><div class="text-xs text-3 mt-sm">3 – 1 940 km</div></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Typ kolumny wykrywany heurystycznie: kategoria = mała liczba powtarzających się wartości tekstowych;
+            liczba = parsowalna numerycznie; data = parsowalny znacznik czasu. Typ możesz nadpisać ręcznie przy wyborze celu.
+          </div>
+        </section>
+
+        <!-- Nawigacja dół -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="p01-kreator-projekt.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Kreator projektu</a>
+          <div class="flex gap-md align-center">
+            <span class="text-xs text-3">Krok 2 z 2 (Profil)</span>
+            <a class="btn btn-primary btn-lg" href="t01-cel.html">Dalej: Cel i typ zadania<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

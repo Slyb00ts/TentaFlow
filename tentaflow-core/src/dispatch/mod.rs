@@ -35,6 +35,7 @@ pub mod legal_admin;
 pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
+pub mod ml_studio;
 pub mod recorder;
 pub mod resume_token;
 pub mod role_catalog;
@@ -522,6 +523,32 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::SchedulerPayload::JobRunNowResponse(_) => {
                 "SchedulerJobRunNowResponse"
+            }
+        },
+        MessageBody::MlStudioBody(p) => match p {
+            tentaflow_protocol::MlStudioPayload::ProjectsListRequest(_) => {
+                "MlStudioProjectsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectsListResponse(_) => {
+                "MlStudioProjectsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectCreateRequest(_) => {
+                "MlStudioProjectCreateRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectCreateResponse(_) => {
+                "MlStudioProjectCreateResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectDetailRequest(_) => {
+                "MlStudioProjectDetailRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectDetailResponse(_) => {
+                "MlStudioProjectDetailResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectTypesListRequest(_) => {
+                "MlStudioProjectTypesListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(_) => {
+                "MlStudioProjectTypesListResponse"
             }
         },
         MessageBody::SkillsBody(p) => match p {
