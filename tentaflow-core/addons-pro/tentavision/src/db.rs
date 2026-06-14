@@ -414,6 +414,114 @@ pub fn delete_profile(id: &str) -> Result<u64, AbiError> {
 }
 
 // =============================================================================
+// Models CRUD
+// =============================================================================
+
+/// An inference model row as persisted in SQLite. `status` is one of
+/// active/loaded/loading/error/idle; `vram_mb` is the model's VRAM footprint in
+/// megabytes (counted toward the budget only while the model is active/loaded).
+#[derive(Debug, Clone)]
+pub struct ModelRow {
+    pub id: String,
+    pub name: String,
+    pub runtime: String,
+    pub status: String,
+    pub vram_mb: i64,
+    pub version: String,
+    pub created_at: i64,
+}
+
+/// Fields needed to create a model. id/created_at are filled by `insert_model`.
+#[derive(Debug, Clone)]
+pub struct NewModel {
+    pub name: String,
+    pub runtime: String,
+    pub status: String,
+    pub vram_mb: i64,
+    pub version: String,
+}
+
+const MODEL_COLS: &str = "id, name, runtime, status, vram_mb, version, created_at";
+
+fn row_to_model(r: &Row) -> ModelRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    ModelRow {
+        id: g(0).as_str().into(),
+        name: g(1).as_str().into(),
+        runtime: g(2).as_str().into(),
+        status: g(3).as_str().into(),
+        vram_mb: g(4).as_i64(),
+        version: g(5).as_str().into(),
+        created_at: g(6).as_i64(),
+    }
+}
+
+/// Lists all models ordered by name.
+pub fn list_models() -> Result<Vec<ModelRow>, AbiError> {
+    let sql = alloc::format!("SELECT {MODEL_COLS} FROM models ORDER BY name");
+    let rows = query(&sql, &[])?;
+    Ok(rows.iter().map(row_to_model).collect())
+}
+
+/// Fetches a single model by id, or None.
+pub fn get_model(id: &str) -> Result<Option<ModelRow>, AbiError> {
+    let sql = alloc::format!("SELECT {MODEL_COLS} FROM models WHERE id = ?1");
+    let rows = query(&sql, &[SqlValue::Text(id.into())])?;
+    Ok(rows.first().map(row_to_model))
+}
+
+/// Inserts a new model, returning its generated id. created_at is stamped from
+/// the authoritative SQLite clock.
+pub fn insert_model(m: &NewModel) -> Result<String, AbiError> {
+    let id = generate_id("mdl");
+    let now = now_secs();
+    exec(
+        "INSERT INTO models (id, name, runtime, status, vram_mb, version, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(m.name.clone()),
+            SqlValue::Text(m.runtime.clone()),
+            SqlValue::Text(m.status.clone()),
+            SqlValue::I64(m.vram_mb),
+            SqlValue::Text(m.version.clone()),
+            SqlValue::I64(now),
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Updates an existing model in place (created_at is immutable).
+pub fn update_model(m: &ModelRow) -> Result<u64, AbiError> {
+    exec(
+        "UPDATE models SET name = ?2, runtime = ?3, status = ?4, vram_mb = ?5, version = ?6 \
+         WHERE id = ?1",
+        &[
+            SqlValue::Text(m.id.clone()),
+            SqlValue::Text(m.name.clone()),
+            SqlValue::Text(m.runtime.clone()),
+            SqlValue::Text(m.status.clone()),
+            SqlValue::I64(m.vram_mb),
+            SqlValue::Text(m.version.clone()),
+        ],
+    )
+}
+
+/// Deletes a model by id. Returns rows affected (0 if it did not exist).
+pub fn delete_model(id: &str) -> Result<u64, AbiError> {
+    exec("DELETE FROM models WHERE id = ?1", &[SqlValue::Text(id.into())])
+}
+
+/// Sum of VRAM (MB) over models that count toward the live budget — those whose
+/// status is active or loaded. idle/error/loading models do not occupy VRAM.
+pub fn used_vram_mb() -> Result<i64, AbiError> {
+    scalar_i64(
+        "SELECT COALESCE(SUM(vram_mb), 0) FROM models WHERE status IN ('active', 'loaded')",
+        &[],
+    )
+}
+
+// =============================================================================
 // Dashboard aggregates (read-only)
 // =============================================================================
 
