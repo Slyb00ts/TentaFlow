@@ -6,7 +6,7 @@
 #![allow(clippy::too_many_lines, clippy::collapsible_else_if, dead_code)]
 
 #[used]
-static BUILD_TS: &str = "20260526-1210";
+static BUILD_TS: &str = "20260614-1500";
 
 extern crate alloc;
 
@@ -85,6 +85,20 @@ extern "C" {
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
         input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn vector_upsert_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn vector_search_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn llm_generate(
+        prompt_ptr: i32, prompt_len: i32,
+        model_ptr: i32, model_len: i32,
+        options_ptr: i32, options_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 }
@@ -1766,28 +1780,48 @@ impl AlarmsState {
     fn status_or_open(&self) -> &str { if self.status_view.is_empty() { "open" } else { &self.status_view } }
 }
 
+/// One resolved search hit shown as a result card: the alarm row plus the raw
+/// vector similarity score (only meaningful for the semantic text mode).
+#[derive(Clone)]
+struct SearchHit {
+    alarm: db::AlarmRow,
+    score: f32,
+}
+
+/// Outcome of the last search submit, driving the results area. `Empty` is the
+/// pre-submit hint; `Results` carries real matching rows (text-semantic or
+/// attribute SQL); `ModelUnavailable` is the honest message when the embedding
+/// model is not deployed; `Placeholder` is the honest "needs vision pipeline"
+/// message for image/plate modes only.
+#[derive(Clone)]
+enum SearchOutcome {
+    Empty,
+    Results(Vec<SearchHit>),
+    ModelUnavailable,
+    Placeholder,
+}
+
 /// View state for the historical search panel. The DURABLE parts (chosen mode,
 /// last per-mode query text, camera/time filters, recent searches) live in the
-/// settings table and are read fresh in `build_search_content`; this struct only
-/// holds the ephemeral "a search was just submitted" flag so the results area
-/// can switch from the empty hint to the honest no-engine placeholder. There is
-/// NO search/embedding/ANPR engine wired to this addon, so submit never
-/// fabricates result cards — it surfaces a per-mode placeholder and persists the
-/// query into recents.
+/// settings table and are read fresh in `build_search_content`; this struct holds
+/// the ephemeral last-submit outcome. Text-semantic search runs through the real
+/// embedding + vector store; attribute search runs a real SQL query; image/plate
+/// keep an honest placeholder because they need the (not-yet-wired) vision
+/// pipeline. Submit NEVER fabricates result cards.
 struct SearchState {
-    /// Set true once the user pressed "Szukaj"; drives the honest placeholder.
-    submitted: bool,
-    /// The mode the last submit ran in (so the placeholder message matches it
-    /// even before the next render reads the persisted mode).
+    /// The mode the last submit ran in (so the result area matches it even
+    /// before the next render reads the persisted mode).
     submitted_mode: String,
+    /// The last submit's outcome (real hits, honest message, or empty).
+    outcome: SearchOutcome,
 }
 impl SearchState {
     const fn new() -> Self {
-        Self { submitted: false, submitted_mode: String::new() }
+        Self { submitted_mode: String::new(), outcome: SearchOutcome::Empty }
     }
     fn clear_all(&mut self) {
-        self.submitted = false;
         self.submitted_mode.clear();
+        self.outcome = SearchOutcome::Empty;
     }
 }
 
@@ -2440,6 +2474,7 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "search-field-change" => handle_search_field_change(params),
         "search-submit" => handle_search_submit(params),
         "search-recent-pick" => handle_search_recent_pick(params),
+        "search-reindex" => handle_search_reindex(),
         "search-clear-all" => handle_search_clear_all(),
         "reid-flag-set" => handle_reid_flag_set(params),
         "reid-legalgrant-request" => handle_reid_legalgrant_request(),
@@ -3391,6 +3426,10 @@ fn handle_alarm_simulate() -> JsonValue {
     let ts = db::now_secs();
     match db::insert_alarm(&cam.id, severity, kind, message, ts) {
         Ok(id) => {
+            // Index the new alarm into the semantic event store. Best-effort:
+            // if no embedding model is deployed, the alarm is still created and
+            // the warning is logged (the Search tab's Reindex action backfills).
+            index_alarm_by_id(&id);
             with_state(|s| { s.alarms.selected_id = Some(id); s.success_message = Some("Zasymulowano alarm testowy.".into()); });
             render_panel("alarms");
             json!({"ok":true})
@@ -5076,7 +5115,179 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 // =============================================================================
-// Historical search (M6) — four modes, honest no-engine placeholder
+// Semantic event index — embeddings (llm_generate) + vector store (events ns)
+// =============================================================================
+
+/// Vector namespace declared in manifest.toml for semantic event search.
+const EVENT_VECTOR_NS: &str = "events";
+/// Embedding model + dimension. Matches the `[[vector_namespace]]` dim and the
+/// jina-embeddings-v5-text-small model used by the embeddings-chunker addon.
+const EMBED_MODEL: &str = "jina-embeddings-v5-text-small";
+const EMBED_DIM: usize = 1024;
+/// Buffer for the llm_generate response — a 1024-dim f32 vector serialized as
+/// JSON floats is well under this.
+const EMBED_RESP_BUF: usize = 262_144;
+
+/// Stable u64 ref_id for an alarm string id (FNV-1a). The vector store keys by
+/// u64; the alarm_id ↔ ref_id mapping is persisted in `vector_refs` so a hit
+/// resolves back to the alarm even though the hash itself is one-way.
+fn alarm_ref_id(alarm_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in alarm_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // ref_id 0 is a valid key but the bindings probe searches with a zero query
+    // vector; keep alarm ids off 0 so the two never alias semantically.
+    if h == 0 { 1 } else { h }
+}
+
+/// Builds the text document embedded for an alarm. Concatenates the human-facing
+/// fields so a natural-language query matches on camera, type, message, severity.
+fn alarm_doc(a: &db::AlarmRow) -> String {
+    alloc::format!(
+        "Kamera: {}. Typ: {}. Waga: {}. Zdarzenie: {}",
+        if a.camera_name.is_empty() { a.camera_id.as_str() } else { a.camera_name.as_str() },
+        a.kind, a.severity, a.message,
+    )
+}
+
+/// Generates an embedding for `text` via the host `llm_generate` with the
+/// embedding model. `mode` is "query" or "document" (asymmetric retrieval
+/// prefix). Returns the f32 vector, or an honest error string on failure.
+fn generate_embedding(text: &str, mode: &str) -> Result<Vec<f32>, String> {
+    let prefixed = match mode {
+        "query" => alloc::format!("Query: {}", text),
+        _ => alloc::format!("Document: {}", text),
+    };
+    let options = json!({"task": "embedding", "dimensions": EMBED_DIM, "adapter": "retrieval"}).to_string();
+    let prompt_b = prefixed.as_bytes();
+    let model_b = EMBED_MODEL.as_bytes();
+    let opt_b = options.as_bytes();
+    let mut buf = alloc::vec![0u8; EMBED_RESP_BUF];
+    let mut out_len: i32 = 0;
+    let code = unsafe {
+        llm_generate(
+            prompt_b.as_ptr() as i32, prompt_b.len() as i32,
+            model_b.as_ptr() as i32, model_b.len() as i32,
+            opt_b.as_ptr() as i32, opt_b.len() as i32,
+            buf.as_mut_ptr() as i32, EMBED_RESP_BUF as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+    if code != 0 {
+        return Err(alloc::format!("llm_generate code {}", code));
+    }
+    if out_len <= 0 {
+        return Err("pusta odpowiedź modelu".into());
+    }
+    let resp = String::from_utf8_lossy(&buf[..out_len as usize]).to_string();
+    parse_embedding_response(&resp)
+}
+
+/// Extracts the f32 vector from an llm_generate embedding response. Accepts a
+/// bare float array, or an object with `embedding` / `vector` / `data[0].embedding`.
+fn parse_embedding_response(resp: &str) -> Result<Vec<f32>, String> {
+    let parsed: JsonValue = serde_json::from_str(resp)
+        .map_err(|e| alloc::format!("parse embeddingu: {}", e))?;
+    let arr = parsed.as_array()
+        .or_else(|| parsed.get("embedding").and_then(|v| v.as_array()))
+        .or_else(|| parsed.get("vector").and_then(|v| v.as_array()))
+        .or_else(|| parsed.get("data").and_then(|d| d.as_array())
+            .and_then(|a| a.first())
+            .and_then(|f| f.get("embedding"))
+            .and_then(|v| v.as_array()));
+    let arr = arr.ok_or_else(|| "brak wektora w odpowiedzi".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        out.push(v.as_f64().ok_or_else(|| "element wektora nie jest liczbą".to_string())? as f32);
+    }
+    if out.is_empty() {
+        return Err("pusty wektor".into());
+    }
+    Ok(out)
+}
+
+/// Base64(LE f32 bytes) — the wire encoding the vector host functions expect.
+fn encode_vector_b64(vector: &[f32]) -> String {
+    use base64::Engine;
+    let mut raw = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        raw.extend_from_slice(&f.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(&raw)
+}
+
+/// Upserts one vector into the events namespace. Thin wrapper over the
+/// vector_upsert_v1 host function with the CBOR payload shape.
+fn vector_upsert(ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
+    let input = tentaflow_sdk_spec::VectorUpsertInput {
+        namespace: EVENT_VECTOR_NS.into(),
+        ref_id,
+        vector_b64: encode_vector_b64(vector),
+        fields: None,
+        sparse: None,
+    };
+    let out: tentaflow_sdk_spec::VectorUpsertOutput = call_cbor_in_out(&input, vector_upsert_v1)?;
+    Ok(out.count)
+}
+
+/// k-NN search over the events namespace. Returns hits (ref_id + score),
+/// closest first.
+fn vector_search(query: &[f32], k: u32) -> Result<Vec<tentaflow_sdk_spec::VectorSearchHit>, AbiError> {
+    let input = tentaflow_sdk_spec::VectorSearchInput {
+        namespace: EVENT_VECTOR_NS.into(),
+        query_b64: encode_vector_b64(query),
+        k,
+        gate_claim_id: None,
+        filter: None,
+        output_fields: None,
+    };
+    let out: tentaflow_sdk_spec::VectorSearchOutput = call_cbor_in_out(&input, vector_search_v1)?;
+    Ok(out.hits)
+}
+
+/// Embeds one alarm and upserts it into the events vector namespace, recording
+/// the ref_id ↔ alarm_id mapping. Best-effort: returns the error string so the
+/// caller can surface honest failures (e.g. no embedding model deployed) instead
+/// of fabricating a result. Never panics on a missing model.
+fn index_alarm(a: &db::AlarmRow) -> Result<(), String> {
+    let doc = alarm_doc(a);
+    let vector = generate_embedding(&doc, "document")?;
+    let ref_id = alarm_ref_id(&a.id);
+    vector_upsert(ref_id, &vector).map_err(|e| alloc::format!("vector_upsert: {}", abi_message(e)))?;
+    db::upsert_vector_ref(ref_id, &a.id, a.ts).map_err(|e| alloc::format!("vector_refs: {}", abi_message(e)))?;
+    Ok(())
+}
+
+/// Indexes an alarm by id, looking the row up first. Used by the alarm
+/// create/decide handlers so the live index stays in sync. Errors are logged,
+/// not surfaced to the operator (indexing is a background concern of those
+/// flows; the Search tab's Reindex action is where indexing health is visible).
+fn index_alarm_by_id(alarm_id: &str) {
+    if let Ok(Some(a)) = db::get_alarm(alarm_id) {
+        if let Err(e) = index_alarm(&a) {
+            log::warn(&alloc::format!("index_alarm {} failed: {}", alarm_id, e));
+        }
+    }
+}
+
+/// Probes the embedding model: embeds a tiny query and reports whether a model
+/// answered. Used by the text-search path and the Bindings probe to give an
+/// honest "model unavailable" message instead of faking results.
+fn embedding_model_available() -> bool {
+    generate_embedding("ping", "query").is_ok()
+}
+
+/// Probes the vector store: a zero-vector k=1 search either returns hits or an
+/// empty list (both prove the API responds). Only a hard AbiError means the
+/// vector capability is unavailable. Used by the Bindings Vector status cell.
+fn vector_store_available() -> bool {
+    vector_search(&[0.0f32; EMBED_DIM], 1).is_ok()
+}
+
+// =============================================================================
+// Historical search (M6) — text+attribute REAL, image+plate honest placeholder
 // =============================================================================
 
 /// Actor recorded in the audit log for search-query writes (D5 attribute search
@@ -5089,16 +5300,18 @@ const KEY_SEARCH_CAMERAS: &str = "search_cameras";
 const KEY_SEARCH_FROM: &str = "search_time_from";
 const KEY_SEARCH_TO: &str = "search_time_to";
 const KEY_SEARCH_RECENTS: &str = "search_recents";
+/// Attribute-mode severity filter ("all"/critical/warning/info).
+const KEY_SEARCH_ATTR_SEVERITY: &str = "search_attr_severity";
 
 /// Maximum number of recent query strings retained per mode.
 const SEARCH_RECENTS_MAX: usize = 5;
 
 /// The four search modes from the m06 mockup. Order matches the mode selector.
 const SEARCH_MODES: [(&str, &str, &str, &str); 4] = [
-    ("text", "Tekst (semantyczne)", "text", "SigLIP2 — np. \"czerwona czapka, okulary\""),
-    ("attribute", "Atrybut (formularz)", "tag", "Kolor + ubranie + wzrost + dodatki"),
-    ("image", "Podobieństwo (zdjęcie)", "image", "Upload obrazu → top-K matches"),
-    ("plate", "Tablica rejestracyjna", "car", "LPRNet · format PL/EU"),
+    ("text", "Tekst (semantyczne)", "text", "Embedding zdarzeń + vector store — opisz zdarzenie słowami"),
+    ("attribute", "Atrybut (formularz)", "tag", "Zapytanie SQL po wadze / typie / kamerze / czasie"),
+    ("image", "Podobieństwo (zdjęcie)", "image", "Wymaga pipeline'u wizyjnego (embedding klatek)"),
+    ("plate", "Tablica rejestracyjna", "car", "Wymaga silnika ANPR (LPRNet)"),
 ];
 
 /// Normalizes a persisted/incoming mode to a known mode id, defaulting to text.
@@ -5254,6 +5467,30 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
     comp
 }
 
+/// Severity select for attribute mode, bound to `search_attr_severity`, committed
+/// to settings on change. "all" = no severity constraint.
+fn search_attr_severity_select() -> Component {
+    let options = vec![
+        SelectOption { value: SelectValue::Text("all".into()), label: lit("Każda waga"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("critical".into()), label: lit("Krytyczny"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("warning".into()), label: lit("Ostrzeżenie"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("info".into()), label: lit("Informacja"), icon: None, disabled: false, group_id: None, description: None },
+    ];
+    let mut comp = select("Waga", options, "search_attr_severity");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text("severity".into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "search-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
 /// Camera-scope select bound to `search_cameras`, committed to settings on change.
 fn search_camera_select(cameras: &[db::CameraRow]) -> Component {
     let mut comp = select("Kamery", search_camera_options(cameras), "search_cameras");
@@ -5316,18 +5553,21 @@ fn build_search_filters(cameras: &[db::CameraRow]) -> Component {
 /// image and plate modes add their mode-specific affordance.
 fn build_search_query_form(mode: &str) -> Component {
     match mode {
-        "attribute" => card(Some("Atrybuty osoby / pojazdu"), vec![
-            text_styled("Wyszukiwanie strukturalne po atrybutach (kolor, ubranie, dodatki).", "caption"),
-            search_query_input("Atrybuty", "np. mężczyzna, czarna kurtka, plecak, wzrost ~180", mode, true),
+        "attribute" => card(Some("Atrybuty zdarzenia"), vec![
+            text_styled("Strukturalne wyszukiwanie SQL po wadze, typie, kamerze i zakresie czasu — bez AI, zawsze dostępne.", "caption"),
+            grid(2, vec![
+                search_attr_severity_select(),
+                search_query_input("Typ zdarzenia", "np. agresja, ADR, pojazd", mode, false),
+            ]),
             stack_h_gap("sm", vec![
-                chip_toned("kolor + ubranie", "info"),
-                chip_toned("wzrost", "info"),
-                chip_toned("dodatki", "info"),
+                chip_toned("waga", "info"),
+                chip_toned("typ", "info"),
+                chip_toned("kamera + czas", "info"),
             ]),
         ]),
         "image" => card(Some("Podobieństwo do zdjęcia"), vec![
             text_styled("Upload obrazu referencyjnego → top-K najbardziej podobnych klatek.", "caption"),
-            empty_state("Przeciągnij zdjęcie lub kliknij, aby wybrać", Some("Brak backendu uploadu/embeddingu — pole referencyjne."), Some("image")),
+            empty_state("Przeciągnij zdjęcie lub kliknij, aby wybrać", Some("Wymaga pipeline'u wizyjnego (embedding klatek) — pole referencyjne."), Some("image")),
             search_query_input("Opcjonalny opis referencji", "np. ta sama osoba co na zdjęciu z 14:32", mode, false),
         ]),
         "plate" => card(Some("Tablica rejestracyjna (ANPR)"), vec![
@@ -5340,10 +5580,10 @@ fn build_search_query_form(mode: &str) -> Component {
             ]),
         ]),
         _ => card(Some("Zapytanie semantyczne"), vec![
-            text_styled("Embedding SigLIP2 + filtry meta — opisz scenę słowami.", "caption"),
-            search_query_input("Zapytanie semantyczne", "np. mężczyzna w czerwonej czapce i ciemnej kurtce", mode, true),
+            text_styled("Embedding zdarzenia (model embeddingów) + vector store — opisz zdarzenie słowami.", "caption"),
+            search_query_input("Zapytanie semantyczne", "np. agresja przy wjeździe, nieczytelna tablica", mode, true),
             stack_h_gap("sm", vec![
-                chip_toned("embedding · SigLIP2 ViT-L/14", "info"),
+                chip_toned("embedding zdarzeń", "info"),
                 chip_toned("cosine similarity", "info"),
                 chip_toned("top-K = 30", "info"),
             ]),
@@ -5351,42 +5591,83 @@ fn build_search_query_form(mode: &str) -> Component {
     }
 }
 
-/// The honest no-engine placeholder shown in the results area after a submit.
-/// Per-mode message — NEVER fabricates result cards or thumbnails.
-fn build_search_results(submitted: bool, mode: &str) -> Component {
-    if !submitted {
-        return card(Some("Wyniki"), vec![empty_state(
+/// Renders the results area from the last submit's outcome. Text-semantic and
+/// attribute modes produce REAL result cards; image/plate keep an honest
+/// placeholder (vision pipeline not wired); an unavailable embedding model gives
+/// an honest message — never fabricated hits.
+fn build_search_results(outcome: &SearchOutcome, mode: &str) -> Component {
+    match outcome {
+        SearchOutcome::Empty => card(Some("Wyniki"), vec![empty_state(
             "Wprowadź zapytanie",
             Some("Wybierz tryb, wpisz zapytanie i naciśnij Szukaj."),
             Some("search"),
-        )]);
+        )]),
+        SearchOutcome::ModelUnavailable => card(Some("Wyniki"), vec![
+            alert(
+                "Model embeddingów niedostępny — skonfiguruj go w Ustawieniach / deploy. Zapytanie zapisano w historii.",
+                "warning",
+            ),
+            empty_state(
+                "Brak modelu embeddingów",
+                Some("Wyszukiwanie semantyczne wymaga wdrożonego modelu embeddingów (jina-embeddings-v5-text-small). Indeks wektorowy działa — uruchom model i ponów."),
+                Some("search"),
+            ),
+        ]),
+        SearchOutcome::Placeholder => {
+            let (title, msg, icon) = match search_mode_norm(mode) {
+                "image" => (
+                    "Wymaga pipeline'u wizyjnego",
+                    "Wyszukiwanie po podobieństwie obrazu wymaga embeddingów klatek z pipeline'u wizyjnego (jeszcze niewdrożony). Zapytanie zapisano w historii.",
+                    "image",
+                ),
+                _ => (
+                    "Wymaga silnika ANPR",
+                    "Wyszukiwanie po tablicy wymaga embeddingów/odczytu tablic z silnika ANPR (LPRNet, jeszcze niewdrożony). Zapytanie zapisano w historii.",
+                    "car",
+                ),
+            };
+            card(Some("Wyniki"), vec![
+                alert(msg, "warning"),
+                empty_state(title, Some("Po wdrożeniu pipeline'u wizyjnego trafienia pojawią się tutaj."), Some(icon)),
+            ])
+        }
+        SearchOutcome::Results(hits) => {
+            if hits.is_empty() {
+                return card(Some("Wyniki"), vec![empty_state(
+                    "Brak trafień",
+                    Some("Żadne zdarzenie nie pasuje do zapytania. Zmień kryteria lub zakres czasu."),
+                    Some("search"),
+                )]);
+            }
+            let is_semantic = search_mode_norm(mode) == "text";
+            let mut children = vec![text_styled(
+                &alloc::format!("Znaleziono {} zdarzeń.", hits.len()),
+                "caption",
+            )];
+            for h in hits {
+                children.push(build_search_result_card(h, is_semantic));
+            }
+            card(Some("Wyniki"), vec![stack_v_gap("sm", children)])
+        }
     }
-    let (title, msg, icon) = match search_mode_norm(mode) {
-        "attribute" => (
-            "Brak silnika wyszukiwania atrybutów",
-            "Wyszukiwanie po atrybutach wymaga uruchomionego silnika detekcji + indeksu atrybutów — brak backendu. Zapytanie zapisano w historii.",
-            "tag",
-        ),
-        "image" => (
-            "Brak silnika podobieństwa obrazu",
-            "Wyszukiwanie po podobieństwie wymaga silnika embeddingów obrazu (SigLIP2) i indeksu klatek — brak backendu. Zapytanie zapisano w historii.",
-            "image",
-        ),
-        "plate" => (
-            "Brak silnika ANPR",
-            "Wyszukiwanie po tablicy wymaga uruchomionego silnika ANPR (LPRNet) — brak backendu. Zapytanie zapisano w historii.",
-            "car",
-        ),
-        _ => (
-            "Brak silnika wyszukiwania semantycznego",
-            "Wyszukiwanie semantyczne wymaga uruchomionego silnika (SigLIP2 / embeddings) i historycznego indeksu klatek — brak backendu. Zapytanie zapisano w historii.",
-            "search",
-        ),
-    };
-    card(Some("Wyniki"), vec![
-        alert(msg, "warning"),
-        empty_state(title, Some("Po podłączeniu silnika i indeksu w tym miejscu pojawi się siatka trafień z wynikami podobieństwa."), Some(icon)),
-    ])
+}
+
+/// One result card: camera + message + severity chip + timestamp, and (for the
+/// semantic mode) the cosine similarity. Built entirely from a real alarm row.
+fn build_search_result_card(h: &SearchHit, show_score: bool) -> Component {
+    let a = &h.alarm;
+    let header = stack_h(vec![
+        text_styled(if a.camera_name.is_empty() { a.camera_id.as_str() } else { a.camera_name.as_str() }, "body_strong"),
+        badge(alarm_severity_label(&a.severity), alarm_severity_variant(&a.severity)),
+        chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
+    ]);
+    let mut rows = vec![header, text_styled(&a.message, "body")];
+    if show_score {
+        // Cosine distance: lower = closer. Report similarity = 1 - distance.
+        let sim = (1.0 - h.score).clamp(0.0, 1.0);
+        rows.push(chip_toned(&alloc::format!("podobieństwo {:.0}%", sim * 100.0), "info"));
+    }
+    card(None, rows)
 }
 
 /// Recent-searches list for the current mode. Each entry re-runs that query.
@@ -5420,9 +5701,9 @@ fn build_search_content() -> Component {
     let messages = build_messages_section();
     let cameras = db::list_cameras().unwrap_or_default();
     let mode = search_mode();
-    let submitted = with_state(|s| s.search.submitted);
-    let submitted_mode = with_state(|s| {
-        if s.search.submitted_mode.is_empty() { mode.clone() } else { s.search.submitted_mode.clone() }
+    let (outcome, submitted_mode) = with_state(|s| {
+        let m = if s.search.submitted_mode.is_empty() { mode.clone() } else { s.search.submitted_mode.clone() };
+        (s.search.outcome.clone(), m)
     });
 
     let header = stack_h(vec![
@@ -5430,7 +5711,7 @@ fn build_search_content() -> Component {
         risk_badge("B"),
     ]);
     let subtitle = text_styled(
-        "Cztery tryby: tekst (SigLIP2 semantyczne), atrybut formularzowy, podobieństwo zdjęcia, tablica rejestracyjna.",
+        "Tekst (semantyczne, embedding + vector store) i atrybut (SQL) działają realnie; podobieństwo zdjęcia i tablica wymagają pipeline'u wizyjnego.",
         "caption",
     );
 
@@ -5441,10 +5722,11 @@ fn build_search_content() -> Component {
     let submit_row = stack_h(vec![
         button_with_icon("Szukaj", "search-submit", "primary", "search"),
         button("Wyczyść", "search-clear-all", "ghost"),
+        button_with_icon("Reindeksuj zdarzenia", "search-reindex", "secondary", "refresh"),
     ]);
 
     let recents = build_search_recents(&mode);
-    let results = build_search_results(submitted, &submitted_mode);
+    let results = build_search_results(&outcome, &submitted_mode);
     let rodo = build_search_rodo_note();
 
     stack_v(vec![
@@ -5480,6 +5762,10 @@ fn search_overlay() -> Vec<StateEntry> {
             path: StatePath::new(vec![PathSegment::Key("search_time_to".into())]),
             value: Value::Text(db::get_setting(KEY_SEARCH_TO).ok().flatten().unwrap_or_default()),
         },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("search_attr_severity".into())]),
+            value: Value::Text(db::get_setting(KEY_SEARCH_ATTR_SEVERITY).ok().flatten().unwrap_or_else(|| "all".into())),
+        },
     ];
     // Seed the active mode's query control with its persisted last query.
     entries.push(StateEntry {
@@ -5497,9 +5783,9 @@ fn handle_search_mode_change(params: &JsonValue) -> JsonValue {
         .unwrap_or("text");
     let mode = search_mode_norm(v);
     let _ = db::set_setting(KEY_SEARCH_MODE, mode);
-    // Switching mode clears the "submitted" placeholder so it doesn't show a
-    // stale message for the previous mode.
-    with_state(|s| { s.search.submitted = false; s.search.submitted_mode.clear(); });
+    // Switching mode clears the last outcome so it doesn't show stale results
+    // for the previous mode.
+    with_state(|s| { s.search.clear_all(); });
     render_panel("search");
     json!({"ok":true, "mode": mode})
 }
@@ -5517,13 +5803,102 @@ fn handle_search_field_change(params: &JsonValue) -> JsonValue {
         "cameras" => { let _ = db::set_setting(KEY_SEARCH_CAMERAS, &value); }
         "time_from" => { let _ = db::set_setting(KEY_SEARCH_FROM, &value); }
         "time_to" => { let _ = db::set_setting(KEY_SEARCH_TO, &value); }
+        "severity" => { let _ = db::set_setting(KEY_SEARCH_ATTR_SEVERITY, &value); }
         _ => {}
     }
     json!({"ok":true})
 }
 
-/// Runs a search: persists the query into recents and flips the honest
-/// placeholder on. NEVER fabricates results — there is no engine wired here.
+/// Runs the actual search for `mode`/`query` and returns the outcome. Text mode
+/// embeds the query and runs a real k-NN over the events vector store, resolving
+/// hits to alarm rows; attribute mode runs a real SQL query; image/plate return
+/// the honest placeholder (vision pipeline not wired). Never fabricates hits.
+fn run_search(mode: &str, query: &str) -> SearchOutcome {
+    match search_mode_norm(mode) {
+        "attribute" => run_attribute_search(query),
+        "text" => run_semantic_search(query),
+        _ => SearchOutcome::Placeholder,
+    }
+}
+
+/// Real structured SQL search over alarms: severity (settings), free-text type
+/// (LIKE on the alarm type/message), camera scope and time range from settings.
+fn run_attribute_search(query: &str) -> SearchOutcome {
+    let severity = db::get_setting(KEY_SEARCH_ATTR_SEVERITY).ok().flatten().unwrap_or_else(|| "all".into());
+    let severity = if severity == "all" { String::new() } else { severity };
+    let camera = db::get_setting(KEY_SEARCH_CAMERAS).ok().flatten().unwrap_or_else(|| "all".into());
+    let camera = if camera == "all" { String::new() } else { camera };
+    let from = parse_search_time(&db::get_setting(KEY_SEARCH_FROM).ok().flatten().unwrap_or_default());
+    let to = parse_search_time(&db::get_setting(KEY_SEARCH_TO).ok().flatten().unwrap_or_default());
+    let rows = db::search_alarms(&severity, query.trim(), &camera, from, to).unwrap_or_default();
+    SearchOutcome::Results(rows.into_iter().map(|alarm| SearchHit { alarm, score: 0.0 }).collect())
+}
+
+/// Real semantic search: embed the query, k-NN over the events namespace,
+/// resolve each hit's ref_id back to its alarm row. If no embedding model is
+/// deployed, return the honest ModelUnavailable outcome (never fake hits).
+fn run_semantic_search(query: &str) -> SearchOutcome {
+    let qvec = match generate_embedding(query.trim(), "query") {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(&alloc::format!("semantic search embedding failed: {}", e));
+            return SearchOutcome::ModelUnavailable;
+        }
+    };
+    let hits = match vector_search(&qvec, 30) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn(&alloc::format!("vector_search failed: {}", abi_message(e)));
+            return SearchOutcome::ModelUnavailable;
+        }
+    };
+    let mut out = Vec::new();
+    for h in hits {
+        if let Ok(Some(alarm_id)) = db::alarm_id_for_ref(h.ref_id) {
+            if let Ok(Some(alarm)) = db::get_alarm(&alarm_id) {
+                out.push(SearchHit { alarm, score: h.score });
+            }
+        }
+    }
+    SearchOutcome::Results(out)
+}
+
+/// Parses a "YYYY-MM-DD HH:MM" search time field into unix seconds, or 0 (no
+/// bound) when empty/unparsable. Best-effort: accepts a leading date with an
+/// optional time; treats the input as UTC.
+fn parse_search_time(s: &str) -> i64 {
+    let s = s.trim();
+    if s.is_empty() { return 0; }
+    let bytes: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
+    let date = bytes.first().copied().unwrap_or("");
+    let dparts: Vec<&str> = date.split('-').collect();
+    if dparts.len() != 3 { return 0; }
+    let (y, mo, d) = match (dparts[0].parse::<i64>(), dparts[1].parse::<i64>(), dparts[2].parse::<i64>()) {
+        (Ok(y), Ok(mo), Ok(d)) if (1..=12).contains(&mo) && (1..=31).contains(&d) => (y, mo, d),
+        _ => return 0,
+    };
+    let (mut hh, mut mm) = (0i64, 0i64);
+    if let Some(time) = bytes.get(1) {
+        let tparts: Vec<&str> = time.split(':').collect();
+        hh = tparts.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+        mm = tparts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    }
+    days_from_civil(y, mo, d) * 86400 + hh * 3600 + mm * 60
+}
+
+/// Days since the unix epoch for a civil (proleptic Gregorian) date. Howard
+/// Hinnant's algorithm — exact, no leap-year edge cases.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Runs a search: persists the query into recents, audits it, and stores the
+/// REAL outcome (text-semantic / attribute hits, honest message, or placeholder).
 fn handle_search_submit(params: &JsonValue) -> JsonValue {
     let mode = search_mode();
     // The query control commits on keystroke, so the persisted value is
@@ -5531,22 +5906,27 @@ fn handle_search_submit(params: &JsonValue) -> JsonValue {
     let query = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| search_last_query(&mode));
-    if query.trim().is_empty() {
+    // Attribute mode can run on the structured fields alone (empty free text);
+    // every other mode needs a query string.
+    if query.trim().is_empty() && search_mode_norm(&mode) != "attribute" {
         with_state(|s| { s.clear_messages(); s.error_message = Some("Wpisz zapytanie przed wyszukaniem.".into()); });
         render_panel("search");
         return json!({"ok":false});
     }
     let _ = db::set_setting(&search_query_key(&mode), &query);
-    search_push_recent(&mode, &query);
+    if !query.trim().is_empty() {
+        search_push_recent(&mode, &query);
+    }
     // D5 attribute search is auditable per the RODO note; record every submit.
     let after = json!({"mode": mode, "query": query}).to_string();
     let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
-    with_state(|s| { s.clear_messages(); s.search.submitted = true; s.search.submitted_mode = mode.clone(); });
+    let outcome = run_search(&mode, &query);
+    with_state(|s| { s.clear_messages(); s.search.submitted_mode = mode.clone(); s.search.outcome = outcome; });
     render_panel("search");
     json!({"ok":true})
 }
 
-/// Re-runs a recent query: persists it as the current mode's query, then submits.
+/// Re-runs a recent query: persists it as the current mode's query, then runs it.
 fn handle_search_recent_pick(params: &JsonValue) -> JsonValue {
     let query = params.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
     if query.is_empty() { return json!({"ok":false}); }
@@ -5555,9 +5935,43 @@ fn handle_search_recent_pick(params: &JsonValue) -> JsonValue {
     search_push_recent(&mode, &query);
     let after = json!({"mode": mode, "query": query}).to_string();
     let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
-    with_state(|s| { s.clear_messages(); s.search.submitted = true; s.search.submitted_mode = mode.clone(); });
+    let outcome = run_search(&mode, &query);
+    with_state(|s| { s.clear_messages(); s.search.submitted_mode = mode.clone(); s.search.outcome = outcome; });
     render_panel("search");
     json!({"ok":true})
+}
+
+/// Backfills embeddings for every existing alarm into the events vector store.
+/// If no embedding model is deployed, reports the honest model-unavailable
+/// message instead of pretending success.
+fn handle_search_reindex() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    if !embedding_model_available() {
+        with_state(|s| s.error_message = Some(
+            "Model embeddingów niedostępny — skonfiguruj go w Ustawieniach / deploy. Indeksowanie pominięte.".into()
+        ));
+        render_panel("search");
+        return json!({"ok":false, "error":"no embedding model"});
+    }
+    let alarms = db::list_all_alarms().unwrap_or_default();
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    for a in &alarms {
+        match index_alarm(a) {
+            Ok(()) => ok += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    let _ = db::insert_audit(
+        SEARCH_ACTOR, "search_reindex", EVENT_VECTOR_NS,
+        "", &json!({"indexed": ok, "failed": failed}).to_string(),
+    );
+    with_state(|s| s.success_message = Some(alloc::format!(
+        "Zaindeksowano {} zdarzeń{}.", ok,
+        if failed > 0 { alloc::format!(" ({} błędów)", failed) } else { String::new() }
+    )));
+    render_panel("search");
+    json!({"ok":true, "indexed": ok, "failed": failed})
 }
 
 /// Clears the current mode's query + the just-submitted placeholder. Keeps the
@@ -8959,9 +9373,22 @@ fn build_storage_status_card() -> Component {
         Err(_) => ("błąd zapisu", "err", "tabela settings"),
     };
 
-    // Vector: this addon declares no vector host function / capability in its
-    // manifest, so report it honestly as unavailable rather than faking a count.
-    let (vec_label, vec_tone, vec_sub) = ("niedostępne", "muted", "brak host-fn / capability w manifeście");
+    // Vector: REAL probe. A zero-vector k=1 search over the declared `events`
+    // namespace proves the vector host function + capability respond (an empty
+    // result set still means the API works). Only a hard AbiError is "unavailable".
+    let (vec_label, vec_tone, vec_sub) = if vector_store_available() {
+        ("dostępny", "ok", "events · cosine 1024d · vector store")
+    } else {
+        ("niedostępny", "err", "vector_search zwrócił błąd")
+    };
+
+    // Embeddings: REAL probe of the embedding model behind llm.generate. The
+    // semantic search + indexing depend on it; report it honestly.
+    let (emb_label, emb_tone, emb_sub) = if embedding_model_available() {
+        ("dostępny", "ok", "llm.generate · model embeddingów")
+    } else {
+        ("niedostępny", "warn", "llm.generate · brak modelu embeddingów")
+    };
 
     // Recording: report configured recordings dir from settings + the granted
     // recording.read permission.
@@ -8982,10 +9409,11 @@ fn build_storage_status_card() -> Component {
 
     card(None, vec![
         heading(3, "Storage — wbudowane API TentaFlow"),
-        grid(4, vec![
+        grid(3, vec![
             cell("KV store", kv_label, kv_tone, kv_sub),
             cell("SQL · SQLite", sql_label, sql_tone, sql_sub),
             cell("Vector store", vec_label, vec_tone, vec_sub),
+            cell("Embeddings", emb_label, emb_tone, emb_sub),
             cell("Recording", rec_label, rec_tone, &alloc::format!("{}{}", rec_sub, if rec_dir.trim().is_empty() { String::new() } else { alloc::format!(" · {}", rec_dir) })),
         ]),
     ])
