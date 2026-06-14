@@ -54,6 +54,7 @@ import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
+import MlStudioScreen from '/js/modules/ml-studio.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
 import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
@@ -129,6 +130,7 @@ const ADMIN_NAV = [
     items: [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
+      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain' },
     ],
   },
   {
@@ -493,6 +495,7 @@ async function renderApp() {
   Router.register('flows', FlowsScreen);
   Router.register('flow-builder', FlowBuilderScreen);
   Router.register('scheduler', SchedulerScreen);
+  Router.register('ml-studio', MlStudioScreen);
   Router.register('skills', SkillsScreen);
   Router.register('agents', AgentsScreen);
   Router.register('mesh', MeshScreen);

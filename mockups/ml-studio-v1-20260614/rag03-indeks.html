@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<!-- ===== Plik: rag03-indeks.html — Indeks HNSW RAG: budowa indeksu wektorowego (backend vector_*, parametry M/efConstruction), postęp budowy, statystyki indeksu z pochodzeniem. ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Indeks HNSW (RAG)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Callout „pochodzenie wartości” (zero magii) ----- */
+  .origin-callout {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: linear-gradient(135deg, var(--accent-glow), transparent);
+    border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .origin-callout .oc-ico {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    background: var(--gradient-accent); color: white;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .origin-callout .oc-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.9; }
+  .origin-callout .oc-title { font-size: 12.5px; font-weight: 800; margin-bottom: 3px; }
+  .origin-callout .oc-text { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-scissors" viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-vector" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><path d="M2 17l10 5 10-5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Indeks HNSW (RAG)</h1>
+  <p class="lead">
+    Wektory z kroku „Chunking” (<strong>≈ 2 480 fragmentów × 1024 wymiary</strong>) trafiają do indeksu
+    <strong>HNSW</strong> na backendzie <code>vector_*</code>. Wszystkie statystyki tu pokazane — liczba wektorów,
+    wymiar, rozmiar indeksu, czas budowy — wynikają wprost z poprzednich kroków i realnego procesu budowy,
+    nie są wpisane na sztywno.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-layers"/></svg>HNSW na vector_*</h3>
+      <p>Graf nawigacyjny dla szybkiego wyszukiwania k-NN. Parametry M i efConstruction sterują jakością/kosztem.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-vector"/></svg>Wektory z kroku Chunking</h3>
+      <p>2 480 wektorów × 1024 wym. pochodzi z bge-m3 — nic nie jest dokładane „od systemu”.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-info"/></svg>Pochodzenie statystyk</h3>
+      <p>Rozmiar ~12 MB = 2 480 × 1024 × 4 B + graf; czas 38 s = realny przebieg budowy.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">RAG3</span>
+    <h2>Indeks HNSW — budowa indeksu wektorowego, postęp i statystyki (zakładka „Indeks”)</h2>
+    <div class="desc">Backend vector_* · parametry M / efConstruction · pasek budowy · stat-cards.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Baza wiedzy ADR (RAG)”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Indeks</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Baza wiedzy ADR (RAG) <span class="chip accent"><span class="dot"></span>typ: RAG</span></div>
+            <div class="d-sub">Indeks · budowa HNSW · gotowość do wyszukiwania</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Biblioteka zasobów</button>
+            <a class="btn btn-primary" href="rag04-eval.html"><svg class="icon"><use href="#i-chart"/></svg>Dalej: Ewaluacja</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Korpus</button>
+          <button class="tab"><svg class="icon"><use href="#i-scissors"/></svg>Chunking</button>
+          <button class="tab active"><svg class="icon"><use href="#i-layers"/></svg>Indeks</button>
+          <button class="tab"><svg class="icon"><use href="#i-chart"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-rocket"/></svg>Deploy</button>
+        </div>
+
+        <!-- Sekcja 1: Budowa indeksu -->
+        <section class="section-card ml-enter ml-enter-1">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Budowa indeksu — backend vector_* (HNSW)</div>
+            <span class="hint">Indeksuje ≈ 2 480 wektorów z kroku Chunking</span>
+          </div>
+          <div class="grid-3">
+            <div class="field">
+              <label>Backend</label>
+              <input class="input mono" value="vector_* · HNSW" readonly />
+              <span class="hint">Wbudowany silnik wektorowy TentaFlow (graf HNSW). Bez zewnętrznej bazy wektorowej.</span>
+            </div>
+            <div class="field">
+              <label>M (połączenia na węzeł)</label>
+              <input class="input mono" value="16" />
+              <span class="hint">Liczba sąsiadów w grafie. Wyższe M = lepszy recall, większy indeks i wolniejsza budowa.</span>
+            </div>
+            <div class="field">
+              <label>efConstruction</label>
+              <input class="input mono" value="200" />
+              <span class="hint">Szerokość przeszukiwania przy wstawianiu. Wyższe = dokładniejszy graf, dłuższa budowa.</span>
+            </div>
+          </div>
+
+          <!-- Pasek postępu budowy + status -->
+          <div class="section-card" style="background:var(--bg-input);margin:14px 0 0;">
+            <div class="flex align-center justify-between" style="margin-bottom:10px;">
+              <div class="flex align-center gap-sm">
+                <span class="status-pill ok">zbudowano</span>
+                <span class="text-sm fw-700">Indeks HNSW gotowy</span>
+              </div>
+              <span class="text-xs text-3 mono">2 480 / 2 480 wektorów wstawionych</span>
+            </div>
+            <div class="progress-row">
+              <div class="progress done"><span style="width:100%"></span></div>
+              <span class="pct">100%</span>
+            </div>
+            <div class="text-xs text-3 mt-sm" style="line-height:1.6">
+              Każdy z ≈ 2 480 wektorów (1024 wym., model bge-m3) został wstawiony do grafu HNSW z M=16, efConstruction=200.
+              Pasek odzwierciedla realny postęp wstawiania, nie animację poglądową.
+            </div>
+          </div>
+        </section>
+
+        <!-- Sekcja 2: Statystyki indeksu (stat-cards) -->
+        <section class="section-card ml-enter ml-enter-2">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-chart"/></svg>Statystyki zbudowanego indeksu</div>
+            <span class="hint">Każda wartość ma pochodzenie z poprzednich kroków</span>
+          </div>
+          <div class="grid-4">
+            <div class="stat-card">
+              <div class="sc-lbl">Wektory</div>
+              <div class="sc-val">2 480</div>
+              <div class="sc-foot">= fragmenty z kroku Chunking</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-lbl">Wymiar</div>
+              <div class="sc-val">1024</div>
+              <div class="sc-foot">= wymiar modelu bge-m3</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-lbl">Rozmiar indeksu</div>
+              <div class="sc-val">~12 MB</div>
+              <div class="sc-foot">2 480 × 1024 × 4 B + graf HNSW</div>
+            </div>
+            <div class="stat-card">
+              <div class="sc-lbl">Czas budowy</div>
+              <div class="sc-val">38 s</div>
+              <div class="sc-foot">realny przebieg na 1× CPU</div>
+            </div>
+          </div>
+          <div class="text-xs text-3 mt-md" style="line-height:1.6">
+            Rozmiar surowych wektorów: 2 480 × 1024 × 4 bajty (float32) ≈ 10,2 MB; graf sąsiedztw HNSW (M=16) dokłada
+            ~1,8 MB metadanych połączeń — stąd łącznie ~12 MB. Czas 38 s zmierzony podczas wstawiania wszystkich wektorów.
+          </div>
+        </section>
+
+        <!-- Callout pochodzenia / gotowości -->
+        <div class="origin-callout ml-enter ml-enter-3">
+          <div class="oc-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></div>
+          <div>
+            <div class="oc-title">Indeks zbudowany z fragmentów z kroku „Chunking” i modelu bge-m3. Gotowy do wyszukiwania.</div>
+            <div class="oc-text">
+              Indeks nie zawiera nic poza wektorami Twoich fragmentów: <span class="mono">2 480</span> wektorów po
+              <span class="mono">1024</span> wymiary, zbudowanych modelem <span class="mono">bge-m3</span> z kroku
+              Chunking. W następnym kroku „Ewaluacja” odpytasz ten indeks zestawem pytań testowych i zobaczysz metryki
+              retrieval (recall@k, MRR, nDCG) policzone na realnych trafieniach.
+            </div>
+          </div>
+        </div>
+
+        <!-- Nawigacja dół -->
+        <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+          <a class="btn btn-secondary" href="rag02-chunking.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Chunking</a>
+          <div class="flex gap-md align-center">
+            <span class="text-xs text-3">Indeks gotowy · 2 480 wektorów · 1024 wym.</span>
+            <a class="btn btn-primary btn-lg" href="rag04-eval.html">Dalej: Ewaluacja + Playground<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

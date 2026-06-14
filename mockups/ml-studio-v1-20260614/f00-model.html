@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: f00-model.html — Kreator FT LLM, Krok 1: Model bazowy
+     Opis: Realny krok 1 kreatora fine-tuningu Guard. Wybór modelu bazowego z
+           Biblioteki zasobów (capability = generacja LLM) + panel szczegółów.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Kreator FT · Model bazowy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .callout { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px;
+    background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.25);
+    border-radius: var(--radius); font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  .callout .icon { color: var(--info); flex-shrink: 0; margin-top: 1px; }
+  .origin-tag { font-size: 9.5px; font-weight: 800; padding: 2px 7px; border-radius: 5px;
+    letter-spacing: 0.03em; text-transform: uppercase; }
+  .origin-tag.serwis { background: rgba(34,197,94,0.13); color: var(--success); }
+  .origin-tag.hf { background: rgba(245,158,11,0.14); color: var(--warning); }
+  .base-card.selected { border-color: var(--accent-1); box-shadow: 0 0 0 1px var(--accent-1), var(--glow-indigo); }
+  .base-card .bc-spec { display: flex; gap: 14px; margin-top: 10px; flex-wrap: wrap; }
+  .base-card .bc-spec .sp { font-size: 11px; color: var(--text-2); }
+  .base-card .bc-spec .sp b { display: block; font-size: 12.5px; color: var(--text); font-weight: 800; }
+  .summary-line { display: flex; align-items: center; justify-content: space-between; padding: 8px 0;
+    border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  .summary-line:last-child { border-bottom: 0; }
+  .summary-line .sl-k { color: var(--text-3); }
+  .summary-line .sl-v { font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Kreator FT · Krok 1: Model bazowy (Guard)</h1>
+  <p class="lead">
+    Pierwszy realny krok kreatora fine-tuningu Guarda. Wybierasz <strong>model bazowy</strong>, który zostanie
+    dotrenowany na danych Guarda. Lista nie jest „magiczna” — pochodzi z <strong>Biblioteki zasobów</strong>
+    (Zasoby › Modele usług), a <em>capability check</em> pokazuje tylko modele zdolne do generacji LLM.
+    Po wyborze przechodzisz do Kroku 2 (Dane).
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-package"/></svg>Źródło: Biblioteka zasobów</h3>
+      <p>Każda karta = realny model dostępny w serwisie lub pobierany z HuggingFace. Zero hardcodu.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-check"/></svg>Capability check</h3>
+      <p>Filtr po zdolności „generacja LLM” — odpada to, czego nie da się dotrenować jako klasyfikator.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Wybór dla Guarda</h3>
+      <p>Qwen3.5-0.8B — mały, szybki, mieści się na jednej 4090. Idealny do klasyfikatora bezpieczeństwa.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">F0</span>
+    <h2>Kreator fine-tuningu — Krok 1: Model bazowy (aktywny)</h2>
+    <div class="desc">Stepper 5 kroków · model-card grid z Biblioteki · panel szczegółów.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Trenowanie modelu Guard”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Model bazowy</span>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-package"/></svg>Model bazowy</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Metoda</button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trening</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele</button>
+        </div>
+
+        <div class="section-card">
+          <!-- Stepper 5 kroków: krok 1 aktywny -->
+          <div class="stepper">
+            <div class="step active"><div class="num">1</div><div class="s-meta"><div class="s-label">Model bazowy</div><div class="s-desc">Krok 1 — aktywny</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">2</div><div class="s-meta"><div class="s-label">Dane</div><div class="s-desc">Krok 2</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">3</div><div class="s-meta"><div class="s-label">Metoda</div><div class="s-desc">Krok 3</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">4</div><div class="s-meta"><div class="s-label">Zasoby</div><div class="s-desc">Krok 4</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">5</div><div class="s-meta"><div class="s-label">Podsumowanie</div><div class="s-desc">Krok 5</div></div></div>
+          </div>
+
+          <h3><svg class="icon"><use href="#i-package"/></svg>Krok 1 — Wybierz model bazowy</h3>
+          <p class="section-sub">
+            Model, który dotrenujemy na danych Guarda. Dla klasyfikatora bezpieczeństwa promptów wystarczy mały
+            model — niższy koszt VRAM i szybsza inferencja produkcyjna.
+          </p>
+
+          <div class="callout" style="margin-bottom:16px;">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <span>Lista modeli pochodzi z <strong>Biblioteki zasobów</strong> (Zasoby › Modele usług).
+            <em>Capability check</em> pokazuje tylko modele zdolne do <strong>generacji LLM</strong> —
+            modele detekcji/OCR/embeddingów są tu odfiltrowane.</span>
+          </div>
+
+          <div class="grid-2" style="gap:14px;">
+            <div class="model-card base-card selected">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-brain"/></svg></div>
+                <div>
+                  <div class="mc-name">Qwen3.5-0.8B</div>
+                  <div class="mc-sub">Mały model bazowy — idealny do klasyfikatora Guard</div>
+                </div>
+                <span class="chip success ml-auto"><svg class="icon"><use href="#i-check"/></svg>Wybrany</span>
+              </div>
+              <div class="bc-spec">
+                <div class="sp">parametry<b>0.8 B</b></div>
+                <div class="sp">kontekst<b>32k</b></div>
+                <div class="sp">licencja<b>Apache-2.0</b></div>
+              </div>
+              <div class="flex align-center gap-sm" style="margin-top:10px;">
+                <span class="origin-tag serwis">dostępny w serwisie</span>
+                <span class="text-xs text-3">capability: generacja LLM</span>
+              </div>
+            </div>
+
+            <div class="model-card base-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-shield"/></svg></div>
+                <div>
+                  <div class="mc-name">Llama-Guard-86M</div>
+                  <div class="mc-sub">Gotowy guard — punkt startu z wbudowanymi etykietami safety</div>
+                </div>
+              </div>
+              <div class="bc-spec">
+                <div class="sp">parametry<b>86 M</b></div>
+                <div class="sp">kontekst<b>8k</b></div>
+                <div class="sp">licencja<b>Llama 3 Comm.</b></div>
+              </div>
+              <div class="flex align-center gap-sm" style="margin-top:10px;">
+                <span class="origin-tag serwis">dostępny w serwisie</span>
+                <span class="text-xs text-3">capability: generacja LLM</span>
+              </div>
+            </div>
+
+            <div class="model-card base-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-brain"/></svg></div>
+                <div>
+                  <div class="mc-name">Mistral-Small-3</div>
+                  <div class="mc-sub">Większy bazowy — wyższa jakość kosztem VRAM i czasu</div>
+                </div>
+              </div>
+              <div class="bc-spec">
+                <div class="sp">parametry<b>24 B</b></div>
+                <div class="sp">kontekst<b>32k</b></div>
+                <div class="sp">licencja<b>Apache-2.0</b></div>
+              </div>
+              <div class="flex align-center gap-sm" style="margin-top:10px;">
+                <span class="origin-tag hf">pobierany z HuggingFace</span>
+                <span class="text-xs text-3">capability: generacja LLM</span>
+              </div>
+            </div>
+
+            <div class="model-card base-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-plus"/></svg></div>
+                <div>
+                  <div class="mc-name">+ Własny z HuggingFace</div>
+                  <div class="mc-sub">Wskaż dowolne repo HF zdolne do generacji LLM</div>
+                </div>
+              </div>
+              <div class="field" style="margin-top:10px;margin-bottom:0;">
+                <div class="search-box">
+                  <svg class="icon"><use href="#i-link"/></svg>
+                  <input type="text" placeholder="np. Qwen/Qwen3.5-0.8B-Instruct" value="">
+                </div>
+                <span class="hint">Pobranie wymaga <code>hf_token</code> w Dostępach zewnętrznych (repo gated).</span>
+              </div>
+              <div class="flex align-center gap-sm" style="margin-top:10px;">
+                <span class="origin-tag hf">pobierany z HuggingFace</span>
+                <span class="text-xs text-3">capability sprawdzany po podaniu repo</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel szczegółów wybranego modelu -->
+          <div class="section-card mt-md" style="background:var(--bg-input);margin-bottom:0;">
+            <h3><svg class="icon"><use href="#i-info"/></svg>Szczegóły wybranego modelu — Qwen3.5-0.8B</h3>
+            <div class="grid-ml-2-1">
+              <div>
+                <div class="summary-line"><span class="sl-k">Parametry</span><span class="sl-v">0.8 B</span></div>
+                <div class="summary-line"><span class="sl-k">Długość kontekstu</span><span class="sl-v">32 768 tokenów</span></div>
+                <div class="summary-line"><span class="sl-k">Licencja</span><span class="sl-v">Apache-2.0 (komercyjne OK)</span></div>
+                <div class="summary-line"><span class="sl-k">Pochodzenie</span><span class="sl-v">dostępny w serwisie (Biblioteka zasobów)</span></div>
+                <div class="summary-line"><span class="sl-k">Capability</span><span class="sl-v">generacja LLM ✓</span></div>
+              </div>
+              <div class="flex col gap-md">
+                <div class="stat-card">
+                  <div class="sc-lbl">Bazowy F1 (bez FT)</div>
+                  <div class="sc-val">0.61</div>
+                  <div class="sc-foot">z benchmarku w f03 — punkt odniesienia dla dotrenowanego Guarda</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Nawigacja wizarda -->
+          <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+            <a class="btn btn-secondary" href="p01-kreator-projekt.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Kreator projektu</a>
+            <div class="flex gap-md align-center">
+              <span class="text-xs text-3">Krok 1 z 5</span>
+              <a class="btn btn-primary btn-lg" href="f-dane.html">Dalej: Dane<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

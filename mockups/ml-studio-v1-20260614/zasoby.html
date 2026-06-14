@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: zasoby.html
+     Opis: Biblioteka zasobów — globalna (cross-project) zakładka ML Studio.
+           Modele usług (capability matrix), słowniki lookup, źródła danych
+           i dostępy zewnętrzne. ŹRÓDŁO list w kreatorach całego modułu.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Biblioteka zasobów</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Capability matrix: chipy zdolności w komórce tabeli ----- */
+  .cap-chips { display: flex; gap: 5px; flex-wrap: wrap; }
+  .cap { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 2px 7px; border-radius: 5px; background: var(--bg-3); color: var(--text-2);
+    border: 1px solid var(--border); }
+  .cap.detekcja { background: rgba(96,165,250,0.14); color: var(--info); border-color: rgba(96,165,250,0.3); }
+  .cap.ocr { background: rgba(167,139,250,0.15); color: var(--accent-2); border-color: rgba(167,139,250,0.35); }
+  .cap.embedding { background: rgba(34,197,94,0.13); color: var(--success); border-color: rgba(34,197,94,0.3); }
+  .cap.generacja { background: rgba(245,158,11,0.14); color: var(--warning); border-color: rgba(245,158,11,0.3); }
+  .cap.asr { background: rgba(239,68,68,0.13); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+  .cap.vl { background: rgba(99,102,241,0.16); color: var(--accent-2); border-color: rgba(99,102,241,0.4); }
+  .cap.obraz { background: rgba(167,139,250,0.1); color: var(--accent-2); border-color: rgba(167,139,250,0.3); }
+
+  .callout { display: flex; gap: 12px; align-items: flex-start; padding: 13px 16px;
+    background: var(--accent-glow); border: 1px solid var(--accent-1); border-radius: var(--radius); }
+  .callout .icon { color: var(--accent-2); flex-shrink: 0; margin-top: 1px; }
+  .callout p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  .callout strong { color: var(--text); }
+
+  .lookup-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .lookup-table th { text-align: left; padding: 6px 10px; font-size: 9.5px; text-transform: uppercase;
+    color: var(--text-3); border-bottom: 1px solid var(--border); }
+  .lookup-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; }
+  .lookup-table td:last-child { font-family: 'Manrope', sans-serif; color: var(--text-2); }
+
+  .src-table td .src-name { font-family: ui-monospace, monospace; font-weight: 700; color: var(--text); }
+  .res-tabs { margin-bottom: 18px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Biblioteka zasobów (globalna)</h1>
+  <p class="lead">
+    <strong>Jedno źródło prawdy współdzielone przez wszystkie projekty.</strong> Tu mieszka to, co kreatory tylko
+    wybierają z listy: modele usług (z capability matrix), słowniki lookup, źródła danych i dostępy zewnętrzne.
+    Dzięki temu <strong>żadna lista w module nie jest „magiczna"</strong> — pole „Model OCR" w schemacie albo „Źródło danych"
+    w kreatorze treningu czyta wprost stąd. To zakładka globalna, nie wnętrze pojedynczego projektu.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-link"/></svg>Cross-project</h3>
+      <p>Zasoby są wspólne. Zmiana słownika lub modelu usługi propaguje się do każdego projektu, który go używa.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Capability matrix</h3>
+      <p>Każdy model ma zadeklarowane zdolności. Kreatory filtrują listy po wymaganej zdolności (OCR, detekcja, …).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-lock"/></svg>Sekrety w vault</h3>
+      <p>Dostępy zewnętrzne wskazują na <code>Settings › Dostępy zewnętrzne</code> (vault, <code>is_secret</code>, <code>&lt;redacted&gt;</code>).</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Z</span>
+    <h2>Biblioteka zasobów — modele usług, słowniki, źródła danych, dostępy</h2>
+    <div class="desc">Globalna zakładka · źródło list w kreatorach całego modułu.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">ML Studio</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Zasoby</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Biblioteka zasobów <span class="chip accent"><svg class="icon"><use href="#i-link"/></svg>globalna</span></div>
+            <div class="d-sub">Współdzielone między projektami: modele usług, słowniki lookup, źródła danych, dostępy</div>
+            <div class="d-badges">
+              <span class="chip info"><svg class="icon"><use href="#i-cpu"/></svg>8 modeli usług</span>
+              <span class="chip"><svg class="icon"><use href="#i-book"/></svg>1 słownik · 218 wierszy</span>
+              <span class="chip"><svg class="icon"><use href="#i-database"/></svg>4 źródła danych</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj zasobu…"></div>
+          </div>
+        </div>
+
+        <!-- Taby sekcji biblioteki -->
+        <div class="tabs-bar res-tabs">
+          <button class="tab active"><svg class="icon"><use href="#i-cpu"/></svg>Modele usług<span class="count">8</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Słowniki lookup<span class="count">1</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Źródła danych<span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-key"/></svg>Dostępy zewnętrzne<span class="count">4</span></button>
+        </div>
+
+        <!-- ===== Sekcja 1: Modele usług (capability matrix) ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Modele usług — capability matrix</div>
+            <span class="hint">Modele dostępne przez <code>service_request</code> / <code>llm_generate</code></span>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Model</th><th>Typ</th><th>Zdolności</th><th>Źródło</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">Qwen3.5-0.8B</td><td>LLM</td>
+                <td><div class="cap-chips"><span class="cap generacja">generacja</span></div></td>
+                <td>serwis · vLLM</td><td><span class="status-pill ok">online</span></td>
+              </tr>
+              <tr>
+                <td class="mono">Qwen3.6-27B</td><td>LLM (nauczyciel)</td>
+                <td><div class="cap-chips"><span class="cap generacja">generacja</span></div></td>
+                <td>serwis · vLLM</td><td><span class="status-pill ok">online</span></td>
+              </tr>
+              <tr>
+                <td class="mono">RF-DETR-cysterny</td><td>detektor</td>
+                <td><div class="cap-chips"><span class="cap detekcja">detekcja</span></div></td>
+                <td>serwis · vision-detection</td><td><span class="status-pill ok">online</span></td>
+              </tr>
+              <tr>
+                <td class="mono">OWLv2</td><td>detektor zero-shot</td>
+                <td><div class="cap-chips"><span class="cap detekcja">detekcja</span></div></td>
+                <td>serwis · vision-detection</td><td><span class="status-pill idle">na żądanie</span></td>
+              </tr>
+              <tr>
+                <td class="mono">trocr-base-printed</td><td>OCR</td>
+                <td><div class="cap-chips"><span class="cap ocr">OCR</span></div></td>
+                <td>serwis · ocr-engine</td><td><span class="status-pill ok">online</span></td>
+              </tr>
+              <tr>
+                <td class="mono">bge-m3</td><td>encoder</td>
+                <td><div class="cap-chips"><span class="cap embedding">embedding</span></div></td>
+                <td>serwis · embeddings</td><td><span class="status-pill ok">online</span></td>
+              </tr>
+              <tr>
+                <td class="mono">Whisper-large-v3</td><td>ASR</td>
+                <td><div class="cap-chips"><span class="cap asr">ASR</span></div></td>
+                <td>serwis · whisper</td><td><span class="status-pill idle">na żądanie</span></td>
+              </tr>
+              <tr>
+                <td class="mono">Qwen3-VL</td><td>vision-language</td>
+                <td><div class="cap-chips"><span class="cap vl">VL</span><span class="cap ocr">OCR</span><span class="cap obraz">generacja-obrazu</span></div></td>
+                <td>HF · ładowany lokalnie</td><td><span class="status-pill warn">degraded</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="callout mt-md">
+            <svg class="icon icon-lg"><use href="#i-info"/></svg>
+            <p>Z tej listy kreatory (<strong>Schemat OCR</strong>, <strong>Pre-label</strong>, <strong>Model bazowy</strong>,
+              <strong>Embedding</strong>) filtrują modele po wymaganej zdolności — to <strong>ŹRÓDŁO list w całym module</strong>.
+              Pole „Model OCR" w <code>r01</code> pokazuje tylko wiersze ze zdolnością <span class="cap ocr">OCR</span>,
+              pole „Pre-oznacz modelem" w <code>r02</code> — tylko <span class="cap detekcja">detekcja</span>.</p>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 2: Słowniki lookup ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-book"/></svg>Słowniki lookup</div>
+            <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy słownik</button>
+          </div>
+          <p class="section-sub">Tabele kod → wartości. Źródło lookupu w atrybutach OCR (<code>r01</code>):
+            po odczycie kodu schemat dopisuje pola ze słownika.</p>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Słownik</th><th>Mapowanie</th><th>Wiersze</th><th>Używany w</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">un_kody</td>
+                <td>kod (Kemler) → numer UN + nazwa materiału</td>
+                <td>218</td>
+                <td>Rozpoznawanie na cysternach · atrybut <code>kod</code></td>
+                <td><button class="btn btn-ghost btn-sm">Edytuj</button></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <!-- Podgląd wierszy słownika (jak w r01) -->
+          <div style="margin-top:12px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">
+            <div class="flex align-center justify-between" style="padding:8px 10px;border-bottom:1px solid var(--border);">
+              <span class="text-xs fw-700"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-book"/></svg>&nbsp;Podgląd „un_kody": kod → UN + nazwa (4 z 218)</span>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Wiersz</button>
+            </div>
+            <table class="lookup-table">
+              <thead><tr><th>kod (Kemler)</th><th>numer UN</th><th>nazwa materiału</th></tr></thead>
+              <tbody>
+                <tr><td>33</td><td>UN1203</td><td>Benzyna</td></tr>
+                <tr><td>30</td><td>UN1202</td><td>Olej napędowy</td></tr>
+                <tr><td>X423</td><td>UN1428</td><td>Sód</td></tr>
+                <tr><td>268</td><td>UN1005</td><td>Amoniak bezwodny</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 3: Źródła danych ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-database"/></svg>Źródła danych</div>
+            <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Podłącz źródło</button>
+          </div>
+          <p class="section-sub">Współdzielone zbiory z profilem (wiersze/kolumny). Źródło danych w kreatorach
+            <code>a-dane</code> / <code>t-dane</code> / <code>f-dane</code> / <code>rag01</code>.</p>
+          <table class="tf-table src-table">
+            <thead>
+              <tr><th>Źródło</th><th>Format</th><th>Profil</th><th>Używane w</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="src-name">przesylki_adr.xlsx</span></td><td>XLSX</td>
+                <td>42 180 wierszy · 17 kolumn</td>
+                <td>ML tabelaryczne · anomalie</td><td><span class="status-pill ok">gotowe</span></td>
+              </tr>
+              <tr>
+                <td><span class="src-name">dialogi_wsparcie.jsonl</span></td><td>JSONL</td>
+                <td>18 240 rekordów · pola (text, label)</td>
+                <td>Fine-tuning Guard</td><td><span class="status-pill ok">gotowe</span></td>
+              </tr>
+              <tr>
+                <td><span class="src-name">mowa_pl_adr</span></td><td>katalog WAV + transkrypty</td>
+                <td>3 410 nagrań · ~11 h</td>
+                <td>FT audio (Whisper)</td><td><span class="status-pill info">profilowanie</span></td>
+              </tr>
+              <tr>
+                <td><span class="src-name">dokumenty RAG (ADR/RID)</span></td><td>PDF / MD</td>
+                <td>312 dokumentów · ~9 800 stron</td>
+                <td>RAG dla dokumentów ADR</td><td><span class="status-pill idle">niezindeksowane</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- ===== Sekcja 4: Dostępy zewnętrzne ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-key"/></svg>Dostępy zewnętrzne</div>
+            <span class="hint">Wartości sekretów: <code>&lt;redacted&gt;</code></span>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Klucz</th><th>Przeznaczenie</th><th>Wartość</th><th>is_secret</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">hf_token</td><td>pobieranie modeli / gated repo z HuggingFace</td>
+                <td class="mono">&lt;redacted&gt;</td><td><span class="chip warning"><svg class="icon"><use href="#i-lock"/></svg>tak</span></td>
+                <td><span class="status-pill ok">ustawiony</span></td>
+              </tr>
+              <tr>
+                <td class="mono">ngc_api_key</td><td>NVIDIA NGC (kontenery TensorRT / triton)</td>
+                <td class="mono">&lt;redacted&gt;</td><td><span class="chip warning"><svg class="icon"><use href="#i-lock"/></svg>tak</span></td>
+                <td><span class="status-pill ok">ustawiony</span></td>
+              </tr>
+              <tr>
+                <td class="mono">claude_api_key</td><td>baseline ewaluacji vs Claude (benchmark eksportu)</td>
+                <td class="mono">&lt;redacted&gt;</td><td><span class="chip warning"><svg class="icon"><use href="#i-lock"/></svg>tak</span></td>
+                <td><span class="status-pill ok">ustawiony</span></td>
+              </tr>
+              <tr>
+                <td class="mono">db_postgres_adr</td><td>konektor DB (źródło danych tabelarycznych)</td>
+                <td class="mono">&lt;redacted&gt;</td><td><span class="chip warning"><svg class="icon"><use href="#i-lock"/></svg>tak</span></td>
+                <td><span class="status-pill ok">połączone</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="callout mt-md">
+            <svg class="icon icon-lg"><use href="#i-info"/></svg>
+            <p>Te wpisy re-używają istniejący ekran <strong>Settings › Dostępy zewnętrzne</strong> (vault, <code>is_secret</code>).
+              Lista zwraca <code>&lt;redacted&gt;</code> dla niepustych sekretów; biblioteka tylko wskazuje, który dostęp
+              zasila który kreator (DB, endpointy, baseline Claude).</p>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

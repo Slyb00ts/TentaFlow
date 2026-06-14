@@ -2325,6 +2325,60 @@ export const encode = {
     );
   },
 
+  /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
+  mlStudioProjectsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectTypesListRequest) — six fixed project types. */
+  mlStudioProjectTypesListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectTypesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectCreateRequest). payload: { name, description, projectType }. */
+  mlStudioProjectCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectCreateRequest(
+      String(payload.name ?? ''),
+      String(payload.description ?? ''),
+      String(payload.projectType ?? payload.project_type ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectDetailRequest). payload: { projectId }. */
+  mlStudioProjectDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectDetailRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.

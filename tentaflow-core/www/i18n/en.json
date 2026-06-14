@@ -23,6 +23,7 @@
     "scheduler": "Scheduler",
     "agents": "Agents",
     "skills": "Skills",
+    "ml_studio": "ML Studio",
     "playground": "Playground",
     "chat": "Chat",
     "rules": "Rules",

@@ -16,6 +16,7 @@
 
 pub mod nms;
 pub mod preprocessing;
+pub mod resize;
 
 pub mod hsemotion;
 pub mod movenet;

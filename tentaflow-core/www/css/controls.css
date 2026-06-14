@@ -1360,6 +1360,15 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   opacity: 1;
   transform: translateY(0);
 }
+/* Popup <tf-menu>: the `.open` class lives on the shadow-DOM panel, but the
+   items are slotted light-DOM descendants, so `.tf-menu.open .tf-menu-item`
+   cannot reach them (same reason as the inline workaround above) and they stay
+   opacity:0 — an open-but-empty menu. The host element carries the `open`
+   attribute, which IS a document-scope ancestor of the slotted items. */
+tf-menu[open] .tf-menu-item {
+  opacity: 1;
+  transform: translateY(0);
+}
 .tf-menu-item:hover {
   background: var(--tf-bg-3);
   color: var(--tf-text);

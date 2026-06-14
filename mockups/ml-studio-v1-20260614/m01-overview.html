@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — ML Studio · Przegląd (M1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-anomaly" viewBox="0 0 24 24"><path d="M3 12h3l2-7 4 14 3-9 2 2h4"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Przegląd (M1)</h1>
+  <p class="lead">
+    Addon <strong>ML Studio</strong> w globalnym shellu TentaFlow. Lewa kolumna to standardowa nawigacja TentaFlow;
+    wewnętrzna nawigacja modułu (Przegląd / Dane / Anotacja / Trenuj / Fine-tuning / Joby / Modele) odbywa się przez
+    <strong>zakładki</strong> w detail-header. Ten ekran to pulpit: KPI, ostatnie treningi, modele w serwisie i szybkie skróty.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-brain"/></svg>Jeden moduł</h3>
+      <p>ML, anotacja, dane i fine-tuning w jednym addonie — wspólne zbiory, joby i rejestr modeli.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Silniki + serwis</h3>
+      <p>Treningi odpalane przez flow engine na bundlach Python; inne modele z serwisu pre-oznaczają dane.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-zap"/></svg>Szybki start</h3>
+      <p>Skróty „Nowy trening / Pre-oznacz / Połącz dane” prowadzą wprost do właściwej przestrzeni.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M1</span>
+    <h2>Przegląd — ML Studio (kontekst: pełny shell TentaFlow)</h2>
+    <div class="desc">KPI modułu, ostatnie treningi, modele w serwisie, skróty. Operator: ML engineer.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">8</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip">
+            <div class="avatar">PJ</div>
+            <div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Przegląd</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Uczenie, fine-tuning i anotacja · deployment <span class="mono" style="color:var(--text-2)">gpu-node-01</span> · v0.1.0</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-play"/></svg>3 aktywne joby</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>11 modeli</span>
+              <span class="chip"><svg class="icon"><use href="#i-database"/></svg>9 zbiorów</span>
+              <span class="chip warning"><svg class="icon"><use href="#i-cpu"/></svg>GPU RTX 4090 · 81%</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-zap"/></svg>Nowy trening</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-image"/></svg>Anotacja<span class="count">2</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trenuj</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning</button>
+          <button class="tab"><svg class="icon"><use href="#i-play"/></svg>Joby<span class="count">3</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele<span class="count">11</span></button>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi ml-enter ml-enter-1">
+            <div class="label"><svg class="icon"><use href="#i-play"/></svg>Aktywne joby</div>
+            <div class="value">3 <span class="small">/ 12 dziś</span></div>
+            <div class="delta">2 fine-tune · 1 AutoML</div>
+          </div>
+          <div class="kpi ml-enter ml-enter-2">
+            <div class="label"><svg class="icon"><use href="#i-layers"/></svg>Modele</div>
+            <div class="value">11</div>
+            <div class="delta up">▲ 2 nowe wersje (7 dni)</div>
+          </div>
+          <div class="kpi ml-enter ml-enter-3">
+            <div class="label"><svg class="icon"><use href="#i-database"/></svg>Zbiory danych</div>
+            <div class="value">9 <span class="small">· 4.2 GB</span></div>
+            <div class="delta">3 z anotacją</div>
+          </div>
+          <div class="kpi ml-enter ml-enter-4">
+            <div class="label"><svg class="icon"><use href="#i-cpu"/></svg>GPU / VRAM</div>
+            <div class="value">81% <span class="small">· 21/24 GB</span></div>
+            <div class="delta warn">blisko limitu VRAM</div>
+          </div>
+        </div>
+
+        <div class="grid-ml-2-1">
+
+          <section class="section-card ml-enter ml-enter-2">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-clock"/></svg>Ostatnie treningi</div>
+              <a href="m06-joby.html" class="text-sm">Wszystkie joby <svg class="icon" style="width:12px;height:12px;vertical-align:middle"><use href="#i-chevron"/></svg></a>
+            </div>
+            <table class="tf-table">
+              <thead><tr><th>Job</th><th>Typ</th><th>Status</th><th style="width:160px">Postęp</th><th>GPU</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><div class="fw-700">Qwen3.6-7B · wsparcie ADR</div><div class="text-3 text-xs mono">ft-2041</div></td>
+                  <td><span class="chip accent">LoRA</span></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:64%"></span></div><span class="pct">64%</span></div></td>
+                  <td class="mono text-2">RTX 4090</td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">RF-DETR · cysterny ADR</div><div class="text-3 text-xs mono">tr-2039</div></td>
+                  <td><span class="chip info">vision</span></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:38%"></span></div><span class="pct">38%</span></div></td>
+                  <td class="mono text-2">RTX 4090</td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">AutoML · ryzyko przesyłki</div><div class="text-3 text-xs mono">am-2038</div></td>
+                  <td><span class="chip">AutoML</span></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:81%"></span></div><span class="pct">81%</span></div></td>
+                  <td class="mono text-2">CPU · 16 wątków</td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">Detektor anomalii · czujniki</div><div class="text-3 text-xs mono">an-2034</div></td>
+                  <td><span class="chip warning">anomalie</span></td>
+                  <td><span class="status-pill ok" style="color:var(--success)">gotowe</span></td>
+                  <td><div class="progress-row"><div class="progress done"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                  <td class="mono text-2">CPU</td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">Whisper-L v3 · domena PL</div><div class="text-3 text-xs mono">ft-2030</div></td>
+                  <td><span class="chip accent">QLoRA</span></td>
+                  <td><span class="status-pill err">błąd OOM</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:22%;background:var(--danger)"></span></div><span class="pct">22%</span></div></td>
+                  <td class="mono text-2">RTX 4090</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="section-card ml-enter ml-enter-3">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-zap"/></svg>Szybkie skróty</div>
+            </div>
+            <div class="flex col gap-md">
+              <a class="shortcut-card" href="m04-trenuj.html">
+                <div class="sc-ico"><svg viewBox="0 0 24 24"><use href="#i-cpu"/></svg></div>
+                <div><div class="sc-title">Nowy trening</div><div class="sc-desc">AutoML, anomalie lub klasyczne ML</div></div>
+              </a>
+              <a class="shortcut-card" href="m03-anotacja.html">
+                <div class="sc-ico"><svg viewBox="0 0 24 24"><use href="#i-image"/></svg></div>
+                <div><div class="sc-title">Pre-oznacz dane</div><div class="sc-desc">Wstępne ramki modelem z serwisu</div></div>
+              </a>
+              <a class="shortcut-card" href="m02-dane.html">
+                <div class="sc-ico"><svg viewBox="0 0 24 24"><use href="#i-database"/></svg></div>
+                <div><div class="sc-title">Połącz dane</div><div class="sc-desc">Upload pliku lub zewnętrzna baza</div></div>
+              </a>
+              <a class="shortcut-card" href="m05-finetuning.html">
+                <div class="sc-ico"><svg viewBox="0 0 24 24"><use href="#i-tune"/></svg></div>
+                <div><div class="sc-title">Fine-tune modelu</div><div class="sc-desc">LoRA / QLoRA / DPO / destylacja</div></div>
+              </a>
+            </div>
+          </section>
+
+        </div>
+
+        <section class="section-card mt-md ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Modele w serwisie</div>
+            <a href="m07-model.html" class="text-sm">Rejestr modeli <svg class="icon" style="width:12px;height:12px;vertical-align:middle"><use href="#i-chevron"/></svg></a>
+          </div>
+          <div class="grid-4">
+            <div class="model-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+                <div><div class="mc-name">Qwen3.6-7B-ADR</div><div class="mc-sub">LLM · LoRA · v3</div></div>
+              </div>
+              <div class="flex gap-sm"><span class="status-pill online">deployed</span><span class="chip">8.1 GB</span></div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">0.91</div><div class="mm-lbl">eval acc</div></div>
+                <div class="mc-metric"><div class="mm-val">42 t/s</div><div class="mm-lbl">tput</div></div>
+              </div>
+            </div>
+            <div class="model-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg viewBox="0 0 24 24"><use href="#i-target"/></svg></div>
+                <div><div class="mc-name">RF-DETR-cysterny</div><div class="mc-sub">vision · v5</div></div>
+              </div>
+              <div class="flex gap-sm"><span class="status-pill online">deployed</span><span class="chip">228 MB</span></div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">0.88</div><div class="mm-lbl">mAP50</div></div>
+                <div class="mc-metric"><div class="mm-val">31 ms</div><div class="mm-lbl">lat</div></div>
+              </div>
+            </div>
+            <div class="model-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg viewBox="0 0 24 24"><use href="#i-mic"/></svg></div>
+                <div><div class="mc-name">Whisper-L v3 PL</div><div class="mc-sub">audio · pełny</div></div>
+              </div>
+              <div class="flex gap-sm"><span class="status-pill idle">staging</span><span class="chip">1.5 GB</span></div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">7.2%</div><div class="mm-lbl">WER</div></div>
+                <div class="mc-metric"><div class="mm-val">x1.0</div><div class="mm-lbl">RTF</div></div>
+              </div>
+            </div>
+            <div class="model-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg viewBox="0 0 24 24"><use href="#i-anomaly"/></svg></div>
+                <div><div class="mc-name">IsoForest-czujniki</div><div class="mc-sub">anomalie · v2</div></div>
+              </div>
+              <div class="flex gap-sm"><span class="status-pill online">deployed</span><span class="chip">3 MB</span></div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">0.94</div><div class="mm-lbl">ROC-AUC</div></div>
+                <div class="mc-metric"><div class="mm-val">0.6 ms</div><div class="mm-lbl">lat</div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

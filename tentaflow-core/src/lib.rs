@@ -20,6 +20,7 @@ pub mod hub;
 pub mod inference;
 pub mod memory;
 pub mod mesh;
+pub mod ml_studio;
 pub mod metrics;
 pub mod net;
 pub mod prompt_registry;

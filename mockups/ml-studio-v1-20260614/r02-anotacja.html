@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: r02-anotacja.html
+     Opis: Anotacja z głębią — 3 kolumny: zdjęcia+postęp, obraz z ramkami,
+           panel klas (ze schematu) + atrybuty zaznaczonej ramki + pre-label modelem.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Anotacja</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* Panel atrybutów zaznaczonej ramki */
+  .attr-fill {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .attr-fill .af-label { font-size: 11px; font-weight: 700; color: var(--text-2);
+    display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .attr-fill .af-type {
+    font-size: 8.5px; font-weight: 800; text-transform: uppercase; padding: 1px 5px; border-radius: 4px;
+    background: rgba(167,139,250,0.15); color: var(--accent-2); letter-spacing: 0.04em;
+  }
+  .attr-fill .af-type.list { background: rgba(96,165,250,0.15); color: var(--info); }
+  .attr-fill .af-type.classifier { background: rgba(245,158,11,0.14); color: var(--warning); }
+  .ocr-read-row { display: flex; gap: 6px; align-items: stretch; }
+  .ocr-read-row .input { flex: 1; }
+  .ocr-result { font-size: 10px; color: var(--success); margin-top: 5px; display: flex; align-items: center; gap: 5px; }
+  .ocr-result svg { width: 11px; height: 11px; stroke: currentColor; fill: none; stroke-width: 2.5; }
+  .annotate-side-scroll { display: flex; flex-direction: column; gap: 12px; overflow-y: auto; max-height: 600px; padding-right: 2px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-polygon" viewBox="0 0 24 24"><polygon points="12 2 22 8.5 18 21 6 21 2 8.5"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Anotacja z głębią (cysterny ADR)</h1>
+  <p class="lead">
+    Trzy kolumny: po lewej <strong>lista zdjęć + postęp</strong>, w centrum <strong>obraz z edytowalnymi ramkami</strong>,
+    po prawej <strong>klasy ze schematu</strong> oraz — dla zaznaczonej ramki — <strong>panel atrybutów do wypełnienia</strong>
+    (odczyt OCR przyciskiem, stan z listy). Klasy i atrybuty NIE są tu wymyślane — pochodzą z zapisanego schematu.
+    „⚡ Pre-oznacz modelem” wstępnie wypełnia ramki i atrybuty modelem z serwisu (RF-DETR / OWLv2 / Qwen).
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-box"/></svg>Ramki ze schematu</h3>
+      <p>Lista klas pochodzi ze schematu; możesz też dodać/edytować klasę inline bez wychodzenia z anotacji.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-scan"/></svg>Wypełnianie atrybutów</h3>
+      <p>Dla zaznaczonej ramki widać pola atrybutów: OCR z „odczytaj”, klasa z listy, stan z klasyfikatora.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-zap"/></svg>Pre-label modelem</h3>
+      <p>Model z serwisu wstępnie wypełnia ramki + atrybuty (dashed = predykcja), człowiek tylko poprawia.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">R2</span>
+    <h2>Anotacja — ramka „tablica_adr” zaznaczona, panel atrybutów + Pre-label</h2>
+    <div class="desc">Zdjęcia · obraz z uchwytami · klasy ze schematu · atrybuty · ⚡ model.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Rozpoznawanie znaków na cysternach</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Anotacja</span>
+        </div>
+
+        <div class="tabs-bar">
+          <a class="tab" href="r01-schemat.html"><svg class="icon"><use href="#i-box"/></svg>Schemat</a>
+          <button class="tab active"><svg class="icon"><use href="#i-edit"/></svg>Anotacja<span class="count">61/144</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-image"/></svg>Dane<span class="count">144</span></button>
+          <a class="tab" href="a-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <div class="tabs-right">
+            <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-undo"/></svg>Cofnij</button>
+            <a class="btn btn-primary btn-sm" href="a-trening.html"><svg class="icon"><use href="#i-save"/></svg>Zapisz i dalej</a>
+          </div>
+        </div>
+
+        <div class="annotate-layout">
+
+          <!-- LEWA: lista zdjęć + postęp -->
+          <div class="annotate-tasks">
+            <div class="progress-row" style="margin-bottom:8px;">
+              <div class="progress"><span style="width:42%"></span></div>
+              <span class="pct">42%</span>
+            </div>
+            <div class="text-xs text-3" style="margin-bottom:6px;">61 z 144 oznaczonych</div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div><div class="t-name">cysterna_0188.jpg</div><div class="t-meta"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--success)"><use href="#i-check"/></svg> 4 ramki</div></div>
+            </div>
+            <div class="task-item active">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div><div class="t-name">cysterna_0189.jpg</div><div class="t-meta">edytowane teraz · 3 ramki</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div><div class="t-name">cysterna_0190.jpg</div><div class="t-meta">nieoznaczone</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div><div class="t-name">cysterna_0191.jpg</div><div class="t-meta">nieoznaczone</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div><div class="t-name">cysterna_0192.jpg</div><div class="t-meta">nieoznaczone</div></div>
+            </div>
+            <button class="btn btn-secondary btn-sm mt-sm" style="justify-content:center;border-style:dashed;">
+              <svg class="icon"><use href="#i-plus"/></svg>Dodaj zdjęcia
+            </button>
+          </div>
+
+          <!-- CENTRUM: obraz z ramkami -->
+          <div class="annotate-canvas">
+            <div class="ac-toolbar">
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-box"/></svg>Box</button>
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-polygon"/></svg>Poligon</button>
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-move"/></svg>Przesuń</button>
+              <span class="text-xs text-3 ml-auto">cysterna_0189.jpg · 1920×1080 · zoom 64%</span>
+            </div>
+            <div class="ac-stage">
+              <span class="scene-label">Cysterna ADR — brama wjazdowa · kamera CAM-02</span>
+              <!-- Sylwetka cysterny -->
+              <svg viewBox="0 0 400 240" style="width:78%;opacity:0.4;">
+                <rect x="40" y="120" width="300" height="70" rx="35" fill="#2f3668"/>
+                <rect x="20" y="140" width="40" height="50" rx="6" fill="#3a4178"/>
+                <circle cx="90" cy="200" r="18" fill="#1a1f45"/><circle cx="290" cy="200" r="18" fill="#1a1f45"/>
+              </svg>
+              <!-- Ramka zaznaczona: tablica_adr (z uchwytami) -->
+              <div class="anno-box" data-label="tablica_adr ✓" style="top:38%;left:30%;width:90px;height:46px;">
+                <span class="anno-handle tl"></span><span class="anno-handle tr"></span>
+                <span class="anno-handle bl"></span><span class="anno-handle br"></span>
+              </div>
+              <!-- Ramka inna klasa -->
+              <div class="anno-box success" data-label="nalepka" style="top:30%;left:55%;width:54px;height:54px;"></div>
+              <!-- Ramka predykcji (dashed) z pre-labelu -->
+              <div class="anno-box warning predicted" data-label="tablica_rejestracyjna 0.81" style="top:62%;left:22%;width:80px;height:30px;"></div>
+            </div>
+          </div>
+
+          <!-- PRAWA: klasy ze schematu + atrybuty zaznaczonej ramki + pre-label -->
+          <div class="annotate-side-scroll">
+
+            <!-- Pre-label -->
+            <button class="prelabel-btn"><svg class="icon"><use href="#i-zap"/></svg>Pre-oznacz modelem</button>
+            <div class="section-card" style="padding:12px;margin-bottom:0;">
+              <div class="text-xs text-3" style="margin-bottom:8px;">Model wstępnie oznaczający (z serwisu):</div>
+              <div class="model-pick selected">
+                <div><div class="m-name">RF-DETR</div><div class="m-meta">detekcja boxów · ramki + klasa</div></div>
+                <svg class="icon" style="margin-left:auto;color:var(--accent-1)"><use href="#i-check"/></svg>
+              </div>
+              <div class="model-pick">
+                <div><div class="m-name">OWLv2</div><div class="m-meta">open-vocab · po tekstowym opisie</div></div>
+              </div>
+              <div class="model-pick">
+                <div><div class="m-name">Qwen3-VL</div><div class="m-meta">multimodal · ramki + atrybuty (OCR)</div></div>
+              </div>
+              <p class="text-xs text-3" style="line-height:1.5;margin-top:6px;">
+                Predykcje pojawią się jako <strong>kropkowane ramki</strong> — akceptujesz lub poprawiasz.
+              </p>
+            </div>
+
+            <!-- Klasy ze schematu (zarządzanie inline) -->
+            <div class="section-card" style="padding:12px;margin-bottom:0;">
+              <div class="section-card-head" style="margin-bottom:8px;">
+                <div class="title" style="font-size:12px;"><svg class="icon"><use href="#i-box"/></svg>Klasy (ze schematu)</div>
+                <a class="btn btn-ghost btn-sm" href="r01-schemat.html"><svg class="icon"><use href="#i-edit"/></svg></a>
+              </div>
+              <div class="class-row" style="margin-bottom:5px;">
+                <span class="c-swatch" style="background:#a78bfa"></span><span class="c-name">tablica_adr</span><span class="c-key">1</span>
+              </div>
+              <div class="class-row" style="margin-bottom:5px;">
+                <span class="c-swatch" style="background:#60a5fa"></span><span class="c-name">tablica_rejestracyjna</span><span class="c-key">2</span>
+              </div>
+              <div class="class-row" style="margin-bottom:5px;">
+                <span class="c-swatch" style="background:#22c55e"></span><span class="c-name">nalepka</span><span class="c-key">3</span>
+              </div>
+              <div class="class-row" style="margin-bottom:5px;">
+                <span class="c-swatch" style="background:#f59e0b"></span><span class="c-name">znak_srodowiskowy</span><span class="c-key">4</span>
+              </div>
+              <div class="class-row">
+                <span class="c-swatch" style="background:#ef4444"></span><span class="c-name">termometr</span><span class="c-key">5</span>
+              </div>
+              <button class="btn btn-secondary btn-sm mt-sm" style="width:100%;justify-content:center;border-style:dashed;">
+                <svg class="icon"><use href="#i-plus"/></svg>Dodaj klasę inline
+              </button>
+            </div>
+
+            <!-- ATRYBUTY ZAZNACZONEJ RAMKI -->
+            <div class="section-card" style="padding:12px;margin-bottom:0;border-color:var(--accent-1);box-shadow:0 0 0 1px var(--accent-1);">
+              <div class="section-card-head" style="margin-bottom:8px;">
+                <div class="title" style="font-size:12px;">
+                  <span class="c-swatch" style="width:11px;height:11px;border-radius:3px;background:#a78bfa;display:inline-block;"></span>
+                  Ramka: tablica_adr
+                </div>
+                <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+              <p class="text-xs text-3" style="margin-bottom:10px;">Wypełnij atrybuty zdefiniowane w schemacie dla tej klasy:</p>
+
+              <!-- Atrybut OCR: kod -->
+              <div class="attr-fill">
+                <div class="af-label"><svg class="icon icon-sm" style="color:var(--accent-2)"><use href="#i-scan"/></svg>kod <span class="af-type">OCR</span></div>
+                <div class="ocr-read-row">
+                  <input class="input mono" value="33">
+                  <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-scan"/></svg>Odczytaj</button>
+                </div>
+                <div class="ocr-result"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg>lookup: 33 → UN1203 · Benzyna</div>
+              </div>
+
+              <!-- Atrybut z lookup-wynik (readonly) -->
+              <div class="attr-fill">
+                <div class="af-label"><svg class="icon icon-sm" style="color:var(--info)"><use href="#i-book"/></svg>numer_un <span class="af-type list">lookup</span></div>
+                <input class="input mono" value="UN1203" readonly style="opacity:.8">
+              </div>
+              <div class="attr-fill">
+                <div class="af-label"><svg class="icon icon-sm" style="color:var(--info)"><use href="#i-book"/></svg>material <span class="af-type list">lookup</span></div>
+                <input class="input" value="Benzyna" readonly style="opacity:.8">
+              </div>
+
+              <div class="flex gap-sm mt-sm">
+                <button class="btn btn-primary btn-sm" style="flex:1;justify-content:center;"><svg class="icon"><use href="#i-check"/></svg>Zatwierdź ramkę</button>
+              </div>
+            </div>
+
+            <!-- Przykład: panel atrybutów dla innej klasy (nalepka) -->
+            <div class="section-card" style="padding:12px;margin-bottom:0;">
+              <div class="section-card-head" style="margin-bottom:8px;">
+                <div class="title" style="font-size:12px;">
+                  <span class="c-swatch" style="width:11px;height:11px;border-radius:3px;background:#22c55e;display:inline-block;"></span>
+                  Inna ramka: nalepka
+                </div>
+              </div>
+              <div class="attr-fill">
+                <div class="af-label">klasa <span class="af-type list">lista</span></div>
+                <select class="select"><option>3 — ciecz zapalna</option><option>2.1 — gaz palny</option><option>5.1 — utleniacz</option><option>8 — żrące</option></select>
+              </div>
+              <div class="attr-fill">
+                <div class="af-label">stan <span class="af-type classifier">klasyfikator</span></div>
+                <select class="select"><option>czysta (model: 0.92)</option><option>brudna</option><option>uszkodzona</option></select>
+                <div class="text-xs text-3" style="margin-top:5px;">Wstępnie wypełnione przez klasyfikator stanu — możesz nadpisać.</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

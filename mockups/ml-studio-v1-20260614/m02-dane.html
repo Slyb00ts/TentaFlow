@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — ML Studio · Dane i połączenia (M2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Dane i połączenia (M2)</h1>
+  <p class="lead">
+    Wgrywasz pliki (xlsx / csv / parquet) lub podpinasz zewnętrzną bazę, podglądasz dane i w kreatorze
+    <strong>mapujesz kolumny na role</strong> (feature / label / id / text / prompt / response / timestamp).
+    Dla JSON mapujesz ścieżki. Wynik to znormalizowany zbiór gotowy do treningu.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-upload"/></svg>Upload &amp; bazy</h3>
+      <p>Konektory Rust: calamine (xlsx), csv, parquet/arrow; zewn. bazy przez sqlx (Postgres/MySQL/SQLite).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-arrow"/></svg>Mapowanie ról</h3>
+      <p>Każda kolumna dostaje rolę. Schemat zapisany w storage; konektor produkuje parquet/jsonl.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-code"/></svg>JSON / ścieżki</h3>
+      <p>Zagnieżdżony JSON mapowany przez jsonpath — np. <code>messages[].content</code> → rola text.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M2</span>
+    <h2>Dane i połączenia — upload, podgląd, mapowanie pól</h2>
+    <div class="desc">Kreator: Źródło → Podgląd → Mapowanie → Zapis zbioru.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">8</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Dane i połączenia</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Dane i połączenia · 9 zbiorów · 4.2 GB</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Połącz bazę</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zapisz zbiór</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-image"/></svg>Anotacja<span class="count">2</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trenuj</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning</button>
+          <button class="tab"><svg class="icon"><use href="#i-play"/></svg>Joby<span class="count">3</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele<span class="count">11</span></button>
+        </div>
+
+        <!-- Stepper kreatora -->
+        <div class="stepper ml-enter ml-enter-1">
+          <div class="step done"><div class="num"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Źródło</div><div class="s-desc">plik / baza</div></div></div>
+          <div class="s-line done"></div>
+          <div class="step active"><div class="num">2</div><div class="s-meta"><div class="s-label">Podgląd</div><div class="s-desc">tabela danych</div></div></div>
+          <div class="s-line"></div>
+          <div class="step"><div class="num">3</div><div class="s-meta"><div class="s-label">Mapowanie</div><div class="s-desc">kolumny → role</div></div></div>
+          <div class="s-line"></div>
+          <div class="step"><div class="num">4</div><div class="s-meta"><div class="s-label">Zapis</div><div class="s-desc">zbiór gotowy</div></div></div>
+        </div>
+
+        <div class="grid-ml-2-1">
+          <section class="section-card ml-enter ml-enter-2">
+            <div class="dropzone">
+              <div class="dz-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+              <div class="dz-title">Przeciągnij plik tutaj lub kliknij, aby wybrać</div>
+              <div class="dz-sub">Maksymalnie 2 GB na plik · dane zostają na węźle</div>
+              <div class="dz-formats">
+                <span class="chip">.xlsx</span><span class="chip">.csv</span><span class="chip">.parquet</span><span class="chip">.json</span><span class="chip">.jsonl</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="section-card ml-enter ml-enter-3">
+            <h3><svg class="icon"><use href="#i-database"/></svg>Źródła</h3>
+            <div class="flex col gap-sm">
+              <div class="model-pick selected">
+                <svg class="icon" style="color:var(--accent-2)"><use href="#i-file"/></svg>
+                <div style="flex:1"><div class="m-name">przesylki_adr.xlsx</div><div class="m-meta">12 480 wierszy · 9 kolumn · wgrane teraz</div></div>
+                <span class="chip success">aktywne</span>
+              </div>
+              <div class="model-pick">
+                <svg class="icon" style="color:var(--info)"><use href="#i-database"/></svg>
+                <div style="flex:1"><div class="m-name">pg · logistyka_prod</div><div class="m-meta">Postgres · tabela shipments · 1.2 M wierszy</div></div>
+              </div>
+              <div class="model-pick">
+                <svg class="icon" style="color:var(--text-3)"><use href="#i-code"/></svg>
+                <div style="flex:1"><div class="m-name">dialogi_wsparcie.jsonl</div><div class="m-meta">JSONL · 8 920 rekordów · prompt/response</div></div>
+              </div>
+            </div>
+            <button class="btn btn-secondary mt-md" style="width:100%;justify-content:center"><svg class="icon"><use href="#i-database"/></svg>Dodaj zewnętrzną bazę</button>
+          </section>
+        </div>
+
+        <!-- Podgląd tabeli -->
+        <section class="section-card ml-enter ml-enter-3">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-search"/></svg>Podgląd: przesylki_adr.xlsx</div>
+            <span class="hint">pierwsze 5 z 12 480 wierszy</span>
+          </div>
+          <table class="tf-table">
+            <thead><tr><th>id_przesylki</th><th>opis</th><th>masa_kg</th><th>klasa_adr</th><th>un</th><th>ryzyko</th><th>data_nadania</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">SH-10293</td><td>Benzyna silnikowa, cysterna</td><td>24 100</td><td>3</td><td class="mono">UN 1203</td><td><span class="chip danger">wysokie</span></td><td class="mono">2026-05-12</td></tr>
+              <tr><td class="mono">SH-10294</td><td>Olej napędowy</td><td>22 800</td><td>3</td><td class="mono">UN 1202</td><td><span class="chip warning">średnie</span></td><td class="mono">2026-05-12</td></tr>
+              <tr><td class="mono">SH-10295</td><td>Azot ciekły</td><td>9 400</td><td>2.2</td><td class="mono">UN 1977</td><td><span class="chip success">niskie</span></td><td class="mono">2026-05-13</td></tr>
+              <tr><td class="mono">SH-10296</td><td>Kwas siarkowy</td><td>18 250</td><td>8</td><td class="mono">UN 1830</td><td><span class="chip danger">wysokie</span></td><td class="mono">2026-05-13</td></tr>
+              <tr><td class="mono">SH-10297</td><td>Propan-butan</td><td>15 700</td><td>2.1</td><td class="mono">UN 1965</td><td><span class="chip warning">średnie</span></td><td class="mono">2026-05-14</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Mapowanie pól -->
+        <div class="grid-2">
+          <section class="section-card ml-enter ml-enter-4">
+            <h3><svg class="icon"><use href="#i-arrow"/></svg>Mapowanie pól → role · tabela (xlsx)</h3>
+            <div class="section-sub">Określ, czym jest każda kolumna. Silnik dostaje znormalizowany zbiór wg ról.</div>
+            <div class="map-row">
+              <div class="m-col">id_przesylki<div class="m-type">string</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>id (identyfikator)</option><option>feature</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">opis<div class="m-type">text</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>text (cecha tekstowa)</option><option>feature</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">masa_kg<div class="m-type">number</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>feature (cecha numeryczna)</option><option>label</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">klasa_adr<div class="m-type">category</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>feature (kategoria)</option><option>label</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row" style="border-color:var(--accent-1);box-shadow:0 0 0 1px var(--accent-1)">
+              <div class="m-col">ryzyko<div class="m-type">category</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>label (cel klasyfikacji)</option><option>feature</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">data_nadania<div class="m-type">date</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>timestamp</option><option>feature</option><option>ignoruj</option></select>
+            </div>
+          </section>
+
+          <section class="section-card ml-enter ml-enter-4">
+            <h3><svg class="icon"><use href="#i-code"/></svg>Mapowanie ścieżek JSON · dialogi_wsparcie.jsonl</h3>
+            <div class="section-sub">Zagnieżdżone pola mapowane przez ścieżki (jsonpath) na role do fine-tuningu LLM.</div>
+            <div class="code-block" style="margin-bottom:14px"><span class="c"># próbka rekordu</span>
+{
+  <span class="k">"messages"</span>: [
+    { <span class="k">"role"</span>: <span class="s">"user"</span>, <span class="k">"content"</span>: <span class="s">"Jak oznaczyć cysternę UN 1203?"</span> },
+    { <span class="k">"role"</span>: <span class="s">"assistant"</span>, <span class="k">"content"</span>: <span class="s">"Tablica pomarańczowa 33/1203..."</span> }
+  ],
+  <span class="k">"ticket_id"</span>: <span class="v">48201</span>
+}</div>
+            <div class="map-row">
+              <div class="m-col">$.messages[role=user].content<div class="m-type">jsonpath</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>prompt</option><option>text</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">$.messages[role=assistant].content<div class="m-type">jsonpath</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>response</option><option>text</option><option>ignoruj</option></select>
+            </div>
+            <div class="map-row">
+              <div class="m-col">$.ticket_id<div class="m-type">number</div></div>
+              <div class="m-arrow"><svg><use href="#i-arrow"/></svg></div>
+              <select class="select"><option>id</option><option>feature</option><option>ignoruj</option></select>
+            </div>
+            <div class="flex justify-between align-center mt-md">
+              <span class="chip accent"><svg class="icon"><use href="#i-check"/></svg>2 pary prompt/response wykryte</span>
+              <button class="btn btn-primary"><svg class="icon"><use href="#i-arrow"/></svg>Dalej: zapis zbioru</button>
+            </div>
+          </section>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

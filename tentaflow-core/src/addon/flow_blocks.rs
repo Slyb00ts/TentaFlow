@@ -41,7 +41,8 @@ struct RawBlockDefinition {
     /// Kategoria w palecie (np. "addon", "communication", "utility")
     #[serde(default = "default_category")]
     category: String,
-    /// Etykieta wyswietlana w UI
+    /// Etykieta wyswietlana w UI (akceptuje tez klucz `title`).
+    #[serde(alias = "title")]
     label: String,
     /// Opis bloczka
     #[serde(default)]
@@ -135,12 +136,23 @@ pub fn load_blocks_from_addon(addon_id: &str, addon_dir: &Path) -> Result<Vec<Ad
 /// Parsuje zawartosc blocks.json i zwraca liste AddonFlowBlock.
 /// Obsluguje oba formaty portow: legacy (lista stringow) i nowy (obiekty).
 pub fn parse_blocks_json(addon_id: &str, json_content: &str) -> Result<Vec<AddonFlowBlock>> {
-    let raw: RawBlocksFile = serde_json::from_str(json_content)
+    // Dwa rownoprawne ksztalty pliku: goła tablica bloczkow albo obiekt
+    // `{ "blocks": [...] }`. Najpierw rozrozniamy po typie korzenia, zeby
+    // blad parsowania niosl konkretny powod zamiast generycznego untagged.
+    let root: serde_json::Value = serde_json::from_str(json_content)
         .with_context(|| format!("Niepoprawny format blocks.json dla addonu '{}'", addon_id))?;
+    let raw_blocks: Vec<RawBlockDefinition> = if root.is_array() {
+        serde_json::from_value(root)
+            .with_context(|| format!("Niepoprawny format blocks.json dla addonu '{}'", addon_id))?
+    } else {
+        serde_json::from_value::<RawBlocksFile>(root)
+            .with_context(|| format!("Niepoprawny format blocks.json dla addonu '{}'", addon_id))?
+            .blocks
+    };
 
-    let mut blocks = Vec::with_capacity(raw.blocks.len());
+    let mut blocks = Vec::with_capacity(raw_blocks.len());
 
-    for raw_block in raw.blocks {
+    for raw_block in raw_blocks {
         // Parsuj porty wejsciowe — obsluga obu formatow
         let inputs = parse_ports(&raw_block.inputs, &raw_block.input_ports, true);
         let outputs = parse_ports(&raw_block.outputs, &raw_block.output_ports, false);
@@ -417,6 +429,28 @@ mod tests {
         assert_eq!(blocks[0].outputs.len(), 2);
         assert_eq!(blocks[0].outputs[0].name, "success");
         assert_eq!(blocks[0].outputs[0].required, false);
+    }
+
+    #[test]
+    fn test_parse_blocks_json_top_level_array_with_title() {
+        // Ksztalt uzywany przez deep-research/contacts: goła tablica + klucz
+        // `title` zamiast `label`. Musi byc rownoprawny z `{ "blocks": [...] }`.
+        let json = r#"[
+            {
+                "type": "deep-research.search_web",
+                "title": "Szukaj w internecie",
+                "category": "Research",
+                "inputs": [ { "name": "query", "type": "string", "required": true } ],
+                "outputs": [ { "name": "results", "type": "array" } ]
+            }
+        ]"#;
+
+        let blocks = parse_blocks_json("deep-research", json).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].label, "Szukaj w internecie");
+        assert_eq!(blocks[0].block_type, "addon.deep-research.deep-research.search_web");
+        assert_eq!(blocks[0].inputs.len(), 1);
+        assert_eq!(blocks[0].outputs[0].name, "results");
     }
 
     #[test]

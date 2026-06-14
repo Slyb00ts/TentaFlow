@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 use tokio::sync::{mpsc, watch};
 
 use super::credentials::{credentials_cipher, overlay_credentials};
+use super::decoder_detect::{detect_profile, gpu_resident_available, HwDecoder};
 use super::error::{CameraIngestError, Result};
 use super::fakefile::{ensure_gst_initialized, FrameCounters, FrameMailbox, LatestFrame};
 use super::session::{
@@ -147,19 +148,66 @@ pub struct RtspPipelineHandles {
     pub tee: gst::Element,
 }
 
-/// Build the typed-element RTSP pipeline. `rtspsrc`'s source pad is dynamic
-/// (it appears once SDP negotiation completes), so we register a
-/// `pad-added` handler that links it to `rtph264depay` only for video
-/// streams.
-pub fn build_rtsp_pipeline(
-    camera_id: String,
-    url: &str,
-    timeout_secs: u32,
-    mailbox: Arc<FrameMailbox>,
-    counters: Arc<FrameCounters>,
-) -> Result<RtspPipelineHandles> {
-    let pipeline = gst::Pipeline::new();
+/// Którą ścieżką dekodowania budujemy pipeline dla bieżącej próby. `Cpu` to
+/// zawsze działający fallback (decodebin → videoconvert). `GpuResidentNvidia`
+/// to wariant NVIDIA, w którym dekoding I konwersja kolorów dzieją się na GPU
+/// (nvhXdec → cudaconvert → cudadownload), a na CPU schodzi dopiero pełna
+/// klatka RGB. Wybór i fallback GPU-resident → CPU obsługuje `run_rtsp_session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestPath {
+    GpuResidentNvidia,
+    Cpu,
+}
 
+impl IngestPath {
+    /// Krótka etykieta do logów — by od razu było widać, którą ścieżką poszedł
+    /// ingest danej kamery.
+    fn label(self) -> &'static str {
+        match self {
+            IngestPath::GpuResidentNvidia => "GPU-resident CUDA",
+            IngestPath::Cpu => "CPU decode",
+        }
+    }
+}
+
+/// Rozstrzyga, czy NA STARCIE próbować dekodowania sprzętowego dla tej kamery.
+/// `decoder_override` z konfiguracji ma pierwszeństwo nad auto-detekcją:
+///   * `Some(Software)` → wymuś CPU (nigdy nie próbuj HW),
+///   * `Some(hw)`       → wymuś próbę HW (operator wie lepiej),
+///   * `None`           → auto: HW gdy profil sprzętowy go preferuje.
+/// Zwraca `true`, gdy pierwsza próba ma użyć dekodera sprzętowego. Fallback na
+/// CPU po nieudanej negocjacji obsługuje `run_rtsp_session` (stąd „pierwsza próba").
+fn resolve_use_hw_decode(config: &CameraConfig) -> bool {
+    match config.decoder_override {
+        Some(HwDecoder::Software) => false,
+        Some(hw) => hw.is_hardware(),
+        None => detect_profile().prefer_hw,
+    }
+}
+
+/// Rozstrzyga ścieżkę ingestu NA STARCIE sesji. Preferujemy wariant
+/// GPU-resident NVIDIA, gdy operator nie wymusił dekodera programowego
+/// (`decoder_override = Some(Software)`) ORAZ runtime ma kompletny łańcuch
+/// CUDA (`gpu_resident_available`). W przeciwnym razie idziemy ścieżką CPU
+/// (decodebin), która działa na każdej platformie. Fallback w runtime
+/// (GPU-resident nie zbuduje się / nie znegocjuje) obsługuje
+/// `run_rtsp_session`, stąd „na starcie".
+fn resolve_ingest_path(config: &CameraConfig) -> IngestPath {
+    let forced_software = matches!(config.decoder_override, Some(HwDecoder::Software));
+    if !forced_software && gpu_resident_available() {
+        IngestPath::GpuResidentNvidia
+    } else {
+        IngestPath::Cpu
+    }
+}
+
+/// Buduje i konfiguruje `rtspsrc` — wspólny początek obu wariantów pipeline'u
+/// (CPU i GPU-resident). Czyści `?enableSrtp`, dobiera maskę `protocols`
+/// (TLS dla rtsps://), wyłącza wewnętrzny retry (reconnect zarządzamy na
+/// poziomie sesji) i filtruje strumienie do samego wideo przez `select-stream`.
+/// Zwraca gotowy element — dynamic linking pada wideo robi
+/// `connect_rtspsrc_video_pad`.
+fn build_rtspsrc(url: &str, timeout_secs: u32) -> Result<gst::Element> {
     // Strip vendor-specific query parameters that ask the server to wrap RTP
     // in SRTP/SRTCP (e.g. UniFi Protect `?enableSrtp`). Our pipeline only
     // handles plain RTP — rtspsrc honors the cipher suite advertised in SDP
@@ -240,40 +288,77 @@ pub fn build_rtsp_pipeline(
         Some(include.to_value())
     });
     tracing::info!(
-        "rtsp: built pipeline url_scheme={} protocols={}",
+        "rtsp: built rtspsrc url_scheme={} protocols={}",
         if is_tls { "rtsps" } else { "rtsp" },
         protocols_str
     );
+    Ok(rtspsrc)
+}
 
-    // `decodebin` autoplugs the right depayloader + parser + decoder based
-    // on the RTP caps actually delivered by the server. Previous pipeline
-    // hard-wired rtph264depay+h264parse+avdec_h264 which `not-negotiated`s
-    // out when the NVR streams H.265 (UniFi G4/G5, Hikvision IPC-Bxxx,
-    // Dahua N-series with HEVC profile) or MJPEG. Using decodebin keeps the
-    // pipeline codec-agnostic; downstream we still cap to RGB so the appsink
-    // contract (raw RGB24 frames) is unchanged.
-    let decodebin = gst::ElementFactory::make("decodebin")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("decodebin: {e}")))?;
-    // Force software decoders. If decodebin autoplugs an NVIDIA / VAAPI /
-    // QSV decoder, output caps land in GPU memory (e.g. CUDAMemory NV12)
-    // which `videoconvert` (CPU-only) cannot read — pipeline aborts with
-    // `not-negotiated (-4)` when downstream demands `format=RGB`. Software
-    // decode of 1080p H.264 costs ~3-5% of a CPU core, acceptable for
-    // MVP; a GPU-aware path with `cudadownload` / `vaapipostproc` is a
-    // later optimization. Setting via `set_property` after build because
-    // the builder-side `.property("force-sw-decoders", true)` silently
-    // failed to take effect in gstreamer-rs 0.23 (verified by HW decoder
-    // still autoplugged after restart).
-    decodebin.set_property("force-sw-decoders", true);
-    let fsd_active: bool = decodebin.property("force-sw-decoders");
-    tracing::info!("rtsp: decodebin force-sw-decoders={}", fsd_active);
-    // RTP input capsfilter — pins decodebin's input to `application/x-rtp,
-    // media=video`. Without this, decodebin may briefly see ambiguous caps
-    // during rtspsrc setup and abort the pipeline with `not-negotiated (-4)`
-    // before its first output pad is exposed. Verified by replicating the
-    // exact pipeline in gst-launch: bare `rtspsrc ! decodebin` failed, while
-    // `rtspsrc ! application/x-rtp,media=video ! decodebin` succeeded.
+/// Podłącza dynamiczny pad wideo z `rtspsrc` do statycznego `sink` elementu
+/// `target` (w obu wariantach jest to RTP capsfilter przed `tee`). rtspsrc
+/// emituje `pad-added`, zanim caps RTP są znegocjowane, więc próbujemy zlinkować
+/// od razu, a gdy caps jeszcze nie ma — dowieszamy jednorazowy watcher
+/// `notify::caps`. Linkujemy tylko pad `media=video`. Wspólne dla CPU i
+/// GPU-resident, bo oba mają identyczny front RTP.
+fn connect_rtspsrc_video_pad(rtspsrc: &gst::Element, target: &gst::Element) {
+    let depay_weak = target.downgrade();
+    let try_link =
+        std::sync::Arc::new(move |src_pad: &gst::Pad| -> std::ops::ControlFlow<(), ()> {
+            // ControlFlow::Break = handled (linked, skipped, or impossible) — no
+            // need to keep watching. ControlFlow::Continue = caps not yet known.
+            let Some(depay) = depay_weak.upgrade() else {
+                return std::ops::ControlFlow::Break(());
+            };
+            let Some(sink_pad) = depay.static_pad("sink") else {
+                return std::ops::ControlFlow::Break(());
+            };
+            if sink_pad.is_linked() {
+                return std::ops::ControlFlow::Break(());
+            }
+            let Some(caps) = src_pad.current_caps() else {
+                return std::ops::ControlFlow::Continue(());
+            };
+            let Some(structure) = caps.structure(0) else {
+                return std::ops::ControlFlow::Break(());
+            };
+            let media: Option<String> = structure.get::<String>("media").ok();
+            if media.as_deref() != Some("video") {
+                tracing::debug!("rtsp: skipping non-video pad (media={:?})", media);
+                return std::ops::ControlFlow::Break(());
+            }
+            if let Err(e) = src_pad.link(&sink_pad) {
+                tracing::warn!("rtsp: failed to link rtspsrc → depay: {e:?}");
+            } else {
+                tracing::info!("rtsp: video pad linked");
+            }
+            std::ops::ControlFlow::Break(())
+        });
+    let try_link_pad = try_link.clone();
+    rtspsrc.connect_pad_added(move |_src, src_pad| {
+        if try_link_pad(src_pad).is_break() {
+            return;
+        }
+        // Caps not negotiated yet — re-try on every caps change. We rely on
+        // the sink_pad.is_linked() check inside try_link to keep this
+        // idempotent across multiple `notify::caps` emissions.
+        let try_link_notify = try_link_pad.clone();
+        src_pad.connect_notify_local(Some("caps"), move |pad, _spec| {
+            let _ = try_link_notify(pad);
+        });
+    });
+}
+
+/// Buduje RTP capsfilter + tee + queue branchu A — wspólny front fan-outu RTP
+/// dla obu wariantów. `tee` pozwala dowiesić Branch B (fMP4) bez przebudowy
+/// pipeline'u; `queue_a` odcina branch A (dekod) od branchu B. Zwraca elementy
+/// w kolejności linkowania; caller dodaje je do pipeline'u, linkuje
+/// `rtp_filter → tee → queue_a` i podpina ogon branchu A do `queue_a`.
+fn build_rtp_front() -> Result<(gst::Element, gst::Element, gst::Element)> {
+    // RTP input capsfilter — pins the branch to `application/x-rtp,
+    // media=video`. Without this, the downstream decoder may briefly see
+    // ambiguous caps during rtspsrc setup and abort the pipeline with
+    // `not-negotiated (-4)` before its first output pad is exposed.
     let rtp_caps = gst::Caps::builder("application/x-rtp")
         .field("media", "video")
         .build();
@@ -282,36 +367,10 @@ pub fn build_rtsp_pipeline(
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp capsfilter: {e}")))?;
 
-    let convert = gst::ElementFactory::make("videoconvert")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
-
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("format", "RGB")
-        .build();
-    let capsfilter = gst::ElementFactory::make("capsfilter")
-        .property("caps", &caps)
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
-
-    let appsink = gst::ElementFactory::make("appsink")
-        .property("name", "sink")
-        .property("emit-signals", false)
-        // RTSP frames arrive at network cadence; sync=false avoids stalling
-        // when the clock and the RTSP source disagree on timestamps.
-        .property("sync", false)
-        .property("max-buffers", 1u32)
-        .property("drop", true)
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
-
     // `tee` fans the RTP stream out between Branch A (decode → RGB → appsink,
     // always present, drives the existing frame_storage / streaming_bus path)
     // and an optional Branch B (rtph264depay → h264parse → mp4mux → appsink)
-    // attached on demand by `attach_mp4_branch` when a consumer subscribes
-    // to the `camera:<id>` stream through `StreamHub`. Without the tee the
-    // pipeline could feed only one downstream consumer at a time; with it
-    // Branch B can come and go without disturbing Branch A.
+    // attached on demand by `attach_mp4_branch`.
     let tee = gst::ElementFactory::make("tee")
         .property("name", "rtp_tee")
         // allow-not-linked=true tolerates the gap between pipeline start and
@@ -329,11 +388,136 @@ pub fn build_rtsp_pipeline(
         .property("max-size-buffers", 30u32)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a: {e}")))?;
-    // `leaky` is a GFlags enum (GstQueueLeaky), not a raw uint — the gst-rs
-    // builder API panics if we pass `2u32`. Use stringified value parsed by
-    // GFlags::from_str. "downstream" = drop the oldest buffer when the queue
-    // fills up, matching the previous numeric `2` literal.
+    // `leaky` is a GFlags enum (GstQueueLeaky), not a raw uint. "downstream" =
+    // drop the oldest buffer when the queue fills up.
     queue_a.set_property_from_str("leaky", "downstream");
+    Ok((rtp_filter, tee, queue_a))
+}
+
+/// Buduje appsink z kontraktem ingestu (RGB24, max-buffers=1, drop=true) i
+/// instaluje callback ramki. Wspólny dla obu wariantów — kontrakt downstream
+/// (FrameStorage / StreamingBus / fMP4) jest niezależny od ścieżki dekodowania.
+fn build_appsink(
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink")
+        .property("emit-signals", false)
+        // RTSP frames arrive at network cadence; sync=false avoids stalling
+        // when the clock and the RTSP source disagree on timestamps.
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| CameraIngestError::PipelineBuild("appsink downcast failed".into()))?;
+    install_frame_callback(&appsink_app, camera_id, mailbox, counters);
+    Ok(appsink)
+}
+
+/// Dispatcher budowy pipeline'u RTSP. Wybiera wariant wg `ingest_path`:
+///   * `GpuResidentNvidia` → `build_rtsp_pipeline_gpu_resident` (dekod +
+///     konwersja kolorów na GPU, na CPU schodzi dopiero pełna klatka RGB),
+///   * `Cpu`               → `build_rtsp_pipeline_cpu` (decodebin → videoconvert,
+///     działa na każdej platformie; `use_hw_decode` pozwala decodebinowi
+///     autoplugować dekoder sprzętowy best-effort).
+/// Oba warianty mają identyczne wyjście (RGB, ten sam appsink callback), więc
+/// reszta systemu (frame storage, fMP4 publisher, addon pickup) jest bez zmian.
+///
+/// TODO(GPU-resident inne platformy): analogiczne warianty GPU-resident dla
+/// macOS/iOS (vtdec → metalconvert/glcolorconvert → gldownload), Windows
+/// (d3d11h26Xdec → d3d11convert → d3d11download) i Linux VA-API
+/// (vah26Xdec → vapostproc → vadownload) można dodać jako kolejne gałęzie
+/// `IngestPath`. Dziś te platformy idą ścieżką CPU (działa, decodebin
+/// autopluguje dekoder HW best-effort), więc to optymalizacja, nie brak funkcji.
+fn build_rtsp_pipeline(
+    camera_id: String,
+    url: &str,
+    timeout_secs: u32,
+    ingest_path: IngestPath,
+    use_hw_decode: bool,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<RtspPipelineHandles> {
+    match ingest_path {
+        IngestPath::GpuResidentNvidia => {
+            build_rtsp_pipeline_gpu_resident(camera_id, url, timeout_secs, mailbox, counters)
+        }
+        IngestPath::Cpu => build_rtsp_pipeline_cpu(
+            camera_id,
+            url,
+            timeout_secs,
+            use_hw_decode,
+            mailbox,
+            counters,
+        ),
+    }
+}
+
+/// Wariant CPU pipeline'u RTSP — `decodebin` autopluguje depay+parse+dekoder
+/// wg kodeka strumienia, a `videoconvert` daje RGB na CPU. Zawsze działa
+/// (każda platforma). `rtspsrc`'s source pad is dynamic (it appears once SDP
+/// negotiation completes), so we register a `pad-added` handler that links it
+/// to the RTP capsfilter only for video streams.
+fn build_rtsp_pipeline_cpu(
+    camera_id: String,
+    url: &str,
+    timeout_secs: u32,
+    use_hw_decode: bool,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<RtspPipelineHandles> {
+    let pipeline = gst::Pipeline::new();
+    let rtspsrc = build_rtspsrc(url, timeout_secs)?;
+
+    // `decodebin` autoplugs the right depayloader + parser + decoder based
+    // on the RTP caps actually delivered by the server. Previous pipeline
+    // hard-wired rtph264depay+h264parse+avdec_h264 which `not-negotiated`s
+    // out when the NVR streams H.265 (UniFi G4/G5, Hikvision IPC-Bxxx,
+    // Dahua N-series with HEVC profile) or MJPEG. Using decodebin keeps the
+    // pipeline codec-agnostic; downstream we still cap to RGB so the appsink
+    // contract (raw RGB24 frames) is unchanged.
+    let decodebin = gst::ElementFactory::make("decodebin")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("decodebin: {e}")))?;
+    // Wybór dekodera: `force-sw-decoders=false` pozwala decodebinowi
+    // autoplugować dekoder sprzętowy (NVIDIA / VA-API / D3D11 / VideoToolbox /
+    // MediaCodec) wykryty przez `decoder_detect`. Większość tych dekoderów
+    // udostępnia jednak ramki w pamięci GPU (np. CUDAMemory NV12), której
+    // `videoconvert` (CPU) nie odczyta — wtedy pipeline wyłoży się na
+    // `not-negotiated (-4)` przy żądaniu `format=RGB`. Dlatego HW jest
+    // próbą „best effort": gdy negocjacja padnie, `run_rtsp_session`
+    // przebudowuje pipeline z `use_hw_decode=false` (zawsze działający
+    // fallback CPU). Dekodowanie programowe 1080p H.264 to ~3-5% rdzenia.
+    // Setujemy przez `set_property` po build, bo builder-side
+    // `.property("force-sw-decoders", ...)` bywał ignorowany w gstreamer-rs 0.23.
+    decodebin.set_property("force-sw-decoders", !use_hw_decode);
+    let fsd_active: bool = decodebin.property("force-sw-decoders");
+    tracing::info!(
+        "rtsp: decodebin force-sw-decoders={} (use_hw_decode={})",
+        fsd_active,
+        use_hw_decode
+    );
+    let (rtp_filter, tee, queue_a) = build_rtp_front()?;
+
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
+
+    let appsink = build_appsink(camera_id, mailbox, counters)?;
 
     pipeline
         .add_many([
@@ -403,76 +587,210 @@ pub fn build_rtsp_pipeline(
         }
     });
 
-    // Wire the appsink frame callback before pad-added so the very first
-    // sample is captured.
-    let appsink_app = appsink
-        .downcast::<gst_app::AppSink>()
-        .map_err(|_| CameraIngestError::PipelineBuild("appsink downcast failed".into()))?;
-    install_frame_callback(&appsink_app, camera_id, mailbox, counters);
-
-    // Alias for rtspsrc dynamic linking below — points at the rtp capsfilter
-    // (was `depay`/`decodebin` in earlier revisions). The dynamic pad from
-    // rtspsrc now feeds into `rtp_filter`, which is statically linked to
-    // `decodebin` above.
-    let depay = rtp_filter.clone();
-
-    // Dynamic pad-added handler — link only the video RTP pad.
-    //
-    // rtspsrc emits `pad-added` as soon as the pad is created, but `current_caps()`
-    // can still be None at that moment — RTP caps are negotiated asynchronously
-    // and may only land on the pad after a `notify::caps` signal. For multi-
-    // stream sources (UniFi Protect publishes 2 audio + 1 video pads, Hikvision
-    // similar) every pad arrives without caps, so the `current_caps() -> None ->
-    // return` early-exit silently drops the video pad and the pipeline never
-    // produces frames. We therefore try to link immediately if caps are present,
-    // and fall back to a one-shot `notify::caps` watcher otherwise.
-    let depay_weak = depay.downgrade();
-    let try_link =
-        std::sync::Arc::new(move |src_pad: &gst::Pad| -> std::ops::ControlFlow<(), ()> {
-            // ControlFlow::Break = handled (linked, skipped, or impossible) — no
-            // need to keep watching. ControlFlow::Continue = caps not yet known.
-            let Some(depay) = depay_weak.upgrade() else {
-                return std::ops::ControlFlow::Break(());
-            };
-            let Some(sink_pad) = depay.static_pad("sink") else {
-                return std::ops::ControlFlow::Break(());
-            };
-            if sink_pad.is_linked() {
-                return std::ops::ControlFlow::Break(());
-            }
-            let Some(caps) = src_pad.current_caps() else {
-                return std::ops::ControlFlow::Continue(());
-            };
-            let Some(structure) = caps.structure(0) else {
-                return std::ops::ControlFlow::Break(());
-            };
-            let media: Option<String> = structure.get::<String>("media").ok();
-            if media.as_deref() != Some("video") {
-                tracing::debug!("rtsp: skipping non-video pad (media={:?})", media);
-                return std::ops::ControlFlow::Break(());
-            }
-            if let Err(e) = src_pad.link(&sink_pad) {
-                tracing::warn!("rtsp: failed to link rtspsrc → depay: {e:?}");
-            } else {
-                tracing::info!("rtsp: video pad linked");
-            }
-            std::ops::ControlFlow::Break(())
-        });
-    let try_link_pad = try_link.clone();
-    rtspsrc.connect_pad_added(move |_src, src_pad| {
-        if try_link_pad(src_pad).is_break() {
-            return;
-        }
-        // Caps not negotiated yet — re-try on every caps change. We rely on
-        // the sink_pad.is_linked() check inside try_link to keep this
-        // idempotent across multiple `notify::caps` emissions.
-        let try_link_notify = try_link_pad.clone();
-        src_pad.connect_notify_local(Some("caps"), move |pad, _spec| {
-            let _ = try_link_notify(pad);
-        });
-    });
+    // The dynamic pad from rtspsrc feeds the RTP capsfilter, statically linked
+    // to `decodebin` above.
+    connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
 
     Ok(RtspPipelineHandles { pipeline, tee })
+}
+
+/// Wariant GPU-resident NVIDIA. Branch A dekoduje I konwertuje kolory na GPU:
+///
+///   rtspsrc → rtp_filter → tee → queue_a → rtphXdepay → hXparse →
+///     nvhXdec (klatka w `video/x-raw(memory:CUDAMemory),NV12`) →
+///     cudaconvert (NV12→RGBA na GPU) → cudadownload (CUDAMemory→host) →
+///     videoconvert (siatka bezpieczeństwa do RGB) → capsfilter RGB → appsink
+///
+/// `nvhXdec`/`rtphXdepay`/`hXparse` dobierane są w runtime wg kodeka strumienia
+/// (`encoding-name` z caps RTP): H264 → rtph264depay+h264parse+nvh264dec,
+/// H265/HEVC → rtph265depay+h265parse+nvh265dec. Branch A dobudowywany jest
+/// dynamicznie po negocjacji caps RTP, bo kodek znamy dopiero wtedy. Gdy kodek
+/// nie ma odpowiednika NVDEC (np. MJPEG), branch A się nie zbuduje, pipeline
+/// nie da klatek i `run_rtsp_session` przełączy się na ścieżkę CPU.
+///
+/// Wyjście jest identyczne jak w wariancie CPU (RGB, te same caps, ten sam
+/// appsink callback) — reszta systemu jest bez zmian. `cudaconvert` celuje w
+/// RGBA na GPU (natywny format wyjścia NVDEC→CUDA), a końcowy `videoconvert`
+/// gwarantuje RGB nawet gdy `cudadownload` odda inny układ — to ostatnia
+/// konwersja na CPU, dużo tańsza niż pełny dekod programowy.
+fn build_rtsp_pipeline_gpu_resident(
+    camera_id: String,
+    url: &str,
+    timeout_secs: u32,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<RtspPipelineHandles> {
+    let pipeline = gst::Pipeline::new();
+    let rtspsrc = build_rtspsrc(url, timeout_secs)?;
+    let (rtp_filter, tee, queue_a) = build_rtp_front()?;
+
+    // Statyczny ogon branchu A: konwersja+download na GPU, potem RGB na CPU.
+    // `cudaconvert` robi NV12→RGBA w pamięci CUDA; `cudadownload` przenosi
+    // gotową klatkę do pamięci hosta. Końcowy `videoconvert` jest siatką
+    // bezpieczeństwa do RGB (cudadownload eksponuje RGBA/RGB/itd.).
+    let cudaconvert = gst::ElementFactory::make("cudaconvert")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudaconvert: {e}")))?;
+    let cudadownload = gst::ElementFactory::make("cudadownload")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload: {e}")))?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
+    let appsink = build_appsink(camera_id, mailbox, counters)?;
+
+    pipeline
+        .add_many([
+            &rtspsrc,
+            &rtp_filter,
+            &tee,
+            &queue_a,
+            &cudaconvert,
+            &cudadownload,
+            &convert,
+            &capsfilter,
+            &appsink,
+        ])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many gpu: {e}")))?;
+
+    // Statyczne segmenty znane przed negocjacją:
+    //   rtp_filter → tee → queue_a (front RTP)
+    //   cudaconvert → cudadownload → videoconvert → capsfilter → appsink (ogon)
+    // Środek (depay → parse → nvhXdec) dobudowujemy dynamicznie po poznaniu
+    // kodeka i wpinamy między queue_a a cudaconvert.
+    gst::Element::link(&rtp_filter, &tee)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → tee: {e}")))?;
+    let tee_src_a = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("tee src_%u request failed".into()))?;
+    let queue_a_sink = queue_a
+        .static_pad("sink")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a sink pad missing".into()))?;
+    tee_src_a
+        .link(&queue_a_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
+    gst::Element::link_many([&cudaconvert, &cudadownload, &convert, &capsfilter, &appsink])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many gpu tail: {e}")))?;
+
+    // Dobudowa dekodera NVDEC po negocjacji RTP. queue_a ma stałe caps
+    // `application/x-rtp` (rtp_filter wymusza video), ale `encoding-name`
+    // (H264 vs H265) znamy dopiero po SETUP rtspsrc. Wieszamy więc watcher na
+    // src padzie queue_a: gdy caps się pojawią, tworzymy odpowiedni
+    // depay+parse+nvhXdec, dodajemy do pipeline'u, linkujemy
+    // queue_a → depay → parse → nvhXdec → cudaconvert i podnosimy stan.
+    let pipeline_weak = pipeline.downgrade();
+    let cudaconvert_weak = cudaconvert.downgrade();
+    let queue_a_src = queue_a
+        .static_pad("src")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
+    let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let build_decoder = move |caps: &gst::Caps| {
+        if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(pipeline) = pipeline_weak.upgrade() else {
+            return;
+        };
+        let Some(cudaconvert) = cudaconvert_weak.upgrade() else {
+            return;
+        };
+        let Some(queue_a) = pipeline.by_name("queue_branch_a") else {
+            return;
+        };
+        let encoding = caps
+            .structure(0)
+            .and_then(|s| s.get::<String>("encoding-name").ok())
+            .unwrap_or_default();
+        if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &cudaconvert, &encoding) {
+            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
+            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie
+            // na ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            tracing::warn!(
+                encoding = %encoding,
+                error = %e,
+                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+            );
+        }
+    };
+    let build_decoder = std::sync::Arc::new(build_decoder);
+    if let Some(caps) = queue_a_src.current_caps() {
+        build_decoder(&caps);
+    } else {
+        let build_notify = build_decoder.clone();
+        // `notify::caps` is emitted on the GStreamer streaming thread, but this
+        // watcher is registered from the pipeline-build (tokio) thread. The
+        // `_local` variant binds the closure to its registration thread and
+        // glib's ThreadGuard aborts the process when the signal later fires on
+        // the streaming thread ("Value accessed from different thread…"). The
+        // closure only captures Send+Sync state (AtomicBool + WeakRefs) and does
+        // thread-safe gst ops, so the cross-thread-safe `connect_notify` is correct.
+        queue_a_src.connect_notify(Some("caps"), move |pad, _spec| {
+            if let Some(caps) = pad.current_caps() {
+                build_notify(&caps);
+            }
+        });
+    }
+
+    // Front RTP identyczny jak w wariancie CPU.
+    connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
+
+    Ok(RtspPipelineHandles { pipeline, tee })
+}
+
+/// Tworzy i wpina łańcuch dekodera NVDEC `depay → parse → nvhXdec` między
+/// `queue_a` a `cudaconvert`, dobierając elementy wg `encoding-name` RTP:
+/// H264 → rtph264depay+h264parse+nvh264dec, H265/HEVC → rtph265depay+
+/// h265parse+nvh265dec. Po dodaniu elementów podnosi ich stan do stanu
+/// pipeline'u (`sync_state_with_parent`), bo dokładamy je po starcie. Zwraca
+/// błąd dla kodeków bez odpowiednika NVDEC (np. MJPEG) — wtedy branch A nie
+/// rusza i sesja schodzi na CPU.
+fn link_nvdec_branch(
+    pipeline: &gst::Pipeline,
+    queue_a: &gst::Element,
+    cudaconvert: &gst::Element,
+    encoding: &str,
+) -> std::result::Result<(), String> {
+    let (depay_name, parse_name, dec_name) = if encoding.eq_ignore_ascii_case("H264") {
+        ("rtph264depay", "h264parse", "nvh264dec")
+    } else if encoding.eq_ignore_ascii_case("H265") || encoding.eq_ignore_ascii_case("HEVC") {
+        ("rtph265depay", "h265parse", "nvh265dec")
+    } else {
+        return Err(format!("brak dekodera NVDEC dla kodeka {encoding}"));
+    };
+
+    let depay = gst::ElementFactory::make(depay_name)
+        .build()
+        .map_err(|e| format!("{depay_name}: {e}"))?;
+    let parse = gst::ElementFactory::make(parse_name)
+        .build()
+        .map_err(|e| format!("{parse_name}: {e}"))?;
+    let dec = gst::ElementFactory::make(dec_name)
+        .build()
+        .map_err(|e| format!("{dec_name}: {e}"))?;
+
+    pipeline
+        .add_many([&depay, &parse, &dec])
+        .map_err(|e| format!("add_many nvdec: {e}"))?;
+    gst::Element::link_many([queue_a, &depay, &parse, &dec, cudaconvert])
+        .map_err(|e| format!("link nvdec branch: {e}"))?;
+
+    for el in [&depay, &parse, &dec] {
+        el.sync_state_with_parent()
+            .map_err(|e| format!("sync_state nvdec element: {e}"))?;
+    }
+    tracing::info!(
+        encoding = %encoding,
+        decoder = dec_name,
+        "rtsp: gałąź NVDEC GPU-resident wpięta (dekod + konwersja kolorów na GPU)"
+    );
+    Ok(())
 }
 
 fn install_frame_callback(
@@ -506,12 +824,14 @@ fn install_frame_callback(
                 }
                 let pts_ns = buffer.pts().map(|t| t.nseconds());
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let bytes = map.as_slice().to_vec();
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                let shared: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+                // Single copy: build the shared frame directly from the
+                // GStreamer map (no intermediate Vec). `Arc::from(&[u8])`
+                // allocates once and memcpy's the slice in place.
+                let shared: Arc<[u8]> = Arc::from(map.as_slice());
                 let frame_size = shared.len();
                 mailbox_cb.put(LatestFrame {
                     width: width as u32,
@@ -710,6 +1030,22 @@ pub async fn run_rtsp_session(
     let cam_id = config.camera_id.clone();
     let timeout_secs = 10u32;
 
+    // Ścieżka ingestu bieżącej próby. Start wg `resolve_ingest_path`:
+    // preferuje GPU-resident NVIDIA (dekod + konwersja kolorów na GPU), gdy
+    // sprzęt i elementy CUDA są obecne; inaczej CPU (decodebin). Po nieudanej
+    // negocjacji GPU-resident (pipeline pada zanim wejdzie Online) schodzimy na
+    // CPU i zostajemy tam do końca życia sesji — „musi działać".
+    let mut ingest_path = resolve_ingest_path(&config);
+    // Czy w wariancie CPU pozwolić decodebinowi autoplugować dekoder sprzętowy
+    // (best-effort). Nieużywane dla ścieżki GPU-resident. Po nieudanej
+    // negocjacji HW w wariancie CPU schodzimy na dekodowanie programowe.
+    let mut use_hw_decode = resolve_use_hw_decode(&config);
+    tracing::info!(
+        camera_id = %cam_id,
+        path = ingest_path.label(),
+        "rtsp: wybrana ścieżka ingestu (fallback na CPU przy błędzie negocjacji)"
+    );
+
     // Connection attempt counter — reset when we successfully reach Online.
     let mut attempt: u32 = 0;
     let mut backoff = policy.initial_backoff;
@@ -757,18 +1093,34 @@ pub async fn run_rtsp_session(
         tracing::info!(
             camera_id = %cam_id,
             attempt = attempt,
+            path = ingest_path.label(),
             "rtsp: building pipeline"
         );
         let handles = match build_rtsp_pipeline(
             cam_id.clone(),
             &final_url,
             timeout_secs,
+            ingest_path,
+            use_hw_decode,
             mailbox.clone(),
             counters.clone(),
         ) {
             Ok(h) => h,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("build failed: {e}"));
+                // Fallback budowy GPU-resident → CPU. Gdy wariant GPU-resident
+                // nie zbuduje się (np. element CUDA zniknął z rejestru),
+                // przebudowujemy od razu na zawsze działającą ścieżkę CPU
+                // zamiast kończyć sesję błędem.
+                if ingest_path == IngestPath::GpuResidentNvidia {
+                    tracing::warn!(
+                        camera_id = %cam_id,
+                        reason = %reason,
+                        "rtsp: budowa pipeline GPU-resident nie powiodła się — przełączam na CPU"
+                    );
+                    ingest_path = IngestPath::Cpu;
+                    continue 'outer;
+                }
                 tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: pipeline build failed");
                 publish(
                     &health_tx,
@@ -797,6 +1149,33 @@ pub async fn run_rtsp_session(
             let reason = redact_url_in_text(&raw_reason);
             tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: set_state Playing failed");
             let _ = pipeline.set_state(gst::State::Null);
+            // Ścieżka GPU-resident padła już przy przejściu do Playing —
+            // natychmiast schodzimy na CPU (bez backoffu).
+            if ingest_path == IngestPath::GpuResidentNvidia {
+                tracing::warn!(
+                    camera_id = %cam_id,
+                    reason = %reason,
+                    "rtsp: ścieżka GPU-resident zawiodła przy starcie (set_state) — przełączam na CPU"
+                );
+                ingest_path = IngestPath::Cpu;
+                streaming_bus().close_camera(&cam_id, &reason).await;
+                backoff = policy.initial_backoff;
+                continue 'outer;
+            }
+            // Próba HW padła już przy przejściu do Playing — natychmiast
+            // schodzimy na dekodowanie programowe (bez backoffu), zamiast
+            // wpadać w pętlę reconnectów na niedziałającym dekoderze sprzętowym.
+            if use_hw_decode {
+                tracing::warn!(
+                    camera_id = %cam_id,
+                    reason = %reason,
+                    "rtsp: dekodowanie sprzętowe zawiodło przy starcie (set_state) — przełączam na programowe (CPU)"
+                );
+                use_hw_decode = false;
+                streaming_bus().close_camera(&cam_id, &reason).await;
+                backoff = policy.initial_backoff;
+                continue 'outer;
+            }
             streaming_bus().close_camera(&cam_id, &reason).await;
             // A pure state-set failure is recoverable in principle, but it
             // usually means a misconfigured element — fall into the
@@ -1041,6 +1420,45 @@ pub async fn run_rtsp_session(
         }
         let reason =
             redact_url_in_text(&inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()));
+
+        // Fallback GPU-resident → CPU. Pipeline GPU-resident padł na busie,
+        // ZANIM wszedł Online (brak ani jednej klatki) — typowy objaw
+        // nieudanej negocjacji łańcucha CUDA albo kodeka bez NVDEC (np. MJPEG,
+        // gdy gałąź NVDEC się nie wpięła). Przebudowujemy natychmiast na CPU
+        // (bez backoffu, bez liczenia do limitu prób). Gdy GPU-resident zdążyło
+        // dać klatki (`online`), traktujemy awarię jako sieciową i zostajemy.
+        if ingest_path == IngestPath::GpuResidentNvidia && !online {
+            tracing::warn!(
+                camera_id = %cam_id,
+                reason = %reason,
+                "rtsp: ścieżka GPU-resident zawiodła na starcie — przełączam na CPU"
+            );
+            ingest_path = IngestPath::Cpu;
+            streaming_bus().close_camera(&cam_id, &reason).await;
+            backoff = policy.initial_backoff;
+            continue 'outer;
+        }
+
+        // Fallback HW → CPU. Pipeline z dekoderem sprzętowym padł, ZANIM
+        // zdążył wejść Online (brak ani jednej klatki) — to typowy objaw
+        // nieudanej negocjacji HW (np. ramki w pamięci GPU, których
+        // `videoconvert` nie odczyta → `not-negotiated`). Przebudowujemy
+        // natychmiast na dekodowanie programowe (bez backoffu, bez liczenia
+        // do limitu prób), żeby kamera zadziałała zamiast wpaść w pętlę
+        // reconnectów. Jeśli HW zdążyło dać klatki (`online`), traktujemy
+        // awarię jako sieciową i zostajemy na HW.
+        if use_hw_decode && !online {
+            tracing::warn!(
+                camera_id = %cam_id,
+                reason = %reason,
+                "rtsp: dekodowanie sprzętowe zawiodło na starcie — przełączam na programowe (CPU)"
+            );
+            use_hw_decode = false;
+            streaming_bus().close_camera(&cam_id, &reason).await;
+            backoff = policy.initial_backoff;
+            continue 'outer;
+        }
+
         tracing::warn!(camera_id = %cam_id, reason = %reason, "rtsp pipeline failed; reconnecting");
         streaming_bus().close_camera(&cam_id, &reason).await;
 
@@ -1379,6 +1797,41 @@ mod tests {
             "stop should interrupt backoff promptly, took {elapsed:?}"
         );
         drop(tx);
+    }
+
+    #[test]
+    fn forced_software_override_always_picks_cpu_path() {
+        // Operator wymusił dekoder programowy — ścieżka MUSI być CPU bez
+        // względu na obecność sprzętu/elementów CUDA. Deterministyczne, bo
+        // `Some(Software)` zwiera warunek `resolve_ingest_path` przed
+        // odpytaniem runtime'u.
+        let mut cfg = CameraConfig::new_unowned("cam_sw", "rtsp", "rtsp://x/y", 30, None);
+        cfg.decoder_override = Some(HwDecoder::Software);
+        assert_eq!(resolve_ingest_path(&cfg), IngestPath::Cpu);
+    }
+
+    #[test]
+    fn ingest_path_default_matches_runtime_gpu_availability() {
+        // Bez override ścieżka startowa zależy wyłącznie od tego, czy runtime
+        // ma kompletny łańcuch GPU-resident. Na maszynie z NVIDIA + CUDA wyjdzie
+        // GPU-resident, na pozostałych CPU — test pilnuje spójności tej reguły
+        // z `gpu_resident_available`, nie konkretnego sprzętu CI.
+        let cfg = CameraConfig::new_unowned("cam_auto", "rtsp", "rtsp://x/y", 30, None);
+        let expected = if gpu_resident_available() {
+            IngestPath::GpuResidentNvidia
+        } else {
+            IngestPath::Cpu
+        };
+        assert_eq!(resolve_ingest_path(&cfg), expected);
+    }
+
+    #[test]
+    fn ingest_path_labels_are_distinct() {
+        assert_ne!(
+            IngestPath::GpuResidentNvidia.label(),
+            IngestPath::Cpu.label()
+        );
+        assert!(IngestPath::GpuResidentNvidia.label().contains("GPU"));
     }
 
     #[test]

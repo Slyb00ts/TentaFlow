@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — ML Studio · Joby i treningi (M6)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Joby i treningi (M6)</h1>
+  <p class="lead">
+    Długie zadania w tle: tabela jobów z typem, statusem, paskiem postępu w wierszu, czasem i GPU.
+    Po wybraniu joba widzisz panel szczegółu — <strong>żywy wykres loss/metryk</strong>, scrollowane logi, postęp i sterowanie
+    (Anuluj / Wznów). Backend: flow engine (<code>flow_invoke/status/cancel</code>) + metrics collector; logi przez event stream.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-play"/></svg>Tabela jobów</h3>
+      <p>Typ, status, postęp w wierszu, czas, GPU. Filtry po stanie i typie zadania.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-chart"/></svg>Live metryki</h3>
+      <p>Wykres loss/metryk z metrics collectora (SQLite/ring), odświeżany na bieżąco.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-terminal"/></svg>Logi + sterowanie</h3>
+      <p>Strumień logów bundla, przyciski Anuluj / Wznów spięte z flow engine.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M6</span>
+    <h2>Joby i treningi — lista + panel szczegółu z live metrykami</h2>
+    <div class="desc">Tabela jobów po lewej, szczegół wybranego po prawej.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">8</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Joby i treningi</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Joby · 3 aktywne · 9 zakończonych dziś</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-image"/></svg>Anotacja<span class="count">2</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trenuj</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning</button>
+          <button class="tab active"><svg class="icon"><use href="#i-play"/></svg>Joby<span class="count">3</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele<span class="count">11</span></button>
+        </div>
+
+        <div class="flex gap-sm" style="margin-bottom:14px">
+          <span class="filter-chip active">Wszystkie</span>
+          <span class="filter-chip">Trwające<span class="chip accent" style="margin-left:4px">3</span></span>
+          <span class="filter-chip">Zakończone</span>
+          <span class="filter-chip">Błędy<span class="chip danger" style="margin-left:4px">1</span></span>
+          <div class="search-box ml-auto"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj joba..."></div>
+        </div>
+
+        <div class="grid-ml-1-2">
+
+          <!-- Tabela jobów -->
+          <section class="section-card ml-enter ml-enter-1" style="padding:0;overflow:hidden">
+            <table class="tf-table" style="border:0;border-radius:0">
+              <thead><tr><th>Job</th><th>Status</th><th>Postęp</th></tr></thead>
+              <tbody>
+                <tr style="background:var(--accent-glow);box-shadow:inset 3px 0 0 var(--accent-1)">
+                  <td><div class="fw-700">Qwen3.6-7B · LoRA</div><div class="text-3 text-xs mono">ft-2041 · 24 min</div></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:64%"></span></div><span class="pct">64%</span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">RF-DETR · vision</div><div class="text-3 text-xs mono">tr-2039 · 11 min</div></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:38%"></span></div><span class="pct">38%</span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">AutoML · ryzyko</div><div class="text-3 text-xs mono">am-2038 · 8 min</div></td>
+                  <td><span class="status-pill ok">trwa</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:81%"></span></div><span class="pct">81%</span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">IsoForest · anomalie</div><div class="text-3 text-xs mono">an-2034 · zakończony</div></td>
+                  <td><span class="status-pill ok" style="color:var(--success)">gotowe</span></td>
+                  <td><div class="progress-row"><div class="progress done"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">Whisper-L · QLoRA</div><div class="text-3 text-xs mono">ft-2030 · błąd</div></td>
+                  <td><span class="status-pill err">OOM</span></td>
+                  <td><div class="progress-row"><div class="progress"><span style="width:22%;background:var(--danger)"></span></div><span class="pct">22%</span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="fw-700">XGBoost · regresja</div><div class="text-3 text-xs mono">tr-2028 · zakończony</div></td>
+                  <td><span class="status-pill ok" style="color:var(--success)">gotowe</span></td>
+                  <td><div class="progress-row"><div class="progress done"><span style="width:100%"></span></div><span class="pct">100%</span></div></td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <!-- Panel szczegółu -->
+          <div class="ml-enter ml-enter-2">
+            <section class="section-card">
+              <div class="section-card-head">
+                <div class="title"><svg class="icon"><use href="#i-tune"/></svg>ft-2041 · Qwen3.6-7B · LoRA (wsparcie ADR)</div>
+                <span class="status-pill ok">trwa · epoka 2/3</span>
+              </div>
+              <div class="grid-4" style="margin-bottom:16px">
+                <div class="stat-card" style="padding:12px"><div class="sc-lbl">Krok</div><div class="sc-val" style="font-size:20px">1072 / 1674</div></div>
+                <div class="stat-card" style="padding:12px"><div class="sc-lbl">Loss</div><div class="sc-val" style="font-size:20px">0.84</div></div>
+                <div class="stat-card" style="padding:12px"><div class="sc-lbl">LR</div><div class="sc-val" style="font-size:20px">1.4e-4</div></div>
+                <div class="stat-card" style="padding:12px"><div class="sc-lbl">ETA</div><div class="sc-val" style="font-size:20px">~14 min</div></div>
+              </div>
+              <div class="progress-row" style="margin-bottom:16px"><div class="progress"><span style="width:64%"></span></div><span class="pct">64%</span></div>
+
+              <h3><svg class="icon"><use href="#i-chart"/></svg>Loss / grad_norm (live)</h3>
+              <div class="chart-wrap" style="margin-bottom:16px">
+                <svg viewBox="0 0 560 180" preserveAspectRatio="none">
+                  <g class="chart-grid"><line x1="0" y1="40" x2="560" y2="40"/><line x1="0" y1="90" x2="560" y2="90"/><line x1="0" y1="140" x2="560" y2="140"/></g>
+                  <path class="chart-line" stroke="#6366f1" d="M0,46 L60,70 L120,88 L180,100 L240,110 L300,118 L360,124 L420,128 L480,132 L520,134"/>
+                  <path class="chart-line" stroke="#a78bfa" stroke-dasharray="5 4" d="M0,150 L60,120 L120,138 L180,112 L240,128 L300,116 L360,124 L420,118 L480,122 L520,120"/>
+                  <circle cx="520" cy="134" r="4" fill="#6366f1"><animate attributeName="opacity" values="1;0.3;1" dur="1.4s" repeatCount="indefinite"/></circle>
+                </svg>
+                <div class="chart-legend">
+                  <div class="lg"><span class="sw" style="background:#6366f1"></span>train loss</div>
+                  <div class="lg"><span class="sw" style="background:#a78bfa"></span>grad_norm</div>
+                </div>
+              </div>
+
+              <h3><svg class="icon"><use href="#i-terminal"/></svg>Logi treningu</h3>
+              <div class="log-block">
+<span class="ts">12:41:02</span> <span class="lvl-info">INFO</span>  flow ml_finetune_v1 → bundle ml-training (sidecar QUIC) up
+<span class="ts">12:41:09</span> <span class="lvl-info">INFO</span>  loaded Qwen/Qwen3.6-7B-Instruct · bf16 · grad_checkpointing=on
+<span class="ts">12:41:14</span> <span class="lvl-ok">OK</span>    LoRA r=16 alpha=32 → 24.0M trainable params (0.31%)
+<span class="ts">12:41:15</span> <span class="lvl-info">INFO</span>  dataset dialogi_wsparcie.jsonl · 8920 examples · 1674 steps
+<span class="ts">12:48:33</span> <span class="lvl-info">INFO</span>  step 800  loss 0.97  lr 1.7e-4  12.4 it/s
+<span class="ts">12:53:10</span> <span class="lvl-warn">WARN</span>  VRAM 22.1/24 GB — gradient accumulation bump to 2
+<span class="ts">12:57:48</span> <span class="lvl-info">INFO</span>  step 1000 loss 0.88  lr 1.5e-4  11.9 it/s
+<span class="ts">13:01:22</span> <span class="lvl-ok">OK</span>    eval@1024 loss 0.86  val_acc 0.89
+<span class="ts">13:03:05</span> <span class="lvl-info">INFO</span>  step 1072 loss 0.84  lr 1.4e-4  · checkpoint zapisany
+              </div>
+
+              <div class="flex justify-between mt-md">
+                <div class="flex gap-sm">
+                  <span class="chip"><svg class="icon"><use href="#i-cpu"/></svg>RTX 4090 · 92%</span>
+                  <span class="chip warning">VRAM 22.1 GB</span>
+                </div>
+                <div class="flex gap-sm">
+                  <button class="btn"><svg class="icon"><use href="#i-play"/></svg>Wznów</button>
+                  <button class="btn btn-danger"><svg class="icon"><use href="#i-x"/></svg>Anuluj job</button>
+                </div>
+              </div>
+            </section>
+          </div>
+
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
