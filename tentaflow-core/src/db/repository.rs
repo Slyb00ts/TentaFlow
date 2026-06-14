@@ -13266,6 +13266,51 @@ pub fn installed_addon_ids_for_package(
     Ok(ids)
 }
 
+/// Mesh sync targets for an uploaded addon package's bytes: the union of the sync
+/// targets of every installed instance backed by this package. An `addon-package`
+/// blob carries no per-resource ACL of its own (its resource id is a content
+/// hash), so it must replicate to exactly the nodes that receive the
+/// `core.addon_instance` rows referencing it — otherwise a receiver sees the
+/// instance row but never the wasm it names.
+pub fn list_sync_target_nodes_for_addon_package(
+    pool: &DbPool,
+    org_id: &str,
+    package_id: &str,
+    version: &str,
+) -> Result<Vec<String>> {
+    let addon_ids = installed_addon_ids_for_package(pool, package_id, version)?;
+    let mut nodes = std::collections::BTreeSet::new();
+    for addon_id in addon_ids {
+        for target in list_sync_targets_for_resource(
+            pool,
+            org_id,
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.addon_instance",
+            &addon_id,
+        )? {
+            nodes.insert(target.node_id);
+        }
+    }
+    Ok(nodes.into_iter().collect())
+}
+
+/// Content hash of the most recent capture recorded for a blob id, or None when
+/// no capture exists yet. A package version's bytes are immutable, so any capture
+/// for the id yields the same sha; the caller uses it to locate the blob's chunk
+/// + manifest operations in the ledger.
+pub fn latest_blob_sha_for_blob_id(pool: &DbPool, blob_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    Ok(conn
+        .query_row(
+            "SELECT sha256 FROM __tentaflow_blob_sync_captures \
+             WHERE blob_id = ?1 \
+             ORDER BY created_at_ms DESC, capture_id DESC LIMIT 1",
+            rusqlite::params![blob_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 /// Composite resource id for an `addon_config` row. `addon_id` charset excludes
 /// `:`, so splitting on the first `:` is unambiguous.
 fn addon_config_resource_id(addon_id: &str, key: &str) -> String {
