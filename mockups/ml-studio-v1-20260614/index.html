@@ -43,6 +43,12 @@
     i <strong>Biblioteka zasobów</strong>.
   </div>
 
+  <div class="v2-note">
+    <strong>v2.1:</strong> projekty per-właściciel + zaproszenia; ML Studio w <strong>Aplikacjach</strong> (widoczne tylko dla
+    Power Userów); zasoby przydzielane <strong>mesh-wide</strong> (admin daje GPU z dowolnego noda osobie / grupie / projektowi);
+    baza synchronizowana między nodami, a trening może być <strong>rozproszony</strong> na wiele nodów.
+  </div>
+
   <!-- 1. START I NAWIGACJA GLOBALNA -->
   <div class="grp-title">1 · Start i nawigacja globalna<span class="ln"></span></div>
   <div class="index-grid">
@@ -50,6 +56,17 @@
     <a class="index-card" href="p01-kreator-projekt.html"><div class="id">P1</div><h3>Kreator projektu</h3><p>Router typu: nazwa → <strong>typ</strong> (rozpoznawanie / fine-tune LLM / RAG / anomalie / destylacja / vision-audio) → dane → schemat. Typ determinuje kroki.</p></a>
     <a class="index-card global" href="zasoby.html"><div class="id">Z<span class="tag-global">globalny</span></div><h3>Biblioteka zasobów</h3><p>Cross-project: modele usług (capability matrix), słowniki lookup, źródła danych, dostępy zewnętrzne. ŹRÓDŁO list w kreatorach całego modułu.</p></a>
     <a class="index-card global" href="m07-model.html"><div class="id">M7<span class="tag-global">globalny</span></div><h3>Rejestr modeli</h3><p>Wszystkie wytrenowane modele wszystkich projektów: metryki, wersje, krzywe, Deploy / Użyj. Każdy model linkuje do projektu-źródła.</p></a>
+  </div>
+
+  <!-- 1b. UPRAWNIENIA I ZASOBY (v2) -->
+  <div class="grp-title">1b · Uprawnienia i zasoby (v2)<span class="ln"></span></div>
+  <div class="grp-note">
+    Projekty są per-właściciel z zaproszeniami; zasoby (GPU/CPU/RAM) przydziela administrator z puli wszystkich nodów mesh.
+    Bez przydziału trening się nie uruchomi.
+  </div>
+  <div class="index-grid">
+    <a class="index-card" href="p02-udostepnianie.html"><div class="id">P2</div><h3>Udostępnianie projektu</h3><p>Członkowie projektu + zaproszenie po użytkowniku / e-mailu, role owner / editor / viewer. Właściciel zaprasza i odbiera dostęp.</p></a>
+    <a class="index-card global" href="admin-zasoby.html"><div class="id">AZ<span class="tag-global">admin</span></div><h3>Zasoby (alokacja mesh)</h3><p>Pula GPU/CPU/RAM wszystkich nodów mesh; przydział do osoby / grupy / projektu z limitem; aktywne przydziały. Domyślnie pula pusta.</p></a>
   </div>
 
   <!-- 2. PROJEKT: ROZPOZNAWANIE OBRAZU -->
