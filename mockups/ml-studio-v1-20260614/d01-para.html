@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: d01-para.html
+     Opis: Destylacja — wybór pary nauczyciel + uczeń. Nauczyciel (większy, z serwisu)
+           generuje dane; uczeń (mniejszy bazowy) uczy się go naśladować (cel = KD).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Destylacja: nauczyciel + uczeń</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .origin-note { font-size: 11px; color: var(--text-3); display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+  .origin-note .icon { width: 12px; height: 12px; color: var(--accent-2); flex-shrink: 0; }
+  .pick-card { cursor: pointer; }
+  .pick-card.selected { border-color: var(--accent-1); box-shadow: var(--glow-indigo); }
+  .pick-card .pick-flag { position: absolute; top: 12px; right: 14px; font-size: 9px; font-weight: 800;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent-2); }
+  .why-box { display: flex; gap: 14px; padding: 16px 18px; background: var(--accent-glow);
+    border: 1px solid var(--accent-1); border-radius: var(--radius); align-items: flex-start; }
+  .why-box .wb-ico { width: 38px; height: 38px; border-radius: 9px; background: var(--bg);
+    border: 1px solid var(--accent-1); display: flex; align-items: center; justify-content: center;
+    color: var(--accent-2); flex-shrink: 0; }
+  .why-box .wb-ico svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.75;
+    stroke-linecap: round; stroke-linejoin: round; }
+  .why-box h4 { font-size: 13px; font-weight: 800; margin-bottom: 4px; }
+  .why-box p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  .ratio-box { display: flex; align-items: center; gap: 18px; padding: 16px 20px; margin-top: 16px;
+    background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); }
+  .ratio-box .rb-side { text-align: center; }
+  .ratio-box .rb-side .rb-val { font-size: 22px; font-weight: 800; }
+  .ratio-box .rb-side .rb-lbl { font-size: 10.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+  .ratio-box .rb-arrow { color: var(--accent-2); display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .ratio-box .rb-arrow svg { width: 28px; height: 28px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+  .ratio-box .rb-result { margin-left: auto; text-align: right; }
+  .ratio-box .rb-result .rr-val { font-size: 24px; font-weight: 800;
+    background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .ratio-box .rb-result .rr-lbl { font-size: 11px; color: var(--text-2); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></symbol>
+  <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="m5 7 7-4 7 4"/><path d="m5 7-3 6h6z"/><path d="m19 7-3 6h6z"/></symbol>
+  <symbol id="i-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>Destylacja — para nauczyciel + uczeń</h1>
+  <p class="lead">
+    W projekcie destylacji <strong>nauczyciel</strong> (większy, mocny model z serwisu) wygeneruje odpowiedzi referencyjne,
+    a <strong>uczeń</strong> (mniejszy model bazowy) nauczy się je naśladować. To pierwszy krok pary, na której opiera się
+    cały workflow — <strong>cel treningu = KD (knowledge distillation)</strong>. Modele pochodzą z Biblioteki zasobów (capability check).
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-brain"/></svg>Nauczyciel z serwisu</h3>
+      <p>Model generacyjny dostępny przez <code>service_request</code> — większy, droższy, dokładny.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Uczeń bazowy</h3>
+      <p>Mały model bazowy, którego wytrenujemy. Po destylacji działa lokalnie i tanio.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-scale"/></svg>Stosunek rozmiarów</h3>
+      <p>27B → 0.8B to ~34× mniejszy model — cel destylacji to zachować jakość mimo redukcji.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D1</span>
+    <h2>Nauczyciel + uczeń — wybór pary modeli</h2>
+    <div class="desc">Nauczyciel z serwisu · uczeń bazowy · stosunek 34× · cel = KD.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Destylacja asystenta ADR"</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Nauczyciel + uczeń</span>
+        </div>
+
+        <!-- Pasek nawigacji wnętrza projektu -->
+        <div class="tabs-bar">
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-overview"/></svg>Przegląd</a>
+          <button class="tab active"><svg class="icon"><use href="#i-link"/></svg>Nauczyciel+uczeń</button>
+          <a class="tab" href="d02-prompty.html"><svg class="icon"><use href="#i-list"/></svg>Prompty</a>
+          <a class="tab" href="d03-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <a class="tab" href="d04-porownanie.html"><svg class="icon"><use href="#i-scale"/></svg>Porównanie</a>
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-cpu"/></svg>Modele</a>
+        </div>
+
+        <!-- Model-nauczyciel -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-brain"/></svg>Model-nauczyciel <span class="text-3">— większy, generuje dane referencyjne</span></h3>
+          <p class="section-sub">Filtr zdolności: <strong>generacja</strong>. Lista pochodzi z Biblioteki zasobów → modele dostępne w serwisie (<code>service_request</code> capability check).</p>
+          <div class="grid-3">
+            <div class="model-card pick-card selected">
+              <span class="pick-flag">wybrany</span>
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-brain"/></svg></div>
+                <div><div class="mc-name">Qwen3.6-27B</div><div class="mc-sub">generacja · dostępny w serwisie</div></div>
+              </div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">27B</div><div class="mm-lbl">parametry</div></div>
+                <div class="mc-metric"><div class="mm-val">12 tok/s</div><div class="mm-lbl">throughput</div></div>
+                <div class="mc-metric"><div class="mm-val">16 GB</div><div class="mm-lbl">VRAM</div></div>
+              </div>
+              <div class="flex gap-sm mt-sm"><span class="chip success"><span class="dot"></span>online</span><span class="chip accent">lokalny GGUF</span></div>
+              <div class="origin-note"><svg class="icon"><use href="#i-library"/></svg>Biblioteka zasobów → modele usług (capability: generacja)</div>
+            </div>
+            <div class="model-card pick-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-cloud"/></svg></div>
+                <div><div class="mc-name">Claude</div><div class="mc-sub">generacja · przez API</div></div>
+              </div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">—</div><div class="mm-lbl">parametry</div></div>
+                <div class="mc-metric"><div class="mm-val">API</div><div class="mm-lbl">hosting</div></div>
+                <div class="mc-metric"><div class="mm-val">koszt</div><div class="mm-lbl">za token</div></div>
+              </div>
+              <div class="flex gap-sm mt-sm"><span class="chip info">zewnętrzne API</span></div>
+              <div class="origin-note"><svg class="icon"><use href="#i-library"/></svg>Biblioteka zasobów → wymaga Dostępów zewnętrznych (klucz API)</div>
+            </div>
+            <div class="model-card pick-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-brain"/></svg></div>
+                <div><div class="mc-name">Mistral-Large</div><div class="mc-sub">generacja · dostępny w serwisie</div></div>
+              </div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">24B</div><div class="mm-lbl">parametry</div></div>
+                <div class="mc-metric"><div class="mm-val">14 tok/s</div><div class="mm-lbl">throughput</div></div>
+                <div class="mc-metric"><div class="mm-val">15 GB</div><div class="mm-lbl">VRAM</div></div>
+              </div>
+              <div class="flex gap-sm mt-sm"><span class="chip success"><span class="dot"></span>online</span></div>
+              <div class="origin-note"><svg class="icon"><use href="#i-library"/></svg>Biblioteka zasobów → modele usług (capability: generacja)</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Model-uczeń -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-cpu"/></svg>Model-uczeń <span class="text-3">— mniejszy bazowy, naśladuje nauczyciela</span></h3>
+          <p class="section-sub">Filtr zdolności: <strong>generacja</strong>, posortowane rosnąco po rozmiarze. To model, który wytrenujemy w kroku „Trening".</p>
+          <div class="grid-3">
+            <div class="model-card pick-card selected">
+              <span class="pick-flag">wybrany</span>
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-cpu"/></svg></div>
+                <div><div class="mc-name">Qwen3.5-0.8B</div><div class="mc-sub">generacja · model bazowy</div></div>
+              </div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">0.8B</div><div class="mm-lbl">parametry</div></div>
+                <div class="mc-metric"><div class="mm-val">95 tok/s</div><div class="mm-lbl">throughput</div></div>
+                <div class="mc-metric"><div class="mm-val">0.5 GB</div><div class="mm-lbl">VRAM</div></div>
+              </div>
+              <div class="flex gap-sm mt-sm"><span class="chip accent">ta sama rodzina co nauczyciel</span></div>
+              <div class="origin-note"><svg class="icon"><use href="#i-library"/></svg>Biblioteka zasobów → modele bazowe (capability: generacja)</div>
+            </div>
+            <div class="model-card pick-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-cpu"/></svg></div>
+                <div><div class="mc-name">Llama-3.2-1B</div><div class="mc-sub">generacja · model bazowy</div></div>
+              </div>
+              <div class="mc-metrics">
+                <div class="mc-metric"><div class="mm-val">1B</div><div class="mm-lbl">parametry</div></div>
+                <div class="mc-metric"><div class="mm-val">82 tok/s</div><div class="mm-lbl">throughput</div></div>
+                <div class="mc-metric"><div class="mm-val">0.7 GB</div><div class="mm-lbl">VRAM</div></div>
+              </div>
+              <div class="flex gap-sm mt-sm"><span class="chip">inna rodzina</span></div>
+              <div class="origin-note"><svg class="icon"><use href="#i-library"/></svg>Biblioteka zasobów → modele bazowe (capability: generacja)</div>
+            </div>
+            <div class="model-card pick-card">
+              <div class="mc-head">
+                <div class="mc-ico"><svg><use href="#i-library"/></svg></div>
+                <div><div class="mc-name">Własny HF repo</div><div class="mc-sub">wskaż repozytorium HuggingFace</div></div>
+              </div>
+              <div class="field mt-sm" style="margin-bottom:0;">
+                <input class="input mono" placeholder="organizacja/model-bazowy" />
+                <span class="hint">Pobranie wymaga <code>hf_token</code> (Settings → Dostępy zewnętrzne).</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Po co destylacja + stosunek rozmiarów -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-info"/></svg>Po co destylacja</h3>
+          <div class="why-box">
+            <div class="wb-ico"><svg><use href="#i-zap"/></svg></div>
+            <div>
+              <h4>Uczeń (0.8B) uczy się naśladować nauczyciela (27B)</h4>
+              <p>Mniejszy, szybszy, tańszy — działa lokalnie bez kosztów API. <strong>Cel treningu = KD (knowledge distillation):</strong>
+                uczeń dopasowuje swoje wyjścia do odpowiedzi nauczyciela. W kolejnych krokach nauczyciel wygeneruje zbiór treningowy,
+                a uczeń przejdzie na nim trening (z wybraną parametryzacją — oś 2).</p>
+            </div>
+          </div>
+          <div class="ratio-box">
+            <div class="rb-side"><div class="rb-val">27B</div><div class="rb-lbl">nauczyciel</div></div>
+            <div class="rb-arrow"><svg><use href="#i-arrow-down"/></svg></div>
+            <div class="rb-side"><div class="rb-val">0.8B</div><div class="rb-lbl">uczeń</div></div>
+            <div class="rb-result">
+              <div class="rr-val">~34× mniejszy</div>
+              <div class="rr-lbl">27 000M ÷ 800M ≈ 34 — stąd licznik przyspieszenia i redukcji</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Nawigacja -->
+        <div class="flex justify-between" style="padding-top:4px;">
+          <a class="btn btn-secondary" href="p01-kreator-projekt.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Kreator projektu</a>
+          <a class="btn btn-primary btn-lg" href="d02-prompty.html">Dalej: Zbiór promptów<svg class="icon"><use href="#i-chevron"/></svg></a>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

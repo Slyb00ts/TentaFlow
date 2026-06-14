@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: d04-porownanie.html
+     Opis: Destylacja — porównanie nauczyciel vs uczeń (jakość, tok/s, rozmiar, koszt)
+           + eksport ucznia (GGUF/ONNX/MLX/HF) i deploy do models/ z manifestem TOML.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Destylacja: porównanie + eksport</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .bench-mini { display: inline-flex; align-items: center; gap: 5px; }
+  .bench-bar { width: 50px; height: 5px; border-radius: 3px; background: var(--bg-3); position: relative; overflow: hidden; }
+  .bench-bar > span { position: absolute; inset: 0; border-radius: 3px; background: var(--gradient-accent); }
+  .quant-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .quant-opt { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 10px 12px; cursor: pointer; transition: all 0.15s; text-align: center; }
+  .quant-opt:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .quant-opt.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+  .quant-opt .q-name { font-size: 12px; font-weight: 800; font-family: ui-monospace, monospace; }
+  .quant-opt .q-size { font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+  .fmt-tab { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-apple" viewBox="0 0 24 24"><path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06z"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="m5 7 7-4 7 4"/><path d="m5 7-3 6h6z"/><path d="m19 7-3 6h6z"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>Destylacja — porównanie nauczyciel vs uczeń, eksport</h1>
+  <p class="lead">
+    Ostatni krok: zestawienie <strong>nauczyciela, ucznia po destylacji i ucznia bazowego</strong> (bez KD) na zestawie
+    ewaluacyjnym. Cel destylacji = uczeń odzyskał większość jakości nauczyciela przy ~34× mniejszym rozmiarze i ~8× szybciej.
+    Potem <strong>eksport</strong> ucznia do formatu produkcyjnego i <strong>deploy</strong> do <code>models/</code> z manifestem TOML.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-scale"/></svg>Retencja jakości</h3>
+      <p>Uczeń 0.88 / nauczyciel 0.94 = 94% jakości zachowane mimo 34× mniejszego modelu.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Przyspieszenie</h3>
+      <p>95 tok/s vs 12 tok/s ≈ 8× szybciej, lokalnie, bez kosztu API.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-rocket"/></svg>Eksport + deploy</h3>
+      <p>GGUF / ONNX / MLX / HF → <code>models/</code> + manifest TOML (<code>distilled_from</code>).</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D4</span>
+    <h2>Porównanie nauczyciel vs uczeń + eksport ucznia</h2>
+    <div class="desc">Leaderboard 3 modele · retencja 94% · 8× · 34× · eksport+deploy.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Destylacja asystenta ADR"</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Porównanie</span>
+        </div>
+
+        <!-- Pasek nawigacji wnętrza projektu -->
+        <div class="tabs-bar">
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-overview"/></svg>Przegląd</a>
+          <a class="tab" href="d01-para.html"><svg class="icon"><use href="#i-link"/></svg>Nauczyciel+uczeń</a>
+          <a class="tab" href="d02-prompty.html"><svg class="icon"><use href="#i-list"/></svg>Prompty<span class="count">5 200</span></a>
+          <a class="tab" href="d03-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <button class="tab active"><svg class="icon"><use href="#i-scale"/></svg>Porównanie</button>
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-cpu"/></svg>Modele</a>
+        </div>
+
+        <!-- Stat cards: retencja / przyspieszenie / redukcja -->
+        <div class="grid-3" style="margin-bottom:16px;">
+          <div class="stat-card"><div class="sc-lbl">Retencja jakości</div><div class="sc-val">94%</div><div class="sc-foot">uczeń 0.88 ÷ nauczyciel 0.94</div></div>
+          <div class="stat-card"><div class="sc-lbl">Przyspieszenie</div><div class="sc-val">8×</div><div class="sc-foot">95 tok/s ÷ 12 tok/s</div></div>
+          <div class="stat-card"><div class="sc-lbl">Redukcja rozmiaru</div><div class="sc-val">34×</div><div class="sc-foot">27B ÷ 0.8B (z kroku d01)</div></div>
+        </div>
+
+        <!-- Tabela porównawcza -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-scale"/></svg>Porównanie na zestawie ewaluacyjnym <span class="text-3">— 260 par eval (split 95/5 z datasetu KD)</span></h3>
+          <p class="section-sub">Jakość = ocena odpowiedzi względem nauczyciela (sędzia LLM + dokładność faktów ADR). Throughput i rozmiar zmierzone lokalnie.</p>
+          <table class="leaderboard">
+            <thead>
+              <tr><th>#</th><th>Model</th><th>jakość</th><th>tok/s</th><th>rozmiar</th><th>hosting / koszt</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="rank">1</span></td>
+                <td><strong>Nauczyciel — Qwen3.6-27B</strong> <span class="chip info">referencja</span></td>
+                <td><span class="bench-mini"><div class="bench-bar"><span style="width:94%"></span></div> 0.94</span></td>
+                <td>12</td><td>16 GB</td><td>serwis / koszt API</td>
+              </tr>
+              <tr class="best">
+                <td><span class="rank">2</span></td>
+                <td><strong>Uczeń po destylacji — 0.8B</strong> <span class="chip accent">ten model</span></td>
+                <td><span class="bench-mini"><div class="bench-bar"><span style="width:88%"></span></div> 0.88</span></td>
+                <td>95</td><td>0.5 GB</td><td>lokalnie / 0 zł</td>
+              </tr>
+              <tr>
+                <td><span class="rank">3</span></td>
+                <td>Uczeń bazowy — 0.8B (bez KD)</td>
+                <td><span class="bench-mini"><div class="bench-bar"><span style="width:55%"></span></div> 0.55</span></td>
+                <td>95</td><td>0.5 GB</td><td>lokalnie / 0 zł</td>
+              </tr>
+            </tbody>
+          </table>
+          <p class="text-xs text-3 mt-sm"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-info"/></svg>
+            Destylacja podniosła ucznia z 0.55 (bazowy) do 0.88 — odzyskał <strong>94% jakości nauczyciela</strong> (0.88/0.94)
+            przy 34× mniejszym rozmiarze i ~8× wyższym throughpucie, bez kosztu API. To uzasadnia deploy ucznia lokalnie.</p>
+        </div>
+
+        <!-- Eksport ucznia -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-package"/></svg>Eksport ucznia — format</h3>
+          <p class="section-sub">Uczeń to LLM, więc dostępne formaty są bramkowane zdolnością (LLM). Dla GGUF wybierz poziom kwantyzacji.</p>
+          <div class="fmt-tab">
+            <span class="filter-chip active"><svg class="icon"><use href="#i-package"/></svg>GGUF (llama.cpp)</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-cpu"/></svg>ONNX (onnxruntime)</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-apple"/></svg>MLX (macOS)</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-brain"/></svg>HuggingFace (safetensors)</span>
+          </div>
+          <p class="text-xs text-3" style="margin:-4px 0 10px;">Rozmiary szacowane dla ucznia 0.8B — wartości potwierdzone po realnej konwersji wariantu.</p>
+          <div class="quant-grid">
+            <div class="quant-opt"><div class="q-name">Q2_K</div><div class="q-size">~280 MB</div></div>
+            <div class="quant-opt"><div class="q-name">Q3_K_M</div><div class="q-size">~360 MB</div></div>
+            <div class="quant-opt"><div class="q-name">Q4_K_S</div><div class="q-size">~430 MB</div></div>
+            <div class="quant-opt selected"><div class="q-name">Q4_K_M</div><div class="q-size">~470 MB</div></div>
+            <div class="quant-opt"><div class="q-name">Q5_K_M</div><div class="q-size">~540 MB</div></div>
+            <div class="quant-opt"><div class="q-name">Q6_K</div><div class="q-size">~620 MB</div></div>
+            <div class="quant-opt"><div class="q-name">Q8_0</div><div class="q-size">~800 MB</div></div>
+            <div class="quant-opt"><div class="q-name">F16</div><div class="q-size">~1.5 GB</div></div>
+          </div>
+          <div class="flex align-center gap-md mt-md">
+            <span class="chip accent"><svg class="icon"><use href="#i-info"/></svg>Wybrano: GGUF Q4_K_M (~470 MB)</span>
+            <button class="btn btn-primary ml-auto"><svg class="icon"><use href="#i-download"/></svg>Eksportuj ucznia</button>
+          </div>
+        </div>
+
+        <!-- Deploy ucznia -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-rocket"/></svg>Deploy ucznia</h3>
+          <div class="grid-2">
+            <div class="radio-card selected" style="border-radius:var(--radius);">
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Lokalnie do models/ + TOML</span></div>
+              <div class="rc-desc">Skopiuj GGUF do <code>models/adr-assistant/</code>, wygeneruj manifest deploy (llama.cpp),
+                zarejestruj w serwisie. Dostępny przez <code>service_request</code> / <code>llm_generate</code>.</div>
+            </div>
+            <div class="radio-card" style="border-radius:var(--radius);">
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Zewnętrzny endpoint</span></div>
+              <div class="rc-desc">Wypchnij do vLLM / HF Inference Endpoint. Wymaga skonfigurowanego dostępu
+                (Settings → Dostępy zewnętrzne).</div>
+            </div>
+          </div>
+          <div class="code-block mt-md"><span class="c"># wygenerowany manifest deploy (models/adr-assistant/deploy.toml)</span>
+<span class="k">name</span> = <span class="s">"adr-assistant"</span>
+<span class="k">engine</span> = <span class="s">"llama.cpp"</span>
+<span class="k">model_file</span> = <span class="s">"adr-assistant-Q4_K_M.gguf"</span>
+<span class="k">quantization</span> = <span class="s">"Q4_K_M"</span>
+<span class="k">context_size</span> = <span class="v">2048</span>
+<span class="k">task</span> = <span class="s">"adr-assistant"</span>
+<span class="k">distilled_from</span> = <span class="s">"Qwen3.6-27B"</span></div>
+          <div class="flex justify-between mt-md">
+            <a class="btn btn-secondary" href="d03-trening.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Trening</a>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-rocket"/></svg>Deploy ucznia</button>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

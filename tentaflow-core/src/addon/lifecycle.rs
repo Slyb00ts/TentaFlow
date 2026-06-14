@@ -398,6 +398,16 @@ fn install_core(
         return Ok(manifest);
     }
 
+    // Hash katalogowy wersji, z ktorej instalujemy instancje — zapisany na
+    // instancji, zeby detekcja aktualizacji reagowala na zmiane TRESCI pakietu
+    // (manifest/wasm/migracje) nawet bez podbicia numeru wersji. Pobierane przed
+    // zajeciem locka, zeby nie zagniezdzac blokady DB.
+    let installed_bundle_hash = crate::db::repository::get_addon_package(db, package_id, package_version)
+        .ok()
+        .flatten()
+        .map(|p| p.bundle_hash)
+        .unwrap_or_default();
+
     // 5-9. Zarejestruj w DB (w jednej transakcji)
     let conn = db.lock().unwrap();
 
@@ -443,8 +453,8 @@ fn install_core(
     // package_version == manifest.version. Faza 1 wprowadzi syntetyczne id
     // instancji rozne od package_id (install_instance).
     conn.execute(
-        "INSERT INTO addons (addon_id, name, display_name, version, package_id, package_version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        "INSERT INTO addons (addon_id, name, display_name, version, package_id, package_version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog, installed_bundle_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         rusqlite::params![
             &manifest.addon_id,
             &manifest.display_name,
@@ -465,6 +475,7 @@ fn install_core(
             wasm_size,
             license,
             show_in_catalog,
+            &installed_bundle_hash,
         ],
     ).map_err(|e| anyhow::anyhow!("Nie udalo sie zarejestrowac addonu w DB: {e}"))?;
 
@@ -1424,6 +1435,17 @@ fn upgrade_core(
         apply_addon_sql_migrations(&new_manifest, &package_dir, db)?;
     }
 
+    // Hash katalogowy wersji docelowej — zapisany na instancji, zeby po
+    // aktualizacji detekcja przestala raportowac "dostepna aktualizacja"
+    // (i znow ja zaraportowala przy kolejnej zmianie tresci). Pobrane przed
+    // lockiem, zeby nie zagniezdzac blokady DB.
+    let installed_bundle_hash =
+        crate::db::repository::get_addon_package(db, package_id, package_version)
+            .ok()
+            .flatten()
+            .map(|p| p.bundle_hash)
+            .unwrap_or_default();
+
     let conn = db.lock().unwrap();
     conn.execute("BEGIN TRANSACTION", [])?;
 
@@ -1437,8 +1459,9 @@ fn upgrade_core(
         "UPDATE addons SET version = ?1, name = ?2, description = ?3, author = ?4, \
          manifest_json = ?5, platforms = ?6, category = ?7, icon = ?8, runtime = ?9, \
          wasm_size_bytes = ?10, license = ?11, show_in_catalog = ?12, \
-         package_version = ?13, skill_md = ?14, updated_at = datetime('now') \
-         WHERE addon_id = ?15",
+         package_version = ?13, skill_md = ?14, installed_bundle_hash = ?15, \
+         updated_at = datetime('now') \
+         WHERE addon_id = ?16",
         rusqlite::params![
             &new_manifest.version,
             &new_manifest.display_name,
@@ -1454,6 +1477,7 @@ fn upgrade_core(
             show_in_catalog,
             package_version,
             &new_skill_md,
+            &installed_bundle_hash,
             addon_id,
         ],
     )?;

@@ -209,16 +209,14 @@ pub(crate) fn build_pipeline_from_description(
                 let height: i32 = s.get("height").map_err(|_| gst::FlowError::Error)?;
                 let pts_ns = buffer.pts().map(|t| t.nseconds());
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let bytes = map.as_slice().to_vec();
                 let ts_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 // Single Arc<[u8]> shared between mailbox + storage + future
-                // consumers; the per-frame allocation here is still the
-                // GStreamer buffer copy (improving that needs a zero-copy
-                // pull which is out of scope for F1a).
-                let shared: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+                // consumers, copied once straight from the GStreamer map
+                // (no intermediate Vec).
+                let shared: Arc<[u8]> = Arc::from(map.as_slice());
                 let frame_size = shared.len();
                 mailbox_cb.put(LatestFrame {
                     width: width as u32,

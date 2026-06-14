@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: a-eksport.html — Eksport i deploy (vision) dla projektu Rozpoznawanie:
+           matryca formatów bramkowana możliwościami (ONNX/TensorRT/CoreML/HF),
+           kwantyzacje właściwe dla formatu, multi-select wariantów, deploy + TOML.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Eksport i deploy (vision)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .quant-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .quant-opt {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 10px 12px; cursor: pointer; transition: all 0.15s; text-align: center; position: relative;
+  }
+  .quant-opt:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .quant-opt.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+  .quant-opt .q-name { font-size: 12px; font-weight: 800; font-family: ui-monospace, monospace; }
+  .quant-opt .q-size { font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+  .quant-opt .q-note { font-size: 9.5px; color: var(--text-3); margin-top: 2px; }
+  .quant-opt .q-check {
+    position: absolute; top: 6px; right: 6px; width: 14px; height: 14px; color: var(--accent-1); display: none;
+  }
+  .quant-opt.selected .q-check { display: block; }
+  .quant-opt .q-check svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 3; }
+  /* format chip wyszarzony (capability gate) */
+  .filter-chip.disabled { opacity: 0.42; cursor: not-allowed; position: relative; }
+  .filter-chip.disabled:hover { border-color: var(--border); color: var(--text-2); }
+  .fmt-tab { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-apple" viewBox="0 0 24 24"><path d="M12 20.94c1.5 0 2.75 1.06 4 1.06 3 0 6-8 6-12.22A4.91 4.91 0 0 0 17 5c-2.22 0-4 1.44-5 2-1-.56-2.78-2-5-2a4.9 4.9 0 0 0-5 4.78C2 14 5 22 8 22c1.25 0 2.5-1.06 4-1.06z"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91 0z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Eksport i deploy modelu vision (RF-DETR)</h1>
+  <p class="lead">
+    Ostatni etap: eksport wytrenowanego detektora do formatu produkcyjnego. Matryca <strong>nie jest globalna</strong> —
+    dostępność formatu zależy od typu modelu i hardware (<em>capability-gated</em>). Dla modelu VISION dostępne są
+    <strong>ONNX, TensorRT, CoreML, HuggingFace</strong>; formaty LLM-only (<code>GGUF</code>, <code>MLX-LLM</code>)
+    są wyszarzone z wyjaśnieniem. Kwantyzacje pokazywane są <strong>właściwe dla wybranego formatu</strong>, a rozmiary
+    przed konwersją to „szacowany ~".
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-lock"/></svg>Bramkowanie możliwościami</h3>
+      <p>GGUF/MLX-LLM wyszarzone — dotyczą LLM, nie modelu detekcji. Tooltip mówi „dlaczego".</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-package"/></svg>Kwantyzacje per format</h3>
+      <p>ONNX ma FP32/FP16/INT8, TensorRT FP16/INT8, CoreML palettize — nie jedna globalna siatka.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-download"/></svg>Multi-select paczki</h3>
+      <p>Zaznacz kilka wariantów (np. ONNX FP16 + TensorRT INT8) i wyeksportuj jedną paczką.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A4</span>
+    <h2>Eksport (vision) — matryca capability-gated, multi-select, deploy + TOML</h2>
+    <div class="desc">Format · kwantyzacje per format · multi-select · deploy do serwisu.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Rozpoznawanie znaków na cysternach</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Eksport i deploy</span>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-apps"/></svg>Przegląd</button>
+          <a class="tab" href="a-dane.html"><svg class="icon"><use href="#i-image"/></svg>Dane<span class="count">248</span></a>
+          <a class="tab" href="r01-schemat.html"><svg class="icon"><use href="#i-box"/></svg>Schemat</a>
+          <a class="tab" href="r02-anotacja.html"><svg class="icon"><use href="#i-edit"/></svg>Anotacja<span class="count">61/144</span></a>
+          <a class="tab" href="a-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <a class="tab" href="a-ewaluacja.html"><svg class="icon"><use href="#i-check"/></svg>Ewaluacja</a>
+          <button class="tab active"><svg class="icon"><use href="#i-catalog"/></svg>Modele</button>
+        </div>
+
+        <!-- Format eksportu (capability-gated) -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-package"/></svg>Krok 1 — Format eksportu <span class="text-3">(bramkowany: model = detekcja vision)</span></h3>
+          <p class="section-sub">Dostępne tylko formaty wspierające model detekcji. Formaty LLM-only są wyszarzone z powodem.</p>
+          <div class="fmt-tab">
+            <span class="filter-chip active"><svg class="icon"><use href="#i-package"/></svg>ONNX</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-cpu"/></svg>TensorRT</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-apple"/></svg>CoreML</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-brain"/></svg>HuggingFace</span>
+            <span class="filter-chip disabled" title="GGUF dotyczy modeli LLM (llama.cpp), nie modeli vision."><svg class="icon"><use href="#i-lock"/></svg>GGUF</span>
+            <span class="filter-chip disabled" title="MLX-LLM dotyczy modeli LLM, nie vision."><svg class="icon"><use href="#i-lock"/></svg>MLX-LLM</span>
+          </div>
+
+          <!-- Kwantyzacje WŁAŚCIWE dla ONNX -->
+          <p class="text-xs text-3" style="margin-bottom:8px;"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-info"/></svg>
+            Kwantyzacje dla <strong>ONNX</strong> (zaznacz wiele do paczki):</p>
+          <div class="quant-grid">
+            <div class="quant-opt">
+              <span class="q-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></span>
+              <div class="q-name">FP32</div><div class="q-size">~118 MB (szacowany)</div><div class="q-note">pełna precyzja</div>
+            </div>
+            <div class="quant-opt selected">
+              <span class="q-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></span>
+              <div class="q-name">FP16</div><div class="q-size">~59 MB (szacowany)</div><div class="q-note">połowa, ~zero strat</div>
+            </div>
+            <div class="quant-opt">
+              <span class="q-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></span>
+              <div class="q-name">INT8 (dynamic)</div><div class="q-size">~32 MB (szacowany)</div><div class="q-note">bez kalibracji</div>
+            </div>
+            <div class="quant-opt">
+              <span class="q-check"><svg viewBox="0 0 24 24"><use href="#i-check"/></svg></span>
+              <div class="q-name">INT8 (static)</div><div class="q-size">~30 MB (szacowany)</div><div class="q-note">wymaga kalibracji</div>
+            </div>
+          </div>
+
+          <!-- Podgląd kwantyzacji dla innych formatów (pochodzenie matrycy) -->
+          <div class="grid-3 mt-md">
+            <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;">
+              <div class="text-xs fw-700" style="margin-bottom:6px;"><svg class="icon icon-sm" style="vertical-align:-2px"><use href="#i-cpu"/></svg> TensorRT (po wyborze)</div>
+              <div class="flex gap-sm wrap"><span class="chip">FP16</span><span class="chip">INT8</span></div>
+            </div>
+            <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;">
+              <div class="text-xs fw-700" style="margin-bottom:6px;"><svg class="icon icon-sm" style="vertical-align:-2px"><use href="#i-apple"/></svg> CoreML (po wyborze)</div>
+              <div class="flex gap-sm wrap"><span class="chip">FP16</span><span class="chip">INT8 (palettize)</span></div>
+            </div>
+            <div style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;">
+              <div class="text-xs fw-700" style="margin-bottom:6px;"><svg class="icon icon-sm" style="vertical-align:-2px"><use href="#i-brain"/></svg> HuggingFace (po wyborze)</div>
+              <div class="flex gap-sm wrap"><span class="chip">FP32</span><span class="chip">FP16</span></div>
+            </div>
+          </div>
+
+          <!-- Multi-select: paczka -->
+          <div class="flex align-center gap-md mt-md wrap">
+            <span class="chip accent"><svg class="icon"><use href="#i-check"/></svg>Wybrano: ONNX FP16</span>
+            <span class="chip accent"><svg class="icon"><use href="#i-check"/></svg>TensorRT INT8</span>
+            <span class="text-xs text-3">2 warianty w paczce</span>
+            <button class="btn btn-primary ml-auto"><svg class="icon"><use href="#i-download"/></svg>Eksportuj paczkę (2)</button>
+          </div>
+        </div>
+
+        <!-- Deploy -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-rocket"/></svg>Krok 2 — Deploy</h3>
+          <div class="grid-2">
+            <div class="radio-card selected" style="border-radius:var(--radius);">
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Lokalnie do models/ + TOML</span></div>
+              <div class="rc-desc">Skopiuj ONNX do <code>models/rozpoznawanie-adr/</code>, wygeneruj manifest deploy
+                (onnxruntime), zarejestruj w serwisie. Dostępny przez <code>service_request</code>.</div>
+            </div>
+            <div class="radio-card" style="border-radius:var(--radius);">
+              <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Zewnętrzny endpoint</span></div>
+              <div class="rc-desc">Wypchnij na zewnętrzny serwer inferencji (Triton / własny). Wymaga skonfigurowanego
+                dostępu (Settings → Dostępy zewnętrzne).</div>
+            </div>
+          </div>
+          <div class="code-block mt-md"><span class="c"># wygenerowany manifest deploy (models/rozpoznawanie-adr/deploy.toml)</span>
+<span class="k">name</span> = <span class="s">"rozpoznawanie-adr"</span>
+<span class="k">engine</span> = <span class="s">"onnxruntime"</span>
+<span class="k">model_file</span> = <span class="s">"rozpoznawanie-adr-fp16.onnx"</span>
+<span class="k">task</span> = <span class="s">"object-detection"</span>
+<span class="k">input_resolution</span> = <span class="v">560</span>
+<span class="k">classes</span> = [<span class="s">"tablica_adr"</span>, <span class="s">"tablica_rejestracyjna"</span>, <span class="s">"nalepka"</span>, <span class="s">"znak_srodowiskowy"</span>, <span class="s">"termometr"</span>]</div>
+          <p class="text-xs text-3 mt-sm"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-info"/></svg>
+            <code>classes</code> i <code>input_resolution</code> nie są wpisane ręcznie — pochodzą ze
+            <a href="r01-schemat.html">Schematu</a> (5 klas) i kroku <a href="a-trening.html">Trening</a> (560 px).</p>
+
+          <div class="flex justify-between mt-md">
+            <a class="btn btn-secondary" href="a-ewaluacja.html">Wstecz: Ewaluacja</a>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-rocket"/></svg>Deploy do serwisu</button>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

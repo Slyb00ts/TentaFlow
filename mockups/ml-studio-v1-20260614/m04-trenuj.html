@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — ML Studio · Trenuj / Silniki (M4)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
+  <symbol id="i-anomaly" viewBox="0 0 24 24"><path d="M3 12h3l2-7 4 14 3-9 2 2h4"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+  <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="i-trophy" viewBox="0 0 24 24"><path d="M6 9a6 6 0 0 0 12 0V3H6z"/><path d="M6 5H3a2 2 0 0 0 0 4h3"/><path d="M18 5h3a2 2 0 0 1 0 4h-3"/><line x1="9" y1="21" x2="15" y2="21"/><line x1="12" y1="15" x2="12" y2="21"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Trenuj / Silniki (M4)</h1>
+  <p class="lead">
+    Wybierasz silnik (AutoML, wykrywanie anomalii, klasyczne ML), wskazujesz dane i cel — silnik robi resztę.
+    AutoML zwraca <strong>leaderboard</strong> modeli z metrykami, posortowany, z podświetlonym najlepszym.
+    Treningi odpalane przez flow engine na bundlach Python (AutoGluon / FLAML / PyOD / sklearn / xgboost).
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-rocket"/></svg>AutoML</h3>
+      <p>Jak Watson AutoAI: dane + kolumna-cel + typ zadania → wiele pipeline'ów → leaderboard.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-anomaly"/></svg>Anomalie</h3>
+      <p>IsolationForest / PyOD / autoenkoder / szeregi czasowe — próg + scoring + podgląd.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Klasyczne ML</h3>
+      <p>Ręczny wybór algorytmu (XGBoost / RandomForest / LogReg) + hiperparametry.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M4</span>
+    <h2>Trenuj — silniki, wizard AutoML, leaderboard</h2>
+    <div class="desc">Silnik → dane → cel → konfiguracja → leaderboard.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">8</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Trenuj</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Trenuj · silnik AutoML · zbiór „przesylki_adr”</div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-database"/></svg>Zmień dane</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-play"/></svg>Uruchom trening</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab"><svg class="icon"><use href="#i-image"/></svg>Anotacja<span class="count">2</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-cpu"/></svg>Trenuj</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning</button>
+          <button class="tab"><svg class="icon"><use href="#i-play"/></svg>Joby<span class="count">3</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele<span class="count">11</span></button>
+        </div>
+
+        <!-- Karty silników -->
+        <section class="section-card ml-enter ml-enter-1">
+          <h3><svg class="icon"><use href="#i-cpu"/></svg>Wybierz silnik</h3>
+          <div class="engine-grid">
+            <div class="engine-card selected">
+              <div class="engine-ico"><svg viewBox="0 0 24 24"><use href="#i-rocket"/></svg></div>
+              <h4>AutoML</h4>
+              <p>Wskazujesz zbiór, kolumnę-cel i typ zadania. Silnik próbuje wielu algorytmów i pipeline'ów, zwraca leaderboard.</p>
+              <div class="engine-tags"><span class="chip">AutoGluon</span><span class="chip">FLAML</span><span class="chip success">wybrany</span></div>
+            </div>
+            <div class="engine-card">
+              <div class="engine-ico" style="background:linear-gradient(135deg,#f59e0b,#ef4444);box-shadow:0 0 30px rgba(245,158,11,0.3)"><svg viewBox="0 0 24 24"><use href="#i-anomaly"/></svg></div>
+              <h4>Wykrywanie anomalii</h4>
+              <p>IsolationForest, PyOD, autoenkoder lub anomalie szeregów czasowych. Próg + scoring + podgląd wykrytych zdarzeń.</p>
+              <div class="engine-tags"><span class="chip">PyOD</span><span class="chip">IsolationForest</span><span class="chip">szeregi</span></div>
+            </div>
+            <div class="engine-card">
+              <div class="engine-ico" style="background:linear-gradient(135deg,#60a5fa,#6366f1)"><svg viewBox="0 0 24 24"><use href="#i-tune"/></svg></div>
+              <h4>Klasyczne ML</h4>
+              <p>Ręczny wybór algorytmu i hiperparametrów: XGBoost, RandomForest, LogReg, SVM. Pełna kontrola pipeline'u.</p>
+              <div class="engine-tags"><span class="chip">XGBoost</span><span class="chip">sklearn</span></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Wizard AutoML -->
+        <section class="section-card ml-enter ml-enter-2">
+          <div class="stepper">
+            <div class="step done"><div class="num"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Dane</div><div class="s-desc">przesylki_adr</div></div></div>
+            <div class="s-line done"></div>
+            <div class="step done"><div class="num"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Cel</div><div class="s-desc">ryzyko</div></div></div>
+            <div class="s-line done"></div>
+            <div class="step active"><div class="num">3</div><div class="s-meta"><div class="s-label">Silnik</div><div class="s-desc">AutoML</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">4</div><div class="s-meta"><div class="s-label">Konfiguracja</div><div class="s-desc">budżet czasu</div></div></div>
+          </div>
+          <div class="grid-3">
+            <div class="field"><label>Zbiór danych</label><select class="select"><option>przesylki_adr (12 480 wierszy)</option><option>czujniki_temp</option></select></div>
+            <div class="field"><label>Kolumna-cel</label><select class="select"><option>ryzyko (kategoria, 3 klasy)</option><option>masa_kg</option></select></div>
+            <div class="field"><label>Typ zadania</label><select class="select"><option>klasyfikacja wieloklasowa</option><option>regresja</option><option>klasyfikacja binarna</option></select></div>
+            <div class="field"><label>Budżet czasu</label><select class="select"><option>10 minut</option><option>30 minut</option><option>2 godziny</option></select></div>
+            <div class="field"><label>Metryka optymalizacji</label><select class="select"><option>F1 makro</option><option>accuracy</option><option>ROC-AUC</option></select></div>
+            <div class="field"><label>Walidacja</label><select class="select"><option>5-fold CV</option><option>holdout 20%</option></select></div>
+          </div>
+        </section>
+
+        <!-- Leaderboard + wykres -->
+        <div class="grid-ml-2-1">
+          <section class="section-card ml-enter ml-enter-3">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-trophy"/></svg>Leaderboard · 8 modeli wytrenowanych</div>
+              <span class="chip success"><span class="dot"></span>AutoML zakończony · 9 min 42 s</span>
+            </div>
+            <table class="leaderboard">
+              <thead><tr><th>#</th><th>Model</th><th>F1 makro</th><th>Accuracy</th><th>ROC-AUC</th><th>Czas</th></tr></thead>
+              <tbody>
+                <tr class="best">
+                  <td><span class="rank">1</span></td>
+                  <td><div class="fw-800">WeightedEnsemble_L2</div><div class="text-3 text-xs">stack: XGB + LightGBM + CatBoost</div></td>
+                  <td><div class="fw-700">0.927</div><div class="metric-bar"><span style="width:93%"></span></div></td>
+                  <td>0.941</td><td>0.978</td><td class="mono text-2">3.1 s</td>
+                </tr>
+                <tr>
+                  <td><span class="rank">2</span></td>
+                  <td><div class="fw-700">CatBoost</div><div class="text-3 text-xs">depth 6 · lr 0.05</div></td>
+                  <td><div class="fw-700">0.913</div><div class="metric-bar"><span style="width:91%"></span></div></td>
+                  <td>0.928</td><td>0.971</td><td class="mono text-2">1.8 s</td>
+                </tr>
+                <tr>
+                  <td><span class="rank">3</span></td>
+                  <td><div class="fw-700">LightGBM</div><div class="text-3 text-xs">leaves 64</div></td>
+                  <td><div class="fw-700">0.906</div><div class="metric-bar"><span style="width:90%"></span></div></td>
+                  <td>0.919</td><td>0.965</td><td class="mono text-2">0.9 s</td>
+                </tr>
+                <tr>
+                  <td><span class="rank">4</span></td>
+                  <td><div class="fw-700">XGBoost</div><div class="text-3 text-xs">n_est 400</div></td>
+                  <td><div class="fw-700">0.898</div><div class="metric-bar"><span style="width:89%"></span></div></td>
+                  <td>0.911</td><td>0.960</td><td class="mono text-2">1.2 s</td>
+                </tr>
+                <tr>
+                  <td><span class="rank">5</span></td>
+                  <td><div class="fw-700">RandomForest</div><div class="text-3 text-xs">300 drzew</div></td>
+                  <td><div class="fw-700">0.871</div><div class="metric-bar"><span style="width:86%"></span></div></td>
+                  <td>0.884</td><td>0.944</td><td class="mono text-2">0.7 s</td>
+                </tr>
+                <tr>
+                  <td><span class="rank">6</span></td>
+                  <td><div class="fw-700">LogReg (L2)</div><div class="text-3 text-xs">baseline liniowy</div></td>
+                  <td><div class="fw-700">0.802</div><div class="metric-bar"><span style="width:79%"></span></div></td>
+                  <td>0.818</td><td>0.901</td><td class="mono text-2">0.2 s</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="flex justify-between align-center mt-md">
+              <span class="text-xs text-3">najlepszy: WeightedEnsemble_L2 · zarejestrowany jako „ryzyko-przesylki v1”</span>
+              <button class="btn btn-primary"><svg class="icon"><use href="#i-rocket"/></svg>Deploy najlepszego</button>
+            </div>
+          </section>
+
+          <section class="section-card ml-enter ml-enter-4">
+            <h3><svg class="icon"><use href="#i-chart"/></svg>F1 makro w czasie AutoML</h3>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 320 180" preserveAspectRatio="none">
+                <g class="chart-grid">
+                  <line x1="30" y1="20" x2="310" y2="20"/><line x1="30" y1="60" x2="310" y2="60"/>
+                  <line x1="30" y1="100" x2="310" y2="100"/><line x1="30" y1="140" x2="310" y2="140"/>
+                </g>
+                <text x="2" y="24" fill="#6a7196" font-size="9">0.95</text>
+                <text x="2" y="104" fill="#6a7196" font-size="9">0.80</text>
+                <text x="2" y="144" fill="#6a7196" font-size="9">0.72</text>
+                <path class="chart-line draw" stroke="url(#gradA)" d="M30,128 L70,96 L110,78 L150,66 L190,52 L230,44 L270,34 L310,30"/>
+                <circle cx="310" cy="30" r="4" fill="#a78bfa"/>
+                <defs><linearGradient id="gradA" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+              </svg>
+              <div class="chart-legend"><div class="lg"><span class="sw" style="background:var(--gradient-accent)"></span>najlepszy F1 (rolling)</div></div>
+            </div>
+            <div class="mt-md text-xs text-2" style="line-height:1.7">
+              <div class="flex justify-between"><span>Przeszukane pipeline'y</span><span class="fw-700">34</span></div>
+              <div class="flex justify-between"><span>Najlepszy fold</span><span class="fw-700">3 / 5</span></div>
+              <div class="flex justify-between"><span>Cechy po imputacji</span><span class="fw-700">14</span></div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Wariant: anomalie -->
+        <section class="section-card mt-md ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-anomaly"/></svg>Wariant: wykrywanie anomalii · czujniki temperatury cysterny</div>
+            <span class="chip warning"><span class="dot"></span>7 anomalii ponad próg 0.82</span>
+          </div>
+          <div class="chart-wrap">
+            <svg viewBox="0 0 640 200" preserveAspectRatio="none">
+              <g class="chart-grid">
+                <line x1="0" y1="50" x2="640" y2="50"/><line x1="0" y1="100" x2="640" y2="100"/><line x1="0" y1="150" x2="640" y2="150"/>
+              </g>
+              <rect class="anomaly-band" x="150" y="0" width="34" height="200"/>
+              <rect class="anomaly-band" x="430" y="0" width="40" height="200"/>
+              <path class="chart-line" stroke="#60a5fa" d="M0,120 L40,118 L80,124 L120,116 L160,60 L184,72 L220,118 L260,122 L300,114 L340,120 L380,116 L420,118 L450,40 L480,70 L520,120 L560,116 L600,122 L640,118"/>
+              <circle class="anomaly-dot" cx="165" cy="60" r="5"/>
+              <circle class="anomaly-dot" cx="452" cy="40" r="5"/>
+              <circle class="anomaly-dot" cx="480" cy="70" r="5"/>
+            </svg>
+            <div class="chart-legend">
+              <div class="lg"><span class="sw" style="background:#60a5fa"></span>temperatura (°C)</div>
+              <div class="lg"><span class="sw" style="background:var(--danger)"></span>wykryta anomalia</div>
+              <div class="lg"><span class="sw" style="background:rgba(239,68,68,0.25)"></span>okno alarmu</div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

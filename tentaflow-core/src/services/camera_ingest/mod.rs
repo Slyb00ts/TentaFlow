@@ -7,6 +7,7 @@
 // and streaming bus arrive in later chunks.
 
 pub mod credentials;
+pub mod decoder_detect;
 pub mod error;
 pub mod fakefile;
 pub mod local;
@@ -22,6 +23,7 @@ pub mod stream_publisher;
 pub mod supervisor;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
+pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};
 pub use error::{CameraIngestError, Result};
 pub use local::{list_local_devices, LocalCameraDevice};
 pub use session::{
@@ -69,6 +71,7 @@ mod integration_tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -101,6 +104,7 @@ mod integration_tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         };
         sup.add_camera(cfg.clone()).await.expect("first add");
         let err = sup.add_camera(cfg).await.unwrap_err();
@@ -123,6 +127,7 @@ mod integration_tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .expect("add");
@@ -157,6 +162,7 @@ mod integration_tests {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .expect("add");

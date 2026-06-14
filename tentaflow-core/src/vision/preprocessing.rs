@@ -5,14 +5,16 @@
 //       konwersja do NCHW f32 (1, 3, H, W).
 //
 //       Optymalizacje:
-//         - resize bilinear przez `image::imageops` (SIMD na x86_64 / NEON
-//           na ARM przez crate `image` 0.25)
+//         - resize bilinear przez nasz `vision::resize` (staloprzecinkowy Q8,
+//           SIMD AVX2 na x86_64 / NEON na ARM, fallback skalarny)
 //         - bezposrednio operujemy na buforze `Vec<f32>` zamiast tworzyc
 //           posrednie struktury — dla 640x640x3 to ~5 MB allocacji i kazda
 //           kopia jest droga w hot pathu meeting-bota
 // =============================================================================
 
-use image::{imageops::FilterType, Rgb, RgbImage};
+use image::{Rgb, RgbImage};
+
+use super::resize::resize_rgb_image;
 
 /// Skala + padding do letterboxa. Zwraca `(scale, pad_x, pad_y)` zeby caller
 /// mogl odwzorowac wspolrzedne detekcji z powrotem na oryginalny obrazek.
@@ -29,14 +31,17 @@ pub struct LetterboxMeta {
 pub fn letterbox(src: &RgbImage, target: u32, fill: [u8; 3]) -> (RgbImage, LetterboxMeta) {
     let (sw, sh) = src.dimensions();
     let scale = (target as f32 / sw as f32).min(target as f32 / sh as f32);
-    let nw = (sw as f32 * scale).round() as u32;
-    let nh = (sh as f32 * scale).round() as u32;
+    let nw = ((sw as f32 * scale).round() as u32).max(1);
+    let nh = ((sh as f32 * scale).round() as u32).max(1);
     let pad_x = (target - nw) / 2;
     let pad_y = (target - nh) / 2;
 
-    let resized = image::imageops::resize(src, nw, nh, FilterType::Triangle);
     let mut canvas = RgbImage::from_pixel(target, target, Rgb(fill));
-    image::imageops::overlay(&mut canvas, &resized, pad_x as i64, pad_y as i64);
+    // Resize naszym staloprzecinkowym silnikiem; przy zerowych wymiarach src
+    // (niemozliwe dla poprawnego wejscia) zostaje sam padding zamiast paniki.
+    if let Ok(resized) = resize_rgb_image(src, nw, nh) {
+        image::imageops::overlay(&mut canvas, &resized, pad_x as i64, pad_y as i64);
+    }
 
     (
         canvas,

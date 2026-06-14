@@ -7,10 +7,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use image::imageops::FilterType;
 use tract_onnx::prelude::*;
 
 use super::preprocessing::rgb_buf_to_image;
+use super::resize::resize_rgb_image;
 use super::yolo_pose::COCO_KEYPOINT_NAMES;
 use super::{PoseDetection, PoseEstimator, PoseKeypoint};
 
@@ -34,7 +34,8 @@ impl PoseEstimator for MovenetEngine {
             )
         })?;
 
-        let resized = image::imageops::resize(&img, INPUT_SIZE, INPUT_SIZE, FilterType::Triangle);
+        let resized = resize_rgb_image(&img, INPUT_SIZE, INPUT_SIZE)
+            .map_err(|e| anyhow!("MoveNet: resize failed: {e}"))?;
         let mut nhwc = Vec::with_capacity((INPUT_SIZE * INPUT_SIZE * 3) as usize);
         for p in resized.pixels() {
             nhwc.push(p[0] as i32);

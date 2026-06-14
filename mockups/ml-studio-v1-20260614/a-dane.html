@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: a-dane.html — Dane (zdjęcia) dla projektu Rozpoznawanie: import zdjęć
+           (upload/folder/kamera TentaFlow), galeria podglądu, podział train/val/test.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Dane (zdjęcia)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Galeria miniatur zdjęć ----- */
+  .img-gallery { display: grid; grid-template-columns: repeat(8, 1fr); gap: 8px; }
+  .img-thumb {
+    aspect-ratio: 4/3; border-radius: var(--radius-sm); overflow: hidden; position: relative;
+    background: linear-gradient(135deg, #2f3668, #050818); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; color: var(--text-3);
+  }
+  .img-thumb svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 1.5; opacity: 0.6; }
+  .img-thumb .it-name {
+    position: absolute; left: 0; right: 0; bottom: 0; font-size: 8.5px; color: var(--text-2);
+    background: linear-gradient(0deg, rgba(5,8,24,0.85), transparent); padding: 8px 4px 2px; text-align: center;
+    font-family: ui-monospace, monospace;
+  }
+  .img-thumb.more { background: var(--bg-input); color: var(--text-2); font-weight: 800; font-size: 14px; }
+  /* ----- Kafelki źródła ----- */
+  .source-tile {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px; text-align: center; cursor: pointer; transition: all 0.15s;
+  }
+  .source-tile:hover { border-color: var(--border-hover); background: var(--bg-card); }
+  .source-tile.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+  .source-tile .st-ico {
+    width: 38px; height: 38px; margin: 0 auto 8px; border-radius: 10px; background: var(--accent-glow);
+    display: flex; align-items: center; justify-content: center; color: var(--accent-2);
+  }
+  .source-tile .st-ico svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.75;
+    stroke-linecap: round; stroke-linejoin: round; }
+  .source-tile .st-name { font-size: 12.5px; font-weight: 800; }
+  .source-tile .st-desc { font-size: 10.5px; color: var(--text-3); margin-top: 3px; line-height: 1.4; }
+  /* ----- Podział train/val/test (segmenty paska) ----- */
+  .split-bar { display: flex; height: 16px; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border); }
+  .split-bar .seg-train { background: var(--accent-1); }
+  .split-bar .seg-val { background: var(--info); }
+  .split-bar .seg-test { background: var(--success); }
+  /* ----- Callout ----- */
+  .callout {
+    display: flex; gap: 12px; align-items: flex-start; background: var(--bg-input);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent-1); border-radius: var(--radius);
+    padding: 13px 15px;
+  }
+  .callout .co-ico { color: var(--accent-2); flex-shrink: 0; margin-top: 1px; }
+  .callout .co-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+  .callout p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Dane (zdjęcia) dla rozpoznawania ADR</h1>
+  <p class="lead">
+    Pierwszy krok ścieżki vision: <strong>skąd biorą się zdjęcia</strong> i <strong>jak dzielą się na zbiory</strong>.
+    Źródło to upload, folder lub <strong>kamera TentaFlow</strong> (przez <code>service_request</code>). Galeria pokazuje
+    wgrane zdjęcia, a podział train/val/test jest <strong>policzony z procentów</strong> — liczby nie są wpisane ręcznie,
+    wynikają z podziału. Schemat klas (co oznaczasz) zdefiniujesz w następnym kroku.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-upload"/></svg>Źródło jawne</h3>
+      <p>Upload / folder / kamera TentaFlow — każde wgrane zdjęcie ma pochodzenie i licznik.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-image"/></svg>Galeria podglądu</h3>
+      <p>Miniatury wgranych zdjęć z licznikiem, zanim zaczniesz oznaczać ramki.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-box"/></svg>Podział = liczby</h3>
+      <p>70/15/15 daje 174/37/37 zdjęć — liczby wyliczone z podziału, nie wpisane.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A1</span>
+    <h2>Dane (zdjęcia) — źródło: kamera TentaFlow, podział 70/15/15</h2>
+    <div class="desc">Źródło · galeria · podział train/val/test policzony z procentów.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Rozpoznawanie znaków na cysternach</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Dane</span>
+        </div>
+
+        <!-- Pasek nawigacji wnętrza projektu -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-apps"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-image"/></svg>Dane<span class="count">248</span></button>
+          <a class="tab" href="r01-schemat.html"><svg class="icon"><use href="#i-box"/></svg>Schemat</a>
+          <a class="tab" href="r02-anotacja.html"><svg class="icon"><use href="#i-edit"/></svg>Anotacja<span class="count">61/144</span></a>
+          <a class="tab" href="a-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <a class="tab" href="a-ewaluacja.html"><svg class="icon"><use href="#i-check"/></svg>Ewaluacja</a>
+          <button class="tab"><svg class="icon"><use href="#i-catalog"/></svg>Modele</button>
+          <div class="tabs-right">
+            <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-save"/></svg>Zapisz dane</button>
+          </div>
+        </div>
+
+        <!-- Stepper kroku Dane -->
+        <div class="stepper">
+          <div class="step done">
+            <div class="num"><svg class="icon"><use href="#i-check"/></svg></div>
+            <div class="s-meta"><div class="s-label">Źródło</div><div class="s-desc">skąd zdjęcia</div></div>
+          </div>
+          <div class="s-line done"></div>
+          <div class="step active">
+            <div class="num">2</div>
+            <div class="s-meta"><div class="s-label">Podział</div><div class="s-desc">train / val / test</div></div>
+          </div>
+        </div>
+
+        <!-- Źródło zdjęć -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-upload"/></svg>Źródło zdjęć</h3>
+          <p class="section-sub">Wybierz skąd pochodzą zdjęcia. Możesz łączyć źródła — każde wgranie dopisuje się do licznika.</p>
+
+          <div class="grid-3" style="margin-bottom:14px;">
+            <div class="source-tile">
+              <div class="st-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+              <div class="st-name">Upload plików</div>
+              <div class="st-desc">Przeciągnij JPG/PNG lub wskaż pliki z dysku.</div>
+            </div>
+            <div class="source-tile">
+              <div class="st-ico"><svg viewBox="0 0 24 24"><use href="#i-folder"/></svg></div>
+              <div class="st-name">Z folderu</div>
+              <div class="st-desc">Import całego katalogu zdjęć (rekurencyjnie).</div>
+            </div>
+            <div class="source-tile selected">
+              <div class="st-ico"><svg viewBox="0 0 24 24"><use href="#i-camera"/></svg></div>
+              <div class="st-name">Kamera TentaFlow</div>
+              <div class="st-desc">Klatki z usługi kamery przez <code>service_request</code>.</div>
+            </div>
+          </div>
+
+          <div class="dropzone" style="padding:30px 24px;">
+            <div class="dz-ico"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg></div>
+            <div class="dz-title">Upuść zdjęcia tutaj lub kliknij, aby wybrać</div>
+            <div class="dz-sub">Obsługiwane: JPG, PNG · maks. 50 MB / plik</div>
+            <div class="dz-formats">
+              <span class="chip">JPG</span><span class="chip">PNG</span>
+            </div>
+          </div>
+
+          <!-- Wgrane źródło -->
+          <div class="flex align-center gap-md mt-md" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;">
+            <span class="st-ico" style="width:34px;height:34px;margin:0;"><svg viewBox="0 0 24 24"><use href="#i-camera"/></svg></span>
+            <div>
+              <div class="fw-700" style="font-size:13px;">brama_wjazdowa</div>
+              <div class="text-xs text-3">kamera TentaFlow · CAM-02 · service_request</div>
+            </div>
+            <span class="chip accent ml-auto"><svg class="icon"><use href="#i-image"/></svg>248 zdjęć</span>
+            <span class="chip">4032×3024</span>
+            <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>wgrane</span>
+          </div>
+        </div>
+
+        <!-- Galeria podglądu -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-image"/></svg>Galeria podglądu</div>
+            <span class="hint">248 zdjęć · źródło: brama_wjazdowa</span>
+          </div>
+          <div class="img-gallery">
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0188.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0189.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0190.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0191.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0192.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0193.jpg</span></div>
+            <div class="img-thumb"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg><span class="it-name">_0194.jpg</span></div>
+            <div class="img-thumb more">+241</div>
+          </div>
+        </div>
+
+        <!-- Podział train/val/test -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-box"/></svg>Podział train / val / test</h3>
+          <p class="section-sub">Ustaw procenty — liczby zdjęć są wyliczane z 248 wgranych. Test trzymany osobno do końcowej oceny.</p>
+
+          <div class="split-bar" style="margin-bottom:14px;">
+            <div class="seg-train" style="width:70%"></div>
+            <div class="seg-val" style="width:15%"></div>
+            <div class="seg-test" style="width:15%"></div>
+          </div>
+
+          <div class="grid-3">
+            <div class="field">
+              <label><span class="chip accent" style="background:var(--accent-1);color:white;border:0;">train</span> &nbsp;procent</label>
+              <input class="input mono" value="70 %">
+              <span class="hint">= <strong>174 zdjęcia</strong> (z 248) — używane do treningu.</span>
+            </div>
+            <div class="field">
+              <label><span class="chip info">val</span> &nbsp;procent</label>
+              <input class="input mono" value="15 %">
+              <span class="hint">= <strong>37 zdjęć</strong> — walidacja podczas treningu.</span>
+            </div>
+            <div class="field">
+              <label><span class="chip success">test</span> &nbsp;procent</label>
+              <input class="input mono" value="15 %">
+              <span class="hint">= <strong>37 zdjęć</strong> — odłożone do końcowej ewaluacji.</span>
+            </div>
+          </div>
+
+          <div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-top:6px;margin-bottom:0;">
+            <div class="stat-card"><div class="sc-lbl">Wgrane</div><div class="sc-val">248</div><div class="sc-foot">źródło: brama_wjazdowa</div></div>
+            <div class="stat-card"><div class="sc-lbl">Train (70%)</div><div class="sc-val">174</div><div class="sc-foot">do treningu RF-DETR</div></div>
+            <div class="stat-card"><div class="sc-lbl">Val (15%)</div><div class="sc-val">37</div><div class="sc-foot">metryki w czasie treningu</div></div>
+            <div class="stat-card"><div class="sc-lbl">Test (15%)</div><div class="sc-val">37</div><div class="sc-foot">końcowa ewaluacja</div></div>
+          </div>
+        </div>
+
+        <!-- Callout: schemat w następnym kroku -->
+        <div class="callout">
+          <span class="co-ico"><svg viewBox="0 0 24 24"><use href="#i-info"/></svg></span>
+          <p>
+            <strong>Schemat klas zdefiniujesz w następnym kroku</strong> — to on określi, co oznaczasz na zdjęciach
+            i jakie głowy będzie miał model (np. <code>tablica_adr</code>, <code>nalepka</code>, <code>termometr</code>).
+            Bez schematu anotacja nie wie, jakie ramki rysować.
+          </p>
+        </div>
+
+        <!-- Nawigacja kreatora -->
+        <div class="flex justify-between" style="padding-top:6px;">
+          <a class="btn btn-secondary" href="p01-kreator-projekt.html">Wstecz: Typ projektu</a>
+          <a class="btn btn-primary btn-lg" href="r01-schemat.html">Dalej: Schemat klas<svg class="icon"><use href="#i-chevron"/></svg></a>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

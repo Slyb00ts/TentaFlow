@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<!-- ===== Plik: c-metoda.html — FT vision/audio/obraz, Krok 3: Metoda (dwie osie, audio) ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Whisper PL · Metoda</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .vram-badge { font-size: 9.5px; font-weight: 800; padding: 2px 7px; border-radius: 5px;
+    background: rgba(34,197,94,0.13); color: var(--success); letter-spacing: 0.03em; }
+  .vram-badge.mid { background: rgba(96,165,250,0.14); color: var(--info); }
+  .vram-badge.high { background: rgba(245,158,11,0.14); color: var(--warning); }
+  .vram-badge.max { background: rgba(239,68,68,0.14); color: var(--danger); }
+  .axis-sub { margin-bottom: 16px; }
+  .axis-sub .axis-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-3); font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .axis-label .axis-n { background: var(--bg-3); color: var(--accent-2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 7px; font-size: 10px; }
+  .objective-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .radio-card.disabled { opacity: 0.5; pointer-events: none; }
+  .radio-card.disabled .rc-badge { color: var(--text-3); }
+  .combo-box { display: flex; align-items: center; gap: 14px; padding: 13px 16px; margin-top: 14px;
+    background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); }
+  .combo-box .combo-eq { font-size: 14px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+  .combo-box .combo-eq .op { color: var(--accent-2); font-size: 16px; }
+  .combo-box .combo-vram { margin-left: auto; text-align: right; }
+  .combo-box .combo-vram .cv-val { font-size: 16px; font-weight: 800; }
+  .combo-box .combo-vram .cv-note { font-size: 10.5px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-package" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Whisper PL · Krok 3: Metoda (dwie osie)</h1>
+  <p class="lead">
+    Metoda to <strong>dwie niezależne osie, które się mnożą</strong>: <strong>algorytm (cel)</strong> × <strong>parametryzacja</strong>.
+    Dla audio/ASR celem jest <strong>SFT</strong> (fine-tune Whispera na parach audio/transkrypt) — <strong>DPO nie ma sensu</strong>
+    dla ASR, jest pokazane jako niedostępne. Parametryzacja: <strong>LoRA</strong> (wybrana dla Whispera) / Full / QLoRA / DoRA.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-tune"/></svg>Oś 1 — cel (SFT)</h3>
+      <p>Dla Whispera SFT na parach audio/transkrypt. DPO głównie dla diffusers/LLM (preferencje), nie dla ASR.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-layers"/></svg>Oś 2 — parametryzacja</h3>
+      <p>Full / LoRA / QLoRA / DoRA z estymatą VRAM. LoRA = dobry kompromis dla 1.5B Whispera.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Kombinacja = SFT × LoRA</h3>
+      <p>Iloczyn obu osi → komenda CLI z flagami modality/objective/method.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">CM</span>
+    <h2>FT modalność — Krok 3: Metoda (SFT × LoRA dla Whispera, aktywny)</h2>
+    <div class="desc">Oś cel (SFT, DPO wyszarzony) · oś parametryzacja z VRAM · hiperparametry audio · CLI.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Dotrenowanie Whisper PL”</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Metoda</span>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Model bazowy</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab active"><svg class="icon"><use href="#i-tune"/></svg>Metoda</button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trening</button>
+          <button class="tab"><svg class="icon"><use href="#i-package"/></svg>Eksport</button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele</button>
+        </div>
+
+        <div class="section-card">
+          <!-- Stepper 5 kroków: 1-2 done, 3 aktywny -->
+          <div class="stepper">
+            <div class="step done"><div class="num"><svg class="icon icon-sm" style="stroke-width:3"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Model</div><div class="s-desc">Krok 1</div></div></div>
+            <div class="s-line done"></div>
+            <div class="step done"><div class="num"><svg class="icon icon-sm" style="stroke-width:3"><use href="#i-check"/></svg></div><div class="s-meta"><div class="s-label">Dane</div><div class="s-desc">Krok 2</div></div></div>
+            <div class="s-line done"></div>
+            <div class="step active"><div class="num">3</div><div class="s-meta"><div class="s-label">Metoda</div><div class="s-desc">Krok 3 — aktywny</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">4</div><div class="s-meta"><div class="s-label">Trening</div><div class="s-desc">Krok 4</div></div></div>
+            <div class="s-line"></div>
+            <div class="step"><div class="num">5</div><div class="s-meta"><div class="s-label">Eksport</div><div class="s-desc">Krok 5</div></div></div>
+          </div>
+
+          <!-- Podsumowanie kroków 1-2 -->
+          <div class="grid-2" style="margin-bottom:16px;">
+            <div class="section-card" style="background:var(--bg-input);margin-bottom:0;padding:12px 14px;">
+              <div class="flex align-center gap-sm" style="margin-bottom:6px;"><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>Krok 1</span><strong class="text-sm">Model · modalność Audio</strong><a class="btn btn-ghost btn-sm ml-auto" href="c01-model.html">Edytuj</a></div>
+              <div class="text-sm mono">Whisper-large-v3</div>
+              <div class="text-xs text-3">1.5B · ASR · bazowy WER PL 7.2%</div>
+            </div>
+            <div class="section-card" style="background:var(--bg-input);margin-bottom:0;padding:12px 14px;">
+              <div class="flex align-center gap-sm" style="margin-bottom:6px;"><span class="chip success"><svg class="icon"><use href="#i-check"/></svg>Krok 2</span><strong class="text-sm">Dane</strong><a class="btn btn-ghost btn-sm ml-auto" href="c-dane.html">Edytuj</a></div>
+              <div class="text-sm">3 200 par audio↔transkrypt <span class="text-3">(11.4 h)</span></div>
+              <div class="text-xs text-3">split train/val 90/10 → 2 880 / 320</div>
+            </div>
+          </div>
+
+          <h3><svg class="icon"><use href="#i-tune"/></svg>Krok 3 — Metoda treningu</h3>
+          <p class="section-sub">
+            Dwie prostopadłe osie: <strong>algorytm/cel</strong> (CO optymalizujemy) × <strong>parametryzacja</strong> (ILE wag ruszamy).
+            VRAM zależy od obu.
+          </p>
+
+          <!-- Oś 1 — Algorytm/cel -->
+          <div class="axis-sub">
+            <div class="axis-label"><span class="axis-n">Oś 1</span>Algorytm treningu (cel)</div>
+            <div class="objective-grid">
+              <div class="radio-card selected">
+                <span class="rc-badge">naturalny dla ASR</span>
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">SFT</span></div>
+                <div class="rc-desc">Supervised fine-tuning — Whisper uczy się par <strong>audio→transkrypt</strong>. Minimalizuje błąd transkrypcji (WER).</div>
+              </div>
+              <div class="radio-card disabled">
+                <span class="rc-badge"><svg class="icon icon-sm" style="vertical-align:-2px"><use href="#i-lock"/></svg> niedostępne</span>
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">DPO</span></div>
+                <div class="rc-desc">Preferencje (chosen/rejected) — <strong>głównie dla diffusers/LLM</strong>. Dla ASR nie ma sensu: transkrypt jest jedną poprawną odpowiedzią, nie kwestią preferencji.</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Oś 2 — Parametryzacja -->
+          <div class="axis-sub">
+            <div class="axis-label"><span class="axis-n">Oś 2</span>Parametryzacja <span class="text-3" style="text-transform:none;letter-spacing:0;font-weight:400;">— auto-estymata VRAM dla Whisper-large-v3 (1.5B), batch=16, 30 s audio</span></div>
+            <div class="radio-card-grid" style="grid-template-columns:repeat(4,1fr);">
+              <div class="radio-card selected">
+                <span class="rc-badge">domyślna</span>
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">LoRA</span></div>
+                <div class="rc-desc">Adaptery na warstwach uwagi enkodera/dekodera. Dobra jakość, niska VRAM — wybór dla Whispera.</div>
+                <span class="vram-badge mid" style="display:inline-block;margin-top:8px;">~14 GB VRAM</span>
+              </div>
+              <div class="radio-card">
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">QLoRA</span></div>
+                <div class="rc-desc">4-bit baza + adaptery LoRA. Najniższa VRAM, lekki spadek jakości transkrypcji.</div>
+                <span class="vram-badge" style="display:inline-block;margin-top:8px;">~9 GB VRAM</span>
+              </div>
+              <div class="radio-card">
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">DoRA</span></div>
+                <div class="rc-desc">LoRA z dekompozycją wagi (magnitude+direction). Wyższa wierność, większa VRAM.</div>
+                <span class="vram-badge high" style="display:inline-block;margin-top:8px;">~16 GB VRAM</span>
+              </div>
+              <div class="radio-card">
+                <div class="rc-head"><span class="rc-dot"></span><span class="rc-name">Full</span></div>
+                <div class="rc-desc">Pełny fine-tune wszystkich wag Whispera. Najlepsza jakość, najdroższa.</div>
+                <span class="vram-badge max" style="display:inline-block;margin-top:8px;">~22 GB VRAM</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Iloczyn obu osi -->
+          <div class="combo-box">
+            <span class="combo-eq">SFT <span class="op">×</span> LoRA</span>
+            <span class="text-xs text-3">cel × parametryzacja — kombinacja realizowalna dla ASR. DPO byłby dostępny tylko dla modalności Obraz/diffusers.</span>
+            <div class="combo-vram">
+              <div class="cv-val">~14 GB VRAM</div>
+              <div class="cv-note">mieści się na 1× RTX 4090 (24 GB)</div>
+            </div>
+          </div>
+
+          <!-- Hiperparametry specyficzne audio -->
+          <div class="section-card mt-md" style="background:var(--bg-input);margin-bottom:0;">
+            <h3><svg class="icon"><use href="#i-tune"/></svg>Hiperparametry (audio/ASR) <span class="text-3">— mapują się na flagi CLI train.py</span></h3>
+            <div class="grid-2" style="gap:24px;">
+              <div>
+                <div class="slider-row"><span class="s-label">learning rate</span>
+                  <div class="slider-track"><span class="s-fill" style="width:30%"></span><span class="s-knob" style="left:30%"></span></div>
+                  <span class="s-val">1e-4</span></div>
+                <div class="slider-row"><span class="s-label">batch size</span>
+                  <div class="slider-track"><span class="s-fill" style="width:60%"></span><span class="s-knob" style="left:60%"></span></div>
+                  <span class="s-val">16</span></div>
+                <div class="slider-row"><span class="s-label">epoki</span>
+                  <div class="slider-track"><span class="s-fill" style="width:40%"></span><span class="s-knob" style="left:40%"></span></div>
+                  <span class="s-val">4</span></div>
+                <div class="slider-row"><span class="s-label">LoRA r (rank)</span>
+                  <div class="slider-track"><span class="s-fill" style="width:50%"></span><span class="s-knob" style="left:50%"></span></div>
+                  <span class="s-val">16</span></div>
+              </div>
+              <div>
+                <div class="field" style="margin-bottom:14px;">
+                  <label>Język docelowy</label>
+                  <select class="select"><option>pl — polski</option><option>auto-detect</option><option>en — angielski</option></select>
+                  <span class="hint">flaga <code>--language pl</code> — wymusza dekodowanie w PL.</span>
+                </div>
+                <div class="toggle-row" style="margin-bottom:14px;">
+                  <span class="toggle on"></span>
+                  <div>
+                    <div class="text-sm fw-700">Freeze encoder</div>
+                    <div class="text-xs text-3">Mrozi enkoder audio, trenuje tylko dekoder + adaptery — szybciej i stabilniej dla małego zbioru (<code>--freeze-encoder</code>).</div>
+                  </div>
+                </div>
+                <div class="slider-row"><span class="s-label">max audio (s)</span>
+                  <div class="slider-track"><span class="s-fill" style="width:100%"></span><span class="s-knob" style="left:100%"></span></div>
+                  <span class="s-val">30</span></div>
+              </div>
+            </div>
+            <!-- Podgląd komendy CLI -->
+            <div class="code-block mt-md"><span class="c"># wygenerowana komenda (bundle ml-training)</span>
+python train.py <span class="k">--modality</span> <span class="v">audio</span> <span class="k">--objective</span> <span class="v">sft</span> <span class="k">--method</span> <span class="v">lora</span> <span class="k">--model</span> whisper-large-v3 \
+  <span class="k">--language</span> pl <span class="k">--freeze-encoder</span> <span class="k">--lr</span> 1e-4 <span class="k">--batch</span> 16 <span class="k">--epochs</span> 4 \
+  <span class="k">--lora-r</span> 16 <span class="k">--lora-alpha</span> 32 <span class="k">--max-audio</span> 30 <span class="k">--split</span> 0.9</div>
+          </div>
+
+          <!-- Nawigacja wizarda -->
+          <div class="flex justify-between" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border);">
+            <a class="btn btn-secondary" href="c-dane.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Dane</a>
+            <div class="flex gap-md align-center">
+              <span class="text-xs text-3">Krok 3 z 5</span>
+              <a class="btn btn-primary btn-lg" href="c-trening.html">Dalej: Trening<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
