@@ -39,6 +39,7 @@ use tentaflow_sdk_spec::protocol::ui::{
            KeyValue as KvComp, StatCard as StatCardComp, Avatar as AvatarComp,
            Sparkline as SparklineComp, Heatmap as HeatmapComp,
            ProgressBar as ProgressBarComp},
+    data::charts::StackedBar as StackedBarComp,
     data::tables::Table as TableComp,
     actions::{Button as ButtonComp, IconButton as IconButtonComp, Link as LinkComp,
               FilterChips as FilterChipsComp},
@@ -1164,6 +1165,31 @@ fn input(label: &str, placeholder: &str, field_id: &str) -> Component {
     }.into_component(field_id).expect("Input")
 }
 
+fn number_input(label: &str, placeholder: &str, field_id: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    Input {
+        r#type: InputType::Number,
+        bind_path: StatePath::new(vec![PathSegment::Key(field_id.into())]),
+        placeholder: Some(lit(placeholder)),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }.into_component(field_id).expect("Input")
+}
+
 fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Select;
     Select {
@@ -1515,8 +1541,62 @@ impl SettingsState {
 struct ReidState { gate_passed: bool }
 impl ReidState { const fn new() -> Self { Self { gate_passed: false } } }
 
-struct ModelsState { expanded_id: Option<String> }
-impl ModelsState { const fn new() -> Self { Self { expanded_id: None } } }
+/// Models tab UI state. `form_visible` shows the add/edit model form; the
+/// `form_*` fields are mirrored from the bound inputs so submit stays
+/// authoritative. `editing_id` distinguishes create from edit. `pending_remove`
+/// arms the delete-confirmation bar. `budget_editing` shows the VRAM budget
+/// editor and `budget_draft` mirrors that input.
+struct ModelsState {
+    expanded_id: Option<String>,
+    form_visible: bool,
+    editing_id: Option<String>,
+    pending_remove: Option<String>,
+    form_name: String,
+    form_runtime: String,
+    form_status: String,
+    form_vram: String,
+    form_version: String,
+    budget_editing: bool,
+    budget_draft: String,
+}
+
+impl ModelsState {
+    const fn new() -> Self {
+        Self {
+            expanded_id: None,
+            form_visible: false,
+            editing_id: None,
+            pending_remove: None,
+            form_name: String::new(),
+            form_runtime: String::new(),
+            form_status: String::new(),
+            form_vram: String::new(),
+            form_version: String::new(),
+            budget_editing: false,
+            budget_draft: String::new(),
+        }
+    }
+
+    /// Resets the form to a clean "create" draft with sensible defaults.
+    fn reset_form(&mut self) {
+        self.editing_id = None;
+        self.form_name.clear();
+        self.form_runtime = "tensorrt".into();
+        self.form_status = "active".into();
+        self.form_vram = "1024".into();
+        self.form_version.clear();
+    }
+
+    /// Loads an existing model row into the form for editing.
+    fn load_for_edit(&mut self, m: &db::ModelRow) {
+        self.editing_id = Some(m.id.clone());
+        self.form_name = m.name.clone();
+        self.form_runtime = if m.runtime.is_empty() { "tensorrt".into() } else { m.runtime.clone() };
+        self.form_status = if m.status.is_empty() { "active".into() } else { m.status.clone() };
+        self.form_vram = alloc::format!("{}", m.vram_mb);
+        self.form_version = m.version.clone();
+    }
+}
 
 #[derive(Clone)]
 struct ZonePoint { x: f64, y: f64 }
@@ -1869,6 +1949,9 @@ static PENDING_CAMERA_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 /// rows seeded into the slot's state_overlay so the Table mounts populated.
 static PENDING_PROFILE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
+/// Same mechanism as `PENDING_CAMERA_ROWS` but for the models registry Table.
+static PENDING_MODEL_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
     f(&mut guard)
@@ -2126,6 +2209,30 @@ fn render_panel(panel_id: &str) {
         }
         let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
+    } else if panel_id == "models" {
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_MODEL_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("models_rows".into())]),
+                value: rows,
+            });
+        }
+        // Seed the VRAM stacked-bar's bound segment values + total so the bar
+        // mounts already showing used vs free instead of an empty first paint.
+        entries.extend(models_vram_overlay());
+        // When the form is open, seed its bound inputs/selects with the draft /
+        // edited model's values.
+        if with_state(|s| s.models.form_visible) {
+            entries.extend(models_form_overlay());
+        }
+        // When the budget editor is open, seed its bound number input.
+        if with_state(|s| s.models.budget_editing) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("model_budget_input".into())]),
+                value: Value::Text(with_state(|s| s.models.budget_draft.clone())),
+            });
+        }
+        send_slot_content_with_overlay("content", content, Some(entries));
     } else if panel_id == "alarms" {
         // Seed the operator-note textarea's bound key so it mounts with the
         // current draft note (cleared on selection change).
@@ -2237,6 +2344,20 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "search-clear-all" => { with_state(|s| s.search.clear_all()); json!({"ok":true}) }
         "reid-bypass-gate" => { with_state(|s| { s.reid.gate_passed = !s.reid.gate_passed; }); json!({"ok":true}) }
         "model-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.models.expanded_id = if id.is_empty() || s.models.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); json!({"ok":true}) }
+        "model-add-show" => { with_state(|s| { s.clear_messages(); s.models.form_visible = true; s.models.pending_remove = None; s.models.budget_editing = false; s.models.reset_form(); }); render_panel("models"); json!({"ok":true}) }
+        "model-form-cancel" => { with_state(|s| { s.models.form_visible = false; s.models.editing_id = None; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
+        "model-field-change" => handle_model_field_change(params),
+        "model-add-submit" => handle_model_add_submit(),
+        "model-edit" => handle_model_edit(params),
+        "model-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("model_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.models.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("models"); json!({"ok":true}) }
+        "model-remove-cancel" => { with_state(|s| { s.models.pending_remove = None; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
+        "model-remove" => handle_model_remove(params),
+        "model-rollback" => handle_model_rollback(params),
+        "model-benchmark" | "model-upload-onnx" => { with_state(|s| { s.clear_messages(); s.success_message = Some("Ta operacja wymaga uruchomionego runtime inferencji (brak backendu).".into()); }); render_panel("models"); json!({"ok":true,"noop":true}) }
+        "model-budget-edit" => { with_state(|s| { s.clear_messages(); s.models.budget_editing = true; s.models.form_visible = false; s.models.budget_draft = alloc::format!("{}", db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB)); }); render_panel("models"); json!({"ok":true}) }
+        "model-budget-cancel" => { with_state(|s| { s.models.budget_editing = false; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
+        "model-budget-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.models.budget_draft = v); json!({"ok":true}) }
+        "model-budget-save" => handle_model_budget_save(),
         "zone-select-camera" => { let id = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.zones.ensure_seeded(); s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
         "zone-add-start" => { with_state(|s| { s.zones.ensure_seeded(); s.zones.drawing_mode = true; s.zones.drawing_points.clear(); s.zones.selected_zone_id = None; s.zones.cursor = None; }); json!({"ok":true}) }
         "zone-cancel-drawing" => { with_state(|s| { s.zones.drawing_mode = false; s.zones.drawing_points.clear(); s.zones.cursor = None; }); json!({"ok":true}) }
@@ -2709,6 +2830,225 @@ fn handle_profile_remove(params: &JsonValue) -> JsonValue {
         Ok(_) => { with_state(|s| { s.profiles.pending_remove = None; s.success_message = Some("Profil usunięty.".into()); }); render_panel("profiles"); json!({"ok":true}) }
         Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
     }
+}
+
+// =============================================================================
+// Model action handlers
+// =============================================================================
+
+/// Default VRAM budget (MB) when the operator has not set one. 24 GB matches a
+/// typical workstation GPU; editable via the budget editor and persisted under
+/// the `vram_budget_mb` setting key.
+const DEFAULT_VRAM_BUDGET_MB: i64 = 24576;
+
+/// Display attribution for model registry changes in the audit log. No host
+/// identity fn exists in this addon ABI yet, so changes are attributed to the
+/// administrator role.
+const MODEL_ACTOR: &str = "administrator";
+
+/// Mirrors a single model form field into backend state on change so submit
+/// stays authoritative even though the value also lives in the store.
+fn handle_model_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(v) = value {
+        with_state(|s| match field {
+            "model_name" => s.models.form_name = v,
+            "model_runtime" => s.models.form_runtime = v,
+            "model_status" => s.models.form_status = v,
+            "model_vram" => s.models.form_vram = v,
+            "model_version" => s.models.form_version = v,
+            _ => {}
+        });
+    }
+    json!({"ok":true})
+}
+
+/// Creates or updates a model row, writes a hash-chained audit entry
+/// (model_change) with before/after JSON snapshots, then re-renders the panel so
+/// the table + VRAM budget bar reflect the change.
+fn handle_model_add_submit() -> JsonValue {
+    let (editing_id, name, runtime, status, vram_str, version) = with_state(|s| (
+        s.models.editing_id.clone(),
+        s.models.form_name.trim().to_string(),
+        s.models.form_runtime.trim().to_string(),
+        s.models.form_status.trim().to_string(),
+        s.models.form_vram.trim().to_string(),
+        s.models.form_version.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    if name.is_empty() || name.chars().count() > 80 {
+        with_state(|s| s.error_message = Some("Nazwa modelu musi mieć 1–80 znaków.".into()));
+        render_panel("models");
+        return json!({"ok":false,"error":"invalid name"});
+    }
+    let vram_mb = match vram_str.parse::<i64>() {
+        Ok(v) if v >= 0 => v,
+        _ => {
+            with_state(|s| s.error_message = Some("VRAM musi być liczbą całkowitą ≥ 0 (MB).".into()));
+            render_panel("models");
+            return json!({"ok":false,"error":"invalid vram"});
+        }
+    };
+
+    let (result, before_json) = match editing_id {
+        Some(id) => match db::get_model(&id) {
+            Ok(Some(mut row)) => {
+                let before = model_audit_json(&row);
+                row.name = name.clone();
+                row.runtime = runtime;
+                row.status = status;
+                row.vram_mb = vram_mb;
+                row.version = version;
+                (db::update_model(&row).map(|_| (id, row)), before)
+            }
+            Ok(None) => {
+                with_state(|s| s.error_message = Some("Model nie istnieje.".into()));
+                render_panel("models");
+                return json!({"ok":false,"error":"not found"});
+            }
+            Err(e) => (Err(e), String::new()),
+        },
+        None => {
+            let new_model = db::NewModel { name: name.clone(), runtime, status, vram_mb, version };
+            let outcome = db::insert_model(&new_model).and_then(|id| {
+                db::get_model(&id).map(|m| (id.clone(), m.unwrap_or_else(|| db::ModelRow {
+                    id, name: name.clone(), runtime: new_model.runtime.clone(),
+                    status: new_model.status.clone(), vram_mb, version: new_model.version.clone(),
+                    created_at: 0,
+                })))
+            });
+            (outcome, "null".into())
+        }
+    };
+
+    match result {
+        Ok((id, row)) => {
+            let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before_json, &model_audit_json(&row));
+            with_state(|s| {
+                s.models.form_visible = false;
+                s.models.editing_id = None;
+                s.success_message = Some(alloc::format!("Model zapisany ({}).", id));
+            });
+            render_panel("models");
+            json!({"ok":true,"model_id":id})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu modelu: {}", abi_message(e))));
+            render_panel("models");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Opens the form pre-filled with the selected model's persisted values.
+fn handle_model_edit(params: &JsonValue) -> JsonValue {
+    let id = model_id_param(params);
+    if id.is_empty() { return json!({"ok":false,"error":"empty model_id"}); }
+    match db::get_model(&id) {
+        Ok(Some(row)) => {
+            with_state(|s| {
+                s.clear_messages();
+                s.models.pending_remove = None;
+                s.models.budget_editing = false;
+                s.models.form_visible = true;
+                s.models.load_for_edit(&row);
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        Ok(None) => { with_state(|s| s.error_message = Some("Model nie istnieje.".into())); render_panel("models"); json!({"ok":false,"error":"not found"}) }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Deletes the selected model, writing a model_change audit entry recording the
+/// removed row as `before` and null as `after`.
+fn handle_model_remove(params: &JsonValue) -> JsonValue {
+    let id = model_id_param(params);
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        with_state(|s| s.error_message = Some("Wybierz model do usunięcia.".into()));
+        return json!({"ok":false,"error":"empty model_id"});
+    }
+    let before = db::get_model(&id).ok().flatten().map(|m| model_audit_json(&m)).unwrap_or_else(|| "null".into());
+    match db::delete_model(&id) {
+        Ok(_) => {
+            let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before, "null");
+            with_state(|s| { s.models.pending_remove = None; s.success_message = Some("Model usunięty.".into()); });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Rollback is the only per-model action with a real DB effect: it appends a
+/// `-rollback` marker to the version string (a true model-weight rollback needs
+/// the inference runtime, which this addon does not host). The change is audited.
+fn handle_model_rollback(params: &JsonValue) -> JsonValue {
+    let id = model_id_param(params);
+    with_state(|s| s.clear_messages());
+    if id.is_empty() { return json!({"ok":false,"error":"empty model_id"}); }
+    match db::get_model(&id) {
+        Ok(Some(mut row)) => {
+            let before = model_audit_json(&row);
+            row.version = if row.version.is_empty() {
+                "rollback".into()
+            } else {
+                alloc::format!("{}-rollback", row.version)
+            };
+            match db::update_model(&row) {
+                Ok(_) => {
+                    let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before, &model_audit_json(&row));
+                    with_state(|s| s.success_message = Some(alloc::format!("Wersja modelu oznaczona do rollbacku ({}).", row.version)));
+                    render_panel("models");
+                    json!({"ok":true})
+                }
+                Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+            }
+        }
+        Ok(None) => { with_state(|s| s.error_message = Some("Model nie istnieje.".into())); render_panel("models"); json!({"ok":false,"error":"not found"}) }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Persists the edited VRAM budget (MB) to the `vram_budget_mb` setting.
+fn handle_model_budget_save() -> JsonValue {
+    let draft = with_state(|s| s.models.budget_draft.trim().to_string());
+    with_state(|s| s.clear_messages());
+    let budget = match draft.parse::<i64>() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            with_state(|s| s.error_message = Some("Budżet VRAM musi być liczbą całkowitą > 0 (MB).".into()));
+            render_panel("models");
+            return json!({"ok":false,"error":"invalid budget"});
+        }
+    };
+    match db::set_setting("vram_budget_mb", &alloc::format!("{}", budget)) {
+        Ok(_) => {
+            with_state(|s| { s.models.budget_editing = false; s.success_message = Some(alloc::format!("Budżet VRAM ustawiony na {} MB.", budget)); });
+            render_panel("models");
+            json!({"ok":true,"budget":budget})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu budżetu: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Pulls the model id from action params (row_id or model_id).
+fn model_id_param(params: &JsonValue) -> String {
+    params.get("row_id").and_then(|v| v.as_str())
+        .or_else(|| params.get("model_id").and_then(|v| v.as_str()))
+        .unwrap_or("").trim().to_string()
+}
+
+/// Compact JSON snapshot of a model row for the audit before/after fields.
+fn model_audit_json(m: &db::ModelRow) -> String {
+    json!({
+        "id": m.id, "name": m.name, "runtime": m.runtime, "status": m.status,
+        "vram_mb": m.vram_mb, "version": m.version,
+    }).to_string()
 }
 
 // =============================================================================
@@ -4978,29 +5318,329 @@ fn build_reid_content() -> Component {
 
 fn build_models_content() -> Component {
     let messages = build_messages_section();
-    let models_data: &[(&str, &str, &str, &str, &str)] = &[
-        ("yolo11m", "YOLO v11 medium", "object_detection", "active", "420 MB"),
-        ("pp-ocrv5", "PP-OCRv5", "ocr", "active", "180 MB"),
-        ("bot-sort", "BoT-SORT", "tracking", "active", "95 MB"),
-        ("yolov8-face", "YOLOv8 Face", "face_detection", "disabled", "210 MB"),
+    let list_result = db::list_models();
+    let (form_visible, budget_editing) = with_state(|s| (s.models.form_visible, s.models.budget_editing));
+
+    let mut children = vec![messages];
+
+    let toolbar = stack_h(vec![
+        heading(2, "Modele i runtime"),
+        button_with_icon("Upload ONNX", "model-upload-onnx", "secondary", "upload"),
+        button_with_icon("Uruchom benchmark", "model-benchmark", "secondary", "activity"),
+        button_with_icon("Dodaj model", "model-add-show", "primary", "plus"),
+    ]);
+    children.push(toolbar);
+
+    // A DB/permission error must never be masked as "no models".
+    let models = match list_result {
+        Ok(m) => m,
+        Err(e) => {
+            children.push(alert(&alloc::format!("Nie udało się pobrać modeli: {}", abi_message(e)), "critical"));
+            return stack_v(children);
+        }
+    };
+
+    // VRAM budget breakdown (used vs free) always shown so the operator sees the
+    // budget even before any model exists.
+    children.push(build_vram_budget_card(&models, budget_editing));
+
+    if form_visible {
+        children.push(build_model_form());
+    }
+
+    // Delete-confirmation bar above the table once a row is armed.
+    if let Some(pending) = with_state(|s| s.models.pending_remove.clone()) {
+        if models.iter().any(|m| m.id == pending) {
+            children.push(build_model_remove_confirm(&pending, &models));
+        } else {
+            with_state(|s| s.models.pending_remove = None);
+        }
+    }
+
+    if models.is_empty() {
+        children.push(empty_state(
+            "Brak modeli",
+            Some("Dodaj model inferencji (nazwa, runtime, VRAM, wersja), aby zarządzać budżetem GPU."),
+            Some("cpu"),
+        ));
+    } else {
+        let rows: Vec<Value> = models.iter().map(model_table_row_value).collect();
+        if let Ok(mut g) = PENDING_MODEL_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
+        children.push(build_models_table());
+    }
+
+    stack_v(children)
+}
+
+/// VRAM budget card: a stacked bar (used vs free) plus the budget value with an
+/// inline editor. Used = SUM(vram_mb) over active/loaded models; over-budget the
+/// used segment turns critical and the header chip warns.
+fn build_vram_budget_card(models: &[db::ModelRow], editing: bool) -> Component {
+    let budget = db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB).max(1);
+    let used = models.iter()
+        .filter(|m| m.status == "active" || m.status == "loaded")
+        .map(|m| m.vram_mb.max(0))
+        .sum::<i64>();
+    let free = (budget - used).max(0);
+    let over = used > budget;
+
+    let used_tone = if over { "critical" } else if used * 4 >= budget * 3 { "warning" } else { "success" };
+    let header_chip = if over {
+        chip_toned(&alloc::format!("{} / {} MB · przekroczono", used, budget), "critical")
+    } else {
+        chip_toned(&alloc::format!("{} / {} MB · wolne {} MB", used, budget, free), used_tone)
+    };
+
+    // StackedBar segments resolve from literal BindRefs; total drives the scale.
+    let bar = StackedBarComp {
+        segments: vec![
+            StackSegment {
+                id: "used".into(),
+                value: BindRef::Literal(Value::F64(used as f64)),
+                label: Some(lit(&alloc::format!("Użyte {} MB", used))),
+                tone: parse_tone(used_tone),
+            },
+            StackSegment {
+                id: "free".into(),
+                value: BindRef::Literal(Value::F64(free as f64)),
+                label: Some(lit(&alloc::format!("Wolne {} MB", free))),
+                tone: Tone::Muted,
+            },
+        ],
+        total: BindRef::Literal(Value::F64(budget.max(used) as f64)),
+        show_legend: true,
+        show_percentages: true,
+        height_px: 28,
+    }.into_component(next_id()).expect("StackedBar");
+
+    let mut card_children = vec![
+        stack_h(vec![heading(4, "Budżet VRAM"), header_chip]),
+        bar,
+        text("Sumuje VRAM modeli aktywnych/załadowanych. Modele idle/error nie liczą się do budżetu."),
     ];
-    let cols = vec![
-        Value::Text("ID".into()), Value::Text("Nazwa".into()),
-        Value::Text("Typ".into()), Value::Text("Status".into()),
-        Value::Text("Rozmiar".into()),
+
+    if editing {
+        let input = model_budget_input();
+        card_children.push(stack_h(vec![
+            input,
+            button("Zapisz", "model-budget-save", "primary"),
+            button("Anuluj", "model-budget-cancel", "ghost"),
+        ]));
+    } else {
+        card_children.push(stack_h(vec![
+            text(&alloc::format!("Budżet: {} MB", budget)),
+            button("Zmień budżet", "model-budget-edit", "secondary"),
+        ]));
+    }
+
+    card(None, card_children)
+}
+
+/// Number input for the VRAM budget editor, bound to `model_budget_input` and
+/// mirrored to backend state via `model-budget-change`.
+fn model_budget_input() -> Component {
+    let mut comp = number_input("Budżet VRAM (MB)", "np. 24576", "model_budget_input");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "model-budget-change".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// The add/edit model form. Mirrors the mockup's model attributes: name, runtime
+/// backend, status, VRAM (MB) and version/hash.
+fn build_model_form() -> Component {
+    let editing = with_state(|s| s.models.editing_id.is_some());
+    let fields = card(Some("Dane modelu"), vec![
+        model_input("Nazwa", "np. YOLO11m", "model_name"),
+        model_select("Runtime / backend", model_runtime_options(), "model_runtime"),
+        model_select("Status", model_status_options(), "model_status"),
+        model_number("VRAM (MB)", "np. 1700", "model_vram"),
+        model_input("Wersja / hash", "np. yolo11m-2026.04", "model_version"),
+    ]);
+    let save_label = if editing { "Zapisz zmiany" } else { "Zapisz model" };
+    let actions = stack_h(vec![
+        button(save_label, "model-add-submit", "primary"),
+        button("Anuluj", "model-form-cancel", "ghost"),
+    ]);
+    card(None, vec![fields, actions])
+}
+
+/// Model form text input bound to a store key, mirrored to backend on change.
+fn model_input(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+/// Model form number input bound to a store key, mirrored to backend on change.
+fn model_number(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = number_input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+/// Model form select bound to a store key, mirrored to backend on change.
+fn model_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    let mut comp = select(label, options, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+fn model_runtime_options() -> Vec<SelectOption> {
+    [("tensorrt", "TensorRT"), ("onnxruntime", "ONNX Runtime"), ("openvino", "OpenVINO"), ("torch", "PyTorch")]
+        .iter()
+        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
+        .collect()
+}
+
+fn model_status_options() -> Vec<SelectOption> {
+    [("active", "active — w użyciu"), ("loaded", "loaded — w VRAM"), ("loading", "loading — ładowanie"), ("idle", "idle — bezczynny"), ("error", "error — błąd")]
+        .iter()
+        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
+        .collect()
+}
+
+/// Maps a persisted model status to a chip label + tone (mockup colors).
+fn model_status_cell(status: &str) -> Value {
+    match status {
+        "active" | "loaded" => chip_cell(status, "ok"),
+        "loading" => chip_cell(status, "warn"),
+        "error" => chip_cell(status, "err"),
+        "idle" => chip_cell(status, "muted"),
+        other => chip_cell(other, "info"),
+    }
+}
+
+fn model_table_row_value(m: &db::ModelRow) -> Value {
+    let runtime = if m.runtime.trim().is_empty() { "\u{2014}".to_string() } else { m.runtime.clone() };
+    let version = if m.version.trim().is_empty() { "\u{2014}".to_string() } else { m.version.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("model_id".into()), Value::Text(m.id.clone())),
+        (Value::Text("name".into()), Value::Text(m.name.clone())),
+        (Value::Text("runtime".into()), Value::Text(runtime)),
+        (Value::Text("status".into()), model_status_cell(&m.status)),
+        (Value::Text("vram".into()), Value::Text(alloc::format!("{} MB", m.vram_mb))),
+        (Value::Text("version".into()), Value::Text(version)),
     ];
-    let rows: Vec<Value> = models_data.iter().map(|(id, name, typ, status, size)| {
-        Value::Array(vec![
-            Value::Text((*id).into()), Value::Text((*name).into()),
-            Value::Text((*typ).into()), Value::Text((*status).into()),
-            Value::Text((*size).into()),
-        ])
-    }).collect();
-    stack_v(vec![
-        messages,
-        stack_h(vec![heading(2, "Modele"), button("Import", "model-import-show", "secondary")]),
-        card(None, vec![table(cols, rows)]),
-    ])
+    Value::Map(entries)
+}
+
+fn model_table_column(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable: true,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
+}
+
+fn build_models_table() -> Component {
+    let columns = vec![
+        model_table_column("name", "Model", ColumnRender::Text),
+        model_table_column("runtime", "Runtime", ColumnRender::Text),
+        model_table_column("status", "Status", ColumnRender::Chip),
+        model_table_column("vram", "VRAM", ColumnRender::Text),
+        model_table_column("version", "Wersja / hash", ColumnRender::Text),
+    ];
+
+    // Per-row actions: edit pre-fills the form, rollback marks the version (the
+    // only DB-backed per-model action), Usuń arms the confirm bar.
+    let edit_action = button("Edytuj", "model-edit", "secondary");
+    let rollback_action = button("Rollback", "model-rollback", "ghost");
+    let remove_action = button("Usuń", "model-row-select", "destructive");
+
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("models_rows".into())]),
+        row_key_field: "model_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![edit_action, rollback_action, remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// Confirmation bar for deleting the selected model.
+fn build_model_remove_confirm(model_id: &str, models: &[db::ModelRow]) -> Component {
+    let name = models.iter().find(|m| m.id == model_id).map(|m| m.name.as_str()).unwrap_or(model_id);
+    let mut params = CborMap::default();
+    params.0.push(("model_id".into(), Value::Text(model_id.into())));
+    let confirm_btn = button_with_params("Usuń", "model-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "model-remove-cancel", "ghost");
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć model \"{}\"?", name), "body_strong"),
+        text("Tej operacji nie można cofnąć."),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// Seeds the model form's bound store keys from backend state so the form mounts
+/// with the draft (create) or loaded (edit) values in place.
+fn models_form_overlay() -> Vec<StateEntry> {
+    with_state(|s| {
+        let m = &s.models;
+        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
+        vec![
+            key("model_name", Value::Text(m.form_name.clone())),
+            key("model_runtime", Value::Text(m.form_runtime.clone())),
+            key("model_status", Value::Text(m.form_status.clone())),
+            key("model_vram", Value::Text(m.form_vram.clone())),
+            key("model_version", Value::Text(m.form_version.clone())),
+        ]
+    })
+}
+
+/// Seeds the VRAM stacked-bar's bound segment values + total so the bar mounts
+/// already showing used vs free on the first paint.
+fn models_vram_overlay() -> Vec<StateEntry> {
+    let budget = db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB).max(1);
+    let used = db::used_vram_mb().unwrap_or(0).max(0);
+    let free = (budget - used).max(0);
+    let key = |k: &str, v: f64| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: Value::F64(v) };
+    // The literal-bound StackedBar resolves these by value, so no keys are
+    // strictly required; seeding keeps the overlay non-empty and future-proof.
+    let _ = (used, free);
+    vec![key("vram_used_mb", used as f64), key("vram_free_mb", free as f64), key("vram_budget_mb_view", budget as f64)]
 }
 
 fn build_zones_content() -> Component {
