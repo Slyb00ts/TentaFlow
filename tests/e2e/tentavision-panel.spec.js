@@ -33,6 +33,8 @@ const PERMISSIONS = [
   'cameras.snapshot',
   'streams.subscribe',
   'recording.read',
+  'sql.read',
+  'sql.write',
 ];
 
 // Panels reachable from the nav tabs (subset exercised; overview is the
