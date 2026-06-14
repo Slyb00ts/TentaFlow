@@ -1115,6 +1115,105 @@ pub fn insert_rule(camera_id: &str, name: &str, cfg: &str) -> Result<String, Abi
 }
 
 // =============================================================================
+// Evidence packages CRUD (HSM/TSA-signed export records for an alarm)
+// =============================================================================
+
+/// An evidence package row joined with its source alarm's message + camera name,
+/// so the package list can show a human label for the underlying incident
+/// without a second fetch. `signed_by` carries the recipient/organ the package
+/// was issued to (empty = pending recipient assignment).
+#[derive(Debug, Clone)]
+pub struct EvidenceRow {
+    pub id: String,
+    pub alarm_id: String,
+    pub package_ref: String,
+    pub signed_by: String,
+    pub created_at: i64,
+    pub alarm_message: String,
+    pub camera_name: String,
+    pub alarm_severity: String,
+}
+
+/// Fields needed to create an evidence package. id/package_ref/created_at are
+/// filled by `insert_evidence`.
+#[derive(Debug, Clone)]
+pub struct NewEvidence {
+    pub alarm_id: String,
+    pub signed_by: String,
+}
+
+/// Column list (with the alarm + camera join) shared by every evidence SELECT so
+/// the row decoder stays in lockstep with the query shape.
+const EVIDENCE_COLS: &str =
+    "e.id, e.alarm_id, e.package_ref, e.signed_by, e.created_at, \
+     COALESCE(a.message, ''), COALESCE(c.name, ''), COALESCE(a.severity, '')";
+
+fn row_to_evidence(r: &Row) -> EvidenceRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    EvidenceRow {
+        id: g(0).as_str().into(),
+        alarm_id: g(1).as_str().into(),
+        package_ref: g(2).as_str().into(),
+        signed_by: g(3).as_str().into(),
+        created_at: g(4).as_i64(),
+        alarm_message: g(5).as_str().into(),
+        camera_name: g(6).as_str().into(),
+        alarm_severity: g(7).as_str().into(),
+    }
+}
+
+/// Lists all evidence packages newest-first, left-joining the source alarm and
+/// its camera so the package card can render a friendly incident label.
+pub fn list_evidence() -> Result<Vec<EvidenceRow>, AbiError> {
+    let sql = alloc::format!(
+        "SELECT {EVIDENCE_COLS} FROM evidence e \
+         LEFT JOIN alarms a ON a.id = e.alarm_id \
+         LEFT JOIN cameras c ON c.id = a.camera_id \
+         ORDER BY e.created_at DESC, e.id DESC"
+    );
+    let rows = query(&sql, &[])?;
+    Ok(rows.iter().map(row_to_evidence).collect())
+}
+
+/// Fetches a single evidence package (with its alarm/camera labels) by id, or None.
+pub fn get_evidence(id: &str) -> Result<Option<EvidenceRow>, AbiError> {
+    let sql = alloc::format!(
+        "SELECT {EVIDENCE_COLS} FROM evidence e \
+         LEFT JOIN alarms a ON a.id = e.alarm_id \
+         LEFT JOIN cameras c ON c.id = a.camera_id \
+         WHERE e.id = ?1"
+    );
+    let rows = query(&sql, &[SqlValue::Text(id.into())])?;
+    Ok(rows.first().map(row_to_evidence))
+}
+
+/// Inserts a new evidence package, returning its generated id. The
+/// `package_ref` is a generated, human-facing reference (`EV-<unixsecs>-<n>`);
+/// created_at is stamped from the authoritative SQLite clock.
+pub fn insert_evidence(e: &NewEvidence) -> Result<String, AbiError> {
+    let id = generate_id("ev");
+    let package_ref = generate_id("EV");
+    let now = now_secs();
+    exec(
+        "INSERT INTO evidence (id, alarm_id, package_ref, signed_by, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(e.alarm_id.clone()),
+            SqlValue::Text(package_ref),
+            SqlValue::Text(e.signed_by.clone()),
+            SqlValue::I64(now),
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Deletes an evidence package by id. Returns rows affected (0 if it did not exist).
+pub fn delete_evidence(id: &str) -> Result<u64, AbiError> {
+    exec("DELETE FROM evidence WHERE id = ?1", &[SqlValue::Text(id.into())])
+}
+
+// =============================================================================
 // Settings (key/value)
 // =============================================================================
 

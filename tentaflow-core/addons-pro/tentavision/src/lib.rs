@@ -1482,32 +1482,44 @@ impl AuditState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EvidenceTab { Active, Archive, All }
-
+/// View state for the Evidence-export tab. The evidence package rows and the
+/// recipient list both persist in SQLite (the `evidence` table and the
+/// `evidence_recipients` settings key); this struct only holds the transient UI
+/// state: which forms are open, the pending delete arming and the bound draft
+/// fields for the create-package and add-recipient forms.
 struct EvidenceState {
-    tab: EvidenceTab,
-    drawer_open_id: Option<String>,
-    drawer_tab: String,
-    edited_descriptions: Vec<(String, String)>,
+    package_form_visible: bool,
+    form_alarm_id: String,
+    form_recipient: String,
+    pending_remove: Option<String>,
+    recipient_form_visible: bool,
+    recipient_name: String,
+    recipient_key: String,
 }
 
 impl EvidenceState {
     const fn new() -> Self {
-        Self { tab: EvidenceTab::Active, drawer_open_id: None, drawer_tab: String::new(), edited_descriptions: Vec::new() }
-    }
-    fn drawer_tab_or_default(&self) -> &str {
-        if self.drawer_tab.is_empty() { "summary" } else { &self.drawer_tab }
-    }
-    fn description_for(&self, id: &str) -> Option<&str> {
-        self.edited_descriptions.iter().find(|(k, _)| k == id).map(|(_, v)| v.as_str())
-    }
-    fn set_description(&mut self, id: &str, value: String) {
-        if let Some(slot) = self.edited_descriptions.iter_mut().find(|(k, _)| k == id) {
-            slot.1 = value;
-        } else {
-            self.edited_descriptions.push((id.to_string(), value));
+        Self {
+            package_form_visible: false,
+            form_alarm_id: String::new(),
+            form_recipient: String::new(),
+            pending_remove: None,
+            recipient_form_visible: false,
+            recipient_name: String::new(),
+            recipient_key: String::new(),
         }
+    }
+
+    /// Resets the create-package form to a clean draft.
+    fn reset_package_form(&mut self) {
+        self.form_alarm_id.clear();
+        self.form_recipient.clear();
+    }
+
+    /// Resets the add-recipient form to a clean draft.
+    fn reset_recipient_form(&mut self) {
+        self.recipient_name.clear();
+        self.recipient_key.clear();
     }
 }
 
@@ -1959,6 +1971,11 @@ static PENDING_MODEL_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 static PENDING_ZONE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 static PENDING_RULE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
+/// Same mechanism as `PENDING_CAMERA_ROWS` but for the evidence package Table
+/// and the authorized-recipients Table on the Evidence-export tab.
+static PENDING_EVIDENCE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+static PENDING_RECIPIENT_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
     f(&mut guard)
@@ -2286,6 +2303,24 @@ fn render_panel(panel_id: &str) {
             });
         }
         send_slot_content_with_overlay("content", content, Some(entries));
+    } else if panel_id == "evidence" {
+        // Seed the evidence package Table, the recipients Table and, when a form
+        // is open, its bound draft fields so every control mounts populated.
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_EVIDENCE_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("evidence_rows".into())]),
+                value: rows,
+            });
+        }
+        if let Some(rows) = PENDING_RECIPIENT_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("recipients_rows".into())]),
+                value: rows,
+            });
+        }
+        entries.extend(evidence_overlay());
+        send_slot_content_with_overlay("content", content, Some(entries));
     } else if panel_id == "settings" {
         // Seed every settings control's bound store key from the DB (or default,
         // or the pending edit) so each field mounts showing its current value
@@ -2446,9 +2481,19 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "audit-retention-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.audit.retention_draft = v); json!({"ok":true}) }
         "audit-retention-save" => handle_audit_retention_save(params),
         "audit-doc-generate" => { let kind = params.get("kind").and_then(|x| x.as_str()).unwrap_or("dokument").to_string(); with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Generowanie dokumentu '{}' zostanie podłączone do backendu zgodności.", kind.to_uppercase())); }); render_panel("audit"); json!({"ok":true}) }
-        "evidence-tab-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("active").to_string(); with_state(|s| { s.evidence.tab = match v.as_str() { "archive" => EvidenceTab::Archive, "all" => EvidenceTab::All, _ => EvidenceTab::Active }; }); json!({"ok":true}) }
-        "evidence-open" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("evidence_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.evidence.drawer_open_id = if id.is_empty() { None } else { Some(id) }; if s.evidence.drawer_tab.is_empty() { s.evidence.drawer_tab = "summary".into(); } }); json!({"ok":true}) }
-        "evidence-close-drawer" => { with_state(|s| { s.evidence.drawer_open_id = None; }); json!({"ok":true}) }
+        "evidence-new" => { with_state(|s| { s.clear_messages(); s.evidence.package_form_visible = true; s.evidence.recipient_form_visible = false; s.evidence.pending_remove = None; s.evidence.reset_package_form(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-form-cancel" => { with_state(|s| { s.evidence.package_form_visible = false; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-field-change" => handle_evidence_field_change(params),
+        "evidence-create" => handle_evidence_create(),
+        "evidence-row-select" => { let id = params.get("evidence_id").and_then(|x| x.as_str()).or_else(|| params.get("row_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.evidence.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-remove-cancel" => { with_state(|s| { s.evidence.pending_remove = None; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-remove" => handle_evidence_remove(params),
+        "evidence-download" | "evidence-verify" | "evidence-sign" => { with_state(|s| { s.clear_messages(); s.success_message = Some("Podpis HSM/TSA wymaga skonfigurowanego modułu — brak backendu.".into()); }); render_panel("evidence"); json!({"ok":true,"noop":true}) }
+        "evidence-recipient-add-show" => { with_state(|s| { s.clear_messages(); s.evidence.recipient_form_visible = true; s.evidence.package_form_visible = false; s.evidence.pending_remove = None; s.evidence.reset_recipient_form(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-recipient-cancel" => { with_state(|s| { s.evidence.recipient_form_visible = false; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-recipient-field-change" => handle_evidence_recipient_field_change(params),
+        "evidence-recipient-add" => handle_evidence_recipient_add(),
+        "evidence-recipient-remove" => handle_evidence_recipient_remove(params),
         "settings-field-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, value)); } json!({"ok":true}) }
         "settings-toggle-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let on = params.get("value").and_then(|x| x.as_bool()).or_else(|| params.get("checked").and_then(|x| x.as_bool())).unwrap_or(false); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, if on { "1".into() } else { "0".into() })); } json!({"ok":true}) }
         "settings-save" => handle_settings_save(),
@@ -7423,36 +7468,601 @@ fn build_doc_card(title: &str, subtitle: &str, desc: &str, kind: &str) -> Compon
     ])
 }
 
+/// Actor attributed to evidence-export changes. No host identity fn exists in
+/// this addon ABI yet, so changes are attributed to the analyst role that owns
+/// the evidence-export workflow in the mockup.
+const EVIDENCE_ACTOR: &str = "analityk";
+
+/// Settings key under which the authorized-recipients list is persisted as JSON
+/// (an array of `{name, key}` objects).
+const EVIDENCE_RECIPIENTS_KEY: &str = "evidence_recipients";
+
+/// One authorized recipient (organ): a display name and an optional public-key
+/// fingerprint shown in the recipients table.
+#[derive(Debug, Clone)]
+struct EvidenceRecipient {
+    name: String,
+    key: String,
+}
+
+/// Reads + decodes the persisted recipients list. A malformed/empty value yields
+/// an empty list rather than an error so the panel still renders.
+fn load_evidence_recipients() -> Vec<EvidenceRecipient> {
+    let raw = db::get_setting(EVIDENCE_RECIPIENTS_KEY).ok().flatten().unwrap_or_default();
+    let parsed: JsonValue = serde_json::from_str(&raw).unwrap_or(JsonValue::Null);
+    parsed
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    Some(EvidenceRecipient { name, key })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persists the recipients list as a JSON array under the settings key.
+fn save_evidence_recipients(recipients: &[EvidenceRecipient]) -> Result<(), AbiError> {
+    let arr: Vec<JsonValue> = recipients
+        .iter()
+        .map(|r| json!({ "name": r.name, "key": r.key }))
+        .collect();
+    let payload = JsonValue::Array(arr).to_string();
+    db::set_setting(EVIDENCE_RECIPIENTS_KEY, &payload).map(|_| ())
+}
+
+/// Status chip for an evidence package: a non-empty `signed_by` recipient marks
+/// the package as issued/signed (ok), an empty one is still pending (warn).
+fn evidence_status_cell(signed_by: &str) -> Value {
+    if signed_by.trim().is_empty() {
+        chip_cell("oczekuje", "warn")
+    } else {
+        chip_cell("wydana", "ok")
+    }
+}
+
+/// Maps an evidence package row to the bound Table row map.
+fn evidence_table_row_value(e: &db::EvidenceRow) -> Value {
+    let incident = if e.alarm_message.trim().is_empty() {
+        if e.alarm_id.trim().is_empty() { "—".to_string() } else { short_id(&e.alarm_id) }
+    } else {
+        e.alarm_message.clone()
+    };
+    let camera = if e.camera_name.trim().is_empty() { "—".to_string() } else { e.camera_name.clone() };
+    let recipient = if e.signed_by.trim().is_empty() { "—".to_string() } else { e.signed_by.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("evidence_id".into()), Value::Text(e.id.clone())),
+        (Value::Text("package_ref".into()), Value::Text(e.package_ref.clone())),
+        (Value::Text("incident".into()), Value::Text(incident)),
+        (Value::Text("camera".into()), Value::Text(camera)),
+        (Value::Text("status".into()), evidence_status_cell(&e.signed_by)),
+        (Value::Text("recipient".into()), Value::Text(recipient)),
+        (Value::Text("created".into()), Value::Text(format_alarm_datetime(e.created_at))),
+    ];
+    Value::Map(entries)
+}
+
+fn evidence_table_column(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable: true,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
+}
+
+/// The evidence package Table — real rows seeded via PENDING_EVIDENCE_ROWS, with
+/// per-row Pobierz/Weryfikuj/Usuń actions wired to the dispatch handlers.
+fn build_evidence_table() -> Component {
+    let columns = vec![
+        evidence_table_column("package_ref", "Paczka", ColumnRender::Text),
+        evidence_table_column("incident", "Incydent", ColumnRender::Text),
+        evidence_table_column("camera", "Kamera", ColumnRender::Text),
+        evidence_table_column("status", "Status", ColumnRender::Chip),
+        evidence_table_column("recipient", "Odbiorca", ColumnRender::Text),
+        evidence_table_column("created", "Utworzono", ColumnRender::Text),
+    ];
+    let download_action = button("Pobierz", "evidence-download", "secondary");
+    let verify_action = button("Weryfikuj", "evidence-verify", "ghost");
+    let remove_action = button("Usuń", "evidence-row-select", "destructive");
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("evidence_rows".into())]),
+        row_key_field: "evidence_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![download_action, verify_action, remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// The authorized-recipients Table — rows seeded via PENDING_RECIPIENT_ROWS,
+/// with a per-row Usuń action keyed by recipient name.
+fn build_recipients_table() -> Component {
+    let columns = vec![
+        evidence_table_column("name", "Organ", ColumnRender::Text),
+        evidence_table_column("key", "Klucz publiczny", ColumnRender::Text),
+        evidence_table_column("active", "Aktywny", ColumnRender::Chip),
+    ];
+    let remove_action = button("Usuń", "evidence-recipient-remove", "destructive");
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("recipients_rows".into())]),
+        row_key_field: "recipient_name".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// Maps a recipient to the bound recipients-Table row map.
+fn recipient_table_row_value(r: &EvidenceRecipient) -> Value {
+    let key = if r.key.trim().is_empty() { "—".to_string() } else { r.key.clone() };
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("recipient_name".into()), Value::Text(r.name.clone())),
+        (Value::Text("name".into()), Value::Text(r.name.clone())),
+        (Value::Text("key".into()), Value::Text(key)),
+        (Value::Text("active".into()), chip_cell("aktywny", "ok")),
+    ];
+    Value::Map(entries)
+}
+
+/// Evidence form text input bound to a store key, mirrored to backend on change.
+fn evidence_input(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend { action_id: "evidence-recipient-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+/// Evidence form select bound to a store key, mirrored to backend on change.
+fn evidence_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    let mut comp = select(label, options, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend { action_id: "evidence-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+/// The create-evidence-package form: pick a real source alarm + an authorized
+/// recipient, then create a persisted evidence record referencing the alarm.
+fn build_evidence_package_form(alarms: &[db::AlarmRow], recipients: &[EvidenceRecipient]) -> Component {
+    // Alarm options from the real alarm center — empty option first so the
+    // operator must consciously pick a source incident.
+    let mut alarm_opts: Vec<SelectOption> = vec![SelectOption {
+        value: SelectValue::Text("".into()),
+        label: lit("— wybierz alarm źródłowy —"),
+        icon: None, disabled: false, group_id: None, description: None,
+    }];
+    for a in alarms {
+        let label = if a.message.trim().is_empty() {
+            alloc::format!("{} · {}", short_id(&a.id), a.severity)
+        } else {
+            let cam = if a.camera_name.trim().is_empty() { String::new() } else { alloc::format!(" ({})", a.camera_name) };
+            alloc::format!("{}{} · {}", a.message, cam, format_alarm_datetime(a.ts))
+        };
+        alarm_opts.push(SelectOption {
+            value: SelectValue::Text(a.id.clone()),
+            label: lit(&label),
+            icon: None, disabled: false, group_id: None, description: None,
+        });
+    }
+
+    let mut recipient_opts: Vec<SelectOption> = vec![SelectOption {
+        value: SelectValue::Text("".into()),
+        label: lit("— odbiorca (opcjonalnie) —"),
+        icon: None, disabled: false, group_id: None, description: None,
+    }];
+    for r in recipients {
+        recipient_opts.push(SelectOption {
+            value: SelectValue::Text(r.name.clone()),
+            label: lit(&r.name),
+            icon: None, disabled: false, group_id: None, description: None,
+        });
+    }
+
+    let mut fields_children = vec![
+        evidence_select("Alarm źródłowy", alarm_opts, "evidence_alarm"),
+        evidence_select("Uprawniony odbiorca", recipient_opts, "evidence_recipient"),
+    ];
+    if alarms.is_empty() {
+        fields_children.push(text_styled(
+            "Brak alarmów źródłowych — wygeneruj alarm w Centrum alarmów, aby utworzyć paczkę.",
+            "caption",
+        ));
+    }
+    let fields = card(Some("Dane paczki dowodowej"), fields_children);
+    let actions = stack_h(vec![
+        button("Zapisz pakiet", "evidence-create", "primary"),
+        button("Anuluj", "evidence-form-cancel", "ghost"),
+    ]);
+    card(None, vec![fields, actions])
+}
+
+/// The add-recipient form: a display name + optional public-key fingerprint,
+/// persisted into the recipients settings list.
+fn build_recipient_form() -> Component {
+    let fields = card(Some("Nowy uprawniony odbiorca"), vec![
+        evidence_input("Organ", "np. Prokuratura Rejonowa Warszawa-Mokotów", "evidence_recipient_name"),
+        evidence_input("Klucz publiczny (opcjonalnie)", "np. PGP 4F2A...8E91", "evidence_recipient_key"),
+    ]);
+    let actions = stack_h(vec![
+        button("Zapisz odbiorcę", "evidence-recipient-add", "primary"),
+        button("Anuluj", "evidence-recipient-cancel", "ghost"),
+    ]);
+    card(None, vec![fields, actions])
+}
+
+/// Confirmation bar for deleting the selected evidence package.
+fn build_evidence_remove_confirm(evidence_id: &str, packages: &[db::EvidenceRow]) -> Component {
+    let label = packages
+        .iter()
+        .find(|p| p.id == evidence_id)
+        .map(|p| p.package_ref.clone())
+        .unwrap_or_else(|| evidence_id.to_string());
+    let mut params = CborMap::default();
+    params.0.push(("evidence_id".into(), Value::Text(evidence_id.into())));
+    let confirm_btn = button_with_params("Usuń", "evidence-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "evidence-remove-cancel", "ghost");
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć paczkę dowodową \"{}\"?", label), "body_strong"),
+        text("Usuwa wyłącznie rekord metadanych — nie ma podpisanego artefaktu kryptograficznego do skasowania."),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
 fn build_evidence_content() -> Component {
     let messages = build_messages_section();
-    let tab = with_state(|s| match s.evidence.tab { EvidenceTab::Active => "active", EvidenceTab::Archive => "archive", EvidenceTab::All => "all" }.to_string());
+    let (package_form_visible, recipient_form_visible) =
+        with_state(|s| (s.evidence.package_form_visible, s.evidence.recipient_form_visible));
+
+    let mut children = vec![messages];
+
     let toolbar = stack_h(vec![
         heading(2, "Eksport dowodowy"),
-        filter_chips(
-            vec![
-                FilterChipDef { id: "active".into(), label: lit("active"), icon: None, badge: None, count_path: None },
-                FilterChipDef { id: "archive".into(), label: lit("archive"), icon: None, badge: None, count_path: None },
-                FilterChipDef { id: "all".into(), label: lit("all"), icon: None, badge: None, count_path: None },
-            ],
-            &tab,
-        ),
-        button("Nowa paczka", "evidence-new", "primary"),
+        button_with_icon("Dodaj odbiorcę", "evidence-recipient-add-show", "secondary", "plus"),
+        button_with_icon("Utwórz pakiet dowodowy", "evidence-new", "primary", "plus"),
     ]);
-    let fixture: &[(&str, &str, &str, &str)] = &[
-        ("case-2026-04-12", "Incydent C-04 wjazd", "active", "2026-04-12"),
-        ("case-2026-03-04", "Kradzież — parking B", "archive", "2026-03-04"),
-    ];
-    let cols = vec![
-        Value::Text("ID".into()), Value::Text("Tytuł".into()),
-        Value::Text("Status".into()), Value::Text("Data".into()),
-    ];
-    let rows: Vec<Value> = fixture.iter().map(|(id, title, status, date)| {
-        Value::Array(vec![
-            Value::Text((*id).into()), Value::Text((*title).into()),
-            Value::Text((*status).into()), Value::Text((*date).into()),
-        ])
-    }).collect();
-    stack_v(vec![messages, toolbar, card(None, vec![table(cols, rows)])])
+    children.push(toolbar);
+
+    // Trust-chain header strip (placeholders per mockup — honest about the
+    // absence of a real HSM/TSA backend).
+    children.push(card(None, vec![
+        stack_h(vec![
+            heading(4, "Łańcuch zaufania"),
+            chip_toned_icon("Brak modułu HSM/TSA", "warning", "key"),
+        ]),
+        text_styled(
+            "Rekordy metadanych (kto/co/kiedy/odbiorca) są realne i trwałe. Podpis HSM (ed25519), \
+             znacznik czasu TSA (RFC 3161) i eksport plikowy wymagają skonfigurowanego modułu — brak backendu.",
+            "caption",
+        ),
+    ]));
+
+    // A DB/permission error must never be masked as "no packages".
+    let packages = match db::list_evidence() {
+        Ok(p) => p,
+        Err(e) => {
+            children.push(alert(&alloc::format!("Nie udało się pobrać paczek dowodowych: {}", abi_message(e)), "critical"));
+            return stack_v(children);
+        }
+    };
+    let recipients = load_evidence_recipients();
+    let alarms = db::list_alarms("", "", false).unwrap_or_default();
+
+    // Recipients section (left of the mockup grid).
+    let mut recipients_children = vec![stack_h(vec![
+        heading(3, "Uprawnieni odbiorcy"),
+        chip_toned(&alloc::format!("{}", recipients.len()), if recipients.is_empty() { "muted" } else { "info" }),
+    ])];
+    if recipient_form_visible {
+        recipients_children.push(build_recipient_form());
+    }
+    if recipients.is_empty() {
+        recipients_children.push(empty_state(
+            "Brak odbiorców",
+            Some("Dodaj uprawniony organ (np. prokuratura, sąd), aby kierować do niego paczki dowodowe."),
+            Some("users"),
+        ));
+    } else {
+        let rows: Vec<Value> = recipients.iter().map(recipient_table_row_value).collect();
+        if let Ok(mut g) = PENDING_RECIPIENT_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
+        recipients_children.push(build_recipients_table());
+    }
+    children.push(card(None, recipients_children));
+
+    // Create-package form.
+    if package_form_visible {
+        children.push(build_evidence_package_form(&alarms, &recipients));
+    }
+
+    // Delete-confirmation bar above the package list once a row is armed.
+    if let Some(pending) = with_state(|s| s.evidence.pending_remove.clone()) {
+        if packages.iter().any(|p| p.id == pending) {
+            children.push(build_evidence_remove_confirm(&pending, &packages));
+        } else {
+            with_state(|s| s.evidence.pending_remove = None);
+        }
+    }
+
+    // Evidence package list.
+    let mut packages_children = vec![stack_h(vec![
+        heading(3, "Paczki dowodowe"),
+        chip_toned(&alloc::format!("{}", packages.len()), if packages.is_empty() { "muted" } else { "info" }),
+    ])];
+    if packages.is_empty() {
+        packages_children.push(empty_state(
+            "Brak paczek dowodowych",
+            Some("Utwórz pakiet dowodowy z alarmu źródłowego — rekord metadanych zostanie trwale zapisany."),
+            Some("package"),
+        ));
+    } else {
+        let rows: Vec<Value> = packages.iter().map(evidence_table_row_value).collect();
+        if let Ok(mut g) = PENDING_EVIDENCE_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
+        packages_children.push(build_evidence_table());
+    }
+    children.push(card(None, packages_children));
+
+    stack_v(children)
+}
+
+/// Seeds the evidence forms' bound store keys from backend state so each form
+/// mounts with the draft values in place.
+fn evidence_overlay() -> Vec<StateEntry> {
+    with_state(|s| {
+        let e = &s.evidence;
+        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
+        vec![
+            key("evidence_alarm", Value::Text(e.form_alarm_id.clone())),
+            key("evidence_recipient", Value::Text(e.form_recipient.clone())),
+            key("evidence_recipient_name", Value::Text(e.recipient_name.clone())),
+            key("evidence_recipient_key", Value::Text(e.recipient_key.clone())),
+        ]
+    })
+}
+
+/// Mirrors a create-package form field into backend state on change.
+fn handle_evidence_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(v) = value {
+        with_state(|s| match field {
+            "evidence_alarm" => s.evidence.form_alarm_id = v,
+            "evidence_recipient" => s.evidence.form_recipient = v,
+            _ => {}
+        });
+    }
+    json!({"ok":true})
+}
+
+/// Mirrors an add-recipient form field into backend state on change.
+fn handle_evidence_recipient_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(v) = value {
+        with_state(|s| match field {
+            "evidence_recipient_name" => s.evidence.recipient_name = v,
+            "evidence_recipient_key" => s.evidence.recipient_key = v,
+            _ => {}
+        });
+    }
+    json!({"ok":true})
+}
+
+/// Creates a persisted evidence package referencing a real source alarm, writes
+/// a hash-chained audit entry (evidence_change), then re-renders the panel.
+fn handle_evidence_create() -> JsonValue {
+    let (alarm_id, recipient) = with_state(|s| (
+        s.evidence.form_alarm_id.trim().to_string(),
+        s.evidence.form_recipient.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    if alarm_id.is_empty() {
+        with_state(|s| s.error_message = Some("Wybierz alarm źródłowy dla paczki dowodowej.".into()));
+        render_panel("evidence");
+        return json!({"ok":false,"error":"no alarm"});
+    }
+    // The alarm must exist — never create evidence for a phantom incident.
+    match db::get_alarm(&alarm_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            with_state(|s| s.error_message = Some("Wybrany alarm źródłowy nie istnieje.".into()));
+            render_panel("evidence");
+            return json!({"ok":false,"error":"alarm not found"});
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd odczytu alarmu: {}", abi_message(e))));
+            render_panel("evidence");
+            return json!({"ok":false,"error":alloc::format!("{}",e)});
+        }
+    }
+
+    let new_evidence = db::NewEvidence { alarm_id: alarm_id.clone(), signed_by: recipient.clone() };
+    match db::insert_evidence(&new_evidence) {
+        Ok(id) => {
+            let row = db::get_evidence(&id).ok().flatten();
+            let package_ref = row.as_ref().map(|r| r.package_ref.clone()).unwrap_or_else(|| id.clone());
+            let after = json!({
+                "id": id, "package_ref": package_ref,
+                "alarm_id": alarm_id, "signed_by": recipient,
+            }).to_string();
+            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &package_ref, "null", &after);
+            with_state(|s| {
+                s.evidence.package_form_visible = false;
+                s.evidence.reset_package_form();
+                s.success_message = Some(alloc::format!("Pakiet dowodowy utworzony ({}).", package_ref));
+            });
+            render_panel("evidence");
+            json!({"ok":true,"evidence_id":id})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu paczki: {}", abi_message(e))));
+            render_panel("evidence");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Deletes the selected evidence package, writing a hash-chained audit entry with
+/// the deleted row's metadata as the `before` snapshot.
+fn handle_evidence_remove(params: &JsonValue) -> JsonValue {
+    let id = params.get("evidence_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty evidence_id"});
+    }
+    let before_row = db::get_evidence(&id).ok().flatten();
+    let (package_ref, before) = match &before_row {
+        Some(r) => (
+            r.package_ref.clone(),
+            json!({
+                "id": r.id, "package_ref": r.package_ref,
+                "alarm_id": r.alarm_id, "signed_by": r.signed_by,
+            }).to_string(),
+        ),
+        None => (id.clone(), "null".into()),
+    };
+    match db::delete_evidence(&id) {
+        Ok(n) if n > 0 => {
+            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &package_ref, &before, "null");
+            with_state(|s| {
+                s.evidence.pending_remove = None;
+                s.success_message = Some(alloc::format!("Paczka dowodowa usunięta ({}).", package_ref));
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        Ok(_) => {
+            with_state(|s| { s.evidence.pending_remove = None; s.error_message = Some("Paczka nie istnieje.".into()); });
+            render_panel("evidence");
+            json!({"ok":false,"error":"not found"})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania paczki: {}", abi_message(e))));
+            render_panel("evidence");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Adds a new authorized recipient to the persisted recipients list (dedup by
+/// name), writing a hash-chained audit entry.
+fn handle_evidence_recipient_add() -> JsonValue {
+    let (name, key) = with_state(|s| (
+        s.evidence.recipient_name.trim().to_string(),
+        s.evidence.recipient_key.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+    if name.is_empty() || name.chars().count() > 120 {
+        with_state(|s| s.error_message = Some("Nazwa organu musi mieć 1–120 znaków.".into()));
+        render_panel("evidence");
+        return json!({"ok":false,"error":"invalid name"});
+    }
+    let mut recipients = load_evidence_recipients();
+    if recipients.iter().any(|r| r.name.eq_ignore_ascii_case(&name)) {
+        with_state(|s| s.error_message = Some("Taki odbiorca już istnieje.".into()));
+        render_panel("evidence");
+        return json!({"ok":false,"error":"duplicate"});
+    }
+    recipients.push(EvidenceRecipient { name: name.clone(), key });
+    match save_evidence_recipients(&recipients) {
+        Ok(()) => {
+            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &name, "null", &json!({"recipient": name}).to_string());
+            with_state(|s| {
+                s.evidence.recipient_form_visible = false;
+                s.evidence.reset_recipient_form();
+                s.success_message = Some(alloc::format!("Dodano odbiorcę: {}.", name));
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu odbiorcy: {}", abi_message(e))));
+            render_panel("evidence");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Removes an authorized recipient from the persisted list by name, writing a
+/// hash-chained audit entry.
+fn handle_evidence_recipient_remove(params: &JsonValue) -> JsonValue {
+    let name = params.get("recipient_name").and_then(|v| v.as_str())
+        .or_else(|| params.get("row_id").and_then(|v| v.as_str()))
+        .or_else(|| params.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if name.is_empty() {
+        return json!({"ok":false,"error":"empty name"});
+    }
+    let mut recipients = load_evidence_recipients();
+    let before = recipients.len();
+    recipients.retain(|r| !r.name.eq_ignore_ascii_case(&name));
+    if recipients.len() == before {
+        with_state(|s| s.error_message = Some("Odbiorca nie istnieje.".into()));
+        render_panel("evidence");
+        return json!({"ok":false,"error":"not found"});
+    }
+    match save_evidence_recipients(&recipients) {
+        Ok(()) => {
+            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &name, &json!({"recipient": name}).to_string(), "null");
+            with_state(|s| s.success_message = Some(alloc::format!("Usunięto odbiorcę: {}.", name)));
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu odbiorców: {}", abi_message(e))));
+            render_panel("evidence");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
 }
 
 /// The kind of a settings field — drives both the rendered control and how the
