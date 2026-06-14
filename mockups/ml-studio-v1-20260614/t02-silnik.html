@@ -45,6 +45,7 @@
   <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
   <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-mesh" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><line x1="7" y1="6" x2="17" y2="6"/><line x1="6" y1="8" x2="11" y2="16"/><line x1="18" y1="8" x2="13" y2="16"/></symbol>
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
   <symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/></symbol>
   <symbol id="i-anomaly" viewBox="0 0 24 24"><path d="M3 12h3l2-7 4 14 3-9 2 2h4"/></symbol>
@@ -97,6 +98,9 @@
         <div class="nav-section">
           <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
           <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
           <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
         </div>
         <div class="nav-section">
@@ -235,6 +239,42 @@ flow_invoke_v1(<span class="s">'automl_run'</span>, {
               <select class="select"><option>auto (kwantyl 0.98)</option><option>ręczny: 0.82</option></select>
               <span class="hint">Punkt odcięcia score → anomalia. Wyższy próg = mniej, ale pewniejszych alarmów.</span>
             </div>
+          </div>
+        </section>
+
+        <!-- Wykonanie: wybór node / trening rozproszony -->
+        <section class="section-card mt-md ml-enter ml-enter-4">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-mesh"/></svg>Wykonanie <span class="text-3">— node wykonawczy z zasobów przydzielonych projektowi</span></div>
+            <a class="btn btn-ghost btn-sm" href="przeglad-projektu.html">Zasoby projektu<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+          <div class="flex gap-sm wrap" style="margin-bottom:12px;">
+            <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>ml_studio.db zsynchronizowana z mesh (Sync Ledger)</span>
+            <span class="chip info"><svg class="icon"><use href="#i-server"/></svg>dataset przeniesiony na node wykonawczy przez mesh</span>
+          </div>
+          <div class="field">
+            <label>Node wykonawczy</label>
+            <select class="select">
+              <option>warszawa-gpu (2× RTX 4090) · node-A</option>
+              <option>dgx-01 (8× B300) · node-B · przez mesh</option>
+            </select>
+            <span class="hint">Lista zawiera wyłącznie zasoby przydzielone temu projektowi przez administratora (granty). AutoML uruchamia wiele przebiegów — rozproszenie na nody przyspiesza przeszukanie.</span>
+          </div>
+          <div class="toggle-row" style="margin-top:6px;">
+            <span class="toggle"></span>
+            <span>Trening rozproszony na N nodów <span class="text-3">— równoległe przebiegi AutoML na node-A + node-B (dane przez mesh)</span></span>
+          </div>
+        </section>
+
+        <!-- Wykonanie: alternatywny stan — brak przydzielonych zasobów (trening zablokowany) -->
+        <section class="section-card mt-md ml-enter ml-enter-4" style="border-color:rgba(245,158,11,0.35);">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--warning);"><use href="#i-info"/></svg>Wykonanie <span class="text-3">— stan: brak zasobów</span></div>
+            <span class="chip warning"><span class="dot"></span>trening zablokowany</span>
+          </div>
+          <div class="callout" style="display:flex;gap:12px;align-items:flex-start;padding:13px 16px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);">
+            <svg class="icon icon-lg" style="color:var(--warning);flex-shrink:0;"><use href="#i-info"/></svg>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;"><strong>Brak przydzielonych zasobów — trening niemożliwy.</strong> Projekt nie ma grantu GPU/CPU na żadnym node mesh, więc lista node'ów wykonawczych jest pusta, a start AutoML zablokowany. Poproś administratora o przydział w sekcji <a href="admin-zasoby.html" style="color:var(--accent-2);">Zasoby</a>.</p>
           </div>
         </section>
 

@@ -1,9 +1,5 @@
 <!DOCTYPE html>
-<!-- =============================================================================
-     Plik: p00-projekty.html
-     Opis: Ekran główny modułu ML Studio — lista projektów jako karty (projekt =
-           jednostka pracy: własne dane, schemat, anotacje, treningi, modele).
-     ============================================================================= -->
+<!-- ===== Plik: p00-projekty.html — Ekran główny ML Studio: projekty „Moje" i „Udostępnione mi" z badge właściciela i rolą (model własności §11.1) ===== -->
 <html lang="pl">
 <head>
 <meta charset="UTF-8">
@@ -27,6 +23,9 @@
   .project-card:hover { transform: translateY(-4px); border-color: var(--accent-1);
     box-shadow: var(--shadow-lg), var(--glow-indigo); }
   .project-card:hover::before { opacity: 1; }
+  /* Link „Otwórz projekt” rozciągnięty na całą kartę (klik w dowolne miejsce poza akcjami) */
+  .project-card .pc-open { position: absolute; inset: 0; z-index: 1; border-radius: inherit; }
+  .project-card .pc-open span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .project-card .pc-top { display: flex; align-items: flex-start; gap: 12px; }
   .project-card .pc-ico {
     width: 44px; height: 44px; border-radius: var(--radius); flex-shrink: 0;
@@ -65,6 +64,30 @@
     stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
   .project-new .pn-title { font-size: 15px; font-weight: 800; }
   .project-new .pn-sub { font-size: 12px; color: var(--text-3); max-width: 220px; line-height: 1.5; }
+
+  /* ----- Pasek właściciela / roli na karcie + akcja Udostępnij ----- */
+  .project-card .pc-owner { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: 11px; color: var(--text-3); }
+  .project-card .pc-owner svg { width: 11px; height: 11px; }
+  .pc-share {
+    position: absolute; top: 14px; right: 14px; z-index: 2;
+    width: 30px; height: 30px; border-radius: var(--radius-sm);
+    background: var(--bg-3); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; color: var(--text-2);
+    transition: all 0.16s;
+  }
+  .pc-share:hover { color: var(--accent-2); border-color: var(--accent-1); background: var(--accent-glow); }
+  .pc-share svg { width: 15px; height: 15px; stroke: currentColor; fill: none;
+    stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* ----- Nagłówek sekcji listy (Moje / Udostępnione mi) ----- */
+  .list-section-head { display: flex; align-items: center; gap: 10px; margin: 26px 0 14px; }
+  .list-section-head:first-of-type { margin-top: 0; }
+  .list-section-head h3 { font-size: 14px; font-weight: 800; margin: 0; display: flex;
+    align-items: center; gap: 8px; }
+  .list-section-head h3 svg { width: 16px; height: 16px; stroke: var(--accent-2); fill: none;
+    stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .list-section-head .sub { font-size: 11.5px; color: var(--text-3); }
 </style>
 </head>
 <body>
@@ -92,28 +115,34 @@
   <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
   <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+  <symbol id="i-crown" viewBox="0 0 24 24"><path d="M2 18h20l-2-11-5 5-3-7-3 7-5-5z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
 </defs>
 </svg>
 
 <div class="intro">
   <h1>ML Studio — Projekty (start modułu)</h1>
   <p class="lead">
-    <strong>Projekt = jednostka pracy.</strong> Każdy projekt jest samodzielny: ma własne dane, schemat zadania,
-    anotacje, treningi i modele. Ekran główny modułu to lista projektów. Stąd zaczynasz: tworzysz nowy projekt
-    kreatorem albo wchodzisz do istniejącego, by go skonfigurować (schemat, dane), oznaczać lub trenować.
+    <strong>Projekt = jednostka pracy.</strong> Każdy projekt ma <strong>właściciela</strong> i domyślnie jest prywatny —
+    widzisz tylko <strong>swoje</strong> projekty (te, które utworzyłeś) oraz te, do których ktoś Cię
+    <strong>zaprosił</strong>. Lista jest podzielona na „Moje projekty" i „Udostępnione mi". Właściciel może
+    udostępnić projekt innym, nadając im rolę Edytora lub Przeglądającego.
   </p>
   <div class="rules">
     <div class="rule">
-      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Projekt-centryczne</h3>
-      <p>Nie ma „ekranów stanu końcowego” bez kontekstu — wszystko należy do konkretnego projektu.</p>
+      <h3><svg class="icon icon-sm"><use href="#i-crown"/></svg>Własność per-projekt</h3>
+      <p>Twórca jest właścicielem. Domyślnie nikt inny nie widzi projektu — brak współdzielenia w obrębie organizacji.</p>
     </div>
     <div class="rule">
-      <h3><svg class="icon icon-sm"><use href="#i-plus"/></svg>Tworzenie od zera</h3>
-      <p>„+ Nowy projekt” uruchamia kreator (nazwa → typ → dane → schemat). Typ determinuje dalsze kroki.</p>
+      <h3><svg class="icon icon-sm"><use href="#i-share"/></svg>Udostępnianie i role</h3>
+      <p>Akcja „Udostępnij" na karcie prowadzi do zarządzania członkami: zaproszenia po użytkowniku/e-mailu + role.</p>
     </div>
     <div class="rule">
-      <h3><svg class="icon icon-sm"><use href="#i-book"/></svg>Współdzielone źródła</h3>
-      <p>Dane mogą być prywatne dla projektu albo pobrane z biblioteki źródeł współdzielonych między projektami.</p>
+      <h3><svg class="icon icon-sm"><use href="#i-eye"/></svg>Udostępnione mi</h3>
+      <p>Projekty, do których jesteś zaproszony, masz w osobnej sekcji wraz z rolą (Edytor / Przeglądający).</p>
     </div>
   </div>
 </div>
@@ -139,6 +168,9 @@
         <div class="nav-section">
           <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
           <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
           <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
         </div>
         <div class="nav-section">
@@ -165,9 +197,9 @@
             <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
             <div class="d-sub">Trening, fine-tuning, anotacja i wykrywanie anomalii — zorganizowane w projekty</div>
             <div class="d-badges">
-              <span class="chip accent"><svg class="icon"><use href="#i-grid"/></svg>3 projekty</span>
+              <span class="chip accent"><svg class="icon"><use href="#i-crown"/></svg>Moje (3)</span>
+              <span class="chip info"><svg class="icon"><use href="#i-share"/></svg>Udostępnione (2)</span>
               <span class="chip"><svg class="icon"><use href="#i-cpu"/></svg>1× RTX 4090 wolna</span>
-              <span class="chip info"><svg class="icon"><use href="#i-services"/></svg>vision-detection · vLLM aktywne</span>
             </div>
           </div>
           <div class="d-actions">
@@ -178,17 +210,26 @@
 
         <!-- Pasek filtrów typu -->
         <div class="flex gap-sm wrap mt-sm" style="margin-bottom:16px;">
-          <span class="filter-chip active"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie<span style="opacity:.6">3</span></span>
+          <span class="filter-chip active"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie<span style="opacity:.6">5</span></span>
           <span class="filter-chip"><svg class="icon"><use href="#i-image"/></svg>Rozpoznawanie obrazu</span>
           <span class="filter-chip"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning LLM</span>
           <span class="filter-chip"><svg class="icon"><use href="#i-book"/></svg>RAG</span>
           <span class="filter-chip"><svg class="icon"><use href="#i-table"/></svg>ML tabelaryczne</span>
         </div>
 
+        <!-- Sekcja: Moje projekty (jestem właścicielem) -->
+        <div class="list-section-head">
+          <h3><svg viewBox="0 0 24 24"><use href="#i-crown"/></svg>Moje projekty</h3>
+          <span class="chip accent">3</span>
+          <span class="sub">jesteś właścicielem — pełen dostęp i zarządzanie udostępnianiem</span>
+        </div>
+
         <div class="project-grid">
 
           <!-- Projekt 1: rozpoznawanie obrazu -->
-          <a class="project-card ml-enter ml-enter-1" href="r01-schemat.html">
+          <div class="project-card ml-enter ml-enter-1">
+            <a class="pc-open" href="r01-schemat.html"><span>Otwórz projekt: Rozpoznawanie znaków na cysternach</span></a>
+            <a class="pc-share" href="p02-udostepnianie.html" title="Udostępnij projekt"><svg viewBox="0 0 24 24"><use href="#i-share"/></svg></a>
             <div class="pc-top">
               <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
               <div>
@@ -197,6 +238,7 @@
               </div>
               <span class="status-pill ok ml-auto">aktywny</span>
             </div>
+            <div class="pc-owner"><svg><use href="#i-crown"/></svg>Właściciel: Ty · udostępniony 3 osobom</div>
             <p class="pc-desc">Detekcja tablic ADR, rejestracyjnych i nalepek na cysternach ADR z bramy.
               5 klas, atrybuty z OCR + lookup UN. 61/144 zdjęć oznaczonych.</p>
             <div class="pc-stats">
@@ -208,10 +250,12 @@
               <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>edytowany 12 min temu</span>
               <span class="chip accent"><svg class="icon"><use href="#i-image"/></svg>schemat gotowy</span>
             </div>
-          </a>
+          </div>
 
           <!-- Projekt 2: fine-tuning LLM (Guard) -->
-          <a class="project-card ml-enter ml-enter-2" href="f01-kreator-finetune.html">
+          <div class="project-card ml-enter ml-enter-2">
+            <a class="pc-open" href="f01-kreator-finetune.html"><span>Otwórz projekt: Trenowanie modelu Guard</span></a>
+            <a class="pc-share" href="p02-udostepnianie.html" title="Udostępnij projekt"><svg viewBox="0 0 24 24"><use href="#i-share"/></svg></a>
             <div class="pc-top">
               <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg></div>
               <div>
@@ -220,6 +264,7 @@
               </div>
               <span class="status-pill warn ml-auto">trening</span>
             </div>
+            <div class="pc-owner"><svg><use href="#i-crown"/></svg>Właściciel: Ty · prywatny</div>
             <p class="pc-desc">Klasyfikator bezpieczeństwa promptów (11 zadań). Pipeline: generacja danych →
               augmentacja zero-width → QLoRA → GGUF → benchmark vs Claude.</p>
             <div class="pc-stats">
@@ -231,10 +276,12 @@
               <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>trening trwa · ETA 34 min</span>
               <span class="chip warning"><span class="dot"></span>job aktywny</span>
             </div>
-          </a>
+          </div>
 
           <!-- Projekt 3: RAG -->
-          <a class="project-card ml-enter ml-enter-3" href="rag01-korpus.html">
+          <div class="project-card ml-enter ml-enter-3">
+            <a class="pc-open" href="rag01-korpus.html"><span>Otwórz projekt: RAG dla dokumentów ADR</span></a>
+            <a class="pc-share" href="p02-udostepnianie.html" title="Udostępnij projekt"><svg viewBox="0 0 24 24"><use href="#i-share"/></svg></a>
             <div class="pc-top">
               <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
               <div>
@@ -243,6 +290,7 @@
               </div>
               <span class="status-pill idle ml-auto">szkic</span>
             </div>
+            <div class="pc-owner"><svg><use href="#i-crown"/></svg>Właściciel: Ty · prywatny</div>
             <p class="pc-desc">Wyszukiwanie po regulacjach ADR/RID. Indeks wektorowy (HNSW), chunkowanie,
               reranking i odpowiedzi z cytowaniem źródła. Czeka na podpięcie korpusu.</p>
             <div class="pc-stats">
@@ -254,7 +302,7 @@
               <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>utworzony 3 dni temu</span>
               <span class="chip"><svg class="icon"><use href="#i-book"/></svg>brak źródeł</span>
             </div>
-          </a>
+          </div>
 
           <!-- Karta tworzenia nowego projektu -->
           <a class="project-new ml-enter ml-enter-4" href="p01-kreator-projekt.html">
@@ -263,6 +311,69 @@
             <div class="pn-sub">Kreator przeprowadzi Cię krok po kroku: nazwa, typ, dane i schemat zadania.</div>
             <span class="btn btn-primary">Otwórz kreator</span>
           </a>
+
+        </div>
+
+        <!-- Sekcja: Udostępnione mi (jestem zaproszonym członkiem) -->
+        <div class="list-section-head">
+          <h3><svg viewBox="0 0 24 24"><use href="#i-share"/></svg>Udostępnione mi</h3>
+          <span class="chip info">2</span>
+          <span class="sub">projekty, do których zaprosił Cię ich właściciel — działasz wg nadanej roli</span>
+        </div>
+
+        <div class="project-grid">
+
+          <!-- Udostępniony 1: jako Edytor -->
+          <div class="project-card ml-enter ml-enter-1">
+            <a class="pc-open" href="przeglad-projektu.html"><span>Otwórz projekt: Detekcja defektów na liniach OSD</span></a>
+            <div class="pc-top">
+              <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-image"/></svg></div>
+              <div>
+                <div class="pc-name">Detekcja defektów na liniach OSD</div>
+                <div class="pc-type">Rozpoznawanie obrazu · RF-DETR</div>
+              </div>
+              <span class="status-pill ok ml-auto">aktywny</span>
+            </div>
+            <div class="pc-owner"><svg><use href="#i-crown"/></svg>Właściciel: Anna Kowalska
+              <span class="chip"><svg class="icon"><use href="#i-edit"/></svg>Edytor</span></div>
+            <p class="pc-desc">Wykrywanie wad spawów i ubytków powłoki na liniach produkcyjnych.
+              Masz rolę Edytora — możesz oznaczać dane i uruchamiać trening.</p>
+            <div class="pc-stats">
+              <div class="pc-stat"><div class="v">512</div><div class="l">zdjęcia</div></div>
+              <div class="pc-stat"><div class="v">7</div><div class="l">klasy</div></div>
+              <div class="pc-stat"><div class="v">88%</div><div class="l">oznaczone</div></div>
+            </div>
+            <div class="pc-foot">
+              <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>edytowany 1 godz. temu</span>
+              <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>model v3</span>
+            </div>
+          </div>
+
+          <!-- Udostępniony 2: jako Przeglądający -->
+          <div class="project-card ml-enter ml-enter-2">
+            <a class="pc-open" href="przeglad-projektu.html"><span>Otwórz projekt: RAG — baza wiedzy serwisu</span></a>
+            <div class="pc-top">
+              <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+              <div>
+                <div class="pc-name">RAG — baza wiedzy serwisu</div>
+                <div class="pc-type">RAG · embeddings + reranker</div>
+              </div>
+              <span class="status-pill ok ml-auto">aktywny</span>
+            </div>
+            <div class="pc-owner"><svg><use href="#i-crown"/></svg>Właściciel: Marek Nowak
+              <span class="chip"><svg class="icon"><use href="#i-eye"/></svg>Przeglądający</span></div>
+            <p class="pc-desc">Wyszukiwanie po dokumentacji serwisowej. Masz rolę Przeglądającego —
+              widzisz dane, indeks i wyniki, ale bez wprowadzania zmian.</p>
+            <div class="pc-stats">
+              <div class="pc-stat"><div class="v">1.2k</div><div class="l">dokumenty</div></div>
+              <div class="pc-stat"><div class="v">HNSW</div><div class="l">indeks</div></div>
+              <div class="pc-stat"><div class="v">98k</div><div class="l">embeddingi</div></div>
+            </div>
+            <div class="pc-foot">
+              <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>edytowany wczoraj</span>
+              <span class="chip"><svg class="icon"><use href="#i-eye"/></svg>tylko podgląd</span>
+            </div>
+          </div>
 
         </div>
       </main>
