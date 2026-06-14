@@ -3,12 +3,13 @@
 // Description: E2E for the TentaVision "Powiązania i magazyn" tab (Bindings &
 //              Storage, M14). Proves: the built-in storage API status panel
 //              reports REAL probes (SQL round-trip = ok/green, KV settings
-//              round-trip = ok, Vector = honest "niedostępne", Recording status
-//              from settings), the 6 AI aliases render with status chips and an
-//              editable target Select, changing a mapping persists to settings +
-//              writes the audit log, and the mapping survives a full panel reopen
-//              in a fresh context. Screenshots to /tmp/tv/ for visual comparison
-//              to m14-bindings.html.
+//              round-trip = ok, Vector = REAL probe of the events namespace =
+//              "dostępny" because vector_search responds, Embeddings probed via
+//              llm.generate, Recording status from settings), the 6 AI aliases
+//              render with status chips and an editable target Select, changing a
+//              mapping persists to settings + writes the audit log, and the
+//              mapping survives a full panel reopen in a fresh context.
+//              Screenshots to /tmp/tv/ for visual comparison to m14-bindings.html.
 // =============================================================================
 
 const fs = require('fs');
@@ -37,6 +38,9 @@ const PERMISSIONS = [
   'recording.read',
   'sql.read',
   'sql.write',
+  'vector.read',
+  'vector.write',
+  'llm.generate',
 ];
 
 const SHOT_DIR = '/tmp/tv';
@@ -111,15 +115,26 @@ test.describe('TentaVision Bindings — real storage probes + persisted alias ma
     await expect(page.locator('.addon-app-shell').getByText('Storage — wbudowane API TentaFlow').first())
       .toBeVisible({ timeout: 10000 });
 
-    // --- Built-in API status: SQL + KV probed live = "dostępny" (green/ok).
-    //     Vector honestly unavailable; Recording reflects settings. ---
+    // --- Built-in API status: SQL + KV + Vector probed live = "dostępny" (ok).
+    //     Vector is now a REAL probe of the `events` namespace (vector_search
+    //     responds even with no embedding model), so it must NOT be "niedostępny".
+    //     Recording reflects settings; Embeddings reflects the llm.generate probe. ---
     await expect(page.locator('.addon-app-shell').getByText('SQL · SQLite').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('KV store').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('Vector store').first()).toBeVisible();
+    await expect(page.locator('.addon-app-shell').getByText('Embeddings').first()).toBeVisible();
     await expect(page.locator('.addon-app-shell').getByText('Recording').first()).toBeVisible();
-    // Two "dostępny" chips (SQL + KV) prove the live probes succeeded.
-    await expect(page.locator('.addon-app-shell').getByText('dostępny')).toHaveCount(2, { timeout: 10000 });
-    await expect(page.locator('.addon-app-shell').getByText('niedostępne').first()).toBeVisible();
+    // The Vector store cell reports "dostępny" (live vector_search round-trip OK):
+    // its sub-label is only rendered on the OK branch, so it proves the probe.
+    await expect(page.locator('.addon-app-shell')
+      .getByText('events · cosine 1024d · vector store').first())
+      .toBeVisible({ timeout: 10000 });
+    // Vector is NOT the old honest "niedostępne".
+    await expect(page.locator('.addon-app-shell').getByText('niedostępne')).toHaveCount(0);
+    // SQL + KV + Vector all probe green → at least 3 "dostępny" chips.
+    const available = page.locator('.addon-app-shell').getByText('dostępny');
+    expect(await available.count()).toBeGreaterThanOrEqual(3);
+    await page.screenshot({ path: `${SHOT_DIR}/bindings-vector-ok.png`, fullPage: true });
 
     // --- All 6 alias rows render with their status chips. ---
     for (const id of [

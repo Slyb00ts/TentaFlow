@@ -1,15 +1,16 @@
 // =============================================================================
 // File: tests/e2e/tentavision-search.spec.js
-// Description: E2E for the TentaVision "Wyszukiwarka historyczna" (M6) tab. The
-//              addon has NO search/embedding/ANPR engine wired, so this suite
-//              proves the HONEST behaviour: all four search modes render (text /
-//              attribute / image / plate) as a RadioCardGroup selector, each with
-//              its own query form + real camera/time filters (cameras from the
-//              per-addon SQLite cameras table); pressing "Szukaj" NEVER fabricates
-//              result cards but shows a per-mode no-engine placeholder; and the
-//              chosen mode + last query + recents persist (settings table) across
-//              a full panel reopen in a fresh context. Screenshots → /tmp/tv/ for
-//              visual comparison to m06-search.html. Zero console errors expected.
+// Description: E2E for the TentaVision "Wyszukiwarka historyczna" (M6) tab. Two
+//              modes are now REAL: attribute mode runs a structured SQL query
+//              over the per-addon alarms table (no AI) and renders real matching
+//              rows; text mode embeds the query via llm_generate and runs a k-NN
+//              over the `events` vector namespace. When no embedding model is
+//              deployed in the test env, text mode shows the HONEST
+//              model-unavailable message (never the old "brak backendu", never
+//              fabricated hits). Image/plate keep an honest vision-pipeline
+//              placeholder. The "Reindeksuj zdarzenia" action backfills
+//              embeddings. Mode/query/recents still persist across a reopen.
+//              Screenshots → /tmp/tv/. Zero console errors expected.
 // =============================================================================
 
 const fs = require('fs');
@@ -40,6 +41,9 @@ const PERMISSIONS = [
   'cameras.write',
   'sql.read',
   'sql.write',
+  'vector.read',
+  'vector.write',
+  'llm.generate',
 ];
 
 const SHOT_DIR = '/tmp/tv';
@@ -49,6 +53,14 @@ const CAMERAS = [
   { id: 'cam-srch-01', name: 'C-07 peron', status: 'online' },
   { id: 'cam-srch-02', name: 'C-04 wjazd', status: 'online' },
   { id: 'cam-srch-03', name: 'C-15 parking', status: 'offline' },
+];
+
+// Real alarms so attribute (SQL) search returns real rows.
+const ALARMS = [
+  { id: 'alm-s-1', camera: 'cam-srch-02', severity: 'critical', type: 'agresja', message: 'podejrzenie agresji przy wjezdzie' },
+  { id: 'alm-s-2', camera: 'cam-srch-01', severity: 'warning', type: 'ADR', message: 'nieczytelna tablica ADR na peronie' },
+  { id: 'alm-s-3', camera: 'cam-srch-03', severity: 'info', type: 'pojazd', message: 'pojazd w strefie zakazu na parkingu' },
+  { id: 'alm-s-4', camera: 'cam-srch-02', severity: 'critical', type: 'agresja', message: 'bojka grupy osob przy wjezdzie' },
 ];
 
 let proc;
@@ -85,14 +97,18 @@ function addonDbPath() {
   );
 }
 
-function seedCameras() {
+function seedData() {
   const now = Math.floor(Date.now() / 1000);
   const esc = (s) => String(s).replace(/'/g, "''");
-  const stmts = CAMERAS.map((c, i) =>
+  const camStmts = CAMERAS.map((c, i) =>
     `INSERT INTO cameras (id, name, location, rtsp_url, onvif_url, status, fps, detectors, created_at, updated_at) `
     + `VALUES ('${esc(c.id)}', '${esc(c.name)}', 'Strefa ${i + 1}', `
     + `'rtsp://192.168.40.${41 + i}:554/stream1', '', '${esc(c.status)}', 5, 'D1', ${now}, ${now});`);
-  execFileSync('sqlite3', [addonDbPath(), stmts.join('\n')], { encoding: 'utf8' });
+  const almStmts = ALARMS.map((a, i) =>
+    `INSERT INTO alarms (id, camera_id, severity, type, message, thumb_ref, ts, status) `
+    + `VALUES ('${esc(a.id)}', '${esc(a.camera)}', '${esc(a.severity)}', '${esc(a.type)}', `
+    + `'${esc(a.message)}', '', ${now - i * 60}, 'new');`);
+  execFileSync('sqlite3', [addonDbPath(), [...camStmts, ...almStmts].join('\n')], { encoding: 'utf8' });
 }
 
 async function openPanel(page) {
@@ -119,14 +135,14 @@ async function pickMode(page, mode) {
   await page.waitForTimeout(500);
 }
 
-test.describe('TentaVision Wyszukiwarka — 4 modes, honest no-engine placeholder, persistence', () => {
-  test('modes render, submit shows honest placeholder, mode+query+recents persist', async ({ page, browser }) => {
+test.describe('TentaVision Wyszukiwarka — REAL attribute SQL + REAL/honest semantic, persistence', () => {
+  test('attribute search returns real rows; text search is real or honest; recents persist', async ({ page, browser }) => {
     test.setTimeout(180000);
     const errors = collectConsoleErrors(page);
     await loginAsAdmin(page, { port: PORT });
     await openPanel(page);
 
-    seedCameras();
+    seedData();
     await openTab(page, 'search');
 
     // --- Mode selector: all four modes present as cards. ---
@@ -135,46 +151,60 @@ test.describe('TentaVision Wyszukiwarka — 4 modes, honest no-engine placeholde
     await expect(shell.locator('tf-radio[value="attribute"]')).toBeVisible();
     await expect(shell.locator('tf-radio[value="image"]')).toBeVisible();
     await expect(shell.locator('tf-radio[value="plate"]')).toBeVisible();
-    // Cards carry the mockup's labels.
     await expect(shell.getByText('Tekst (semantyczne)').first()).toBeVisible();
     await expect(shell.getByText('Atrybut (formularz)').first()).toBeVisible();
     await expect(shell.getByText('Tablica rejestracyjna').first()).toBeVisible();
 
-    // Default mode = text: section cards render (tf-section-card), camera filter
-    // populated from the real cameras, and a "Szukaj" button is present.
+    // Default mode = text: section cards render, "Szukaj" present.
     await expect(shell.locator('tf-section-card').first()).toBeVisible({ timeout: 10000 });
     await expect(shell.getByText('Zapytanie semantyczne').first()).toBeVisible();
     await expect(shell.locator('tf-button', { hasText: 'Szukaj' }).first()).toBeVisible();
-    await page.screenshot({ path: `${SHOT_DIR}/search-text.png`, fullPage: true });
 
-    // --- Switch to attribute mode: its form swaps in. ---
+    // ===== ATTRIBUTE MODE: REAL SQL search over alarms. =====
     await pickMode(page, 'attribute');
-    await expect(shell.getByText('Atrybuty osoby / pojazdu').first()).toBeVisible({ timeout: 10000 });
-    await page.screenshot({ path: `${SHOT_DIR}/search-attribute.png`, fullPage: true });
+    await expect(shell.getByText('Atrybuty zdarzenia').first()).toBeVisible({ timeout: 10000 });
 
-    // --- Back to text mode, type a query, submit → HONEST placeholder. ---
+    // Type "agresja" into the structured type field and submit → real rows.
+    const typeInput = shell.locator('tf-input input').first();
+    await typeInput.fill('agresja');
+    await page.waitForTimeout(400);
+    await shell.locator('tf-button', { hasText: 'Szukaj' }).first().click();
+    await page.waitForTimeout(800);
+
+    // Two "agresja" alarms exist → real result cards with their messages.
+    await expect(shell.getByText(/Znaleziono \d+ zdarzeń/).first()).toBeVisible({ timeout: 10000 });
+    await expect(shell.getByText('podejrzenie agresji przy wjezdzie').first()).toBeVisible();
+    await expect(shell.getByText('bojka grupy osob przy wjezdzie').first()).toBeVisible();
+    // The non-matching info alarm must NOT appear.
+    await expect(shell.getByText('pojazd w strefie zakazu na parkingu')).toHaveCount(0);
+    await page.screenshot({ path: `${SHOT_DIR}/search-attribute-real.png`, fullPage: true });
+
+    // ===== TEXT MODE: embed query → vector k-NN, or honest model-unavailable. =====
     await pickMode(page, 'text');
-    const QUERY = 'mezczyzna w czerwonej czapce i ciemnej kurtce';
-    const queryInput = shell.locator('tf-input').filter({ hasText: 'Zapytanie semantyczne' }).locator('input').first();
-    // tf-input nests the native input; fall back to the first text input in the
-    // semantic-query card if the structural filter does not match.
-    const semInput = (await queryInput.count())
-      ? queryInput
-      : shell.locator('tf-textarea textarea, tf-input input').first();
+    const QUERY = 'agresja przy wjezdzie';
+    const semInput = shell.locator('tf-textarea textarea, tf-input input').first();
     await semInput.fill(QUERY);
     await page.waitForTimeout(400);
 
-    await shell.locator('tf-button', { hasText: 'Szukaj' }).first().click();
-    await page.waitForTimeout(700);
+    // Reindex first so any deployed embedding model has the alarms indexed.
+    await shell.locator('tf-button', { hasText: 'Reindeksuj zdarzenia' }).first().click();
+    await page.waitForTimeout(1500);
 
-    // The results area shows the honest no-engine message — NO fabricated cards.
-    await expect(shell.getByText(/wymaga uruchomionego silnika/i).first()).toBeVisible({ timeout: 10000 });
-    // No fake result thumbnails: the mockup's score chips (0.92 etc.) must NOT appear.
-    await expect(shell.getByText('0.92')).toHaveCount(0);
-    // The submitted query now appears in recents.
+    await shell.locator('tf-button', { hasText: 'Szukaj' }).first().click();
+    await page.waitForTimeout(1200);
+
+    // The outcome is EITHER real semantic hits (model deployed) OR the honest
+    // model-unavailable message — never the old "brak backendu", never fake hits.
+    const bodyText = await shell.innerText();
+    const modelUnavailable = /Model embedding[oó]w niedost[eę]pny/i.test(bodyText);
+    const realHits = /Znaleziono \d+ zdarzeń/.test(bodyText) || /podobie[nń]stwo \d+%/.test(bodyText);
+    expect(modelUnavailable || realHits, `text-search outcome not recognized:\n${bodyText.slice(0, 600)}`).toBeTruthy();
+    // The legacy blanket placeholder must be gone.
+    expect(/brak backendu/i.test(bodyText)).toBeFalsy();
+    // The submitted query appears in recents.
     await expect(shell.getByText('Ostatnie wyszukiwania').first()).toBeVisible({ timeout: 10000 });
     await expect(shell.getByText(QUERY).first()).toBeVisible();
-    await page.screenshot({ path: `${SHOT_DIR}/search-result.png`, fullPage: true });
+    await page.screenshot({ path: `${SHOT_DIR}/search-text-real.png`, fullPage: true });
 
     // --- Persistence: reopen in a fresh, isolated context. ---
     await page.close();
@@ -186,17 +216,12 @@ test.describe('TentaVision Wyszukiwarka — 4 modes, honest no-engine placeholde
     await openTab(page2, 'search');
 
     const shell2 = page2.locator('.addon-app-shell');
-    // Mode persisted = text (the RadioCardGroup mounts with value="text").
     await expect(shell2.locator('tf-radio-group[cards]').first()).toHaveAttribute('value', 'text', { timeout: 10000 });
-    // Last query restored into the semantic-query control.
-    await expect(shell2.locator('tf-textarea textarea, tf-input input')
-      .filter({ hasText: '' }).first()).toBeVisible({ timeout: 10000 });
     const restored = await shell2.evaluate((root) => {
       const els = root.querySelectorAll('tf-textarea textarea, tf-input input');
       return Array.from(els).map((e) => e.value).filter(Boolean);
     });
-    expect(restored.some((v) => v.includes('czerwonej czapce'))).toBeTruthy();
-    // Recents survived the reopen.
+    expect(restored.some((v) => v.includes('agresja'))).toBeTruthy();
     await expect(shell2.getByText('Ostatnie wyszukiwania').first()).toBeVisible({ timeout: 10000 });
     await expect(shell2.getByText(QUERY).first()).toBeVisible();
     await page2.screenshot({ path: `${SHOT_DIR}/search-persist.png`, fullPage: true });

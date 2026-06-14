@@ -654,6 +654,57 @@ pub fn list_alarms(severity: &str, status: &str, status_open: bool) -> Result<Ve
     Ok(rows.iter().map(row_to_alarm).collect())
 }
 
+/// Structured attribute search over alarms (newest first). Every argument is
+/// optional: an empty `severity`/`camera_id`/`text` and a 0 `from`/`to` mean "no
+/// constraint on that column". `text` matches case-insensitively against either
+/// the alarm type or the message (LIKE %text%). This is the REAL backend for the
+/// Search tab's attribute mode — no AI required.
+pub fn search_alarms(
+    severity: &str,
+    text: &str,
+    camera_id: &str,
+    from: i64,
+    to: i64,
+) -> Result<Vec<AlarmRow>, AbiError> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<SqlValue> = Vec::new();
+    if !severity.is_empty() {
+        clauses.push(alloc::format!("a.severity = ?{}", params.len() + 1));
+        params.push(SqlValue::Text(severity.into()));
+    }
+    if !camera_id.is_empty() {
+        clauses.push(alloc::format!("a.camera_id = ?{}", params.len() + 1));
+        params.push(SqlValue::Text(camera_id.into()));
+    }
+    if !text.trim().is_empty() {
+        let like = alloc::format!("%{}%", text.trim().to_lowercase());
+        clauses.push(alloc::format!(
+            "(LOWER(a.type) LIKE ?{0} OR LOWER(a.message) LIKE ?{0})",
+            params.len() + 1
+        ));
+        params.push(SqlValue::Text(like));
+    }
+    if from > 0 {
+        clauses.push(alloc::format!("a.ts >= ?{}", params.len() + 1));
+        params.push(SqlValue::I64(from));
+    }
+    if to > 0 {
+        clauses.push(alloc::format!("a.ts <= ?{}", params.len() + 1));
+        params.push(SqlValue::I64(to));
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        alloc::format!("WHERE {}", clauses.join(" AND "))
+    };
+    let sql = alloc::format!(
+        "SELECT {ALARM_COLS} FROM alarms a LEFT JOIN cameras c ON c.id = a.camera_id \
+         {where_sql} ORDER BY a.ts DESC LIMIT 100"
+    );
+    let rows = query(&sql, &params)?;
+    Ok(rows.iter().map(row_to_alarm).collect())
+}
+
 /// Number of alarms matching the open-feed view (undecided) or a concrete status.
 pub fn count_alarms(status_open: bool, status: &str) -> Result<i64, AbiError> {
     if status_open {
@@ -1211,6 +1262,35 @@ pub fn insert_evidence(e: &NewEvidence) -> Result<String, AbiError> {
 /// Deletes an evidence package by id. Returns rows affected (0 if it did not exist).
 pub fn delete_evidence(id: &str) -> Result<u64, AbiError> {
     exec("DELETE FROM evidence WHERE id = ?1", &[SqlValue::Text(id.into())])
+}
+
+// =============================================================================
+// Vector ref mapping (ref_id u64 ↔ alarm string id)
+// =============================================================================
+
+/// Records (or replaces) the mapping from a vector namespace `ref_id` to the
+/// alarm string id its embedding was built from, so a search hit's numeric
+/// ref_id can be resolved back to the real alarm row.
+pub fn upsert_vector_ref(ref_id: u64, alarm_id: &str, ts: i64) -> Result<(), AbiError> {
+    exec(
+        "INSERT INTO vector_refs (ref_id, alarm_id, ts) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(ref_id) DO UPDATE SET alarm_id = ?2, ts = ?3",
+        &[SqlValue::I64(ref_id as i64), SqlValue::Text(alarm_id.into()), SqlValue::I64(ts)],
+    )?;
+    Ok(())
+}
+
+/// Resolves a vector `ref_id` back to its alarm string id, or None when the
+/// mapping is unknown (e.g. an alarm deleted after indexing).
+pub fn alarm_id_for_ref(ref_id: u64) -> Result<Option<String>, AbiError> {
+    let rows = query("SELECT alarm_id FROM vector_refs WHERE ref_id = ?1", &[SqlValue::I64(ref_id as i64)])?;
+    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+}
+
+/// Lists every alarm (newest first) for the reindex backfill. Reuses the alarm
+/// SELECT shape so callers get fully decoded rows including the camera name.
+pub fn list_all_alarms() -> Result<Vec<AlarmRow>, AbiError> {
+    list_alarms("", "", false)
 }
 
 // =============================================================================
