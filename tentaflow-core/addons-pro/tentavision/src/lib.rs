@@ -495,6 +495,11 @@ fn parse_icon_name(s: &str) -> IconName {
         "check" => IconName::Check,
         "clock" => IconName::Clock,
         "shield" => IconName::Shield,
+        "tag" => IconName::Filter,
+        "image" => IconName::Image,
+        "car" => IconName::Vehicle,
+        "calendar" => IconName::Clock,
+        "alert" => IconName::Alert,
         _ => IconName::Info,
     }
 }
@@ -1749,29 +1754,28 @@ impl AlarmsState {
     fn status_or_open(&self) -> &str { if self.status_view.is_empty() { "open" } else { &self.status_view } }
 }
 
+/// View state for the historical search panel. The DURABLE parts (chosen mode,
+/// last per-mode query text, camera/time filters, recent searches) live in the
+/// settings table and are read fresh in `build_search_content`; this struct only
+/// holds the ephemeral "a search was just submitted" flag so the results area
+/// can switch from the empty hint to the honest no-engine placeholder. There is
+/// NO search/embedding/ANPR engine wired to this addon, so submit never
+/// fabricates result cards — it surfaces a per-mode placeholder and persists the
+/// query into recents.
 struct SearchState {
-    query: String, date_from: String, date_to: String,
-    cameras: Vec<String>, profiles: Vec<String>,
-    min_confidence: f64, object_type: String,
-    only_with_evidence: bool, submitted: bool,
+    /// Set true once the user pressed "Szukaj"; drives the honest placeholder.
+    submitted: bool,
+    /// The mode the last submit ran in (so the placeholder message matches it
+    /// even before the next render reads the persisted mode).
+    submitted_mode: String,
 }
 impl SearchState {
     const fn new() -> Self {
-        Self {
-            query: String::new(), date_from: String::new(), date_to: String::new(),
-            cameras: Vec::new(), profiles: Vec::new(), min_confidence: 0.7,
-            object_type: String::new(), only_with_evidence: false, submitted: false,
-        }
-    }
-    fn has_any_filter(&self) -> bool {
-        !self.query.is_empty() || !self.date_from.is_empty() || !self.date_to.is_empty()
-            || !self.cameras.is_empty() || !self.profiles.is_empty()
-            || self.min_confidence > 0.0 || !self.object_type.is_empty() || self.only_with_evidence
+        Self { submitted: false, submitted_mode: String::new() }
     }
     fn clear_all(&mut self) {
-        self.query.clear(); self.date_from.clear(); self.date_to.clear();
-        self.cameras.clear(); self.profiles.clear(); self.min_confidence = 0.7;
-        self.object_type.clear(); self.only_with_evidence = false; self.submitted = false;
+        self.submitted = false;
+        self.submitted_mode.clear();
     }
 }
 
@@ -2287,6 +2291,11 @@ fn render_panel(panel_id: &str) {
         // or the pending edit) so each field mounts showing its current value
         // and persists across reopen / process restart.
         send_slot_content_with_overlay("content", content, Some(settings_overlay()));
+    } else if panel_id == "search" {
+        // Seed the mode selector, active mode's query control and the camera /
+        // time filters from settings so the panel mounts on the persisted mode
+        // with its last query and filters restored across reopen.
+        send_slot_content_with_overlay("content", content, Some(search_overlay()));
     } else if panel_id == "live" {
         // Seed the grid-size segmented control's bound key from settings so it
         // mounts showing the persisted layout instead of an empty selection.
@@ -2392,9 +2401,11 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "alarm-acknowledge-all" => handle_alarm_acknowledge_all(),
         "alarm-simulate" => handle_alarm_simulate(),
         "alarm-mute-sound" => { with_state(|s| { s.alarms.sound_muted = !s.alarms.sound_muted; }); json!({"ok":true}) }
-        "search-query-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.search.query = v); json!({"ok":true}) }
-        "search-submit" => { let v = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()); with_state(|s| { if let Some(q) = v { s.search.query = q; } s.search.submitted = true; }); json!({"ok":true}) }
-        "search-clear-all" => { with_state(|s| s.search.clear_all()); json!({"ok":true}) }
+        "search-mode-change" => handle_search_mode_change(params),
+        "search-field-change" => handle_search_field_change(params),
+        "search-submit" => handle_search_submit(params),
+        "search-recent-pick" => handle_search_recent_pick(params),
+        "search-clear-all" => handle_search_clear_all(),
         "reid-flag-set" => handle_reid_flag_set(params),
         "reid-legalgrant-request" => handle_reid_legalgrant_request(),
         "reid-query" => handle_reid_query(),
@@ -5019,20 +5030,500 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+// =============================================================================
+// Historical search (M6) — four modes, honest no-engine placeholder
+// =============================================================================
+
+/// Actor recorded in the audit log for search-query writes (D5 attribute search
+/// is auditable per the RODO note in the mockup).
+const SEARCH_ACTOR: &str = "analyst";
+
+/// Settings keys that make the search panel durable across reopen / restart.
+const KEY_SEARCH_MODE: &str = "search_mode";
+const KEY_SEARCH_CAMERAS: &str = "search_cameras";
+const KEY_SEARCH_FROM: &str = "search_time_from";
+const KEY_SEARCH_TO: &str = "search_time_to";
+const KEY_SEARCH_RECENTS: &str = "search_recents";
+
+/// Maximum number of recent query strings retained per mode.
+const SEARCH_RECENTS_MAX: usize = 5;
+
+/// The four search modes from the m06 mockup. Order matches the mode selector.
+const SEARCH_MODES: [(&str, &str, &str, &str); 4] = [
+    ("text", "Tekst (semantyczne)", "text", "SigLIP2 — np. \"czerwona czapka, okulary\""),
+    ("attribute", "Atrybut (formularz)", "tag", "Kolor + ubranie + wzrost + dodatki"),
+    ("image", "Podobieństwo (zdjęcie)", "image", "Upload obrazu → top-K matches"),
+    ("plate", "Tablica rejestracyjna", "car", "LPRNet · format PL/EU"),
+];
+
+/// Normalizes a persisted/incoming mode to a known mode id, defaulting to text.
+fn search_mode_norm(raw: &str) -> &'static str {
+    SEARCH_MODES.iter().map(|m| m.0).find(|m| *m == raw).unwrap_or("text")
+}
+
+/// Current search mode read from settings (defaults to "text").
+fn search_mode() -> String {
+    let raw = db::get_setting(KEY_SEARCH_MODE).ok().flatten().unwrap_or_default();
+    search_mode_norm(&raw).to_string()
+}
+
+/// Settings key holding the last query text for a given mode.
+fn search_query_key(mode: &str) -> String {
+    alloc::format!("search_last_{}", search_mode_norm(mode))
+}
+
+/// Last query text persisted for a mode (empty if none).
+fn search_last_query(mode: &str) -> String {
+    db::get_setting(&search_query_key(mode)).ok().flatten().unwrap_or_default()
+}
+
+/// Store key the per-mode query control binds to (one key per mode so switching
+/// modes restores that mode's own last text).
+fn search_query_store_key(mode: &str) -> String {
+    alloc::format!("search_q_{}", search_mode_norm(mode))
+}
+
+/// Recent searches are stored per mode as a JSON array under one settings key:
+/// `{ "text": ["..."], "attribute": [...] }`. Returns the list for one mode.
+fn search_recents(mode: &str) -> Vec<String> {
+    let raw = db::get_setting(KEY_SEARCH_RECENTS).ok().flatten().unwrap_or_default();
+    if raw.is_empty() { return Vec::new(); }
+    let parsed: JsonValue = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return Vec::new() };
+    parsed.get(search_mode_norm(mode))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// Prepends `query` to the recents list for `mode`, de-duplicating and capping
+/// at SEARCH_RECENTS_MAX, then persists the whole per-mode map back to settings.
+fn search_push_recent(mode: &str, query: &str) {
+    let mode = search_mode_norm(mode);
+    let q = query.trim();
+    if q.is_empty() { return; }
+    let raw = db::get_setting(KEY_SEARCH_RECENTS).ok().flatten().unwrap_or_default();
+    let mut map: JsonValue = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    if !map.is_object() { map = json!({}); }
+    let mut list: Vec<String> = map.get(mode)
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    list.retain(|x| x != q);
+    list.insert(0, q.to_string());
+    list.truncate(SEARCH_RECENTS_MAX);
+    if let Some(obj) = map.as_object_mut() {
+        obj.insert(mode.to_string(), JsonValue::Array(list.into_iter().map(JsonValue::String).collect()));
+    }
+    let _ = db::set_setting(KEY_SEARCH_RECENTS, &map.to_string());
+}
+
+/// Camera-scope select options built from the real camera list (db::list_cameras).
+fn search_camera_options(cameras: &[db::CameraRow]) -> Vec<SelectOption> {
+    let mut opts = vec![SelectOption {
+        value: SelectValue::Text("all".into()),
+        label: lit(&alloc::format!("Wszystkie kamery ({})", cameras.len())),
+        icon: None, disabled: false, group_id: None, description: None,
+    }];
+    for c in cameras {
+        opts.push(SelectOption {
+            value: SelectValue::Text(c.id.clone()),
+            label: lit(&c.name),
+            icon: None, disabled: false, group_id: None, description: None,
+        });
+    }
+    opts
+}
+
+/// The four-mode selector as a RadioCardGroup (label + description per mode),
+/// mirroring the mockup's `.search-modes` boxes. Bound to `search_mode` and
+/// committed to settings via `search-mode-change` so it survives reopen.
+fn build_search_mode_selector() -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::RadioCardGroup;
+    let options: Vec<RadioCardOption> = SEARCH_MODES.iter().map(|(id, title, icon, desc)| RadioCardOption {
+        value: SelectValue::Text((*id).into()),
+        icon: icon_named(parse_icon_name(icon)),
+        title: lit(title),
+        description: Some(lit(desc)),
+        badge: None,
+        disabled: false,
+    }).collect();
+    let mut group = RadioCardGroup {
+        bind_path: StatePath::new(vec![PathSegment::Key("search_mode".into())]),
+        options,
+        columns: 4,
+        variant: RadioCardVariant::Default,
+    }.into_component("search_mode").expect("RadioCardGroup");
+    group = with_a11y_label(group, "Tryb wyszukiwania");
+    group.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "search-mode-change".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    group
+}
+
+/// A query control (input or textarea) bound to a per-mode store key that mirrors
+/// each keystroke into the per-mode settings value via `search-field-change`, so
+/// the last query persists across reopen even before submit.
+fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: bool) -> Component {
+    let store_key = search_query_store_key(mode);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text("query".into())));
+    params.0.push(("mode".into(), Value::Text(search_mode_norm(mode).into())));
+    let mut comp = if multiline {
+        use tentaflow_sdk_spec::protocol::ui::form::Textarea;
+        Textarea {
+            bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
+            placeholder: Some(lit(placeholder)),
+            label: Some(lit(label)),
+            hint: None, validators: vec![], max_length: Some(500), min_length: None,
+            disabled: None, readonly: None, error: None, size: InputSize::Md,
+            rows: 2, autoresize: true, max_rows: Some(5), monospace: false,
+        }.into_component(&store_key).expect("Textarea")
+    } else {
+        use tentaflow_sdk_spec::protocol::ui::form::Input;
+        Input {
+            r#type: InputType::Text,
+            bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
+            placeholder: Some(lit(placeholder)),
+            label: Some(lit(label)),
+            hint: None, leading_icon: Some(icon_named(parse_icon_name("search"))),
+            trailing_icon: None, prefix: None, suffix: None, validators: vec![],
+            max_length: None, min_length: None, pattern: None, autocomplete: None,
+            input_mode: None, disabled: None, readonly: None, error: None, size: InputSize::Md,
+        }.into_component(&store_key).expect("Input")
+    };
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "search-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Camera-scope select bound to `search_cameras`, committed to settings on change.
+fn search_camera_select(cameras: &[db::CameraRow]) -> Component {
+    let mut comp = select("Kamery", search_camera_options(cameras), "search_cameras");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text("cameras".into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "search-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// A datetime-local range field committed to settings on change (from/to bound to
+/// `search_time_from` / `search_time_to`).
+fn search_time_input(label: &str, store_key: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: InputType::Text,
+        bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
+        placeholder: Some(lit("RRRR-MM-DD GG:MM")),
+        label: Some(lit(label)),
+        hint: None, leading_icon: Some(icon_named(parse_icon_name("calendar"))), trailing_icon: None, prefix: None, suffix: None,
+        validators: vec![], max_length: None, min_length: None, pattern: None,
+        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        size: InputSize::Md,
+    }.into_component(store_key).expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "search-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// The shared camera + time-range filter block reused by every mode's query form.
+fn build_search_filters(cameras: &[db::CameraRow]) -> Component {
+    card(Some("Filtry"), vec![
+        search_camera_select(cameras),
+        heading(4, "Zakres czasu"),
+        text_styled("Retencja klasy B = 14 dni — starsze klatki nie są indeksowane.", "caption"),
+        grid(2, vec![
+            search_time_input("Od", "search_time_from", "time_from"),
+            search_time_input("Do", "search_time_to", "time_to"),
+        ]),
+    ])
+}
+
+/// Per-mode query form. Each mode gets its own inputs faithful to the mockup;
+/// image and plate modes add their mode-specific affordance.
+fn build_search_query_form(mode: &str) -> Component {
+    match mode {
+        "attribute" => card(Some("Atrybuty osoby / pojazdu"), vec![
+            text_styled("Wyszukiwanie strukturalne po atrybutach (kolor, ubranie, dodatki).", "caption"),
+            search_query_input("Atrybuty", "np. mężczyzna, czarna kurtka, plecak, wzrost ~180", mode, true),
+            stack_h_gap("sm", vec![
+                chip_toned("kolor + ubranie", "info"),
+                chip_toned("wzrost", "info"),
+                chip_toned("dodatki", "info"),
+            ]),
+        ]),
+        "image" => card(Some("Podobieństwo do zdjęcia"), vec![
+            text_styled("Upload obrazu referencyjnego → top-K najbardziej podobnych klatek.", "caption"),
+            empty_state("Przeciągnij zdjęcie lub kliknij, aby wybrać", Some("Brak backendu uploadu/embeddingu — pole referencyjne."), Some("image")),
+            search_query_input("Opcjonalny opis referencji", "np. ta sama osoba co na zdjęciu z 14:32", mode, false),
+        ]),
+        "plate" => card(Some("Tablica rejestracyjna (ANPR)"), vec![
+            text_styled("Dopasowanie po numerze tablicy (LPRNet, format PL/EU).", "caption"),
+            search_query_input("Numer tablicy", "np. WX 12345 lub fragment", mode, false),
+            stack_h_gap("sm", vec![
+                chip_toned("LPRNet", "info"),
+                chip_toned("format PL/EU", "info"),
+                chip_toned("fuzzy match", "info"),
+            ]),
+        ]),
+        _ => card(Some("Zapytanie semantyczne"), vec![
+            text_styled("Embedding SigLIP2 + filtry meta — opisz scenę słowami.", "caption"),
+            search_query_input("Zapytanie semantyczne", "np. mężczyzna w czerwonej czapce i ciemnej kurtce", mode, true),
+            stack_h_gap("sm", vec![
+                chip_toned("embedding · SigLIP2 ViT-L/14", "info"),
+                chip_toned("cosine similarity", "info"),
+                chip_toned("top-K = 30", "info"),
+            ]),
+        ]),
+    }
+}
+
+/// The honest no-engine placeholder shown in the results area after a submit.
+/// Per-mode message — NEVER fabricates result cards or thumbnails.
+fn build_search_results(submitted: bool, mode: &str) -> Component {
+    if !submitted {
+        return card(Some("Wyniki"), vec![empty_state(
+            "Wprowadź zapytanie",
+            Some("Wybierz tryb, wpisz zapytanie i naciśnij Szukaj."),
+            Some("search"),
+        )]);
+    }
+    let (title, msg, icon) = match search_mode_norm(mode) {
+        "attribute" => (
+            "Brak silnika wyszukiwania atrybutów",
+            "Wyszukiwanie po atrybutach wymaga uruchomionego silnika detekcji + indeksu atrybutów — brak backendu. Zapytanie zapisano w historii.",
+            "tag",
+        ),
+        "image" => (
+            "Brak silnika podobieństwa obrazu",
+            "Wyszukiwanie po podobieństwie wymaga silnika embeddingów obrazu (SigLIP2) i indeksu klatek — brak backendu. Zapytanie zapisano w historii.",
+            "image",
+        ),
+        "plate" => (
+            "Brak silnika ANPR",
+            "Wyszukiwanie po tablicy wymaga uruchomionego silnika ANPR (LPRNet) — brak backendu. Zapytanie zapisano w historii.",
+            "car",
+        ),
+        _ => (
+            "Brak silnika wyszukiwania semantycznego",
+            "Wyszukiwanie semantyczne wymaga uruchomionego silnika (SigLIP2 / embeddings) i historycznego indeksu klatek — brak backendu. Zapytanie zapisano w historii.",
+            "search",
+        ),
+    };
+    card(Some("Wyniki"), vec![
+        alert(msg, "warning"),
+        empty_state(title, Some("Po podłączeniu silnika i indeksu w tym miejscu pojawi się siatka trafień z wynikami podobieństwa."), Some(icon)),
+    ])
+}
+
+/// Recent-searches list for the current mode. Each entry re-runs that query.
+fn build_search_recents(mode: &str) -> Component {
+    let recents = search_recents(mode);
+    if recents.is_empty() {
+        return divider();
+    }
+    let mut rows: Vec<Component> = vec![heading(4, "Ostatnie wyszukiwania")];
+    for q in &recents {
+        let mut params = CborMap::default();
+        params.0.push(("query".into(), Value::Text(q.clone())));
+        rows.push(button_with_params(q, "search-recent-pick", "ghost", params));
+    }
+    card(None, vec![stack_v_gap("sm", rows)])
+}
+
+/// The RODO note from the mockup: attribute searches (D5) are audited; face
+/// search (D4) needs an active LegalGrant (Re-ID tab).
+fn build_search_rodo_note() -> Component {
+    card(None, vec![
+        chip_toned_icon("Uwaga RODO", "warning", "alert"),
+        text_styled(
+            "Każde wyszukanie po atrybutach osób (D5) jest zapisywane w audit log (operator, zapytanie, czas). Wyszukiwanie po twarzy (D4) wymaga aktywnego LegalGrant — zakładka Re-ID.",
+            "caption",
+        ),
+    ])
+}
+
 fn build_search_content() -> Component {
     let messages = build_messages_section();
-    let toolbar = stack_h(vec![
-        heading(2, "Wyszukiwarka"),
+    let cameras = db::list_cameras().unwrap_or_default();
+    let mode = search_mode();
+    let submitted = with_state(|s| s.search.submitted);
+    let submitted_mode = with_state(|s| {
+        if s.search.submitted_mode.is_empty() { mode.clone() } else { s.search.submitted_mode.clone() }
+    });
+
+    let header = stack_h(vec![
+        heading(2, "Wyszukiwarka historyczna"),
+        risk_badge("B"),
+    ]);
+    let subtitle = text_styled(
+        "Cztery tryby: tekst (SigLIP2 semantyczne), atrybut formularzowy, podobieństwo zdjęcia, tablica rejestracyjna.",
+        "caption",
+    );
+
+    let mode_selector = build_search_mode_selector();
+    let query_form = build_search_query_form(&mode);
+    let filters = build_search_filters(&cameras);
+
+    let submit_row = stack_h(vec![
+        button_with_icon("Szukaj", "search-submit", "primary", "search"),
         button("Wyczyść", "search-clear-all", "ghost"),
     ]);
-    let search_input = input("Szukaj", "Wpisz zapytanie...", "search_query");
-    let submitted = with_state(|s| s.search.submitted);
-    let results = if submitted {
-        card(None, vec![text("Wyniki wyszukiwania — wymaga backendu historycznego indeksu.")])
-    } else {
-        empty_state("Wprowadź zapytanie", Some("Wpisz frazę i naciśnij Enter."), Some("search"))
-    };
-    stack_v(vec![messages, toolbar, search_input, results])
+
+    let recents = build_search_recents(&mode);
+    let results = build_search_results(submitted, &submitted_mode);
+    let rodo = build_search_rodo_note();
+
+    stack_v(vec![
+        messages, header, subtitle,
+        mode_selector,
+        query_form,
+        filters,
+        submit_row,
+        recents,
+        results,
+        rodo,
+    ])
+}
+
+/// Seeds every bound search control from settings so the panel mounts showing
+/// the persisted mode, that mode's last query, and the camera/time filters.
+fn search_overlay() -> Vec<StateEntry> {
+    let mode = search_mode();
+    let mut entries = vec![
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("search_mode".into())]),
+            value: Value::Text(mode.clone()),
+        },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("search_cameras".into())]),
+            value: Value::Text(db::get_setting(KEY_SEARCH_CAMERAS).ok().flatten().unwrap_or_else(|| "all".into())),
+        },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("search_time_from".into())]),
+            value: Value::Text(db::get_setting(KEY_SEARCH_FROM).ok().flatten().unwrap_or_default()),
+        },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("search_time_to".into())]),
+            value: Value::Text(db::get_setting(KEY_SEARCH_TO).ok().flatten().unwrap_or_default()),
+        },
+    ];
+    // Seed the active mode's query control with its persisted last query.
+    entries.push(StateEntry {
+        path: StatePath::new(vec![PathSegment::Key(search_query_store_key(&mode))]),
+        value: Value::Text(search_last_query(&mode)),
+    });
+    entries
+}
+
+/// Persists the picked search mode to settings and re-renders so the per-mode
+/// query form and its last-query / recents swap in.
+fn handle_search_mode_change(params: &JsonValue) -> JsonValue {
+    let v = params.get("value").and_then(|x| x.as_str())
+        .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+        .unwrap_or("text");
+    let mode = search_mode_norm(v);
+    let _ = db::set_setting(KEY_SEARCH_MODE, mode);
+    // Switching mode clears the "submitted" placeholder so it doesn't show a
+    // stale message for the previous mode.
+    with_state(|s| { s.search.submitted = false; s.search.submitted_mode.clear(); });
+    render_panel("search");
+    json!({"ok":true, "mode": mode})
+}
+
+/// Mirrors a search field (per-mode query text, camera scope, time range) into
+/// settings on each keystroke/change so it persists across reopen.
+fn handle_search_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    match field {
+        "query" => {
+            let mode = params.get("mode").and_then(|x| x.as_str()).unwrap_or("text");
+            let _ = db::set_setting(&search_query_key(mode), &value);
+        }
+        "cameras" => { let _ = db::set_setting(KEY_SEARCH_CAMERAS, &value); }
+        "time_from" => { let _ = db::set_setting(KEY_SEARCH_FROM, &value); }
+        "time_to" => { let _ = db::set_setting(KEY_SEARCH_TO, &value); }
+        _ => {}
+    }
+    json!({"ok":true})
+}
+
+/// Runs a search: persists the query into recents and flips the honest
+/// placeholder on. NEVER fabricates results — there is no engine wired here.
+fn handle_search_submit(params: &JsonValue) -> JsonValue {
+    let mode = search_mode();
+    // The query control commits on keystroke, so the persisted value is
+    // authoritative; a submit-time `value` (if the host sends one) overrides it.
+    let query = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| search_last_query(&mode));
+    if query.trim().is_empty() {
+        with_state(|s| { s.clear_messages(); s.error_message = Some("Wpisz zapytanie przed wyszukaniem.".into()); });
+        render_panel("search");
+        return json!({"ok":false});
+    }
+    let _ = db::set_setting(&search_query_key(&mode), &query);
+    search_push_recent(&mode, &query);
+    // D5 attribute search is auditable per the RODO note; record every submit.
+    let after = json!({"mode": mode, "query": query}).to_string();
+    let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
+    with_state(|s| { s.clear_messages(); s.search.submitted = true; s.search.submitted_mode = mode.clone(); });
+    render_panel("search");
+    json!({"ok":true})
+}
+
+/// Re-runs a recent query: persists it as the current mode's query, then submits.
+fn handle_search_recent_pick(params: &JsonValue) -> JsonValue {
+    let query = params.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if query.is_empty() { return json!({"ok":false}); }
+    let mode = search_mode();
+    let _ = db::set_setting(&search_query_key(&mode), &query);
+    search_push_recent(&mode, &query);
+    let after = json!({"mode": mode, "query": query}).to_string();
+    let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
+    with_state(|s| { s.clear_messages(); s.search.submitted = true; s.search.submitted_mode = mode.clone(); });
+    render_panel("search");
+    json!({"ok":true})
+}
+
+/// Clears the current mode's query + the just-submitted placeholder. Keeps the
+/// recents history and the chosen mode (clearing one query should not wipe the
+/// whole search history).
+fn handle_search_clear_all() -> JsonValue {
+    let mode = search_mode();
+    let _ = db::set_setting(&search_query_key(&mode), "");
+    with_state(|s| { s.clear_messages(); s.search.clear_all(); });
+    render_panel("search");
+    json!({"ok":true})
 }
 
 /// Input bound to a store key that also mirrors its value into backend profile
