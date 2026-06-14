@@ -26,8 +26,8 @@ use tentaflow_sdk_spec::{
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::camera::{
-    CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput, CameraInfoOut,
-    CameraListOut, CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput,
+    CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
     DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 use tentaflow_sdk_spec::protocol::ui::{
@@ -46,7 +46,7 @@ use tentaflow_sdk_spec::protocol::ui::{
     feedback::{Alert as AlertComp, Spinner as SpinnerComp, GateScreen as GateScreenComp},
     feedback::overlays::Modal as ModalComp,
     molecules::EmptyState as EmptyStateComp,
-    specialized::{VideoStream as VideoStreamComp, StepProgress as StepProgressComp},
+    specialized::StepProgress as StepProgressComp,
     tokens::*,
     inline::*,
     icon_name::IconName,
@@ -73,7 +73,6 @@ extern "C" {
     fn log_info(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_warn(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_error(msg_ptr: i32, msg_len: i32) -> i32;
-    fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_add_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -210,7 +209,7 @@ where
 }
 
 /// Decodes the CBOR response of a host function with the read-only
-/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_list` / `camera_discover` /
+/// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_discover` /
 /// `camera_local_devices`).
 fn call_cbor_out<O>(
     host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
@@ -239,11 +238,6 @@ where
         out.truncate(out_len as usize);
         return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
-}
-
-fn camera_list() -> Result<Vec<CameraInfoOut>, AbiError> {
-    let out: CameraListOut = call_cbor_out(camera_list_v1)?;
-    Ok(out.camera)
 }
 
 fn camera_add(spec: CameraAddInput) -> Result<CameraAddOutput, AbiError> {
@@ -1091,19 +1085,6 @@ fn key_value(items: Vec<(&str, &str)>) -> Component {
         layout: KvLayout::Horizontal,
         label_width: None,
     }.into_component(next_id()).expect("KeyValue")
-}
-
-fn video_stream(src: &str) -> Component {
-    VideoStreamComp {
-        stream_id: lit(src),
-        width_px: None,
-        aspect_ratio: AspectRatio::R16To9,
-        controls: VideoControls::Minimal,
-        autoplay: true,
-        muted: true,
-        object_fit: ImageFit::Cover,
-        poster_ref: None,
-    }.into_component(next_id()).expect("VideoStream")
 }
 
 fn heatmap(_rows: u32, _cols: u32, _values: Vec<Vec<f64>>, row_labels: Vec<&str>, col_labels: Vec<&str>) -> Component {
@@ -2270,6 +2251,14 @@ fn render_panel(panel_id: &str) {
         // or the pending edit) so each field mounts showing its current value
         // and persists across reopen / process restart.
         send_slot_content_with_overlay("content", content, Some(settings_overlay()));
+    } else if panel_id == "live" {
+        // Seed the grid-size segmented control's bound key from settings so it
+        // mounts showing the persisted layout instead of an empty selection.
+        let overlay = vec![StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("live_grid_size".into())]),
+            value: Value::Text(alloc::format!("{}", live_grid_size())),
+        }];
+        send_slot_content_with_overlay("content", content, Some(overlay));
     } else if panel_id == "overview" {
         // Seed the activity heatmap's cells into the slot snapshot so the
         // Heatmap mounts with its data already in the store (same pattern as the
@@ -2317,6 +2306,22 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
         "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
+        "live-grid-change" => {
+            // The segmented control commits its picked layout to settings so the
+            // choice survives panel reopen; only the four allowed sizes persist.
+            let v = params.get("value").and_then(|x| x.as_str())
+                .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if let Ok(n) = v.parse::<u32>() {
+                if LIVE_GRID_SIZES.contains(&n) {
+                    let _ = db::set_setting("live_grid_size", &alloc::format!("{}", n));
+                }
+            }
+            render_panel("live");
+            json!({"ok":true})
+        }
         "panel-navigate" => {
             let target = params.get("panel_id")
                 .or_else(|| params.get("item_id"))
@@ -3782,9 +3787,92 @@ fn build_messages_section() -> Component {
     stack_v_gap("sm", children)
 }
 
+/// Allowed live-grid layouts: tile count → grid column count. Mirrors the
+/// mockup's 1/4/9/16 segmented control (1=1col, 4=2col, 9=3col, 16=4col).
+const LIVE_GRID_SIZES: [u32; 4] = [1, 4, 9, 16];
+const DEFAULT_LIVE_GRID_SIZE: i64 = 4;
+
+/// Normalizes a persisted grid-size value to one of the allowed layouts.
+fn live_grid_size() -> u32 {
+    let raw = db::get_setting_i64("live_grid_size", DEFAULT_LIVE_GRID_SIZE);
+    if LIVE_GRID_SIZES.contains(&(raw as u32)) {
+        raw as u32
+    } else {
+        DEFAULT_LIVE_GRID_SIZE as u32
+    }
+}
+
+/// Column count for a given tile-count layout (square root of the grid size).
+fn live_grid_columns(size: u32) -> u32 {
+    match size {
+        1 => 1,
+        4 => 2,
+        9 => 3,
+        _ => 4,
+    }
+}
+
+/// Segmented control for the 1/4/9/16 layout. Its picked value is written to the
+/// `live_grid_size` store key and committed to settings by `live-grid-change`,
+/// so the chosen layout survives panel reopen / process restart.
+fn live_grid_selector(current: u32) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::actions::SegmentedControl;
+    let options: Vec<SegmentOption> = LIVE_GRID_SIZES.iter().map(|n| SegmentOption {
+        value: SelectValue::Text(alloc::format!("{}", n)),
+        label: Some(lit(&alloc::format!("{}", n))),
+        icon: None,
+        badge: None,
+    }).collect();
+    let mut comp = SegmentedControl {
+        bind_path: StatePath::new(vec![PathSegment::Key("live_grid_size".into())]),
+        options,
+        size: SegmentSize::Md,
+        full_width: false,
+    }.into_component("live_grid_size").expect("SegmentedControl");
+    let _ = current;
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "live-grid-change".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// One live tile per real camera. There is NO live-stream backend wired to the
+/// browser yet, so the video area is an honest placeholder (camera name + status)
+/// — it deliberately does NOT open a `camera:<id>` WebSocket subscription, which
+/// an earlier iteration found triggers 401 console errors. No fake video, no
+/// fabricated detection overlay.
+fn live_camera_tile(c: &db::CameraRow) -> Component {
+    let online = c.status == "online";
+    let (status_label, status_tone) = if online {
+        ("online", "success")
+    } else if c.status == "offline" {
+        ("offline", "critical")
+    } else {
+        (c.status.as_str(), "warning")
+    };
+    let header = stack_h_gap("sm", vec![
+        chip_with_icon(&c.name, "neutral", "video"),
+        chip_toned(status_label, status_tone),
+    ]);
+    // Honest placeholder: no stream is available, so the area shows the camera
+    // name and "brak podglądu" instead of a frame.
+    let placeholder = empty_state(
+        &c.name,
+        Some(if online { "Brak podglądu (brak backendu streamu)" } else { "Offline — brak podglądu" }),
+        Some(if online { "video" } else { "alert" }),
+    );
+    card(None, vec![header, placeholder])
+}
+
 fn build_live_content() -> Component {
     let messages = build_messages_section();
-    let cameras = match camera_list() {
+    let cameras = match db::list_cameras() {
         Ok(c) => c,
         Err(e) => {
             return stack_v(vec![
@@ -3793,21 +3881,44 @@ fn build_live_content() -> Component {
             ]);
         }
     };
+
     if cameras.is_empty() {
-        return stack_v(vec![
-            messages,
-            // No outer Outlined Card: matches the dashboard stack so the empty
-            // state does not get a stray white frame around it.
-            empty_state("Brak kamer", Some("Dodaj kamerę aby zobaczyć podgląd na żywo."), Some("video")),
-        ]);
+        // Empty state with a CTA that navigates to the Cameras tab so the user
+        // can add a camera before any tile can appear.
+        let cta = button_with_params(
+            "Dodaj kamerę",
+            "panel-navigate",
+            "primary",
+            {
+                let mut p = CborMap::default();
+                p.0.push(("panel_id".into(), Value::Text("cameras".into())));
+                p
+            },
+        );
+        let empty = EmptyStateComp {
+            icon: icon_named(parse_icon_name("video")),
+            heading: lit("Brak kamer"),
+            message: Some(lit("Dodaj kamerę, aby zobaczyć podgląd na żywo.")),
+            primary_action: Some(cta),
+            secondary_action: None,
+            variant: EmptyStateVariant::Default,
+        }.into_component(next_id()).expect("EmptyState");
+        return stack_v(vec![messages, empty]);
     }
-    // Live tiles subscribe to the core's per-camera fMP4 publisher over the
-    // binary protocol (`camera:<id>` → streamSubscribeRequest). The raw camera
-    // URL is never handed to the browser — it cannot play rtsp(s):// directly.
-    let streams: Vec<Component> = cameras.iter().take(4).map(|c| {
-        card(Some(&c.display_name), vec![video_stream(&alloc::format!("camera:{}", c.camera_id))])
-    }).collect();
-    stack_v(core::iter::once(messages).chain(streams).collect())
+
+    let size = live_grid_size();
+    let columns = live_grid_columns(size);
+    let toolbar = stack_h(vec![
+        heading(2, "Podgląd na żywo"),
+        live_grid_selector(size),
+    ]);
+    // Only as many tiles as the chosen layout, capped by the real camera count.
+    let tiles: Vec<Component> = cameras.iter()
+        .take(size as usize)
+        .map(live_camera_tile)
+        .collect();
+    let grid_comp = grid(columns, tiles);
+    stack_v(vec![messages, toolbar, grid_comp])
 }
 
 fn build_cameras_content() -> Component {
@@ -4056,39 +4167,6 @@ fn build_camera_remove_confirm(camera_id: &str, cameras: &[db::CameraRow]) -> Co
         stack_h(vec![confirm_btn, cancel_btn]),
     ])])
 }
-
-/// A camera is "warning" when it is not cleanly online or carries a
-/// status_message diagnostic from the supervisor.
-fn camera_has_warning(c: &CameraInfoOut) -> bool {
-    if c.status != "online" && c.status != "offline" {
-        return true;
-    }
-    c.status_message.as_deref().map(|m| !m.trim().is_empty()).unwrap_or(false)
-}
-
-/// Renders "<actual>/<target>" fps when a live measurement exists, otherwise the
-/// configured target only, or em-dash for offline cameras with no target.
-fn camera_fps_display(c: &CameraInfoOut) -> String {
-    match c.fps_actual {
-        Some(actual) if c.status == "online" => alloc::format!("{:.0}/{}", actual, c.target_fps),
-        _ if c.target_fps > 0 => alloc::format!("\u{2014}/{}", c.target_fps),
-        _ => "\u{2014}".to_string(),
-    }
-}
-
-/// Maps a camera into a diagnostics label + tone for the table cell.
-fn camera_diagnostics(c: &CameraInfoOut) -> (String, &'static str) {
-    if let Some(msg) = c.status_message.as_deref().filter(|m| !m.trim().is_empty()) {
-        let tone = if c.status == "online" { "warning" } else { "critical" };
-        return (msg.to_string(), tone);
-    }
-    match c.status.as_str() {
-        "online" => ("OK".to_string(), "success"),
-        "offline" => ("offline".to_string(), "critical"),
-        other => (other.to_string(), "warning"),
-    }
-}
-
 
 /// Total number of wizard steps. The wizard is 0-indexed internally.
 const ADD_CAMERA_WIZARD_STEPS: u8 = 4;
