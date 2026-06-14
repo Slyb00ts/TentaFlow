@@ -416,8 +416,14 @@ pub async fn camera_admin_dispatch(
         }
         CameraAdminPayload::DiscoverResponse(_)
         | CameraAdminPayload::AddOnvifResponse(_)
-        | CameraAdminPayload::FrameUrlResponse(_) => Err(ProtocolError::bad_request(
+        | CameraAdminPayload::FrameUrlResponse(_)
+        | CameraAdminPayload::DetectionsFrame(_) => Err(ProtocolError::bad_request(
             "response variant cannot be sent as a request",
+        )),
+        // Streaming subscribe is served by the R-STREAM handler
+        // (`camera_detections`), not this synchronous RPC dispatch.
+        CameraAdminPayload::DetectionsSubscribeRequest(_) => Err(ProtocolError::bad_request(
+            "CameraDetectionsSubscribeRequest is a streaming request",
         )),
     }
 }

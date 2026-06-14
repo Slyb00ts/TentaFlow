@@ -6,19 +6,19 @@
 //              toned online/offline status chip, the 1/4/9/16 grid-size segmented
 //              control, and that the chosen grid size persists across a full panel
 //              reopen (fresh context) — it is written to the settings table.
-//              Each online tile attempts a REAL frame via the camera_snapshot host
-//              fn (RGB24 -> BMP data: URL -> SDK Image). In this CI env there is no
-//              real RTSP source, so the snapshot fails and EVERY tile degrades
-//              honestly to the placeholder for THAT tile only. The tab does NOT
-//              open a `camera:<id>` live WebSocket (which 401s), so the suite
-//              asserts ZERO console errors (no 401 stream spam). A manual "Odśwież"
-//              button re-renders the grid (re-attempts the snapshots). Screenshots
-//              to /tmp/tv/ for visual comparison to m02-live-view.html.
+//              ONLINE tiles render a real `<tf-video-stream>` (SDK VideoStream →
+//              MSE over the BINARY `streamSubscribeRequest`; the dashboard
+//              renderer also attaches the binary detection overlay). OFFLINE tiles
+//              degrade honestly to a placeholder (no stream). Nothing touches REST:
+//              the suite asserts ZERO console errors (no 401 stream spam). A manual
+//              "Odśwież" button re-renders the grid. Screenshots to /tmp/tv/ for
+//              visual comparison to m02-live-view.html.
 // =============================================================================
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { test, expect } = require('@playwright/test');
 const {
@@ -42,7 +42,7 @@ const PERMISSIONS = [
   'ui',
   'cameras.read',
   'cameras.write',
-  'cameras.snapshot',
+  'streams.subscribe',
   'sql.read',
   'sql.write',
 ];
@@ -50,12 +50,14 @@ const PERMISSIONS = [
 const SHOT_DIR = '/tmp/tv';
 
 // Four real cameras with mixed status so the grid shows both online (ok) and
-// offline (err) status chips. Names mirror the mockup's tile labels.
+// offline (err) status chips. Canonical `cam_<uuid v4>` ids so the online tiles'
+// `camera:<id>` subscribe stream ids pass the camera ACL. Names mirror the
+// mockup's tile labels.
 const CAMERAS = [
-  { id: 'cam-live-01', name: 'C-01 brama wjazdowa', status: 'online' },
-  { id: 'cam-live-02', name: 'C-04 wjazd-2', status: 'online' },
-  { id: 'cam-live-03', name: 'C-07 peron', status: 'online' },
-  { id: 'cam-live-04', name: 'C-12 magazyn', status: 'offline' },
+  { id: `cam_${crypto.randomUUID()}`, name: 'C-01 brama wjazdowa', status: 'online' },
+  { id: `cam_${crypto.randomUUID()}`, name: 'C-04 wjazd-2', status: 'online' },
+  { id: `cam_${crypto.randomUUID()}`, name: 'C-07 peron', status: 'online' },
+  { id: `cam_${crypto.randomUUID()}`, name: 'C-12 magazyn', status: 'offline' },
 ];
 
 let proc;
@@ -154,21 +156,23 @@ test.describe('TentaVision Live view — real camera grid + grid-size persistenc
     await expect(page.locator('.addon-app-shell tf-segmented').first()).toBeVisible({ timeout: 10000 });
     await page.screenshot({ path: `${SHOT_DIR}/live-grid.png`, fullPage: true });
 
-    // Real-frame path: every online tile attempted a camera_snapshot. With no
-    // real RTSP source in CI the snapshot fails, so every tile degrades honestly
-    // to the placeholder — assert the placeholders are present (one per tile) and
-    // NO real <img> frame leaked. In production with reachable cameras these tiles
-    // would instead carry an SDK <img> from the BMP data: URL.
+    // Video-tile path: every ONLINE tile renders a real <tf-video-stream> bound
+    // to its `camera:<id>` subscribe stream id (MSE over the binary protocol).
+    // The OFFLINE camera degrades honestly to a placeholder (no stream).
+    await expect(page.locator('.addon-app-shell tf-video-stream').first())
+      .toBeVisible({ timeout: 10000 });
+    const onlineCount = CAMERAS.filter((c) => c.status === 'online').length;
+    await expect(page.locator('.addon-app-shell tf-video-stream')).toHaveCount(onlineCount, { timeout: 10000 });
     await expect(page.locator('.addon-app-shell tf-empty-state').first())
       .toBeVisible({ timeout: 10000 });
 
-    // The manual "Odśwież" button re-renders the grid (re-attempts snapshots);
-    // it must not open a stream or emit console errors.
+    // The manual "Odśwież" button re-renders the grid; it must not emit console
+    // errors (and never opens a REST route — the rewrite is binary-only).
     const refreshBtn = page.locator('.addon-app-shell tf-button', { hasText: 'Odśwież' }).first();
     await expect(refreshBtn).toBeVisible({ timeout: 10000 });
     await refreshBtn.click();
     await page.waitForTimeout(600);
-    await expect(page.locator('.addon-app-shell tf-empty-state').first())
+    await expect(page.locator('.addon-app-shell tf-video-stream').first())
       .toBeVisible({ timeout: 10000 });
     await page.screenshot({ path: `${SHOT_DIR}/live-real.png`, fullPage: true });
 

@@ -29,8 +29,9 @@ pub mod types;
 pub mod vision;
 
 pub use camera::{
-    CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDiscoverRequest,
-    CameraDiscoverResponse, CameraFrameUrlRequest, CameraFrameUrlResponse, DiscoveredCameraInfo,
+    CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,
+    CameraDetectionsSubscribeRequest, CameraDiscoverRequest, CameraDiscoverResponse,
+    CameraFrameUrlRequest, CameraFrameUrlResponse, DetectionItem, DiscoveredCameraInfo,
 };
 pub use compliance::{
     ComplianceAdminPayload, ComplianceAiEventListFilter, ComplianceAiEventSummary,

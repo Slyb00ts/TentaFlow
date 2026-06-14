@@ -962,6 +962,24 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::CameraAdminBody(DetectionsSubscribeRequest) — open a per-camera
+   * detection overlay stream. The server replies with a long-lived stream of
+   * CameraDetectionsFrame chunks (IS_STREAM_CHUNK) on the same correlation id
+   * until MetaCancelStream or disconnect.
+   * payload: { cameraId }
+   */
+  cameraDetectionsSubscribeRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCameraDetectionsSubscribeRequest(payload.cameraId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
