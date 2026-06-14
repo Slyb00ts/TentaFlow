@@ -8258,6 +8258,40 @@ pub fn get_addon_instance_package_ref(
     Ok(row)
 }
 
+/// Zwraca `bundle_hash` pakietu z katalogu dla danej (package_id, version), albo
+/// None gdy wersja nie jest skatalogowana. Sluzy detekcji aktualizacji: porownanie
+/// z `addons.installed_bundle_hash` wykrywa zmiane TRESCI pakietu bez podbicia wersji.
+pub fn get_package_bundle_hash(
+    pool: &DbPool,
+    package_id: &str,
+    version: &str,
+) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT bundle_hash FROM addon_packages WHERE package_id = ?1 AND version = ?2",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![package_id, version], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// `installed_bundle_hash` instancji — hash katalogowy, z ktorego instancja byla
+/// materializowana. Pusty string gdy instancja powstala przed migracja 77 (czyta
+/// sie jako "starsza niz dowolny skatalogowany hash").
+pub fn get_instance_installed_bundle_hash(pool: &DbPool, addon_id: &str) -> Result<String> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached("SELECT installed_bundle_hash FROM addons WHERE addon_id = ?1")?;
+    let hash = stmt
+        .query_row(rusqlite::params![addon_id], |row| row.get::<_, String>(0))
+        .optional()?
+        .unwrap_or_default();
+    Ok(hash)
+}
+
 /// Upsert wersji pakietu do katalogu `addon_packages`. Idempotentne po
 /// (package_id, version) — reconciler wbudowanych addonow woła to przy kazdym
 /// starcie; ponowne wrzucenie tej samej wersji odswieza manifest/hash.

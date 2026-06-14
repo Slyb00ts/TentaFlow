@@ -244,13 +244,21 @@ pub fn get_camera(id: &str) -> Result<Option<CameraRow>, AbiError> {
 /// stamped from the authoritative SQLite clock.
 pub fn insert_camera(c: &NewCamera) -> Result<String, AbiError> {
     let id = generate_id("cam");
+    insert_camera_with_id(&id, c)?;
+    Ok(id)
+}
+
+/// Inserts a camera under an EXPLICIT id — used when the core ingest supervisor
+/// owns the authoritative `cam_<uuid>` id, so the addon row, the live
+/// `camera:<id>` stream and the detection overlay all key on the same id.
+pub fn insert_camera_with_id(id: &str, c: &NewCamera) -> Result<(), AbiError> {
     let now = now_secs();
     exec(
         "INSERT INTO cameras \
          (id, name, location, rtsp_url, onvif_url, status, fps, detectors, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         &[
-            SqlValue::Text(id.clone()),
+            SqlValue::Text(id.into()),
             SqlValue::Text(c.name.clone()),
             SqlValue::Text(c.location.clone()),
             SqlValue::Text(c.rtsp_url.clone()),
@@ -261,7 +269,7 @@ pub fn insert_camera(c: &NewCamera) -> Result<String, AbiError> {
             SqlValue::I64(now),
         ],
     )?;
-    Ok(id)
+    Ok(())
 }
 
 /// Updates an existing camera in place; bumps updated_at.
@@ -279,6 +287,20 @@ pub fn update_camera(c: &CameraRow) -> Result<u64, AbiError> {
             SqlValue::Text(c.status.clone()),
             SqlValue::I64(c.fps),
             SqlValue::Text(c.detectors.clone()),
+            SqlValue::I64(now),
+        ],
+    )
+}
+
+/// Updates only the liveness status of a camera (e.g. after a reachability
+/// probe). Returns rows affected (0 if the camera does not exist).
+pub fn set_camera_status(id: &str, status: &str) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "UPDATE cameras SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::Text(status.into()),
             SqlValue::I64(now),
         ],
     )

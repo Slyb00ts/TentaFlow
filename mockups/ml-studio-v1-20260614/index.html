@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: index.html
+     Opis: Spis mockupów ML Studio (architektura v2, projekt-centryczna). Start =
+           Projekty. Ekrany pogrupowane wg 6 typów projektu + nawigacja globalna
+           + archiwum v1 (referencja).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow ML Studio — Mockupy v2</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .grp-title { font-size: 13px; font-weight: 800; color: var(--accent-2); text-transform: uppercase;
+    letter-spacing: 0.1em; margin: 30px 0 12px; display: flex; align-items: center; gap: 9px; }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); }
+  .grp-note { font-size: 12px; color: var(--text-3); margin: -4px 0 12px; line-height: 1.6; }
+  .index-card.start { border-color: var(--accent-1); background: linear-gradient(135deg, var(--accent-glow), transparent); }
+  .index-card.start .id { color: var(--accent-2); }
+  .index-card.global { border-color: var(--info); }
+  .index-card.archive { opacity: 0.72; border-style: dashed; }
+  .v2-note { background: var(--bg-2); border: 1px solid var(--accent-1); border-radius: var(--radius);
+    padding: 14px 18px; margin-bottom: 8px; font-size: 13px; color: var(--text-2); line-height: 1.7; }
+  .v2-note strong { color: var(--text); }
+  .tag-global { font-size: 9.5px; font-weight: 800; color: var(--info); text-transform: uppercase;
+    letter-spacing: 0.06em; margin-left: 6px; }
+</style>
+</head>
+<body>
+<div class="index-page">
+  <h1>TentaFlow ML Studio</h1>
+  <p class="subtitle">
+    Projekt-centryczny moduł ML: zaczynasz od <strong>Projektów</strong>, tworzysz nowy kreatorem (typ determinuje
+    resztę), a wewnątrz projektu konfigurujesz schemat, oznaczasz dane i trenujesz. Wizardy pokazują KAŻDY krok
+    z realnymi polami i pomocą kontekstową — widać JAK zbudować rzeczy od zera, nie tylko stan końcowy.
+  </p>
+
+  <div class="v2-note">
+    <strong>v2 — projekt-centryczny.</strong> Start = Projekty. Każdy z 6 typów projektu ma pełną ścieżkę
+    od kreatora do wdrożonego modelu. Globalne (cross-project) są tylko dwa: <strong>Rejestr modeli</strong>
+    i <strong>Biblioteka zasobów</strong>.
+  </div>
+
+  <!-- 1. START I NAWIGACJA GLOBALNA -->
+  <div class="grp-title">1 · Start i nawigacja globalna<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card start" href="p00-projekty.html"><div class="id">P0 · START</div><h3>Projekty</h3><p>Ekran główny modułu: projekty jako karty (Rozpoznawanie na cysternach, Trening Guard, RAG), status, aktywność, „+ Nowy projekt”.</p></a>
+    <a class="index-card" href="p01-kreator-projekt.html"><div class="id">P1</div><h3>Kreator projektu</h3><p>Router typu: nazwa → <strong>typ</strong> (rozpoznawanie / fine-tune LLM / RAG / anomalie / destylacja / vision-audio) → dane → schemat. Typ determinuje kroki.</p></a>
+    <a class="index-card global" href="zasoby.html"><div class="id">Z<span class="tag-global">globalny</span></div><h3>Biblioteka zasobów</h3><p>Cross-project: modele usług (capability matrix), słowniki lookup, źródła danych, dostępy zewnętrzne. ŹRÓDŁO list w kreatorach całego modułu.</p></a>
+    <a class="index-card global" href="m07-model.html"><div class="id">M7<span class="tag-global">globalny</span></div><h3>Rejestr modeli</h3><p>Wszystkie wytrenowane modele wszystkich projektów: metryki, wersje, krzywe, Deploy / Użyj. Każdy model linkuje do projektu-źródła.</p></a>
+  </div>
+
+  <!-- 2. PROJEKT: ROZPOZNAWANIE OBRAZU -->
+  <div class="grp-title">2 · Projekt: Rozpoznawanie obrazu<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="przeglad-projektu.html"><div class="id">P·O</div><h3>Przegląd projektu</h3><p>Zakładka wnętrza projektu: KPI (zdjęcia, klasy, % oznaczone, modele), ostatnie joby, modele projektu, szybkie skróty. Zastępuje rolę m01.</p></a>
+    <a class="index-card" href="a-dane.html"><div class="id">A·D</div><h3>Dane</h3><p>Import zdjęć, profil zbioru, zbiór anotacji (144) vs wszystkie (248), podgląd i statystyki klas.</p></a>
+    <a class="index-card" href="r01-schemat.html"><div class="id">R1</div><h3>Schemat zadania</h3><p>Edytor klas i atrybutów od zera: kolor/kształt, typ atrybutu (lista / tekst / OCR / liczba / klasyfikator), OCR + lookup UN.</p></a>
+    <a class="index-card" href="r02-anotacja.html"><div class="id">R2</div><h3>Anotacja</h3><p>3 kolumny: zdjęcia, obraz z edytowalnymi ramkami, klasy + panel atrybutów (OCR „odczytaj”) + „⚡ Pre-oznacz modelem”.</p></a>
+    <a class="index-card" href="a-trening.html"><div class="id">A·T</div><h3>Trening</h3><p>Konfiguracja i uruchomienie treningu detektora (RF-DETR) na zbiorze anotacji projektu, postęp jobu.</p></a>
+    <a class="index-card" href="a-ewaluacja.html"><div class="id">A·E</div><h3>Ewaluacja</h3><p>mAP per klasa, macierz pomyłek, przykłady FP/FN, porównanie wersji modelu.</p></a>
+    <a class="index-card" href="a-eksport.html"><div class="id">A·X</div><h3>Eksport</h3><p>Matryca format×kwant bramkowana możliwościami (ONNX / TensorRT / CoreML / HF), deploy do serwisu.</p></a>
+  </div>
+
+  <!-- 3. PROJEKT: FINE-TUNING LLM (GUARD) -->
+  <div class="grp-title">3 · Projekt: Fine-tuning LLM (Guard)<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="f00-model.html"><div class="id">F0</div><h3>Model bazowy</h3><p>Krok 1: wybór modelu bazowego (Qwen3.5-0.8B / Llama-Guard / własny HF repo), pobranie wymaga hf_token.</p></a>
+    <a class="index-card" href="f-dane.html"><div class="id">F·D</div><h3>Dane</h3><p>Krok 2: upload lub generacja danych + augmentacja zero-width, split train/eval, format (text, label).</p></a>
+    <a class="index-card" href="f01-kreator-finetune.html"><div class="id">F1</div><h3>Metoda treningu</h3><p>Krok 3: <strong>dwie prostopadłe osie</strong> — algorytm/cel (SFT/DPO) × parametryzacja (QLoRA/LoRA/DoRA/Full) z auto-estymatą VRAM i hiperparametrami.</p></a>
+    <a class="index-card" href="f02-trening-live.html"><div class="id">F2</div><h3>Trening na żywo</h3><p>Live wykres loss+eval, pasek epoki/kroków, metryki, gauge VRAM, logi mono, Anuluj / Wznów, checkpointy.</p></a>
+    <a class="index-card" href="f03-eksport-deploy.html"><div class="id">F3</div><h3>Eksport + deploy</h3><p>Formaty (GGUF / NVFP4 / MLX / ONNX / HF), benchmark wariantów vs baseline Claude (per-class P/R/F1, tok/s), deploy + TOML.</p></a>
+  </div>
+
+  <!-- 4. PROJEKT: ML TABELARYCZNE + ANOMALIE -->
+  <div class="grp-title">4 · Projekt: ML tabelaryczne + anomalie<span class="ln"></span></div>
+  <div class="grp-note">Zastępuje stary <strong>m04</strong> — pełne pochodzenie kolumn i klas (źródło danych → role pól → cel → silnik).</div>
+  <div class="index-grid">
+    <a class="index-card" href="t-dane.html"><div class="id">T·D</div><h3>Dane (profil)</h3><p>Źródło tabelaryczne (xlsx/parquet/DB), profil kolumn z typami i mapowanie pól → role. Pochodzenie każdej kolumny.</p></a>
+    <a class="index-card" href="t01-cel.html"><div class="id">T1</div><h3>Cel zadania</h3><p>Wybór celu: klasyfikacja / regresja / wykrywanie anomalii; kolumna celu i metryka z profilu danych.</p></a>
+    <a class="index-card" href="t02-silnik.html"><div class="id">T2</div><h3>Silnik</h3><p>Karty silników (AutoGluon / PyOD / …) dobrane do celu, z parametrami i budżetem czasu.</p></a>
+    <a class="index-card" href="t03-leaderboard.html"><div class="id">T3</div><h3>Leaderboard</h3><p>Ranking modeli AutoML z metrykami i paskami, najlepszy wyróżniony, wykres.</p></a>
+    <a class="index-card" href="t04-ewaluacja.html"><div class="id">T4</div><h3>Ewaluacja</h3><p>Metryki finalnego modelu, ważność cech, krzywe; dla anomalii: progi i przykłady wykryć.</p></a>
+  </div>
+
+  <!-- 5. PROJEKT: RAG -->
+  <div class="grp-title">5 · Projekt: RAG<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="rag01-korpus.html"><div class="id">RAG1</div><h3>Korpus</h3><p>Podpięcie dokumentów (PDF/MD), profil korpusu, czyszczenie i ekstrakcja tekstu.</p></a>
+    <a class="index-card" href="rag02-chunking.html"><div class="id">RAG2</div><h3>Chunking</h3><p>Strategia dzielenia (rozmiar/overlap), podgląd chunków, embedder z biblioteki zasobów.</p></a>
+    <a class="index-card" href="rag03-indeks.html"><div class="id">RAG3</div><h3>Indeks</h3><p>Budowa indeksu wektorowego (HNSW), parametry, postęp embeddowania.</p></a>
+    <a class="index-card" href="rag04-eval.html"><div class="id">RAG4</div><h3>Ewaluacja</h3><p>Zapytania testowe, trafność (recall@k), reranking, odpowiedzi z cytowaniem źródła.</p></a>
+  </div>
+
+  <!-- 6. PROJEKT: DESTYLACJA -->
+  <div class="grp-title">6 · Projekt: Destylacja<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="d01-para.html"><div class="id">D1</div><h3>Para nauczyciel→uczeń</h3><p>Wybór modelu nauczyciela (Qwen3.6-27B) i ucznia, cel destylacji.</p></a>
+    <a class="index-card" href="d02-prompty.html"><div class="id">D2</div><h3>Prompty / zbiór</h3><p>Zbiór promptów do generacji odpowiedzi nauczyciela, podgląd i augmentacja.</p></a>
+    <a class="index-card" href="d03-trening.html"><div class="id">D3</div><h3>Trening ucznia</h3><p>Trening na odpowiedziach nauczyciela (live loss, VRAM, checkpointy).</p></a>
+    <a class="index-card" href="d04-porownanie.html"><div class="id">D4</div><h3>Porównanie</h3><p>Uczeń vs nauczyciel: jakość, tok/s, rozmiar, koszt — zysk z destylacji.</p></a>
+  </div>
+
+  <!-- 7. PROJEKT: FINE-TUNING VISION/AUDIO/OBRAZ -->
+  <div class="grp-title">7 · Projekt: Fine-tuning vision / audio / obraz<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="c01-model.html"><div class="id">C1</div><h3>Model bazowy</h3><p>Wybór modelu vision/audio/obraz-gen (Whisper / detektor / diffusers), pobranie z HF.</p></a>
+    <a class="index-card" href="c-dane.html"><div class="id">C·D</div><h3>Dane</h3><p>Zbiór (nagrania + transkrypty / obrazy + opisy), profil i split.</p></a>
+    <a class="index-card" href="c-metoda.html"><div class="id">C·M</div><h3>Metoda</h3><p>Metoda fine-tuningu właściwa dla modalności (LoRA / pełny / adaptery) z estymatą VRAM.</p></a>
+    <a class="index-card" href="c-trening.html"><div class="id">C·T</div><h3>Trening</h3><p>Live trening modelu vision/audio: loss, metryki modalności, logi.</p></a>
+    <a class="index-card" href="c-eksport.html"><div class="id">C·X</div><h3>Eksport</h3><p>Matryca formatów (CoreML / ONNX / MLX / HF) bramkowana modalnością i HW, deploy.</p></a>
+  </div>
+
+  <!-- 8. ARCHIWUM v1 -->
+  <div class="grp-title">8 · Archiwum v1 (NIE wzorzec — referencja)<span class="ln"></span></div>
+  <div class="grp-note">
+    Stare ekrany <strong>zastąpione</strong> przez powyższe ścieżki projektowe. Zostawione <strong>tylko do porównania</strong>:
+    m01 → Przegląd projektu, m02 → Dane projektu, m03 → R2, m04 → flow T1–T4, m05 → F1–F3, m06 → joby projektowe, m07 → Rejestr modeli.
+    Docelowy system ich NIE zawiera.
+  </div>
+  <div class="index-grid">
+    <a class="index-card archive" href="m01-overview.html"><div class="id">M1 · arch.</div><h3>Przegląd (v1)</h3><p>Globalny pulpit KPI — zastąpiony przez Przegląd projektu (projekt-centryczny).</p></a>
+    <a class="index-card archive" href="m02-dane.html"><div class="id">M2 · arch.</div><h3>Dane i połączenia (v1)</h3><p>Drag-drop i mapowanie pól bez kontekstu projektu — przeniesione do zakładek danych projektu.</p></a>
+    <a class="index-card archive" href="m03-anotacja.html"><div class="id">M3 · arch.</div><h3>Studio anotacji (v1)</h3><p>Wcześniejsza anotacja — zastąpiona przez R2 (inny, projektowy model danych).</p></a>
+    <a class="index-card archive" href="m04-trenuj.html"><div class="id">M4 · arch.</div><h3>Trenuj/silniki (v1)</h3><p>Wrzucał w gotowy stan bez pochodzenia danych — rozbity na flow T1–T4.</p></a>
+    <a class="index-card archive" href="m05-finetuning.html"><div class="id">M5 · arch.</div><h3>Fine-tuning (v1)</h3><p>Nieprojektowy fine-tuning — rozwinięty w F1 + F2 + F3 oraz ścieżki vision/destylacja.</p></a>
+    <a class="index-card archive" href="m06-joby.html"><div class="id">M6 · arch.</div><h3>Joby i treningi (v1)</h3><p>Tabela jobów bez projektu — docelowo joby są projekt-aware (zakładka w projekcie).</p></a>
+  </div>
+
+</div>
+</body>
+</html>

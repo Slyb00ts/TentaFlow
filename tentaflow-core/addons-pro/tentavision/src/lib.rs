@@ -2484,7 +2484,8 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "camera-remove" => handle_camera_remove(params),
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
-        "cameras-refresh" | "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
+        "cameras-refresh" => handle_camera_refresh_status(),
+        "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
         "live-grid-change" => {
             // The segmented control commits its picked layout to settings so the
             // choice survives panel reopen; only the four allowed sizes persist.
@@ -2832,51 +2833,166 @@ fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, fps, profile, source_type) = with_state(|s| (
+    let (target, name, fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
         s.discover.resolve_target(),
         s.discover.name.trim().to_string(),
         s.discover.fps_value(),
         s.discover.profile_or_default().to_string(),
         s.discover.source_type,
+        s.discover.cred_user.trim().to_string(),
+        s.discover.cred_pass.trim().to_string(),
     ));
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 60 {
         return submit_fail("Nazwa musi mieć 1–60 znaków.", "invalid name");
     }
-    let (vendor, url, _profile_token) = match target {
+    let (vendor, url, profile_token) = match target {
         Ok(t) => t,
         Err(msg) => return submit_fail(msg, "invalid target"),
     };
+    let credentials_b64 = match build_credentials_b64(&vendor, &cred_user, &cred_pass) {
+        Ok(c) => c,
+        Err(msg) => return submit_fail(msg, "invalid credentials"),
+    };
 
-    // Persist the camera to SQLite — the cameras list reads exclusively from
-    // there, so the row survives panel reopen and process restart. The URL is
-    // routed into onvif_url / rtsp_url depending on the chosen source type so
-    // later tabs (live, zones) can pick the right transport.
+    // Register the camera with the CORE ingest supervisor — THIS starts the
+    // RTSP→fMP4 pipeline that feeds the live `camera:<id>` stream. Without it the
+    // live tile has no producer and hangs on "Łączenie ze strumieniem…". The
+    // core camera_id (cam_<uuid>) becomes the addon row id so the row, the live
+    // stream and the detection overlay all key on the same id.
+    let input = CameraAddInput {
+        display_name: name.clone(),
+        vendor: vendor.clone(),
+        url: url.clone(),
+        target_fps: Some(fps),
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: None,
+        profile: Some(profile.clone()),
+        credentials_b64,
+        onvif_profile_token: profile_token,
+    };
+    let added = match camera_add(input) {
+        Ok(o) => o,
+        Err(e) => return submit_fail(
+            &alloc::format!("Nie udało się uruchomić kamery w rdzeniu: {}", abi_message(e)),
+            &alloc::format!("{}", e),
+        ),
+    };
+
+    // The cameras list reads from the addon DB; persist the row under the core id
+    // so live/zones/overlay resolve the same camera. Status comes from a real
+    // reachability probe (re-probable later via "Odśwież status").
     let (onvif_url, rtsp_url) = match source_type {
         Some(SourceType::Onvif) => (url.clone(), String::new()),
         _ => (String::new(), url.clone()),
+    };
+    let status = match camera_test_connection(&vendor, &url) {
+        Ok(out) if out.ok => "online",
+        _ => "offline",
     };
     let new_cam = db::NewCamera {
         name: name.clone(),
         location: profile.clone(),
         rtsp_url,
         onvif_url,
-        status: "offline".into(),
+        status: status.into(),
         fps: i64::from(fps),
         detectors: vendor,
     };
-    match db::insert_camera(&new_cam) {
-        Ok(id) => {
-            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", id)); });
-            // Close the modal and refresh the camera list so the new camera
-            // appears. render_panel re-sends the "cameras" content fragment
-            // without the modal, which is the intended end state on success.
+    match db::insert_camera_with_id(&added.camera_id, &new_cam) {
+        Ok(()) => {
+            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", added.camera_id)); });
             render_panel("cameras");
-            json!({"ok":true,"camera_id":id})
+            json!({"ok":true,"camera_id":added.camera_id})
         }
-        Err(e) => submit_fail(&alloc::format!("Błąd dodawania: {}", abi_message(e)), &alloc::format!("{}", e)),
+        Err(e) => submit_fail(&alloc::format!("Błąd zapisu: {}", abi_message(e)), &alloc::format!("{}", e)),
     }
+}
+
+/// Per-row probe target: ONVIF cameras probe their device-service URL, everything
+/// else probes the RTSP(S) URL. Returns (vendor, url) for `camera_test_connection`.
+fn camera_row_probe_target(c: &db::CameraRow) -> (String, String) {
+    if !c.onvif_url.trim().is_empty() {
+        ("onvif".to_string(), c.onvif_url.clone())
+    } else {
+        ("rtsp".to_string(), c.rtsp_url.clone())
+    }
+}
+
+/// Re-probes every camera's reachability and persists the resulting online/offline
+/// status, then re-renders the Cameras tab. This is the truthful source of status
+/// for cameras added before liveness probing existed (and after a camera goes up
+/// or down). Sequential by design — at large fleet sizes this should move to the
+/// core ingest supervisor's health, but for operator-driven refresh it is fine.
+fn handle_camera_refresh_status() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    let cameras = match db::list_cameras() {
+        Ok(c) => c,
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e))); });
+            render_panel("cameras");
+            return json!({"ok":false,"error":alloc::format!("{}",e)});
+        }
+    };
+    let mut online = 0usize;
+    let total = cameras.len();
+    for c in &cameras {
+        let (vendor, url) = camera_row_probe_target(c);
+        if url.trim().is_empty() {
+            let _ = db::set_camera_status(&c.id, "offline");
+            continue;
+        }
+        // Cameras added before core-ingest wiring carry a non-core id and have no
+        // ingest session, so their live tile can never stream. Register them with
+        // the core supervisor now (starts the RTSP→fMP4 pipeline) and rekey the
+        // row to the returned core camera_id so `camera:<id>` has a producer.
+        if !is_valid_camera_id(&c.id) {
+            let input = CameraAddInput {
+                display_name: c.name.clone(),
+                vendor: vendor.clone(),
+                url: url.clone(),
+                target_fps: Some(c.fps as u32),
+                resolution_width: None,
+                resolution_height: None,
+                retention_class: None,
+                profile: Some(c.location.clone()),
+                credentials_b64: None,
+                onvif_profile_token: None,
+            };
+            if let Ok(added) = camera_add(input) {
+                let probed = match camera_test_connection(&vendor, &url) {
+                    Ok(out) if out.ok => "online",
+                    _ => "offline",
+                };
+                let rekeyed = db::NewCamera {
+                    name: c.name.clone(),
+                    location: c.location.clone(),
+                    rtsp_url: c.rtsp_url.clone(),
+                    onvif_url: c.onvif_url.clone(),
+                    status: probed.into(),
+                    fps: c.fps,
+                    detectors: c.detectors.clone(),
+                };
+                let _ = db::delete_camera(&c.id);
+                let _ = db::insert_camera_with_id(&added.camera_id, &rekeyed);
+                if probed == "online" { online += 1; }
+                continue;
+            }
+            // Core registration failed (e.g. needs credentials) — keep the row,
+            // just record reachability so the operator sees the real state.
+        }
+        let status = match camera_test_connection(&vendor, &url) {
+            Ok(out) if out.ok => "online",
+            _ => "offline",
+        };
+        let _ = db::set_camera_status(&c.id, status);
+        if status == "online" { online += 1; }
+    }
+    with_state(|s| { s.success_message = Some(alloc::format!("Odświeżono status: {}/{} online.", online, total)); });
+    render_panel("cameras");
+    json!({"ok":true,"online":online,"total":total})
 }
 
 fn handle_camera_remove(params: &JsonValue) -> JsonValue {
@@ -4190,6 +4306,7 @@ fn build_cameras_content() -> Component {
     let toolbar = stack_h(vec![
         heading(2, "Kamery"),
         search_input,
+        button_with_icon("Odśwież status", "cameras-refresh", "secondary", "refresh"),
         button_with_icon("Dodaj kamerę", "camera-add-show", "primary", "plus"),
     ]);
     children.push(toolbar);

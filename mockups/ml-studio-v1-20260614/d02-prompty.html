@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: d02-prompty.html
+     Opis: Destylacja — zbiór promptów. Źródło: upload JSONL lub generacja z szablonu.
+           Te prompty zasilą nauczyciela w kroku generacji (pochodzenie datasetu).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Destylacja: zbiór promptów</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .source-card { cursor: pointer; height: 100%; }
+  .source-card.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+  .source-card .sc-head { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+  .source-card .sc-dot { width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--border-hover); flex-shrink: 0; }
+  .source-card.selected .sc-dot { border-color: var(--accent-1); background: var(--accent-1); box-shadow: inset 0 0 0 3px var(--bg-2); }
+  .source-card .sc-title { font-size: 13px; font-weight: 800; }
+  .uploaded { display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin-top: 12px;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .uploaded .up-ico { width: 34px; height: 34px; border-radius: 8px; background: rgba(34,197,94,0.13);
+    color: var(--success); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .uploaded .up-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+  .uploaded .up-name { font-size: 12.5px; font-weight: 700; font-family: ui-monospace, monospace; }
+  .uploaded .up-meta { font-size: 11px; color: var(--text-3); }
+  .callout { display: flex; gap: 14px; padding: 16px 18px; background: var(--accent-glow);
+    border: 1px solid var(--accent-1); border-radius: var(--radius); align-items: flex-start; }
+  .callout .co-ico { width: 36px; height: 36px; border-radius: 9px; background: var(--bg);
+    border: 1px solid var(--accent-1); color: var(--accent-2); flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; }
+  .callout .co-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.75; }
+  .callout h4 { font-size: 13px; font-weight: 800; margin-bottom: 4px; }
+  .callout p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  .callout .flow { font-family: ui-monospace, monospace; color: var(--text); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+  <symbol id="i-wand" viewBox="0 0 24 24"><path d="m15 4 5 5L9 20l-5 1 1-5z"/><path d="M14.5 5.5 18.5 9.5"/></symbol>
+  <symbol id="i-library" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="m5 7 7-4 7 4"/><path d="m5 7-3 6h6z"/><path d="m19 7-3 6h6z"/></symbol>
+  <symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>Destylacja — zbiór promptów</h1>
+  <p class="lead">
+    Prompty to <strong>pytania, na które nauczyciel wygeneruje wzorcowe odpowiedzi</strong>. Możesz wgrać własny zbiór JSONL
+    albo wygenerować prompty z szablonu. To wejście dla kroku „Generacja" — z każdego promptu powstanie jedna para
+    (prompt → odpowiedź nauczyciela), która utworzy zbiór treningowy ucznia.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-upload"/></svg>Upload JSONL</h3>
+      <p>Wgraj gotowy plik z promptami — jeden obiekt na linię, pole <code>prompt</code>.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-wand"/></svg>Generacja z szablonu</h3>
+      <p>Albo wygeneruj N promptów z parametryzowanego szablonu (np. kategorie ADR × N).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-arrow-r"/></svg>Pochodzenie datasetu</h3>
+      <p>Liczba promptów = liczba par treningowych, które wygeneruje nauczyciel w następnym kroku.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D2</span>
+    <h2>Zbiór promptów — źródło i podgląd</h2>
+    <div class="desc">Upload lub generacja · 5 200 promptów · pochodzenie datasetu.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">„Destylacja asystenta ADR"</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Prompty</span>
+        </div>
+
+        <!-- Pasek nawigacji wnętrza projektu -->
+        <div class="tabs-bar">
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-overview"/></svg>Przegląd</a>
+          <a class="tab" href="d01-para.html"><svg class="icon"><use href="#i-link"/></svg>Nauczyciel+uczeń</a>
+          <button class="tab active"><svg class="icon"><use href="#i-list"/></svg>Prompty<span class="count">5 200</span></button>
+          <a class="tab" href="d03-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <a class="tab" href="d04-porownanie.html"><svg class="icon"><use href="#i-scale"/></svg>Porównanie</a>
+          <a class="tab" href="p00-projekty.html"><svg class="icon"><use href="#i-cpu"/></svg>Modele</a>
+        </div>
+
+        <!-- Źródło promptów -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-list"/></svg>Źródło promptów</h3>
+          <p class="section-sub">Wybierz, skąd wziąć prompty. Aktualny zbiór pochodzi z uploadu JSONL.</p>
+          <div class="grid-2">
+            <div class="source-card section-card" style="margin-bottom:0;">
+              <div class="sc-head"><span class="sc-dot" style="border-color:var(--accent-1);background:var(--accent-1);box-shadow:inset 0 0 0 3px var(--bg-2);"></span><span class="sc-title">Upload JSONL</span><span class="chip success ml-auto"><svg class="icon"><use href="#i-check"/></svg>aktywne</span></div>
+              <p class="text-sm text-2">Wgraj plik z promptami — jeden obiekt JSON na linię, pole <code>prompt</code>.</p>
+              <div class="uploaded">
+                <div class="up-ico"><svg><use href="#i-file"/></svg></div>
+                <div>
+                  <div class="up-name">prompty_adr.jsonl</div>
+                  <div class="up-meta">5 200 promptów · 2.1 MB · zwalidowane (pole <code>prompt</code> obecne w 100% linii)</div>
+                </div>
+                <button class="btn btn-ghost btn-sm ml-auto"><svg class="icon"><use href="#i-upload"/></svg>Zmień plik</button>
+              </div>
+            </div>
+            <div class="source-card section-card" style="margin-bottom:0;opacity:0.65;">
+              <div class="sc-head"><span class="sc-dot"></span><span class="sc-title">Generacja z szablonu</span></div>
+              <p class="text-sm text-2">Wygeneruj prompty z parametryzowanego szablonu — kombinacja kategorii i wzorców pytań.</p>
+              <div class="field mt-sm"><label>Szablon promptu</label>
+                <textarea class="textarea mono" style="min-height:54px;">Jakie wymagania ADR dotyczą {kategoria} przy przewozie {substancja}?</textarea></div>
+              <div class="flex gap-md align-center">
+                <div class="field" style="flex:1;margin-bottom:0;"><label>Liczba promptów (N)</label><input class="input" value="5000"></div>
+                <button class="btn btn-secondary" style="margin-top:18px;"><svg class="icon"><use href="#i-wand"/></svg>Generuj</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Podgląd tabeli promptów -->
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-file"/></svg>Podgląd promptów <span class="text-3">— 5 z 5 200 (czytane z pliku)</span></h3>
+          <table class="tf-table">
+            <thead><tr><th style="width:60px;">#</th><th>prompt</th><th style="width:140px;">kategoria (auto-tag)</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">1</td><td>Jakie dokumenty ADR musi mieć kierowca cysterny przewożącej UN 1203 (benzyna)?</td><td><span class="chip">dokumenty</span></td></tr>
+              <tr><td class="mono">2</td><td>Jak oznakować cysternę przewożącą materiał klasy 3 zgodnie z ADR?</td><td><span class="chip">oznakowanie</span></td></tr>
+              <tr><td class="mono">3</td><td>Jakie są wymagania dotyczące wyposażenia gaśniczego dla cysterny ADR powyżej 7,5 t?</td><td><span class="chip">wyposażenie</span></td></tr>
+              <tr><td class="mono">4</td><td>Czy do przewozu UN 1830 (kwas siarkowy) wymagana jest cysterna z określonym kodem cysterny?</td><td><span class="chip">kody cystern</span></td></tr>
+              <tr><td class="mono">5</td><td>Jakie ograniczenia tunelowe obowiązują przy przewozie materiałów klasy 2 w cysternie?</td><td><span class="chip">ograniczenia</span></td></tr>
+            </tbody>
+          </table>
+          <p class="text-xs text-3 mt-sm"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-info"/></svg>
+            Kategoria to auto-tag z treści promptu (słowa kluczowe) — służy tylko do balansu zbioru, nie jest etykietą treningową.</p>
+        </div>
+
+        <!-- Callout pochodzenia -->
+        <div class="section-card">
+          <div class="callout">
+            <div class="co-ico"><svg><use href="#i-arrow-r"/></svg></div>
+            <div>
+              <h4>Pochodzenie zbioru treningowego ucznia</h4>
+              <p>Z tych <span class="flow">5 200 promptów</span> nauczyciel (Qwen3.6-27B) wygeneruje
+                <span class="flow">5 200 odpowiedzi referencyjnych</span> w następnym kroku — to będzie zbiór treningowy ucznia.
+                Stąd liczniki par i kroków w kroku „Trening" mają dokładne źródło: <span class="flow">1 prompt → 1 para (prompt, odpowiedź nauczyciela)</span>.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Nawigacja -->
+        <div class="flex justify-between" style="padding-top:4px;">
+          <a class="btn btn-secondary" href="d01-para.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wstecz: Nauczyciel + uczeń</a>
+          <a class="btn btn-primary btn-lg" href="d03-trening.html">Dalej: Generacja + trening<svg class="icon"><use href="#i-chevron"/></svg></a>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

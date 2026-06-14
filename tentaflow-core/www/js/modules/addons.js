@@ -584,8 +584,17 @@ async function openUpdateModal(addonId) {
   }
   const current = info.current || '';
   const available = Array.isArray(info.available) ? info.available : [];
+  // Newer versions come first (catalog is sorted newest-first). The current
+  // version stays selectable as a "reload changed content" option: a bundled
+  // addon often ships edits under the SAME version, so re-applying it refreshes
+  // the manifest (permissions, storage) without a version bump.
+  const hasNewer = available.some((v) => v !== current);
   const opts = available
-    .map((v) => `<option value="${escapeAttr(v)}"${v === current ? ' disabled' : ''}>${escapeHtml(v)}${v === current ? ' (aktualna)' : ''}</option>`)
+    .map((v) => {
+      const label = v === current ? `${escapeHtml(v)} (przeładuj zawartość)` : escapeHtml(v);
+      const selected = (hasNewer ? v !== current : v === current) ? ' selected' : '';
+      return `<option value="${escapeAttr(v)}"${selected}>${label}</option>`;
+    })
     .join('');
   openModal({
     title: `Aktualizuj instancje`,
@@ -601,7 +610,7 @@ async function openUpdateModal(addonId) {
       </div>`,
     onConfirm: async (win) => {
       const target = win.querySelector('#upd-version')?.value || '';
-      if (!target || target === current) { toast('Wybierz inna wersje', 'error'); return false; }
+      if (!target) { toast('Wybierz wersje', 'error'); return false; }
       const res = await ApiBinary.action('addonInstanceUpdateRequest', { addonId, targetVersion: target });
       if (!res.ok) { toast(res.error || 'Aktualizacja nieudana', 'error'); return false; }
       toast(`Zaktualizowano do v${target}`, 'success');

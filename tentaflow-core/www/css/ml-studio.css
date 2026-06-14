@@ -1,0 +1,229 @@
+/* =============================================================================
+   Plik: ml-studio.css
+   Opis: Style modułu ML Studio — siatka kart projektów (p00), karty typów
+         w kreatorze (p01) oraz nagłówek + statystyki widoku szczegółu.
+   ============================================================================= */
+
+/* ---------- Lista projektów (p00) ---------- */
+
+.ml-studio-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.ml-studio-loading {
+  display: flex;
+  justify-content: center;
+  padding: 48px 0;
+}
+
+.ml-studio-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+
+.ml-studio-card:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-card-hover);
+  transform: translateY(-2px);
+}
+
+.ml-studio-card-top {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.ml-studio-card-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-glow);
+  color: var(--accent-2);
+}
+
+.ml-studio-card-ico .icon {
+  width: 22px;
+  height: 22px;
+}
+
+.ml-studio-card-name {
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ml-studio-card-type {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.ml-studio-card-desc {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ml-studio-card-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.ml-studio-stat {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  text-align: center;
+}
+
+.ml-studio-stat .v {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ml-studio-stat .l {
+  font-size: 11px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ml-studio-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.ml-studio-card-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-card-meta .icon {
+  width: 13px;
+  height: 13px;
+}
+
+/* ---------- Karta „Nowy projekt" (tf-button) ---------- */
+
+.ml-studio-new {
+  display: block;
+  height: 100%;
+}
+
+.ml-studio-new .tf-btn {
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 160px;
+  padding: 16px;
+  border-style: dashed;
+  text-align: center;
+}
+
+.ml-studio-new-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-glow);
+  color: var(--accent-2);
+}
+
+.ml-studio-new-ico .icon {
+  width: 22px;
+  height: 22px;
+}
+
+.ml-studio-new-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ml-studio-new-title {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.ml-studio-new-sub {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* ---------- Kreator (p01) ---------- */
+
+.ml-studio-form {
+  display: grid;
+  gap: 16px;
+}
+
+.ml-studio-type-field {
+  display: grid;
+  gap: 8px;
+}
+
+/* Liczba kolumn dla tf-radio-card-group (komponent czyta --tf-radio-card-cols). */
+#ml-studio-types {
+  --tf-radio-card-cols: 3;
+}
+
+@media (max-width: 720px) {
+  #ml-studio-types {
+    --tf-radio-card-cols: 1;
+  }
+}
+
+/* ---------- Szczegół projektu ---------- */
+
+.ml-studio-detail-top {
+  margin-bottom: 12px;
+}
+
+.ml-studio-detail-desc {
+  margin: 12px 0;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+.ml-studio-detail-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.ml-studio-tab-panel {
+  margin-top: 16px;
+}

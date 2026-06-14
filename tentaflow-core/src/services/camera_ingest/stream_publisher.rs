@@ -142,7 +142,7 @@ impl Mp4StreamPublisher {
                 if &kind == b"moof" {
                     // Init phase complete — seal what we have and start the
                     // first media segment with this `moof`.
-                    let pending = std::mem::take(&mut self.pending_init.lock().clone());
+                    let pending = std::mem::take(&mut *self.pending_init.lock());
                     if !pending.is_empty() {
                         *init_guard = Some(Bytes::from(pending));
                         drop(init_guard);

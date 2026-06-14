@@ -32,6 +32,12 @@ struct ActiveSource {
 pub struct StreamHub {
     factories: RwLock<HashMap<String, StreamSourceFactory>>,
     active: RwLock<HashMap<String, Arc<ActiveSource>>>,
+    /// Per-stream async lock serializing cold-path source creation. Without it,
+    /// two concurrent cold subscribes each build a source; the loser is
+    /// discarded and (for camera fMP4 sources) its Drop emits DetachMp4Branch,
+    /// tearing down the WINNER's mux branch — leaving the stream producing
+    /// nothing and the client stuck on "connecting".
+    creation_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 static GLOBAL: OnceLock<Arc<StreamHub>> = OnceLock::new();
@@ -41,7 +47,17 @@ impl StreamHub {
         Self {
             factories: RwLock::new(HashMap::new()),
             active: RwLock::new(HashMap::new()),
+            creation_locks: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns the per-stream creation lock, allocating it on first use.
+    fn creation_lock(&self, stream_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.creation_locks
+            .lock()
+            .entry(stream_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Returns the process-wide hub, constructing it on first access.
@@ -90,9 +106,29 @@ impl StreamHub {
             ));
         }
 
-        // Cold path: call the factory under no lock, await the init segment,
-        // then insert. A racing cold subscribe for the same id is resolved
-        // below by re-checking the map under the write lock.
+        // Cold path: serialize per stream so exactly ONE source is created.
+        // Holding this async lock across factory()+init_segment().await means a
+        // racing cold subscribe waits here and then takes the fast path below —
+        // no discarded loser source, no spurious DetachMp4Branch.
+        let create_lock = self.creation_lock(stream_id);
+        let _create_guard = create_lock.lock().await;
+
+        // Re-check under the creation lock — a racer may have just published it.
+        if let Some(entry) = self.active.read().get(stream_id).cloned() {
+            entry.subscribers.fetch_add(1, Ordering::AcqRel);
+            let receiver = entry.source.chunk_broadcaster().subscribe();
+            let mime = entry.source.mime_type().to_string();
+            let init = entry.init_segment.clone();
+            let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
+            return Ok(SubscriptionHandle::new(
+                stream_id.to_string(),
+                mime,
+                init,
+                receiver,
+                token,
+            ));
+        }
+
         let factory_result = {
             let factories = self.factories.read();
             let factory = factories

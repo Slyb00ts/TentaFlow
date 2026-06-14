@@ -460,6 +460,15 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// Resize obrazu RGB24 (SIMD downscale). Surowe bajty src plyna bez CBOR;
+    /// wymiary jako parametry. Wynik RGB24 dst_w*dst_h*3 do bufora wyjsciowego.
+    /// ABI: (src_ptr, src_len, src_w, src_h, dst_w, dst_h, out_ptr, out_cap, out_len_ptr) -> i32
+    fn image_resize_rgb_v1(
+        src_ptr: i32, src_len: i32,
+        src_w: i32, src_h: i32, dst_w: i32, dst_h: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -1281,6 +1290,12 @@ const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
 /// payloads without raising the cap for every other call.
 const MAX_OUT_CAP_SNAPSHOT: usize = 8 * 1024 * 1024;
 
+/// Hard cap dla wyniku resize obrazu (RGB24). Host jest zrodlem prawdy:
+/// `image_resize_rgb_v1` odrzuca > `MAX_PIXELS` (64 MP), wiec maks. wynik to
+/// 64 MP * 3 bajty/px = 192 MiB. Snapshot kamery (`MAX_OUT_CAP_SNAPSHOT`) to
+/// odrebny limit i nie ma zastosowania do resize.
+const MAX_IMAGE_OUT_CAP: usize = 64 * 1024 * 1024 * 3;
+
 /// Stream subscribe/next/close responses carry only small metadata payloads
 /// (stream_id, frame_ref + a few numeric fields, never frame bytes). 4 KiB is
 /// well above the realistic ceiling and keeps the guest from following a
@@ -2066,6 +2081,75 @@ pub fn camera_snapshot(camera_id: &str) -> Result<SnapshotInfo, AbiError> {
         timestamp_unix_ms: raw.timestamp_unix_ms,
         data,
     })
+}
+
+/// Resize obrazu RGB24 (row-major, 3 bajty/piksel) z `src_w x src_h` do
+/// `dst_w x dst_h`. Zwraca nowy bufor RGB24 `dst_w * dst_h * 3`. Host uzywa
+/// najszybszego separowalnego resizera SIMD (AVX2 / NEON).
+///
+/// Rozmiar wyniku jest znany z gory (`dst_w*dst_h*3`), wiec bufor alokujemy
+/// dokladnie — kod 6 (OutputBufferTooSmall) obslugujemy mimo to jednym retry
+/// z rozmiarem zwroconym przez host (defensywnie).
+///
+/// Wymaga uprawnienia "image.resize" w manifescie addonu.
+pub fn image_resize_rgb(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Result<Vec<u8>, AbiError> {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Err(AbiError::Operation);
+    }
+    let expected_src = src_w as usize * src_h as usize * 3;
+    if src.len() != expected_src {
+        return Err(AbiError::Operation);
+    }
+
+    let mut cap = dst_w as usize * dst_h as usize * 3;
+    if cap > MAX_IMAGE_OUT_CAP {
+        return Err(AbiError::PayloadTooLarge);
+    }
+
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            image_resize_rgb_v1(
+                src.as_ptr() as i32,
+                src.len() as i32,
+                src_w as i32,
+                src_h as i32,
+                dst_w as i32,
+                dst_h as i32,
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            return Ok(buffer);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            if attempts > MAX_RETRY_ATTEMPTS {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            let required = out_len as usize;
+            if required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_IMAGE_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
 }
 
 /// Health + runtime metryki z supervisora. Gdy session zniknal (np. restart

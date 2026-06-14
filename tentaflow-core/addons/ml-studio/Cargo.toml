@@ -1,0 +1,17 @@
+[package]
+name = "tentaflow-addon-ml-studio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
+minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

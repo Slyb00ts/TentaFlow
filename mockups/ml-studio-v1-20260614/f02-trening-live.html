@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: f02-trening-live.html
+     Opis: Trening na żywo — wykres loss+eval, pasek epoki/kroków, metryki
+           (loss, eval acc, tok/s, gauge VRAM), logi mono, sterowanie + checkpointy.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Trening na żywo</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .live-dot { r: 4; fill: var(--accent-2); }
+  .live-pulse { fill: var(--accent-2); opacity: 0.4; animation: ml-pulse 1.6s ease-out infinite; }
+  @keyframes ml-pulse { 0% { r: 4; opacity: 0.5; } 100% { r: 16; opacity: 0; } }
+  .ckpt-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--bg-input);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 6px; font-size: 12px; }
+  .ckpt-row.best { border-color: var(--accent-1); background: var(--accent-glow); }
+  .ckpt-row .ck-step { font-family: ui-monospace, monospace; font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Trening na żywo (model Guard)</h1>
+  <p class="lead">
+    Job treningowy w tle z metrykami w czasie rzeczywistym: krzywa <strong>loss + eval</strong> z pulsującym
+    punktem na czole, pasek epoki/kroków, metryki (loss, eval acc, tok/s, gauge VRAM), strumień logów (mono)
+    i sterowanie: <strong>Anuluj / Wznów z checkpointu</strong> + lista checkpointów. Dane płyną z flow engine
+    (<code>flow_status_v1</code>) + metrics collector.
+  </p>
+  <div class="rules">
+    <div class="rule"><h3><svg class="icon icon-sm"><use href="#i-cpu"/></svg>Live metryki</h3><p>loss/eval/tok-s/VRAM odświeżane co krok przez metrics collector.</p></div>
+    <div class="rule"><h3><svg class="icon icon-sm"><use href="#i-flag"/></svg>Checkpointy</h3><p>Zapisywane co N kroków; można wznowić trening z dowolnego (<code>--resume</code>).</p></div>
+    <div class="rule"><h3><svg class="icon icon-sm"><use href="#i-pause"/></svg>Sterowanie</h3><p>Anuluj job albo wznów po przerwaniu — bez utraty postępu.</p></div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">F2</span>
+    <h2>Trening na żywo — Guard · epoka 2/3 · krok 4120/6840</h2>
+    <div class="desc">Wykres loss+eval · metryki · gauge VRAM · logi · checkpointy.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Trenowanie modelu Guard</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Trening na żywo</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Guard · QLoRA <span class="chip warning"><span class="dot"></span>trening trwa</span></div>
+            <div class="d-sub">Qwen3.5-0.8B · job flow_invoke #a91f · 1× RTX 4090</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-clock"/></svg>ETA 34 min</span>
+              <span class="chip"><svg class="icon"><use href="#i-flag"/></svg>epoka 2/3</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-play"/></svg>Wznów z checkpointu</button>
+            <button class="btn btn-danger"><svg class="icon"><use href="#i-x"/></svg>Anuluj</button>
+          </div>
+        </div>
+
+        <!-- Pasek postępu kroków -->
+        <div class="section-card" style="padding:14px 18px;">
+          <div class="flex justify-between" style="margin-bottom:8px;">
+            <span class="text-sm fw-700">Krok 4120 / 6840 · epoka 2/3</span>
+            <span class="text-sm text-2">60% · ~2.2 it/s</span>
+          </div>
+          <div class="progress"><span style="width:60%"></span></div>
+        </div>
+
+        <!-- Metryki KPI -->
+        <div class="kpi-grid">
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-cpu"/></svg>train loss</div><div class="value">0.187</div><div class="delta up"><svg class="icon icon-sm"><use href="#i-check"/></svg>spada</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-check"/></svg>eval acc</div><div class="value">94.3<span class="small">%</span></div><div class="delta up"><svg class="icon icon-sm"><use href="#i-check"/></svg>+1.8 pp</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-clock"/></svg>throughput</div><div class="value">3140<span class="small"> tok/s</span></div><div class="delta">stabilny</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-cpu"/></svg>VRAM</div><div class="value">8.4<span class="small"> / 24 GB</span></div><div class="delta">35% wykorzystania</div></div>
+        </div>
+
+        <div class="grid-ml-2-1">
+          <!-- Wykres loss + eval -->
+          <div class="chart-wrap">
+            <div class="flex justify-between align-center" style="margin-bottom:8px;">
+              <span class="text-sm fw-700">Krzywa loss / eval — na żywo</span>
+              <span class="chip warning"><span class="dot"></span>live</span>
+            </div>
+            <svg viewBox="0 0 600 260" preserveAspectRatio="none">
+              <g class="chart-grid">
+                <line x1="0" y1="40" x2="600" y2="40"/><line x1="0" y1="100" x2="600" y2="100"/>
+                <line x1="0" y1="160" x2="600" y2="160"/><line x1="0" y1="220" x2="600" y2="220"/>
+              </g>
+              <!-- train loss (spadająca) -->
+              <path class="chart-line draw" stroke="#a78bfa"
+                d="M0,30 C60,70 100,110 160,140 C220,168 280,182 340,196 C400,206 440,210 500,214 L500,214"/>
+              <!-- eval loss (kropkowana, wyżej) -->
+              <path class="chart-line" stroke="#60a5fa" stroke-dasharray="5 4"
+                d="M0,50 C60,85 120,120 180,150 C240,172 300,186 360,200 C420,208 460,212 500,218"/>
+              <!-- pulsujący punkt na czole -->
+              <circle class="live-pulse" cx="500" cy="214"/>
+              <circle class="live-dot" cx="500" cy="214"/>
+            </svg>
+            <div class="chart-legend">
+              <div class="lg"><span class="sw" style="background:#a78bfa"></span>train loss</div>
+              <div class="lg"><span class="sw" style="background:#60a5fa"></span>eval loss</div>
+              <div class="lg"><span class="sw" style="background:var(--accent-2)"></span>aktualny krok (live)</div>
+            </div>
+          </div>
+
+          <!-- Gauge VRAM -->
+          <div class="section-card" style="margin-bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;">
+            <div class="gauge">
+              <svg width="130" height="130" viewBox="0 0 100 100">
+                <defs><linearGradient id="gaugeGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#6366f1"/><stop offset="100%" stop-color="#a78bfa"/></linearGradient></defs>
+                <circle class="g-track" cx="50" cy="50" r="45"/>
+                <circle class="g-fill" cx="50" cy="50" r="45" style="stroke-dashoffset:184"/>
+              </svg>
+              <div class="gauge-value">35%</div>
+              <div class="g-label">VRAM · 8.4 GB</div>
+            </div>
+            <div class="text-xs text-3 center" style="line-height:1.5;">QLoRA trzyma się znacznie<br>poniżej 24 GB — jest zapas<br>na większy batch.</div>
+          </div>
+        </div>
+
+        <div class="grid-ml-2-1 mt-md">
+          <!-- Logi -->
+          <div class="section-card" style="margin-bottom:0;">
+            <h3><svg class="icon"><use href="#i-audit"/></svg>Logi treningu (stream)</h3>
+            <div class="log-block">
+<span class="ts">12:41:02</span> <span class="lvl-info">INFO</span>  step 4118 | loss 0.191 | lr 1.94e-4 | 3122 tok/s
+<span class="ts">12:41:03</span> <span class="lvl-info">INFO</span>  step 4119 | loss 0.188 | lr 1.94e-4 | 3140 tok/s
+<span class="ts">12:41:04</span> <span class="lvl-ok">EVAL</span>  eval_loss 0.214 | eval_acc 0.943 | f1 0.938
+<span class="ts">12:41:04</span> <span class="lvl-ok">CKPT</span>  saved checkpoint-4000 (best eval_loss)
+<span class="ts">12:41:05</span> <span class="lvl-info">INFO</span>  step 4120 | loss 0.187 | lr 1.93e-4 | 3140 tok/s
+<span class="ts">12:41:05</span> <span class="lvl-warn">WARN</span>  grad_norm 2.41 (clip @ 1.0 applied)
+<span class="ts">12:41:06</span> <span class="lvl-info">INFO</span>  augment: zero-width injected on 8.2% batch samples
+            </div>
+          </div>
+
+          <!-- Checkpointy -->
+          <div class="section-card" style="margin-bottom:0;">
+            <h3><svg class="icon"><use href="#i-flag"/></svg>Checkpointy</h3>
+            <div class="ckpt-row best">
+              <span class="ck-step">checkpoint-4000</span>
+              <span class="chip accent">best</span>
+              <span class="text-xs text-3 ml-auto">eval 0.214</span>
+            </div>
+            <div class="ckpt-row">
+              <span class="ck-step">checkpoint-3000</span>
+              <span class="text-xs text-3 ml-auto">eval 0.241</span>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg></button>
+            </div>
+            <div class="ckpt-row">
+              <span class="ck-step">checkpoint-2000</span>
+              <span class="text-xs text-3 ml-auto">eval 0.298</span>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg></button>
+            </div>
+            <div class="ckpt-row">
+              <span class="ck-step">checkpoint-1000</span>
+              <span class="text-xs text-3 ml-auto">eval 0.402</span>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg></button>
+            </div>
+            <a class="btn btn-primary mt-sm" href="f03-eksport-deploy.html" style="width:100%;justify-content:center;">
+              Po zakończeniu: Eksport i benchmark<svg class="icon"><use href="#i-chevron"/></svg>
+            </a>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

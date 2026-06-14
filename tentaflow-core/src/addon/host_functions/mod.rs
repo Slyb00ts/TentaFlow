@@ -16,6 +16,7 @@ pub mod events;
 pub mod flow;
 pub mod gate;
 pub mod http;
+pub mod image;
 pub mod llm;
 pub mod log;
 pub mod network;
@@ -206,6 +207,15 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "tool_register", tool_register)
         .map_err(|e| anyhow::anyhow!("Rejestracja tool_register: {e}"))?;
+
+    // --- Image API (resize RGB24 — SIMD downscale dla addonow vision) ---
+    linker
+        .func_wrap(
+            "tentaflow",
+            "image_resize_rgb_v1",
+            image::image_resize_rgb_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja image_resize_rgb_v1: {e}"))?;
 
     // --- Network API (proxy TCP/UDP) ---
     linker
@@ -476,7 +486,11 @@ pub fn read_guest_bytes<'a>(
         return None;
     }
     let start = ptr as usize;
-    let end = start + len as usize;
+    // checked_add chroni przed wrap-around na 32-bit hostach (ARMv7 mobile).
+    let end = match start.checked_add(len as usize) {
+        Some(e) => e,
+        None => return None,
+    };
     let data = memory.data(store);
     if end > data.len() {
         return None;

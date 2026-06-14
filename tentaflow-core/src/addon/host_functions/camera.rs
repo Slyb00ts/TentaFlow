@@ -217,6 +217,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
             resolution,
             owner_addon_id: Some(row.owner_addon_id.clone()),
             credentials_encrypted: row.credentials_encrypted.clone(),
+            decoder_override: None,
         };
         if let Err(e) = sup.add_camera(cfg).await {
             warn!(
@@ -479,23 +480,112 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
         .host_str()
         .ok_or_else(|| "missing host".to_string())?
         .to_string();
-    let port = parsed.port().unwrap_or(554);
+    // `rtsps://` is RTSP tunneled over TLS (UniFi Protect, some Axis/Hanwha).
+    // Default RTSPS port is 322; plain RTSP is 554.
+    let tls = parsed.scheme().eq_ignore_ascii_case("rtsps");
+    let port = parsed.port().unwrap_or(if tls { 322 } else { 554 });
     let path = if parsed.path().is_empty() {
         "/"
     } else {
         parsed.path()
     };
-    let request_uri = format!("rtsp://{host}:{port}{path}");
+    let scheme = if tls { "rtsps" } else { "rtsp" };
+    let request_uri = format!("{scheme}://{host}:{port}{path}");
     let redacted = redact_rtsp_url(url);
 
     let dur = Duration::from_secs(timeout_secs);
-    let stream = tokio::time::timeout(dur, tokio::net::TcpStream::connect((host.as_str(), port)))
+    let tcp = tokio::time::timeout(dur, tokio::net::TcpStream::connect((host.as_str(), port)))
         .await
         .map_err(|_| format!("connect timeout: {redacted}"))?
         .map_err(|e| format!("tcp connect failed: {e}"))?;
 
+    // Plain RTSP probes the bare TCP socket; RTSPS must complete a TLS handshake
+    // first (a plaintext OPTIONS to a TLS port makes the server hang up without
+    // replying). Cameras almost always present self-signed certs, so this probe
+    // skips chain validation — it tests reachability, not transport trust.
+    if tls {
+        let connector = rtsps_tls_connector()?;
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|_| format!("invalid TLS host: {redacted}"))?;
+        let stream = tokio::time::timeout(dur, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| "tls handshake timeout".to_string())?
+            .map_err(|e| format!("tls handshake failed: {e}"))?;
+        rtsp_options_exchange(stream, &request_uri, dur).await
+    } else {
+        rtsp_options_exchange(tcp, &request_uri, dur).await
+    }
+}
+
+/// Builds a rustls `TlsConnector` that accepts any server certificate. Used only
+/// by the RTSPS reachability probe — never for data transfer. Explicit ring
+/// provider so the probe works even if no process-wide default is installed.
+fn rtsps_tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("tls config: {e}"))?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+    .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+}
+
+/// Certificate verifier that accepts every server certificate. SOLELY for the
+/// RTSPS connection-test probe (self-signed camera certs); not used anywhere a
+/// real trust decision matters.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Sends an RTSP `OPTIONS` over an established stream (plain TCP or TLS) and
+/// treats ANY `RTSP/1.x`/`RTSP/2.x` status line as reachable — a 4xx (wrong
+/// path / unsupported method) still proves the server is alive and speaking
+/// RTSP, which is all a connection test verifies.
+async fn rtsp_options_exchange<S>(mut stream: S, request_uri: &str, dur: Duration) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use crate::services::camera_ingest::rtsp::redact_url_in_text;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = stream;
+
     let req =
         format!("OPTIONS {request_uri} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: TentaFlow/F1b\r\n\r\n");
     tokio::time::timeout(dur, stream.write_all(req.as_bytes()))
@@ -513,13 +603,10 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
     }
     let response = std::str::from_utf8(&buf[..n]).unwrap_or("(non-utf8 response)");
     let status = response.lines().next().unwrap_or("");
-    // Accept 2xx and 401 (auth challenge means the server is alive).
-    let ok = (status.starts_with("RTSP/1.0 2") || status.starts_with("RTSP/2.0 2"))
-        || status.starts_with("RTSP/1.0 401")
-        || status.starts_with("RTSP/2.0 401");
+    let ok = status.starts_with("RTSP/1.0 ") || status.starts_with("RTSP/2.0 ");
     if !ok {
         return Err(format!(
-            "RTSP server returned: {}",
+            "unexpected response: {}",
             redact_url_in_text(status)
         ));
     }
@@ -861,6 +948,7 @@ pub fn camera_add_v1(
         },
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: credentials_blob.clone(),
+        decoder_override: None,
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,
@@ -2454,6 +2542,7 @@ pub fn camera_credentials_rotate_v1(
         },
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: new_blob.clone(),
+        decoder_override: None,
     };
     let restart_result = run_async(async {
         let sup = get_or_init_supervisor().await?;
@@ -2717,6 +2806,7 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         },
         owner_addon_id: Some(addon_id.clone()),
         credentials_encrypted: credentials_blob.clone(),
+        decoder_override: None,
     };
     let sup = match run_async(get_or_init_supervisor()) {
         Ok(s) => s,

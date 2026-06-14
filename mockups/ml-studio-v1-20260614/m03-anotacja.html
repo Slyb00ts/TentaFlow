@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — ML Studio · Studio anotacji (M3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-polygon" viewBox="0 0 24 24"><polygon points="12 2 22 8.5 18 21 6 21 2 8.5"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Studio anotacji (M3)</h1>
+  <p class="lead">
+    Oznaczanie zdjęć jak w Label Studio, ale zintegrowane: lista zadań po lewej, edytowalne ramki na obrazie
+    w centrum, klasy i atrybuty po prawej. <strong>Killer-feature</strong>: „⚡ Pre-oznacz modelem” woła model z serwisu
+    (RF-DETR / OWLv2 / Qwen), który wstępnie wypełnia ramki — człowiek tylko poprawia. To samo, co robiliśmy w Pythonie, ale wyklikane.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-box"/></svg>Edytowalny canvas</h3>
+      <p>Rysowanie i edycja boxów/poligonów, klasy, atrybuty, skróty klawiszowe (tf-annotate-canvas).</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-zap"/></svg>Pre-label z serwisu</h3>
+      <p>Wynik <code>service_request</code> / <code>llm_generate</code> wstawiany jako edytowalne anotacje.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-layers"/></svg>Eksport do treningu</h3>
+      <p>Zbiór anotacji → COCO / JSONL / CSV, gotowy dla przestrzeni „Trenuj”.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M3</span>
+    <h2>Studio anotacji — cysterny ADR (zdjęcia z bramy)</h2>
+    <div class="desc">Zadania → obraz z ramkami → klasy + Pre-oznacz modelem.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-puzzle"/></svg>Addons (WASM)<span class="badge">8</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Addons</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Studio anotacji</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Zbiór anotacji „cysterny-adr” · 248 obrazów · 61 oznaczonych</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-image"/></svg>obraz 142 / 248</span>
+              <span class="chip"><svg class="icon"><use href="#i-box"/></svg>4 klasy</span>
+              <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>auto-zapis</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-layers"/></svg>Eksport COCO</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zatwierdź obraz</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-database"/></svg>Dane</button>
+          <button class="tab active"><svg class="icon"><use href="#i-image"/></svg>Anotacja<span class="count">2</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-cpu"/></svg>Trenuj</button>
+          <button class="tab"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning</button>
+          <button class="tab"><svg class="icon"><use href="#i-play"/></svg>Joby<span class="count">3</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-layers"/></svg>Modele<span class="count">11</span></button>
+        </div>
+
+        <div class="annotate-layout ml-enter ml-enter-1">
+
+          <!-- Lista zadań -->
+          <div class="annotate-tasks">
+            <div class="flex justify-between align-center" style="margin-bottom:6px">
+              <span class="text-xs fw-700 text-2">ZADANIA</span>
+              <span class="chip success">61/248</span>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0140.jpg</div><div class="t-meta">3 ramki · ✓ gotowe</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0141.jpg</div><div class="t-meta">2 ramki · ✓ gotowe</div></div>
+            </div>
+            <div class="task-item active">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0142.jpg</div><div class="t-meta">3 ramki · edycja</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0143.jpg</div><div class="t-meta">pre-label czeka</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0144.jpg</div><div class="t-meta">— pusty</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0145.jpg</div><div class="t-meta">— pusty</div></div>
+            </div>
+            <div class="task-item">
+              <div class="t-thumb"><svg class="icon"><use href="#i-truck"/></svg></div>
+              <div style="flex:1"><div class="t-name">brama_0146.jpg</div><div class="t-meta">— pusty</div></div>
+            </div>
+          </div>
+
+          <!-- Canvas z obrazem i ramkami -->
+          <div class="annotate-canvas">
+            <div class="ac-toolbar">
+              <button class="btn btn-sm btn-primary"><svg class="icon"><use href="#i-box"/></svg>Box</button>
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-polygon"/></svg>Poligon</button>
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-move"/></svg>Przesuń</button>
+              <div style="width:1px;height:20px;background:var(--border);margin:0 4px"></div>
+              <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-undo"/></svg>Cofnij</button>
+              <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button>
+              <span class="text-xs text-3 ml-auto mono">brama_0142.jpg · 1920×1080 · zoom 64%</span>
+            </div>
+            <div class="ac-stage">
+              <span class="scene-label">scena: cysterna ADR przy bramie (mock obrazu)</span>
+
+              <!-- Mock sceny: cysterna jako prosty rysunek SVG, ramki nad nią -->
+              <svg viewBox="0 0 640 360" style="position:absolute;inset:0;width:100%;height:100%;opacity:0.55">
+                <rect x="60" y="150" width="380" height="110" rx="14" fill="#3a4170"/>
+                <rect x="60" y="150" width="380" height="110" rx="14" fill="none" stroke="#5a629c" stroke-width="2"/>
+                <rect x="440" y="170" width="120" height="90" rx="10" fill="#2b3157"/>
+                <circle cx="150" cy="270" r="26" fill="#1a1f3a"/><circle cx="150" cy="270" r="12" fill="#0a0d24"/>
+                <circle cx="340" cy="270" r="26" fill="#1a1f3a"/><circle cx="340" cy="270" r="12" fill="#0a0d24"/>
+                <circle cx="500" cy="270" r="24" fill="#1a1f3a"/><circle cx="500" cy="270" r="11" fill="#0a0d24"/>
+                <rect x="210" y="185" width="60" height="36" rx="4" fill="#d97706"/>
+                <rect x="300" y="190" width="46" height="46" rx="4" fill="#16a34a"/>
+              </svg>
+
+              <!-- Ramki anotacji (procentowo nad sceną) -->
+              <div class="anno-box success" data-label="tablica · 33/1203 · czytelna" style="left:31%;top:50%;width:11%;height:11%">
+                <span class="anno-handle tl"></span><span class="anno-handle tr"></span><span class="anno-handle bl"></span><span class="anno-handle br"></span>
+              </div>
+              <div class="anno-box warning" data-label="nalepka · klasa 3 · uszkodzona" style="left:46%;top:51%;width:8%;height:13%">
+                <span class="anno-handle tl"></span><span class="anno-handle tr"></span><span class="anno-handle bl"></span><span class="anno-handle br"></span>
+              </div>
+              <div class="anno-box predicted" data-label="⚡ cysterna · 0.94 (pre-label)" style="left:8%;top:40%;width:60%;height:32%"></div>
+            </div>
+          </div>
+
+          <!-- Panel klas + pre-label -->
+          <div class="annotate-side">
+            <section class="section-card" style="margin:0;padding:14px">
+              <h3 style="margin-bottom:10px"><svg class="icon"><use href="#i-box"/></svg>Klasy</h3>
+              <div class="class-row"><span class="c-swatch" style="background:var(--accent-2)"></span><span class="c-name">cysterna</span><span class="c-key">1</span></div>
+              <div style="height:6px"></div>
+              <div class="class-row"><span class="c-swatch" style="background:var(--success)"></span><span class="c-name">tablica ADR</span><span class="c-key">2</span></div>
+              <div style="height:6px"></div>
+              <div class="class-row"><span class="c-swatch" style="background:var(--warning)"></span><span class="c-name">nalepka</span><span class="c-key">3</span></div>
+              <div style="height:6px"></div>
+              <div class="class-row"><span class="c-swatch" style="background:var(--danger)"></span><span class="c-name">wyciek / uszkodzenie</span><span class="c-key">4</span></div>
+            </section>
+
+            <section class="section-card" style="margin:0;padding:14px">
+              <h3 style="margin-bottom:8px"><svg class="icon"><use href="#i-tune"/></svg>Atrybuty zaznaczonej ramki</h3>
+              <div class="field"><label>Stan tablicy</label>
+                <select class="select"><option>czytelna</option><option>częściowo czytelna</option><option>nieczytelna</option></select>
+              </div>
+              <div class="field"><label>Numer UN</label><input class="input mono" value="UN 1203"></div>
+              <div class="toggle-row"><span class="toggle on"></span>Zweryfikowana ręcznie</div>
+            </section>
+
+            <section class="section-card" style="margin:0;padding:14px;border-color:var(--accent-1)">
+              <h3 style="margin-bottom:8px;color:var(--accent-2)"><svg class="icon"><use href="#i-zap"/></svg>Pre-oznacz modelem</h3>
+              <div class="section-sub" style="margin-bottom:10px">Model z serwisu wstawi wstępne ramki (edytowalne).</div>
+              <div class="model-pick selected"><svg class="icon" style="color:var(--accent-2)"><use href="#i-target"/></svg><div style="flex:1"><div class="m-name">RF-DETR-cysterny</div><div class="m-meta">vision · własny · mAP 0.88</div></div></div>
+              <div class="model-pick"><svg class="icon" style="color:var(--info)"><use href="#i-box"/></svg><div style="flex:1"><div class="m-name">OWLv2 (open-vocab)</div><div class="m-meta">serwis · prompt tekstowy</div></div></div>
+              <div class="model-pick"><svg class="icon" style="color:var(--text-3)"><use href="#i-brain"/></svg><div style="flex:1"><div class="m-name">Qwen3.6-VL</div><div class="m-meta">serwis · opis + boxy</div></div></div>
+              <button class="prelabel-btn mt-md"><svg class="icon"><use href="#i-zap"/></svg>Pre-oznacz tym modelem</button>
+              <div class="text-xs text-3 center mt-sm">ostatnio: 1 ramka wstawiona · 0.94 conf</div>
+            </section>
+          </div>
+
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

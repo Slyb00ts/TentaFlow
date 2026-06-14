@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: a-ewaluacja.html — Ewaluacja (vision) dla projektu Rozpoznawanie:
+           metryki mAP/precision/recall na zbiorze val, macierz pomyłek 5 klas,
+           tabela per-klasa i podgląd predykcji (TP + FP) na zbiorze walidacyjnym.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Ewaluacja (vision)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Macierz pomyłek 5×5 (heatmap z etykietami osi) ----- */
+  .cm-wrap { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+  .cm-grid { display: grid; grid-template-columns: 130px repeat(5, 1fr); gap: 3px; }
+  .cm-grid .cm-corner { font-size: 9px; color: var(--text-3); display: flex; align-items: flex-end; }
+  .cm-grid .cm-coltop { font-size: 9.5px; color: var(--text-3); text-align: center; padding-bottom: 4px;
+    font-family: ui-monospace, monospace; align-self: end; }
+  .cm-grid .cm-rowlabel { font-size: 10px; color: var(--text-2); display: flex; align-items: center;
+    justify-content: flex-end; padding-right: 8px; font-family: ui-monospace, monospace; }
+  .cm-cell { aspect-ratio: 2.6/1; border-radius: 3px; background: var(--bg-3); display: flex;
+    align-items: center; justify-content: center; font-size: 12px; font-weight: 800; color: var(--text); }
+  .cm-cell.lvl-1 { background: rgba(99,102,241,0.20); }
+  .cm-cell.lvl-2 { background: rgba(99,102,241,0.45); }
+  .cm-cell.lvl-3 { background: rgba(167,139,250,0.70); }
+  .cm-cell.lvl-4 { background: rgba(99,102,241,0.92); color: white; }
+  .cm-cell.miss  { background: rgba(239,68,68,0.30); color: var(--danger); }
+  .cm-axis-y { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 9px; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.08em; }
+  /* ----- Galeria predykcji ----- */
+  .pred-tile {
+    position: relative; aspect-ratio: 4/3; border-radius: var(--radius); overflow: hidden;
+    background: linear-gradient(135deg, #14213a 0%, #07101f 100%); border: 1px solid var(--border);
+  }
+  .pred-tile .pt-scene { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .pred-tile .pt-scene svg { width: 60%; opacity: 0.32; }
+  .pred-tile .pt-name {
+    position: absolute; left: 8px; bottom: 8px; font-size: 10px; color: var(--text-2);
+    background: rgba(5,8,24,0.6); padding: 2px 7px; border-radius: 5px; font-family: ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Ewaluacja modelu (vision) na zbiorze val</h1>
+  <p class="lead">
+    Po treningu RF-DETR mierzymy jakość na <strong>zbiorze walidacyjnym (37 zdjęć)</strong> — tych samych, które
+    odłożył krok Dane. Metryki <strong>mAP@50, mAP@50-95, precision, recall</strong>, <strong>macierz pomyłek</strong>
+    między 5 klasami, rozbicie <strong>per-klasa</strong> i <strong>podgląd predykcji</strong> z ramkami (poprawne TP
+    oraz jeden błąd FP). Liczba instancji per klasa pochodzi z anotacji val.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-check"/></svg>Metryki z val</h3>
+      <p>Wszystkie liczby liczone na 37 zdjęciach walidacyjnych — pochodzenie z kroku Dane.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Macierz pomyłek</h3>
+      <p>Co z czym model myli — przekątna to trafienia, poza nią pomyłki klas.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-image"/></svg>Podgląd predykcji</h3>
+      <p>Ramki na realnych zdjęciach val: zielone = TP, czerwone = błąd (FP) do analizy.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A3</span>
+    <h2>Ewaluacja (vision) — mAP@50 0.88, macierz 5 klas, podgląd predykcji</h2>
+    <div class="desc">Metryki · macierz pomyłek · per-klasa · TP/FP na val.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Rozpoznawanie znaków na cysternach</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Ewaluacja</span>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-apps"/></svg>Przegląd</button>
+          <a class="tab" href="a-dane.html"><svg class="icon"><use href="#i-image"/></svg>Dane<span class="count">248</span></a>
+          <a class="tab" href="r01-schemat.html"><svg class="icon"><use href="#i-box"/></svg>Schemat</a>
+          <a class="tab" href="r02-anotacja.html"><svg class="icon"><use href="#i-edit"/></svg>Anotacja<span class="count">61/144</span></a>
+          <a class="tab" href="a-trening.html"><svg class="icon"><use href="#i-brain"/></svg>Trening</a>
+          <button class="tab active"><svg class="icon"><use href="#i-check"/></svg>Ewaluacja</button>
+          <button class="tab"><svg class="icon"><use href="#i-catalog"/></svg>Modele</button>
+        </div>
+
+        <!-- Metryki na val -->
+        <div class="flex align-center gap-md" style="margin-bottom:12px;">
+          <span class="chip info"><svg class="icon"><use href="#i-image"/></svg>zbiór val: 37 zdjęć (z kroku Dane)</span>
+          <span class="chip accent">model: RF-DETR · 50 epok</span>
+        </div>
+        <div class="kpi-grid">
+          <div class="stat-card"><div class="sc-lbl">mAP@50</div><div class="sc-val">0.88</div><div class="sc-foot">próg IoU 0.5</div></div>
+          <div class="stat-card"><div class="sc-lbl">mAP@50-95</div><div class="sc-val">0.71</div><div class="sc-foot">uśrednione po progach IoU</div></div>
+          <div class="stat-card"><div class="sc-lbl">Precision</div><div class="sc-val">0.90</div><div class="sc-foot">trafność wykryć</div></div>
+          <div class="stat-card"><div class="sc-lbl">Recall</div><div class="sc-val">0.86</div><div class="sc-foot">pokrycie obiektów</div></div>
+        </div>
+
+        <div class="grid-2">
+          <!-- Macierz pomyłek -->
+          <div class="section-card">
+            <h3><svg class="icon"><use href="#i-grid"/></svg>Macierz pomyłek (5 klas)</h3>
+            <p class="section-sub">Wiersz = klasa prawdziwa, kolumna = predykcja modelu. Przekątna to trafienia.</p>
+            <div class="cm-wrap">
+              <div class="flex gap-sm">
+                <span class="cm-axis-y" style="margin-right:2px;">prawdziwa</span>
+                <div style="flex:1;">
+                  <div class="cm-grid">
+                    <div class="cm-corner">↓ true / → pred</div>
+                    <div class="cm-coltop">adr</div><div class="cm-coltop">rej</div><div class="cm-coltop">nal</div><div class="cm-coltop">śro</div><div class="cm-coltop">ter</div>
+                    <div class="cm-rowlabel">tablica_adr</div>
+                    <div class="cm-cell lvl-4">34</div><div class="cm-cell lvl-1">1</div><div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell">0</div>
+                    <div class="cm-rowlabel">tablica_rej.</div>
+                    <div class="cm-cell lvl-1">1</div><div class="cm-cell lvl-4">29</div><div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell">0</div>
+                    <div class="cm-rowlabel">nalepka</div>
+                    <div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell lvl-4">51</div><div class="cm-cell miss">3</div><div class="cm-cell">0</div>
+                    <div class="cm-rowlabel">znak_środ.</div>
+                    <div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell lvl-2">2</div><div class="cm-cell lvl-3">18</div><div class="cm-cell">0</div>
+                    <div class="cm-rowlabel">termometr</div>
+                    <div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell">0</div><div class="cm-cell lvl-1">1</div><div class="cm-cell lvl-3">14</div>
+                  </div>
+                  <div class="center text-xs text-3" style="margin-top:6px;">predykcja modelu →</div>
+                </div>
+              </div>
+            </div>
+            <p class="text-xs text-3 mt-sm"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--danger)"><use href="#i-info"/></svg>
+              Główna pomyłka: <strong>nalepka → znak_srodowiskowy</strong> (3 przypadki) — wizualnie podobne, kandydat do dosyntetyzowania danych.</p>
+          </div>
+
+          <!-- Tabela per-klasa -->
+          <div class="section-card">
+            <h3><svg class="icon"><use href="#i-box"/></svg>Metryki per-klasa</h3>
+            <p class="section-sub">AP@50, precision i recall dla każdej klasy + liczba instancji w zbiorze val.</p>
+            <table class="tf-table">
+              <thead>
+                <tr><th>Klasa</th><th>AP@50</th><th>Precision</th><th>Recall</th><th>Instancje</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><span class="chip accent">tablica_adr</span></td><td class="mono">0.94</td><td class="mono">0.94</td><td class="mono">0.92</td><td class="mono">35</td></tr>
+                <tr><td><span class="chip info">tablica_rejestracyjna</span></td><td class="mono">0.91</td><td class="mono">0.92</td><td class="mono">0.90</td><td class="mono">30</td></tr>
+                <tr><td><span class="chip success">nalepka</span></td><td class="mono">0.89</td><td class="mono">0.91</td><td class="mono">0.89</td><td class="mono">54</td></tr>
+                <tr><td><span class="chip warning">znak_srodowiskowy</span></td><td class="mono">0.79</td><td class="mono">0.82</td><td class="mono">0.78</td><td class="mono">20</td></tr>
+                <tr><td><span class="chip danger">termometr</span></td><td class="mono">0.87</td><td class="mono">0.90</td><td class="mono">0.84</td><td class="mono">15</td></tr>
+              </tbody>
+            </table>
+            <p class="text-xs text-3 mt-sm"><svg class="icon icon-sm" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-info"/></svg>
+              <strong>znak_srodowiskowy</strong> najsłabszy (AP 0.79, 20 instancji) — najmniej danych, warto dobrać więcej zdjęć.</p>
+          </div>
+        </div>
+
+        <!-- Podgląd predykcji -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-image"/></svg>Podgląd predykcji na zbiorze walidacyjnym</div>
+            <span class="hint">zielone = poprawne (TP) · czerwone = błąd (FP)</span>
+          </div>
+          <div class="grid-4">
+            <div>
+              <div class="pred-tile">
+                <div class="pt-scene"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+                <div class="video-tile-bbox success" data-label="tablica_adr 0.96" style="top:30%;left:20%;width:36%;height:22%;"></div>
+                <div class="video-tile-bbox success" data-label="nalepka 0.91" style="top:55%;left:58%;width:24%;height:26%;"></div>
+                <span class="pt-name">val_0203.jpg</span>
+              </div>
+              <div class="text-xs text-3 center" style="margin-top:5px;">2 × TP</div>
+            </div>
+            <div>
+              <div class="pred-tile">
+                <div class="pt-scene"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+                <div class="video-tile-bbox success" data-label="tablica_rej. 0.93" style="top:58%;left:22%;width:34%;height:16%;"></div>
+                <div class="video-tile-bbox success" data-label="termometr 0.88" style="top:28%;left:64%;width:16%;height:18%;"></div>
+                <span class="pt-name">val_0211.jpg</span>
+              </div>
+              <div class="text-xs text-3 center" style="margin-top:5px;">2 × TP</div>
+            </div>
+            <div>
+              <div class="pred-tile">
+                <div class="pt-scene"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+                <div class="video-tile-bbox success" data-label="nalepka 0.90" style="top:34%;left:30%;width:26%;height:30%;"></div>
+                <div class="video-tile-bbox danger" data-label="FP: znak_środ. 0.61" style="top:40%;left:60%;width:24%;height:24%;"></div>
+                <span class="pt-name">val_0224.jpg</span>
+              </div>
+              <div class="text-xs text-3 center" style="margin-top:5px;">1 × TP · <span style="color:var(--danger)">1 × FP</span></div>
+            </div>
+            <div>
+              <div class="pred-tile">
+                <div class="pt-scene"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+                <div class="video-tile-bbox success" data-label="tablica_adr 0.95" style="top:32%;left:26%;width:34%;height:20%;"></div>
+                <span class="pt-name">val_0237.jpg</span>
+              </div>
+              <div class="text-xs text-3 center" style="margin-top:5px;">1 × TP</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Nawigacja kreatora -->
+        <div class="flex justify-between" style="padding-top:6px;">
+          <a class="btn btn-secondary" href="a-trening.html">Wstecz: Trening</a>
+          <a class="btn btn-primary btn-lg" href="a-eksport.html">Dalej: Eksport i deploy<svg class="icon"><use href="#i-chevron"/></svg></a>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

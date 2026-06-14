@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: p00-projekty.html
+     Opis: Ekran główny modułu ML Studio — lista projektów jako karty (projekt =
+           jednostka pracy: własne dane, schemat, anotacje, treningi, modele).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Projekty</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Karta projektu (ekran główny modułu) ----- */
+  .project-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .project-card {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 18px; cursor: pointer; transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    position: relative; overflow: hidden; display: flex; flex-direction: column; gap: 12px;
+  }
+  .project-card::before {
+    content: ''; position: absolute; inset: 0; opacity: 0; transition: opacity 0.22s;
+    background: radial-gradient(120% 120% at 100% 0%, var(--accent-glow), transparent 55%);
+    pointer-events: none;
+  }
+  .project-card:hover { transform: translateY(-4px); border-color: var(--accent-1);
+    box-shadow: var(--shadow-lg), var(--glow-indigo); }
+  .project-card:hover::before { opacity: 1; }
+  .project-card .pc-top { display: flex; align-items: flex-start; gap: 12px; }
+  .project-card .pc-ico {
+    width: 44px; height: 44px; border-radius: var(--radius); flex-shrink: 0;
+    background: var(--gradient-accent); display: flex; align-items: center; justify-content: center;
+    color: white; box-shadow: var(--glow-indigo);
+  }
+  .project-card .pc-ico svg { width: 22px; height: 22px; stroke: currentColor; fill: none;
+    stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+  .project-card .pc-name { font-size: 15px; font-weight: 800; line-height: 1.3; }
+  .project-card .pc-type { font-size: 11px; color: var(--accent-2); font-weight: 700; margin-top: 2px; }
+  .project-card .pc-desc { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  .project-card .pc-stats { display: flex; gap: 14px; flex-wrap: wrap; padding-top: 4px;
+    border-top: 1px solid var(--border); }
+  .project-card .pc-stat .v { font-size: 15px; font-weight: 800; }
+  .project-card .pc-stat .l { font-size: 10px; color: var(--text-3); text-transform: uppercase;
+    letter-spacing: 0.05em; }
+  .project-card .pc-foot { display: flex; align-items: center; justify-content: space-between;
+    margin-top: auto; }
+  .project-card .pc-activity { font-size: 11px; color: var(--text-3); display: flex; align-items: center; gap: 5px; }
+  .project-card .pc-activity .icon { width: 12px; height: 12px; }
+
+  /* Karta „+ Nowy projekt” */
+  .project-new {
+    border: 2px dashed var(--border-hover); background: linear-gradient(135deg, var(--bg-2), var(--bg-input));
+    border-radius: var(--radius-lg); padding: 18px; cursor: pointer; transition: all 0.22s;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    text-align: center; min-height: 230px;
+  }
+  .project-new:hover { border-color: var(--accent-1); transform: translateY(-3px); }
+  .project-new .pn-ico {
+    width: 56px; height: 56px; border-radius: 50%; background: var(--accent-glow);
+    display: flex; align-items: center; justify-content: center; color: var(--accent-2);
+    animation: ml-float 3s ease-in-out infinite;
+  }
+  .project-new .pn-ico svg { width: 28px; height: 28px; stroke: currentColor; fill: none;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .project-new .pn-title { font-size: 15px; font-weight: 800; }
+  .project-new .pn-sub { font-size: 12px; color: var(--text-3); max-width: 220px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="12" y1="3" x2="12" y2="21"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Projekty (start modułu)</h1>
+  <p class="lead">
+    <strong>Projekt = jednostka pracy.</strong> Każdy projekt jest samodzielny: ma własne dane, schemat zadania,
+    anotacje, treningi i modele. Ekran główny modułu to lista projektów. Stąd zaczynasz: tworzysz nowy projekt
+    kreatorem albo wchodzisz do istniejącego, by go skonfigurować (schemat, dane), oznaczać lub trenować.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-grid"/></svg>Projekt-centryczne</h3>
+      <p>Nie ma „ekranów stanu końcowego” bez kontekstu — wszystko należy do konkretnego projektu.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-plus"/></svg>Tworzenie od zera</h3>
+      <p>„+ Nowy projekt” uruchamia kreator (nazwa → typ → dane → schemat). Typ determinuje dalsze kroki.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-book"/></svg>Współdzielone źródła</h3>
+      <p>Dane mogą być prywatne dla projektu albo pobrane z biblioteki źródeł współdzielonych między projektami.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">P0</span>
+    <h2>Projekty ML Studio — ekran startowy modułu</h2>
+    <div class="desc">Lista projektów jako karty + duży przycisk „+ Nowy projekt”.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">ML Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Projekty</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-brain"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">ML Studio <span class="chip success"><span class="dot"></span>runtime online</span></div>
+            <div class="d-sub">Trening, fine-tuning, anotacja i wykrywanie anomalii — zorganizowane w projekty</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-grid"/></svg>3 projekty</span>
+              <span class="chip"><svg class="icon"><use href="#i-cpu"/></svg>1× RTX 4090 wolna</span>
+              <span class="chip info"><svg class="icon"><use href="#i-services"/></svg>vision-detection · vLLM aktywne</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj projektu…"></div>
+            <a class="btn btn-primary btn-lg" href="p01-kreator-projekt.html"><svg class="icon"><use href="#i-plus"/></svg>Nowy projekt</a>
+          </div>
+        </div>
+
+        <!-- Pasek filtrów typu -->
+        <div class="flex gap-sm wrap mt-sm" style="margin-bottom:16px;">
+          <span class="filter-chip active"><svg class="icon"><use href="#i-grid"/></svg>Wszystkie<span style="opacity:.6">3</span></span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-image"/></svg>Rozpoznawanie obrazu</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-tune"/></svg>Fine-tuning LLM</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-book"/></svg>RAG</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-table"/></svg>ML tabelaryczne</span>
+        </div>
+
+        <div class="project-grid">
+
+          <!-- Projekt 1: rozpoznawanie obrazu -->
+          <a class="project-card ml-enter ml-enter-1" href="r01-schemat.html">
+            <div class="pc-top">
+              <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+              <div>
+                <div class="pc-name">Rozpoznawanie znaków na cysternach</div>
+                <div class="pc-type">Rozpoznawanie obrazu · RF-DETR</div>
+              </div>
+              <span class="status-pill ok ml-auto">aktywny</span>
+            </div>
+            <p class="pc-desc">Detekcja tablic ADR, rejestracyjnych i nalepek na cysternach ADR z bramy.
+              5 klas, atrybuty z OCR + lookup UN. 61/144 zdjęć oznaczonych.</p>
+            <div class="pc-stats">
+              <div class="pc-stat"><div class="v">144</div><div class="l">zdjęcia</div></div>
+              <div class="pc-stat"><div class="v">5</div><div class="l">klasy</div></div>
+              <div class="pc-stat"><div class="v">42%</div><div class="l">oznaczone</div></div>
+            </div>
+            <div class="pc-foot">
+              <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>edytowany 12 min temu</span>
+              <span class="chip accent"><svg class="icon"><use href="#i-image"/></svg>schemat gotowy</span>
+            </div>
+          </a>
+
+          <!-- Projekt 2: fine-tuning LLM (Guard) -->
+          <a class="project-card ml-enter ml-enter-2" href="f01-kreator-finetune.html">
+            <div class="pc-top">
+              <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-shield"/></svg></div>
+              <div>
+                <div class="pc-name">Trenowanie modelu Guard</div>
+                <div class="pc-type">Fine-tuning LLM · Qwen3.5-0.8B QLoRA</div>
+              </div>
+              <span class="status-pill warn ml-auto">trening</span>
+            </div>
+            <p class="pc-desc">Klasyfikator bezpieczeństwa promptów (11 zadań). Pipeline: generacja danych →
+              augmentacja zero-width → QLoRA → GGUF → benchmark vs Claude.</p>
+            <div class="pc-stats">
+              <div class="pc-stat"><div class="v">18k</div><div class="l">próbek</div></div>
+              <div class="pc-stat"><div class="v">2/3</div><div class="l">epoki</div></div>
+              <div class="pc-stat"><div class="v">0.214</div><div class="l">eval loss</div></div>
+            </div>
+            <div class="pc-foot">
+              <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>trening trwa · ETA 34 min</span>
+              <span class="chip warning"><span class="dot"></span>job aktywny</span>
+            </div>
+          </a>
+
+          <!-- Projekt 3: RAG -->
+          <a class="project-card ml-enter ml-enter-3" href="rag01-korpus.html">
+            <div class="pc-top">
+              <div class="pc-ico"><svg viewBox="0 0 24 24"><use href="#i-book"/></svg></div>
+              <div>
+                <div class="pc-name">RAG dla dokumentów ADR</div>
+                <div class="pc-type">RAG · embeddings + reranker</div>
+              </div>
+              <span class="status-pill idle ml-auto">szkic</span>
+            </div>
+            <p class="pc-desc">Wyszukiwanie po regulacjach ADR/RID. Indeks wektorowy (HNSW), chunkowanie,
+              reranking i odpowiedzi z cytowaniem źródła. Czeka na podpięcie korpusu.</p>
+            <div class="pc-stats">
+              <div class="pc-stat"><div class="v">0</div><div class="l">dokumenty</div></div>
+              <div class="pc-stat"><div class="v">—</div><div class="l">indeks</div></div>
+              <div class="pc-stat"><div class="v">—</div><div class="l">embeddingi</div></div>
+            </div>
+            <div class="pc-foot">
+              <span class="pc-activity"><svg class="icon"><use href="#i-clock"/></svg>utworzony 3 dni temu</span>
+              <span class="chip"><svg class="icon"><use href="#i-book"/></svg>brak źródeł</span>
+            </div>
+          </a>
+
+          <!-- Karta tworzenia nowego projektu -->
+          <a class="project-new ml-enter ml-enter-4" href="p01-kreator-projekt.html">
+            <div class="pn-ico"><svg viewBox="0 0 24 24"><use href="#i-plus"/></svg></div>
+            <div class="pn-title">Nowy projekt</div>
+            <div class="pn-sub">Kreator przeprowadzi Cię krok po kroku: nazwa, typ, dane i schemat zadania.</div>
+            <span class="btn btn-primary">Otwórz kreator</span>
+          </a>
+
+        </div>
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<!-- Symbol brakujący wcześniej -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+</defs></svg>
+
+</body>
+</html>
