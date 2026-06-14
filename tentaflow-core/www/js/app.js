@@ -130,7 +130,6 @@ const ADMIN_NAV = [
     items: [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
-      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain' },
     ],
   },
   {
@@ -162,6 +161,9 @@ const USER_NAV = [
     items: [
       { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
+      // ML Studio jest narzedziem zaawansowanym — widoczne tylko dla Power User
+      // i Admin (wymog §11.2). Gate realizuje filtr `requiresPowerUser` w paint().
+      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
       { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
@@ -272,11 +274,22 @@ async function renderApp() {
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
   const role = (me?.role ?? 'user').toLowerCase();
   const isAdmin = role === 'admin';
+  // Power User to rola posrednia miedzy `user` a `admin` (zob. users.js: role
+  // moze byc 'admin' | 'power_user' | 'user'). Admin jest nadzbiorem Power Usera.
+  const isPowerUser = isAdmin || role === 'power_user';
   const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
 
   function paint() {
     // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
-    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
+    const rawNav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
+    // Gate pozycji wymagajacych roli: `requiresPowerUser` widoczne tylko dla
+    // Power User i Admin. Filtrujemy itemy, sekcje pomijamy gdy zostaja puste.
+    const nav = rawNav
+      .map((section) => ({
+        ...section,
+        items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
+      }))
+      .filter((section) => section.items.length > 0);
     const userClass = isAdmin ? 'admin' : 'user';
     const roleLabel = I18n.t(isAdmin ? 'role.administrator' : 'role.user');
     const logoutLabel = I18n.t('nav.logout');

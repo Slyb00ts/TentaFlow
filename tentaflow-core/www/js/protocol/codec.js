@@ -2379,6 +2379,67 @@ export const encode = {
     );
   },
 
+  /** MessageBody::MlStudioBody(ProjectMembersListRequest). payload: { projectId }. */
+  mlStudioProjectMembersListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectMembersListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectInviteRequest). payload: { projectId, inviteeUserId, role }. */
+  mlStudioProjectInviteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectInviteRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.inviteeUserId ?? payload.invitee_user_id ?? ''),
+      String(payload.role ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectMemberRemoveRequest). payload: { projectId, userId }. */
+  mlStudioProjectMemberRemoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectMemberRemoveRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.userId ?? payload.user_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ProjectMemberRoleSetRequest). payload: { projectId, userId, role }. */
+  mlStudioProjectMemberRoleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectMemberRoleSetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.userId ?? payload.user_id ?? ''),
+      String(payload.role ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.

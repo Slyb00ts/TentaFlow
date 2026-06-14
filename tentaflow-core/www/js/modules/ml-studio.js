@@ -16,6 +16,8 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-modal.js';
 import '/js/components/tf-radio.js';
+import '/js/components/tf-select.js';
+import '/js/components/tf-table.js';
 import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-stat-card.js';
 import '/js/components/tf-detail-header.js';
@@ -27,6 +29,26 @@ let projects = [];
 let projectTypes = [];
 let activeTypeFilter = 'all';
 let detailProjectId = null;
+// Cached current user (from AuthMeRequest) so the sharing screen can mark the
+// "(Ty)" row and resolve self-identity for owner gating across mount/unmount.
+let currentUser = null;
+
+// Human label + sprite per project role. Owner is rendered as an accent badge,
+// the rest as info badges / chips (matches p02 legend).
+const ROLE_LABEL = {
+  owner: 'Właściciel',
+  editor: 'Edytor',
+  viewer: 'Przeglądający',
+};
+const ROLE_ICON = {
+  owner: 'crown',
+  editor: 'edit',
+  viewer: 'eye',
+};
+
+function roleLabel(role) {
+  return ROLE_LABEL[String(role || '').toLowerCase()] || role || '—';
+}
 
 // Per-type icon (sprite id) and the placeholder tab map for the project detail.
 // Slugs are the backend contract (ml_studio::models::ProjectType::slug).
@@ -76,6 +98,9 @@ const MlStudioScreen = {
   get title() { return 'ML Studio'; },
 
   render(params = {}) {
+    if (params && params.projectId && params.share) {
+      return `<div id="ml-studio-share" class="ml-studio-share"></div>`;
+    }
     if (params && params.projectId) {
       return `<div id="ml-studio-detail" class="ml-studio-detail"></div>`;
     }
@@ -98,6 +123,10 @@ const MlStudioScreen = {
   },
 
   async mount(params = {}) {
+    if (params && params.projectId && params.share) {
+      await showShare(params.projectId);
+      return;
+    }
     if (params && params.projectId) {
       await showDetail(params.projectId);
       return;
@@ -141,13 +170,18 @@ async function loadAll() {
     const [typesResp, projectsResp] = await Promise.all([
       ApiBinary.one('mlStudioProjectTypesListRequest'),
       ApiBinary.one('mlStudioProjectsListRequest'),
+      ensureCurrentUser(),
     ]);
     projectTypes = Array.isArray(typesResp.types) ? typesResp.types : [];
     projects = Array.isArray(projectsResp.projects) ? projectsResp.projects : [];
     renderFilters();
     renderList();
     const sub = byId('ml-studio-sub');
-    if (sub) sub.textContent = `${projects.length} ${plural(projects.length, 'projekt', 'projekty', 'projektów')}`;
+    if (sub) {
+      const owned = projects.filter(isOwnerProject).length;
+      const shared = projects.length - owned;
+      sub.textContent = `Moje (${owned}) · Udostępnione (${shared})`;
+    }
   } catch (err) {
     projects = [];
     if (list) {
@@ -185,6 +219,37 @@ function projectType(p) {
   return p.projectType ?? p.project_type ?? '';
 }
 
+function projectId(p) {
+  return p.projectId ?? p.project_id ?? '';
+}
+
+// Ownership flag straight from the backend (ProjectsListResponse / detail carry
+// `isOwner`). Falls back to comparing the project `role` to "owner" when the
+// flag is absent so the split still works against older payloads.
+function isOwnerProject(p) {
+  if (typeof p.isOwner === 'boolean') return p.isOwner;
+  if (typeof p.is_owner === 'boolean') return p.is_owner;
+  return String(p.role || '').toLowerCase() === 'owner';
+}
+
+function projectRole(p) {
+  return String(p.role ?? '').toLowerCase();
+}
+
+async function ensureCurrentUser() {
+  if (currentUser) return currentUser;
+  try {
+    currentUser = await ApiBinary.one('authMeRequest');
+  } catch (_) {
+    currentUser = null;
+  }
+  return currentUser;
+}
+
+function currentUserId() {
+  return currentUser ? String(currentUser.userId ?? currentUser.user_id ?? '') : '';
+}
+
 function renderList() {
   const host = byId('ml-studio-list');
   if (!host) return;
@@ -209,8 +274,29 @@ function renderList() {
     return;
   }
 
-  host.innerHTML = visible.map((p) => projectCard(p)).join('') + newProjectCard();
+  const mine = visible.filter(isOwnerProject);
+  const shared = visible.filter((p) => !isOwnerProject(p));
 
+  // "Moje projekty" zawsze pokazuje kartę „Nowy projekt"; sekcja „Udostępnione
+  // mi" pojawia się tylko gdy są jakieś projekty z rolą gościa.
+  let html = sectionHead('crown', 'Moje projekty', mine.length, 'accent',
+    'jesteś właścicielem — pełen dostęp i zarządzanie udostępnianiem');
+  html += `<div class="ml-studio-grid">${mine.map((p) => projectCard(p, true)).join('')}${newProjectCard()}</div>`;
+
+  if (shared.length) {
+    html += sectionHead('share', 'Udostępnione mi', shared.length, 'info',
+      'projekty, do których zaprosił Cię właściciel — działasz wg nadanej roli');
+    html += `<div class="ml-studio-grid">${shared.map((p) => projectCard(p, false)).join('')}</div>`;
+  }
+
+  host.innerHTML = html;
+
+  host.querySelectorAll('[data-share-id]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      Router.navigate('ml-studio', { projectId: el.dataset.shareId, share: true });
+    });
+  });
   host.querySelectorAll('[data-project-id]').forEach((el) => {
     el.addEventListener('click', () => {
       Router.navigate('ml-studio', { projectId: el.dataset.projectId });
@@ -219,15 +305,40 @@ function renderList() {
   host.querySelector('[data-new-project]')?.addEventListener('click', openCreateModal);
 }
 
-function projectCard(p) {
-  const id = p.projectId ?? p.project_id ?? '';
+function sectionHead(icon, title, count, tone, sub) {
+  return `
+    <div class="ml-studio-section-head">
+      <h3>${sprite(icon)} ${escapeHtml(title)}</h3>
+      <tf-badge tone="${escapeAttr(tone)}" value="${count}"></tf-badge>
+      <span class="ml-studio-section-sub">${escapeHtml(sub)}</span>
+    </div>
+  `;
+}
+
+function projectCard(p, owned) {
+  const id = projectId(p);
   const slug = projectType(p);
   const datasetCount = p.datasetCount ?? p.dataset_count ?? 0;
   const modelCount = p.modelCount ?? p.model_count ?? 0;
   const created = formatDate(p.createdAt ?? p.created_at);
   const updated = formatDate(p.updatedAt ?? p.updated_at);
+
+  // Owner strip: "Właściciel: Ty" with a share action for my projects; the
+  // guest role chip (Edytor/Przeglądający) for shared-with-me projects.
+  let ownerStrip;
+  let shareBtn = '';
+  if (owned) {
+    ownerStrip = `<div class="ml-studio-card-owner">${sprite('crown')} Właściciel: Ty</div>`;
+    shareBtn = `<button type="button" class="ml-studio-card-share" data-share-id="${escapeAttr(id)}" title="Udostępnij projekt" aria-label="Udostępnij projekt">${sprite('share')}</button>`;
+  } else {
+    const role = projectRole(p);
+    ownerStrip = `<div class="ml-studio-card-owner">${sprite('crown')} Właściciel: inny użytkownik
+      <tf-chip status="info" icon="${escapeAttr(ROLE_ICON[role] || 'eye')}" label="${escapeAttr(roleLabel(role))}"></tf-chip></div>`;
+  }
+
   return `
     <article class="ml-studio-card" data-project-id="${escapeAttr(id)}">
+      ${shareBtn}
       <div class="ml-studio-card-top">
         <div class="ml-studio-card-ico">${sprite(typeIcon(slug))}</div>
         <div class="ml-studio-card-id">
@@ -236,6 +347,7 @@ function projectCard(p) {
         </div>
         <tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(p.status || '—')}"></tf-badge>
       </div>
+      ${ownerStrip}
       <p class="ml-studio-card-desc">${escapeHtml(p.description || 'Bez opisu.')}</p>
       <div class="ml-studio-card-stats">
         <div class="ml-studio-stat"><div class="v">${datasetCount}</div><div class="l">datasety</div></div>
@@ -402,6 +514,7 @@ function renderDetail(host, p) {
       subtitle="${escapeAttr(typeLabel(slug))}"
       icon="${escapeAttr(typeIcon(slug))}">
       <span slot="badges"><tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(p.status || '—')}"></tf-badge></span>
+      ${isOwnerProject(p) ? `<span slot="actions"><tf-button variant="outline" icon="share" id="ml-studio-manage-access">Zarządzaj dostępem</tf-button></span>` : ''}
     </tf-detail-header>
 
     <p class="ml-studio-detail-desc">${escapeHtml(p.description || 'Bez opisu.')}</p>
@@ -421,6 +534,9 @@ function renderDetail(host, p) {
   `;
 
   byId('ml-studio-back')?.addEventListener('click', () => Router.navigate('ml-studio'));
+  byId('ml-studio-manage-access')?.addEventListener('click', () => {
+    Router.navigate('ml-studio', { projectId: projectId(p), share: true });
+  });
 
   const tabsEl = byId('ml-studio-tabs');
   const renderPanel = (tabId) => {
@@ -442,6 +558,253 @@ function renderDetail(host, p) {
     renderPanel(e.detail?.value);
   });
   renderPanel('ml-tab-0');
+}
+
+// =============================================================================
+// Sharing screen (p02) — members table, invite form, role legend.
+// Owner-only controls (invite / remove / role change) are gated by the
+// project's isOwner flag confirmed against the current user's membership.
+// =============================================================================
+
+async function showShare(pid) {
+  detailProjectId = pid;
+  const host = byId('ml-studio-share');
+  if (!host) return;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+
+  try {
+    const [detailResp, membersResp] = await Promise.all([
+      ApiBinary.one('mlStudioProjectDetailRequest', { projectId: pid }),
+      ApiBinary.one('mlStudioProjectMembersListRequest', { projectId: pid }),
+      ensureProjectTypes(),
+      ensureCurrentUser(),
+    ]);
+    const project = detailResp.project || {};
+    const members = Array.isArray(membersResp.members) ? membersResp.members : [];
+    renderShare(host, project, members);
+  } catch (err) {
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Nie udało się wczytać udostępniania');
+    empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+    const back = document.createElement('tf-button');
+    back.setAttribute('variant', 'primary');
+    back.textContent = 'Wróć do projektu';
+    back.addEventListener('click', () => Router.navigate('ml-studio', { projectId: pid }));
+    empty.appendChild(back);
+    host.appendChild(empty);
+    toast(`ML Studio: ${err.message}`, 'error');
+  }
+}
+
+function renderShare(host, project, members) {
+  const pid = projectId(project);
+  const slug = projectType(project);
+  const isOwner = isOwnerProject(project);
+  const memberCount = members.filter((m) => String(m.status || 'active').toLowerCase() === 'active').length;
+  const pendingCount = members.filter((m) => String(m.status || '').toLowerCase() === 'invited').length;
+
+  host.innerHTML = `
+    <div class="ml-studio-detail-top">
+      <tf-button variant="ghost" icon="chevron-left" id="ml-studio-share-back">Wróć do projektu</tf-button>
+    </div>
+
+    <tf-detail-header
+      title="Udostępnianie — ${escapeAttr(project.name || '(bez nazwy)')}"
+      subtitle="Zarządzaj członkami projektu i ich rolami. Domyślnie projekt jest prywatny."
+      icon="${escapeAttr(typeIcon(slug))}">
+      <span slot="badges">
+        <tf-badge tone="${isOwner ? 'accent' : 'info'}" value="${isOwner ? 'Właściciel: Ty' : roleLabel(projectRole(project))}"></tf-badge>
+        <tf-badge tone="info" value="${memberCount} ${plural(memberCount, 'członek', 'członków', 'członków')}"></tf-badge>
+        ${pendingCount ? `<tf-badge tone="warning" value="${pendingCount} oczekuje"></tf-badge>` : ''}
+      </span>
+    </tf-detail-header>
+
+    <section class="ml-studio-share-card">
+      <div class="ml-studio-share-head">${sprite('users')} Członkowie projektu</div>
+      <tf-table id="ml-studio-members" variant="lined">
+        <tf-column key="user" label="Użytkownik" renderer="html"></tf-column>
+        <tf-column key="role" label="Rola" renderer="html"></tf-column>
+        <tf-column key="status" label="Status" renderer="html"></tf-column>
+        <tf-column key="invitedBy" label="Dodany przez"></tf-column>
+        <tf-column key="createdAt" label="Data"></tf-column>
+      </tf-table>
+    </section>
+
+    ${isOwner ? inviteSection() : ''}
+
+    <section class="ml-studio-share-card">
+      <div class="ml-studio-share-head">${sprite('info')} Co potrafi każda rola</div>
+      <div class="ml-studio-role-legend">
+        ${roleLegendItem('owner', 'Pełnia uprawnień + zarządzanie dostępem: zaprasza, usuwa członków, zmienia role, usuwa projekt. Jeden na projekt (twórca).')}
+        ${roleLegendItem('editor', 'Pracuje na projekcie: dane, schemat, anotacja, uruchamianie treningu i eksport. Nie zarządza dostępem.')}
+        ${roleLegendItem('viewer', 'Tylko podgląd: dane, schemat, wyniki i modele. Nie zmienia anotacji ani nie uruchamia treningu.')}
+      </div>
+      ${isOwner ? '' : '<p class="ml-studio-share-hint">' + sprite('info') + ' Zarządzanie dostępem (zaproszenia, role, usuwanie) jest dostępne tylko dla właściciela projektu.</p>'}
+    </section>
+  `;
+
+  byId('ml-studio-share-back')?.addEventListener('click', () => Router.navigate('ml-studio', { projectId: pid }));
+
+  renderMembersTable(pid, project, members, isOwner);
+  if (isOwner) bindInviteForm(pid);
+}
+
+function inviteSection() {
+  return `
+    <section class="ml-studio-share-card">
+      <div class="ml-studio-share-head">${sprite('mail')} Zaproś do projektu</div>
+      <div class="ml-studio-invite-row">
+        <tf-input id="ml-studio-invite-user" label="Identyfikator użytkownika"
+          placeholder="np. user-1a2b lub login" hint="Podaj identyfikator użytkownika TentaFlow (lookup po nazwie dorobimy później)."></tf-input>
+        <tf-select id="ml-studio-invite-role" label="Rola" value="editor">
+          <option value="editor">Edytor</option>
+          <option value="viewer">Przeglądający</option>
+        </tf-select>
+        <tf-button variant="primary" icon="send" id="ml-studio-invite-send">Wyślij zaproszenie</tf-button>
+      </div>
+      <p class="ml-studio-share-hint">${sprite('info')} Zaproszony zobaczy projekt na swoim koncie i będzie działał wg roli. Rola „Właściciel" nie jest nadawana przez zaproszenie.</p>
+    </section>
+  `;
+}
+
+function roleLegendItem(role, desc) {
+  const tone = role === 'owner' ? 'accent' : 'info';
+  return `
+    <div class="ml-studio-role-item">
+      <tf-chip status="${tone}" icon="${escapeAttr(ROLE_ICON[role])}" label="${escapeAttr(roleLabel(role))}"></tf-chip>
+      <p class="ml-studio-role-desc">${escapeHtml(desc)}</p>
+    </div>
+  `;
+}
+
+function memberUserId(m) {
+  return String(m.userId ?? m.user_id ?? '');
+}
+
+function renderMembersTable(pid, project, members, isOwner) {
+  const table = byId('ml-studio-members');
+  if (!table) return;
+  const selfId = currentUserId();
+
+  table.rows = members.map((m) => {
+    const uid = memberUserId(m);
+    const role = String(m.role ?? '').toLowerCase();
+    const status = String(m.status ?? 'active').toLowerCase();
+    const isSelf = selfId && uid === selfId;
+    const invitedBy = m.invitedBy ?? m.invited_by;
+
+    const userHtml = `
+      <div class="ml-studio-member-cell">
+        <span class="ml-studio-member-id">${escapeHtml(uid || '—')}${isSelf ? ' <span class="ml-studio-member-self">(Ty)</span>' : ''}</span>
+      </div>`;
+
+    // Owner role is always a static badge; for the rest the owner gets an inline
+    // tf-select to change the role, everyone else sees a read-only chip.
+    let roleHtml;
+    if (role === 'owner') {
+      roleHtml = `<tf-chip status="accent" icon="crown" label="Właściciel"></tf-chip>`;
+    } else if (isOwner && status !== 'invited') {
+      roleHtml = `<tf-select class="ml-studio-role-pick" data-user-id="${escapeAttr(uid)}" value="${escapeAttr(role || 'viewer')}">
+          <option value="editor">Edytor</option>
+          <option value="viewer">Przeglądający</option>
+        </tf-select>`;
+    } else {
+      roleHtml = `<tf-chip status="info" icon="${escapeAttr(ROLE_ICON[role] || 'eye')}" label="${escapeAttr(roleLabel(role))}"></tf-chip>`;
+    }
+
+    const statusHtml = status === 'invited'
+      ? `<tf-chip status="warn" dot label="oczekuje"></tf-chip>`
+      : `<tf-chip status="ok" dot label="aktywny"></tf-chip>`;
+
+    return {
+      _userId: uid,
+      _role: role,
+      _status: status,
+      user: userHtml,
+      role: roleHtml,
+      status: statusHtml,
+      invitedBy: invitedBy ? String(invitedBy) : (role === 'owner' ? '— (twórca)' : '—'),
+      createdAt: formatDate(m.createdAt ?? m.created_at),
+    };
+  });
+
+  // The owner manages access; non-owners get a read-only table (no actions col).
+  if (isOwner) {
+    table.rowActions = (row) => {
+      if (row._role === 'owner') {
+        const note = document.createElement('span');
+        note.className = 'ml-studio-member-note';
+        note.textContent = 'nie można usunąć';
+        return note;
+      }
+      const btn = document.createElement('tf-button');
+      btn.setAttribute('variant', 'ghost');
+      btn.setAttribute('icon', 'trash');
+      btn.textContent = row._status === 'invited' ? 'Cofnij' : 'Usuń';
+      btn.addEventListener('click', () => removeMember(pid, row._userId));
+      return btn;
+    };
+  } else {
+    table.rowActions = null;
+  }
+
+  // Inline role selects live in tf-table's (open) shadow DOM, so a single
+  // delegated listener on the shadow root catches their bubbling `change`
+  // CustomEvent (detail.value, tf-select.js:114-117) — host-level binding would
+  // never see them across the shadow boundary.
+  if (isOwner && table.shadowRoot && !table._mlRoleBound) {
+    table._mlRoleBound = true;
+    table.shadowRoot.addEventListener('change', (e) => {
+      const sel = e.target?.closest?.('.ml-studio-role-pick');
+      if (!sel) return;
+      const uid = sel.dataset.userId;
+      const role = e.detail?.value;
+      if (uid && role) setMemberRole(pid, uid, role);
+    });
+  }
+}
+
+function bindInviteForm(pid) {
+  const sendBtn = byId('ml-studio-invite-send');
+  sendBtn?.addEventListener('click', async () => {
+    const inviteeUserId = byId('ml-studio-invite-user')?.value?.trim() || '';
+    const role = byId('ml-studio-invite-role')?.value || 'editor';
+    if (!inviteeUserId) {
+      toast('Podaj identyfikator użytkownika.', 'error');
+      return;
+    }
+    sendBtn.setAttribute('loading', '');
+    try {
+      await ApiBinary.one('mlStudioProjectInviteRequest', { projectId: pid, inviteeUserId, role });
+      toast('Zaproszenie wysłane', 'success');
+      await showShare(pid);
+    } catch (err) {
+      sendBtn.removeAttribute('loading');
+      toast(`Zaproszenie: ${err.message}`, 'error');
+    }
+  });
+}
+
+async function removeMember(pid, userId) {
+  try {
+    await ApiBinary.one('mlStudioProjectMemberRemoveRequest', { projectId: pid, userId });
+    toast('Członek usunięty', 'success');
+    await showShare(pid);
+  } catch (err) {
+    toast(`Usuwanie: ${err.message}`, 'error');
+  }
+}
+
+async function setMemberRole(pid, userId, role) {
+  try {
+    await ApiBinary.one('mlStudioProjectMemberRoleSetRequest', { projectId: pid, userId, role });
+    toast('Rola zmieniona', 'success');
+    await showShare(pid);
+  } catch (err) {
+    toast(`Zmiana roli: ${err.message}`, 'error');
+  }
 }
 
 function formatDate(value) {

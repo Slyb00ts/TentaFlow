@@ -227,3 +227,192 @@
 .ml-studio-tab-panel {
   margin-top: 16px;
 }
+
+/* ---------- Podział listy: Moje / Udostępnione mi ---------- */
+
+.ml-studio-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 26px 0 14px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-section-head:first-child {
+  margin-top: 0;
+}
+
+.ml-studio-section-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.ml-studio-section-head h3 .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ---------- Pasek właściciela / roli na karcie + akcja Udostępnij ---------- */
+
+.ml-studio-card {
+  position: relative;
+}
+
+.ml-studio-card-owner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-card-owner .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.ml-studio-card-share {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--bg-3, var(--bg-input));
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.ml-studio-card-share:hover {
+  color: var(--accent-2, var(--accent));
+  border-color: var(--accent-1, var(--accent));
+  background: var(--accent-glow, var(--bg-input));
+}
+
+.ml-studio-card-share .icon {
+  width: 15px;
+  height: 15px;
+}
+
+/* ---------- Ekran udostępniania (p02) ---------- */
+
+.ml-studio-share-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.ml-studio-share-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ml-studio-share-head .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-share-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.ml-studio-share-hint .icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.ml-studio-member-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ml-studio-member-id {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ml-studio-member-self {
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.ml-studio-member-note {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-role-pick {
+  max-width: 180px;
+}
+
+.ml-studio-invite-row {
+  display: grid;
+  grid-template-columns: 1fr 180px auto;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.ml-studio-role-legend {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.ml-studio-role-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+}
+
+.ml-studio-role-desc {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+@media (max-width: 720px) {
+  .ml-studio-invite-row {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-role-legend {
+    grid-template-columns: 1fr;
+  }
+}
