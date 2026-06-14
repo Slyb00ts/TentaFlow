@@ -27,7 +27,7 @@ use tentaflow_sdk_spec::{
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::camera::{
     CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput,
-    CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
     DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 use tentaflow_sdk_spec::protocol::ui::{
@@ -84,10 +84,6 @@ extern "C" {
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
-    ) -> i32;
-    fn camera_snapshot_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
@@ -369,14 +365,6 @@ fn camera_local_devices() -> Result<Vec<LocalCameraDeviceOut>, AbiError> {
 fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectionOut, AbiError> {
     let input = CameraTestConnectionInput { vendor: vendor.to_string(), url: url.to_string() };
     call_cbor_in_out(&input, camera_test_connection_v1)
-}
-
-/// Pulls one decoded frame from the host frame LRU for `camera_id`. Fails (e.g.
-/// `CameraUnreachable` / `NotFound`) whenever no real frame exists — there is no
-/// fabricated fallback frame, so the Live view can degrade honestly per tile.
-fn camera_snapshot(camera_id: &str) -> Result<CameraSnapshotOut, AbiError> {
-    let input = CameraIdInput { camera_id: camera_id.to_string() };
-    call_cbor_in_out(&input, camera_snapshot_v1)
 }
 
 // =============================================================================
@@ -4062,119 +4050,11 @@ fn live_grid_selector(current: u32) -> Component {
     comp
 }
 
-/// Encodes an RGB24 buffer (row-major, top-down, 3 bytes/pixel) as an
-/// uncompressed 24-bit BMP and returns a `data:image/bmp;base64,...` URL that the
-/// SDK `Image` component can render directly — no PNG/zlib dependency in the
-/// WASM addon. BMP rows are stored bottom-up as BGR and padded to a 4-byte
-/// boundary. Returns `None` when the buffer length does not match `w*h*3`.
-fn rgb24_to_bmp_data_url(width: u32, height: u32, rgb: &[u8]) -> Option<String> {
-    use base64::Engine;
-    let (w, h) = (width as usize, height as usize);
-    if w == 0 || h == 0 || rgb.len() != w * h * 3 {
-        return None;
-    }
-    let row_stride = (w * 3 + 3) & !3; // padded to 4 bytes
-    let pixel_data_size = row_stride * h;
-    let file_header_size = 14usize;
-    let info_header_size = 40usize;
-    let pixel_offset = file_header_size + info_header_size;
-    let file_size = pixel_offset + pixel_data_size;
-
-    let mut buf = Vec::with_capacity(file_size);
-    // BITMAPFILEHEADER
-    buf.extend_from_slice(b"BM");
-    buf.extend_from_slice(&(file_size as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    buf.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
-    // BITMAPINFOHEADER
-    buf.extend_from_slice(&(info_header_size as u32).to_le_bytes());
-    buf.extend_from_slice(&(width as i32).to_le_bytes());
-    buf.extend_from_slice(&(height as i32).to_le_bytes()); // positive = bottom-up
-    buf.extend_from_slice(&1u16.to_le_bytes()); // planes
-    buf.extend_from_slice(&24u16.to_le_bytes()); // bits per pixel
-    buf.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB, no compression
-    buf.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
-    buf.extend_from_slice(&2835i32.to_le_bytes()); // x ppm (~72 dpi)
-    buf.extend_from_slice(&2835i32.to_le_bytes()); // y ppm
-    buf.extend_from_slice(&0u32.to_le_bytes()); // colors used
-    buf.extend_from_slice(&0u32.to_le_bytes()); // important colors
-
-    // Pixel rows, bottom-up, RGB -> BGR, padded.
-    let pad = row_stride - w * 3;
-    for y in (0..h).rev() {
-        let src = &rgb[y * w * 3..(y + 1) * w * 3];
-        for px in src.chunks_exact(3) {
-            buf.push(px[2]); // B
-            buf.push(px[1]); // G
-            buf.push(px[0]); // R
-        }
-        for _ in 0..pad {
-            buf.push(0);
-        }
-    }
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-    let mut url = String::with_capacity("data:image/bmp;base64,".len() + b64.len());
-    url.push_str("data:image/bmp;base64,");
-    url.push_str(&b64);
-    Some(url)
-}
-
-/// Attempts to fetch a real frame for `camera_id`. Returns a renderable
-/// `data:image/bmp;base64,...` URL on success, or `None` when no real frame is
-/// reachable (offline camera, no host frame, unsupported pixel format) so the
-/// caller can fall back to the honest placeholder for that tile only.
-fn live_camera_frame_url(camera_id: &str) -> Option<String> {
-    match camera_snapshot(camera_id) {
-        Ok(snap) => {
-            // The host snapshot ABI ships RGB24; reject anything else rather than
-            // render a garbled frame.
-            if !snap.pixel_format.eq_ignore_ascii_case("rgb24")
-                && !snap.pixel_format.eq_ignore_ascii_case("rgb")
-            {
-                log::warn(&alloc::format!(
-                    "TentaVision live: unexpected snapshot pixel_format '{}' for {}",
-                    snap.pixel_format, camera_id
-                ));
-                return None;
-            }
-            use base64::Engine;
-            let rgb: Vec<u8> = match base64::engine::general_purpose::STANDARD
-                .decode(snap.data_b64.as_bytes())
-            {
-                Ok(b) => b,
-                Err(_) => return None,
-            };
-            rgb24_to_bmp_data_url(snap.width, snap.height, &rgb)
-        }
-        Err(_) => None,
-    }
-}
-
-/// Builds the SDK `Image` component for a real frame data URL inside a tile.
-fn live_frame_image(url: &str, alt: &str) -> Component {
-    use tentaflow_sdk_spec::protocol::ui::data::specialised::Image;
-    Image {
-        src_ref: BindRef::Literal(Value::Text(url.to_string())),
-        alt: alt.to_string(),
-        width: None,
-        height: None,
-        fit: ImageFit::Cover,
-        aspect_ratio: Some(AspectRatio::R16To9),
-        radius: Some(RadiusToken::Md),
-        clickable: false,
-        lazy_load: false,
-    }
-    .into_component(next_id())
-    .expect("Image")
-}
-
-/// One live tile per real camera. Each tile attempts a real frame snapshot from
-/// the host frame LRU and renders it via the SDK `Image` component. When no real
-/// frame is reachable (offline camera, or a test/CI env with no RTSP source) the
-/// tile degrades honestly to a placeholder for THAT tile only — it deliberately
-/// does NOT open a `camera:<id>` WebSocket subscription (an earlier iteration
-/// found that triggers 401 console errors). No fake video, no fabricated overlay.
+/// One live tile per real camera. ONLINE cameras render a real MSE video tile
+/// via the SDK `VideoStream` component with a `camera:<id>` subscribe stream id:
+/// the dashboard renderer plays fMP4 over the binary protocol AND attaches the
+/// detection overlay (also binary) on top. OFFLINE cameras degrade honestly to a
+/// placeholder for THAT tile only — no stream, no fabricated frame, no overlay.
 fn live_camera_tile(c: &db::CameraRow) -> Component {
     let online = c.status == "online";
     let (status_label, status_tone) = if online {
@@ -4189,19 +4069,38 @@ fn live_camera_tile(c: &db::CameraRow) -> Component {
         chip_toned(status_label, status_tone),
     ]);
 
-    // Only probe online cameras: an offline camera never has a host frame, so
-    // skipping the snapshot avoids a pointless failing host call per tile.
-    let frame_url = if online { live_camera_frame_url(&c.id) } else { None };
-
-    let body = match frame_url {
-        Some(url) => live_frame_image(&url, &c.name),
-        None => empty_state(
+    let body = if online {
+        live_video_tile(&c.id)
+    } else {
+        empty_state(
             &c.name,
-            Some(if online { "Brak podglądu (kamera nieosiągalna)" } else { "Offline — brak podglądu" }),
-            Some(if online { "video" } else { "alert" }),
-        ),
+            Some("Offline — brak podglądu"),
+            Some("alert"),
+        )
     };
     card(None, vec![header, body])
+}
+
+/// Builds the SDK `VideoStream` component bound to the live `camera:<id>` stream.
+/// The `camera:` prefix is the only subscribe scheme the core wires today
+/// (dispatch/stream.rs CAMERA_PREFIX); the dashboard renderer maps it to
+/// `<tf-video-stream>` (MSE over `streamSubscribeRequest`) and attaches the
+/// binary detection overlay. The id is a literal (one camera per tile, not a
+/// reactive store path).
+fn live_video_tile(camera_id: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::specialized::media::VideoStream;
+    VideoStream {
+        stream_id: BindRef::Literal(Value::Text(alloc::format!("camera:{}", camera_id))),
+        width_px: None,
+        aspect_ratio: AspectRatio::R16To9,
+        controls: VideoControls::None,
+        autoplay: true,
+        muted: true,
+        object_fit: ImageFit::Contain,
+        poster_ref: None,
+    }
+    .into_component(next_id())
+    .expect("VideoStream")
 }
 
 fn build_live_content() -> Component {

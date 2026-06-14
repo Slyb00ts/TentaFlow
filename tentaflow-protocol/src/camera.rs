@@ -113,6 +113,52 @@ pub struct CameraFrameUrlResponse {
     pub expires_at_ms: i64,
 }
 
+/// Subscribe to a per-camera detection overlay stream (server→client). The
+/// dashboard `<tf-live-camera-tile>` opens one of these per VISIBLE tile and
+/// receives a long-lived stream of `CameraDetectionsFrame` chunks until it
+/// cancels (`MetaCancelStream`) or disconnects. The stream is best-effort,
+/// latest-wins: when the per-camera broadcast ring overruns a slow subscriber
+/// the server drops the lagged frames silently rather than ending the stream.
+#[derive(
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraDetectionsSubscribeRequest {
+    /// Camera id (`cam_<uuid v4>`, 40 chars). The handler validates the format
+    /// and gates on `camera.read` + org isolation before subscribing.
+    pub camera_id: String,
+}
+
+/// One detected object on a frame. Mirrors `detection_bus::Detection` field
+/// for field so the server-side mapping is an allocation-cheap copy.
+#[derive(
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct DetectionItem {
+    /// Class name from our set (e.g. `tablica_adr`).
+    pub klasa: String,
+    /// `[x, y, w, h]` NORMALIZED 0..1 relative to the frame; the frontend
+    /// rescales to the `<video>` element size.
+    pub bbox: [f32; 4],
+    /// Detection confidence 0..1.
+    pub score: f32,
+    /// State features (e.g. `["uszkodzona"]`); may be empty.
+    pub stan: Vec<String>,
+    /// OCR read or `None` (serialized as `null`).
+    pub tekst: Option<String>,
+}
+
+/// One streamed detection frame (server→client chunk). Carries the normalized
+/// detections for a single camera frame. `ts_ms` is Unix epoch milliseconds —
+/// kept as `u64` for the BigInt-tolerant JS decoders.
+#[derive(
+    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct CameraDetectionsFrame {
+    pub camera_id: String,
+    pub ts_ms: u64,
+    pub items: Vec<DetectionItem>,
+}
+
 /// Inner-enum pack — keeps every admin camera RPC in a single
 /// `MessageBody::CameraAdminBody` slot (CBOR 256-variant budget). Matches the
 /// `ProfilingPayload` / `VisionInferPayload` pattern.
@@ -126,6 +172,8 @@ pub enum CameraAdminPayload {
     AddOnvifResponse(CameraAddOnvifResponse),
     FrameUrlRequest(CameraFrameUrlRequest),
     FrameUrlResponse(CameraFrameUrlResponse),
+    DetectionsSubscribeRequest(CameraDetectionsSubscribeRequest),
+    DetectionsFrame(CameraDetectionsFrame),
 }
 
 #[cfg(test)]
@@ -283,6 +331,60 @@ mod tests {
             CameraFrameUrlResponse {
                 signed_url: "/frames/frame_x?token=A&exp=1&ref=frame_x".into(),
                 expires_at_ms: 1,
+            },
+        ));
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn detections_subscribe_request_round_trip() {
+        let v = CameraAdminPayload::DetectionsSubscribeRequest(CameraDetectionsSubscribeRequest {
+            camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn detections_frame_round_trip() {
+        let v = CameraAdminPayload::DetectionsFrame(CameraDetectionsFrame {
+            camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
+            ts_ms: 1_700_000_000_123,
+            items: vec![
+                DetectionItem {
+                    klasa: "tablica_adr".into(),
+                    bbox: [0.41, 0.22, 0.12, 0.06],
+                    score: 0.96,
+                    stan: Vec::new(),
+                    tekst: Some("30/1202".into()),
+                },
+                DetectionItem {
+                    klasa: "nalepka_3".into(),
+                    bbox: [0.30, 0.15, 0.05, 0.07],
+                    score: 0.94,
+                    stan: vec!["uszkodzona".into()],
+                    tekst: None,
+                },
+            ],
+        });
+        assert_eq!(round_trip!(CameraAdminPayload, v.clone()), v);
+    }
+
+    #[test]
+    fn camera_admin_body_detections_round_trip() {
+        use crate::message_body::MessageBody;
+        let body = MessageBody::CameraAdminBody(CameraAdminPayload::DetectionsFrame(
+            CameraDetectionsFrame {
+                camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
+                ts_ms: 42,
+                items: vec![DetectionItem {
+                    klasa: "termometr".into(),
+                    bbox: [0.0, 0.0, 0.1, 0.1],
+                    score: 0.5,
+                    stan: Vec::new(),
+                    tekst: None,
+                }],
             },
         ));
         let bytes = crate::cbor::encode(&body).expect("encode");

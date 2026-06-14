@@ -30,6 +30,43 @@ function isSubscribeStreamId(v) {
   return typeof v === 'string' && v.startsWith('camera:');
 }
 
+// Wpina nakladke detekcji na zywo nad kafelek tf-video-stream. Z `camera:<id>`
+// wyciagamy camera_id i otwieramy BINARNY strumien detekcji (ApiBinary.subscribe
+// 'cameraDetectionsSubscribeRequest') — zero REST, zero raw WebSocket. Modul
+// ladujemy dynamicznie (import()) — node-owy harness testowy nie ma DOM canvasa,
+// a renderer musi sie w nim ladowac. Cleanup zwalnia overlay (binarny unsubscribe
+// + rAF cancel) gdy kafelek znika z DOM.
+function attachLiveDetections(wrapper, tile, readStreamId, ctx) {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  const streamId = readStreamId();
+  if (typeof streamId !== 'string' || !streamId.startsWith('camera:')) return;
+  const cameraId = streamId.slice('camera:'.length);
+  if (!cameraId) return;
+
+  let overlay = null;
+  let cancelled = false;
+  import('/js/modules/vision-detections-overlay.js')
+    .then(({ attachDetectionsOverlay }) => {
+      if (cancelled) return;
+      overlay = attachDetectionsOverlay({
+        video: tile,
+        cameraId,
+        videoResolver: () => tile.shadowRoot?.querySelector('video') || null,
+      });
+    })
+    .catch((e) => {
+      console.warn('[specialized-media] detections overlay load failed:', e?.message ?? e);
+    });
+
+  ctx.registerCleanup(() => {
+    cancelled = true;
+    if (overlay) {
+      overlay.destroy();
+      overlay = null;
+    }
+  });
+}
+
 // =============================================================================
 // VideoStream (0x0604)
 // =============================================================================
@@ -79,6 +116,7 @@ function renderVideoStream(component, ctx) {
     applyId();
     ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applyId));
     wrapper.appendChild(tile);
+    attachLiveDetections(wrapper, tile, () => resolveBindRef(streamIdBind, ctx.store), ctx);
     return wrapper;
   }
 

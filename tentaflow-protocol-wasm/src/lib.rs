@@ -6695,6 +6695,46 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "expiresAtMs", resp.expires_at_ms.clone().into());
                 set(&obj, "expires_at_ms", resp.expires_at_ms.clone().into());
             }
+            tentaflow_protocol::CameraAdminPayload::DetectionsSubscribeRequest(_) => {
+                // Request variant never legitimately arrives in a response/chunk
+                // path. Surface the variant tag only — same defense-in-depth
+                // pattern as the other CameraAdminPayload request branches.
+                set(&obj, "variant", "CameraDetectionsSubscribeRequest".into());
+                set(
+                    &obj,
+                    "warning",
+                    "unexpected_request_variant_in_response".into(),
+                );
+            }
+            tentaflow_protocol::CameraAdminPayload::DetectionsFrame(frame) => {
+                set(&obj, "variant", "CameraDetectionsFrame".into());
+                set(&obj, "cameraId", frame.camera_id.clone().into());
+                set(&obj, "camera_id", frame.camera_id.into());
+                set(&obj, "tsMs", (frame.ts_ms as f64).into());
+                set(&obj, "ts_ms", (frame.ts_ms as f64).into());
+                let items = js_sys::Array::new();
+                for det in frame.items {
+                    let item = js_sys::Object::new();
+                    set(&item, "klasa", det.klasa.into());
+                    let bbox = js_sys::Array::new();
+                    for v in det.bbox {
+                        bbox.push(&JsValue::from_f64(v as f64));
+                    }
+                    set(&item, "bbox", bbox.into());
+                    set(&item, "score", (det.score as f64).into());
+                    let stan = js_sys::Array::new();
+                    for s in det.stan {
+                        stan.push(&JsValue::from_str(&s));
+                    }
+                    set(&item, "stan", stan.into());
+                    match det.tekst {
+                        Some(t) => set(&item, "tekst", t.into()),
+                        None => set(&item, "tekst", JsValue::NULL),
+                    }
+                    items.push(&item.into());
+                }
+                set(&obj, "items", items.into());
+            }
         },
         MessageBody::LegalAdminBody(payload) => match payload {
             tentaflow_protocol::LegalAdminPayload::ListRequest(_) => {
@@ -10412,6 +10452,22 @@ pub fn encode_camera_frame_url_request(
                 camera_id,
                 ttl_secs,
             },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CameraAdminBody(DetectionsSubscribeRequest) — open a per-camera
+/// detection overlay stream. The handler validates the `cam_<uuid v4>` id,
+/// gates on `camera.read` + org isolation, and replies with a long-lived
+/// stream of `CameraDetectionsFrame` chunks until cancel/disconnect.
+#[wasm_bindgen(js_name = encodeCameraDetectionsSubscribeRequest)]
+pub fn encode_camera_detections_subscribe_request(
+    camera_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CameraAdminBody(
+        tentaflow_protocol::CameraAdminPayload::DetectionsSubscribeRequest(
+            tentaflow_protocol::CameraDetectionsSubscribeRequest { camera_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))

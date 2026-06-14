@@ -27,6 +27,8 @@ pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
+#[cfg(feature = "camera")]
+pub mod camera_detections;
 pub mod compliance_admin;
 pub mod handlers;
 pub mod legal_admin;
@@ -428,6 +430,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::CameraAdminPayload::AddOnvifResponse(_) => "CameraAddOnvifResponse",
             tentaflow_protocol::CameraAdminPayload::FrameUrlRequest(_) => "CameraFrameUrlRequest",
             tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_) => "CameraFrameUrlResponse",
+            tentaflow_protocol::CameraAdminPayload::DetectionsSubscribeRequest(_) => {
+                "CameraDetectionsSubscribeRequest"
+            }
+            tentaflow_protocol::CameraAdminPayload::DetectionsFrame(_) => "CameraDetectionsFrame",
         },
         MessageBody::LegalAdminBody(p) => match p {
             tentaflow_protocol::LegalAdminPayload::ListRequest(_) => "LegalDocumentsListRequest",

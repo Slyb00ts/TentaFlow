@@ -1656,6 +1656,26 @@ export function encodeCameraAddOnvifRequest(display_name, device_service_url, us
 }
 
 /**
+ * MessageBody::CameraAdminBody(DetectionsSubscribeRequest) — open a per-camera
+ * detection overlay stream. The handler validates the `cam_<uuid v4>` id,
+ * gates on `camera.read` + org isolation, and replies with a long-lived
+ * stream of `CameraDetectionsFrame` chunks until cancel/disconnect.
+ * @param {string} camera_id
+ * @returns {Uint8Array}
+ */
+export function encodeCameraDetectionsSubscribeRequest(camera_id) {
+    const ptr0 = passStringToWasm0(camera_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCameraDetectionsSubscribeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::CameraAdminBody(DiscoverRequest) — kick off ONVIF WS-Discovery
  * against the local network; the response carries the discovered devices.
  * @returns {Uint8Array}
