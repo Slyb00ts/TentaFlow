@@ -1352,23 +1352,6 @@ fn step_progress(steps: Vec<StepDef>, _current_id: &str) -> Component {
     }.into_component(next_id()).expect("StepProgress")
 }
 
-fn canvas(commands: Vec<Value>) -> Component {
-    // VideoStream doubles as canvas surface in the spec (tag 0x0604).
-    // For canvas drawing commands, pass through as a raw VideoStream with
-    // the commands encoded in stream_id as a JSON payload.
-    let json_str = commands.iter().map(|_| "cmd").collect::<Vec<_>>().join(",");
-    VideoStreamComp {
-        stream_id: lit(&alloc::format!("canvas:{}", json_str)),
-        width_px: None,
-        aspect_ratio: AspectRatio::R16To9,
-        controls: VideoControls::None,
-        autoplay: false,
-        muted: true,
-        object_fit: ImageFit::Contain,
-        poster_ref: None,
-    }.into_component(next_id()).expect("Canvas")
-}
-
 fn sparkline(_points: Vec<f64>) -> Component {
     SparklineComp {
         data_path: StatePath::new(vec![PathSegment::Key("sparkline_data".into())]),
@@ -1598,57 +1581,55 @@ impl ModelsState {
     }
 }
 
-#[derive(Clone)]
-struct ZonePoint { x: f64, y: f64 }
-
-#[derive(Clone)]
-struct ZoneFixture {
-    id: String, name: String, zone_type: String,
-    points: Vec<ZonePoint>, schedule: [[bool; 24]; 7],
-    min_confidence: f64, models: Vec<String>, alarm_on_detect: bool,
-}
-
+/// State for the Zones tab. Everything persists in SQLite (the `zones` table);
+/// this struct only holds the transient view state: which camera is selected,
+/// whether the add-zone form / add-rule form is open, the pending delete arming,
+/// and the bound draft fields for the two forms. The zone geometry itself is read
+/// from the database on every render — there is no in-memory zone cache.
 struct ZonesState {
     selected_camera_id: Option<String>,
-    zones: Vec<ZoneFixture>,
-    selected_zone_id: Option<String>,
-    drawing_mode: bool,
-    drawing_points: Vec<ZonePoint>,
-    cursor: Option<ZonePoint>,
+    zone_form_visible: bool,
+    zone_pending_remove: Option<String>,
+    // Add-zone form draft (bound store keys mirrored on input/change).
+    form_name: String,
+    form_kind: String,
+    form_polygon: String,
+    // Add-rule form draft.
+    rule_form_visible: bool,
+    rule_name: String,
+    rule_expr: String,
+    rule_action: String,
 }
 
 impl ZonesState {
-    const fn const_placeholder() -> Self {
-        Self {
-            selected_camera_id: None, zones: Vec::new(), selected_zone_id: None,
-            drawing_mode: false, drawing_points: Vec::new(), cursor: None,
-        }
-    }
-    fn ensure_seeded(&mut self) {
-        if !self.zones.is_empty() { return; }
-        *self = Self::new();
-    }
-    fn new() -> Self {
-        let always: [[bool; 24]; 7] = [[true; 24]; 7];
+    const fn new() -> Self {
         Self {
             selected_camera_id: None,
-            zones: vec![
-                ZoneFixture { id: "z1".into(), name: "Peron główny".into(), zone_type: "detection".into(),
-                    points: vec![ZonePoint{x:80.0,y:280.0}, ZonePoint{x:420.0,y:280.0}, ZonePoint{x:420.0,y:520.0}, ZonePoint{x:80.0,y:520.0}],
-                    schedule: always, min_confidence: 0.6, models: vec!["yolo".into()], alarm_on_detect: false },
-                ZoneFixture { id: "z2".into(), name: "Ławka (ignore)".into(), zone_type: "exclusion".into(),
-                    points: vec![ZonePoint{x:500.0,y:380.0}, ZonePoint{x:660.0,y:380.0}, ZonePoint{x:660.0,y:500.0}, ZonePoint{x:500.0,y:500.0}],
-                    schedule: always, min_confidence: 0.5, models: vec![], alarm_on_detect: false },
-                ZoneFixture { id: "z3".into(), name: "Wjazd ADR".into(), zone_type: "alert".into(),
-                    points: vec![ZonePoint{x:200.0,y:100.0}, ZonePoint{x:360.0,y:100.0}, ZonePoint{x:280.0,y:240.0}],
-                    schedule: always, min_confidence: 0.75, models: vec!["yolo".into(), "ocr".into()], alarm_on_detect: true },
-            ],
-            selected_zone_id: Some("z1".into()),
-            drawing_mode: false, drawing_points: Vec::new(), cursor: None,
+            zone_form_visible: false,
+            zone_pending_remove: None,
+            form_name: String::new(),
+            form_kind: String::new(),
+            form_polygon: String::new(),
+            rule_form_visible: false,
+            rule_name: String::new(),
+            rule_expr: String::new(),
+            rule_action: String::new(),
         }
     }
-    fn find_zone_mut(&mut self, id: &str) -> Option<&mut ZoneFixture> {
-        self.zones.iter_mut().find(|z| z.id == id)
+
+    /// Resets the add-zone form to a clean draft with a sensible default shape.
+    fn reset_zone_form(&mut self) {
+        self.form_name.clear();
+        self.form_kind = "include".into();
+        // Default include polygon as a centered rectangle in 0..100 frame coords.
+        self.form_polygon = "[[15,40],[60,40],[60,85],[15,85]]".into();
+    }
+
+    /// Resets the add-rule form to a clean draft.
+    fn reset_rule_form(&mut self) {
+        self.rule_name.clear();
+        self.rule_expr.clear();
+        self.rule_action = "Alarm info + log".into();
     }
 }
 
@@ -1930,7 +1911,7 @@ impl PanelState {
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
             reid: ReidState::new(), models: ModelsState::new(),
-            zones: ZonesState::const_placeholder(), audit: AuditState::new(),
+            zones: ZonesState::new(), audit: AuditState::new(),
             evidence: EvidenceState::new(), settings: SettingsState::new(),
             onboarding: OnboardingState::new(), bindings: BindingsState::new(),
         }
@@ -1951,6 +1932,11 @@ static PENDING_PROFILE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
 /// Same mechanism as `PENDING_CAMERA_ROWS` but for the models registry Table.
 static PENDING_MODEL_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
+/// Same mechanism as `PENDING_CAMERA_ROWS` but for the zone list Table and the
+/// composite-rules Table on the Zones tab.
+static PENDING_ZONE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+static PENDING_RULE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
 fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
     let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
@@ -2242,6 +2228,24 @@ fn render_panel(panel_id: &str) {
             value: Value::Text(note),
         }];
         send_slot_content_with_overlay("content", content, Some(overlay));
+    } else if panel_id == "zones" {
+        // Seed the zone list Table, the composite-rules Table and, when a form is
+        // open, its bound draft fields, so every control mounts populated.
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_ZONE_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("zones_rows".into())]),
+                value: rows,
+            });
+        }
+        if let Some(rows) = PENDING_RULE_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("rules_rows".into())]),
+                value: rows,
+            });
+        }
+        entries.extend(zones_overlay());
+        send_slot_content_with_overlay("content", content, Some(entries));
     } else if panel_id == "audit" {
         // Seed the audit filter search box and, when a retention card is being
         // edited, its bound number input so both mount with the current values.
@@ -2358,16 +2362,20 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "model-budget-cancel" => { with_state(|s| { s.models.budget_editing = false; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
         "model-budget-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.models.budget_draft = v); json!({"ok":true}) }
         "model-budget-save" => handle_model_budget_save(),
-        "zone-select-camera" => { let id = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.zones.ensure_seeded(); s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
-        "zone-add-start" => { with_state(|s| { s.zones.ensure_seeded(); s.zones.drawing_mode = true; s.zones.drawing_points.clear(); s.zones.selected_zone_id = None; s.zones.cursor = None; }); json!({"ok":true}) }
-        "zone-cancel-drawing" => { with_state(|s| { s.zones.drawing_mode = false; s.zones.drawing_points.clear(); s.zones.cursor = None; }); json!({"ok":true}) }
-        "zone-finish-drawing" => { with_state(|s| { if s.zones.drawing_points.len() < 3 { s.error_message = Some("Strefa wymaga przynajmniej 3 wierzchołków.".into()); } else { let next_id = alloc::format!("z{}", s.zones.zones.len() + 1); let name = alloc::format!("Strefa {}", s.zones.zones.len() + 1); let points = core::mem::take(&mut s.zones.drawing_points); s.zones.zones.push(ZoneFixture { id: next_id.clone(), name, zone_type: "detection".into(), points, schedule: [[true; 24]; 7], min_confidence: 0.6, models: vec!["yolo".into()], alarm_on_detect: false }); s.zones.selected_zone_id = Some(next_id); s.zones.drawing_mode = false; s.zones.cursor = None; s.success_message = Some("Dodano nową strefę.".into()); } }); json!({"ok":true}) }
-        "zone-select" => { let id = params.get("zone_id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.zones.ensure_seeded(); s.zones.selected_zone_id = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
-        "zone-delete" => { let id = params.get("zone_id").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| { s.zones.zones.retain(|z| z.id != id); if s.zones.selected_zone_id.as_deref() == Some(id.as_str()) { s.zones.selected_zone_id = None; } s.success_message = Some(alloc::format!("Usunięto strefę '{}'.", id)); }); json!({"ok":true}) }
-        "zone-name-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| { let sel = s.zones.selected_zone_id.clone(); if let Some(id) = sel { if let Some(z) = s.zones.find_zone_mut(&id) { z.name = v; } } }); json!({"ok":true}) }
-        "zone-type-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("detection").to_string(); with_state(|s| { let sel = s.zones.selected_zone_id.clone(); if let Some(id) = sel { if let Some(z) = s.zones.find_zone_mut(&id) { z.zone_type = v; } } }); json!({"ok":true}) }
-        "zone-confidence-change" => { let v = params.get("value").and_then(|x| x.as_f64()).unwrap_or(0.6); with_state(|s| { let sel = s.zones.selected_zone_id.clone(); if let Some(id) = sel { if let Some(z) = s.zones.find_zone_mut(&id) { z.min_confidence = v; } } }); json!({"ok":true}) }
-        "zone-canvas-pointer" => handle_zone_canvas_pointer(params),
+        "zone-select-camera" => { let id = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) }; s.zones.zone_form_visible = false; s.zones.rule_form_visible = false; s.zones.zone_pending_remove = None; }); render_panel("zones"); json!({"ok":true}) }
+        "zone-add-start" => { with_state(|s| { s.clear_messages(); s.zones.zone_form_visible = true; s.zones.rule_form_visible = false; s.zones.zone_pending_remove = None; s.zones.reset_zone_form(); }); render_panel("zones"); json!({"ok":true}) }
+        "zone-form-cancel" => { with_state(|s| { s.zones.zone_form_visible = false; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "zone-field-change" => handle_zone_field_change(params),
+        "zone-add-submit" => handle_zone_add_submit(),
+        "zone-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("zone_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.zones.zone_pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("zones"); json!({"ok":true}) }
+        "zone-remove-cancel" => { with_state(|s| { s.zones.zone_pending_remove = None; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "zone-remove" => handle_zone_remove(params),
+        "schedule-cell-toggle" => handle_schedule_cell_toggle(params),
+        "rule-add-start" => { with_state(|s| { s.clear_messages(); s.zones.rule_form_visible = true; s.zones.zone_form_visible = false; s.zones.reset_rule_form(); }); render_panel("zones"); json!({"ok":true}) }
+        "rule-form-cancel" => { with_state(|s| { s.zones.rule_form_visible = false; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "rule-field-change" => handle_rule_field_change(params),
+        "rule-add-submit" => handle_rule_add_submit(),
+        "rule-row-select" => handle_rule_remove(params),
         "audit-filter-change" => { with_state(|s| { let id = params.get("id").and_then(|x| x.as_str()).unwrap_or(""); match id { "date_preset" => s.audit.date_preset = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), "query" => s.audit.query = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), _ => {} } }); render_panel("audit"); json!({"ok":true}) }
         "audit-clear-filters" => { with_state(|s| s.audit.clear_filters()); render_panel("audit"); json!({"ok":true}) }
         "audit-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.audit.expanded_id = if id.is_empty() || s.audit.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); render_panel("audit"); json!({"ok":true}) }
@@ -3327,20 +3335,6 @@ fn handle_discover_select(params: &JsonValue) -> JsonValue {
     if with_state(|s| s.add_form_visible) {
         send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
     }
-    json!({"ok":true})
-}
-
-fn handle_zone_canvas_pointer(params: &JsonValue) -> JsonValue {
-    let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let event = params.get("event").and_then(|v| v.as_str()).unwrap_or("move");
-    with_state(|s| {
-        if !s.zones.drawing_mode { return; }
-        match event {
-            "click" => s.zones.drawing_points.push(ZonePoint { x, y }),
-            _ => s.zones.cursor = Some(ZonePoint { x, y }),
-        }
-    });
     json!({"ok":true})
 }
 
@@ -5643,61 +5637,577 @@ fn models_vram_overlay() -> Vec<StateEntry> {
     vec![key("vram_used_mb", used as f64), key("vram_free_mb", free as f64), key("vram_budget_mb_view", budget as f64)]
 }
 
+/// Display label + chip tone for a zone kind, mirroring the mockup colors:
+/// include = green (ok), exclude = red (err), line = blue (info).
+fn zone_kind_cell(kind: &str) -> Value {
+    match kind {
+        "include" => chip_cell("include", "ok"),
+        "exclude" => chip_cell("exclude", "err"),
+        "line" => chip_cell("line", "info"),
+        other => chip_cell(other, "muted"),
+    }
+}
+
+/// Weekday + hour-band labels for the weekly schedule grid (matches the mockup's
+/// 5 bands × 7 days). The grid JSON is row-major: `grid[band][day]` is a profile
+/// code ("" = off, "day", "night").
+const SCHEDULE_DAYS: &[&str] = &["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nd"];
+const SCHEDULE_BANDS: &[&str] = &["04–06", "06–12", "12–18", "18–22", "22–04"];
+
+/// Parses the persisted schedule JSON into a 5×7 grid of profile codes. Falls
+/// back to an all-off grid when absent or malformed.
+fn parse_schedule(json: Option<&str>) -> Vec<Vec<String>> {
+    let default = || (0..SCHEDULE_BANDS.len()).map(|_| (0..SCHEDULE_DAYS.len()).map(|_| String::new()).collect()).collect::<Vec<Vec<String>>>();
+    let raw = match json { Some(s) if !s.trim().is_empty() => s, _ => return default() };
+    let parsed: JsonValue = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => return default() };
+    let rows = match parsed.as_array() { Some(r) => r, None => return default() };
+    let mut grid = default();
+    for (b, row) in rows.iter().take(SCHEDULE_BANDS.len()).enumerate() {
+        if let Some(cols) = row.as_array() {
+            for (d, cell) in cols.iter().take(SCHEDULE_DAYS.len()).enumerate() {
+                grid[b][d] = cell.as_str().unwrap_or("").to_string();
+            }
+        }
+    }
+    grid
+}
+
+/// Builds the camera selector (real cameras from the DB), bound to
+/// `zone_camera_select` and committing on change via `zone-select-camera`.
+fn zone_camera_selector(cameras: &[db::CameraRow], selected: Option<&str>) -> Component {
+    let mut options: Vec<SelectOption> = vec![SelectOption {
+        value: SelectValue::Text(String::new()),
+        label: lit("— wybierz kamerę —"),
+        icon: None, disabled: false, group_id: None, description: None,
+    }];
+    for c in cameras {
+        options.push(SelectOption {
+            value: SelectValue::Text(c.id.clone()),
+            label: lit(&c.name),
+            icon: None, disabled: false, group_id: None, description: None,
+        });
+    }
+    let _ = selected;
+    let mut comp = select("Kamera", options, "zone_camera_select");
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend { action_id: "zone-select-camera".into(), params: CborMap::default(), optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
 fn build_zones_content() -> Component {
     let messages = build_messages_section();
-    let (zones, selected_id, drawing_mode, drawing_points) = with_state(|s| {
-        s.zones.ensure_seeded();
-        (s.zones.zones.clone(), s.zones.selected_zone_id.clone(), s.zones.drawing_mode, s.zones.drawing_points.clone())
-    });
+    let (selected_camera, zone_form_visible, rule_form_visible, pending_remove) = with_state(|s| (
+        s.zones.selected_camera_id.clone(),
+        s.zones.zone_form_visible,
+        s.zones.rule_form_visible,
+        s.zones.zone_pending_remove.clone(),
+    ));
+
+    let cameras = db::list_cameras().unwrap_or_default();
 
     let toolbar = stack_h(vec![
         heading(2, "Strefy i reguły"),
-        button_with_icon("Nowa strefa", "zone-add-start", "primary", "plus"),
+        zone_camera_selector(&cameras, selected_camera.as_deref()),
     ]);
 
-    let mut canvas_commands: Vec<Value> = Vec::new();
-    for zone in &zones {
-        let is_selected = selected_id.as_deref() == Some(&zone.id);
-        let color = match zone.zone_type.as_str() {
-            "exclusion" => "red", "alert" => "orange", _ => "green"
-        };
-        if zone.points.len() >= 2 {
-            let pts: Vec<Value> = zone.points.iter().map(|p| Value::Array(vec![Value::F64(p.x), Value::F64(p.y)])).collect();
-            canvas_commands.push(Value::Map(vec![
-                (Value::Text("type".into()), Value::Text("polygon".into())),
-                (Value::Text("points".into()), Value::Array(pts)),
-                (Value::Text("stroke".into()), Value::Text(color.into())),
-                (Value::Text("fill".into()), Value::Text(if is_selected { "rgba(0,255,0,0.2)" } else { "rgba(0,0,0,0)" }.into())),
-            ]));
+    let mut children = vec![messages, toolbar];
+
+    let camera = match selected_camera.as_deref().and_then(|id| cameras.iter().find(|c| c.id == id)) {
+        Some(c) => c,
+        None => {
+            children.push(empty_state(
+                "Wybierz kamerę",
+                Some("Wybierz kamerę z listy powyżej, aby zdefiniować strefy detekcji, harmonogram i reguły."),
+                Some("zones"),
+            ));
+            return stack_v(children);
+        }
+    };
+
+    let zones = db::list_zones(&camera.id).unwrap_or_default();
+
+    // --- Camera view + zone management (left/right grid, like the mockup) ---
+    // A static frame placeholder (no live VideoStream) — the live detection
+    // socket belongs to the Live view tab; here we only configure zone geometry.
+    let zone_summary = if zones.is_empty() {
+        "Brak zdefiniowanych stref".to_string()
+    } else {
+        let inc = zones.iter().filter(|z| z.kind == "include").count();
+        let exc = zones.iter().filter(|z| z.kind == "exclude").count();
+        let lin = zones.iter().filter(|z| z.kind == "line").count();
+        alloc::format!("{} include · {} exclude · {} linie", inc, exc, lin)
+    };
+    let camera_card = card(
+        Some(&alloc::format!("{} · widok kamery", camera.name)),
+        vec![
+            empty_state("Kadr kamery", Some(&zone_summary), Some("cameras")),
+            text_styled(
+                "Strefy zapisane są jako współrzędne wielokąta (0–100% kadru) i renderowane przez silnik analityki na żywym podglądzie (zakładka Live view).",
+                "caption",
+            ),
+        ],
+    );
+
+    let mut right_children = vec![
+        stack_h(vec![
+            heading(4, "Strefy na tej kamerze"),
+            button_with_icon("Nowa strefa", "zone-add-start", "primary", "plus"),
+        ]),
+    ];
+    if zone_form_visible {
+        right_children.push(build_zone_form());
+    }
+    if let Some(pending) = &pending_remove {
+        if zones.iter().any(|z| &z.id == pending) {
+            right_children.push(build_zone_remove_confirm(pending, &zones));
+        } else {
+            with_state(|s| s.zones.zone_pending_remove = None);
         }
     }
-    if drawing_mode && !drawing_points.is_empty() {
-        let pts: Vec<Value> = drawing_points.iter().map(|p| Value::Array(vec![Value::F64(p.x), Value::F64(p.y)])).collect();
-        canvas_commands.push(Value::Map(vec![
-            (Value::Text("type".into()), Value::Text("polyline".into())),
-            (Value::Text("points".into()), Value::Array(pts)),
-            (Value::Text("stroke".into()), Value::Text("yellow".into())),
-        ]));
+    if zones.is_empty() {
+        right_children.push(empty_state("Brak stref", Some("Dodaj strefę include/exclude lub linię przekroczenia."), Some("zones")));
+    } else {
+        let rows: Vec<Value> = zones.iter().map(zone_table_row_value).collect();
+        if let Ok(mut g) = PENDING_ZONE_ROWS.lock() { *g = Some(Value::Array(rows)); }
+        right_children.push(build_zones_table());
     }
 
-    let canvas_comp = canvas(canvas_commands);
+    children.push(grid(2, vec![camera_card, card(None, right_children)]));
 
-    let zone_list: Vec<Component> = zones.iter().map(|z| {
-        let is_sel = selected_id.as_deref() == Some(&z.id);
-        let label = alloc::format!("{} ({})", z.name, z.zone_type);
-        if is_sel { chip_with_icon(&label, "status", "check") } else { chip(&label, "category") }
-    }).collect();
+    // --- Weekly schedule grid ---
+    children.push(build_schedule_card(&camera.id));
 
-    let mut right_panel = vec![stack_v_gap("xs", zone_list)];
-    if drawing_mode {
-        right_panel.push(stack_h(vec![
-            button("Zakończ", "zone-finish-drawing", "primary"),
-            button("Anuluj", "zone-cancel-drawing", "ghost"),
-        ]));
+    // --- Composite rules ---
+    children.push(build_rules_card(&camera.id, rule_form_visible));
+
+    stack_v(children)
+}
+
+fn zone_table_row_value(z: &db::ZoneRow) -> Value {
+    let verts = serde_json::from_str::<JsonValue>(&z.polygon).ok()
+        .and_then(|v| v.as_array().map(|a| a.len())).unwrap_or(0);
+    Value::Map(vec![
+        (Value::Text("zone_id".into()), Value::Text(z.id.clone())),
+        (Value::Text("name".into()), Value::Text(z.name.clone())),
+        (Value::Text("kind".into()), zone_kind_cell(&z.kind)),
+        (Value::Text("verts".into()), Value::Text(alloc::format!("{} pkt", verts))),
+    ])
+}
+
+fn build_zones_table() -> Component {
+    let columns = vec![
+        model_table_column("name", "Strefa", ColumnRender::Text),
+        model_table_column("kind", "Typ", ColumnRender::Chip),
+        model_table_column("verts", "Wierzchołki", ColumnRender::Text),
+    ];
+    let remove_action = button("Usuń", "zone-row-select", "destructive");
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("zones_rows".into())]),
+        row_key_field: "zone_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// Add-zone form: name, kind (include/exclude/line) and the polygon coordinates
+/// as a JSON list of `[x, y]` points in 0–100 frame percentages. No fake drawing
+/// canvas — the coordinates are the real persisted geometry.
+fn build_zone_form() -> Component {
+    let fields = card(Some("Nowa strefa"), vec![
+        zone_input("Nazwa", "np. Peron główny", "zone_name"),
+        zone_select("Typ strefy", zone_kind_options(), "zone_kind"),
+        zone_input("Wielokąt [x,y] (0–100%)", "[[15,40],[60,40],[60,85],[15,85]]", "zone_polygon"),
+        text_styled("Współrzędne w procentach kadru. include = obszar detekcji, exclude = obszar ignorowany, line = linia przekroczenia (2 punkty).", "caption"),
+    ]);
+    let actions = stack_h(vec![
+        button("Zapisz strefę", "zone-add-submit", "primary"),
+        button("Anuluj", "zone-form-cancel", "ghost"),
+    ]);
+    card(None, vec![fields, actions])
+}
+
+fn zone_kind_options() -> Vec<SelectOption> {
+    [("include", "include — obszar detekcji"), ("exclude", "exclude — obszar ignorowany"), ("line", "line — linia przekroczenia")]
+        .iter()
+        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
+        .collect()
+}
+
+fn zone_input(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend { action_id: "zone-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+fn zone_select(label: &str, options: Vec<SelectOption>, field: &str) -> Component {
+    let mut comp = select(label, options, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend { action_id: "zone-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+fn build_zone_remove_confirm(zone_id: &str, zones: &[db::ZoneRow]) -> Component {
+    let name = zones.iter().find(|z| z.id == zone_id).map(|z| z.name.as_str()).unwrap_or(zone_id);
+    let mut params = CborMap::default();
+    params.0.push(("zone_id".into(), Value::Text(zone_id.into())));
+    let confirm_btn = button_with_params("Usuń", "zone-remove", "destructive", params);
+    let cancel_btn = button("Anuluj", "zone-remove-cancel", "ghost");
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Usunąć strefę \"{}\"?", name), "body_strong"),
+        stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// Weekly schedule grid (5 hour bands × 7 days). Each cell is a toned chip
+/// reflecting the persisted profile assignment; clicking a cell cycles
+/// off → day → night → off and persists the whole grid as JSON.
+fn build_schedule_card(camera_id: &str) -> Component {
+    let grid_data = parse_schedule(db::get_schedule(camera_id).ok().flatten().as_deref());
+
+    let legend = stack_h(vec![
+        chip_toned("Profil dzienny", "info"),
+        chip_toned("Profil nocny", "err"),
+        chip_toned("Wyłączone", "muted"),
+    ]);
+
+    // Header row: empty corner + weekday labels.
+    let mut header_cells = vec![text_styled("", "caption")];
+    for d in SCHEDULE_DAYS { header_cells.push(text_styled(d, "body_strong")); }
+    let mut grid_children: Vec<Component> = vec![grid(8, header_cells)];
+
+    for (b, band) in SCHEDULE_BANDS.iter().enumerate() {
+        let mut row_cells = vec![text_styled(band, "caption")];
+        for d in 0..SCHEDULE_DAYS.len() {
+            let code = grid_data[b][d].as_str();
+            let (label, tone) = match code {
+                "day" => ("dzień", "info"),
+                "night" => ("noc", "err"),
+                _ => ("—", "muted"),
+            };
+            let mut params = CborMap::default();
+            params.0.push(("band".into(), Value::Text(alloc::format!("{}", b))));
+            params.0.push(("day".into(), Value::Text(alloc::format!("{}", d))));
+            // A toned chip-button so the cell shows its profile and is clickable.
+            row_cells.push(schedule_cell_button(label, tone, params));
+        }
+        grid_children.push(grid(8, row_cells));
     }
 
-    let main_area = grid(2, vec![canvas_comp, stack_v(right_panel)]);
-    stack_v(vec![messages, toolbar, main_area])
+    card_with_icon_action(
+        &alloc::format!("Harmonogram tygodniowy profili"),
+        "calendar",
+        None,
+        vec![legend, stack_v_gap("xs", grid_children)],
+    )
+}
+
+/// One schedule cell rendered as a small toned button so a click cycles the
+/// profile and the new grid is persisted.
+fn schedule_cell_button(label: &str, tone: &str, params: CborMap) -> Component {
+    let variant = match tone { "info" => "primary", "err" => "destructive", _ => "ghost" };
+    button_with_params(label, "schedule-cell-toggle", variant, params)
+}
+
+/// Composite-rules section: a Table of persisted rules + an add-rule form.
+fn build_rules_card(camera_id: &str, form_visible: bool) -> Component {
+    let rules = db::list_rules(camera_id).unwrap_or_default();
+    let mut children = vec![stack_h(vec![
+        heading(4, "Reguły kompozytowe (AND/OR detektorów)"),
+        button_with_icon("Nowa reguła", "rule-add-start", "primary", "plus"),
+    ])];
+
+    if form_visible {
+        children.push(build_rule_form());
+    }
+
+    if rules.is_empty() {
+        children.push(empty_state("Brak reguł", Some("Dodaj regułę kompozytową łączącą detektory i strefy wyrażeniem AND/OR."), Some("zones")));
+    } else {
+        let rows: Vec<Value> = rules.iter().map(rule_table_row_value).collect();
+        if let Ok(mut g) = PENDING_RULE_ROWS.lock() { *g = Some(Value::Array(rows)); }
+        children.push(build_rules_table());
+    }
+    card(None, children)
+}
+
+/// Decodes a rule row's JSON config (`{expr, action, enabled}`) for display.
+fn rule_table_row_value(r: &db::ZoneRow) -> Value {
+    let cfg: JsonValue = serde_json::from_str(&r.polygon).unwrap_or(JsonValue::Null);
+    let expr = cfg.get("expr").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let action = cfg.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let enabled = cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    Value::Map(vec![
+        (Value::Text("rule_id".into()), Value::Text(r.id.clone())),
+        (Value::Text("name".into()), Value::Text(r.name.clone())),
+        (Value::Text("expr".into()), Value::Text(if expr.is_empty() { "\u{2014}".into() } else { expr })),
+        (Value::Text("action".into()), Value::Text(if action.is_empty() { "\u{2014}".into() } else { action })),
+        (Value::Text("enabled".into()), if enabled { chip_cell("aktywna", "ok") } else { chip_cell("wyłączona", "muted") }),
+    ])
+}
+
+fn build_rules_table() -> Component {
+    let columns = vec![
+        model_table_column("name", "Nazwa", ColumnRender::Text),
+        model_table_column("expr", "Wyrażenie", ColumnRender::Text),
+        model_table_column("action", "Akcja", ColumnRender::Text),
+        model_table_column("enabled", "Aktywna", ColumnRender::Chip),
+    ];
+    let remove_action = button("Usuń", "rule-row-select", "destructive");
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("rules_rows".into())]),
+        row_key_field: "rule_id".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![remove_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+fn build_rule_form() -> Component {
+    let fields = card(Some("Nowa reguła"), vec![
+        rule_input("Nazwa", "np. Bagaż + pusta strefa", "rule_name"),
+        rule_input("Wyrażenie", "D3.luggage(unowned>90s) AND zone.peron AND not zone.lawka", "rule_expr"),
+        rule_input("Akcja", "np. Alarm krytyczny + SMS", "rule_action"),
+    ]);
+    let actions = stack_h(vec![
+        button("Zapisz regułę", "rule-add-submit", "primary"),
+        button("Anuluj", "rule-form-cancel", "ghost"),
+    ]);
+    card(None, vec![fields, actions])
+}
+
+fn rule_input(label: &str, placeholder: &str, field: &str) -> Component {
+    let mut comp = input(label, placeholder, field);
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend { action_id: "rule-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+    )]));
+    comp
+}
+
+/// Seeds the bound store keys for the Zones tab so the camera selector and any
+/// open form mount with their current values.
+fn zones_overlay() -> Vec<StateEntry> {
+    with_state(|s| {
+        let z = &s.zones;
+        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
+        let mut entries = vec![
+            key("zone_camera_select", Value::Text(z.selected_camera_id.clone().unwrap_or_default())),
+        ];
+        if z.zone_form_visible {
+            entries.push(key("zone_name", Value::Text(z.form_name.clone())));
+            entries.push(key("zone_kind", Value::Text(z.form_kind.clone())));
+            entries.push(key("zone_polygon", Value::Text(z.form_polygon.clone())));
+        }
+        if z.rule_form_visible {
+            entries.push(key("rule_name", Value::Text(z.rule_name.clone())));
+            entries.push(key("rule_expr", Value::Text(z.rule_expr.clone())));
+            entries.push(key("rule_action", Value::Text(z.rule_action.clone())));
+        }
+        entries
+    })
+}
+
+/// Actor attributed to zone/schedule/rule audit entries (no host identity fn).
+const ZONE_ACTOR: &str = "administrator";
+
+/// Compact JSON snapshot of a zone row for the audit before/after fields.
+fn zone_audit_json(z: &db::ZoneRow) -> String {
+    json!({ "id": z.id, "camera_id": z.camera_id, "name": z.name, "kind": z.kind, "polygon": z.polygon }).to_string()
+}
+
+fn handle_zone_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(v) = value {
+        with_state(|s| match field {
+            "zone_name" => s.zones.form_name = v,
+            "zone_kind" => s.zones.form_kind = v,
+            "zone_polygon" => s.zones.form_polygon = v,
+            _ => {}
+        });
+    }
+    json!({"ok":true})
+}
+
+/// Creates a zone for the selected camera. Validates the polygon JSON (array of
+/// `[x, y]` numeric pairs; line needs ≥2, include/exclude need ≥3), persists it
+/// and writes a `zone_change` audit entry.
+fn handle_zone_add_submit() -> JsonValue {
+    let (camera_id, name, kind, polygon) = with_state(|s| (
+        s.zones.selected_camera_id.clone(),
+        s.zones.form_name.trim().to_string(),
+        s.zones.form_kind.trim().to_string(),
+        s.zones.form_polygon.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+
+    let camera_id = match camera_id {
+        Some(c) => c,
+        None => { with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into())); render_panel("zones"); return json!({"ok":false}); }
+    };
+    if name.is_empty() || name.chars().count() > 80 {
+        with_state(|s| s.error_message = Some("Nazwa strefy musi mieć 1–80 znaków.".into()));
+        render_panel("zones");
+        return json!({"ok":false,"error":"invalid name"});
+    }
+    let kind = if matches!(kind.as_str(), "include" | "exclude" | "line") { kind } else { "include".into() };
+    let pts = match serde_json::from_str::<JsonValue>(&polygon).ok().and_then(|v| v.as_array().cloned()) {
+        Some(a) => a,
+        None => { with_state(|s| s.error_message = Some("Wielokąt musi być tablicą JSON par [x,y].".into())); render_panel("zones"); return json!({"ok":false,"error":"invalid polygon"}); }
+    };
+    let valid_pts = pts.iter().all(|p| p.as_array().map(|c| c.len() == 2 && c.iter().all(|n| n.is_number())).unwrap_or(false));
+    let min_pts = if kind == "line" { 2 } else { 3 };
+    if !valid_pts || pts.len() < min_pts {
+        with_state(|s| s.error_message = Some(alloc::format!("Wielokąt wymaga co najmniej {} prawidłowych punktów [x,y].", min_pts)));
+        render_panel("zones");
+        return json!({"ok":false,"error":"too few points"});
+    }
+    let polygon_canon = serde_json::to_string(&JsonValue::Array(pts)).unwrap_or_else(|_| "[]".into());
+
+    let new_zone = db::NewZone { camera_id: camera_id.clone(), name: name.clone(), kind: kind.clone(), polygon: polygon_canon.clone() };
+    match db::insert_zone(&new_zone) {
+        Ok(id) => {
+            let after = db::get_zone(&id).ok().flatten().map(|z| zone_audit_json(&z)).unwrap_or_else(|| "null".into());
+            let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, "null", &after);
+            with_state(|s| { s.zones.zone_form_visible = false; s.success_message = Some(alloc::format!("Strefa zapisana ({}).", id)); });
+            render_panel("zones");
+            json!({"ok":true,"zone_id":id})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu strefy: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+    }
+}
+
+fn handle_zone_remove(params: &JsonValue) -> JsonValue {
+    let id = params.get("zone_id").and_then(|v| v.as_str()).or_else(|| params.get("row_id").and_then(|v| v.as_str())).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() { return json!({"ok":false,"error":"empty zone_id"}); }
+    let before = db::get_zone(&id).ok().flatten().map(|z| zone_audit_json(&z)).unwrap_or_else(|| "null".into());
+    match db::delete_zone(&id) {
+        Ok(_) => {
+            let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, &before, "null");
+            with_state(|s| { s.zones.zone_pending_remove = None; s.success_message = Some("Strefa usunięta.".into()); });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+    }
+}
+
+/// Cycles one schedule cell off → day → night → off and persists the whole grid.
+fn handle_schedule_cell_toggle(params: &JsonValue) -> JsonValue {
+    let parse_idx = |k: &str| params.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or(-1);
+    let band = parse_idx("band");
+    let day = parse_idx("day");
+    let camera_id = match with_state(|s| s.zones.selected_camera_id.clone()) { Some(c) => c, None => return json!({"ok":false}) };
+    if band < 0 || day < 0 || band as usize >= SCHEDULE_BANDS.len() || day as usize >= SCHEDULE_DAYS.len() {
+        return json!({"ok":false,"error":"out of range"});
+    }
+    let mut grid = parse_schedule(db::get_schedule(&camera_id).ok().flatten().as_deref());
+    let cell = &mut grid[band as usize][day as usize];
+    *cell = match cell.as_str() { "" => "day".into(), "day" => "night".into(), _ => String::new() };
+    let json_grid: Vec<JsonValue> = grid.iter().map(|row| JsonValue::Array(row.iter().map(|c| JsonValue::String(c.clone())).collect())).collect();
+    let grid_str = serde_json::to_string(&JsonValue::Array(json_grid)).unwrap_or_else(|_| "[]".into());
+    if db::set_schedule(&camera_id, &grid_str).is_ok() {
+        let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &alloc::format!("schedule:{}", camera_id), "", &grid_str);
+    }
+    render_panel("zones");
+    json!({"ok":true})
+}
+
+fn handle_rule_field_change(params: &JsonValue) -> JsonValue {
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
+    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if let Some(v) = value {
+        with_state(|s| match field {
+            "rule_name" => s.zones.rule_name = v,
+            "rule_expr" => s.zones.rule_expr = v,
+            "rule_action" => s.zones.rule_action = v,
+            _ => {}
+        });
+    }
+    json!({"ok":true})
+}
+
+fn handle_rule_add_submit() -> JsonValue {
+    let (camera_id, name, expr, action) = with_state(|s| (
+        s.zones.selected_camera_id.clone(),
+        s.zones.rule_name.trim().to_string(),
+        s.zones.rule_expr.trim().to_string(),
+        s.zones.rule_action.trim().to_string(),
+    ));
+    with_state(|s| s.clear_messages());
+    let camera_id = match camera_id { Some(c) => c, None => { with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into())); render_panel("zones"); return json!({"ok":false}); } };
+    if name.is_empty() || expr.is_empty() {
+        with_state(|s| s.error_message = Some("Reguła wymaga nazwy i wyrażenia.".into()));
+        render_panel("zones");
+        return json!({"ok":false,"error":"missing fields"});
+    }
+    let cfg = json!({ "expr": expr, "action": action, "enabled": true }).to_string();
+    match db::insert_rule(&camera_id, &name, &cfg) {
+        Ok(id) => {
+            let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, "null", &cfg);
+            with_state(|s| { s.zones.rule_form_visible = false; s.success_message = Some("Reguła zapisana.".into()); });
+            render_panel("zones");
+            json!({"ok":true,"rule_id":id})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu reguły: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+    }
+}
+
+fn handle_rule_remove(params: &JsonValue) -> JsonValue {
+    let id = params.get("row_id").and_then(|v| v.as_str()).or_else(|| params.get("rule_id").and_then(|v| v.as_str())).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() { return json!({"ok":false,"error":"empty rule_id"}); }
+    let before = db::get_zone(&id).ok().flatten().map(|z| z.polygon).unwrap_or_else(|| "null".into());
+    match db::delete_zone(&id) {
+        Ok(_) => {
+            let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, &before, "null");
+            with_state(|s| s.success_message = Some("Reguła usunięta.".into()));
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+    }
 }
 
 /// Default retention (in days) per risk class. Compliance floor for the audit

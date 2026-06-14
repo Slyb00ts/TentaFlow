@@ -33,5 +33,6 @@ module.exports = defineConfig({
     { name: 'tentavision-audit', testMatch: 'tentavision-audit.spec.js' },
     { name: 'tentavision-settings', testMatch: 'tentavision-settings.spec.js' },
     { name: 'tentavision-models', testMatch: 'tentavision-models.spec.js' },
+    { name: 'tentavision-zones', testMatch: 'tentavision-zones.spec.js' },
   ],
 });
