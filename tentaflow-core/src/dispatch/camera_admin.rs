@@ -605,6 +605,7 @@ async fn camera_add_onvif(
         "onvif",
         &resolved.rtsp_uri,
         target_fps as i64,
+        tentaflow_sdk_spec::protocol::camera::CAMERA_DEFAULT_ANALYSIS_FPS as i64,
         None,
         None,
         "C",

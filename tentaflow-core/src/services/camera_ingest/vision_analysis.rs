@@ -27,9 +27,40 @@ use crate::vision::classifier_stan::StateClassifier;
 use crate::vision::detector_rfdetr::RfDetrDetector;
 use crate::vision::ocr_plate::PlateOcr;
 
-/// Analysis cadence. Starts conservative (2 fps) — always-on CV on CPU does
-/// not need full frame rate for placard/label tracking.
-const ANALYSIS_INTERVAL: Duration = Duration::from_millis(500);
+/// Floor interval for `analysis_fps = 0` (unlimited). ~30 fps native cadence —
+/// a hard floor so the loop never busy-spins waiting on frames; inference on CPU
+/// is the real ceiling anyway.
+const UNLIMITED_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Default analysis cadence when no per-camera value is resolvable (10 fps).
+const DEFAULT_ANALYSIS_FPS: u32 = 10;
+
+/// How many ticks between re-reads of the per-camera `analysis_fps` from the
+/// core DB, so an operator's runtime FPS change takes effect without a session
+/// restart.
+const FPS_REFRESH_EVERY_TICKS: u32 = 30;
+
+/// Resolves the loop tick interval from a configured analysis FPS. `0` is
+/// unlimited (native cadence floored at [`UNLIMITED_INTERVAL`]); any other
+/// value maps to `1000 / fps` ms.
+fn interval_for_fps(fps: u32) -> Duration {
+    if fps == 0 {
+        UNLIMITED_INTERVAL
+    } else {
+        Duration::from_millis((1000 / fps.max(1)) as u64)
+    }
+}
+
+/// Reads the per-camera analysis FPS from the core DB, falling back to the
+/// default when no pool / row is available.
+fn resolve_analysis_fps(camera_id: &str) -> u32 {
+    match crate::db::global_pool() {
+        Some(pool) => {
+            crate::db::repository::camera_analysis_fps(&pool, camera_id).unwrap_or(DEFAULT_ANALYSIS_FPS)
+        }
+        None => DEFAULT_ANALYSIS_FPS,
+    }
+}
 
 /// Process-wide RF-DETR detector, loaded on first use. `tokio::sync::OnceCell`
 /// so a slow load (~hundreds of ms) does not block the async runtime, and a
@@ -177,12 +208,31 @@ fn spawn_analysis(camera_id: String) -> tokio::task::JoinHandle<()> {
         let classifier = get_classifier().await;
         // Optional: a missing OCR runner just leaves `tekst` empty.
         let ocr = get_ocr().await;
-        info!("[vision_analysis] starting analysis loop for {camera_id}");
+        let mut analysis_fps = resolve_analysis_fps(&camera_id);
+        info!(
+            "[vision_analysis] starting analysis loop for {camera_id} (analysis_fps={analysis_fps})"
+        );
 
-        let mut ticker = tokio::time::interval(ANALYSIS_INTERVAL);
+        let mut ticker = tokio::time::interval(interval_for_fps(analysis_fps));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticks_since_refresh: u32 = 0;
         loop {
             ticker.tick().await;
+
+            // Periodically re-read the per-camera FPS so a runtime change takes
+            // effect without restarting the session. Rebuild the ticker only
+            // when the value actually changed.
+            ticks_since_refresh += 1;
+            if ticks_since_refresh >= FPS_REFRESH_EVERY_TICKS {
+                ticks_since_refresh = 0;
+                let latest = resolve_analysis_fps(&camera_id);
+                if latest != analysis_fps {
+                    analysis_fps = latest;
+                    ticker = tokio::time::interval(interval_for_fps(analysis_fps));
+                    ticker
+                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
+            }
 
             let frame =
                 crate::addon::host_functions::camera::latest_frame_global(&camera_id).await;

@@ -44,10 +44,18 @@ pub struct CameraAddInput {
     pub credentials_b64: Option<String>,
     #[n(9)]
     pub onvif_profile_token: Option<String>,
+    /// Per-camera AI analysis frame rate honored by the always-on analysis
+    /// loop. `0` means unlimited (run at the native frame cadence). `None`
+    /// resolves to [`CAMERA_DEFAULT_ANALYSIS_FPS`].
+    #[n(10)]
+    pub analysis_fps: Option<u32>,
 }
 
 /// Legacy TOML default for `target_fps` when the payload omits it.
 pub const CAMERA_ADD_DEFAULT_TARGET_FPS: u32 = 30;
+
+/// Default AI analysis frame rate when `analysis_fps` is absent on the wire.
+pub const CAMERA_DEFAULT_ANALYSIS_FPS: u32 = 10;
 /// Legacy TOML default for `retention_class` when the payload omits it.
 pub const CAMERA_ADD_DEFAULT_RETENTION_CLASS: &str = "C";
 /// Legacy TOML default for `profile` when the payload omits it.
@@ -71,6 +79,11 @@ impl CameraAddInput {
         self.profile
             .clone()
             .unwrap_or_else(|| CAMERA_ADD_DEFAULT_PROFILE.to_string())
+    }
+
+    /// `analysis_fps` with the default applied when absent (`0` = unlimited).
+    pub fn analysis_fps_or_default(&self) -> u32 {
+        self.analysis_fps.unwrap_or(CAMERA_DEFAULT_ANALYSIS_FPS)
     }
 }
 
@@ -102,6 +115,17 @@ pub struct CameraUpdateInput {
     pub retention_class: Option<String>,
     #[n(6)]
     pub profile: Option<String>,
+    /// Patch the per-camera AI analysis frame rate. `Some(0)` = unlimited,
+    /// `None` leaves the stored value untouched.
+    #[n(7)]
+    pub analysis_fps: Option<u32>,
+}
+
+impl CameraUpdateInput {
+    /// `analysis_fps` with the default applied when absent (`0` = unlimited).
+    pub fn analysis_fps_or_default(&self) -> u32 {
+        self.analysis_fps.unwrap_or(CAMERA_DEFAULT_ANALYSIS_FPS)
+    }
 }
 
 /// Input for `camera_test_connection_v1`.
@@ -324,6 +348,7 @@ mod tests {
             profile: Some("default".into()),
             credentials_b64: Some("dXNlcjpwYXNz".into()),
             onvif_profile_token: Some("profile_1".into()),
+            analysis_fps: Some(5),
         });
     }
 
@@ -340,6 +365,7 @@ mod tests {
             profile: None,
             credentials_b64: None,
             onvif_profile_token: None,
+            analysis_fps: None,
         });
     }
 
@@ -356,6 +382,7 @@ mod tests {
             profile: None,
             credentials_b64: None,
             onvif_profile_token: None,
+            analysis_fps: None,
         };
         let mut buf = Vec::new();
         minicbor::encode(&minimal, &mut buf).unwrap();
@@ -363,6 +390,7 @@ mod tests {
         assert_eq!(decoded.target_fps_or_default(), 30);
         assert_eq!(decoded.retention_class_or_default(), "C");
         assert_eq!(decoded.profile_or_default(), "default");
+        assert_eq!(decoded.analysis_fps_or_default(), 10);
     }
 
     #[test]
