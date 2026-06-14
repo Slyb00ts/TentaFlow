@@ -33,6 +33,9 @@ inference-mlx-kokoro = ["dep:libloading"]
 # statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
 # dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization"]
+# RF-DETR ADR detector (ONNX via `ort`, CPU EP). Gates the whole detector
+# module + the per-camera always-on analysis loop. Build without it = no change.
+inference-vision-gpu = ["dep:ort", "dep:ndarray"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
