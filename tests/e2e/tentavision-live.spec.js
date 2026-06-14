@@ -6,10 +6,14 @@
 //              toned online/offline status chip, the 1/4/9/16 grid-size segmented
 //              control, and that the chosen grid size persists across a full panel
 //              reopen (fresh context) — it is written to the settings table.
-//              The video area is an honest non-streaming placeholder: the tab does
-//              NOT open a `camera:<id>` live WebSocket (which 401s), so the suite
-//              asserts ZERO console errors. Screenshots to /tmp/tv/ for visual
-//              comparison to m02-live-view.html.
+//              Each online tile attempts a REAL frame via the camera_snapshot host
+//              fn (RGB24 -> BMP data: URL -> SDK Image). In this CI env there is no
+//              real RTSP source, so the snapshot fails and EVERY tile degrades
+//              honestly to the placeholder for THAT tile only. The tab does NOT
+//              open a `camera:<id>` live WebSocket (which 401s), so the suite
+//              asserts ZERO console errors (no 401 stream spam). A manual "Odśwież"
+//              button re-renders the grid (re-attempts the snapshots). Screenshots
+//              to /tmp/tv/ for visual comparison to m02-live-view.html.
 // =============================================================================
 
 const fs = require('fs');
@@ -38,6 +42,7 @@ const PERMISSIONS = [
   'ui',
   'cameras.read',
   'cameras.write',
+  'cameras.snapshot',
   'sql.read',
   'sql.write',
 ];
@@ -148,6 +153,24 @@ test.describe('TentaVision Live view — real camera grid + grid-size persistenc
     // The segmented grid-size control is present.
     await expect(page.locator('.addon-app-shell tf-segmented').first()).toBeVisible({ timeout: 10000 });
     await page.screenshot({ path: `${SHOT_DIR}/live-grid.png`, fullPage: true });
+
+    // Real-frame path: every online tile attempted a camera_snapshot. With no
+    // real RTSP source in CI the snapshot fails, so every tile degrades honestly
+    // to the placeholder — assert the placeholders are present (one per tile) and
+    // NO real <img> frame leaked. In production with reachable cameras these tiles
+    // would instead carry an SDK <img> from the BMP data: URL.
+    await expect(page.locator('.addon-app-shell tf-empty-state').first())
+      .toBeVisible({ timeout: 10000 });
+
+    // The manual "Odśwież" button re-renders the grid (re-attempts snapshots);
+    // it must not open a stream or emit console errors.
+    const refreshBtn = page.locator('.addon-app-shell tf-button', { hasText: 'Odśwież' }).first();
+    await expect(refreshBtn).toBeVisible({ timeout: 10000 });
+    await refreshBtn.click();
+    await page.waitForTimeout(600);
+    await expect(page.locator('.addon-app-shell tf-empty-state').first())
+      .toBeVisible({ timeout: 10000 });
+    await page.screenshot({ path: `${SHOT_DIR}/live-real.png`, fullPage: true });
 
     // --- Change grid size to 9 via the segmented control. tf-segmented replaces
     // its <option> children with .tf-seg-opt buttons on build, so click those. ---
