@@ -936,6 +936,185 @@ pub fn verify_audit_chain() -> Result<ChainStatus, AbiError> {
 }
 
 // =============================================================================
+// Zones CRUD (detection / exclusion / line zones drawn on a camera)
+// =============================================================================
+
+/// A detection zone row as persisted in SQLite. `kind` is one of
+/// include/exclude/line; `polygon` is a JSON array of `[x, y]` points (in 0..100
+/// percentage coordinates relative to the camera frame). The synthetic kinds
+/// `schedule` and `rule` reuse this same table (one schedule row per camera, one
+/// row per composite rule) with their config carried in `polygon` as JSON.
+#[derive(Debug, Clone)]
+pub struct ZoneRow {
+    pub id: String,
+    pub camera_id: String,
+    pub name: String,
+    pub kind: String,
+    pub polygon: String,
+    pub created_at: i64,
+}
+
+/// Fields needed to create a zone. id/created_at are filled by `insert_zone`.
+#[derive(Debug, Clone)]
+pub struct NewZone {
+    pub camera_id: String,
+    pub name: String,
+    pub kind: String,
+    pub polygon: String,
+}
+
+const ZONE_COLS: &str = "id, camera_id, name, kind, polygon, created_at";
+
+fn row_to_zone(r: &Row) -> ZoneRow {
+    let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
+    ZoneRow {
+        id: g(0).as_str().into(),
+        camera_id: g(1).as_str().into(),
+        name: g(2).as_str().into(),
+        kind: g(3).as_str().into(),
+        polygon: g(4).as_str().into(),
+        created_at: g(5).as_i64(),
+    }
+}
+
+/// Lists the geometric zones (include/exclude/line) of a camera, oldest first.
+/// The synthetic `schedule`/`rule` kinds are excluded so the zone list/canvas
+/// only ever sees real drawable zones.
+pub fn list_zones(camera_id: &str) -> Result<Vec<ZoneRow>, AbiError> {
+    let sql = alloc::format!(
+        "SELECT {ZONE_COLS} FROM zones \
+         WHERE camera_id = ?1 AND kind IN ('include', 'exclude', 'line') \
+         ORDER BY created_at, id"
+    );
+    let rows = query(&sql, &[SqlValue::Text(camera_id.into())])?;
+    Ok(rows.iter().map(row_to_zone).collect())
+}
+
+/// Fetches a single zone by id, or None.
+pub fn get_zone(id: &str) -> Result<Option<ZoneRow>, AbiError> {
+    let sql = alloc::format!("SELECT {ZONE_COLS} FROM zones WHERE id = ?1");
+    let rows = query(&sql, &[SqlValue::Text(id.into())])?;
+    Ok(rows.first().map(row_to_zone))
+}
+
+/// Inserts a new zone, returning its generated id. created_at is stamped from
+/// the authoritative SQLite clock.
+pub fn insert_zone(z: &NewZone) -> Result<String, AbiError> {
+    let id = generate_id("zone");
+    let now = now_secs();
+    exec(
+        "INSERT INTO zones (id, camera_id, name, kind, polygon, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(z.camera_id.clone()),
+            SqlValue::Text(z.name.clone()),
+            SqlValue::Text(z.kind.clone()),
+            SqlValue::Text(z.polygon.clone()),
+            SqlValue::I64(now),
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Updates an existing zone in place (created_at is immutable).
+pub fn update_zone(z: &ZoneRow) -> Result<u64, AbiError> {
+    exec(
+        "UPDATE zones SET camera_id = ?2, name = ?3, kind = ?4, polygon = ?5 WHERE id = ?1",
+        &[
+            SqlValue::Text(z.id.clone()),
+            SqlValue::Text(z.camera_id.clone()),
+            SqlValue::Text(z.name.clone()),
+            SqlValue::Text(z.kind.clone()),
+            SqlValue::Text(z.polygon.clone()),
+        ],
+    )
+}
+
+/// Deletes a zone by id. Returns rows affected (0 if it did not exist).
+pub fn delete_zone(id: &str) -> Result<u64, AbiError> {
+    exec("DELETE FROM zones WHERE id = ?1", &[SqlValue::Text(id.into())])
+}
+
+// =============================================================================
+// Weekly schedule (one row per camera, kind='schedule', polygon = JSON grid)
+// =============================================================================
+
+/// Reads the persisted weekly schedule JSON for a camera (the `polygon` column of
+/// the camera's `kind='schedule'` row), or None when no schedule was ever saved.
+/// The JSON is a 5×7 array of profile codes (`""`/`day`/`night`) — the row index
+/// is the hour band, the column index is the weekday.
+pub fn get_schedule(camera_id: &str) -> Result<Option<String>, AbiError> {
+    let sql = "SELECT polygon FROM zones WHERE camera_id = ?1 AND kind = 'schedule' LIMIT 1";
+    let rows = query(sql, &[SqlValue::Text(camera_id.into())])?;
+    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+}
+
+/// Upserts the weekly schedule JSON for a camera. There is at most one
+/// `kind='schedule'` row per camera; this replaces its grid in place or inserts a
+/// fresh row stamped from the SQLite clock.
+pub fn set_schedule(camera_id: &str, grid_json: &str) -> Result<(), AbiError> {
+    let existing = query(
+        "SELECT id FROM zones WHERE camera_id = ?1 AND kind = 'schedule' LIMIT 1",
+        &[SqlValue::Text(camera_id.into())],
+    )?;
+    if let Some(id) = existing.first().and_then(|r| r.first()).map(SqlValue::as_str) {
+        exec(
+            "UPDATE zones SET polygon = ?2 WHERE id = ?1",
+            &[SqlValue::Text(id.into()), SqlValue::Text(grid_json.into())],
+        )?;
+    } else {
+        let id = generate_id("sched");
+        let now = now_secs();
+        exec(
+            "INSERT INTO zones (id, camera_id, name, kind, polygon, created_at) \
+             VALUES (?1, ?2, 'schedule', 'schedule', ?3, ?4)",
+            &[
+                SqlValue::Text(id),
+                SqlValue::Text(camera_id.into()),
+                SqlValue::Text(grid_json.into()),
+                SqlValue::I64(now),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Composite rules (kind='rule', polygon = JSON {name, expr, action, enabled})
+// =============================================================================
+
+/// Lists composite rule rows for a camera (kind='rule'), oldest first. Each
+/// row's `polygon` carries the rule JSON; the caller decodes it.
+pub fn list_rules(camera_id: &str) -> Result<Vec<ZoneRow>, AbiError> {
+    let sql = alloc::format!(
+        "SELECT {ZONE_COLS} FROM zones WHERE camera_id = ?1 AND kind = 'rule' \
+         ORDER BY created_at, id"
+    );
+    let rows = query(&sql, &[SqlValue::Text(camera_id.into())])?;
+    Ok(rows.iter().map(row_to_zone).collect())
+}
+
+/// Inserts a composite rule for a camera, returning its generated id. The rule
+/// config (name/expr/action/enabled) is JSON-encoded by the caller into `cfg`.
+pub fn insert_rule(camera_id: &str, name: &str, cfg: &str) -> Result<String, AbiError> {
+    let id = generate_id("rule");
+    let now = now_secs();
+    exec(
+        "INSERT INTO zones (id, camera_id, name, kind, polygon, created_at) \
+         VALUES (?1, ?2, ?3, 'rule', ?4, ?5)",
+        &[
+            SqlValue::Text(id.clone()),
+            SqlValue::Text(camera_id.into()),
+            SqlValue::Text(name.into()),
+            SqlValue::Text(cfg.into()),
+            SqlValue::I64(now),
+        ],
+    )?;
+    Ok(id)
+}
+
+// =============================================================================
 // Settings (key/value)
 // =============================================================================
 
