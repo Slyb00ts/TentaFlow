@@ -307,6 +307,13 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             aliases::alias_list_owned_v1,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja alias_list_owned_v1: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "alias_list_available_v1",
+            aliases::alias_list_available_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja alias_list_available_v1: {e}"))?;
 
     // --- Camera API (F1a M1.W6 — TentaVision camera ingest) ---
     #[cfg(feature = "camera")]

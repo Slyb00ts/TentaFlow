@@ -417,7 +417,28 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_visibility_changes",
             MigrationStep::Sql(MODEL_VISIBILITY_CHANGES),
         ),
+        (
+            76,
+            "model_aliases_methods_column",
+            MigrationStep::Rust(model_aliases_add_methods_column),
+        ),
     ]
+}
+
+/// Adds the `methods` column to `model_aliases`. Methods are declared in the
+/// owner addon's `[[alias]].methods` manifest list and were previously parsed
+/// but never persisted, so a consumer addon had no way to learn which capability
+/// (detect/recognize/embed/...) an alias serves. The column stores the methods
+/// as a JSON array string; an empty list is the default for manual aliases and
+/// addons that declare no methods. Idempotent — guarded by a column probe so a
+/// re-run on an already-migrated database is a no-op.
+fn model_aliases_add_methods_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_aliases", "methods")? {
+        conn.execute_batch(
+            "ALTER TABLE model_aliases ADD COLUMN methods TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+    Ok(())
 }
 
 /// Removes the legacy sub-flow harness rows (`…011` TentaFlow Harness, `…013`

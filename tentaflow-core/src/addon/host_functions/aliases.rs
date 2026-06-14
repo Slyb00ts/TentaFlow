@@ -402,6 +402,117 @@ pub fn alias_list_owned_v1(
 }
 
 // =============================================================================
+// Internal logic — alias_list_available
+// =============================================================================
+
+/// Output schema for `alias_list_available_v1` array elements. Mirrors the
+/// `DbAvailableAlias` repository row 1:1.
+#[derive(Debug, Serialize)]
+struct AvailableAliasOut {
+    alias_id: String,
+    target_model: Option<String>,
+    methods: Vec<String>,
+    strategy: Option<String>,
+    grant_status: String,
+    visibility: Option<String>,
+    active: bool,
+    required: bool,
+}
+
+/// Include-policy: returns ALL `[[uses_alias]]` declarations of the calling
+/// addon with their honest reconciled `grant_status` — `granted`,
+/// `auto_granted`, `pending` and `denied` rows are ALL surfaced. This is a
+/// deliberate choice: the addon UI must be able to distinguish "you may use
+/// this" (granted/auto_granted) from "ask an admin" (pending/denied) rather
+/// than silently hiding ungranted entries, which would look like the alias does
+/// not exist. The actual resolve gate at call time still enforces the grant
+/// (`resolve_model_alias_for_addon`), so listing a `pending`/`denied` entry
+/// here never grants access — it only informs the operator.
+fn do_alias_list_available(
+    db: &DbPool,
+    caller_addon_id: &str,
+) -> Result<Vec<AvailableAliasOut>, AbiError> {
+    let rows = crate::db::repository::list_addon_available_aliases(db, caller_addon_id)
+        .map_err(|_| AbiError::Operation)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AvailableAliasOut {
+            alias_id: r.alias_id,
+            target_model: r.target_model,
+            methods: r.methods,
+            strategy: r.strategy,
+            grant_status: r.grant_status,
+            visibility: r.visibility,
+            active: r.active,
+            required: r.required,
+        })
+        .collect())
+}
+
+// =============================================================================
+// Host function: alias_list_available_v1
+// =============================================================================
+
+/// ABI: (out_ptr, out_cap, out_len_ptr) -> i32
+///
+/// Returns `{"aliases":[AvailableAlias,...]}` — the aliases/models the calling
+/// addon declared via `[[uses_alias]]`, each joined with the concrete resolved
+/// target model, capability methods, routing strategy, owner visibility, active
+/// flag and the reconciled grant status. Unlike `alias_list_owned_v1` (which
+/// lists what the addon CREATED), this lists what the addon may CONSUME from the
+/// access-control grant system. See `do_alias_list_available` for the
+/// include-policy (all statuses surfaced, gate enforced at call time).
+pub fn alias_list_available_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+
+    if !check_permission(caller.data(), PERM_ALIAS_READ, None) {
+        audit(
+            caller.data(),
+            "alias.list_available",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+
+    let list = match do_alias_list_available(&db, &addon_id) {
+        Ok(v) => v,
+        Err(e) => {
+            let (result_kind, reason) = audit_outcome_for_error(e, false);
+            audit(
+                caller.data(),
+                "alias.list_available",
+                None,
+                result_kind,
+                Some(reason),
+            );
+            return e.as_i32();
+        }
+    };
+
+    audit(caller.data(), "alias.list_available", None, "ok", None);
+
+    let response = json!({ "aliases": list });
+    let bytes = match serde_json::to_vec(&response) {
+        Ok(b) => b,
+        Err(_) => return AbiError::Operation.as_i32(),
+    };
+    write_output_with_retry_semantics(&memory, &mut caller, &bytes, out_ptr, out_cap, out_len_ptr)
+}
+
+// =============================================================================
 // Public test surface — invoked from `tests/alias_host_functions.rs`
 // =============================================================================
 
@@ -428,6 +539,15 @@ pub mod test_api {
         caller_addon_id: &str,
     ) -> Result<JsonValue, AbiError> {
         let list = do_alias_list_owned(db, caller_addon_id)?;
+        Ok(json!({ "aliases": list }))
+    }
+
+    #[doc(hidden)]
+    pub fn alias_list_available_internal(
+        db: &DbPool,
+        caller_addon_id: &str,
+    ) -> Result<JsonValue, AbiError> {
+        let list = do_alias_list_available(db, caller_addon_id)?;
         Ok(json!({ "aliases": list }))
     }
 }

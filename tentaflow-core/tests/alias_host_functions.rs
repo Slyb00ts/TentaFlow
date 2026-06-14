@@ -291,3 +291,85 @@ fn alias_get_payload_too_large_rejected() {
     let err = test_api::alias_get_internal(&db, &huge, "addon-x").unwrap_err();
     assert_eq!(err, AbiError::PayloadTooLarge);
 }
+
+// =============================================================================
+// alias_list_available
+// =============================================================================
+
+/// Writes a `[[uses_alias]]` declaration row directly. Mirrors what the install
+/// path produces in `addon_uses_alias`.
+fn insert_uses_alias(db: &DbPool, addon_id: &str, alias: &str, status: &str, required: bool) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO addon_uses_alias \
+            (addon_id, alias_target_name, required, reason, grant_status, created_at) \
+         VALUES (?1, ?2, ?3, 'test', ?4, strftime('%s','now'))",
+        rusqlite::params![addon_id, alias, required as i64, status],
+    )
+    .unwrap();
+}
+
+fn set_alias_methods(db: &DbPool, alias: &str, methods: &[&str]) {
+    let conn = db.lock().unwrap();
+    let json = serde_json::to_string(methods).unwrap();
+    conn.execute(
+        "UPDATE model_aliases SET methods = ?1 WHERE alias = ?2",
+        rusqlite::params![json, alias],
+    )
+    .unwrap();
+}
+
+#[test]
+fn alias_list_available_joins_target_methods_and_status() {
+    let db = make_core_db();
+    // Owner installs the alias (addon owns + consumes it → auto_granted view).
+    install_addon_alias(&db, "vision", "vision-yolo", "yolo11m");
+    set_alias_methods(&db, "vision-yolo", &["detect", "track"]);
+    insert_uses_alias(&db, "vision", "vision-yolo", "auto_granted", true);
+
+    let out = test_api::alias_list_available_internal(&db, "vision").unwrap();
+    let arr = out["aliases"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let item = &arr[0];
+    assert_eq!(item["alias_id"], "vision-yolo");
+    assert_eq!(item["target_model"], "yolo11m");
+    assert_eq!(item["grant_status"], "auto_granted");
+    assert_eq!(item["active"], true);
+    assert_eq!(item["required"], true);
+    let methods: Vec<String> = serde_json::from_value(item["methods"].clone()).unwrap();
+    assert_eq!(methods, vec!["detect", "track"]);
+}
+
+#[test]
+fn alias_list_available_surfaces_pending_without_alias_row() {
+    let db = make_core_db();
+    // Consumer declared a uses_alias whose owner is not installed yet — the
+    // join is empty on the alias side, status stays pending, but the entry is
+    // still surfaced honestly with a null target_model.
+    insert_uses_alias(&db, "consumer", "absent-alias", "pending", false);
+
+    let out = test_api::alias_list_available_internal(&db, "consumer").unwrap();
+    let arr = out["aliases"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let item = &arr[0];
+    assert_eq!(item["alias_id"], "absent-alias");
+    assert_eq!(item["grant_status"], "pending");
+    assert!(item["target_model"].is_null());
+    assert_eq!(item["active"], false);
+    let methods: Vec<String> = serde_json::from_value(item["methods"].clone()).unwrap();
+    assert!(methods.is_empty());
+}
+
+#[test]
+fn alias_list_available_scoped_to_caller() {
+    let db = make_core_db();
+    install_addon_alias(&db, "a", "a-alias", "m-a");
+    insert_uses_alias(&db, "a", "a-alias", "auto_granted", false);
+    install_addon_alias(&db, "b", "b-alias", "m-b");
+    insert_uses_alias(&db, "b", "b-alias", "auto_granted", false);
+
+    let out = test_api::alias_list_available_internal(&db, "a").unwrap();
+    let arr = out["aliases"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["alias_id"], "a-alias");
+}

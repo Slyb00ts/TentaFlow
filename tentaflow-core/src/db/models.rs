@@ -99,6 +99,35 @@ pub struct DbAddonUses {
     pub grant_decided_at: Option<i64>,
 }
 
+/// One alias/model an addon is allowed to consume, joined from its
+/// `[[uses_alias]]` declaration (`addon_uses_alias`) with the resolved alias
+/// row (`model_aliases`) and its visibility. Drives the addon-facing
+/// `alias_list_available_v1` discovery host function: the addon learns the
+/// concrete target model, the capability methods, the grant status, and the
+/// owner-set visibility for each alias it declared it needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAvailableAlias {
+    /// Alias name the addon declared via `[[uses_alias]]`.
+    pub alias_id: String,
+    /// Concrete model the alias currently resolves to. `None` when the alias
+    /// row does not exist yet (declaration is `pending`, owner not installed).
+    pub target_model: Option<String>,
+    /// Capability methods (detect/recognize/embed/...) declared by the owner
+    /// addon. Empty when the alias has no methods or does not exist yet.
+    pub methods: Vec<String>,
+    /// Routing strategy of the resolved alias, if it exists.
+    pub strategy: Option<String>,
+    /// Reconciled grant state: `granted` / `auto_granted` / `pending` / `denied`.
+    pub grant_status: String,
+    /// Owner-set visibility (`private` / `restricted` / `public`) of the alias,
+    /// or `None` when the alias row does not exist yet.
+    pub visibility: Option<String>,
+    /// Whether the resolved alias row is active. `false` when missing or gated.
+    pub active: bool,
+    /// `true` when the consumer declared the alias as `required`.
+    pub required: bool,
+}
+
 /// Klaster nodow mesh
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCluster {
