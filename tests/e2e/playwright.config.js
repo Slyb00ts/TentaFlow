@@ -39,5 +39,6 @@ module.exports = defineConfig({
     { name: 'tentavision-reid', testMatch: 'tentavision-reid.spec.js' },
     { name: 'tentavision-bindings', testMatch: 'tentavision-bindings.spec.js' },
     { name: 'tentavision-onboarding', testMatch: 'tentavision-onboarding.spec.js' },
+    { name: 'tentavision-evidence', testMatch: 'tentavision-evidence.spec.js' },
   ],
 });
