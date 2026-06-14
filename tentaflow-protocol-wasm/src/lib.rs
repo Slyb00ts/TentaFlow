@@ -7199,6 +7199,19 @@ fn ml_studio_detail_to_js(d: &tentaflow_protocol::MlStudioProjectDetail) -> js_s
     item
 }
 
+fn ml_studio_member_to_js(m: &tentaflow_protocol::MlStudioProjectMember) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "userId", m.user_id.clone().into());
+    set(&item, "user_id", m.user_id.clone().into());
+    set(&item, "role", m.role.clone().into());
+    set(&item, "status", m.status.clone().into());
+    set(&item, "invitedBy", m.invited_by.clone().into());
+    set(&item, "invited_by", m.invited_by.clone().into());
+    set(&item, "createdAt", m.created_at.clone().into());
+    set(&item, "created_at", m.created_at.clone().into());
+    item
+}
+
 fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::MlStudioPayload) {
     match payload {
         tentaflow_protocol::MlStudioPayload::ProjectsListRequest(_) => {
@@ -7246,6 +7259,57 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 arr.push(&item);
             }
             set(obj, "types", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMembersListRequest(req) => {
+            set(obj, "variant", "MlStudioProjectMembersListRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMembersListResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectMembersListResponse".into());
+            let arr = js_sys::Array::new();
+            for m in &resp.members {
+                arr.push(&ml_studio_member_to_js(m));
+            }
+            set(obj, "members", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectInviteRequest(req) => {
+            set(obj, "variant", "MlStudioProjectInviteRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "inviteeUserId", req.invitee_user_id.clone().into());
+            set(obj, "invitee_user_id", req.invitee_user_id.into());
+            set(obj, "role", req.role.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectInviteResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectInviteResponse".into());
+            set(obj, "member", ml_studio_member_to_js(&resp.member).into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveRequest(req) => {
+            set(obj, "variant", "MlStudioProjectMemberRemoveRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "userId", req.user_id.clone().into());
+            set(obj, "user_id", req.user_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectMemberRemoveResponse".into());
+            set(obj, "projectId", resp.project_id.clone().into());
+            set(obj, "project_id", resp.project_id.into());
+            set(obj, "userId", resp.user_id.clone().into());
+            set(obj, "user_id", resp.user_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetRequest(req) => {
+            set(obj, "variant", "MlStudioProjectMemberRoleSetRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "userId", req.user_id.clone().into());
+            set(obj, "user_id", req.user_id.into());
+            set(obj, "role", req.role.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectMemberRoleSetResponse".into());
+            set(obj, "member", ml_studio_member_to_js(&resp.member).into());
         }
     }
 }

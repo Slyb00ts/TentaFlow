@@ -550,6 +550,30 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(_) => {
                 "MlStudioProjectTypesListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListRequest(_) => {
+                "MlStudioProjectMembersListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListResponse(_) => {
+                "MlStudioProjectMembersListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteRequest(_) => {
+                "MlStudioProjectInviteRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteResponse(_) => {
+                "MlStudioProjectInviteResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveRequest(_) => {
+                "MlStudioProjectMemberRemoveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveResponse(_) => {
+                "MlStudioProjectMemberRemoveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetRequest(_) => {
+                "MlStudioProjectMemberRoleSetRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(_) => {
+                "MlStudioProjectMemberRoleSetResponse"
+            }
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",
