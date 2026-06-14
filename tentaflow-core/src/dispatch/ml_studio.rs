@@ -28,6 +28,9 @@ fn db_err(e: impl std::fmt::Display) -> ProtocolError {
 }
 
 fn to_detail(summary: ProjectSummary) -> MlStudioProjectDetail {
+    let model_count = summary.model_count;
+    let role = summary.role;
+    let is_owner = summary.is_owner;
     let p = summary.project;
     MlStudioProjectDetail {
         project_id: p.project_id,
@@ -37,7 +40,9 @@ fn to_detail(summary: ProjectSummary) -> MlStudioProjectDetail {
         status: p.status,
         owner_user_id: p.owner_user_id,
         org_id: p.org_id,
-        model_count: summary.model_count,
+        model_count,
+        role,
+        is_owner,
         created_at: p.created_at,
         updated_at: p.updated_at,
     }

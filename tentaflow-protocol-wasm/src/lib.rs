@@ -1552,6 +1552,70 @@ pub fn encode_ml_studio_project_detail_request(project_id: String) -> Result<Vec
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioProjectMembersListRequest)]
+pub fn encode_ml_studio_project_members_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectMembersListRequest(
+            tentaflow_protocol::MlStudioProjectMembersListRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectInviteRequest)]
+pub fn encode_ml_studio_project_invite_request(
+    project_id: String,
+    invitee_user_id: String,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectInviteRequest(
+            tentaflow_protocol::MlStudioProjectInviteRequest {
+                project_id,
+                invitee_user_id,
+                role,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectMemberRemoveRequest)]
+pub fn encode_ml_studio_project_member_remove_request(
+    project_id: String,
+    user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveRequest(
+            tentaflow_protocol::MlStudioProjectMemberRemoveRequest {
+                project_id,
+                user_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectMemberRoleSetRequest)]
+pub fn encode_ml_studio_project_member_role_set_request(
+    project_id: String,
+    user_id: String,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetRequest(
+            tentaflow_protocol::MlStudioProjectMemberRoleSetRequest {
+                project_id,
+                user_id,
+                role,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -7199,6 +7263,9 @@ fn ml_studio_detail_to_js(d: &tentaflow_protocol::MlStudioProjectDetail) -> js_s
     set(&item, "created_at", d.created_at.clone().into());
     set(&item, "updatedAt", d.updated_at.clone().into());
     set(&item, "updated_at", d.updated_at.clone().into());
+    set(&item, "role", d.role.clone().into());
+    set(&item, "isOwner", d.is_owner.into());
+    set(&item, "is_owner", d.is_owner.into());
     item
 }
 
