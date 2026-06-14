@@ -92,7 +92,7 @@ fn action_err(e: anyhow::Error) -> ProtocolError {
 }
 
 #[handler(variant = "MlStudioProjectsListRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_projects_list(
     req: &MessageBody,
@@ -114,7 +114,7 @@ pub fn ml_studio_projects_list(
 }
 
 #[handler(variant = "MlStudioProjectCreateRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_create(
     req: &MessageBody,
@@ -141,7 +141,7 @@ pub fn ml_studio_project_create(
 }
 
 #[handler(variant = "MlStudioProjectDetailRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_detail(
     req: &MessageBody,
@@ -163,7 +163,7 @@ pub fn ml_studio_project_detail(
 }
 
 #[handler(variant = "MlStudioProjectTypesListRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_types_list(
     req: &MessageBody,
@@ -204,7 +204,7 @@ fn require_project_owner(user_id: &str, project_id: &str) -> Result<(), Protocol
 }
 
 #[handler(variant = "MlStudioProjectMembersListRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_members_list(
     req: &MessageBody,
@@ -232,8 +232,26 @@ pub fn ml_studio_project_members_list(
     )))
 }
 
+/// Asserts the invitee is a Power User or Admin in the CORE user directory
+/// (`tentaflow.db.user_accounts`), the single source of truth for user roles.
+/// ML Studio access is restricted to Power Users, so only Power Users / Admins
+/// may be invited into a project. A missing user surfaces as a `BadRequest`.
+fn require_invitee_power_user(invitee_user_id: &str) -> Result<(), ProtocolError> {
+    let pool = crate::db::global_pool().ok_or_else(|| {
+        ProtocolError::internal("core user directory unavailable")
+    })?;
+    match crate::db::repository::get_user_role(&pool, invitee_user_id).map_err(db_err)? {
+        Some((role, is_admin)) if is_admin || role == "power_user" => Ok(()),
+        Some(_) => Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "można zapraszać tylko użytkowników Power User",
+        )),
+        None => Err(ProtocolError::bad_request("nie ma takiego użytkownika")),
+    }
+}
+
 #[handler(variant = "MlStudioProjectInviteRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_invite(
     req: &MessageBody,
@@ -245,6 +263,7 @@ pub fn ml_studio_project_invite(
     };
     let org = require_org(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
+    require_invitee_power_user(&payload.invitee_user_id)?;
     let member = repository::invite_member(
         &payload.project_id,
         &org.user_id,
@@ -260,7 +279,7 @@ pub fn ml_studio_project_invite(
 }
 
 #[handler(variant = "MlStudioProjectMemberRemoveRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_member_remove(
     req: &MessageBody,
@@ -287,7 +306,7 @@ pub fn ml_studio_project_member_remove(
 }
 
 #[handler(variant = "MlStudioProjectMemberRoleSetRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn ml_studio_project_member_role_set(
     req: &MessageBody,

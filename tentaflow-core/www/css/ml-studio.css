@@ -287,28 +287,6 @@
   top: 12px;
   right: 12px;
   z-index: 2;
-  width: 30px;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm, 6px);
-  background: var(--bg-3, var(--bg-input));
-  color: var(--text-2);
-  cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
-}
-
-.ml-studio-card-share:hover {
-  color: var(--accent-2, var(--accent));
-  border-color: var(--accent-1, var(--accent));
-  background: var(--accent-glow, var(--bg-input));
-}
-
-.ml-studio-card-share .icon {
-  width: 15px;
-  height: 15px;
 }
 
 /* ---------- Ekran udostępniania (p02) ---------- */

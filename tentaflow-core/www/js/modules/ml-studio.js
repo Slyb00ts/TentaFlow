@@ -329,7 +329,7 @@ function projectCard(p, owned) {
   let shareBtn = '';
   if (owned) {
     ownerStrip = `<div class="ml-studio-card-owner">${sprite('crown')} Właściciel: Ty</div>`;
-    shareBtn = `<button type="button" class="ml-studio-card-share" data-share-id="${escapeAttr(id)}" title="Udostępnij projekt" aria-label="Udostępnij projekt">${sprite('share')}</button>`;
+    shareBtn = `<tf-button variant="ghost" size="sm" icon="share" class="ml-studio-card-share" data-share-id="${escapeAttr(id)}" title="Udostępnij projekt" aria-label="Udostępnij projekt"></tf-button>`;
   } else {
     const role = projectRole(p);
     ownerStrip = `<div class="ml-studio-card-owner">${sprite('crown')} Właściciel: inny użytkownik
