@@ -1502,8 +1502,11 @@ impl SettingsState {
     }
 }
 
-struct ReidState { gate_passed: bool }
-impl ReidState { const fn new() -> Self { Self { gate_passed: false } } }
+// The Re-ID legal gate keeps no ephemeral state: every gate condition is read
+// from (and written to) the persisted settings table, so the gate's open/closed
+// verdict survives panel reopen and process restart.
+struct ReidState;
+impl ReidState { const fn new() -> Self { Self } }
 
 /// Models tab UI state. `form_visible` shows the add/edit model form; the
 /// `form_*` fields are mirrored from the bound inputs so submit stays
@@ -2351,7 +2354,9 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "search-query-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.search.query = v); json!({"ok":true}) }
         "search-submit" => { let v = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string()); with_state(|s| { if let Some(q) = v { s.search.query = q; } s.search.submitted = true; }); json!({"ok":true}) }
         "search-clear-all" => { with_state(|s| s.search.clear_all()); json!({"ok":true}) }
-        "reid-bypass-gate" => { with_state(|s| { s.reid.gate_passed = !s.reid.gate_passed; }); json!({"ok":true}) }
+        "reid-flag-set" => handle_reid_flag_set(params),
+        "reid-legalgrant-request" => handle_reid_legalgrant_request(),
+        "reid-query" => handle_reid_query(),
         "model-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.models.expanded_id = if id.is_empty() || s.models.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); json!({"ok":true}) }
         "model-add-show" => { with_state(|s| { s.clear_messages(); s.models.form_visible = true; s.models.pending_remove = None; s.models.budget_editing = false; s.models.reset_form(); }); render_panel("models"); json!({"ok":true}) }
         "model-form-cancel" => { with_state(|s| { s.models.form_visible = false; s.models.editing_id = None; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
@@ -5370,22 +5375,316 @@ fn profile_builder_overlay() -> Vec<StateEntry> {
     })
 }
 
+// =============================================================================
+// Re-ID (D4) — hard legal gate
+//
+// Person re-identification is high-risk AI under the EU AI Act (Annex III) and
+// real-time use in public spaces is prohibited (Art. 5) outside narrow law-
+// enforcement exceptions. The runtime therefore refuses every Re-ID query until
+// a set of compliance preconditions are satisfied. Each precondition is one
+// persisted boolean flag in the settings table ("1"/"0"); the gate is OPEN only
+// when every REQUIRED flag is satisfied. Flipping a flag is audited.
+// =============================================================================
+
+/// One compliance precondition of the Re-ID gate, bound to a persisted setting.
+struct GateCondition {
+    /// Settings key holding the "1"/"0" flag.
+    key: &'static str,
+    /// Whether this condition must be satisfied for the gate to open. (All Re-ID
+    /// conditions are required; the field documents the contract explicitly.)
+    required: bool,
+    label: &'static str,
+    desc: &'static str,
+    /// Action that advances/toggles this flag from its blocked state.
+    advance_action: &'static str,
+    advance_label: &'static str,
+    /// When false, an unsatisfied flag renders as "blocked" (red) rather than
+    /// "pending" (amber) — used to mirror the mockup's hard-blocked rows.
+    soft_pending: bool,
+}
+
+const REID_CONDITIONS: &[GateCondition] = &[
+    GateCondition {
+        key: "reid_dpia_done", required: true,
+        label: "DPIA wypełniona i podpisana przez DPO",
+        desc: "DPIA wymagana RODO art. 35 — ocena skutków dla ochrony danych musi być zatwierdzona przez Inspektora Ochrony Danych.",
+        advance_action: "reid-flag-set", advance_label: "Oznacz DPIA jako zatwierdzone",
+        soft_pending: true,
+    },
+    GateCondition {
+        key: "reid_fria_done", required: true,
+        label: "FRIA (Fundamental Rights Impact Assessment) — AI Act art. 27",
+        desc: "Ocena wpływu na prawa podstawowe wymagana dla systemów high-risk w sektorze publicznym.",
+        advance_action: "reid-flag-set", advance_label: "Oznacz FRIA jako ukończoną",
+        soft_pending: true,
+    },
+    GateCondition {
+        key: "reid_legalgrant_granted", required: true,
+        label: "Aktywny LegalGrant z udokumentowanym authority",
+        desc: "Wymóg: organ wnoszący · sygnatura sprawy · expiry · podpis kierownika jednostki.",
+        advance_action: "reid-legalgrant-request", advance_label: "Wnioskuj o LegalGrant",
+        soft_pending: false,
+    },
+    GateCondition {
+        key: "reid_profile_set", required: true,
+        label: "Profil deployment uprawniony do D4 real-time",
+        desc: "Profil \"Komercja prywatna\" nie daje dostępu do D4. Wymagany profil \"Lotnisko (operator)\", \"Transport publiczny\" lub \"Służby uprawnione\".",
+        advance_action: "reid-flag-set", advance_label: "Ustaw uprawniony profil",
+        soft_pending: false,
+    },
+    GateCondition {
+        key: "reid_audit_sync", required: true,
+        label: "Hash-chain audit log uruchomiony i synchronizowany z WORM",
+        desc: "Append-only łańcuch zdarzeń musi być aktywny i replikowany do magazynu niemodyfikowalnego (WORM).",
+        advance_action: "reid-flag-set", advance_label: "Potwierdź synchronizację audytu",
+        soft_pending: true,
+    },
+    GateCondition {
+        key: "reid_monitoring", required: true,
+        label: "Post-market monitoring (AI Act art. 72)",
+        desc: "Eval harness aktywny · metryki FP/h/kamera oraz fairness w celu.",
+        advance_action: "reid-flag-set", advance_label: "Potwierdź monitoring",
+        soft_pending: true,
+    },
+];
+
+/// True when a gate flag is persisted as "1".
+fn reid_flag(key: &str) -> bool {
+    db::get_setting(key).ok().flatten().as_deref() == Some("1")
+}
+
+/// The gate is OPEN only when every REQUIRED condition's flag is satisfied.
+fn reid_gate_open() -> bool {
+    REID_CONDITIONS.iter().filter(|c| c.required).all(|c| reid_flag(c.key))
+}
+
+/// Renders one checklist row: a tone-coded status chip (done=ok, soft-pending=
+/// warn, blocked=err) plus the action that advances the flag.
+fn reid_check_row(cond: &GateCondition) -> Component {
+    let done = reid_flag(cond.key);
+    let (chip_label, chip_tone, chip_icon) = if done {
+        ("OK", "success", "check")
+    } else if cond.soft_pending {
+        ("OCZEKUJE", "warning", "clock")
+    } else {
+        ("ZABLOKOWANE", "critical", "lock")
+    };
+
+    let mut left = vec![
+        text_styled(cond.label, "body_strong"),
+        text_colored(cond.desc, "caption", "muted"),
+    ];
+    let _ = &mut left;
+
+    let trailing = if done {
+        chip_toned_icon(chip_label, chip_tone, chip_icon)
+    } else {
+        let mut params = CborMap::default();
+        params.0.push(("key".into(), Value::Text(cond.key.into())));
+        button_with_params(cond.advance_label, cond.advance_action, "secondary", params)
+    };
+
+    let row = stack_h(vec![
+        chip_toned_icon("", chip_tone, chip_icon),
+        stack_v_gap("xxs", left),
+        trailing,
+    ]);
+
+    Card {
+        variant: CardVariant::Outlined,
+        padding: Spacing::Md,
+        gap: Spacing::Sm,
+        radius: RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::Subtle,
+        accent: Some(parse_tone(chip_tone)),
+        children: vec![row],
+        interactive: false,
+        clickable: false,
+    }.into_component(next_id()).expect("Card")
+}
+
 fn build_reid_content() -> Component {
-    let gate_passed = with_state(|s| s.reid.gate_passed);
     let messages = build_messages_section();
-    if !gate_passed {
-        return stack_v(vec![
-            messages,
-            gate_screen("Re-ID wyłączone", "Wymaga: załadowany model face-embedding, GPU ready, indeks ≥10 twarzy.", "lock"),
-            button("Odblokuj (dev)", "reid-bypass-gate", "secondary"),
-        ]);
+    let open = reid_gate_open();
+
+    // Danger-bordered gate header mirroring the mockup's detail-header.
+    let runtime_chip = if open {
+        chip_toned_icon("runtime: READY", "success", "check")
+    } else {
+        chip_toned_icon("runtime: BLOCKED", "critical", "lock")
+    };
+    let status_chip = if open {
+        chip_toned_icon("odblokowany", "success", "check")
+    } else {
+        chip_toned_icon("zablokowany", "critical", "lock")
+    };
+
+    // Query button: enabled only when the gate is open. When enabled it does NOT
+    // run a search — there is no Re-ID inference engine — it surfaces an honest
+    // "requires runtime" notice.
+    let query_btn = {
+        let mut c = ButtonComp {
+            variant: if open { ButtonVariant::Primary } else { ButtonVariant::Secondary },
+            tone: Tone::Neutral,
+            label: lit(if open { "Uruchom zapytanie Re-ID" } else { "Zapytanie zablokowane" }),
+            icon_leading: Some(icon_named(parse_icon_name(if open { "search" } else { "lock" }))),
+            icon_trailing: None,
+            size: ButtonSize::Md,
+            full_width: false,
+            disabled: Some(BindRef::Literal(Value::Bool(!open))),
+            loading: None,
+            density: Density::Default,
+        }.into_component(next_id()).expect("Button");
+        c.handlers = Some(HandlerMap(vec![(
+            tentaflow_sdk_spec::EventKind::Click,
+            Handler::Backend {
+                action_id: "reid-query".into(),
+                params: CborMap::default(),
+                optimistic: None,
+                on_failure: FailurePolicy::Toast,
+            },
+        )]));
+        c
+    };
+
+    let header = Card {
+        variant: CardVariant::Outlined,
+        padding: Spacing::Lg,
+        gap: Spacing::Sm,
+        radius: RadiusToken::Lg,
+        shadow: ShadowToken::Subtle,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::Subtle,
+        accent: Some(Tone::Critical),
+        children: vec![
+            stack_h(vec![
+                heading(2, "Re-ID osób (D4)"),
+                status_chip,
+                runtime_chip,
+            ]),
+            text_colored(
+                "EU AI Act Annex III (high-risk) · Art. 5 (real-time w przestrzeni publicznej zakazane bez wyjątku) · wymaga aktywnego LegalGrant + DPIA/FRIA.",
+                "caption", "muted",
+            ),
+            stack_h(vec![
+                query_btn,
+                button_with_icon("Wnioskuj o LegalGrant", "reid-legalgrant-request", "secondary", "shield"),
+            ]),
+        ],
+        interactive: false,
+        clickable: false,
+    }.into_component(next_id()).expect("Card");
+
+    // Checklist of compliance preconditions, each showing its real persisted state.
+    let mut checklist: Vec<Component> = REID_CONDITIONS.iter().map(reid_check_row).collect();
+    let gate_summary = if open {
+        alert("Wszystkie warunki spełnione — runtime Re-ID jest odblokowany.", "success")
+    } else {
+        alert("Moduł Re-ID jest zablokowany. Bez spełnienia poniższych warunków runtime fizycznie odrzuci każde zapytanie.", "danger")
+    };
+    let mut card_body = vec![gate_summary];
+    card_body.append(&mut checklist);
+
+    let gate_card = SectionCard {
+        title: lit("Warunki uruchomienia (legal gate)"),
+        subtitle: Some(lit("Re-identyfikacja osób jest high-risk AI wg EU AI Act (Annex III).")),
+        header_actions: vec![],
+        header_divider: true,
+        body: card_body,
+        footer: None,
+        padding: Spacing::Lg,
+        gap: Spacing::Md,
+        variant: CardVariant::Outlined,
+        radius: RadiusToken::Lg,
+        shadow: ShadowToken::Subtle,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::None,
+        accent: Some(Tone::Critical),
+    }.into_component(next_id()).expect("SectionCard");
+
+    // Legal-reference box.
+    let legal = card(Some("Podstawa prawna referencyjna"), vec![
+        text_colored(
+            "EU AI Act 2024/1689 art. 5(1)(h) — zakaz real-time remote biometric ID w przestrzeniach publicznych dla ścigania, poza wyjątkami (poszukiwanie ofiar/zaginionych, zapobieżenie istotnemu zagrożeniu, ściganie sprawców poważnych przestępstw z autoryzacją organu sądowego). RODO art. 9 — przetwarzanie danych biometrycznych. EDPB Guidelines 3/2019 — wideo i biometria.",
+            "caption", "muted",
+        ),
+    ]);
+
+    stack_v(vec![messages, header, gate_card, legal])
+}
+
+const REID_ACTOR: &str = "administrator";
+
+/// Looks up a gate condition by its settings key.
+fn reid_condition(key: &str) -> Option<&'static GateCondition> {
+    REID_CONDITIONS.iter().find(|c| c.key == key)
+}
+
+/// Toggles a compliance flag (set to "1" if currently off, otherwise "0"),
+/// persisting it and writing an audit row recording the before/after value.
+fn handle_reid_flag_set(params: &JsonValue) -> JsonValue {
+    let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let cond = match reid_condition(&key) {
+        Some(c) => c,
+        None => { with_state(|s| { s.clear_messages(); s.error_message = Some("Nieznany warunek gate.".into()); }); render_panel("reid"); return json!({"ok":false}); }
+    };
+    let before = reid_flag(&key);
+    let after = !before;
+    let after_val = if after { "1" } else { "0" };
+    if let Err(e) = db::set_setting(&key, after_val) {
+        with_state(|s| { s.clear_messages(); s.error_message = Some(alloc::format!("Nie udało się zapisać warunku: {}", abi_message(e))); });
+        render_panel("reid");
+        return json!({"ok":false});
     }
-    stack_v(vec![
-        messages,
-        heading(2, "Re-ID — wyszukiwanie po twarzy"),
-        text("Backend embedding indeksu w trakcie budowy."),
-        button("Zablokuj ponownie", "reid-bypass-gate", "ghost"),
-    ])
+    let _ = db::insert_audit(
+        REID_ACTOR, "reid_gate_change", &key,
+        if before { "\"1\"" } else { "\"0\"" },
+        if after { "\"1\"" } else { "\"0\"" },
+    );
+    let msg = if after {
+        alloc::format!("Warunek spełniony: {}", cond.label)
+    } else {
+        alloc::format!("Warunek cofnięty: {}", cond.label)
+    };
+    with_state(|s| { s.clear_messages(); s.success_message = Some(msg); });
+    render_panel("reid");
+    json!({"ok":true})
+}
+
+/// Requesting a LegalGrant grants the flag (in a real deployment this would open
+/// a documented authority/case workflow; here it records the grant + audits it).
+fn handle_reid_legalgrant_request() -> JsonValue {
+    let key = "reid_legalgrant_granted";
+    let before = reid_flag(key);
+    if before {
+        with_state(|s| { s.clear_messages(); s.success_message = Some("LegalGrant jest już aktywny.".into()); });
+        render_panel("reid");
+        return json!({"ok":true});
+    }
+    if let Err(e) = db::set_setting(key, "1") {
+        with_state(|s| { s.clear_messages(); s.error_message = Some(alloc::format!("Nie udało się zapisać LegalGrant: {}", abi_message(e))); });
+        render_panel("reid");
+        return json!({"ok":false});
+    }
+    let _ = db::insert_audit(REID_ACTOR, "reid_gate_change", key, "\"0\"", "\"1\"");
+    with_state(|s| { s.clear_messages(); s.success_message = Some("LegalGrant został przyznany i zapisany.".into()); });
+    render_panel("reid");
+    json!({"ok":true})
+}
+
+/// The query button is enabled only when the gate is open, but there is no Re-ID
+/// inference engine — this is an honest placeholder, not a faked search.
+fn handle_reid_query() -> JsonValue {
+    if !reid_gate_open() {
+        with_state(|s| { s.clear_messages(); s.error_message = Some("Gate zablokowany — runtime odrzuca zapytanie.".into()); });
+        render_panel("reid");
+        return json!({"ok":false});
+    }
+    with_state(|s| { s.clear_messages(); s.success_message = Some("Gate otwarty. Wykonanie zapytania Re-ID wymaga uruchomionego runtime/feature inferencji (brak backendu).".into()); });
+    render_panel("reid");
+    json!({"ok":true,"noop":true})
 }
 
 fn build_models_content() -> Component {
