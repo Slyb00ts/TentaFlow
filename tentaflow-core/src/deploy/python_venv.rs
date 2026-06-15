@@ -207,6 +207,7 @@ fn find_bundle_dir(workspace_root: &Path, engine_id: &str) -> Option<PathBuf> {
         "video-gen",
         "music-gen",
         "model-3d-gen",
+        "training",
         "agents",
         "tools",
     ];
