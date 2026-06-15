@@ -88,10 +88,7 @@ impl PlateOcr {
             .next()
             .ok_or_else(|| anyhow!("plate-ocr-config.json: pad_char is empty"))?;
 
-        let session = Session::builder()
-            .context("Session::builder")?
-            .commit_from_file(&model_path)
-            .with_context(|| format!("commit ONNX {}", model_path.display()))?;
+        let session = super::ort_session::build_session(&model_path)?;
 
         let input_name = session
             .inputs()

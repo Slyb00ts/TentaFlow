@@ -35,11 +35,6 @@ const UNLIMITED_INTERVAL: Duration = Duration::from_millis(33);
 /// Default analysis cadence when no per-camera value is resolvable (10 fps).
 const DEFAULT_ANALYSIS_FPS: u32 = 10;
 
-/// How many ticks between re-reads of the per-camera `analysis_fps` from the
-/// core DB, so an operator's runtime FPS change takes effect without a session
-/// restart.
-const FPS_REFRESH_EVERY_TICKS: u32 = 30;
-
 /// Resolves the loop tick interval from a configured analysis FPS. `0` is
 /// unlimited (native cadence floored at [`UNLIMITED_INTERVAL`]); any other
 /// value maps to `1000 / fps` ms.
@@ -164,150 +159,223 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
     out
 }
 
-/// Per-camera analysis task registry. At most one task per camera regardless of
-/// how many tiles subscribe or how often a tile re-subscribes. Tasks live for
-/// the process lifetime (always-on) until aborted by `drain`.
-fn registry() -> &'static Mutex<HashMap<String, tokio::task::JoinHandle<()>>> {
-    static REG: OnceLock<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+/// Max cameras stacked into a single detector `Session::run`. One GPU launch is
+/// amortized across the batch — the fleet throughput lever.
+const MAX_BATCH: usize = 16;
+
+/// Engine scan granularity. The single engine task wakes this often and runs
+/// every camera whose per-FPS deadline has elapsed.
+const BASE_TICK: Duration = Duration::from_millis(20);
+
+/// How often each camera's `analysis_fps` is re-read from the core DB so an
+/// operator's runtime change applies without restarting anything.
+const FPS_RECHECK: Duration = Duration::from_secs(3);
+
+/// One registered camera's scheduling state inside the shared engine.
+struct CamSlot {
+    fps: u32,
+    next_due: std::time::Instant,
+    next_fps_check: std::time::Instant,
 }
 
-/// Ensures exactly one always-on analysis task for `camera_id`. A finished /
-/// aborted handle is replaced; a live one is left untouched.
+/// Active-camera registry driven by the single engine task. Cameras join via
+/// `ensure_analysis` and leave via `drain`.
+fn cameras() -> &'static Mutex<HashMap<String, CamSlot>> {
+    static CAMS: OnceLock<Mutex<HashMap<String, CamSlot>>> = OnceLock::new();
+    CAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Handle to the single engine task, so `drain` can abort it.
+fn engine_handle() -> &'static Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static H: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(None))
+}
+
+/// Registers `camera_id` for always-on analysis and starts the shared engine
+/// once. Idempotent: re-subscribing a tile does not duplicate the camera.
 pub fn ensure_analysis(camera_id: &str) {
-    let mut reg = registry().lock().unwrap();
-    if let Some(handle) = reg.get(camera_id) {
-        if !handle.is_finished() {
-            return;
+    {
+        let mut reg = cameras().lock().unwrap();
+        if !reg.contains_key(camera_id) {
+            let now = std::time::Instant::now();
+            let fps = resolve_analysis_fps(camera_id);
+            reg.insert(
+                camera_id.to_string(),
+                CamSlot {
+                    fps,
+                    next_due: now,
+                    next_fps_check: now + FPS_RECHECK,
+                },
+            );
+            info!("[vision_analysis] camera {camera_id} registered (analysis_fps={fps})");
         }
     }
-    let handle = spawn_analysis(camera_id.to_string());
-    reg.insert(camera_id.to_string(), handle);
+    start_engine_once();
 }
 
-/// Aborts every running analysis task. Wired into camera shutdown so the
-/// ONNX session and frame-pull loops stop before GStreamer tears down.
+/// Removes every camera and aborts the engine task. Wired into camera shutdown
+/// so the ONNX sessions and frame-pull loop stop before GStreamer tears down.
 pub fn drain() {
-    let mut reg = registry().lock().unwrap();
-    for (_, handle) in reg.drain() {
+    cameras().lock().unwrap().clear();
+    if let Some(handle) = engine_handle().lock().unwrap().take() {
         handle.abort();
     }
 }
 
-fn spawn_analysis(camera_id: String) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let detector = match get_detector().await {
-            Some(d) => d,
-            None => {
-                // Load failed earlier — nothing to run. The camera session and
-                // overlay keep working; there are simply no real detections.
-                return;
-            }
-        };
-        // Optional: a missing classifier just leaves `stan` empty.
-        let classifier = get_classifier().await;
-        // Optional: a missing OCR runner just leaves `tekst` empty.
-        let ocr = get_ocr().await;
-        let mut analysis_fps = resolve_analysis_fps(&camera_id);
-        info!(
-            "[vision_analysis] starting analysis loop for {camera_id} (analysis_fps={analysis_fps})"
-        );
+/// Spawns the single engine task if it is not already running.
+fn start_engine_once() {
+    let mut h = engine_handle().lock().unwrap();
+    if h.as_ref().map(|j| j.is_finished()).unwrap_or(true) {
+        *h = Some(tokio::spawn(engine_loop()));
+    }
+}
 
-        let mut ticker = tokio::time::interval(interval_for_fps(analysis_fps));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut ticks_since_refresh: u32 = 0;
-        loop {
-            ticker.tick().await;
+/// The one process-wide analysis engine: collects cameras whose per-FPS
+/// deadline elapsed, batches up to [`MAX_BATCH`] latest frames into a single
+/// detector run, then per camera classifies state + reads plates on crops and
+/// publishes. Cross-camera batching is what scales to thousands of cameras.
+async fn engine_loop() {
+    let detector = match get_detector().await {
+        Some(d) => d,
+        None => return, // load failed earlier — overlay still works, no detections
+    };
+    let classifier = get_classifier().await;
+    let ocr = get_ocr().await;
+    info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
 
-            // Periodically re-read the per-camera FPS so a runtime change takes
-            // effect without restarting the session. Rebuild the ticker only
-            // when the value actually changed.
-            ticks_since_refresh += 1;
-            if ticks_since_refresh >= FPS_REFRESH_EVERY_TICKS {
-                ticks_since_refresh = 0;
-                let latest = resolve_analysis_fps(&camera_id);
-                if latest != analysis_fps {
-                    analysis_fps = latest;
-                    ticker = tokio::time::interval(interval_for_fps(analysis_fps));
-                    ticker
-                        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                }
-            }
+    let mut ticker = tokio::time::interval(BASE_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let now = std::time::Instant::now();
 
-            let frame =
-                crate::addon::host_functions::camera::latest_frame_global(&camera_id).await;
-            let (rgb, w, h) = match frame {
-                Some(f) => f,
-                // No frame yet (session warming up or transiently offline).
-                // Keep ticking — the next frame will land.
-                None => continue,
-            };
-
-            // Inference is blocking + CPU-bound; run detection then per-crop
-            // state classification off the async worker, serialized across
-            // cameras through the shared model mutexes. The frame buffer moves
-            // into the blocking task so crops are cut from the full-res RGB.
-            let detector = detector.clone();
-            let classifier = classifier.clone();
-            let ocr = ocr.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut items = {
-                    let mut guard = detector.lock().unwrap();
-                    guard.detect(&rgb, w, h)?
-                };
-
-                for det in items.iter_mut() {
-                    // bbox is [x, y, w, h] normalized 0..1 → pixels, clamped.
-                    let fw = w as f32;
-                    let fh = h as f32;
-                    let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
-                    let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
-                    let raw_cw = (det.bbox[2] * fw).round().max(0.0) as u32;
-                    let raw_ch = (det.bbox[3] * fh).round().max(0.0) as u32;
-                    let cw = raw_cw.min(w.saturating_sub(x0));
-                    let ch = raw_ch.min(h.saturating_sub(y0));
-                    if cw < 8 || ch < 8 {
-                        continue;
-                    }
-
-                    if wants_state(&det.klasa) {
-                        if let Some(classifier) = classifier.as_ref() {
-                            let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
-                            let mut guard = classifier.lock().unwrap();
-                            match guard.classify(&crop, cw, ch) {
-                                Ok(stany) => det.stan = stany,
-                                Err(e) => warn!(
-                                    "[vision_analysis] classify failed for {}: {e:#}",
-                                    det.klasa
-                                ),
-                            }
-                        }
-                    }
-
-                    if det.klasa == "tablica_rejestracyjna" {
-                        if let Some(ocr) = ocr.as_ref() {
-                            let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
-                            let mut guard = ocr.lock().unwrap();
-                            match guard.read(&crop, cw, ch) {
-                                Ok(Some(plate)) => det.tekst = Some(plate),
-                                Ok(None) => {}
-                                Err(e) => {
-                                    warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa)
-                                }
-                            }
-                        }
+        // Collect due cameras + which need an FPS re-read (no DB under the lock).
+        let mut due: Vec<String> = Vec::new();
+        let mut recheck: Vec<String> = Vec::new();
+        {
+            let reg = cameras().lock().unwrap();
+            for (id, slot) in reg.iter() {
+                if slot.next_due <= now {
+                    due.push(id.clone());
+                    if slot.next_fps_check <= now {
+                        recheck.push(id.clone());
                     }
                 }
-
-                anyhow::Ok(items)
-            })
-            .await;
-
-            match result {
-                Ok(Ok(items)) => detection_bus::publish_detections(&camera_id, items),
-                Ok(Err(e)) => warn!("[vision_analysis] detect failed for {camera_id}: {e:#}"),
-                Err(e) => warn!("[vision_analysis] inference task panicked for {camera_id}: {e}"),
             }
         }
-    })
+        if due.is_empty() {
+            continue;
+        }
+        // Re-read changed FPS values outside the lock.
+        for id in &recheck {
+            let fps = resolve_analysis_fps(id);
+            let mut reg = cameras().lock().unwrap();
+            if let Some(slot) = reg.get_mut(id) {
+                slot.fps = fps;
+                slot.next_fps_check = now + FPS_RECHECK;
+            }
+        }
+
+        // Take this cycle's batch; cameras beyond MAX_BATCH stay overdue and are
+        // picked next tick (drop-nothing, just deferred).
+        let batch_ids: Vec<String> = due.iter().take(MAX_BATCH).cloned().collect();
+
+        // Pull the latest frame for each batched camera (async snapshot).
+        let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)> = Vec::new();
+        for id in &batch_ids {
+            if let Some((rgb, w, h)) =
+                crate::addon::host_functions::camera::latest_frame_global(id).await
+            {
+                frames.push((id.clone(), rgb, w, h));
+            }
+        }
+
+        // Reschedule every batched camera by its own FPS interval.
+        {
+            let mut reg = cameras().lock().unwrap();
+            for id in &batch_ids {
+                if let Some(slot) = reg.get_mut(id) {
+                    slot.next_due = now + interval_for_fps(slot.fps);
+                }
+            }
+        }
+        if frames.is_empty() {
+            continue;
+        }
+
+        // One batched detector run + per-image state/OCR, off the async worker.
+        let detector = detector.clone();
+        let classifier = classifier.clone();
+        let ocr = ocr.clone();
+        let result = tokio::task::spawn_blocking(move || run_batch(detector, classifier, ocr, frames))
+            .await;
+        match result {
+            Ok(per_cam) => {
+                for (id, items) in per_cam {
+                    detection_bus::publish_detections(&id, items);
+                }
+            }
+            Err(e) => warn!("[vision_analysis] batch task panicked: {e}"),
+        }
+    }
+}
+
+/// Blocking: one `detect_batch` across the frames, then per-image state + plate
+/// OCR on crops. Returns `(camera_id, detections)` per frame.
+fn run_batch(
+    detector: std::sync::Arc<Mutex<RfDetrDetector>>,
+    classifier: Option<std::sync::Arc<Mutex<StateClassifier>>>,
+    ocr: Option<std::sync::Arc<Mutex<PlateOcr>>>,
+    frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)>,
+) -> Vec<(String, Vec<crate::services::detection_bus::Detection>)> {
+    let batch = {
+        let refs: Vec<(&[u8], u32, u32)> =
+            frames.iter().map(|(_, rgb, w, h)| (&rgb[..], *w, *h)).collect();
+        let mut guard = detector.lock().unwrap();
+        match guard.detect_batch(&refs) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[vision_analysis] detect_batch failed (n={}): {e:#}", refs.len());
+                return Vec::new();
+            }
+        }
+    };
+
+    let mut out = Vec::with_capacity(frames.len());
+    for ((id, rgb, w, h), mut items) in frames.into_iter().zip(batch.into_iter()) {
+        for det in items.iter_mut() {
+            let fw = w as f32;
+            let fh = h as f32;
+            let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
+            let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
+            let cw = (det.bbox[2] * fw).round().max(0.0) as u32;
+            let ch = (det.bbox[3] * fh).round().max(0.0) as u32;
+            let cw = cw.min(w.saturating_sub(x0));
+            let ch = ch.min(h.saturating_sub(y0));
+            if cw < 8 || ch < 8 {
+                continue;
+            }
+            if wants_state(&det.klasa) {
+                if let Some(classifier) = classifier.as_ref() {
+                    let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
+                    match classifier.lock().unwrap().classify(&crop, cw, ch) {
+                        Ok(stany) => det.stan = stany,
+                        Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
+                    }
+                }
+            }
+            if det.klasa == "tablica_rejestracyjna" {
+                if let Some(ocr) = ocr.as_ref() {
+                    let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
+                    match ocr.lock().unwrap().read(&crop, cw, ch) {
+                        Ok(Some(plate)) => det.tekst = Some(plate),
+                        Ok(None) => {}
+                        Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
+                    }
+                }
+            }
+        }
+        out.push((id, items));
+    }
+    out
 }

@@ -424,6 +424,7 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
         vendor: "made_up_vendor".to_string(),
         url: "http://example.com/stream".to_string(),
         target_fps: Some(15),
+        analysis_fps: Some(10),
         resolution_width: None,
         resolution_height: None,
         retention_class: Some("C".to_string()),
