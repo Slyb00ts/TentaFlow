@@ -55,6 +55,17 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
         };
         let (w, h) = dims.ok_or_else(|| anyhow!("vision_classify: image has no dims"))?;
         let rgb = ctx.blobs.get(&blob_ref).await?;
+        // Contract: raw RGB24. Reject encoded/mismatched blobs with a clear error.
+        let expected = w as usize * h as usize * 3;
+        if rgb.len() != expected {
+            return Err(anyhow!(
+                "vision_classify: blob is {} bytes, expected {}x{}x3={} (raw RGB24 only)",
+                rgb.len(),
+                w,
+                h,
+                expected
+            ));
+        }
         let alias = node
             .config
             .get("alias")
