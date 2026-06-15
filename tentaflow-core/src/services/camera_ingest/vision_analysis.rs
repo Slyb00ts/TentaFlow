@@ -16,11 +16,14 @@
 #![cfg(feature = "inference-vision-gpu")]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, OnceCell};
 use tracing::{info, warn};
+
+use crate::services::detection_bus::Detection;
 
 use crate::services::detection_bus;
 use crate::vision::classifier_stan::StateClassifier;
@@ -230,6 +233,11 @@ pub fn drain() {
         handle.abort();
     }
     *cold_chan().lock().unwrap() = None;
+    // Reset coalescer state + byte counter: the aborted consumer never released
+    // its in-flight slots, so stale `in_flight = true` would permanently block
+    // those cameras after a restart.
+    cold_state().lock().unwrap().clear();
+    cold_bytes().store(0, AtomicOrdering::Relaxed);
 }
 
 /// Spawns the single engine task if it is not already running.
@@ -250,6 +258,7 @@ async fn engine_loop() {
         None => return, // load failed earlier — overlay still works, no detections
     };
     let cold = ensure_cold_started();
+    let mut last_metrics = Instant::now();
     info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
 
     // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
@@ -259,6 +268,20 @@ async fn engine_loop() {
     // batch finishes faster than the tick — which is exactly what FP16/TensorRT do.
     loop {
         let now = std::time::Instant::now();
+
+        if now.duration_since(last_metrics) >= Duration::from_secs(30) {
+            let m = metrics();
+            info!(
+                "[vision_analysis] cold metrics: emitted={} coalesced={} drop_inflight={} drop_full={} drop_budget={} bytes_inflight={}",
+                m.emitted.load(AtomicOrdering::Relaxed),
+                m.coalesced.load(AtomicOrdering::Relaxed),
+                m.dropped_inflight.load(AtomicOrdering::Relaxed),
+                m.dropped_full.load(AtomicOrdering::Relaxed),
+                m.dropped_budget.load(AtomicOrdering::Relaxed),
+                cold_bytes().load(AtomicOrdering::Relaxed),
+            );
+            last_metrics = now;
+        }
 
         // Collect due cameras + which need an FPS re-read (no DB under the lock).
         // Also track the soonest upcoming deadline so an idle wait sleeps exactly
@@ -337,26 +360,36 @@ async fn engine_loop() {
         match detected {
             Ok(per_cam) => {
                 for (id, frame, w, h, dets) in per_cam {
+                    let sig = detection_sig(&dets);
+                    // Empty events drop the frame buffer (no enrichment needed).
                     let frame = if dets.is_empty() {
                         Arc::<[u8]>::from(Vec::new())
                     } else {
                         frame
                     };
+                    let bytes = frame.len();
+                    // Coalesce / rate-limit / byte-budget gate (reserves the slot).
+                    if admit_cold(&id, sig, bytes).is_none() {
+                        continue;
+                    }
                     let ev = DetectionEvent {
-                        camera_id: id,
+                        camera_id: id.clone(),
                         frame,
                         w,
                         h,
                         detections: dets,
                     };
-                    // try_send: Full drops the event (backpressure; 0b adds
-                    // coalescing + counters). Closed means the cold task died —
-                    // warn (ensure_cold_started will respawn next cycle).
                     match cold.try_send(ev) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Ok(()) => {
+                            metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
+                            release_cold(&id, bytes);
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             warn!("[vision_analysis] cold path closed; detections dropped");
+                            release_cold(&id, bytes);
                         }
                     }
                 }
@@ -414,6 +447,113 @@ fn ensure_cold_started() -> mpsc::Sender<DetectionEvent> {
     tx
 }
 
+/// Coalescing knobs. Unchanged scenes re-emit at most every `COALESCE_REFRESH`
+/// (a parked truck is not re-OCR'd every frame); changed scenes emit as fast as
+/// the cold path drains (per-camera in-flight = 1). `BBOX_BUCKET` quantizes boxes
+/// so sub-pixel jitter doesn't count as a change.
+const COALESCE_REFRESH: Duration = Duration::from_secs(2);
+const BBOX_BUCKET: f32 = 0.02;
+/// Total frame bytes allowed in flight on the cold path (memory bound that makes
+/// the queue cap meaningful — the count cap alone could pin GiBs of RGB frames).
+const COLD_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Per-camera cold-path scheduling state.
+struct ColdCamState {
+    last_sig: u64,
+    last_emit: Instant,
+    in_flight: bool,
+}
+
+fn cold_state() -> &'static Mutex<HashMap<String, ColdCamState>> {
+    static S: OnceLock<Mutex<HashMap<String, ColdCamState>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bytes of frame buffers currently queued/in-flight on the cold path.
+fn cold_bytes() -> &'static AtomicUsize {
+    static B: AtomicUsize = AtomicUsize::new(0);
+    &B
+}
+
+/// Backpressure counters (cumulative). Logged periodically by the engine loop.
+#[derive(Default)]
+struct ColdMetrics {
+    emitted: AtomicU64,
+    coalesced: AtomicU64,
+    dropped_inflight: AtomicU64,
+    dropped_full: AtomicU64,
+    dropped_budget: AtomicU64,
+}
+fn metrics() -> &'static ColdMetrics {
+    static M: OnceLock<ColdMetrics> = OnceLock::new();
+    M.get_or_init(ColdMetrics::default)
+}
+
+/// Order-independent signature of a frame's worthy detections (class + bucketed
+/// box). Same signature ⇒ "same scene" ⇒ coalesce.
+fn detection_sig(dets: &[Detection]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<(u32, u32, u32, u32, &str)> = dets
+        .iter()
+        .map(|d| {
+            (
+                (d.bbox[0] / BBOX_BUCKET) as u32,
+                (d.bbox[1] / BBOX_BUCKET) as u32,
+                (d.bbox[2] / BBOX_BUCKET) as u32,
+                (d.bbox[3] / BBOX_BUCKET) as u32,
+                d.klasa.as_str(),
+            )
+        })
+        .collect();
+    keys.sort_unstable();
+    let mut h = DefaultHasher::new();
+    keys.hash(&mut h);
+    h.finish()
+}
+
+/// Coalesce + rate-limit + byte-budget gate. Decides whether this frame's
+/// detections become a cold event. Returns the bytes reserved (to release on
+/// failure / completion) or None when the event is dropped. Per-camera ordering
+/// is guaranteed by `in_flight = 1`: no second event for a camera is admitted
+/// until the consumer clears the flag.
+fn admit_cold(camera_id: &str, sig: u64, frame_bytes: usize) -> Option<()> {
+    let now = Instant::now();
+    let mut st = cold_state().lock().unwrap();
+    let entry = st.entry(camera_id.to_string()).or_insert(ColdCamState {
+        last_sig: u64::MAX,
+        last_emit: now - COALESCE_REFRESH * 2,
+        in_flight: false,
+    });
+    if entry.in_flight {
+        metrics().dropped_inflight.fetch_add(1, AtomicOrdering::Relaxed);
+        return None;
+    }
+    let unchanged = sig == entry.last_sig;
+    if unchanged && now.duration_since(entry.last_emit) < COALESCE_REFRESH {
+        metrics().coalesced.fetch_add(1, AtomicOrdering::Relaxed);
+        return None;
+    }
+    if cold_bytes().load(AtomicOrdering::Relaxed) + frame_bytes > COLD_BYTE_BUDGET {
+        metrics().dropped_budget.fetch_add(1, AtomicOrdering::Relaxed);
+        return None;
+    }
+    entry.in_flight = true;
+    entry.last_sig = sig;
+    entry.last_emit = now;
+    cold_bytes().fetch_add(frame_bytes, AtomicOrdering::Relaxed);
+    Some(())
+}
+
+/// Releases a camera's in-flight slot + its reserved bytes. Called by the cold
+/// consumer after each event (success or failure) and on admit→send failure.
+fn release_cold(camera_id: &str, frame_bytes: usize) {
+    if let Some(slot) = cold_state().lock().unwrap().get_mut(camera_id) {
+        slot.in_flight = false;
+    }
+    cold_bytes().fetch_sub(frame_bytes, AtomicOrdering::Relaxed);
+}
+
 /// Cold path: enriches each detection frame (state classify + plate OCR on crops)
 /// off the hot detector loop, then publishes. Owns the classifier/OCR runners.
 async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
@@ -428,6 +568,8 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             h,
             detections,
         } = ev;
+        let bytes = frame.len();
+        let cid = camera_id.clone();
         let classifier = classifier.clone();
         let ocr = ocr.clone();
         let res = tokio::task::spawn_blocking(move || {
@@ -440,6 +582,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             Ok((id, dets)) => detection_bus::publish_detections(&id, dets),
             Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
         }
+        // Free the camera's in-flight slot + reserved bytes so the next frame for
+        // this camera can be admitted (per-camera ordering + bound preserved).
+        release_cold(&cid, bytes);
     }
 }
 
