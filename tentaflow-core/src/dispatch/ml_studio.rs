@@ -13,7 +13,9 @@ use tentaflow_protocol::{
 };
 
 use super::HandlerContext;
-use crate::ml_studio::models::{Dataset, ProjectMember, ProjectRole, ProjectSummary, ProjectType};
+use crate::ml_studio::models::{
+    Dataset, ProjectMember, ProjectRole, ProjectSummary, ProjectType, ResourceGrant,
+};
 use crate::ml_studio::profile::{self, TableProfile};
 use crate::ml_studio::repository;
 use crate::services::rbac::OrgContext;
@@ -496,5 +498,138 @@ pub fn ml_studio_dataset_profile(
             dataset: to_dataset_summary(&dataset),
             profile: to_protocol_profile(table),
         },
+    )))
+}
+
+fn to_grant(g: ResourceGrant) -> tentaflow_protocol::MlStudioResourceGrant {
+    tentaflow_protocol::MlStudioResourceGrant {
+        grant_id: g.grant_id,
+        subject_kind: g.subject_kind,
+        subject_id: g.subject_id,
+        node_id: g.node_id,
+        resource_kind: g.resource_kind,
+        resource_ref: g.resource_ref,
+        quota: g.quota,
+        granted_by: g.granted_by,
+        created_at: g.created_at,
+    }
+}
+
+#[handler(variant = "MlStudioResourceGrantCreateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn ml_studio_resource_grant_create(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantCreateRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioResourceGrantCreateRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let grant = repository::create_grant(
+        &payload.subject_kind,
+        &payload.subject_id,
+        &payload.node_id,
+        &payload.resource_kind,
+        &payload.resource_ref,
+        &payload.quota,
+        &org.user_id,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("create grant failed: {}", e)))?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantCreateResponse(
+        tentaflow_protocol::MlStudioResourceGrantCreateResponse {
+            grant: to_grant(grant),
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioResourceGrantsListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn ml_studio_resource_grants_list(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantsListRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioResourceGrantsListRequest",
+            ))
+        }
+    }
+    let grants = repository::list_grants()
+        .map_err(db_err)?
+        .into_iter()
+        .map(to_grant)
+        .collect();
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantsListResponse(
+        tentaflow_protocol::MlStudioResourceGrantsListResponse { grants },
+    )))
+}
+
+#[handler(variant = "MlStudioResourceGrantRevokeRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn ml_studio_resource_grant_revoke(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantRevokeRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioResourceGrantRevokeRequest",
+            ))
+        }
+    };
+    let revoked = repository::revoke_grant(&payload.grant_id).map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantRevokeResponse(
+        tentaflow_protocol::MlStudioResourceGrantRevokeResponse {
+            grant_id: payload.grant_id.clone(),
+            revoked,
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioProjectResourcesRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_resources(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectResourcesRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectResourcesRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    // A project member (any role) may see the resources allocated to the
+    // project. Non-members are rejected — membership is the access boundary.
+    if repository::member_role(&payload.project_id, &org.user_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotFound,
+            "project not found",
+        ));
+    }
+    let grants = repository::list_grants_for_project(&payload.project_id)
+        .map_err(db_err)?
+        .into_iter()
+        .map(to_grant)
+        .collect();
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectResourcesResponse(
+        tentaflow_protocol::MlStudioProjectResourcesResponse { grants },
     )))
 }

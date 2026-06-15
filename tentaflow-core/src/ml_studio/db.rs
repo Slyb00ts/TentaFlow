@@ -114,8 +114,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 /// Ordered ML Studio schema migrations. `owner_user_id`/`org_id` are TEXT
 /// references to core identity (app-level, no SQL FK — different DB file).
-const MIGRATIONS: &[(i64, &str)] =
-    &[(1, INITIAL_SCHEMA), (2, PROJECT_MEMBERS), (3, DATASET_PROFILE)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, INITIAL_SCHEMA),
+    (2, PROJECT_MEMBERS),
+    (3, DATASET_PROFILE),
+    (4, RESOURCE_GRANTS),
+];
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -228,4 +232,25 @@ FROM projects WHERE owner_user_id IS NOT NULL AND owner_user_id != '';
 const DATASET_PROFILE: &str = "
 ALTER TABLE datasets ADD COLUMN column_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE datasets ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}';
+";
+
+// Admin-managed mesh resource grants (§11.3). One row = one allocation of a
+// node resource (gpu/cpu/ram) to a subject (user/group/project). These are
+// GRANT records, not live usage: `quota` is free-form text (GPU count, hours,
+// or empty). `node_id`/`subject_id`/`granted_by` are app-level identifiers
+// (no SQL FK — pool of nodes comes from the mesh registry, not this DB).
+const RESOURCE_GRANTS: &str = "
+CREATE TABLE resource_grants (
+    grant_id      TEXT PRIMARY KEY,
+    subject_kind  TEXT NOT NULL,
+    subject_id    TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    resource_ref  TEXT NOT NULL DEFAULT '',
+    quota         TEXT NOT NULL DEFAULT '',
+    granted_by    TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_resource_grants_subject ON resource_grants(subject_kind, subject_id);
+CREATE INDEX idx_resource_grants_node ON resource_grants(node_id);
 ";

@@ -1659,6 +1659,62 @@ pub fn encode_ml_studio_dataset_profile_request(dataset_id: String) -> Result<Ve
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioResourceGrantCreateRequest)]
+pub fn encode_ml_studio_resource_grant_create_request(
+    subject_kind: String,
+    subject_id: String,
+    node_id: String,
+    resource_kind: String,
+    resource_ref: String,
+    quota: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(
+            tentaflow_protocol::MlStudioResourceGrantCreateRequest {
+                subject_kind,
+                subject_id,
+                node_id,
+                resource_kind,
+                resource_ref,
+                quota,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioResourceGrantsListRequest)]
+pub fn encode_ml_studio_resource_grants_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ResourceGrantsListRequest(
+            tentaflow_protocol::MlStudioResourceGrantsListRequest,
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioResourceGrantRevokeRequest)]
+pub fn encode_ml_studio_resource_grant_revoke_request(
+    grant_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeRequest(
+            tentaflow_protocol::MlStudioResourceGrantRevokeRequest { grant_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectResourcesRequest)]
+pub fn encode_ml_studio_project_resources_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectResourcesRequest(
+            tentaflow_protocol::MlStudioProjectResourcesRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -7325,6 +7381,28 @@ fn ml_studio_member_to_js(m: &tentaflow_protocol::MlStudioProjectMember) -> js_s
     item
 }
 
+fn ml_studio_grant_to_js(g: &tentaflow_protocol::MlStudioResourceGrant) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "grantId", g.grant_id.clone().into());
+    set(&item, "grant_id", g.grant_id.clone().into());
+    set(&item, "subjectKind", g.subject_kind.clone().into());
+    set(&item, "subject_kind", g.subject_kind.clone().into());
+    set(&item, "subjectId", g.subject_id.clone().into());
+    set(&item, "subject_id", g.subject_id.clone().into());
+    set(&item, "nodeId", g.node_id.clone().into());
+    set(&item, "node_id", g.node_id.clone().into());
+    set(&item, "resourceKind", g.resource_kind.clone().into());
+    set(&item, "resource_kind", g.resource_kind.clone().into());
+    set(&item, "resourceRef", g.resource_ref.clone().into());
+    set(&item, "resource_ref", g.resource_ref.clone().into());
+    set(&item, "quota", g.quota.clone().into());
+    set(&item, "grantedBy", g.granted_by.clone().into());
+    set(&item, "granted_by", g.granted_by.clone().into());
+    set(&item, "createdAt", g.created_at.clone().into());
+    set(&item, "created_at", g.created_at.clone().into());
+    item
+}
+
 fn ml_studio_dataset_summary_to_js(d: &tentaflow_protocol::DatasetSummary) -> js_sys::Object {
     let item = js_sys::Object::new();
     set(&item, "datasetId", d.dataset_id.clone().into());
@@ -7515,6 +7593,59 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "variant", "MlStudioDatasetProfileResponse".into());
             set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
             set(obj, "profile", ml_studio_table_profile_to_js(&resp.profile).into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(req) => {
+            set(obj, "variant", "MlStudioResourceGrantCreateRequest".into());
+            set(obj, "subjectKind", req.subject_kind.clone().into());
+            set(obj, "subject_kind", req.subject_kind.clone().into());
+            set(obj, "subjectId", req.subject_id.clone().into());
+            set(obj, "subject_id", req.subject_id.clone().into());
+            set(obj, "nodeId", req.node_id.clone().into());
+            set(obj, "node_id", req.node_id.clone().into());
+            set(obj, "resourceKind", req.resource_kind.clone().into());
+            set(obj, "resource_kind", req.resource_kind.clone().into());
+            set(obj, "resourceRef", req.resource_ref.clone().into());
+            set(obj, "resource_ref", req.resource_ref.clone().into());
+            set(obj, "quota", req.quota.clone().into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantCreateResponse(resp) => {
+            set(obj, "variant", "MlStudioResourceGrantCreateResponse".into());
+            set(obj, "grant", ml_studio_grant_to_js(&resp.grant).into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantsListRequest(_) => {
+            set(obj, "variant", "MlStudioResourceGrantsListRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantsListResponse(resp) => {
+            set(obj, "variant", "MlStudioResourceGrantsListResponse".into());
+            let arr = js_sys::Array::new();
+            for g in &resp.grants {
+                arr.push(&ml_studio_grant_to_js(g));
+            }
+            set(obj, "grants", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeRequest(req) => {
+            set(obj, "variant", "MlStudioResourceGrantRevokeRequest".into());
+            set(obj, "grantId", req.grant_id.clone().into());
+            set(obj, "grant_id", req.grant_id.clone().into());
+        }
+        tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeResponse(resp) => {
+            set(obj, "variant", "MlStudioResourceGrantRevokeResponse".into());
+            set(obj, "grantId", resp.grant_id.clone().into());
+            set(obj, "grant_id", resp.grant_id.clone().into());
+            set(obj, "revoked", resp.revoked.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectResourcesRequest(req) => {
+            set(obj, "variant", "MlStudioProjectResourcesRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.clone().into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectResourcesResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectResourcesResponse".into());
+            let arr = js_sys::Array::new();
+            for g in &resp.grants {
+                arr.push(&ml_studio_grant_to_js(g));
+            }
+            set(obj, "grants", arr.into());
         }
     }
 }

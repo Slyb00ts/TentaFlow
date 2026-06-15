@@ -1293,6 +1293,68 @@ pub struct MlStudioDatasetProfileResponse {
     pub profile: TableProfile,
 }
 
+/// One admin-managed mesh resource grant (§11.3). A record of an allocation of
+/// a node resource to a subject, not live usage. `subject_kind` ∈
+/// {user, group, project}; `resource_kind` ∈ {gpu, cpu, ram}. `resource_ref`
+/// names the card (e.g. GPU name/index) and is empty for cpu/ram; `quota` is
+/// free-form text (GPU count, hours, or empty).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrant {
+    pub grant_id: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub node_id: String,
+    pub resource_kind: String,
+    pub resource_ref: String,
+    pub quota: String,
+    pub granted_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantCreateRequest {
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub node_id: String,
+    pub resource_kind: String,
+    pub resource_ref: String,
+    pub quota: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantCreateResponse {
+    pub grant: MlStudioResourceGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantsListRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantsListResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantRevokeRequest {
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantRevokeResponse {
+    pub grant_id: String,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectResourcesRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectResourcesResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -1317,6 +1379,14 @@ pub enum MlStudioPayload {
     DatasetsListResponse(MlStudioDatasetsListResponse),
     DatasetProfileRequest(MlStudioDatasetProfileRequest),
     DatasetProfileResponse(MlStudioDatasetProfileResponse),
+    ResourceGrantCreateRequest(MlStudioResourceGrantCreateRequest),
+    ResourceGrantCreateResponse(MlStudioResourceGrantCreateResponse),
+    ResourceGrantsListRequest(MlStudioResourceGrantsListRequest),
+    ResourceGrantsListResponse(MlStudioResourceGrantsListResponse),
+    ResourceGrantRevokeRequest(MlStudioResourceGrantRevokeRequest),
+    ResourceGrantRevokeResponse(MlStudioResourceGrantRevokeResponse),
+    ProjectResourcesRequest(MlStudioProjectResourcesRequest),
+    ProjectResourcesResponse(MlStudioProjectResourcesResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

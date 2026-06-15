@@ -3468,6 +3468,22 @@ export function encodeMlStudioProjectMembersListRequest(project_id) {
 }
 
 /**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectResourcesRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectResourcesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @returns {Uint8Array}
  */
 export function encodeMlStudioProjectTypesListRequest() {
@@ -3485,6 +3501,66 @@ export function encodeMlStudioProjectTypesListRequest() {
  */
 export function encodeMlStudioProjectsListRequest() {
     const ret = wasm.encodeMlStudioProjectsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} subject_kind
+ * @param {string} subject_id
+ * @param {string} node_id
+ * @param {string} resource_kind
+ * @param {string} resource_ref
+ * @param {string} quota
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantCreateRequest(subject_kind, subject_id, node_id, resource_kind, resource_ref, quota) {
+    const ptr0 = passStringToWasm0(subject_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(resource_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(resource_ref, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passStringToWasm0(quota, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioResourceGrantCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * @param {string} grant_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantRevokeRequest(grant_id) {
+    const ptr0 = passStringToWasm0(grant_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioResourceGrantRevokeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantsListRequest() {
+    const ret = wasm.encodeMlStudioResourceGrantsListRequest();
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

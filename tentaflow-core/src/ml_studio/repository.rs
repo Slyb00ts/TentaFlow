@@ -5,6 +5,7 @@ use rusqlite::{params, OptionalExtension};
 
 use super::models::{
     Dataset, MemberStatus, Project, ProjectMember, ProjectRole, ProjectSummary, ProjectType,
+    ResourceGrant, GRANT_RESOURCE_KINDS, GRANT_SUBJECT_KINDS,
 };
 
 /// Lists projects the user is an active member of (owner or invited-and-accepted),
@@ -400,6 +401,187 @@ pub fn count_models_per_project(project_id: &str) -> Result<u32> {
         |row| row.get(0),
     )?;
     Ok(count.max(0) as u32)
+}
+
+/// Confirms a grant subject actually exists before a grant is stored, so a typo
+/// in `subject_id` can never create an orphaned grant (§11.3). `project`
+/// subjects live in the ML Studio database (reuses the held connection); `user`
+/// and `group` subjects live in the CORE user directory, reached through
+/// `db::global_pool`. Returns a `BadRequest`-style error (anyhow) for unknown
+/// subjects and when the core directory is unavailable.
+fn validate_grant_subject(
+    conn: &rusqlite::Connection,
+    subject_kind: &str,
+    subject_id: &str,
+) -> Result<()> {
+    match subject_kind {
+        "project" => {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM projects WHERE project_id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiego projektu");
+            }
+        }
+        "user" => {
+            let core = crate::db::global_pool()
+                .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
+            let core_conn = core
+                .lock()
+                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+            let exists = core_conn
+                .query_row(
+                    "SELECT 1 FROM user_accounts WHERE id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiego użytkownika");
+            }
+        }
+        "group" => {
+            let core = crate::db::global_pool()
+                .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
+            let core_conn = core
+                .lock()
+                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+            let exists = core_conn
+                .query_row(
+                    "SELECT 1 FROM user_groups WHERE id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiej grupy");
+            }
+        }
+        _ => bail!("subject_kind must be one of user/group/project"),
+    }
+    Ok(())
+}
+
+/// Creates a mesh resource grant (§11.3). Validates `subject_kind` and
+/// `resource_kind` against the fixed catalogues and requires a non-empty
+/// `subject_id` and `node_id`. `resource_ref` (card id) and `quota` are
+/// free-form and may be empty. Returns the stored row.
+#[allow(clippy::too_many_arguments)]
+pub fn create_grant(
+    subject_kind: &str,
+    subject_id: &str,
+    node_id: &str,
+    resource_kind: &str,
+    resource_ref: &str,
+    quota: &str,
+    granted_by: &str,
+) -> Result<ResourceGrant> {
+    if !GRANT_SUBJECT_KINDS.contains(&subject_kind) {
+        bail!("subject_kind must be one of user/group/project");
+    }
+    if !GRANT_RESOURCE_KINDS.contains(&resource_kind) {
+        bail!("resource_kind must be one of gpu/cpu/ram");
+    }
+    let subject_id = subject_id.trim();
+    if subject_id.is_empty() {
+        bail!("subject_id is required");
+    }
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        bail!("node_id is required");
+    }
+
+    let grant_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    validate_grant_subject(&conn, subject_kind, subject_id)?;
+    conn.execute(
+        "INSERT INTO resource_grants \
+             (grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            grant_id,
+            subject_kind,
+            subject_id,
+            node_id,
+            resource_kind,
+            resource_ref,
+            quota,
+            granted_by
+        ],
+    )?;
+    conn.query_row(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants WHERE grant_id = ?1",
+        params![grant_id],
+        read_grant,
+    )
+    .map_err(Into::into)
+}
+
+/// Lists every resource grant, newest first. Admin-wide view — no subject
+/// scoping. Caller gates visibility (admin-only).
+pub fn list_grants() -> Result<Vec<ResourceGrant>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants ORDER BY created_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map([], read_grant)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists grants targeting one specific subject (`kind`/`id`), newest first.
+pub fn list_grants_for_subject(kind: &str, id: &str) -> Result<Vec<ResourceGrant>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants WHERE subject_kind = ?1 AND subject_id = ?2 \
+         ORDER BY created_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map(params![kind, id], read_grant)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists grants allocated to one project (`subject_kind = 'project'`).
+pub fn list_grants_for_project(project_id: &str) -> Result<Vec<ResourceGrant>> {
+    list_grants_for_subject("project", project_id)
+}
+
+/// Removes a grant by id. Returns `true` when a row was deleted.
+pub fn revoke_grant(grant_id: &str) -> Result<bool> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let affected = conn.execute(
+        "DELETE FROM resource_grants WHERE grant_id = ?1",
+        params![grant_id],
+    )?;
+    Ok(affected > 0)
+}
+
+fn read_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceGrant> {
+    Ok(ResourceGrant {
+        grant_id: row.get(0)?,
+        subject_kind: row.get(1)?,
+        subject_id: row.get(2)?,
+        node_id: row.get(3)?,
+        resource_kind: row.get(4)?,
+        resource_ref: row.get(5)?,
+        quota: row.get(6)?,
+        granted_by: row.get(7)?,
+        created_at: row.get(8)?,
+    })
 }
 
 fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {

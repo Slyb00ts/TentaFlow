@@ -180,6 +180,30 @@ pub struct Dataset {
     pub created_at: String,
 }
 
+/// One admin-managed mesh resource grant (§11.3). A record of an allocation,
+/// not live usage. `subject_kind` is one of `user`/`group`/`project`;
+/// `resource_kind` is one of `gpu`/`cpu`/`ram`. `resource_ref` identifies the
+/// card (e.g. GPU name/index) and is empty for cpu/ram. `quota` is free-form
+/// text (GPU count, hours, or empty).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceGrant {
+    pub grant_id: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub node_id: String,
+    pub resource_kind: String,
+    pub resource_ref: String,
+    pub quota: String,
+    pub granted_by: String,
+    pub created_at: String,
+}
+
+/// Allowed `subject_kind` values for a resource grant.
+pub const GRANT_SUBJECT_KINDS: [&str; 3] = ["user", "group", "project"];
+
+/// Allowed `resource_kind` values for a resource grant.
+pub const GRANT_RESOURCE_KINDS: [&str; 3] = ["gpu", "cpu", "ram"];
+
 /// Project plus its per-project KPIs (dataset/model counts), used to build
 /// list/detail responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
