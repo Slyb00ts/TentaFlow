@@ -38,6 +38,7 @@ struct Args {
     dets: u32,
     plates: u32,
     fps: Vec<f64>,
+    batches: Vec<usize>,
 }
 
 fn parse_args() -> Args {
@@ -49,6 +50,7 @@ fn parse_args() -> Args {
         dets: 3,
         plates: 1,
         fps: vec![1.0, 5.0, 10.0, 15.0, 25.0, 30.0],
+        batches: vec![1, 2, 4, 8, 16, 32],
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -68,6 +70,11 @@ fn parse_args() -> Args {
             "--fps" => {
                 if let Some(v) = it.next() {
                     a.fps = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                }
+            }
+            "--batches" => {
+                if let Some(v) = it.next() {
+                    a.batches = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                 }
             }
             other => eprintln!("ignoring unknown flag: {other}"),
@@ -120,9 +127,15 @@ fn main() -> anyhow::Result<()> {
         "batch", "ms/batch", "ms/img", "img/s"
     );
     let mut detect_img_per_s_by_batch: Vec<(usize, f64)> = Vec::new();
-    for &n in &[1usize, 2, 4, 8, 16, 32] {
+    for &n in &args.batches {
         let frames: Vec<(&[u8], u32, u32)> =
             (0..n).map(|_| (frame.as_slice(), args.fw, args.fh)).collect();
+        // One probe call: if it fails (e.g. CUDA OOM at large batch), skip this
+        // batch size and stop growing rather than aborting the whole bench.
+        if let Err(e) = detector.detect_batch(&frames) {
+            println!("{:>6}  (skipped: {})", n, e);
+            break;
+        }
         let iters = if n >= 16 { args.iters / 2 + 1 } else { args.iters };
         let (med, _min, _max) = time_ms(args.warmup.max(2), iters.max(3), || {
             detector.detect_batch(&frames).expect("detect_batch");
