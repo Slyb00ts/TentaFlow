@@ -777,10 +777,52 @@ fn pick_voice_style(dir: &Path, hint: Option<&str>) -> Option<PathBuf> {
     available.into_iter().next()
 }
 
+/// `ort` runs in `load-dynamic` mode (to coexist with sherpa-rs), so it needs to
+/// locate the system `libonnxruntime` at runtime. We probe `ORT_DYLIB_PATH` once
+/// (binary dir then standard locations) so a deploy needs no env wiring. The
+/// camera-CV path used to do this; it now lives here, the only remaining ort user.
+fn ensure_ort_dylib() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+            return;
+        }
+        let libname = if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else {
+            "libonnxruntime.so"
+        };
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join(libname));
+                candidates.push(dir.join("lib").join(libname));
+            }
+        }
+        for base in [
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/opt/onnxruntime/lib",
+            "/usr/lib/x86_64-linux-gnu",
+        ] {
+            candidates.push(std::path::Path::new(base).join(libname));
+        }
+        if let Some(found) = candidates.into_iter().find(|p| p.exists()) {
+            std::env::set_var("ORT_DYLIB_PATH", &found);
+            tracing::info!("[supertonic] ORT_DYLIB_PATH -> {}", found.display());
+        }
+    });
+}
+
 impl SupertonicTtsEngine {
     /// Buduje czterosesyjny pipeline z katalogu modelu i wczytuje voice style.
     /// Wydzielone z `load_model`, bo uzywane tez przy zmianie glosu w runtime.
     fn build_loaded(&self, model_dir: &Path) -> Result<(Loaded, String)> {
+        ensure_ort_dylib();
         let cfg_bytes = std::fs::read(model_dir.join("tts.json"))
             .with_context(|| format!("brak tts.json w {}", model_dir.display()))?;
         let cfg: Config = serde_json::from_slice(&cfg_bytes).context("parse tts.json")?;

@@ -49,7 +49,9 @@ const BUNDLES: &[CvBundle] = &[
         engine_id: "rfdetr-adr",
         files: &[
             CvFile {
-                name: "rfdetr-base.onnx",
+                // Burn weights artifact (architecture is compiled in; only weights
+                // are distributed). Host the .bpk at the release URL.
+                name: "rfdetr-base.bpk",
                 remote: true,
                 embedded: None,
             },
@@ -64,12 +66,7 @@ const BUNDLES: &[CvBundle] = &[
         engine_id: "nalepka-stan",
         files: &[
             CvFile {
-                name: "model_stan.onnx",
-                remote: true,
-                embedded: None,
-            },
-            CvFile {
-                name: "model_stan.onnx.data",
+                name: "model_stan.bpk",
                 remote: true,
                 embedded: None,
             },
@@ -84,7 +81,7 @@ const BUNDLES: &[CvBundle] = &[
         engine_id: "plate-ocr",
         files: &[
             CvFile {
-                name: "plate_ocr.onnx",
+                name: "plate_ocr.bpk",
                 remote: true,
                 embedded: None,
             },
