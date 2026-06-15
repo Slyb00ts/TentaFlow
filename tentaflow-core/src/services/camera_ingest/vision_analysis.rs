@@ -224,6 +224,12 @@ pub fn drain() {
     if let Some(handle) = engine_handle().lock().unwrap().take() {
         handle.abort();
     }
+    // Tear down the cold path too, so its classifier/OCR runners stop and a later
+    // `ensure_analysis` restarts a fresh consumer (the channel is recreated).
+    if let Some(handle) = cold_handle().lock().unwrap().take() {
+        handle.abort();
+    }
+    *cold_chan().lock().unwrap() = None;
 }
 
 /// Spawns the single engine task if it is not already running.
@@ -243,6 +249,7 @@ async fn engine_loop() {
         Some(d) => d,
         None => return, // load failed earlier — overlay still works, no detections
     };
+    let cold = ensure_cold_started();
     info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
 
     // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
@@ -320,20 +327,21 @@ async fn engine_loop() {
             continue;
         }
 
-        // HOT PATH: one batched detector run only (no OCR/classify here). Empty
-        // results publish immediately to clear the overlay; non-empty go to the
-        // cold path for per-detection enrichment + publish, keeping the hot loop
-        // bounded to detector throughput.
+        // HOT PATH: one batched detector run only (no OCR/classify here). EVERY
+        // frame — empty or not — flows through the single cold FIFO so overlay
+        // clears stay ordered with enriched frames (no stale-frame resurrection).
+        // Empty events drop the frame buffer so they cost no memory.
         let detector = detector.clone();
         let detected =
             tokio::task::spawn_blocking(move || detect_only(detector, frames)).await;
         match detected {
             Ok(per_cam) => {
                 for (id, frame, w, h, dets) in per_cam {
-                    if dets.is_empty() {
-                        detection_bus::publish_detections(&id, Vec::new());
-                        continue;
-                    }
+                    let frame = if dets.is_empty() {
+                        Arc::<[u8]>::from(Vec::new())
+                    } else {
+                        frame
+                    };
                     let ev = DetectionEvent {
                         camera_id: id,
                         frame,
@@ -341,9 +349,16 @@ async fn engine_loop() {
                         h,
                         detections: dets,
                     };
-                    // try_send: a full cold queue drops the event (backpressure).
-                    // Chunk 0b adds coalescing, per-camera limits and metrics.
-                    let _ = cold_sender().try_send(ev);
+                    // try_send: Full drops the event (backpressure; 0b adds
+                    // coalescing + counters). Closed means the cold task died —
+                    // warn (ensure_cold_started will respawn next cycle).
+                    match cold.try_send(ev) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("[vision_analysis] cold path closed; detections dropped");
+                        }
+                    }
                 }
             }
             Err(e) => warn!("[vision_analysis] detect task panicked: {e}"),
@@ -351,13 +366,16 @@ async fn engine_loop() {
     }
 }
 
-/// Bounded cold-path queue capacity. A full queue means enrichment can't keep up
-/// with detections; events are dropped (overlay still got raw boxes via the empty
-/// publish path is not affected). Chunk 0b refines this into per-camera limits.
-const COLD_QUEUE_CAP: usize = 256;
+/// Bounded cold-path queue capacity. Each NON-empty event carries a full RGB
+/// frame (≈6 MB @1080p), so the cap is deliberately small to bound memory; empty
+/// events drop the frame and are cheap. Chunk 0b replaces this with a byte-budget
+/// + per-camera coalescing.
+const COLD_QUEUE_CAP: usize = 32;
 
-/// One detection frame handed from the hot detector to the cold enrichment path:
-/// the raw frame + the detector's boxes, to be enriched (state/OCR) and published.
+/// One detection frame handed from the hot detector to the cold enrichment path.
+/// Empty-detection events carry an empty `frame` (no enrichment needed) so they
+/// cost no memory; they still flow through the same FIFO so overlay clears stay
+/// ordered relative to enriched frames (no stale-frame resurrection).
 struct DetectionEvent {
     camera_id: String,
     frame: Arc<[u8]>,
@@ -366,15 +384,34 @@ struct DetectionEvent {
     detections: Vec<crate::services::detection_bus::Detection>,
 }
 
-/// Process-wide sender into the cold enrichment path. First use spawns the single
-/// cold consumer task (which owns the classifier + OCR runners).
-fn cold_sender() -> &'static mpsc::Sender<DetectionEvent> {
-    static TX: OnceLock<mpsc::Sender<DetectionEvent>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<DetectionEvent>(COLD_QUEUE_CAP);
-        tokio::spawn(cold_consumer(rx));
-        tx
-    })
+/// Live cold-path sender + consumer handle, so `drain` can tear the cold path
+/// down and a later `ensure_analysis` can restart it cleanly (an `OnceLock` could
+/// not be reset, leaving a dead sender after drain).
+fn cold_chan() -> &'static Mutex<Option<mpsc::Sender<DetectionEvent>>> {
+    static C: OnceLock<Mutex<Option<mpsc::Sender<DetectionEvent>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+fn cold_handle() -> &'static Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static H: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(None))
+}
+
+/// Returns a sender into the cold path, spawning the consumer if absent or dead.
+fn ensure_cold_started() -> mpsc::Sender<DetectionEvent> {
+    let mut chan = cold_chan().lock().unwrap();
+    let dead = cold_handle()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|j| j.is_finished())
+        .unwrap_or(true);
+    if let (Some(tx), false) = (chan.as_ref(), dead) {
+        return tx.clone();
+    }
+    let (tx, rx) = mpsc::channel::<DetectionEvent>(COLD_QUEUE_CAP);
+    *cold_handle().lock().unwrap() = Some(tokio::spawn(cold_consumer(rx)));
+    *chan = Some(tx.clone());
+    tx
 }
 
 /// Cold path: enriches each detection frame (state classify + plate OCR on crops)
