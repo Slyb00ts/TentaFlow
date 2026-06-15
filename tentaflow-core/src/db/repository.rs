@@ -17079,6 +17079,9 @@ pub struct CameraRow {
     /// any non-ONVIF camera and for ONVIF cameras whose
     /// `GetMetadataConfigurations` returned an empty list.
     pub metadata_supported: bool,
+    /// Per-camera analysis Flow id (the cold path runs it on a detection
+    /// event). `None` = no flow assigned → built-in enrichment.
+    pub analysis_flow_id: Option<String>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -17124,6 +17127,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         onvif_profile_token: row.get(19)?,
         metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
         analysis_fps: row.get(21)?,
+        analysis_flow_id: row.get(22)?,
     })
 }
 
@@ -17132,7 +17136,7 @@ const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
-     onvif_url, onvif_profile_token, metadata_supported, analysis_fps";
+     onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must

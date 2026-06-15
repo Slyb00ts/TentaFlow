@@ -345,6 +345,7 @@ async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> Came
         last_frame_at,
         retention_class: row.retention_class,
         profile: row.profile,
+        analysis_flow_id: row.analysis_flow_id,
     }
 }
 
@@ -1329,6 +1330,7 @@ pub fn camera_get_v1(
             last_frame_at: row.last_frame_at,
             retention_class: row.retention_class,
             profile: row.profile,
+            analysis_flow_id: row.analysis_flow_id,
         },
     };
     audit(
@@ -1726,6 +1728,7 @@ pub fn camera_update_v1(
                 last_frame_at: row.last_frame_at,
                 retention_class: row.retention_class,
                 profile: row.profile,
+                analysis_flow_id: row.analysis_flow_id,
             }
         }
     });
