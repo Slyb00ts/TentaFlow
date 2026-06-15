@@ -43,7 +43,8 @@ use crate::flow_engine::node_adapters::{
     OutputNodeAdapter, PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
-    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
+    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionClassifyNodeAdapter,
+    VisionNodeAdapter, VisionOcrNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -906,6 +907,8 @@ fn build_registry(
         Arc::new(SessionContextNodeAdapter::new()),
         Arc::new(SpeakerContextNodeAdapter::new()),
         Arc::new(VisionNodeAdapter::new()),
+        Arc::new(VisionOcrNodeAdapter::new()),
+        Arc::new(VisionClassifyNodeAdapter::new()),
         // ask_user (§3.13 C) — BPMN User Task: no dependency slot, it uses the
         // process-global interaction registry + run manager.
         Arc::new(AskUserNodeAdapter::new()),
