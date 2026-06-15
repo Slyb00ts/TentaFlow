@@ -574,6 +574,24 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(_) => {
                 "MlStudioProjectMemberRoleSetResponse"
             }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(_) => {
+                "MlStudioDatasetUploadRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(_) => {
+                "MlStudioDatasetUploadResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListRequest(_) => {
+                "MlStudioDatasetsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListResponse(_) => {
+                "MlStudioDatasetsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileRequest(_) => {
+                "MlStudioDatasetProfileRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
+                "MlStudioDatasetProfileResponse"
+            }
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",

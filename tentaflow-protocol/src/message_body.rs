@@ -1209,7 +1209,91 @@ pub struct MlStudioProjectMemberRoleSetResponse {
     pub member: MlStudioProjectMember,
 }
 
+/// One distinct value of a categorical column with its row count. Mirrors
+/// `ml_studio::profile::ClassCount`; feeds the "wykryto N klas" UI list.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClassCount {
+    pub value: String,
+    pub count: u64,
+}
+
+/// Profile of one dataset column. `column_type` is a stable slug
+/// (`categorical`/`integer`/`float`/`date`/`text`). `classes` is non-empty only
+/// for small categorical columns. Mirrors `ml_studio::profile::ColumnProfile`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct ColumnProfile {
+    pub name: String,
+    pub column_type: String,
+    pub unique_count: u64,
+    pub missing_ratio: f64,
+    pub examples: Vec<String>,
+    pub classes: Vec<ClassCount>,
+    pub unique_capped: bool,
+}
+
+/// Full profile of an uploaded table. Mirrors `ml_studio::profile::TableProfile`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct TableProfile {
+    pub format: String,
+    pub row_count: u64,
+    pub scanned_rows: u64,
+    pub column_count: u32,
+    pub columns: Vec<ColumnProfile>,
+    pub truncated: bool,
+}
+
+/// Compact dataset row for the project data screen (`t-dane`): identity, source
+/// kind and the row/column KPIs. The full per-column profile is fetched
+/// separately via `DatasetProfileRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct DatasetSummary {
+    pub dataset_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub kind: String,
+    pub row_count: u64,
+    pub column_count: u32,
+    pub created_at: String,
+}
+
+/// Upload a tabular file (CSV/XLSX) into a project for profiling. `bytes` is the
+/// raw file content carried inline in the CBOR body (no multipart for the
+/// dashboard); `filename` selects the parser by extension.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadRequest {
+    pub project_id: String,
+    pub name: String,
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadResponse {
+    pub dataset: DatasetSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetsListResponse {
+    pub datasets: Vec<DatasetSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetProfileRequest {
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetProfileResponse {
+    pub dataset: DatasetSummary,
+    pub profile: TableProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
     ProjectsListResponse(MlStudioProjectsListResponse),
@@ -1227,6 +1311,12 @@ pub enum MlStudioPayload {
     ProjectMemberRemoveResponse(MlStudioProjectMemberRemoveResponse),
     ProjectMemberRoleSetRequest(MlStudioProjectMemberRoleSetRequest),
     ProjectMemberRoleSetResponse(MlStudioProjectMemberRoleSetResponse),
+    DatasetUploadRequest(MlStudioDatasetUploadRequest),
+    DatasetUploadResponse(MlStudioDatasetUploadResponse),
+    DatasetsListRequest(MlStudioDatasetsListRequest),
+    DatasetsListResponse(MlStudioDatasetsListResponse),
+    DatasetProfileRequest(MlStudioDatasetProfileRequest),
+    DatasetProfileResponse(MlStudioDatasetProfileResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

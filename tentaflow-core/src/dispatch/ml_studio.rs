@@ -13,7 +13,8 @@ use tentaflow_protocol::{
 };
 
 use super::HandlerContext;
-use crate::ml_studio::models::{ProjectMember, ProjectRole, ProjectSummary, ProjectType};
+use crate::ml_studio::models::{Dataset, ProjectMember, ProjectRole, ProjectSummary, ProjectType};
+use crate::ml_studio::profile::{self, TableProfile};
 use crate::ml_studio::repository;
 use crate::services::rbac::OrgContext;
 
@@ -203,6 +204,21 @@ fn require_project_owner(user_id: &str, project_id: &str) -> Result<(), Protocol
     }
 }
 
+/// Asserts the caller may WRITE data into `project_id` — i.e. is its owner or an
+/// editor. Viewers and non-members are rejected with `PolicyDenied`. Read paths
+/// (list/profile) stay open to every member; only data mutation needs this gate.
+fn require_project_editor(user_id: &str, project_id: &str) -> Result<(), ProtocolError> {
+    match repository::member_role(project_id, user_id).map_err(db_err)? {
+        Some(role) if role == ProjectRole::Owner.slug() || role == ProjectRole::Editor.slug() => {
+            Ok(())
+        }
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "tylko właściciel lub edytor może wgrywać dane",
+        )),
+    }
+}
+
 #[handler(variant = "MlStudioProjectMembersListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -332,6 +348,153 @@ pub fn ml_studio_project_member_role_set(
     Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectMemberRoleSetResponse(
         MlStudioProjectMemberRoleSetResponse {
             member: to_member(member),
+        },
+    )))
+}
+
+fn to_dataset_summary(d: &Dataset) -> tentaflow_protocol::DatasetSummary {
+    tentaflow_protocol::DatasetSummary {
+        dataset_id: d.dataset_id.clone(),
+        project_id: d.project_id.clone(),
+        name: d.name.clone(),
+        kind: d.kind.clone(),
+        row_count: d.row_count,
+        column_count: d.column_count,
+        created_at: d.created_at.clone(),
+    }
+}
+
+/// Maps the internal `profile::TableProfile` to its protocol mirror. The wire
+/// type carries `column_type` as the slug string the UI localises.
+fn to_protocol_profile(p: TableProfile) -> tentaflow_protocol::TableProfile {
+    tentaflow_protocol::TableProfile {
+        format: p.format,
+        row_count: p.row_count,
+        scanned_rows: p.scanned_rows,
+        column_count: p.column_count,
+        truncated: p.truncated,
+        columns: p
+            .columns
+            .into_iter()
+            .map(|c| tentaflow_protocol::ColumnProfile {
+                name: c.name,
+                column_type: c.column_type.slug().to_string(),
+                unique_count: c.unique_count,
+                missing_ratio: c.missing_ratio,
+                examples: c.examples,
+                classes: c
+                    .classes
+                    .into_iter()
+                    .map(|cc| tentaflow_protocol::ClassCount {
+                        value: cc.value,
+                        count: cc.count,
+                    })
+                    .collect(),
+                unique_capped: c.unique_capped,
+            })
+            .collect(),
+    }
+}
+
+#[handler(variant = "MlStudioDatasetUploadRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_upload(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetUploadRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    let table = profile::profile_table(&payload.bytes, &payload.filename)
+        .map_err(|e| ProtocolError::bad_request(format!("profiling failed: {}", e)))?;
+    let kind = table.format.clone();
+    let row_count = table.row_count;
+    let column_count = table.column_count;
+    let profile_json =
+        serde_json::to_string(&table).map_err(|e| ProtocolError::internal(e.to_string()))?;
+
+    let name = if payload.name.trim().is_empty() {
+        payload.filename.as_str()
+    } else {
+        payload.name.as_str()
+    };
+    let dataset = repository::create_dataset(
+        &org.user_id,
+        &payload.project_id,
+        name,
+        &kind,
+        row_count,
+        column_count,
+        &profile_json,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))?;
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadResponse(
+        tentaflow_protocol::MlStudioDatasetUploadResponse {
+            dataset: to_dataset_summary(&dataset),
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioDatasetsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_datasets_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetsListRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetsListRequest")),
+    };
+    let org = require_org(ctx)?;
+    let datasets = repository::list_datasets(&org.user_id, &payload.project_id)
+        .map_err(|e| {
+            if e.to_string().contains("not a member") {
+                ProtocolError::new(ProtocolErrorCode::NotFound, "project not found")
+            } else {
+                db_err(e)
+            }
+        })?
+        .iter()
+        .map(to_dataset_summary)
+        .collect();
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetsListResponse(
+        tentaflow_protocol::MlStudioDatasetsListResponse { datasets },
+    )))
+}
+
+#[handler(variant = "MlStudioDatasetProfileRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_profile(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetProfileRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetProfileRequest")),
+    };
+    let org = require_org(ctx)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+
+    let table: TableProfile = serde_json::from_str(&dataset.profile_json)
+        .map_err(|e| ProtocolError::internal(format!("stored profile is corrupt: {}", e)))?;
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetProfileResponse(
+        tentaflow_protocol::MlStudioDatasetProfileResponse {
+            dataset: to_dataset_summary(&dataset),
+            profile: to_protocol_profile(table),
         },
     )))
 }

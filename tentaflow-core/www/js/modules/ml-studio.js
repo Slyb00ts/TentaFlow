@@ -18,6 +18,7 @@ import '/js/components/tf-modal.js';
 import '/js/components/tf-radio.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
+import '/js/components/tf-file-input.js';
 import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-stat-card.js';
 import '/js/components/tf-detail-header.js';
@@ -544,6 +545,10 @@ function renderDetail(host, p) {
     if (!panel) return;
     const idx = Number(String(tabId ?? '').replace('ml-tab-', ''));
     const label = tabs[Number.isNaN(idx) ? 0 : idx] || tabs[0];
+    if (label === 'Dane') {
+      renderDataTab(panel, projectId(p));
+      return;
+    }
     panel.innerHTML = '';
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', typeIcon(slug));
@@ -558,6 +563,280 @@ function renderDetail(host, p) {
     renderPanel(e.detail?.value);
   });
   renderPanel('ml-tab-0');
+}
+
+// =============================================================================
+// "Dane" tab — data provenance: upload a tabular file, list datasets, and show
+// the column profile (type/unique/missing/examples) read straight from the file.
+// Everything shown here comes from the backend profile; nothing is predefined.
+// =============================================================================
+
+// Backend columnType slug → human label + chip status (mirrors t-dane type-pill).
+const COLUMN_TYPE_LABEL = {
+  categorical: 'kategoria',
+  integer: 'całkowita',
+  float: 'zmiennoprzecinkowa',
+  date: 'data',
+  text: 'tekst',
+};
+const COLUMN_TYPE_STATUS = {
+  categorical: 'accent',
+  integer: 'info',
+  float: 'info',
+  date: 'ok',
+  text: 'info',
+};
+
+function columnTypeSlug(col) {
+  return String(col.columnType ?? col.column_type ?? 'text').toLowerCase();
+}
+
+function datasetKindLabel(kind) {
+  const k = String(kind || '').toLowerCase();
+  if (k === 'csv') return 'CSV';
+  if (k === 'xlsx') return 'XLSX';
+  return kind ? String(kind).toUpperCase() : '—';
+}
+
+function nameFromFilename(filename) {
+  const base = String(filename || '').replace(/\.[^.]+$/, '').trim();
+  return base || String(filename || 'zbiór');
+}
+
+function renderDataTab(panel, pid) {
+  panel.innerHTML = `
+    <div class="ml-studio-data">
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('cloud')} Źródło danych
+          <span class="ml-studio-data-hint">Formaty: .csv · .xlsx · pierwszy wiersz = nagłówki kolumn</span>
+        </div>
+        <tf-file-input id="ml-studio-data-file" accept=".csv,.xlsx" label="Przeciągnij plik lub kliknij, aby wgrać"></tf-file-input>
+      </section>
+
+      <div class="ml-studio-data-origin">
+        <div class="ml-studio-data-origin-ico">${sprite('info')}</div>
+        <div>
+          <div class="ml-studio-data-origin-title">Kolumny i typy są CZYTANE z Twojego pliku — nic nie jest predefiniowane.</div>
+          <p class="ml-studio-data-origin-text">Każdy wiersz profilu poniżej to jedna kolumna z Twojego pliku. Typ, liczba unikalnych wartości, % braków i liczba klas zostały policzone z zawartości — to one są źródłem dalszych kroków (np. „wykryto N klas").</p>
+        </div>
+      </div>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('database')} Wgrane zbiory</div>
+        <div id="ml-studio-datasets"></div>
+      </section>
+
+      <section class="ml-studio-data-card" id="ml-studio-profile-card" hidden>
+        <div class="ml-studio-data-head">${sprite('grid-rows')} Profil kolumn — wykryto z nagłówków pliku
+          <span class="ml-studio-data-hint" id="ml-studio-profile-meta"></span>
+        </div>
+        <div id="ml-studio-profile"></div>
+      </section>
+    </div>
+  `;
+
+  const fileInput = byId('ml-studio-data-file');
+  // tf-file-input emits `change` with detail.files (FileList) — tf-file-input.js:70.
+  fileInput?.addEventListener('change', async (e) => {
+    const files = e.detail?.files;
+    const file = files && files.length ? files[0] : null;
+    if (file) await uploadDataset(pid, file);
+  });
+
+  loadDatasets(pid);
+}
+
+// inline upload bounded by WS frame limit (1 MiB); larger datasets need chunked upload (future)
+const MAX_UPLOAD_BYTES = 900 * 1024;
+
+async function uploadDataset(pid, file) {
+  const filename = file.name || 'zbiór';
+  if (file.size > MAX_UPLOAD_BYTES) {
+    toast('Plik za duży (limit ~0,9 MB dla wgrywania w tej wersji). Większe zbiory: chunked upload w przygotowaniu.', 'error');
+    return;
+  }
+  try {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const resp = await ApiBinary.one('mlStudioDatasetUploadRequest', {
+      projectId: pid,
+      name: nameFromFilename(filename),
+      filename,
+      bytes,
+    });
+    toast(`Wgrano „${filename}" — sprofilowano`, 'success');
+    await loadDatasets(pid);
+    const datasetId = resp.datasetId ?? resp.dataset_id
+      ?? resp.dataset?.datasetId ?? resp.dataset?.dataset_id;
+    if (resp.profile) {
+      renderProfile(resp.profile);
+    } else if (datasetId) {
+      await loadProfile(datasetId);
+    }
+  } catch (err) {
+    toast(`Wgrywanie pliku: ${err.message}`, 'error');
+  }
+}
+
+async function loadDatasets(pid) {
+  const host = byId('ml-studio-datasets');
+  if (!host) return;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  try {
+    const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+    const datasets = Array.isArray(resp.datasets) ? resp.datasets : [];
+    renderDatasetsTable(host, datasets);
+  } catch (err) {
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Nie udało się wczytać zbiorów');
+    empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+    host.appendChild(empty);
+  }
+}
+
+function renderDatasetsTable(host, datasets) {
+  host.innerHTML = '';
+  if (!datasets.length) {
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'database');
+    empty.setAttribute('title', 'Brak danych');
+    empty.setAttribute('message', 'Wgraj plik CSV/XLSX — system odczyta jego nagłówki i zbuduje profil kolumn.');
+    host.appendChild(empty);
+    return;
+  }
+
+  const table = document.createElement('tf-table');
+  table.setAttribute('variant', 'lined');
+  table.innerHTML = `
+    <tf-column key="name" label="Nazwa"></tf-column>
+    <tf-column key="kind" label="Typ pliku" renderer="html"></tf-column>
+    <tf-column key="rowCount" label="Wiersze" renderer="num"></tf-column>
+    <tf-column key="columnCount" label="Kolumny" renderer="num"></tf-column>
+    <tf-column key="createdAt" label="Data"></tf-column>
+  `;
+  table.rows = datasets.map((d) => {
+    const id = d.datasetId ?? d.dataset_id ?? '';
+    return {
+      _datasetId: String(id),
+      name: d.name || '(bez nazwy)',
+      kind: `<span class="tf-chip info">${escapeHtml(datasetKindLabel(d.kind))}</span>`,
+      rowCount: formatNumber(d.rowCount ?? d.row_count),
+      columnCount: formatNumber(d.columnCount ?? d.column_count),
+      createdAt: formatDate(d.createdAt ?? d.created_at),
+    };
+  });
+  table.addEventListener('row-click', (e) => {
+    const id = e.detail?.row?._datasetId;
+    if (id) loadProfile(id);
+  });
+  host.appendChild(table);
+}
+
+async function loadProfile(datasetId) {
+  const card = byId('ml-studio-profile-card');
+  const host = byId('ml-studio-profile');
+  if (!host || !card) return;
+  card.hidden = false;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  try {
+    const resp = await ApiBinary.one('mlStudioDatasetProfileRequest', { datasetId });
+    renderProfile(resp.profile || resp);
+  } catch (err) {
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Nie udało się wczytać profilu');
+    empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+    host.appendChild(empty);
+  }
+}
+
+function renderProfile(profile) {
+  const card = byId('ml-studio-profile-card');
+  const host = byId('ml-studio-profile');
+  const meta = byId('ml-studio-profile-meta');
+  if (!host || !card) return;
+  card.hidden = false;
+
+  const rowCount = profile.rowCount ?? profile.row_count ?? 0;
+  const columnCount = profile.columnCount ?? profile.column_count ?? 0;
+  const scannedRows = profile.scannedRows ?? profile.scanned_rows ?? 0;
+  const truncated = profile.truncated ?? false;
+  const format = profile.format ? datasetKindLabel(profile.format) : '—';
+  const columns = Array.isArray(profile.columns) ? profile.columns : [];
+
+  if (meta) {
+    let text = `${formatNumber(rowCount)} wierszy · ${formatNumber(columnCount)} kolumn · ${format} · przeskanowano ${formatNumber(scannedRows)} wierszy`;
+    if (truncated) text += ' (próbka obcięta)';
+    meta.textContent = text;
+  }
+
+  host.innerHTML = '';
+  if (!columns.length) {
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'grid-rows');
+    empty.setAttribute('title', 'Brak kolumn w profilu');
+    empty.setAttribute('message', 'Plik nie zawiera rozpoznawalnych kolumn.');
+    host.appendChild(empty);
+    return;
+  }
+
+  const table = document.createElement('tf-table');
+  table.setAttribute('variant', 'lined');
+  table.innerHTML = `
+    <tf-column key="name" label="Kolumna" renderer="html"></tf-column>
+    <tf-column key="type" label="Typ" renderer="html"></tf-column>
+    <tf-column key="unique" label="Unikalne" renderer="num"></tf-column>
+    <tf-column key="missing" label="% braków" renderer="html"></tf-column>
+    <tf-column key="examples" label="Przykłady" renderer="html"></tf-column>
+  `;
+  table.rows = columns.map((col) => profileRow(col));
+  host.appendChild(table);
+}
+
+function profileRow(col) {
+  const slug = columnTypeSlug(col);
+  const typeLabel = COLUMN_TYPE_LABEL[slug] || slug;
+  const status = COLUMN_TYPE_STATUS[slug] || 'info';
+  const uniqueCount = col.uniqueCount ?? col.unique_count ?? 0;
+  const uniqueCapped = col.uniqueCapped ?? col.unique_capped ?? false;
+  const missingRatio = Number(col.missingRatio ?? col.missing_ratio ?? 0);
+  const examples = Array.isArray(col.examples) ? col.examples : [];
+  const classes = Array.isArray(col.classes) ? col.classes : [];
+
+  const missingPct = (missingRatio * 100).toFixed(1).replace('.', ',');
+  const missClass = missingRatio > 0.01 ? 'ml-studio-miss-warn' : 'ml-studio-miss-ok';
+
+  // Categorical columns expose their detected classes — this is the provenance of
+  // "wykryto N klas" downstream, so surface the value/count breakdown inline.
+  let nameExtra = '';
+  if (slug === 'categorical' && classes.length) {
+    const list = classes
+      .map((c) => `${escapeHtml(String(c.value ?? ''))} (${formatNumber(c.count ?? 0)})`)
+      .join(', ');
+    nameExtra = `<div class="ml-studio-col-classes">${sprite('info')} wykryto ${classes.length} ${plural(classes.length, 'klasę', 'klasy', 'klas')}: ${list}</div>`;
+  }
+
+  const uniqueText = `${formatNumber(uniqueCount)}${uniqueCapped ? '+' : ''}`;
+  const examplesHtml = examples.length
+    ? examples.slice(0, 4).map((v) => `<span class="ml-studio-col-example">${escapeHtml(String(v))}</span>`).join('')
+    : '<span class="ml-studio-col-example ml-studio-col-example-empty">—</span>';
+
+  return {
+    name: `<span class="ml-studio-col-name">${escapeHtml(String(col.name ?? ''))}</span>${nameExtra}`,
+    type: `<span class="tf-chip ${status}">${escapeHtml(typeLabel)}</span>`,
+    unique: uniqueText,
+    missing: `<span class="${missClass}">${missingPct}%</span>`,
+    examples: `<div class="ml-studio-col-examples">${examplesHtml}</div>`,
+  };
+}
+
+function formatNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value ?? '—');
+  return n.toLocaleString('pl-PL');
 }
 
 // =============================================================================

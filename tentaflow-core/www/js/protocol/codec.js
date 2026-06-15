@@ -2441,6 +2441,58 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(DatasetUploadRequest). Uploads a tabular file
+   * (CSV/XLSX) into a project for profiling. `bytes` must be a Uint8Array of the
+   * raw file content — carried inline in the CBOR body (no multipart).
+   * payload: { projectId, name, filename, bytes }
+   */
+  mlStudioDatasetUploadRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeMlStudioDatasetUploadRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.name ?? ''),
+      String(payload.filename ?? ''),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(DatasetsListRequest). payload: { projectId }. */
+  mlStudioDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDatasetsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(DatasetProfileRequest). payload: { datasetId }. */
+  mlStudioDatasetProfileRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDatasetProfileRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.
    * payload: { tag?, source?, status? }

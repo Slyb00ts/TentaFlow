@@ -165,6 +165,21 @@ pub struct Project {
     pub updated_at: String,
 }
 
+/// One dataset row from `datasets`, including the stored profiling JSON. The
+/// `profile_json` carries a serialized `profile::TableProfile`; an empty
+/// dataset (no successful profile) keeps the `'{}'` default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dataset {
+    pub dataset_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub kind: String,
+    pub row_count: u64,
+    pub column_count: u32,
+    pub profile_json: String,
+    pub created_at: String,
+}
+
 /// Project plus its per-project KPIs (dataset/model counts), used to build
 /// list/detail responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]

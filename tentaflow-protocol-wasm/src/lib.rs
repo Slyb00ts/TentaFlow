@@ -1616,6 +1616,49 @@ pub fn encode_ml_studio_project_member_role_set_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// Upload a tabular file for profiling. `bytes` arrives from JS as a Uint8Array
+/// and wasm-bindgen materializes it directly into `Vec<u8>` — no base64 or copy
+/// step on the JS side.
+#[wasm_bindgen(js_name = encodeMlStudioDatasetUploadRequest)]
+pub fn encode_ml_studio_dataset_upload_request(
+    project_id: String,
+    name: String,
+    filename: String,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(
+            tentaflow_protocol::MlStudioDatasetUploadRequest {
+                project_id,
+                name,
+                filename,
+                bytes,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDatasetsListRequest)]
+pub fn encode_ml_studio_datasets_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetsListRequest(
+            tentaflow_protocol::MlStudioDatasetsListRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDatasetProfileRequest)]
+pub fn encode_ml_studio_dataset_profile_request(dataset_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetProfileRequest(
+            tentaflow_protocol::MlStudioDatasetProfileRequest { dataset_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -7282,6 +7325,64 @@ fn ml_studio_member_to_js(m: &tentaflow_protocol::MlStudioProjectMember) -> js_s
     item
 }
 
+fn ml_studio_dataset_summary_to_js(d: &tentaflow_protocol::DatasetSummary) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "datasetId", d.dataset_id.clone().into());
+    set(&item, "dataset_id", d.dataset_id.clone().into());
+    set(&item, "projectId", d.project_id.clone().into());
+    set(&item, "project_id", d.project_id.clone().into());
+    set(&item, "name", d.name.clone().into());
+    set(&item, "kind", d.kind.clone().into());
+    set(&item, "rowCount", (d.row_count as f64).into());
+    set(&item, "row_count", (d.row_count as f64).into());
+    set(&item, "columnCount", d.column_count.into());
+    set(&item, "column_count", d.column_count.into());
+    set(&item, "createdAt", d.created_at.clone().into());
+    set(&item, "created_at", d.created_at.clone().into());
+    item
+}
+
+fn ml_studio_table_profile_to_js(p: &tentaflow_protocol::TableProfile) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "format", p.format.clone().into());
+    set(&obj, "rowCount", (p.row_count as f64).into());
+    set(&obj, "row_count", (p.row_count as f64).into());
+    set(&obj, "scannedRows", (p.scanned_rows as f64).into());
+    set(&obj, "scanned_rows", (p.scanned_rows as f64).into());
+    set(&obj, "columnCount", p.column_count.into());
+    set(&obj, "column_count", p.column_count.into());
+    set(&obj, "truncated", p.truncated.into());
+    let columns = js_sys::Array::new();
+    for c in &p.columns {
+        let col = js_sys::Object::new();
+        set(&col, "name", c.name.clone().into());
+        set(&col, "columnType", c.column_type.clone().into());
+        set(&col, "column_type", c.column_type.clone().into());
+        set(&col, "uniqueCount", (c.unique_count as f64).into());
+        set(&col, "unique_count", (c.unique_count as f64).into());
+        set(&col, "missingRatio", c.missing_ratio.into());
+        set(&col, "missing_ratio", c.missing_ratio.into());
+        set(&col, "uniqueCapped", c.unique_capped.into());
+        set(&col, "unique_capped", c.unique_capped.into());
+        let examples = js_sys::Array::new();
+        for ex in &c.examples {
+            examples.push(&ex.clone().into());
+        }
+        set(&col, "examples", examples.into());
+        let classes = js_sys::Array::new();
+        for cc in &c.classes {
+            let entry = js_sys::Object::new();
+            set(&entry, "value", cc.value.clone().into());
+            set(&entry, "count", (cc.count as f64).into());
+            classes.push(&entry);
+        }
+        set(&col, "classes", classes.into());
+        columns.push(&col);
+    }
+    set(&obj, "columns", columns.into());
+    obj
+}
+
 fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::MlStudioPayload) {
     match payload {
         tentaflow_protocol::MlStudioPayload::ProjectsListRequest(_) => {
@@ -7380,6 +7481,40 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
         tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(resp) => {
             set(obj, "variant", "MlStudioProjectMemberRoleSetResponse".into());
             set(obj, "member", ml_studio_member_to_js(&resp.member).into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetUploadRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "name", req.name.into());
+            set(obj, "filename", req.filename.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetUploadResponse".into());
+            set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetsListRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetsListRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetsListResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetsListResponse".into());
+            let arr = js_sys::Array::new();
+            for d in &resp.datasets {
+                arr.push(&ml_studio_dataset_summary_to_js(d));
+            }
+            set(obj, "datasets", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetProfileRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetProfileRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetProfileResponse".into());
+            set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+            set(obj, "profile", ml_studio_table_profile_to_js(&resp.profile).into());
         }
     }
 }
