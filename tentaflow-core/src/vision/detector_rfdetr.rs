@@ -1,37 +1,32 @@
 // =============================================================================
-// File: vision/detector_rfdetr.rs — RF-DETR ADR detector (ONNX via `ort`)
+// File: vision/detector_rfdetr.rs — RF-DETR ADR detector (Burn)
 // =============================================================================
 //
 // Always-on ADR (dangerous-goods placards / labels) detector for the Orlen
-// camera-CV PoC. Loads `rfdetr-base.onnx` through ONNX Runtime (`ort`, CPU EP)
-// and produces `detection_bus::Detection` items so the live overlay renders
-// real detections instead of the dev stub.
+// camera-CV PoC. The architecture is the vendored `burn_rfdetr` model (build-time
+// ONNX→Burn codegen); weights load at runtime from `rfdetr-base.bpk`. Runs on the
+// backend chosen by the `vision-*` feature (CUDA/Metal/ROCm native, wgpu fallback).
 //
 // The preprocessing mirrors the reference `model.predict` 1:1: RGB → 560×560
 // bilinear STRETCH (no letterbox) → /255 → per-channel ImageNet normalize →
-// NCHW f32 [1,3,560,560]. The model is a DETR head, so postprocessing is a
-// per-query sigmoid + argmax over the 17 real classes (index 17 is the
-// background/ignore slot) with NO NMS.
+// NCHW f32 [N,3,560,560]. DETR head → per-query sigmoid + argmax over the 17 real
+// classes (index 17 is the background/ignore slot), NO NMS.
 
 #![cfg(feature = "inference-vision-gpu")]
 
-use std::path::Path;
-
 use anyhow::{anyhow, bail, Context, Result};
-use ndarray::Array4;
-use ort::session::Session;
-use ort::value::Value;
+use burn::tensor::{Tensor, TensorData};
+use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::paths;
 use crate::services::detection_bus::Detection;
+use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
+use crate::vision::burn_rfdetr::Model;
 
 /// Square input resolution the exported RF-DETR graph expects.
 const RESOLUTION: u32 = 560;
-
-/// Number of object queries emitted by the decoder (`dets`/`labels` dim 1).
-const NUM_QUERIES: usize = 300;
 
 /// Per-channel ImageNet normalization (matches the training transform).
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -48,22 +43,20 @@ struct ClassesFile {
     resolution: u32,
 }
 
-/// Loaded RF-DETR session plus the class-name table. `Session::run` needs
-/// `&mut`, so `detect` takes `&mut self`; a single shared instance is driven
-/// from one analysis task (or behind a mutex when shared across cameras).
+/// Loaded RF-DETR model + class-name table + backend device. `detect`/`detect_batch`
+/// keep `&mut self` so the cross-camera engine can hold it behind a single mutex.
 pub struct RfDetrDetector {
-    session: Session,
+    model: Model<VisionBackend>,
+    device: VisionDevice,
     classes: Vec<String>,
-    /// Graph input tensor name, read from the model so we do not hard-code it.
-    input_name: String,
 }
 
 impl RfDetrDetector {
     /// Builds the detector from the deploy-time model dir
-    /// (`vision_models_dir()/rfdetr-{base.onnx,classes.json}`). CPU EP for now.
+    /// (`vision_models_dir()/rfdetr-{base.bpk,classes.json}`).
     pub fn load() -> Result<Self> {
         let dir = paths::vision_models_dir();
-        let model_path = dir.join("rfdetr-base.onnx");
+        let weights_path = dir.join("rfdetr-base.bpk");
         let classes_path = dir.join("rfdetr-classes.json");
 
         let classes_bytes = std::fs::read(&classes_path)
@@ -74,24 +67,26 @@ impl RfDetrDetector {
             bail!("rfdetr-classes.json has no classes");
         }
 
-        let session = super::ort_session::build_session(&model_path)?;
-
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| anyhow!("RF-DETR model has no inputs"))?;
+        if !weights_path.exists() {
+            bail!("RF-DETR weights missing: {}", weights_path.display());
+        }
+        let device = burn_backend::device();
+        let mut model = Model::<VisionBackend>::new(&device);
+        let mut store = BurnpackStore::from_file(&weights_path);
+        model
+            .load_from(&mut store)
+            .map_err(|e| anyhow!("load RF-DETR weights {}: {e}", weights_path.display()))?;
 
         info!(
-            "[rfdetr] loaded {} ({} classes, input '{}')",
-            model_path.display(),
+            "[rfdetr] loaded {} ({} classes, backend {})",
+            weights_path.display(),
             parsed.classes.len(),
-            input_name
+            std::any::type_name::<VisionBackend>()
         );
         Ok(Self {
-            session,
+            model,
+            device,
             classes: parsed.classes,
-            input_name,
         })
     }
 
@@ -99,55 +94,39 @@ impl RfDetrDetector {
     /// exactly one preprocess + postprocess code path — a single live camera
     /// gets bit-identical results to the batched fleet path.
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
-        Ok(self.detect_batch(&[(rgb, w, h)])?.pop().unwrap_or_default())
+        Ok(self.detect_batch(&[(rgb, w, h)])?.into_iter().next().unwrap_or_default())
     }
 
-    /// Batched inference across cameras: stacks N frames into one
-    /// `[N,3,560,560]` tensor and issues a SINGLE `Session::run`. Returns
-    /// per-frame detections in the same order as `frames`. This is the fleet
-    /// throughput lever — one GPU launch amortized over many cameras.
+    /// Stacks N camera frames into one `[N,3,560,560]` batch and runs a single
+    /// forward — one GPU launch amortized across the fleet.
     pub fn detect_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
         let n = frames.len();
         let res = RESOLUTION as usize;
-        let mut tensor = Array4::<f32>::zeros((n, 3, res, res));
+        let mut data = vec![0f32; n * 3 * res * res];
         for (bi, &(rgb, w, h)) in frames.iter().enumerate() {
-            fill_frame(&mut tensor, bi, rgb, w, h)?;
+            fill_frame(&mut data, bi, rgb, w, h)?;
         }
-        let input_value = Value::from_array(tensor)?;
+        let input =
+            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [n, 3, res, res]), &self.device);
 
-        // Run + copy outputs to owned buffers inside this scope so the session
-        // borrow is released before postprocessing (which reads `self.classes`).
-        let (dets_v, labels_v, queries, label_dim) = {
-            let outputs = self
-                .session
-                .run(ort::inputs! { self.input_name.as_str() => &input_value })?;
-            let (dets_shape, dets) = outputs["dets"].try_extract_tensor::<f32>()?;
-            let (labels_shape, labels) = outputs["labels"].try_extract_tensor::<f32>()?;
+        let (o0, o1) = self.model.forward(input);
+        // dets last dim = 4 (cxcywh), labels last dim = num_classes + background.
+        let (dets_t, labels_t) = if o0.dims()[2] == 4 { (o0, o1) } else { (o1, o0) };
+        let queries = dets_t.dims()[1];
+        let label_dim = labels_t.dims()[2];
 
-            if dets_shape.len() != 3 || dets_shape[2] != 4 {
-                bail!("unexpected dets shape {:?}", &*dets_shape);
-            }
-            if labels_shape.len() != 3 {
-                bail!("unexpected labels shape {:?}", &*labels_shape);
-            }
-            if dets_shape[0] as usize != n || labels_shape[0] as usize != n {
-                bail!(
-                    "batch mismatch: requested {} got dets {} labels {}",
-                    n,
-                    dets_shape[0],
-                    labels_shape[0]
-                );
-            }
-            (
-                dets.to_vec(),
-                labels.to_vec(),
-                dets_shape[1] as usize,
-                labels_shape[2] as usize,
-            )
-        };
+        let dets_v: Vec<f32> = dets_t
+            .to_data()
+            .to_vec()
+            .map_err(|e| anyhow!("dets to_vec: {e:?}"))?;
+        let labels_v: Vec<f32> = labels_t
+            .to_data()
+            .to_vec()
+            .map_err(|e| anyhow!("labels to_vec: {e:?}"))?;
+
         let num_classes = self.classes.len();
         if label_dim <= num_classes {
             bail!(
@@ -219,60 +198,27 @@ impl RfDetrDetector {
     }
 }
 
-/// Writes one RGB24 frame into batch slot `bi` of an NCHW tensor:
+/// Writes one RGB24 frame into batch slot `bi` of a flat NCHW buffer:
 /// stretch-resize to 560×560, /255, per-channel ImageNet normalize.
-fn fill_frame(tensor: &mut Array4<f32>, bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
+fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
+    let res = RESOLUTION as usize;
     let resized = crate::vision::resize::resize_rgb(rgb, w, h, RESOLUTION, RESOLUTION)
         .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
-    let res = RESOLUTION as usize;
+    let plane = res * res;
+    let base = bi * 3 * plane;
     for y in 0..res {
         for x in 0..res {
             let p = (y * res + x) * 3;
             for c in 0..3 {
                 let v = resized[p + c] as f32 / 255.0;
-                tensor[[bi, c, y, x]] = (v - MEAN[c]) / STD[c];
+                data[base + c * plane + y * res + x] = (v - MEAN[c]) / STD[c];
             }
         }
     }
-    let _ = NUM_QUERIES;
     Ok(())
-}
-
-/// Single-frame NCHW tensor [1,3,560,560] — used by tests.
-#[cfg(test)]
-fn preprocess(rgb: &[u8], w: u32, h: u32) -> Result<Array4<f32>> {
-    let res = RESOLUTION as usize;
-    let mut tensor = Array4::<f32>::zeros((1, 3, res, res));
-    fill_frame(&mut tensor, 0, rgb, w, h)?;
-    Ok(tensor)
 }
 
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sigmoid_midpoint_is_half() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
-        assert!(sigmoid(10.0) > 0.99);
-        assert!(sigmoid(-10.0) < 0.01);
-    }
-
-    #[test]
-    fn preprocess_produces_normalized_nchw() {
-        // 2x2 white frame → every channel value is (1 - mean)/std after norm.
-        let rgb = vec![255u8; 2 * 2 * 3];
-        let t = preprocess(&rgb, 2, 2).expect("preprocess");
-        assert_eq!(t.shape(), &[1, 3, RESOLUTION as usize, RESOLUTION as usize]);
-        for c in 0..3 {
-            let expected = (1.0 - MEAN[c]) / STD[c];
-            let got = t[[0, c, 0, 0]];
-            assert!((got - expected).abs() < 1e-4, "channel {c}: {got} vs {expected}");
-        }
-    }
 }

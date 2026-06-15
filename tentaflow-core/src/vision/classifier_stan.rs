@@ -1,28 +1,28 @@
 // =============================================================================
-// File: vision/classifier_stan.rs — placard-state classifier (ONNX via `ort`)
+// File: vision/classifier_stan.rs — placard-state classifier (Burn)
 // =============================================================================
 //
 // Multi-label condition classifier for ADR placards/labels (MobileNetV4).
-// Loads `model_stan.onnx` (+ external weights `model_stan.onnx.data` next to it,
-// which `ort` picks up automatically) through ONNX Runtime and turns a detector
-// crop into a set of state tags (e.g. ["uszkodzona", "wyblakla"]).
+// Architecture vendored as `burn_stan` (build-time ONNX→Burn codegen); weights
+// load at runtime from `model_stan.bpk`. Turns a detector crop into state tags
+// (e.g. ["uszkodzona", "wyblakla"]).
 //
-// Preprocessing mirrors the training transform: RGB crop → 160×160 bilinear
-// stretch → /255 → per-channel ImageNet normalize → NCHW f32 [1,3,160,160].
-// Postprocessing is per-class sigmoid with a per-class threshold (`progi`): a
-// class is emitted when `prob[i] > progi[i]`, so the result is multi-label and
-// may be empty or contain several tags.
+// Preprocessing mirrors the training transform: RGB crop → SxS bilinear stretch
+// → /255 → per-channel ImageNet normalize → NCHW f32 [1,3,S,S]. Postprocessing
+// is per-class sigmoid with a per-class threshold (`progi`): a class is emitted
+// when `prob[i] > progi[i]`, so the result is multi-label and may be empty.
 
 #![cfg(feature = "inference-vision-gpu")]
 
 use anyhow::{anyhow, bail, Context, Result};
-use ndarray::Array4;
-use ort::session::Session;
-use ort::value::Value;
+use burn::tensor::{Tensor, TensorData};
+use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::paths;
+use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
+use crate::vision::burn_stan::Model;
 
 /// `stan-classes.json` shape — the deploy-time config next to the model.
 #[derive(Debug, Deserialize)]
@@ -36,26 +36,23 @@ struct ClassesFile {
     activation: String,
 }
 
-/// Loaded state-classifier session plus its config. `Session::run` needs
-/// `&mut`, so `classify` takes `&mut self`; a single shared instance is driven
-/// from one analysis task (or behind a mutex when shared across cameras).
+/// Loaded state classifier + config + backend device.
 pub struct StateClassifier {
-    session: Session,
+    model: Model<VisionBackend>,
+    device: VisionDevice,
     classes: Vec<String>,
     mean: [f32; 3],
     std: [f32; 3],
     img_size: u32,
     progi: Vec<f32>,
-    /// Graph input tensor name, read from the model so we do not hard-code it.
-    input_name: String,
 }
 
 impl StateClassifier {
     /// Builds the classifier from the deploy-time model dir
-    /// (`vision_models_dir()/model_stan.onnx` + `stan-classes.json`).
+    /// (`vision_models_dir()/model_stan.bpk` + `stan-classes.json`).
     pub fn load() -> Result<Self> {
         let dir = paths::vision_models_dir();
-        let model_path = dir.join("model_stan.onnx");
+        let weights_path = dir.join("model_stan.bpk");
         let classes_path = dir.join("stan-classes.json");
 
         let classes_bytes = std::fs::read(&classes_path)
@@ -76,89 +73,72 @@ impl StateClassifier {
             bail!("stan-classes.json: img_size must be > 0");
         }
 
-        let session = super::ort_session::build_session(&model_path)?;
-
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| anyhow!("state classifier model has no inputs"))?;
+        if !weights_path.exists() {
+            bail!("state-classifier weights missing: {}", weights_path.display());
+        }
+        let device = burn_backend::device();
+        let mut model = Model::<VisionBackend>::new(&device);
+        let mut store = BurnpackStore::from_file(&weights_path);
+        model
+            .load_from(&mut store)
+            .map_err(|e| anyhow!("load state weights {}: {e}", weights_path.display()))?;
 
         info!(
-            "[classifier_stan] loaded {} ({} classes, {}px, input '{}')",
-            model_path.display(),
+            "[classifier_stan] loaded {} ({} classes, {}px)",
+            weights_path.display(),
             parsed.classes.len(),
-            parsed.img_size,
-            input_name
+            parsed.img_size
         );
         Ok(Self {
-            session,
+            model,
+            device,
             classes: parsed.classes,
             mean: parsed.mean,
             std: parsed.std,
             img_size: parsed.img_size,
             progi: parsed.progi,
-            input_name,
         })
     }
 
     /// Runs one crop through the classifier. `crop_rgb` is tightly packed RGB24
-    /// of size `cw*ch*3`. Returns the matched state tags (multi-label; may be
-    /// empty or hold several entries).
+    /// of size `cw*ch*3`. Returns the matched state tags (multi-label).
     pub fn classify(&mut self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
-        let input = self.preprocess(crop_rgb, cw, ch)?;
-        let input_value = Value::from_array(input)?;
+        let s = self.img_size as usize;
+        let resized = crate::vision::resize::resize_rgb(crop_rgb, cw, ch, self.img_size, self.img_size)
+            .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
+        let plane = s * s;
+        let mut data = vec![0f32; 3 * plane];
+        for y in 0..s {
+            for x in 0..s {
+                let p = (y * s + x) * 3;
+                for c in 0..3 {
+                    let v = resized[p + c] as f32 / 255.0;
+                    data[c * plane + y * s + x] = (v - self.mean[c]) / self.std[c];
+                }
+            }
+        }
+        let input =
+            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [1, 3, s, s]), &self.device);
 
-        let outputs = self
-            .session
-            .run(ort::inputs! { self.input_name.as_str() => &input_value })?;
-
-        let output = outputs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("state classifier produced no outputs"))?
-            .1;
-        let (logits_shape, logits) = output.try_extract_tensor::<f32>()?;
+        let logits: Vec<f32> = self
+            .model
+            .forward(input)
+            .to_data()
+            .to_vec()
+            .map_err(|e| anyhow!("state logits to_vec: {e:?}"))?;
 
         let num_classes = self.classes.len();
-        let total: usize = logits.len();
-        if total < num_classes {
-            bail!(
-                "logits len {} < class count {} (shape {:?})",
-                total,
-                num_classes,
-                &*logits_shape
-            );
+        if logits.len() < num_classes {
+            bail!("logits len {} < class count {}", logits.len(), num_classes);
         }
 
         let mut stany = Vec::new();
         for (i, name) in self.classes.iter().enumerate() {
-            let prob = sigmoid(logits[i]);
-            if prob > self.progi[i] {
+            if sigmoid(logits[i]) > self.progi[i] {
                 stany.push(name.clone());
             }
         }
         Ok(stany)
-    }
-
-    /// RGB24 crop → NCHW f32 [1,3,S,S]: stretch-resize, /255, ImageNet normalize.
-    fn preprocess(&self, rgb: &[u8], w: u32, h: u32) -> Result<Array4<f32>> {
-        let s = self.img_size;
-        let resized = crate::vision::resize::resize_rgb(rgb, w, h, s, s)
-            .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
-
-        let su = s as usize;
-        let mut tensor = Array4::<f32>::zeros((1, 3, su, su));
-        for y in 0..su {
-            for x in 0..su {
-                let p = (y * su + x) * 3;
-                for c in 0..3 {
-                    let v = resized[p + c] as f32 / 255.0;
-                    tensor[[0, c, y, x]] = (v - self.mean[c]) / self.std[c];
-                }
-            }
-        }
-        Ok(tensor)
     }
 }
 

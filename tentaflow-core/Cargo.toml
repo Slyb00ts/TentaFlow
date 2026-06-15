@@ -33,12 +33,12 @@ inference-mlx-kokoro = ["dep:libloading"]
 # statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
 # dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization"]
-# RF-DETR ADR detector (ONNX via `ort`, CPU EP). Gates the whole detector
-# module + the per-camera always-on analysis loop. Build without it = no change.
-inference-vision-gpu = ["dep:ort", "dep:ndarray"]
-# Camera-CV via Burn (replaces ort for vision). `vision-burn` pulls Burn + the
-# vendored models; pick exactly one backend feature per platform (defaults to
-# wgpu/Vulkan when none of cuda/metal/rocm is set).
+# RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
+# per-camera always-on analysis loop. Pulls the wgpu backend as the universal
+# floor; add `vision-cuda`/`vision-metal`/`vision-rocm` for a native backend.
+inference-vision-gpu = ["vision-wgpu"]
+# Camera-CV via Burn. `vision-burn` pulls Burn + the vendored models; a backend
+# feature picks the runtime (defaults to wgpu when none of cuda/metal/rocm set).
 vision-burn = ["dep:burn", "dep:burn-store", "burn/std"]
 vision-wgpu = ["vision-burn", "burn/wgpu", "burn/ndarray"]
 vision-cuda = ["vision-burn", "burn/cuda"]
