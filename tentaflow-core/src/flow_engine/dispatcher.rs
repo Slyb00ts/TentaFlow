@@ -23,12 +23,12 @@ use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
     MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
-    SttDispatcher, TtsCleaningStore, TtsDispatcher,
+    SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
     MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
-    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
+    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl, VisionDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -163,6 +163,7 @@ struct ContextFactory {
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     stt: Arc<dyn SttDispatcher>,
     tts: Arc<dyn TtsDispatcher>,
+    vision: Arc<dyn VisionDispatcher>,
     prompts: Arc<dyn PromptStore>,
     memory: Arc<dyn MemoryStore>,
     history: Arc<dyn ConversationHistoryStore>,
@@ -194,6 +195,7 @@ impl ContextFactory {
             embeddings: self.embeddings.clone(),
             stt: self.stt.clone(),
             tts: self.tts.clone(),
+            vision: self.vision.clone(),
             prompts: self.prompts.clone(),
             memory: self.memory.clone(),
             history: self.history.clone(),
@@ -250,6 +252,7 @@ impl FlowDispatcher {
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
             Arc::new(SttDispatcherImpl::new(runtime_slot, blobs.clone()));
+        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
 
         let ctx_factory = Arc::new(ContextFactory {
             clock,
@@ -258,6 +261,7 @@ impl FlowDispatcher {
             embeddings,
             stt,
             tts,
+            vision,
             prompts,
             memory,
             history,
