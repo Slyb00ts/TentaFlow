@@ -29,10 +29,11 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use tentaflow_sdk_spec::{
-    CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
-    CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
-    CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
-    CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
+    CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut, CameraHealthOut,
+    CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut, CameraSnapshotOut,
+    CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput, DiscoveredCameraOut,
+    LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
@@ -1342,6 +1343,67 @@ pub fn camera_get_v1(
         &memory,
         &mut caller,
         &info,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_analysis_flows_list_v1
+// =============================================================================
+
+/// Lists the active flows assignable as a camera's analysis flow (id + name),
+/// for the per-camera flow selector. Read-only, gated on `cameras.read`. Scoped
+/// to `service_type='camera_analysis'` so an addon cannot enumerate unrelated
+/// flows through this surface.
+pub fn camera_analysis_flows_list_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.analysis_flows_list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let db = caller.data().db.clone();
+    let flows = match crate::db::repository::list_camera_analysis_flows(&db) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.analysis_flows_list",
+                None,
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let out = CameraAnalysisFlowsOut {
+        flows: flows
+            .into_iter()
+            .map(|(id, name)| CameraAnalysisFlowOut { id, name })
+            .collect(),
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
         out_ptr,
         out_cap,
         out_len_ptr,

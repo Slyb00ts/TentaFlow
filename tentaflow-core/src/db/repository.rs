@@ -17442,6 +17442,22 @@ pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<
     Ok(id.filter(|s| !s.is_empty()))
 }
 
+/// Lists active flows assignable as a camera's analysis flow (`(id, name)`),
+/// scoped to `service_type='camera_analysis'`. Powers the per-camera flow
+/// selector; the scope keeps an addon from enumerating unrelated flows.
+pub fn list_camera_analysis_flows(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name FROM flows \
+         WHERE service_type = 'camera_analysis' AND status = 'active' \
+         ORDER BY is_default DESC, name ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Applies a partial update. Returns `Ok(false)` if no row matched
 /// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
 /// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent

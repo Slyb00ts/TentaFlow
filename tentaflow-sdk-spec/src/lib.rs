@@ -21,10 +21,11 @@ pub mod protocol;
 
 pub use protocol::{
     camera::{
-        CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
-        CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
-        CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
-        CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+        CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
+        CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut,
+        CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
+        CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput,
+        DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
     },
     camera_metadata::{
         MetadataFrameOut, MetadataItemOut, MetadataPollInput, MetadataPollOutput,
