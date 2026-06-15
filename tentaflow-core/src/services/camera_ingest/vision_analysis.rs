@@ -381,6 +381,7 @@ async fn engine_loop() {
                     };
                     match cold.try_send(ev) {
                         Ok(()) => {
+                            commit_cold(&id, sig);
                             metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -526,6 +527,10 @@ fn admit_cold(camera_id: &str, sig: u64, frame_bytes: usize) -> Option<()> {
         in_flight: false,
     });
     if entry.in_flight {
+        // A frame arriving while this camera's previous event is still processing
+        // is dropped (not queued) → overlay may show the prior scene until the
+        // next frame is admitted (~one cold cycle). Acceptable for a slow ADR
+        // gate; a per-camera "pending latest" replacement is a future refinement.
         metrics().dropped_inflight.fetch_add(1, AtomicOrdering::Relaxed);
         return None;
     }
@@ -538,20 +543,49 @@ fn admit_cold(camera_id: &str, sig: u64, frame_bytes: usize) -> Option<()> {
         metrics().dropped_budget.fetch_add(1, AtomicOrdering::Relaxed);
         return None;
     }
+    // Reserve only. `last_sig`/`last_emit` are committed by `commit_cold` AFTER a
+    // successful send, so a dropped (Full/Closed) event does not record its scene
+    // as "recently emitted" and starve the next identical/clear frame.
     entry.in_flight = true;
-    entry.last_sig = sig;
-    entry.last_emit = now;
     cold_bytes().fetch_add(frame_bytes, AtomicOrdering::Relaxed);
     Some(())
 }
 
-/// Releases a camera's in-flight slot + its reserved bytes. Called by the cold
-/// consumer after each event (success or failure) and on admit→send failure.
+/// Records a successfully-sent event's scene signature + emit time (coalesce base).
+fn commit_cold(camera_id: &str, sig: u64) {
+    if let Some(slot) = cold_state().lock().unwrap().get_mut(camera_id) {
+        slot.last_sig = sig;
+        slot.last_emit = Instant::now();
+    }
+}
+
+/// Releases a camera's in-flight slot + its reserved bytes. `saturating_sub` so a
+/// release racing a `drain()` reset can never underflow the byte counter (which
+/// would wrap huge and permanently reject the budget gate).
 fn release_cold(camera_id: &str, frame_bytes: usize) {
     if let Some(slot) = cold_state().lock().unwrap().get_mut(camera_id) {
         slot.in_flight = false;
     }
-    cold_bytes().fetch_sub(frame_bytes, AtomicOrdering::Relaxed);
+    let _ = cold_bytes().fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+        Some(v.saturating_sub(frame_bytes))
+    });
+}
+
+/// RAII release: guarantees a received cold event's slot + bytes are released
+/// exactly once, even if enrichment or publish panics (else the camera leaks its
+/// in-flight slot forever and is never analyzed again).
+struct ColdSlot {
+    camera_id: String,
+    bytes: usize,
+    released: bool,
+}
+impl Drop for ColdSlot {
+    fn drop(&mut self) {
+        if !self.released {
+            release_cold(&self.camera_id, self.bytes);
+            self.released = true;
+        }
+    }
 }
 
 /// Cold path: enriches each detection frame (state classify + plate OCR on crops)
@@ -569,7 +603,13 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             detections,
         } = ev;
         let bytes = frame.len();
-        let cid = camera_id.clone();
+        // RAII: releases this camera's in-flight slot + bytes on drop — including
+        // an unwind if publish/enrich panics — so a camera can never be wedged.
+        let _slot = ColdSlot {
+            camera_id: camera_id.clone(),
+            bytes,
+            released: false,
+        };
         let classifier = classifier.clone();
         let ocr = ocr.clone();
         let res = tokio::task::spawn_blocking(move || {
@@ -582,9 +622,6 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             Ok((id, dets)) => detection_bus::publish_detections(&id, dets),
             Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
         }
-        // Free the camera's in-flight slot + reserved bytes so the next frame for
-        // this camera can be admitted (per-camera ordering + bound preserved).
-        release_cold(&cid, bytes);
     }
 }
 
