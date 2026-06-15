@@ -38,7 +38,9 @@ pub mod trigger;
 pub mod tts;
 pub mod tts_clean;
 pub mod variable_merge;
+pub mod vision_classify;
 pub mod vision_llm;
+pub mod vision_ocr;
 
 pub use addon::AddonNodeAdapter;
 pub use agent_block::{AgentNodeAdapter, AGENT_RUN_FLOW_ID};
@@ -71,4 +73,6 @@ pub use tool_exec::ToolExecNodeAdapter;
 pub use trigger::TriggerNodeAdapter;
 pub use tts::TtsNodeAdapter;
 pub use tts_clean::TtsCleanNodeAdapter;
+pub use vision_classify::VisionClassifyNodeAdapter;
 pub use vision_llm::VisionNodeAdapter;
+pub use vision_ocr::VisionOcrNodeAdapter;
