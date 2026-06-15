@@ -866,6 +866,7 @@ mod services_manifest_build {
         Model3dGen,
         Agents,
         Tools,
+        Training,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
