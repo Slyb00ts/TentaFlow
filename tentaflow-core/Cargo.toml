@@ -379,6 +379,10 @@ name = "camera_inference_batch"
 harness = false
 required-features = ["inference-vision-gpu"]
 
+[[example]]
+name = "cv_bench"
+required-features = ["inference-vision-gpu"]
+
 [[test]]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]
