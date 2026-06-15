@@ -227,11 +227,18 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
             credentials_encrypted: row.credentials_encrypted.clone(),
             decoder_override: None,
         };
-        if let Err(e) = sup.add_camera(cfg).await {
-            warn!(
+        match sup.add_camera(cfg).await {
+            Ok(_) => {
+                // Always-on analysis: start the cross-camera RF-DETR engine for
+                // this camera at boot, independent of any dashboard viewer — the
+                // analysis must run even when nobody is watching. Idempotent.
+                #[cfg(feature = "inference-vision-gpu")]
+                crate::services::camera_ingest::vision_analysis::ensure_analysis(&row.camera_id);
+            }
+            Err(e) => warn!(
                 "camera_ingest: failed to hydrate camera_id={} vendor={}: {}",
                 row.camera_id, row.vendor, e
-            );
+            ),
         }
     }
     tracing::info!("camera_ingest: hydrate complete ({} camera(s))", count);
