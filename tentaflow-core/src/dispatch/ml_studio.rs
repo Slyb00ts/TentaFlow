@@ -18,6 +18,7 @@ use crate::ml_studio::models::{
 };
 use crate::ml_studio::profile::{self, TableProfile};
 use crate::ml_studio::repository;
+use crate::ml_studio::train_tabular::{self, Task};
 use crate::services::rbac::OrgContext;
 
 fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
@@ -436,6 +437,7 @@ pub fn ml_studio_dataset_upload(
         row_count,
         column_count,
         &profile_json,
+        &payload.bytes,
     )
     .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))?;
 
@@ -497,6 +499,111 @@ pub fn ml_studio_dataset_profile(
         tentaflow_protocol::MlStudioDatasetProfileResponse {
             dataset: to_dataset_summary(&dataset),
             profile: to_protocol_profile(table),
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioTabularTrainRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_tabular_train(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::TabularTrainRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioTabularTrainRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    let task = Task::from_slug(&payload.task)
+        .ok_or_else(|| ProtocolError::bad_request("task must be 'classification' or 'regression'"))?;
+
+    let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id)
+        .map_err(|e| ProtocolError::bad_request(format!("dataset unavailable: {}", e)))?;
+    // parse_table selects its parser by file extension; the dataset's stored
+    // `kind` ("csv"/"xlsx") is the original format, so reuse it as the suffix.
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    let ext = if dataset.kind == "xlsx" { "xlsx" } else { "csv" };
+    let filename = format!("{}.{}", payload.dataset_id, ext);
+
+    let (headers, rows) = profile::parse_table(&raw, &filename)
+        .map_err(|e| ProtocolError::bad_request(format!("parsing failed: {}", e)))?;
+
+    let outcome = train_tabular::train_tabular(&headers, &rows, &payload.target_column, task)
+        .map_err(|e| ProtocolError::bad_request(format!("training failed: {}", e)))?;
+
+    let best = outcome
+        .leaderboard
+        .first()
+        .ok_or_else(|| ProtocolError::internal("training produced no models"))?;
+
+    let config_json = serde_json::json!({
+        "target": outcome.target_column,
+        "task": outcome.task.slug(),
+        "feature_count": outcome.feature_names.len(),
+        "train_rows": outcome.train_rows,
+        "holdout_rows": outcome.holdout_rows,
+        "class_labels": outcome.class_labels,
+    })
+    .to_string();
+    let metrics_json = serde_json::json!({
+        "model_name": best.model_name,
+        "accuracy": best.accuracy,
+        "f1_macro": best.f1_macro,
+        "rmse": best.rmse,
+        "r2": best.r2,
+        "train_secs": best.train_secs,
+    })
+    .to_string();
+
+    let history: Vec<(i64, String, f64)> = outcome
+        .best_loss_curve
+        .iter()
+        .enumerate()
+        .map(|(step, loss)| (step as i64, "train_loss".to_string(), *loss))
+        .collect();
+
+    let (run_id, best_model_id) = repository::record_training_result(
+        &payload.project_id,
+        &best.model_name,
+        &best.framework,
+        &config_json,
+        &metrics_json,
+        &history,
+    )
+    .map_err(db_err)?;
+
+    let leaderboard = outcome
+        .leaderboard
+        .iter()
+        .map(|e| tentaflow_protocol::MlStudioTabularLeaderboardEntry {
+            model_name: e.model_name.clone(),
+            framework: e.framework.clone(),
+            accuracy: e.accuracy,
+            f1_macro: e.f1_macro,
+            rmse: e.rmse,
+            r2: e.r2,
+            train_secs: e.train_secs,
+        })
+        .collect();
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::TabularTrainResponse(
+        tentaflow_protocol::MlStudioTabularTrainResponse {
+            run_id,
+            best_model_id,
+            best_model_name: outcome.best_model_name,
+            task: outcome.task.slug().to_string(),
+            target_column: outcome.target_column,
+            train_rows: outcome.train_rows as u64,
+            holdout_rows: outcome.holdout_rows as u64,
+            leaderboard,
         },
     )))
 }

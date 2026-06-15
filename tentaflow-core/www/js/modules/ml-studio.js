@@ -69,7 +69,7 @@ const TYPE_TABS = {
   recognition: ['Schemat', 'Dane', 'Anotacje', 'Treningi', 'Modele'],
   ft_llm: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   ft_vision_audio: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
-  tabular_anomaly: ['Dane', 'Cechy', 'AutoML', 'Anomalie', 'Modele'],
+  tabular_anomaly: ['Dane', 'Trenuj', 'Cechy', 'Anomalie', 'Modele'],
   rag: ['Korpus', 'Indeks', 'Reranker', 'Ewaluacja', 'Zapytania'],
   distillation: ['Nauczyciel', 'Uczeń', 'Dane', 'Trening', 'Modele'],
 };
@@ -586,6 +586,10 @@ function renderDetail(host, p) {
       renderDataTab(panel, projectId(p));
       return;
     }
+    if (label === 'Trenuj') {
+      renderTrainTab(panel, projectId(p));
+      return;
+    }
     if (label === 'Zasoby') {
       renderResourcesTab(panel, projectId(p));
       return;
@@ -878,6 +882,350 @@ function formatNumber(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return String(value ?? '—');
   return n.toLocaleString('pl-PL');
+}
+
+// =============================================================================
+// "Trenuj" tab — tabular training: pick dataset → pick target column (origin of
+// "wykryto N klas" from the dataset profile) → engine card → leaderboard with
+// real metrics from mlStudioTabularTrainRequest. Everything is read from the
+// backend; the leaderboard rows are the actual trained models.
+// =============================================================================
+
+// Continuous numeric columns map to regression; everything else (categorical,
+// low-cardinality ints, text) defaults to classification. The user can override.
+function isRegressionColumn(col) {
+  return columnTypeSlug(col) === 'float';
+}
+
+function taskLabel(task) {
+  return task === 'regression' ? 'regresja' : 'klasyfikacja';
+}
+
+// Per-tab state lives on the panel element so re-entering the tab starts clean
+// and concurrent projects never cross-talk.
+function renderTrainTab(panel, pid) {
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid })
+    .then((resp) => {
+      const datasets = Array.isArray(resp.datasets) ? resp.datasets : [];
+      renderTrainContent(panel, pid, datasets);
+    })
+    .catch((err) => {
+      panel.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać zbiorów');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      panel.appendChild(empty);
+    });
+}
+
+function renderTrainContent(panel, pid, datasets) {
+  if (!datasets.length) {
+    panel.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'database');
+    empty.setAttribute('title', 'Brak danych do treningu');
+    empty.setAttribute('message', 'Najpierw wgraj dane w zakładce „Dane" — system odczyta kolumny i klasy, na których uczy się model.');
+    panel.appendChild(empty);
+    return;
+  }
+
+  panel.innerHTML = `
+    <div class="ml-studio-train">
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('star')} Dane i cel
+          <span class="ml-studio-data-hint">wybierz zbiór, a potem kolumnę, którą model ma przewidywać</span>
+        </div>
+        <div class="ml-studio-train-pickers">
+          <tf-select id="ml-studio-train-dataset" label="Zbiór danych"></tf-select>
+          <tf-select id="ml-studio-train-target" label="Kolumna-cel (co przewidywać)" disabled></tf-select>
+          <tf-select id="ml-studio-train-task" label="Typ zadania" disabled>
+            <option value="classification">klasyfikacja</option>
+            <option value="regression">regresja</option>
+          </tf-select>
+        </div>
+        <div id="ml-studio-train-callout"></div>
+      </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('cpu')} Silnik treningu</div>
+        <div class="ml-studio-train-engine">
+          <div class="ml-studio-train-engine-ico">${sprite('cpu')}</div>
+          <div>
+            <div class="ml-studio-train-engine-title">Klasyczny ML (Rust)</div>
+            <p class="ml-studio-train-engine-text">Regresja logistyczna / liniowa + model bazowy (baseline), uczone natywnie w Rust — bez GPU. Cięższy AutoML (AutoGluon) podłączymy w kolejnym plastrze.</p>
+            <div class="ml-studio-train-engine-tags">
+              <tf-chip status="accent" label="Rust"></tf-chip>
+              <tf-chip status="info" label="bez GPU"></tf-chip>
+              <tf-chip status="info" label="baseline"></tf-chip>
+            </div>
+          </div>
+        </div>
+        <div class="ml-studio-train-actions">
+          <tf-button variant="primary" icon="play" id="ml-studio-train-run" disabled>Trenuj</tf-button>
+        </div>
+      </section>
+
+      <section class="ml-studio-data-card" id="ml-studio-train-result-card" hidden>
+        <div class="ml-studio-data-head">${sprite('star')} Leaderboard
+          <span class="ml-studio-data-hint" id="ml-studio-train-result-meta"></span>
+        </div>
+        <div id="ml-studio-train-best" class="ml-studio-detail-stats"></div>
+        <div id="ml-studio-train-leaderboard"></div>
+      </section>
+    </div>
+  `;
+
+  // Local selection state — datasetId / its profile / chosen target column / task.
+  const state = { datasetId: '', profile: null, target: '', task: 'classification' };
+
+  const datasetSel = byId('ml-studio-train-dataset');
+  const targetSel = byId('ml-studio-train-target');
+  const taskSel = byId('ml-studio-train-task');
+  const runBtn = byId('ml-studio-train-run');
+
+  datasetSel?.setOptions(
+    datasets.map((d) => ({
+      value: String(d.datasetId ?? d.dataset_id ?? ''),
+      label: d.name || '(bez nazwy)',
+    })),
+    null,
+  );
+  // Leave the dataset unselected until the user picks one, so the target picker
+  // never shows columns from an arbitrary first dataset.
+  datasetSel && (datasetSel.value = '');
+
+  const resetTarget = () => {
+    state.target = '';
+    state.task = 'classification';
+    targetSel?.setOptions([], null);
+    targetSel?.setAttribute('disabled', '');
+    taskSel?.setAttribute('disabled', '');
+    runBtn?.setAttribute('disabled', '');
+    const callout = byId('ml-studio-train-callout');
+    if (callout) callout.innerHTML = '';
+  };
+
+  datasetSel?.addEventListener('change', async (e) => {
+    const id = e.detail?.value || '';
+    state.datasetId = id;
+    state.profile = null;
+    resetTarget();
+    if (!id) return;
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetProfileRequest', { datasetId: id });
+      state.profile = resp.profile || resp;
+      const columns = Array.isArray(state.profile.columns) ? state.profile.columns : [];
+      if (!columns.length) {
+        toast('Ten zbiór nie ma rozpoznanych kolumn.', 'error');
+        return;
+      }
+      targetSel?.setOptions(
+        columns.map((c) => ({
+          value: String(c.name ?? ''),
+          label: `${c.name ?? ''} · ${COLUMN_TYPE_LABEL[columnTypeSlug(c)] || columnTypeSlug(c)}`,
+        })),
+        null,
+      );
+      targetSel.value = '';
+      targetSel?.removeAttribute('disabled');
+    } catch (err) {
+      toast(`Profil zbioru: ${err.message}`, 'error');
+    }
+  });
+
+  targetSel?.addEventListener('change', (e) => {
+    const name = e.detail?.value || '';
+    state.target = name;
+    const columns = Array.isArray(state.profile?.columns) ? state.profile.columns : [];
+    const col = columns.find((c) => String(c.name ?? '') === name);
+    if (!col) {
+      runBtn?.setAttribute('disabled', '');
+      return;
+    }
+    // Auto-suggest the task from the detected column type; the select stays
+    // editable so the user can override (e.g. treat an integer as a class).
+    state.task = isRegressionColumn(col) ? 'regression' : 'classification';
+    if (taskSel) {
+      taskSel.value = state.task;
+      taskSel.removeAttribute('disabled');
+    }
+    renderTrainCallout(col, state.task);
+    runBtn?.removeAttribute('disabled');
+  });
+
+  taskSel?.addEventListener('change', (e) => {
+    state.task = e.detail?.value === 'regression' ? 'regression' : 'classification';
+    const columns = Array.isArray(state.profile?.columns) ? state.profile.columns : [];
+    const col = columns.find((c) => String(c.name ?? '') === state.target);
+    if (col) renderTrainCallout(col, state.task);
+  });
+
+  runBtn?.addEventListener('click', () => runTraining(pid, state, runBtn));
+}
+
+// The callout is the provenance of "wykryto N klas": for a categorical target it
+// lists the detected classes (value + count) read from the dataset profile; for a
+// continuous numeric target it explains the regression fallback.
+function renderTrainCallout(col, task) {
+  const host = byId('ml-studio-train-callout');
+  if (!host) return;
+  const slug = columnTypeSlug(col);
+  const typeLbl = COLUMN_TYPE_LABEL[slug] || slug;
+  const classes = Array.isArray(col.classes) ? col.classes : [];
+
+  let body;
+  if (task === 'classification' && classes.length) {
+    const list = classes
+      .map((c) => `<span class="ml-studio-train-class">${escapeHtml(String(c.value ?? ''))} <span class="ml-studio-train-class-n">(${formatNumber(c.count ?? 0)})</span></span>`)
+      .join('');
+    body = `
+      <div class="ml-studio-train-callout-title">${sprite('info')} Wykryto: <strong>KATEGORIA</strong>, ${classes.length} ${plural(classes.length, 'klasa', 'klasy', 'klas')}</div>
+      <div class="ml-studio-train-classes">${list}</div>
+      <div class="ml-studio-train-callout-note">→ <strong>klasyfikacja</strong>. Liczba klas to policzone unikalne wartości w tej kolumnie — nie ustawienie systemu.</div>
+    `;
+  } else if (task === 'classification') {
+    const uniqueCount = col.uniqueCount ?? col.unique_count ?? 0;
+    body = `
+      <div class="ml-studio-train-callout-title">${sprite('info')} Wykryto: <strong>${escapeHtml(typeLbl)}</strong>, ${formatNumber(uniqueCount)} unikalnych wartości</div>
+      <div class="ml-studio-train-callout-note">→ <strong>klasyfikacja</strong>. Każda unikalna wartość kolumny-celu staje się klasą.</div>
+    `;
+  } else {
+    body = `
+      <div class="ml-studio-train-callout-title">${sprite('info')} Wykryto: <strong>${escapeHtml(typeLbl)}</strong> (liczba ciągła)</div>
+      <div class="ml-studio-train-callout-note">→ <strong>regresja</strong>. Model przewiduje wartość liczbową, nie klasę.</div>
+    `;
+  }
+  host.innerHTML = `<div class="ml-studio-train-callout">${body}</div>`;
+}
+
+async function runTraining(pid, state, runBtn) {
+  if (!state.datasetId || !state.target) {
+    toast('Wybierz zbiór i kolumnę-cel.', 'error');
+    return;
+  }
+  runBtn.setAttribute('loading', '');
+  runBtn.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.one('mlStudioTabularTrainRequest', {
+      projectId: pid,
+      datasetId: state.datasetId,
+      targetColumn: state.target,
+      task: state.task,
+    });
+    renderLeaderboard(resp, state);
+    toast('Trening zakończony — leaderboard gotowy', 'success');
+  } catch (err) {
+    toast(`Trening: ${err.message}`, 'error');
+  } finally {
+    runBtn.removeAttribute('loading');
+    runBtn.removeAttribute('disabled');
+  }
+}
+
+function fmtMetric(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return n.toLocaleString('pl-PL', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+}
+
+function fmtSecs(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${n.toLocaleString('pl-PL', { maximumFractionDigits: 1 })} s`;
+}
+
+function renderLeaderboard(resp, state) {
+  const card = byId('ml-studio-train-result-card');
+  const meta = byId('ml-studio-train-result-meta');
+  const bestHost = byId('ml-studio-train-best');
+  const host = byId('ml-studio-train-leaderboard');
+  if (!card || !host) return;
+  card.hidden = false;
+
+  const isRegression = state.task === 'regression';
+  const runId = String(resp.runId ?? resp.run_id ?? '');
+  const bestModelId = String(resp.bestModelId ?? resp.best_model_id ?? '');
+  let rows = Array.isArray(resp.leaderboard) ? resp.leaderboard.slice() : [];
+
+  // Sort best-first: by F1 (classification) or by lowest RMSE (regression).
+  rows.sort((a, b) => {
+    if (isRegression) {
+      return Number(a.rmse ?? a.RMSE ?? Infinity) - Number(b.rmse ?? b.RMSE ?? Infinity);
+    }
+    return Number(b.f1Macro ?? b.f1_macro ?? 0) - Number(a.f1Macro ?? a.f1_macro ?? 0);
+  });
+
+  const modelId = (m) => String(m.modelId ?? m.model_id ?? m.modelName ?? m.model_name ?? '');
+  const best = rows.find((m) => bestModelId && modelId(m) === bestModelId) || rows[0];
+
+  if (meta) {
+    let text = `${rows.length} ${plural(rows.length, 'model', 'modele', 'modeli')} · cel = ${escapeHtml(state.target)} · ${taskLabel(state.task)}`;
+    if (runId) text += ` · run ${runId.slice(0, 8)}`;
+    meta.textContent = text;
+  }
+
+  if (bestHost) {
+    bestHost.innerHTML = '';
+    if (best) {
+      const name = String(best.modelName ?? best.model_name ?? '—');
+      const cards = isRegression
+        ? `<tf-stat-card label="Najlepszy model" value="${escapeAttr(name)}" icon="star"></tf-stat-card>
+           <tf-stat-card label="RMSE" value="${escapeAttr(fmtMetric(best.rmse ?? best.RMSE))}" icon="bar-chart"></tf-stat-card>
+           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs ?? best.train_secs))}" icon="clock"></tf-stat-card>`
+        : `<tf-stat-card label="Najlepszy model" value="${escapeAttr(name)}" icon="star"></tf-stat-card>
+           <tf-stat-card label="Dokładność" value="${escapeAttr(fmtMetric(best.accuracy))}" icon="check"></tf-stat-card>
+           <tf-stat-card label="F1 (macro)" value="${escapeAttr(fmtMetric(best.f1Macro ?? best.f1_macro))}" icon="bar-chart"></tf-stat-card>
+           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs ?? best.train_secs))}" icon="clock"></tf-stat-card>`;
+      bestHost.innerHTML = cards;
+    }
+  }
+
+  host.innerHTML = '';
+  if (!rows.length) {
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Brak wyników treningu');
+    empty.setAttribute('message', 'Silnik nie zwrócił żadnego modelu — sprawdź, czy zbiór ma dość danych dla wybranego celu.');
+    host.appendChild(empty);
+    return;
+  }
+
+  const bestId = best ? modelId(best) : '';
+  const table = document.createElement('tf-table');
+  table.setAttribute('variant', 'lined');
+  table.innerHTML = isRegression
+    ? `
+      <tf-column key="model" label="Model" renderer="html"></tf-column>
+      <tf-column key="rmse" label="RMSE" renderer="num"></tf-column>
+      <tf-column key="trainSecs" label="Czas" renderer="num"></tf-column>
+    `
+    : `
+      <tf-column key="model" label="Model" renderer="html"></tf-column>
+      <tf-column key="accuracy" label="Dokładność" renderer="num"></tf-column>
+      <tf-column key="f1Macro" label="F1 (macro)" renderer="num"></tf-column>
+      <tf-column key="trainSecs" label="Czas" renderer="num"></tf-column>
+    `;
+  table.rows = rows.map((m) => {
+    const name = String(m.modelName ?? m.model_name ?? '—');
+    const isBest = bestId && modelId(m) === bestId;
+    const nameHtml = isBest
+      ? `<span class="ml-studio-train-best-row">${sprite('star')} <strong>${escapeHtml(name)}</strong> <tf-chip status="accent" label="najlepszy"></tf-chip></span>`
+      : `<span>${escapeHtml(name)}</span>`;
+    const row = {
+      model: nameHtml,
+      trainSecs: fmtSecs(m.trainSecs ?? m.train_secs),
+    };
+    if (isRegression) {
+      row.rmse = fmtMetric(m.rmse ?? m.RMSE);
+    } else {
+      row.accuracy = fmtMetric(m.accuracy);
+      row.f1Macro = fmtMetric(m.f1Macro ?? m.f1_macro);
+    }
+    return row;
+  });
+  host.appendChild(table);
 }
 
 // =============================================================================

@@ -592,6 +592,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
                 "MlStudioDatasetProfileResponse"
             }
+            tentaflow_protocol::MlStudioPayload::TabularTrainRequest(_) => {
+                "MlStudioTabularTrainRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TabularTrainResponse(_) => {
+                "MlStudioTabularTrainResponse"
+            }
             tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(_) => {
                 "MlStudioResourceGrantCreateRequest"
             }
