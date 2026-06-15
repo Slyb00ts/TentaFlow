@@ -36,6 +36,11 @@ const MAX_TARGET_CLASSES: usize = 100;
 /// treated as an ID-like feature and excluded (e.g. a primary key).
 const ID_CARDINALITY_RATIO: f64 = 0.95;
 
+/// Minimum labeled rows before the near-unique target guard activates. Below this
+/// a high distinct/row ratio is expected (tiny tables, test fixtures) and is not
+/// evidence of an identifier column, so the guard stays off.
+const MIN_ROWS_FOR_ID_TARGET_GUARD: usize = 8;
+
 /// Train/holdout split — fraction of rows used for training.
 const TRAIN_FRACTION: f64 = 0.70;
 
@@ -407,6 +412,21 @@ fn train_classification(
     labels.sort();
     if labels.len() < 2 {
         bail!("target has fewer than 2 classes — nothing to classify");
+    }
+    // Reject identifier-like targets: a column with (near-)unique values per row
+    // (e.g. a primary key) is not a class label — training "classifies" each row
+    // into its own class and scores ~0 accuracy. Mirror the ID exclusion used for
+    // features (`ID_CARDINALITY_RATIO`), but only on non-tiny tables so small test
+    // fixtures (few rows, naturally high distinct ratio) are not blocked.
+    let n_rows = targets.len();
+    if n_rows > MIN_ROWS_FOR_ID_TARGET_GUARD
+        && (labels.len() as f64) / (n_rows as f64) >= ID_CARDINALITY_RATIO
+    {
+        bail!(
+            "target column looks like an identifier ({} unique values across {} rows), not a class label — pick a categorical column",
+            labels.len(),
+            n_rows
+        );
     }
     if labels.len() > MAX_TARGET_CLASSES {
         bail!(
@@ -850,20 +870,59 @@ mod tests {
 
     #[test]
     fn too_many_target_classes_errors() {
-        // A near-unique string target (one class per row) must be rejected as a
-        // classification target rather than building a giant softmax.
-        let headers = h(&["x", "ticket_id"]);
+        // Many distinct classes that each repeat (low distinct/row ratio, so the
+        // identifier guard stays off) must still be rejected by the harder
+        // MAX_TARGET_CLASSES cap rather than building a giant softmax.
+        let headers = h(&["x", "bucket"]);
         let mut rows = Vec::new();
-        for i in 0..300 {
-            rows.push(row(&[&(i as f64 * 0.1).to_string(), &format!("T{i}")]));
+        let n_classes = MAX_TARGET_CLASSES + 20;
+        for i in 0..(n_classes * 4) {
+            let bucket = format!("B{}", i % n_classes);
+            rows.push(row(&[&(i as f64 * 0.1).to_string(), &bucket]));
         }
-        let err = train_tabular(&headers, &rows, "ticket_id", Task::Classification)
+        let err = train_tabular(&headers, &rows, "bucket", Task::Classification)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("too many target classes"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn target_identifier_column_rejected() {
+        // The target `id` runs 1..N (one unique value per row). On a non-tiny
+        // table this is an identifier, not a label: training would "classify"
+        // each row into its own class at ~0 accuracy, so it must be rejected.
+        let headers = h(&["id", "score"]);
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            rows.push(row(&[&(i + 1).to_string(), &((i % 5) as f64).to_string()]));
+        }
+        let err = train_tabular(&headers, &rows, "id", Task::Classification)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("identifier"),
+            "expected identifier rejection, got: {err}"
+        );
+
+        // A genuine categorical target (a handful of classes, each repeated many
+        // times) must still train fine — the guard only fires on near-unique
+        // targets.
+        let headers = h(&["score", "tier"]);
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            let tier = match i % 3 {
+                0 => "low",
+                1 => "mid",
+                _ => "high",
+            };
+            rows.push(row(&[&((i % 7) as f64).to_string(), tier]));
+        }
+        let out = train_tabular(&headers, &rows, "tier", Task::Classification)
+            .expect("categorical target with repeats must train");
+        assert_eq!(out.class_labels.len(), 3);
     }
 
     #[test]
