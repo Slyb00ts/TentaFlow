@@ -60,6 +60,32 @@ impl EmbeddedDeploy {
         }
 
         let engine_id = self.manifest.engine.id.clone();
+
+        // Camera-CV pipeline models (RF-DETR detector / state classifier / plate
+        // OCR) are ort-based singletons loaded lazily by the always-on analysis
+        // engine, not tract `LoadedEngine`s. Deploy only fetches the bundle into
+        // `vision_models_dir()`; the runner loads itself on first camera tick.
+        if crate::vision::camera_cv_models::is_camera_cv_engine(&engine_id) {
+            let base_url = self
+                .manifest
+                .model_presets
+                .iter()
+                .map(|p| p.repo.clone())
+                .find(|r| r.starts_with("http"))
+                .unwrap_or_default();
+            crate::vision::camera_cv_models::ensure_bundle(
+                &engine_id,
+                &base_url,
+                self.log_sink.as_ref(),
+            )
+            .await
+            .map_err(|e| DeployError::Other(format!("camera-CV bundle '{}': {:#}", engine_id, e)))?;
+            if let Some(s) = &self.log_sink {
+                s.info(&format!("[vision] camera-CV bundle ready for {}", engine_id));
+            }
+            return Ok(());
+        }
+
         let kind = crate::vision::VisionEngineKind::from_id(&engine_id).ok_or_else(|| {
             DeployError::Manifest(format!(
                 "vision engine '{}' is not registered in runtime",

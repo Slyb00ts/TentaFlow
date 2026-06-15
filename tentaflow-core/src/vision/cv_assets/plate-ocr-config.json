@@ -1,0 +1,1 @@
+{"alphabet":"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_","pad_char":"_","max_plate_slots":9,"vocab_size":37,"img_height":70,"img_width":140,"color":"grayscale","dtype":"uint8","normalize":"none","output":"flattened_9x37"}
