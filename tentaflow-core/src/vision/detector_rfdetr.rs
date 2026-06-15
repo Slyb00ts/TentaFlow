@@ -74,10 +74,7 @@ impl RfDetrDetector {
             bail!("rfdetr-classes.json has no classes");
         }
 
-        let session = Session::builder()
-            .context("Session::builder")?
-            .commit_from_file(&model_path)
-            .with_context(|| format!("commit ONNX {}", model_path.display()))?;
+        let session = super::ort_session::build_session(&model_path)?;
 
         let input_name = session
             .inputs()
@@ -98,30 +95,59 @@ impl RfDetrDetector {
         })
     }
 
-    /// Runs one frame through the detector. `rgb` is tightly packed RGB24 of
-    /// size `w*h*3`. Returns detections with `bbox` as [x, y, w, h] normalized
-    /// 0..1 (the convention the overlay + `detection_bus` already use).
+    /// Single-frame convenience. Delegates to `detect_batch` (N=1) so there is
+    /// exactly one preprocess + postprocess code path — a single live camera
+    /// gets bit-identical results to the batched fleet path.
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
-        let input = preprocess(rgb, w, h)?;
-        let input_value = Value::from_array(input)?;
+        Ok(self.detect_batch(&[(rgb, w, h)])?.pop().unwrap_or_default())
+    }
 
-        let outputs = self
-            .session
-            .run(ort::inputs! { self.input_name.as_str() => &input_value })?;
-
-        let (dets_shape, dets) = outputs["dets"].try_extract_tensor::<f32>()?;
-        let (labels_shape, labels) = outputs["labels"].try_extract_tensor::<f32>()?;
-
-        if dets_shape.len() != 3 || dets_shape[2] != 4 {
-            bail!("unexpected dets shape {:?}", &*dets_shape);
+    /// Batched inference across cameras: stacks N frames into one
+    /// `[N,3,560,560]` tensor and issues a SINGLE `Session::run`. Returns
+    /// per-frame detections in the same order as `frames`. This is the fleet
+    /// throughput lever — one GPU launch amortized over many cameras.
+    pub fn detect_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
         }
-        if labels_shape.len() != 3 {
-            bail!("unexpected labels shape {:?}", &*labels_shape);
+        let n = frames.len();
+        let res = RESOLUTION as usize;
+        let mut tensor = Array4::<f32>::zeros((n, 3, res, res));
+        for (bi, &(rgb, w, h)) in frames.iter().enumerate() {
+            fill_frame(&mut tensor, bi, rgb, w, h)?;
         }
-        let queries = dets_shape[1] as usize;
-        let label_dim = labels_shape[2] as usize;
-        // Only indices 0..num_classes are real; the trailing logit is the
-        // background/ignore slot and must never win the argmax.
+        let input_value = Value::from_array(tensor)?;
+
+        // Run + copy outputs to owned buffers inside this scope so the session
+        // borrow is released before postprocessing (which reads `self.classes`).
+        let (dets_v, labels_v, queries, label_dim) = {
+            let outputs = self
+                .session
+                .run(ort::inputs! { self.input_name.as_str() => &input_value })?;
+            let (dets_shape, dets) = outputs["dets"].try_extract_tensor::<f32>()?;
+            let (labels_shape, labels) = outputs["labels"].try_extract_tensor::<f32>()?;
+
+            if dets_shape.len() != 3 || dets_shape[2] != 4 {
+                bail!("unexpected dets shape {:?}", &*dets_shape);
+            }
+            if labels_shape.len() != 3 {
+                bail!("unexpected labels shape {:?}", &*labels_shape);
+            }
+            if dets_shape[0] as usize != n || labels_shape[0] as usize != n {
+                bail!(
+                    "batch mismatch: requested {} got dets {} labels {}",
+                    n,
+                    dets_shape[0],
+                    labels_shape[0]
+                );
+            }
+            (
+                dets.to_vec(),
+                labels.to_vec(),
+                dets_shape[1] as usize,
+                labels_shape[2] as usize,
+            )
+        };
         let num_classes = self.classes.len();
         if label_dim <= num_classes {
             bail!(
@@ -131,11 +157,35 @@ impl RfDetrDetector {
             );
         }
 
+        let mut results = Vec::with_capacity(n);
+        for bi in 0..n {
+            let dets_off = bi * queries * 4;
+            let labels_off = bi * queries * label_dim;
+            results.push(self.postprocess_image(
+                &dets_v[dets_off..dets_off + queries * 4],
+                &labels_v[labels_off..labels_off + queries * label_dim],
+                queries,
+                label_dim,
+                num_classes,
+            ));
+        }
+        Ok(results)
+    }
+
+    /// Per-image DETR postprocess: per-query sigmoid + argmax over the real
+    /// classes (index `num_classes` is the background slot), threshold, and
+    /// cxcywh→xywh-normalized box. No NMS.
+    fn postprocess_image(
+        &self,
+        dets: &[f32],
+        labels: &[f32],
+        queries: usize,
+        label_dim: usize,
+        num_classes: usize,
+    ) -> Vec<Detection> {
         let mut items = Vec::new();
         for q in 0..queries {
             let logits = &labels[q * label_dim..q * label_dim + label_dim];
-
-            // argmax over the real classes only (skip the background slot).
             let mut best_idx = 0usize;
             let mut best_logit = f32::NEG_INFINITY;
             for (idx, &l) in logits.iter().take(num_classes).enumerate() {
@@ -148,50 +198,52 @@ impl RfDetrDetector {
             if score <= SCORE_THRESHOLD {
                 continue;
             }
-
             let base = q * 4;
             let cx = dets[base];
             let cy = dets[base + 1];
             let bw = dets[base + 2];
             let bh = dets[base + 3];
-
-            // cxcywh → xyxy (normalized), clamp to the frame.
             let x1 = (cx - bw / 2.0).clamp(0.0, 1.0);
             let y1 = (cy - bh / 2.0).clamp(0.0, 1.0);
             let x2 = (cx + bw / 2.0).clamp(0.0, 1.0);
             let y2 = (cy + bh / 2.0).clamp(0.0, 1.0);
-
             items.push(Detection {
                 klasa: self.classes[best_idx].clone(),
-                // Overlay convention is [x, y, w, h] normalized (top-left + size).
                 bbox: [x1, y1, x2 - x1, y2 - y1],
                 score,
                 stan: Vec::new(),
                 tekst: None,
             });
         }
-        Ok(items)
+        items
     }
 }
 
-/// RGB24 → NCHW f32 [1,3,560,560]: stretch-resize, /255, ImageNet normalize.
-fn preprocess(rgb: &[u8], w: u32, h: u32) -> Result<Array4<f32>> {
+/// Writes one RGB24 frame into batch slot `bi` of an NCHW tensor:
+/// stretch-resize to 560×560, /255, per-channel ImageNet normalize.
+fn fill_frame(tensor: &mut Array4<f32>, bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
     let resized = crate::vision::resize::resize_rgb(rgb, w, h, RESOLUTION, RESOLUTION)
         .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
-
     let res = RESOLUTION as usize;
-    let mut tensor = Array4::<f32>::zeros((1, 3, res, res));
     for y in 0..res {
         for x in 0..res {
             let p = (y * res + x) * 3;
             for c in 0..3 {
                 let v = resized[p + c] as f32 / 255.0;
-                tensor[[0, c, y, x]] = (v - MEAN[c]) / STD[c];
+                tensor[[bi, c, y, x]] = (v - MEAN[c]) / STD[c];
             }
         }
     }
-    debug_assert_eq!(tensor.shape()[1], 3);
     let _ = NUM_QUERIES;
+    Ok(())
+}
+
+/// Single-frame NCHW tensor [1,3,560,560] — used by tests.
+#[cfg(test)]
+fn preprocess(rgb: &[u8], w: u32, h: u32) -> Result<Array4<f32>> {
+    let res = RESOLUTION as usize;
+    let mut tensor = Array4::<f32>::zeros((1, 3, res, res));
+    fill_frame(&mut tensor, 0, rgb, w, h)?;
     Ok(tensor)
 }
 

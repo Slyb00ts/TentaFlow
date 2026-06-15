@@ -374,6 +374,11 @@ harness = false
 name = "camera_frame_allocs"
 harness = false
 
+[[bench]]
+name = "camera_inference_batch"
+harness = false
+required-features = ["inference-vision-gpu"]
+
 [[test]]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]
