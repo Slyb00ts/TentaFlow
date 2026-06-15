@@ -464,37 +464,61 @@ impl FlowDispatcher {
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
-        let pool = self.db.clone();
-        let lookup_id = flow_id.clone();
-        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
-            .await
-            .map_err(|e| DispatchError::Internal(e.to_string()))?
-            .map_err(|e| DispatchError::Internal(e.to_string()))?;
-        let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+        // Compiled-flow cache keyed by id (distinct `byid:` namespace from the
+        // model-resolution path). The camera cold path dispatches the same flow
+        // on every detection event; without this it would re-fetch + re-compile
+        // the flow JSON per event. Flow create/update/delete/version-restore
+        // handlers call `invalidate_cache()`, so a cached compile never serves a
+        // stale edit; the 60 s TTL bounds any other drift.
+        let cache_key = format!("byid:{flow_id}");
+        let cached = match self.cache.get(&cache_key) {
+            Some(slot) => slot,
+            None => {
+                let pool = self.db.clone();
+                let lookup_id = flow_id.clone();
+                let flow_opt =
+                    tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
+                        .await
+                        .map_err(|e| DispatchError::Internal(e.to_string()))?
+                        .map_err(|e| DispatchError::Internal(e.to_string()))?;
+                let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+                    flow_id: flow_id.clone(),
+                    msg: "flow id nie istnieje w DB".to_string(),
+                })?;
+                match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
+                    Ok(c) => {
+                        let cached = Arc::new(CachedFlow {
+                            flow,
+                            compiled: Arc::new(c),
+                        });
+                        self.cache.set(&cache_key, Some(cached.clone()));
+                        Some(cached)
+                    }
+                    Err(e) => {
+                        warn!(flow_id, "compile failed: {e}");
+                        // Negative cache: a structurally broken flow JSON stays
+                        // broken until an admin edits it (which invalidates).
+                        self.cache.set(&cache_key, None);
+                        None
+                    }
+                }
+            }
+        };
+        let cached = cached.ok_or_else(|| DispatchError::CompileFailed {
             flow_id: flow_id.clone(),
-            msg: "flow id nie istnieje w DB".to_string(),
+            msg: "flow compile failed".to_string(),
         })?;
-        if flow.status != "active" {
-            warn!(flow_id, status = %flow.status, "flow nieaktywny — pomijam");
+        if cached.flow.status != "active" {
+            warn!(flow_id, status = %cached.flow.status, "flow nieaktywny — pomijam");
             return Err(DispatchError::CompileFailed {
                 flow_id,
-                msg: format!("flow status='{}' (nie active)", flow.status),
+                msg: format!("flow status='{}' (nie active)", cached.flow.status),
             });
         }
         if !self.acl_allow(&flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!(flow_id, "compile failed: {e}");
-                return Err(DispatchError::CompileFailed {
-                    flow_id,
-                    msg: e.to_string(),
-                });
-            }
-        };
-        self.run_blocking(compiled, initial, meta)
+        self.run_blocking(cached.compiled.clone(), initial, meta)
             .await
             .map_err(DispatchError::from)
     }
