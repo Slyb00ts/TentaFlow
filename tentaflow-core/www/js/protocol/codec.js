@@ -2493,6 +2493,27 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(TabularTrainRequest) — train the tabular baseline
+   * on a dataset's target column and get a ranked leaderboard back.
+   * payload: { projectId, datasetId, targetColumn, task: 'classification'|'regression' }.
+   */
+  mlStudioTabularTrainRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioTabularTrainRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.targetColumn ?? payload.target_column ?? ''),
+      String(payload.task ?? 'classification'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(ResourceGrantCreateRequest) — Admin allocates a
    * mesh node resource to a subject (§11.3). Pool of nodes comes from the mesh
    * registry (MeshNodeListRequest); this only records the GRANT.

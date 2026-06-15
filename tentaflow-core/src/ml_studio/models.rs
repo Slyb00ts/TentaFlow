@@ -122,12 +122,12 @@ impl ProjectRole {
     }
 }
 
-/// Membership lifecycle state. `active` members see and act on the project;
-/// `invited` members have a pending invitation they have not yet accepted.
+/// Membership lifecycle state. Inviting a user creates an immediately `active`
+/// member (there is no acceptance step — only Power Users are invited and they
+/// gain access at once), so `active` is the only state a membership row carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberStatus {
     Active,
-    Invited,
 }
 
 impl MemberStatus {
@@ -135,7 +135,6 @@ impl MemberStatus {
     pub fn slug(self) -> &'static str {
         match self {
             MemberStatus::Active => "active",
-            MemberStatus::Invited => "invited",
         }
     }
 }

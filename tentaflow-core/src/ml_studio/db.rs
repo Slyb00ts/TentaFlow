@@ -119,6 +119,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, PROJECT_MEMBERS),
     (3, DATASET_PROFILE),
     (4, RESOURCE_GRANTS),
+    (5, DATASET_RAW_DATA),
 ];
 
 const INITIAL_SCHEMA: &str = "
@@ -253,4 +254,11 @@ CREATE TABLE resource_grants (
 );
 CREATE INDEX idx_resource_grants_subject ON resource_grants(subject_kind, subject_id);
 CREATE INDEX idx_resource_grants_node ON resource_grants(node_id);
+";
+
+// Stores the raw uploaded file bytes (already bounded to <= 1 MiB by the upload
+// limit) so a later training run can re-parse the original data without keeping
+// a separate file store. NULL for datasets created before this migration.
+const DATASET_RAW_DATA: &str = "
+ALTER TABLE datasets ADD COLUMN raw_data BLOB;
 ";

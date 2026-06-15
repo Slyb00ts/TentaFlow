@@ -239,8 +239,11 @@ fn infer_type(sample: &[String], unique_count: u64, scanned_rows: u64, distinct_
 }
 
 /// A column is "low cardinality" (categorical) when its distinct set is small in
-/// absolute terms and a small fraction of the rows. A capped distinct tracker
-/// means cardinality is high, so never categorical.
+/// absolute terms (<= `CATEGORICAL_MAX_CLASSES`) AND shows repetition, i.e. it is
+/// not a near-unique key or free-text column. A capped distinct tracker means
+/// cardinality is high, so never categorical. The absolute cap (not a row
+/// fraction) is the deciding signal — a row-fraction rule wrongly demotes a
+/// genuine small category on a small sample (e.g. 3 cities across 4 rows).
 fn is_low_cardinality(unique_count: u64, scanned_rows: u64, distinct_capped: bool) -> bool {
     if distinct_capped {
         return false;
@@ -254,8 +257,9 @@ fn is_low_cardinality(unique_count: u64, scanned_rows: u64, distinct_capped: boo
     if scanned_rows == 0 {
         return true;
     }
-    // Distinct values must cover at most half the rows to count as a category.
-    (unique_count as f64) <= (scanned_rows as f64 * 0.5).max(1.0)
+    // Require at least one repeated value: an all-distinct column reads as an
+    // identifier / free text, not a category.
+    unique_count < scanned_rows
 }
 
 fn parse_int(v: &str) -> bool {
@@ -314,6 +318,110 @@ pub fn profile_table(bytes: &[u8], filename: &str) -> Result<TableProfile> {
         "xlsx" | "xlsm" | "xlsb" | "xls" => profile_xlsx(bytes),
         other => bail!("unsupported file extension '.{}' (expected csv or xlsx)", other),
     }
+}
+
+/// Upper bound on data rows materialized by `parse_table`. Training does not
+/// stream, so the full row matrix is held in memory; this cap keeps a huge file
+/// from exhausting memory even though the upload limit already bounds bytes.
+const MAX_PARSE_ROWS: usize = 200_000;
+
+/// Parses an uploaded tabular file into its header names and a dense row matrix
+/// of trimmed string cells. Unlike `profile_table` (which streams per-column
+/// statistics), this materializes the whole table for downstream training. Each
+/// row is padded/truncated to the header width so `rows[i][j]` is always valid.
+/// Parser selection mirrors `profile_table` (extension-based).
+pub fn parse_table(bytes: &[u8], filename: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    if bytes.is_empty() {
+        bail!("uploaded file is empty");
+    }
+    if bytes.len() > MAX_BYTES {
+        bail!(
+            "uploaded file is too large ({} bytes, limit {} bytes)",
+            bytes.len(),
+            MAX_BYTES
+        );
+    }
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "csv" => parse_csv(bytes, b','),
+        "tsv" => parse_csv(bytes, b'\t'),
+        "xlsx" | "xlsm" | "xlsb" | "xls" => parse_xlsx(bytes),
+        other => bail!("unsupported file extension '.{}' (expected csv or xlsx)", other),
+    }
+}
+
+fn parse_csv(bytes: &[u8], delimiter: u8) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .flexible(true)
+        .has_headers(true)
+        .from_reader(bytes);
+    let headers = reader
+        .headers()
+        .map_err(|e| anyhow::anyhow!("failed to read CSV header: {e}"))?
+        .clone();
+    let names: Vec<String> = headers.iter().map(|h| h.trim().to_string()).collect();
+    if names.is_empty() {
+        bail!("CSV has no columns");
+    }
+    if names.len() > MAX_COLUMNS {
+        bail!("too many columns ({}, limit {})", names.len(), MAX_COLUMNS);
+    }
+    let width = names.len();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut record = csv::StringRecord::new();
+    while reader
+        .read_record(&mut record)
+        .map_err(|e| anyhow::anyhow!("failed to read CSV row {}: {e}", rows.len() + 1))?
+    {
+        if rows.len() >= MAX_PARSE_ROWS {
+            break;
+        }
+        let row: Vec<String> = (0..width)
+            .map(|i| record.get(i).unwrap_or("").trim().to_string())
+            .collect();
+        rows.push(row);
+    }
+    Ok((names, rows))
+}
+
+fn parse_xlsx(bytes: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut workbook: Xlsx<_> =
+        Xlsx::new(cursor).map_err(|e| anyhow::anyhow!("failed to open XLSX: {e}"))?;
+    let sheet_name = workbook
+        .sheet_names()
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("XLSX has no worksheets"))?;
+    let range = workbook
+        .worksheet_range(&sheet_name)
+        .map_err(|e| anyhow::anyhow!("failed to read worksheet '{sheet_name}': {e}"))?;
+    let mut iter = range.rows();
+    let header_row = iter.next().ok_or_else(|| anyhow::anyhow!("XLSX sheet is empty"))?;
+    let names: Vec<String> = header_row.iter().map(cell_to_string).collect();
+    if names.is_empty() {
+        bail!("XLSX sheet has no columns");
+    }
+    if names.len() > MAX_COLUMNS {
+        bail!("too many columns ({}, limit {})", names.len(), MAX_COLUMNS);
+    }
+    let width = names.len();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for row in iter {
+        if rows.len() >= MAX_PARSE_ROWS {
+            break;
+        }
+        let parsed: Vec<String> = (0..width)
+            .map(|i| row.get(i).map(cell_to_string).unwrap_or_default())
+            .collect();
+        rows.push(parsed);
+    }
+    Ok((names, rows))
 }
 
 fn profile_csv(bytes: &[u8], delimiter: u8) -> Result<TableProfile> {

@@ -1355,6 +1355,44 @@ pub struct MlStudioProjectResourcesResponse {
     pub grants: Vec<MlStudioResourceGrant>,
 }
 
+/// Request to train the tabular baseline: pick a `target_column` in a dataset
+/// and a `task` (`classification`/`regression`); Core re-parses the dataset's
+/// stored raw bytes and trains several pure-Rust models, returning a ranked
+/// leaderboard. `project_id` scopes authorization (owner/editor membership).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularTrainRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub target_column: String,
+    pub task: String,
+}
+
+/// One leaderboard row returned by a tabular training run. Classification fills
+/// `accuracy`/`f1_macro`; regression fills `rmse`/`r2`. `train_secs` is the
+/// model's wall-clock training time.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularLeaderboardEntry {
+    pub model_name: String,
+    pub framework: String,
+    pub accuracy: Option<f64>,
+    pub f1_macro: Option<f64>,
+    pub rmse: Option<f64>,
+    pub r2: Option<f64>,
+    pub train_secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularTrainResponse {
+    pub run_id: String,
+    pub best_model_id: String,
+    pub best_model_name: String,
+    pub task: String,
+    pub target_column: String,
+    pub train_rows: u64,
+    pub holdout_rows: u64,
+    pub leaderboard: Vec<MlStudioTabularLeaderboardEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -1379,6 +1417,8 @@ pub enum MlStudioPayload {
     DatasetsListResponse(MlStudioDatasetsListResponse),
     DatasetProfileRequest(MlStudioDatasetProfileRequest),
     DatasetProfileResponse(MlStudioDatasetProfileResponse),
+    TabularTrainRequest(MlStudioTabularTrainRequest),
+    TabularTrainResponse(MlStudioTabularTrainResponse),
     ResourceGrantCreateRequest(MlStudioResourceGrantCreateRequest),
     ResourceGrantCreateResponse(MlStudioResourceGrantCreateResponse),
     ResourceGrantsListRequest(MlStudioResourceGrantsListRequest),

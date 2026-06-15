@@ -8,7 +8,7 @@ use super::models::{
     ResourceGrant, GRANT_RESOURCE_KINDS, GRANT_SUBJECT_KINDS,
 };
 
-/// Lists projects the user is an active member of (owner or invited-and-accepted),
+/// Lists projects the user is an active member of (owner or invited),
 /// newest first, each with its per-project KPIs (dataset/model count) plus the
 /// user's role and an `is_owner` flag. Membership is the access boundary: a
 /// project the user is not a member of is invisible here.
@@ -23,7 +23,7 @@ pub fn list_projects(user_id: &str) -> Result<Vec<ProjectSummary>> {
                 pm.role \
          FROM projects p \
          JOIN project_members pm ON pm.project_id = p.project_id \
-         WHERE pm.user_id = ?1 AND pm.status IN ('active', 'invited') \
+         WHERE pm.user_id = ?1 AND pm.status = 'active' \
          ORDER BY p.updated_at DESC, p.name",
     )?;
     let rows = stmt.query_map(params![user_id], read_summary)?;
@@ -97,7 +97,7 @@ pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSumm
                 pm.role \
          FROM projects p \
          JOIN project_members pm ON pm.project_id = p.project_id \
-         WHERE pm.user_id = ?1 AND pm.status IN ('active', 'invited') AND p.project_id = ?2",
+         WHERE pm.user_id = ?1 AND pm.status = 'active' AND p.project_id = ?2",
         params![user_id, project_id],
         read_summary,
     )
@@ -107,8 +107,8 @@ pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSumm
 
 /// Returns the membership role slug of `user_id` in `project_id`, or `None` when
 /// the user has no membership row. Used as the authorization primitive for
-/// owner-only project actions. Includes `invited` rows so a pending invitation
-/// is distinguishable from no membership at all.
+/// owner-only project actions. All membership rows are `active`, so a returned
+/// role always grants the access tied to that role.
 pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
     let pool = super::db::pool()?;
     let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
@@ -121,8 +121,8 @@ pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-/// Lists every member of a project (active and invited), owner first then by
-/// creation time. No authorization is enforced here; callers gate visibility.
+/// Lists every member of a project, owner first then by creation time. No
+/// authorization is enforced here; callers gate visibility.
 pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
     let pool = super::db::pool()?;
     let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
@@ -138,7 +138,8 @@ pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
 }
 
 /// Invites a user to a project with a grantable role (`editor`/`viewer`). Only
-/// the project owner may invite. The new row is created with `status = invited`.
+/// the project owner may invite. There is no acceptance step: the new member is
+/// created `active` and gains access immediately.
 pub fn invite_member(
     project_id: &str,
     inviter_user_id: &str,
@@ -178,7 +179,7 @@ pub fn invite_member(
             project_id,
             invitee_user_id,
             role.slug(),
-            MemberStatus::Invited.slug(),
+            MemberStatus::Active.slug(),
             inviter_user_id
         ],
     )?;
@@ -285,9 +286,9 @@ fn require_owner(
     }
 }
 
-/// Asserts `user_id` is an active or invited member of `project_id`. Membership
-/// is the access boundary for dataset operations, mirroring `get_project`. A
-/// non-member cannot create, list or read datasets in a project they cannot see.
+/// Asserts `user_id` is an active member of `project_id`. Membership is the
+/// access boundary for dataset operations, mirroring `get_project`. A non-member
+/// cannot create, list or read datasets in a project they cannot see.
 fn require_member(
     conn: &rusqlite::Connection,
     project_id: &str,
@@ -296,7 +297,7 @@ fn require_member(
     let role: Option<String> = conn
         .query_row(
             "SELECT role FROM project_members \
-             WHERE project_id = ?1 AND user_id = ?2 AND status IN ('active', 'invited')",
+             WHERE project_id = ?1 AND user_id = ?2 AND status = 'active'",
             params![project_id, user_id],
             |row| row.get(0),
         )
@@ -310,6 +311,7 @@ fn require_member(
 /// Persists a profiled dataset for a project. `profile_json` is the serialized
 /// `profile::TableProfile`. Authorization is by project membership. Returns the
 /// stored row.
+#[allow(clippy::too_many_arguments)]
 pub fn create_dataset(
     user_id: &str,
     project_id: &str,
@@ -318,6 +320,7 @@ pub fn create_dataset(
     row_count: u64,
     column_count: u32,
     profile_json: &str,
+    raw_data: &[u8],
 ) -> Result<Dataset> {
     let name = name.trim();
     if name.is_empty() {
@@ -333,8 +336,8 @@ pub fn create_dataset(
     require_member(&conn, project_id, user_id)?;
     conn.execute(
         "INSERT INTO datasets \
-             (dataset_id, project_id, name, kind, row_count, column_count, profile_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             dataset_id,
             project_id,
@@ -342,7 +345,8 @@ pub fn create_dataset(
             kind,
             row_count as i64,
             column_count as i64,
-            profile_json
+            profile_json,
+            raw_data
         ],
     )?;
     conn.query_row(
@@ -389,6 +393,73 @@ pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
         Ok(()) => Ok(Some(dataset)),
         Err(_) => Ok(None),
     }
+}
+
+/// Returns the raw uploaded bytes of a dataset, scoped to the caller's project
+/// membership. Errors when the dataset does not exist, the user is not a member
+/// of its project, or no raw data was stored (datasets created before the
+/// `raw_data` migration). The bytes feed tabular training.
+pub fn get_dataset_raw(user_id: &str, dataset_id: &str) -> Result<Vec<u8>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row: Option<(String, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT project_id, raw_data FROM datasets WHERE dataset_id = ?1",
+            params![dataset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((project_id, raw)) = row else {
+        bail!("dataset not found");
+    };
+    require_member(&conn, &project_id, user_id)?;
+    match raw {
+        Some(bytes) if !bytes.is_empty() => Ok(bytes),
+        _ => bail!("dataset has no stored raw data (re-upload to enable training)"),
+    }
+}
+
+/// Records a finished tabular training run plus its best model in one
+/// transaction, returning `(run_id, model_id)`. `config_json` carries the
+/// requested target/task; `metrics_json` is the best model's metric blob (the
+/// same JSON stored on the model row). The run is marked `succeeded` with a
+/// `finished_at` timestamp. `metric_history` is an optional list of
+/// `(step, key, value)` rows persisted to `metrics_history` (e.g. per-iteration
+/// training loss) so the leaderboard view can chart convergence.
+pub fn record_training_result(
+    project_id: &str,
+    model_name: &str,
+    framework: &str,
+    config_json: &str,
+    metrics_json: &str,
+    metric_history: &[(i64, String, f64)],
+) -> Result<(String, String)> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let model_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO models \
+             (model_id, project_id, name, framework, base_model, metrics_json, status) \
+         VALUES (?1, ?2, ?3, ?4, '', ?5, 'trained')",
+        params![model_id, project_id, model_name, framework, metrics_json],
+    )?;
+    tx.execute(
+        "INSERT INTO training_runs \
+             (run_id, project_id, model_id, status, config_json, started_at, finished_at) \
+         VALUES (?1, ?2, ?3, 'succeeded', ?4, datetime('now'), datetime('now'))",
+        params![run_id, project_id, model_id, config_json],
+    )?;
+    for (step, key, value) in metric_history {
+        tx.execute(
+            "INSERT INTO metrics_history (run_id, step, metric_key, metric_value) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, step, key, value],
+        )?;
+    }
+    tx.commit()?;
+    Ok((run_id, model_id))
 }
 
 /// Returns the number of registered models for a project.

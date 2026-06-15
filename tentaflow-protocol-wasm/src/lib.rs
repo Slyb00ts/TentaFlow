@@ -1659,6 +1659,26 @@ pub fn encode_ml_studio_dataset_profile_request(dataset_id: String) -> Result<Ve
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioTabularTrainRequest)]
+pub fn encode_ml_studio_tabular_train_request(
+    project_id: String,
+    dataset_id: String,
+    target_column: String,
+    task: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::TabularTrainRequest(
+            tentaflow_protocol::MlStudioTabularTrainRequest {
+                project_id,
+                dataset_id,
+                target_column,
+                task,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioResourceGrantCreateRequest)]
 pub fn encode_ml_studio_resource_grant_create_request(
     subject_kind: String,
@@ -2979,6 +2999,15 @@ pub fn encode_addon_access_decision_request(
 
 fn set(obj: &js_sys::Object, key: &str, value: JsValue) {
     let _ = js_sys::Reflect::set(obj, &key.into(), &value);
+}
+
+/// Maps an optional float to a JS number or `null` (so absent classification /
+/// regression metrics arrive as `null`, not `0`).
+fn opt_f64_to_js(value: Option<f64>) -> JsValue {
+    match value {
+        Some(v) => v.into(),
+        None => JsValue::NULL,
+    }
 }
 
 fn string_vec_to_js(values: Vec<String>) -> js_sys::Array {
@@ -7593,6 +7622,48 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "variant", "MlStudioDatasetProfileResponse".into());
             set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
             set(obj, "profile", ml_studio_table_profile_to_js(&resp.profile).into());
+        }
+        tentaflow_protocol::MlStudioPayload::TabularTrainRequest(req) => {
+            set(obj, "variant", "MlStudioTabularTrainRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "targetColumn", req.target_column.clone().into());
+            set(obj, "target_column", req.target_column.into());
+            set(obj, "task", req.task.into());
+        }
+        tentaflow_protocol::MlStudioPayload::TabularTrainResponse(resp) => {
+            set(obj, "variant", "MlStudioTabularTrainResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "bestModelId", resp.best_model_id.clone().into());
+            set(obj, "best_model_id", resp.best_model_id.into());
+            set(obj, "bestModelName", resp.best_model_name.clone().into());
+            set(obj, "best_model_name", resp.best_model_name.into());
+            set(obj, "task", resp.task.into());
+            set(obj, "targetColumn", resp.target_column.clone().into());
+            set(obj, "target_column", resp.target_column.into());
+            set(obj, "trainRows", (resp.train_rows as f64).into());
+            set(obj, "train_rows", (resp.train_rows as f64).into());
+            set(obj, "holdoutRows", (resp.holdout_rows as f64).into());
+            set(obj, "holdout_rows", (resp.holdout_rows as f64).into());
+            let arr = js_sys::Array::new();
+            for e in &resp.leaderboard {
+                let row = js_sys::Object::new();
+                set(&row, "modelName", e.model_name.clone().into());
+                set(&row, "model_name", e.model_name.clone().into());
+                set(&row, "framework", e.framework.clone().into());
+                set(&row, "accuracy", opt_f64_to_js(e.accuracy));
+                set(&row, "f1Macro", opt_f64_to_js(e.f1_macro));
+                set(&row, "f1_macro", opt_f64_to_js(e.f1_macro));
+                set(&row, "rmse", opt_f64_to_js(e.rmse));
+                set(&row, "r2", opt_f64_to_js(e.r2));
+                set(&row, "trainSecs", e.train_secs.into());
+                set(&row, "train_secs", e.train_secs.into());
+                arr.push(&row);
+            }
+            set(obj, "leaderboard", arr.into());
         }
         tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(req) => {
             set(obj, "variant", "MlStudioResourceGrantCreateRequest".into());
