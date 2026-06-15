@@ -1889,6 +1889,9 @@ pub struct CameraUpdateSpec {
     pub resolution_height: Option<u32>,
     pub retention_class: Option<String>,
     pub profile: Option<String>,
+    /// Per-camera analysis Flow id. `None` keeps current; `Some("")` clears it;
+    /// `Some(id)` assigns (host validates the flow exists and is active).
+    pub analysis_flow_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2044,6 +2047,7 @@ pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
         resolution_height: spec.resolution_height,
         retention_class: spec.retention_class.clone(),
         profile: spec.profile.clone(),
+        analysis_flow_id: spec.analysis_flow_id.clone(),
     })?;
     let bytes = call_sql_with_one_input(camera_update_v1, &payload)?;
     let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
