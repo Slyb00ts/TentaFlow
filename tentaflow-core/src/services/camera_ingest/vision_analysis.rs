@@ -16,10 +16,10 @@
 #![cfg(feature = "inference-vision-gpu")]
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::OnceCell;
+use tokio::sync::{mpsc, OnceCell};
 use tracing::{info, warn};
 
 use crate::services::detection_bus;
@@ -243,8 +243,6 @@ async fn engine_loop() {
         Some(d) => d,
         None => return, // load failed earlier — overlay still works, no detections
     };
-    let classifier = get_classifier().await;
-    let ocr = get_ocr().await;
     info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
 
     // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
@@ -322,31 +320,98 @@ async fn engine_loop() {
             continue;
         }
 
-        // One batched detector run + per-image state/OCR, off the async worker.
+        // HOT PATH: one batched detector run only (no OCR/classify here). Empty
+        // results publish immediately to clear the overlay; non-empty go to the
+        // cold path for per-detection enrichment + publish, keeping the hot loop
+        // bounded to detector throughput.
         let detector = detector.clone();
-        let classifier = classifier.clone();
-        let ocr = ocr.clone();
-        let result = tokio::task::spawn_blocking(move || run_batch(detector, classifier, ocr, frames))
-            .await;
-        match result {
+        let detected =
+            tokio::task::spawn_blocking(move || detect_only(detector, frames)).await;
+        match detected {
             Ok(per_cam) => {
-                for (id, items) in per_cam {
-                    detection_bus::publish_detections(&id, items);
+                for (id, frame, w, h, dets) in per_cam {
+                    if dets.is_empty() {
+                        detection_bus::publish_detections(&id, Vec::new());
+                        continue;
+                    }
+                    let ev = DetectionEvent {
+                        camera_id: id,
+                        frame,
+                        w,
+                        h,
+                        detections: dets,
+                    };
+                    // try_send: a full cold queue drops the event (backpressure).
+                    // Chunk 0b adds coalescing, per-camera limits and metrics.
+                    let _ = cold_sender().try_send(ev);
                 }
             }
-            Err(e) => warn!("[vision_analysis] batch task panicked: {e}"),
+            Err(e) => warn!("[vision_analysis] detect task panicked: {e}"),
         }
     }
 }
 
-/// Blocking: one `detect_batch` across the frames, then per-image state + plate
-/// OCR on crops. Returns `(camera_id, detections)` per frame.
-fn run_batch(
-    detector: std::sync::Arc<Mutex<RfDetrDetector>>,
-    classifier: Option<std::sync::Arc<Mutex<StateClassifier>>>,
-    ocr: Option<std::sync::Arc<Mutex<PlateOcr>>>,
-    frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)>,
-) -> Vec<(String, Vec<crate::services::detection_bus::Detection>)> {
+/// Bounded cold-path queue capacity. A full queue means enrichment can't keep up
+/// with detections; events are dropped (overlay still got raw boxes via the empty
+/// publish path is not affected). Chunk 0b refines this into per-camera limits.
+const COLD_QUEUE_CAP: usize = 256;
+
+/// One detection frame handed from the hot detector to the cold enrichment path:
+/// the raw frame + the detector's boxes, to be enriched (state/OCR) and published.
+struct DetectionEvent {
+    camera_id: String,
+    frame: Arc<[u8]>,
+    w: u32,
+    h: u32,
+    detections: Vec<crate::services::detection_bus::Detection>,
+}
+
+/// Process-wide sender into the cold enrichment path. First use spawns the single
+/// cold consumer task (which owns the classifier + OCR runners).
+fn cold_sender() -> &'static mpsc::Sender<DetectionEvent> {
+    static TX: OnceLock<mpsc::Sender<DetectionEvent>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<DetectionEvent>(COLD_QUEUE_CAP);
+        tokio::spawn(cold_consumer(rx));
+        tx
+    })
+}
+
+/// Cold path: enriches each detection frame (state classify + plate OCR on crops)
+/// off the hot detector loop, then publishes. Owns the classifier/OCR runners.
+async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
+    let classifier = get_classifier().await;
+    let ocr = get_ocr().await;
+    info!("[vision_analysis] cold enrichment consumer started");
+    while let Some(ev) = rx.recv().await {
+        let DetectionEvent {
+            camera_id,
+            frame,
+            w,
+            h,
+            detections,
+        } = ev;
+        let classifier = classifier.clone();
+        let ocr = ocr.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let mut dets = detections;
+            enrich_detections(&classifier, &ocr, &frame, w, h, &mut dets);
+            (camera_id, dets)
+        })
+        .await;
+        match res {
+            Ok((id, dets)) => detection_bus::publish_detections(&id, dets),
+            Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
+        }
+    }
+}
+
+/// HOT, blocking: one `detect_batch` across the frames. Returns the raw boxes per
+/// frame plus the frame buffer, for the cold path to enrich. No OCR/classify here.
+fn detect_only(
+    detector: Arc<Mutex<RfDetrDetector>>,
+    frames: Vec<(String, Arc<[u8]>, u32, u32)>,
+) -> Vec<(String, Arc<[u8]>, u32, u32, Vec<crate::services::detection_bus::Detection>)> {
     let batch = {
         let refs: Vec<(&[u8], u32, u32)> =
             frames.iter().map(|(_, rgb, w, h)| (&rgb[..], *w, *h)).collect();
@@ -359,42 +424,54 @@ fn run_batch(
             }
         }
     };
+    frames
+        .into_iter()
+        .zip(batch.into_iter())
+        .map(|((id, rgb, w, h), items)| (id, rgb, w, h, items))
+        .collect()
+}
 
-    let mut out = Vec::with_capacity(frames.len());
-    for ((id, rgb, w, h), mut items) in frames.into_iter().zip(batch.into_iter()) {
-        for det in items.iter_mut() {
-            let fw = w as f32;
-            let fh = h as f32;
-            let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
-            let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
-            let cw = (det.bbox[2] * fw).round().max(0.0) as u32;
-            let ch = (det.bbox[3] * fh).round().max(0.0) as u32;
-            let cw = cw.min(w.saturating_sub(x0));
-            let ch = ch.min(h.saturating_sub(y0));
-            if cw < 8 || ch < 8 {
-                continue;
-            }
-            if wants_state(&det.klasa) {
-                if let Some(classifier) = classifier.as_ref() {
-                    let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
-                    match classifier.lock().unwrap().classify(&crop, cw, ch) {
-                        Ok(stany) => det.stan = stany,
-                        Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
-                    }
-                }
-            }
-            if det.klasa == "tablica_rejestracyjna" {
-                if let Some(ocr) = ocr.as_ref() {
-                    let crop = crop_rgb(&rgb, w, x0, y0, cw, ch);
-                    match ocr.lock().unwrap().read(&crop, cw, ch) {
-                        Ok(Some(plate)) => det.tekst = Some(plate),
-                        Ok(None) => {}
-                        Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
-                    }
+/// COLD, blocking: per-detection state classify (labels) + plate OCR, mutating
+/// `items` in place. Runs off the hot detector loop so its latency never paces
+/// detection throughput. Missing runners (`None`) skip that stage, never crash.
+fn enrich_detections(
+    classifier: &Option<Arc<Mutex<StateClassifier>>>,
+    ocr: &Option<Arc<Mutex<PlateOcr>>>,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    items: &mut [crate::services::detection_bus::Detection],
+) {
+    for det in items.iter_mut() {
+        let fw = w as f32;
+        let fh = h as f32;
+        let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
+        let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
+        let cw = (det.bbox[2] * fw).round().max(0.0) as u32;
+        let ch = (det.bbox[3] * fh).round().max(0.0) as u32;
+        let cw = cw.min(w.saturating_sub(x0));
+        let ch = ch.min(h.saturating_sub(y0));
+        if cw < 8 || ch < 8 {
+            continue;
+        }
+        if wants_state(&det.klasa) {
+            if let Some(classifier) = classifier.as_ref() {
+                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
+                match classifier.lock().unwrap().classify(&crop, cw, ch) {
+                    Ok(stany) => det.stan = stany,
+                    Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
                 }
             }
         }
-        out.push((id, items));
+        if det.klasa == "tablica_rejestracyjna" {
+            if let Some(ocr) = ocr.as_ref() {
+                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
+                match ocr.lock().unwrap().read(&crop, cw, ch) {
+                    Ok(Some(plate)) => det.tekst = Some(plate),
+                    Ok(None) => {}
+                    Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
+                }
+            }
+        }
     }
-    out
 }
