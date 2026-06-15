@@ -1,29 +1,31 @@
 // =============================================================================
-// File: vision/ocr_plate.rs — license-plate OCR (fast-plate-ocr, ONNX via `ort`)
+// File: vision/ocr_plate.rs — license-plate OCR (fast-plate-ocr, Burn)
 // =============================================================================
 //
-// Reads alphanumeric license plates from detector crops of class
-// `tablica_rejestracyjna`. Loads `plate_ocr.onnx` (the exported fast-plate-ocr
-// CCT model) through ONNX Runtime and turns a crop into a plate string.
+// Reads alphanumeric plates from detector crops of class `tablica_rejestracyjna`.
+// Architecture vendored as `burn_plate` (build-time ONNX→Burn codegen); weights
+// load at runtime from `plate_ocr.bpk`.
 //
 // Preprocessing mirrors the training transform exactly: RGB crop → grayscale
 // (BT.601 luma) → 140×70 bilinear stretch → raw uint8 NHWC tensor [1,70,140,1]
-// with NO /255 and NO normalization (the model ingests raw 0..255 bytes).
+// with NO /255 and NO normalization (the model ingests raw 0..255 bytes — the
+// generated forward takes an Int tensor).
 //
 // The graph emits a flat [1,333] tensor = 9 slots × 37 vocab logits (row-major:
 // slot s occupies [s*vocab .. s*vocab+vocab]). Postprocessing is a per-slot
-// argmax → character via the alphabet, dropping the pad character. An empty
-// result (all pads) maps to `None`.
+// argmax → character via the alphabet, dropping the pad character.
 
 #![cfg(feature = "inference-vision-gpu")]
 
 use anyhow::{anyhow, bail, Context, Result};
-use ort::session::Session;
-use ort::value::Value;
+use burn::tensor::{Int, Tensor, TensorData};
+use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::paths;
+use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
+use crate::vision::burn_plate::Model;
 
 /// `plate-ocr-config.json` shape — the deploy-time config next to the model.
 #[derive(Debug, Deserialize)]
@@ -36,28 +38,24 @@ struct OcrConfig {
     img_width: u32,
 }
 
-/// Loaded plate-OCR session plus its decoded config. `Session::run` needs
-/// `&mut`, so `read` takes `&mut self`; a single shared instance is driven from
-/// one analysis task (or behind a mutex when shared across cameras).
+/// Loaded plate-OCR model + decoded config + backend device.
 pub struct PlateOcr {
-    session: Session,
-    /// Alphabet as chars, indexed by the per-slot argmax (row-major vocab).
+    model: Model<VisionBackend>,
+    device: VisionDevice,
     alphabet: Vec<char>,
     pad: char,
     slots: usize,
     vocab: usize,
     img_h: u32,
     img_w: u32,
-    /// Graph input tensor name, read from the model so we do not hard-code it.
-    input_name: String,
 }
 
 impl PlateOcr {
     /// Builds the OCR runner from the deploy-time model dir
-    /// (`vision_models_dir()/plate_ocr.onnx` + `plate-ocr-config.json`).
+    /// (`vision_models_dir()/plate_ocr.bpk` + `plate-ocr-config.json`).
     pub fn load() -> Result<Self> {
         let dir = paths::vision_models_dir();
-        let model_path = dir.join("plate_ocr.onnx");
+        let weights_path = dir.join("plate_ocr.bpk");
         let config_path = dir.join("plate-ocr-config.json");
 
         let config_bytes = std::fs::read(&config_path)
@@ -88,63 +86,60 @@ impl PlateOcr {
             .next()
             .ok_or_else(|| anyhow!("plate-ocr-config.json: pad_char is empty"))?;
 
-        let session = super::ort_session::build_session(&model_path)?;
-
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| anyhow!("plate OCR model has no inputs"))?;
+        if !weights_path.exists() {
+            bail!("plate-OCR weights missing: {}", weights_path.display());
+        }
+        let device = burn_backend::device();
+        let mut model = Model::<VisionBackend>::new(&device);
+        let mut store = BurnpackStore::from_file(&weights_path);
+        model
+            .load_from(&mut store)
+            .map_err(|e| anyhow!("load plate weights {}: {e}", weights_path.display()))?;
 
         info!(
-            "[ocr_plate] loaded {} ({} slots, vocab {}, {}x{}, input '{}')",
-            model_path.display(),
+            "[ocr_plate] loaded {} ({} slots, vocab {}, {}x{})",
+            weights_path.display(),
             cfg.max_plate_slots,
             cfg.vocab_size,
             cfg.img_width,
-            cfg.img_height,
-            input_name
+            cfg.img_height
         );
         Ok(Self {
-            session,
+            model,
+            device,
             alphabet,
             pad,
             slots: cfg.max_plate_slots,
             vocab: cfg.vocab_size,
             img_h: cfg.img_height,
             img_w: cfg.img_width,
-            input_name,
         })
     }
 
     /// Runs one crop through the OCR model. `crop_rgb` is tightly packed RGB24 of
     /// size `cw*ch*3`. Returns the recognized plate string, or `None` when the
-    /// model reads only pad characters (no plate).
+    /// model reads only pad characters.
     pub fn read(&mut self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>> {
         let gray = self.preprocess(crop_rgb, cw, ch)?;
-        // Raw uint8 NHWC [1, H, W, 1]: the model ingests 0..255 bytes directly,
-        // so the element type of the tensor must be u8 (no /255, no normalize).
+        // Raw uint8 NHWC [1, H, W, 1] as Int — the model ingests 0..255 directly.
+        let data: Vec<i32> = gray.iter().map(|&b| b as i32).collect();
         let shape = [1usize, self.img_h as usize, self.img_w as usize, 1usize];
-        let input_value = Value::from_array((shape, gray))?;
+        let input =
+            Tensor::<VisionBackend, 4, Int>::from_data(TensorData::new(data, shape), &self.device);
 
-        let outputs = self
-            .session
-            .run(ort::inputs! { self.input_name.as_str() => &input_value })?;
-
-        let output = outputs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("plate OCR produced no outputs"))?
-            .1;
-        let (logits_shape, logits) = output.try_extract_tensor::<f32>()?;
+        let logits: Vec<f32> = self
+            .model
+            .forward(input)
+            .to_data()
+            .to_vec()
+            .map_err(|e| anyhow!("plate logits to_vec: {e:?}"))?;
 
         let expected = self.slots * self.vocab;
         if logits.len() < expected {
             bail!(
-                "plate OCR logits len {} < slots*vocab {} (shape {:?})",
+                "plate OCR logits len {} < slots*vocab {}",
                 logits.len(),
-                expected,
-                &*logits_shape
+                expected
             );
         }
 
@@ -159,9 +154,9 @@ impl PlateOcr {
                     best_idx = idx;
                 }
             }
-            let ch = self.alphabet[best_idx];
-            if ch != self.pad {
-                plate.push(ch);
+            let c = self.alphabet[best_idx];
+            if c != self.pad {
+                plate.push(c);
             }
         }
 
@@ -173,8 +168,7 @@ impl PlateOcr {
     }
 
     /// RGB24 crop → raw grayscale uint8, stretch-resized to `img_w × img_h`.
-    /// Resizing happens on RGB (the SIMD resizer is RGB-only), then BT.601 luma
-    /// collapses each pixel to one byte: 0.299R + 0.587G + 0.114B.
+    /// BT.601 luma collapses each pixel to one byte: 0.299R + 0.587G + 0.114B.
     fn preprocess(&self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         let resized = crate::vision::resize::resize_rgb(rgb, w, h, self.img_w, self.img_h)
             .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
@@ -182,10 +176,7 @@ impl PlateOcr {
         let pixels = (self.img_w as usize) * (self.img_h as usize);
         let mut gray = Vec::with_capacity(pixels);
         for px in resized.chunks_exact(3) {
-            let r = px[0] as f32;
-            let g = px[1] as f32;
-            let b = px[2] as f32;
-            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let luma = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
             gray.push(luma.round().clamp(0.0, 255.0) as u8);
         }
         Ok(gray)
