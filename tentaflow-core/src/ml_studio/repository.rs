@@ -3,7 +3,9 @@
 use anyhow::{bail, Result};
 use rusqlite::{params, OptionalExtension};
 
-use super::models::{MemberStatus, Project, ProjectMember, ProjectRole, ProjectSummary, ProjectType};
+use super::models::{
+    Dataset, MemberStatus, Project, ProjectMember, ProjectRole, ProjectSummary, ProjectType,
+};
 
 /// Lists projects the user is an active member of (owner or invited-and-accepted),
 /// newest first, each with its per-project KPIs (dataset/model count) plus the
@@ -282,6 +284,112 @@ fn require_owner(
     }
 }
 
+/// Asserts `user_id` is an active or invited member of `project_id`. Membership
+/// is the access boundary for dataset operations, mirroring `get_project`. A
+/// non-member cannot create, list or read datasets in a project they cannot see.
+fn require_member(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let role: Option<String> = conn
+        .query_row(
+            "SELECT role FROM project_members \
+             WHERE project_id = ?1 AND user_id = ?2 AND status IN ('active', 'invited')",
+            params![project_id, user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if role.is_none() {
+        bail!("not a member of this project");
+    }
+    Ok(())
+}
+
+/// Persists a profiled dataset for a project. `profile_json` is the serialized
+/// `profile::TableProfile`. Authorization is by project membership. Returns the
+/// stored row.
+pub fn create_dataset(
+    user_id: &str,
+    project_id: &str,
+    name: &str,
+    kind: &str,
+    row_count: u64,
+    column_count: u32,
+    profile_json: &str,
+) -> Result<Dataset> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("dataset name is required");
+    }
+    if name.chars().count() > 256 {
+        bail!("dataset name must be at most 256 characters");
+    }
+
+    let dataset_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_member(&conn, project_id, user_id)?;
+    conn.execute(
+        "INSERT INTO datasets \
+             (dataset_id, project_id, name, kind, row_count, column_count, profile_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            dataset_id,
+            project_id,
+            name,
+            kind,
+            row_count as i64,
+            column_count as i64,
+            profile_json
+        ],
+    )?;
+    conn.query_row(
+        "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+         FROM datasets WHERE dataset_id = ?1",
+        params![dataset_id],
+        read_dataset,
+    )
+    .map_err(Into::into)
+}
+
+/// Lists datasets of a project, newest first. Authorization by membership.
+pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_member(&conn, project_id, user_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+         FROM datasets WHERE project_id = ?1 ORDER BY created_at DESC, name",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_dataset)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Fetches a single dataset by id, scoped to the caller's project membership.
+/// Returns `None` when the dataset does not exist or the user is not a member of
+/// its project, so a non-member cannot probe dataset ids.
+pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let dataset: Option<Dataset> = conn
+        .query_row(
+            "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+             FROM datasets WHERE dataset_id = ?1",
+            params![dataset_id],
+            read_dataset,
+        )
+        .optional()?;
+    let Some(dataset) = dataset else {
+        return Ok(None);
+    };
+    match require_member(&conn, &dataset.project_id, user_id) {
+        Ok(()) => Ok(Some(dataset)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Returns the number of registered models for a project.
 pub fn count_models_per_project(project_id: &str) -> Result<u32> {
     let pool = super::db::pool()?;
@@ -316,6 +424,19 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
         dataset_count,
         role,
         is_owner,
+    })
+}
+
+fn read_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dataset> {
+    Ok(Dataset {
+        dataset_id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        row_count: row.get::<_, i64>(4)?.max(0) as u64,
+        column_count: row.get::<_, i64>(5)?.max(0) as u32,
+        profile_json: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 

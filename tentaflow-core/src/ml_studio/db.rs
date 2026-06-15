@@ -114,7 +114,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 /// Ordered ML Studio schema migrations. `owner_user_id`/`org_id` are TEXT
 /// references to core identity (app-level, no SQL FK — different DB file).
-const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA), (2, PROJECT_MEMBERS)];
+const MIGRATIONS: &[(i64, &str)] =
+    &[(1, INITIAL_SCHEMA), (2, PROJECT_MEMBERS), (3, DATASET_PROFILE)];
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -222,4 +223,9 @@ CREATE INDEX idx_project_members_user ON project_members(user_id);
 INSERT OR IGNORE INTO project_members (project_id, user_id, role, status, invited_by)
 SELECT project_id, owner_user_id, 'owner', 'active', owner_user_id
 FROM projects WHERE owner_user_id IS NOT NULL AND owner_user_id != '';
+";
+
+const DATASET_PROFILE: &str = "
+ALTER TABLE datasets ADD COLUMN column_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE datasets ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}';
 ";

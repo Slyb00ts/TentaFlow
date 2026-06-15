@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod models;
+pub mod profile;
 pub mod repository;
 
 use std::path::Path;
