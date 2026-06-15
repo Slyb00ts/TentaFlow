@@ -1,4 +1,9 @@
-// Generated from ONNX "/home/critix/repos/rust/TentaFlow/.runtime/models/vision/plate_ocr.onnx" by burn-onnx
+// Generated from ONNX "plate_ocr.onnx" by burn-onnx.
+// MANUAL FIX (re-apply after any regeneration): the 6 `Interpolate2d` ops were
+// emitted with float `with_scale_factor`, which rounds to the wrong spatial size
+// (e.g. H=4 instead of 6) and panics the downstream window `reshape`. They are
+// pinned to exact `with_output_size` from ONNX shape inference (NCHW H,W):
+// Resize 1..6 = [10,18],[9,18],[6,10],[5,9],[4,6],[3,5]. Model is fixed-input 70x140.
 use burn::prelude::*;
 use burn::nn::Linear;
 use burn::nn::LinearConfig;
@@ -265,8 +270,8 @@ impl<B: Backend> Submodule1<B> {
             .with_bias(false)
             .init(device);
         let resize1 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([1.1111112, 1.0]))
+            .with_output_size(Some([10, 18]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
@@ -727,8 +732,8 @@ impl<B: Backend> Submodule3<B> {
             [1, 1, 1, 1, 64].into(),
         );
         let resize2 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([0.9, 1.0]))
+            .with_output_size(Some([9, 18]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
@@ -946,8 +951,8 @@ impl<B: Backend> Submodule4<B> {
             .with_bias(false)
             .init(device);
         let resize3 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([1.2, 1.1111112]))
+            .with_output_size(Some([6, 10]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
@@ -1697,8 +1702,8 @@ impl<B: Backend> Submodule7<B> {
     #[allow(unused_variables)]
     pub fn new(device: &B::Device) -> Self {
         let resize4 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([0.8333333, 0.9]))
+            .with_output_size(Some([5, 9]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
@@ -1785,8 +1790,8 @@ impl<B: Backend> Submodule7<B> {
             .with_bias(false)
             .init(device);
         let resize5 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([1.3333334, 1.2]))
+            .with_output_size(Some([4, 6]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
@@ -2327,8 +2332,8 @@ impl<B: Backend> Submodule9<B> {
             [1, 1, 1, 1, 128].into(),
         );
         let resize6 = burn::nn::interpolate::Interpolate2dConfig::new()
-            .with_output_size(None)
-            .with_scale_factor(Some([0.75, 0.8333333]))
+            .with_output_size(Some([3, 5]))
+            .with_scale_factor(None)
             .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
             .with_align_corners(false)
             .init();
