@@ -605,11 +605,31 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         let bytes = frame.len();
         // RAII: releases this camera's in-flight slot + bytes on drop — including
         // an unwind if publish/enrich panics — so a camera can never be wedged.
-        let _slot = ColdSlot {
+        let slot = ColdSlot {
             camera_id: camera_id.clone(),
             bytes,
             released: false,
         };
+        // If the camera has an assigned analysis Flow, run it (it owns the
+        // OCR/classify/verdict/alert logic); otherwise fall back to the default
+        // hardcoded enrichment.
+        if let (Some(flow_id), Some(disp)) = (
+            camera_flow_id(&camera_id),
+            crate::flow_engine::dispatcher::global_flow_dispatcher(),
+        ) {
+            // Detach: a flow can run up to its per-frame deadline, so awaiting it
+            // here would head-of-line block every other camera's enrichment. The
+            // spawned task owns `slot`, releasing this camera's in-flight slot +
+            // bytes when the flow finishes. Per-camera in-flight = 1 (admit_cold)
+            // bounds a camera to one concurrent run; the byte budget bounds the
+            // fleet — so detaching stays bounded.
+            tokio::spawn(async move {
+                let _slot = slot;
+                run_camera_flow(disp, flow_id, camera_id, frame, w, h, detections).await;
+            });
+            continue;
+        }
+        let _slot = slot;
         let classifier = classifier.clone();
         let ocr = ocr.clone();
         let res = tokio::task::spawn_blocking(move || {
@@ -623,6 +643,132 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
         }
     }
+}
+
+/// Cached per-camera analysis-flow assignment. The cold path consults this for
+/// every detection event; the short TTL keeps a UI re-assignment visible within
+/// a few seconds without acquiring the SQLite mutex on every event (events are
+/// already coalesced, but a per-event DB hit across 100 cameras is avoidable
+/// load on the tokio worker). `None` is cached too, so an unassigned camera
+/// does not re-query each frame.
+struct FlowIdCacheEntry {
+    flow_id: Option<String>,
+    fetched: Instant,
+}
+const FLOW_ID_TTL: Duration = Duration::from_secs(5);
+
+/// Per-frame deadline for a camera analysis flow. Well under the dispatcher's
+/// 120 s default so a misbehaving flow releases the camera's in-flight slot in
+/// seconds, not minutes (the slot is held for the whole detached run).
+const CAMERA_FLOW_DEADLINE: Duration = Duration::from_secs(15);
+
+fn flow_id_cache() -> &'static Mutex<HashMap<String, FlowIdCacheEntry>> {
+    static C: OnceLock<Mutex<HashMap<String, FlowIdCacheEntry>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns the camera's assigned analysis flow id, or `None` to fall back to the
+/// built-in enrichment path. Cached with [`FLOW_ID_TTL`].
+fn camera_flow_id(camera_id: &str) -> Option<String> {
+    if let Some(e) = flow_id_cache().lock().unwrap().get(camera_id) {
+        if e.fetched.elapsed() < FLOW_ID_TTL {
+            return e.flow_id.clone();
+        }
+    }
+    let flow_id = crate::db::global_pool()
+        .and_then(|pool| crate::db::repository::camera_analysis_flow_id(&pool, camera_id).ok())
+        .flatten();
+    flow_id_cache().lock().unwrap().insert(
+        camera_id.to_string(),
+        FlowIdCacheEntry {
+            flow_id: flow_id.clone(),
+            fetched: Instant::now(),
+        },
+    );
+    flow_id
+}
+
+/// Runs a camera's assigned analysis Flow on one detection frame: stores the raw
+/// RGB frame as an Image blob, builds the initial envelope (payload = Image, meta
+/// carries the hot detector's detections + camera id), dispatches by flow id and
+/// publishes the resulting detections back to the bus so the live overlay
+/// reflects the flow's enrichment/verdict. Errors are logged, never fatal — the
+/// cold path keeps draining and the slot is released by the caller's `ColdSlot`.
+async fn run_camera_flow(
+    disp: Arc<crate::flow_engine::dispatcher::FlowDispatcher>,
+    flow_id: String,
+    camera_id: String,
+    frame: Arc<[u8]>,
+    w: u32,
+    h: u32,
+    detections: Vec<Detection>,
+) {
+    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+
+    let dets_json = match serde_json::to_value(&detections) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[vision_analysis] flow {flow_id}: serialize detections failed: {e}");
+            return;
+        }
+    };
+    // Ephemeral frame store: the frame lives in memory only for the duration of
+    // this flow run (read by the flow's nodes via the composite ctx.blobs) and is
+    // deleted below — it never touches the durable blob store / disk.
+    let frame_blobs = disp.frame_blobs();
+    let blob_ref = match frame_blobs.put(frame.to_vec(), "image/x-rgb24").await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[vision_analysis] flow {flow_id}: blob put failed: {e:#}");
+            return;
+        }
+    };
+    let mut env = FlowEnvelope::with_payload(FlowValue::Image {
+        blob_ref: blob_ref.clone(),
+        mime: "image/x-rgb24".to_string(),
+        dims: Some((w, h)),
+    });
+    env.meta.insert(
+        "camera_id".into(),
+        serde_json::Value::String(camera_id.clone()),
+    );
+    env.meta.insert("detections".into(), dets_json);
+
+    // System-triggered execution: there is no user in the loop, so no per-user
+    // ACL applies here (the dispatcher treats `user_id = None` as allow). The
+    // real authorization gate is the camera→flow assignment write path, which is
+    // admin-only and validates flow access before persisting `analysis_flow_id`.
+    // A per-frame deadline (well under the dispatcher's 120 s cap) bounds how
+    // long one camera's slot stays held if its flow hangs.
+    let mut meta = FlowRequestMeta::new(format!("cam-{camera_id}"));
+    meta.deadline = Some(Instant::now() + CAMERA_FLOW_DEADLINE);
+    match disp.dispatch_by_flow_id(flow_id.clone(), env, meta).await {
+        Ok(outcome) => publish_flow_detections(&camera_id, detections, outcome),
+        Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
+    }
+    // Ephemeral frame: drop the in-memory blob now that the flow has read it, so
+    // the cold path never accumulates per-frame frames in memory.
+    if let Err(e) = frame_blobs.delete(&blob_ref).await {
+        warn!("[vision_analysis] flow {flow_id}: frame blob cleanup failed: {e:#}");
+    }
+}
+
+/// Publishes a finished flow's detections to the live overlay. A flow that
+/// enriches (OCR/classify/verdict) writes the updated detection array back into
+/// `meta["detections"]`; when present and parseable we publish those, otherwise
+/// we publish the original detector boxes so the overlay still shows them.
+fn publish_flow_detections(
+    camera_id: &str,
+    original: Vec<Detection>,
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) {
+    let enriched = outcome
+        .final_envelope
+        .meta
+        .get("detections")
+        .and_then(|v| serde_json::from_value::<Vec<Detection>>(v.clone()).ok());
+    detection_bus::publish_detections(camera_id, enriched.unwrap_or(original));
 }
 
 /// HOT, blocking: one `detect_batch` across the frames. Returns the raw boxes per

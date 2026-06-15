@@ -432,7 +432,22 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_analysis_fps_column",
             MigrationStep::Rust(cameras_add_analysis_fps_column),
         ),
+        (
+            79,
+            "cameras_analysis_flow_id_column",
+            MigrationStep::Rust(cameras_add_analysis_flow_id_column),
+        ),
     ]
+}
+
+/// Adds `analysis_flow_id` to `cameras` — the per-camera analysis Flow run by the
+/// cold path on a detection event. NULL/empty = no flow (cold path enriches with
+/// the default hardcoded pipeline). Idempotent (column probe).
+fn cameras_add_analysis_flow_id_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "analysis_flow_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN analysis_flow_id TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Adds `analysis_fps` to `cameras` — the per-camera AI analysis frame rate

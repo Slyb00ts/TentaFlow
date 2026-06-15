@@ -22,7 +22,7 @@
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// Pojemnosc bufora broadcast per kamera. Przy ~10 fps to ~6 s zaleglosci,
@@ -38,12 +38,14 @@ const DETECTION_BROADCAST_CAPACITY: usize = 64;
 ///   * `score`  — pewnosc detekcji 0..1.
 ///   * `stan`   — lista cech stanu (np. ["uszkodzona"]); moze byc pusta.
 ///   * `tekst`  — odczyt OCR albo `None` (serializowany jako `null`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detection {
     pub klasa: String,
     pub bbox: [f32; 4],
     pub score: f32,
+    #[serde(default)]
     pub stan: Vec<String>,
+    #[serde(default)]
     pub tekst: Option<String>,
 }
 
