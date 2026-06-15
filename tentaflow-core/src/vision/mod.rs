@@ -19,6 +19,21 @@ pub mod nms;
 pub mod preprocessing;
 pub mod resize;
 
+// Vendored Burn models (build-time ONNX→Burn codegen; regenerate via
+// tools/burn-spike when the architecture changes). Each is its own module
+// because every generated file defines a `Model`. Weights load at runtime (.bpk).
+#[cfg(feature = "vision-burn")]
+pub mod burn_backend;
+#[cfg(feature = "vision-burn")]
+#[path = "generated/rfdetr.rs"]
+pub mod burn_rfdetr;
+#[cfg(feature = "vision-burn")]
+#[path = "generated/stan.rs"]
+pub mod burn_stan;
+#[cfg(feature = "vision-burn")]
+#[path = "generated/plate.rs"]
+pub mod burn_plate;
+
 #[cfg(feature = "inference-vision-gpu")]
 pub mod classifier_stan;
 #[cfg(feature = "inference-vision-gpu")]
