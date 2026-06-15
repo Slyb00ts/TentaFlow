@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 burn = { version = "0.21", features = ["wgpu", "ndarray"] }
 burn-store = "0.21"
+image = "0.25"
 
 [build-dependencies]
 burn-onnx = "0.21"
