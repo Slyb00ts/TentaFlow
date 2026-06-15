@@ -2493,6 +2493,74 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(ResourceGrantCreateRequest) — Admin allocates a
+   * mesh node resource to a subject (§11.3). Pool of nodes comes from the mesh
+   * registry (MeshNodeListRequest); this only records the GRANT.
+   * payload: { subjectKind: 'user'|'group'|'project', subjectId, nodeId,
+   *            resourceKind: 'gpu'|'cpu'|'ram', resourceRef?, quota? }
+   */
+  mlStudioResourceGrantCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioResourceGrantCreateRequest(
+      String(payload.subjectKind ?? payload.subject_kind ?? ''),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.nodeId ?? payload.node_id ?? ''),
+      String(payload.resourceKind ?? payload.resource_kind ?? ''),
+      String(payload.resourceRef ?? payload.resource_ref ?? ''),
+      String(payload.quota ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ResourceGrantsListRequest) — Admin: all grants. */
+  mlStudioResourceGrantsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioResourceGrantsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(ResourceGrantRevokeRequest). payload: { grantId }. */
+  mlStudioResourceGrantRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioResourceGrantRevokeRequest(
+      String(payload.grantId ?? payload.grant_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ProjectResourcesRequest) — a project member sees
+   * the resources allocated to the project. payload: { projectId }.
+   */
+  mlStudioProjectResourcesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectResourcesRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.
    * payload: { tag?, source?, status? }

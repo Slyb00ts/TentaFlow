@@ -30,6 +30,9 @@ let projects = [];
 let projectTypes = [];
 let activeTypeFilter = 'all';
 let detailProjectId = null;
+// Mesh node pool cached for the admin resources screen, so grant rows can resolve
+// nodeId → hostname without a second MeshNodeList round-trip.
+let resourceNodes = [];
 // Cached current user (from AuthMeRequest) so the sharing screen can mark the
 // "(Ty)" row and resolve self-identity for owner gating across mount/unmount.
 let currentUser = null;
@@ -99,6 +102,9 @@ const MlStudioScreen = {
   get title() { return 'ML Studio'; },
 
   render(params = {}) {
+    if (params && params.admin === 'resources') {
+      return `<div id="ml-studio-resources" class="ml-studio-resources"></div>`;
+    }
     if (params && params.projectId && params.share) {
       return `<div id="ml-studio-share" class="ml-studio-share"></div>`;
     }
@@ -111,7 +117,7 @@ const MlStudioScreen = {
           <h1>${sprite('brain')} ML Studio</h1>
           <div class="sub" id="ml-studio-sub">Projekty — jednostki pracy ML (dane, schemat, treningi, modele)</div>
         </div>
-        <div class="actions">
+        <div class="actions" id="ml-studio-actions">
           <tf-button variant="ghost" icon="refresh" id="ml-studio-refresh">Odśwież</tf-button>
           <tf-button variant="primary" icon="plus" id="ml-studio-new">Nowy projekt</tf-button>
         </div>
@@ -124,6 +130,10 @@ const MlStudioScreen = {
   },
 
   async mount(params = {}) {
+    if (params && params.admin === 'resources') {
+      await showResourcesAdmin();
+      return;
+    }
     if (params && params.projectId && params.share) {
       await showShare(params.projectId);
       return;
@@ -151,6 +161,7 @@ const MlStudioScreen = {
     projects = [];
     activeTypeFilter = 'all';
     detailProjectId = null;
+    resourceNodes = [];
   },
 };
 
@@ -175,6 +186,7 @@ async function loadAll() {
     ]);
     projectTypes = Array.isArray(typesResp.types) ? typesResp.types : [];
     projects = Array.isArray(projectsResp.projects) ? projectsResp.projects : [];
+    renderAdminEntry();
     renderFilters();
     renderList();
     const sub = byId('ml-studio-sub');
@@ -249,6 +261,28 @@ async function ensureCurrentUser() {
 
 function currentUserId() {
   return currentUser ? String(currentUser.userId ?? currentUser.user_id ?? '') : '';
+}
+
+// Admin gating mirrors app.js: role comes from AuthMeRequest, admin === 'admin'.
+// The resource allocation screen (§11.3) is admin-only; project members only
+// read their own project's grants via mlStudioProjectResourcesRequest.
+function isCurrentUserAdmin() {
+  return String(currentUser?.role ?? '').toLowerCase() === 'admin';
+}
+
+// Adds the "Administracja › Zasoby" entry to the project list header — only for
+// admins. Inserted once `currentUser` is known (after loadAll resolves AuthMe).
+function renderAdminEntry() {
+  const actions = byId('ml-studio-actions');
+  if (!actions || !isCurrentUserAdmin()) return;
+  if (byId('ml-studio-admin-resources')) return;
+  const btn = document.createElement('tf-button');
+  btn.id = 'ml-studio-admin-resources';
+  btn.setAttribute('variant', 'outline');
+  btn.setAttribute('icon', 'host');
+  btn.textContent = 'Administracja › Zasoby';
+  btn.addEventListener('click', () => Router.navigate('ml-studio', { admin: 'resources' }));
+  actions.insertBefore(btn, actions.firstChild);
 }
 
 function renderList() {
@@ -479,6 +513,7 @@ async function showDetail(projectId) {
     const [resp] = await Promise.all([
       ApiBinary.one('mlStudioProjectDetailRequest', { projectId }),
       ensureProjectTypes(),
+      ensureCurrentUser(),
     ]);
     const p = resp.project || {};
     renderDetail(host, p);
@@ -503,7 +538,9 @@ function renderDetail(host, p) {
   const modelCount = p.modelCount ?? p.model_count ?? 0;
   const created = formatDate(p.createdAt ?? p.created_at);
   const updated = formatDate(p.updatedAt ?? p.updated_at);
-  const tabs = TYPE_TABS[slug] || ['Przegląd', 'Dane', 'Treningi', 'Modele'];
+  // Every project type gets a "Zasoby" tab (§11.3) appended after its type-aware
+  // tabs — it shows the mesh resources allocated to this project.
+  const tabs = [...(TYPE_TABS[slug] || ['Przegląd', 'Dane', 'Treningi', 'Modele']), 'Zasoby'];
 
   host.innerHTML = `
     <div class="ml-studio-detail-top">
@@ -547,6 +584,10 @@ function renderDetail(host, p) {
     const label = tabs[Number.isNaN(idx) ? 0 : idx] || tabs[0];
     if (label === 'Dane') {
       renderDataTab(panel, projectId(p));
+      return;
+    }
+    if (label === 'Zasoby') {
+      renderResourcesTab(panel, projectId(p));
       return;
     }
     panel.innerHTML = '';
@@ -1084,6 +1125,405 @@ async function setMemberRole(pid, userId, role) {
   } catch (err) {
     toast(`Zmiana roli: ${err.message}`, 'error');
   }
+}
+
+// =============================================================================
+// Mesh resource allocation (§11.3) — admin screen: pool of mesh nodes, allocate
+// a resource to a subject (user/group/project), and the active grants table.
+// Pool comes from MeshNodeListRequest; grants from the ML Studio backend.
+// =============================================================================
+
+const SUBJECT_KIND_LABEL = {
+  user: 'Osoba',
+  group: 'Grupa',
+  project: 'Projekt',
+};
+const RESOURCE_KIND_LABEL = {
+  gpu: 'GPU',
+  cpu: 'CPU',
+  ram: 'RAM',
+};
+
+// Mesh node fields arrive snake_case over the wire (mesh.js reads vram_total_mb,
+// gpus[].name); the §11.3 contract documents camelCase. Read both so the screen
+// survives either casing.
+function nodeIdOf(n) {
+  return String(n.nodeId ?? n.node_id ?? '');
+}
+function nodeHostname(n) {
+  const id = nodeIdOf(n);
+  return n.hostname || (id ? id.slice(0, 12) : '(nieznany)');
+}
+function nodeGpus(n) {
+  return Array.isArray(n.gpus) ? n.gpus : [];
+}
+function gpuName(g) {
+  return g.name || g.model || '(GPU)';
+}
+function gpuVramMb(g) {
+  return Number(g.vramTotalMb ?? g.vram_total_mb ?? 0);
+}
+function nodeCpuCount(n) {
+  return Number(n.cpuCount ?? n.cpu_count ?? 0);
+}
+function nodeRamMb(n) {
+  return Number(n.ramTotalMb ?? n.ram_total_mb ?? 0);
+}
+
+function formatMbGb(mb) {
+  const n = Number(mb);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n >= 1024) return `${(n / 1024).toLocaleString('pl-PL', { maximumFractionDigits: 1 })} GB`;
+  return `${formatNumber(n)} MB`;
+}
+
+async function showResourcesAdmin() {
+  const host = byId('ml-studio-resources');
+  if (!host) return;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+
+  await ensureCurrentUser();
+  if (!isCurrentUserAdmin()) {
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'lock');
+    empty.setAttribute('title', 'Tylko dla administratora');
+    empty.setAttribute('message', 'Przydział zasobów mesh jest dostępny wyłącznie dla administratora.');
+    const back = document.createElement('tf-button');
+    back.setAttribute('variant', 'primary');
+    back.textContent = 'Wróć do projektów';
+    back.addEventListener('click', () => Router.navigate('ml-studio'));
+    empty.appendChild(back);
+    host.appendChild(empty);
+    return;
+  }
+
+  try {
+    const [nodesResp, grantsResp] = await Promise.all([
+      ApiBinary.one('meshNodeListRequest'),
+      ApiBinary.one('mlStudioResourceGrantsListRequest'),
+      ensureProjectTypes(),
+    ]);
+    if (!projects.length) {
+      const projResp = await ApiBinary.one('mlStudioProjectsListRequest').catch(() => null);
+      if (projResp) projects = Array.isArray(projResp.projects) ? projResp.projects : [];
+    }
+    resourceNodes = Array.isArray(nodesResp.nodes) ? nodesResp.nodes : [];
+    const grants = Array.isArray(grantsResp.grants) ? grantsResp.grants : [];
+    renderResourcesAdmin(host, resourceNodes, grants);
+  } catch (err) {
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Nie udało się wczytać zasobów');
+    empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+    const back = document.createElement('tf-button');
+    back.setAttribute('variant', 'primary');
+    back.textContent = 'Wróć do projektów';
+    back.addEventListener('click', () => Router.navigate('ml-studio'));
+    empty.appendChild(back);
+    host.appendChild(empty);
+    toast(`Zasoby: ${err.message}`, 'error');
+  }
+}
+
+function renderResourcesAdmin(host, nodes, grants) {
+  const totalGpus = nodes.reduce((s, n) => s + nodeGpus(n).length, 0);
+
+  host.innerHTML = `
+    <div class="ml-studio-detail-top">
+      <tf-button variant="ghost" icon="chevron-left" id="ml-studio-res-back">Projekty</tf-button>
+    </div>
+
+    <tf-detail-header
+      title="Zasoby mesh"
+      subtitle="Przydzielanie zasobów obliczeniowych z puli mesh osobom, grupom i projektom. Domyślnie nikt nie ma zasobów."
+      icon="host">
+      <span slot="badges">
+        <tf-badge tone="info" value="${nodes.length} ${plural(nodes.length, 'node', 'nody', 'nodów')}"></tf-badge>
+        <tf-badge tone="accent" value="${totalGpus} GPU"></tf-badge>
+      </span>
+    </tf-detail-header>
+
+    <section class="ml-studio-res-card">
+      <div class="ml-studio-res-head">${sprite('host')} Pula zasobów mesh — wszystkie nody</div>
+      <div id="ml-studio-res-pool" class="ml-studio-res-pool"></div>
+    </section>
+
+    <section class="ml-studio-res-card">
+      <div class="ml-studio-res-head">${sprite('plus')} Przydziel zasób</div>
+      <div class="ml-studio-res-form">
+        <tf-select id="ml-studio-res-subject-kind" label="Komu" value="project">
+          <option value="user">Osoba</option>
+          <option value="group">Grupa</option>
+          <option value="project">Projekt</option>
+        </tf-select>
+        <div id="ml-studio-res-subject-field"></div>
+        <tf-select id="ml-studio-res-node" label="Node"></tf-select>
+        <tf-select id="ml-studio-res-kind" label="Rodzaj zasobu" value="gpu">
+          <option value="gpu">GPU</option>
+          <option value="cpu">CPU</option>
+          <option value="ram">RAM</option>
+        </tf-select>
+        <div id="ml-studio-res-ref-field"></div>
+        <tf-input id="ml-studio-res-quota" label="Limit (quota)" placeholder="np. 1 GPU / 10 h / 8 GB" hint="Jednostka zależy od rodzaju zasobu."></tf-input>
+        <tf-button variant="primary" icon="check" id="ml-studio-res-grant">Przydziel</tf-button>
+      </div>
+    </section>
+
+    <section class="ml-studio-res-card">
+      <div class="ml-studio-res-head">${sprite('list')} Aktywne przydziały</div>
+      <div id="ml-studio-res-grants"></div>
+    </section>
+  `;
+
+  byId('ml-studio-res-back')?.addEventListener('click', () => Router.navigate('ml-studio'));
+
+  renderResourcePool(byId('ml-studio-res-pool'), nodes);
+  bindResourceForm(nodes);
+  renderGrantsTable(byId('ml-studio-res-grants'), grants);
+}
+
+function renderResourcePool(pool, nodes) {
+  if (!pool) return;
+  if (!nodes.length) {
+    pool.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'host');
+    empty.setAttribute('title', 'Brak nodów w mesh');
+    empty.setAttribute('message', 'Sparuj węzeł w sekcji Mesh, aby udostępnić jego zasoby do przydziału.');
+    pool.appendChild(empty);
+    return;
+  }
+
+  pool.innerHTML = nodes.map((n) => {
+    const gpus = nodeGpus(n);
+    const gpuRows = gpus.length
+      ? gpus.map((g) => `
+          <div class="ml-studio-res-gpu">
+            <span class="ml-studio-res-gpu-name">${sprite('chip')} ${escapeHtml(gpuName(g))}</span>
+            <tf-chip status="info" label="${escapeAttr(formatMbGb(gpuVramMb(g)))} VRAM"></tf-chip>
+          </div>`).join('')
+      : `<div class="ml-studio-res-gpu ml-studio-res-gpu-empty">${sprite('info')} brak GPU</div>`;
+    return `
+      <article class="ml-studio-res-node">
+        <div class="ml-studio-res-node-top">
+          <span class="ml-studio-res-node-name">${sprite('host')} ${escapeHtml(nodeHostname(n))}</span>
+          <tf-badge tone="accent" value="${gpus.length} GPU"></tf-badge>
+        </div>
+        <div class="ml-studio-res-gpus">${gpuRows}</div>
+        <div class="ml-studio-res-node-foot">
+          <tf-chip status="ok" icon="cpu" label="${nodeCpuCount(n) || '—'} CPU"></tf-chip>
+          <tf-chip status="ok" icon="ram" label="${escapeAttr(formatMbGb(nodeRamMb(n)))} RAM"></tf-chip>
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+// Subject field switches between a project picker (for kind=project) and a free
+// identifier input (user/group). Resource-ref field shows a GPU picker only when
+// the selected node has GPUs and the resource kind is gpu.
+function bindResourceForm(nodes) {
+  const kindSel = byId('ml-studio-res-subject-kind');
+  const nodeSel = byId('ml-studio-res-node');
+  const resKindSel = byId('ml-studio-res-kind');
+
+  if (nodeSel) {
+    const opts = nodes.map((n) => ({ value: nodeIdOf(n), label: nodeHostname(n) }));
+    nodeSel.setOptions(opts, nodes.length ? nodeIdOf(nodes[0]) : null);
+  }
+
+  const renderSubjectField = () => {
+    const field = byId('ml-studio-res-subject-field');
+    if (!field) return;
+    const kind = kindSel?.value || 'project';
+    if (kind === 'project') {
+      const opts = projects.map((p) => `<option value="${escapeAttr(projectId(p))}">${escapeHtml(p.name || '(bez nazwy)')}</option>`).join('');
+      field.innerHTML = `<tf-select id="ml-studio-res-subject" label="Projekt">${opts}</tf-select>`;
+    } else {
+      const hint = kind === 'user' ? 'id użytkownika' : 'id grupy';
+      field.innerHTML = `<tf-input id="ml-studio-res-subject" label="Identyfikator" placeholder="np. user-1a2b" hint="${escapeAttr(hint)}"></tf-input>`;
+    }
+  };
+
+  const renderRefField = () => {
+    const field = byId('ml-studio-res-ref-field');
+    if (!field) return;
+    const resKind = resKindSel?.value || 'gpu';
+    const node = nodes.find((n) => nodeIdOf(n) === (nodeSel?.value || ''));
+    const gpus = node ? nodeGpus(node) : [];
+    if (resKind === 'gpu' && gpus.length) {
+      const opts = gpus.map((g, i) => {
+        const ref = String(g.uuid ?? g.gpuId ?? g.gpu_id ?? g.index ?? i);
+        return `<option value="${escapeAttr(ref)}">${escapeHtml(gpuName(g))} · ${escapeHtml(formatMbGb(gpuVramMb(g)))}</option>`;
+      }).join('');
+      field.innerHTML = `<tf-select id="ml-studio-res-ref" label="Karta GPU">${opts}</tf-select>`;
+    } else {
+      field.innerHTML = '';
+    }
+  };
+
+  kindSel?.addEventListener('change', renderSubjectField);
+  resKindSel?.addEventListener('change', renderRefField);
+  nodeSel?.addEventListener('change', renderRefField);
+  renderSubjectField();
+  renderRefField();
+
+  const grantBtn = byId('ml-studio-res-grant');
+  grantBtn?.addEventListener('click', async () => {
+    const subjectKind = kindSel?.value || 'project';
+    const subjectId = byId('ml-studio-res-subject')?.value?.trim() || '';
+    const nodeId = nodeSel?.value || '';
+    const resourceKind = resKindSel?.value || 'gpu';
+    const resourceRef = byId('ml-studio-res-ref')?.value || '';
+    const quota = byId('ml-studio-res-quota')?.value?.trim() || '';
+    if (!subjectId) {
+      toast('Wskaż podmiot przydziału (osobę, grupę lub projekt).', 'error');
+      return;
+    }
+    if (!nodeId) {
+      toast('Wybierz node z puli mesh.', 'error');
+      return;
+    }
+    grantBtn.setAttribute('loading', '');
+    try {
+      await ApiBinary.one('mlStudioResourceGrantCreateRequest', {
+        subjectKind, subjectId, nodeId, resourceKind, resourceRef, quota,
+      });
+      toast('Zasób przydzielony', 'success');
+      await showResourcesAdmin();
+    } catch (err) {
+      grantBtn.removeAttribute('loading');
+      toast(`Przydział: ${err.message}`, 'error');
+    }
+  });
+}
+
+function grantNodeLabel(g) {
+  const nid = String(g.nodeId ?? g.node_id ?? '');
+  const node = resourceNodes.find((n) => nodeIdOf(n) === nid);
+  return node ? nodeHostname(node) : (nid ? nid.slice(0, 12) : '—');
+}
+
+function renderGrantsTable(host, grants) {
+  if (!host) return;
+  host.innerHTML = '';
+  if (!grants.length) {
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'lock');
+    empty.setAttribute('title', 'Brak przydziałów');
+    empty.setAttribute('message', 'Domyślnie nikt nie ma zasobów. Użyj formularza powyżej, aby przydzielić zasób mesh.');
+    host.appendChild(empty);
+    return;
+  }
+
+  const table = document.createElement('tf-table');
+  table.setAttribute('variant', 'lined');
+  table.innerHTML = `
+    <tf-column key="subject" label="Podmiot" renderer="html"></tf-column>
+    <tf-column key="resource" label="Zasób" renderer="html"></tf-column>
+    <tf-column key="quota" label="Limit"></tf-column>
+    <tf-column key="grantedBy" label="Przydzielił"></tf-column>
+    <tf-column key="createdAt" label="Data"></tf-column>
+  `;
+  table.rows = grants.map((g) => {
+    const kind = String(g.subjectKind ?? g.subject_kind ?? '').toLowerCase();
+    const subjectId = String(g.subjectId ?? g.subject_id ?? '');
+    const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '').toLowerCase();
+    const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
+    const subjectHtml = `<span class="ml-studio-res-subject-cell"><tf-chip status="info" label="${escapeAttr(SUBJECT_KIND_LABEL[kind] || kind || '—')}"></tf-chip> ${escapeHtml(subjectId || '—')}</span>`;
+    const resLabel = RESOURCE_KIND_LABEL[resourceKind] || resourceKind || '—';
+    const resourceHtml = `<span class="ml-studio-res-resource-cell">${sprite('host')} ${escapeHtml(grantNodeLabel(g))} · <strong>${escapeHtml(resLabel)}</strong>${resourceRef ? ` · ${escapeHtml(resourceRef)}` : ''}</span>`;
+    return {
+      _grantId: String(g.grantId ?? g.grant_id ?? ''),
+      subject: subjectHtml,
+      resource: resourceHtml,
+      quota: g.quota ? String(g.quota) : '—',
+      grantedBy: String(g.grantedBy ?? g.granted_by ?? '—'),
+      createdAt: formatDate(g.createdAt ?? g.created_at),
+    };
+  });
+  table.rowActions = (row) => {
+    const btn = document.createElement('tf-button');
+    btn.setAttribute('variant', 'ghost');
+    btn.setAttribute('icon', 'trash');
+    btn.textContent = 'Cofnij';
+    btn.addEventListener('click', () => revokeGrant(row._grantId));
+    return btn;
+  };
+  host.appendChild(table);
+}
+
+async function revokeGrant(grantId) {
+  if (!grantId) return;
+  try {
+    await ApiBinary.one('mlStudioResourceGrantRevokeRequest', { grantId });
+    toast('Przydział cofnięty', 'success');
+    await showResourcesAdmin();
+  } catch (err) {
+    toast(`Cofanie: ${err.message}`, 'error');
+  }
+}
+
+// Project detail "Zasoby" section — read-only view of the grants allocated to a
+// project. Non-admins see a hint to ask an admin; admins get a shortcut to the
+// allocation screen.
+function renderResourcesTab(panel, pid) {
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioProjectResourcesRequest', { projectId: pid })
+    .then((resp) => {
+      const grants = Array.isArray(resp.grants) ? resp.grants : [];
+      panel.innerHTML = '';
+      if (!grants.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'host');
+        empty.setAttribute('title', 'Brak przydzielonych zasobów');
+        empty.setAttribute('message', isCurrentUserAdmin()
+          ? 'Ten projekt nie ma przydzielonych zasobów mesh. Przejdź do ekranu Zasoby, aby je przydzielić.'
+          : 'Ten projekt nie ma przydzielonych zasobów mesh — poproś administratora o przydział.');
+        if (isCurrentUserAdmin()) {
+          const btn = document.createElement('tf-button');
+          btn.setAttribute('variant', 'primary');
+          btn.setAttribute('icon', 'host');
+          btn.textContent = 'Przejdź do Zasobów';
+          btn.addEventListener('click', () => Router.navigate('ml-studio', { admin: 'resources' }));
+          empty.appendChild(btn);
+        }
+        panel.appendChild(empty);
+        return;
+      }
+      const table = document.createElement('tf-table');
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="resource" label="Zasób" renderer="html"></tf-column>
+        <tf-column key="quota" label="Limit"></tf-column>
+        <tf-column key="grantedBy" label="Przydzielił"></tf-column>
+        <tf-column key="createdAt" label="Data"></tf-column>
+      `;
+      table.rows = grants.map((g) => {
+        const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '').toLowerCase();
+        const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
+        const nid = String(g.nodeId ?? g.node_id ?? '');
+        const resLabel = RESOURCE_KIND_LABEL[resourceKind] || resourceKind || '—';
+        const nodeLabel = g.hostname || (nid ? nid.slice(0, 12) : '—');
+        return {
+          resource: `<span class="ml-studio-res-resource-cell">${sprite('host')} ${escapeHtml(nodeLabel)} · <strong>${escapeHtml(resLabel)}</strong>${resourceRef ? ` · ${escapeHtml(resourceRef)}` : ''}</span>`,
+          quota: g.quota ? String(g.quota) : '—',
+          grantedBy: String(g.grantedBy ?? g.granted_by ?? '—'),
+          createdAt: formatDate(g.createdAt ?? g.created_at),
+        };
+      });
+      panel.appendChild(table);
+    })
+    .catch((err) => {
+      panel.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać zasobów projektu');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      panel.appendChild(empty);
+    });
 }
 
 function formatDate(value) {

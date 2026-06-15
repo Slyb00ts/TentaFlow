@@ -522,12 +522,114 @@
   font-weight: 700;
 }
 
+/* =============================================================================
+   Mesh resource allocation (§11.3) — admin resources screen + project section.
+   ============================================================================= */
+
+.ml-studio-res-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: var(--spacing-lg, 20px);
+  margin-bottom: var(--spacing-lg, 20px);
+}
+
+.ml-studio-res-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 16px;
+}
+
+.ml-studio-res-pool {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.ml-studio-res-node {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ml-studio-res-node-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ml-studio-res-node-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ml-studio-res-gpus {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ml-studio-res-gpu {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.ml-studio-res-gpu-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ml-studio-res-gpu-empty {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+.ml-studio-res-node-foot {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-res-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  align-items: end;
+}
+
+.ml-studio-res-subject-cell,
+.ml-studio-res-resource-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 @media (max-width: 720px) {
   .ml-studio-invite-row {
     grid-template-columns: 1fr;
   }
 
   .ml-studio-role-legend {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-res-form {
     grid-template-columns: 1fr;
   }
 }
