@@ -20,9 +20,11 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Pojedyncze źródło logiki serwera żyje w native bundle — Docker kopiuje ten sam
-# plik, żeby nie duplikować implementacji treningu.
-COPY tentaflow-containers/training/python/ml-training/server.py /app/server.py
+# Build context = ten katalog (context_path = training/docker/ml-training), wiec
+# COPY siega tylko lokalnych plikow. server.py to ta sama logika co native bundle
+# (training/python/ml-training/server.py) — identyczna kopia trzymana w obu
+# lokalizacjach, bo build context Dockera nie siega poza swoj katalog.
+COPY server.py /app/server.py
 
 EXPOSE 8200
 
