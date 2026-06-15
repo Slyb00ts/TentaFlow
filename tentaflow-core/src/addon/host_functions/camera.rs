@@ -1481,6 +1481,54 @@ pub fn camera_update_v1(
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
 
+    // Assignment is the authorization gate for the system-triggered camera flow
+    // runner (which dispatches with no user, so per-user ACL does not apply
+    // there). A non-empty `analysis_flow_id` must reference an existing, active
+    // flow; an empty string clears the assignment. `flows` are global (no
+    // org_id column), so there is no per-org flow scope to enforce here.
+    let analysis_flow_id: Option<Option<String>> = match input.analysis_flow_id.as_ref() {
+        None => None,
+        Some(s) if s.is_empty() => Some(None),
+        Some(id) => {
+            match crate::db::repository::get_flow(&db, id) {
+                Ok(Some(flow)) if flow.status == "active" => Some(Some(id.clone())),
+                Ok(Some(_)) => {
+                    audit(
+                        caller.data(),
+                        "camera.update",
+                        Some(&input.camera_id),
+                        RiskClass::A,
+                        "denied",
+                        Some("analysis_flow_not_active"),
+                    );
+                    return AbiError::Operation.as_i32();
+                }
+                Ok(None) => {
+                    audit(
+                        caller.data(),
+                        "camera.update",
+                        Some(&input.camera_id),
+                        RiskClass::A,
+                        "denied",
+                        Some("analysis_flow_not_found"),
+                    );
+                    return AbiError::NotFound.as_i32();
+                }
+                Err(_) => {
+                    audit(
+                        caller.data(),
+                        "camera.update",
+                        Some(&input.camera_id),
+                        RiskClass::A,
+                        "error",
+                        Some("analysis_flow_lookup_failed"),
+                    );
+                    return AbiError::Operation.as_i32();
+                }
+            }
+        }
+    };
+
     match get_camera_for_addon(
         &db,
         &addon_id,
@@ -1534,6 +1582,9 @@ pub fn camera_update_v1(
     if input.profile.is_some() {
         diff.push("profile");
     }
+    if analysis_flow_id.is_some() {
+        diff.push("analysis_flow_id");
+    }
     let patch = CameraPatch {
         display_name: input.display_name.clone(),
         target_fps: input.target_fps.map(|v| v as i64),
@@ -1542,6 +1593,7 @@ pub fn camera_update_v1(
         resolution_height: input.resolution_height.map(|v| Some(v as i64)),
         retention_class: input.retention_class.clone(),
         profile: input.profile.clone(),
+        analysis_flow_id,
     };
 
     if update_camera(

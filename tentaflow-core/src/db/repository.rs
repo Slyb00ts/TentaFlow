@@ -17094,6 +17094,9 @@ pub struct CameraPatch {
     pub resolution_height: Option<Option<i64>>,
     pub retention_class: Option<String>,
     pub profile: Option<String>,
+    /// Per-camera analysis Flow id. Tri-state: `None` = untouched,
+    /// `Some(None)` = clear (NULL), `Some(Some(id))` = assign.
+    pub analysis_flow_id: Option<Option<String>>,
 }
 
 #[cfg(feature = "camera")]
@@ -17484,6 +17487,11 @@ pub fn update_camera(
     }
     if let Some(v) = patch.profile.as_ref() {
         sets.push("profile = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.analysis_flow_id.as_ref() {
+        // Tri-state: `Some(None)` clears (binds NULL), `Some(Some(id))` assigns.
+        sets.push("analysis_flow_id = ?");
         params.push(Box::new(v.clone()));
     }
     sets.push("updated_at = ?");

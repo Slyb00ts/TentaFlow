@@ -119,6 +119,12 @@ pub struct CameraUpdateInput {
     /// `None` leaves the stored value untouched.
     #[n(7)]
     pub analysis_fps: Option<u32>,
+    /// Patch the per-camera analysis Flow id (the cold path runs it on a
+    /// detection event). `None` leaves the assignment untouched; `Some("")`
+    /// clears it (back to the built-in enrichment); `Some(id)` assigns that
+    /// flow. The host validates the flow exists and is active before persisting.
+    #[n(8)]
+    pub analysis_flow_id: Option<String>,
 }
 
 impl CameraUpdateInput {
