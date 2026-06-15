@@ -123,6 +123,22 @@ pub fn apply_core_operation(
 
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+
+    // A synced flow edit/delete/status change must drop the FlowDispatcher's
+    // compiled-flow cache (same guarantee the local save handlers give), else a
+    // remote change is masked by a cached compile until the TTL. Post-commit +
+    // best-effort: `None` before the dispatcher exists just means nothing is
+    // cached. `FlowModelBinding` affects model→flow resolution, so it counts too.
+    if rows > 0
+        && matches!(
+            descriptor.kind,
+            CoreSyncResourceKind::Flow | CoreSyncResourceKind::FlowModelBinding
+        )
+    {
+        if let Some(d) = crate::flow_engine::dispatcher::global_flow_dispatcher() {
+            d.invalidate_cache();
+        }
+    }
     Ok(rows)
 }
 
