@@ -36,6 +36,14 @@ inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode
 # RF-DETR ADR detector (ONNX via `ort`, CPU EP). Gates the whole detector
 # module + the per-camera always-on analysis loop. Build without it = no change.
 inference-vision-gpu = ["dep:ort", "dep:ndarray"]
+# Camera-CV via Burn (replaces ort for vision). `vision-burn` pulls Burn + the
+# vendored models; pick exactly one backend feature per platform (defaults to
+# wgpu/Vulkan when none of cuda/metal/rocm is set).
+vision-burn = ["dep:burn", "dep:burn-store", "burn/std"]
+vision-wgpu = ["vision-burn", "burn/wgpu", "burn/ndarray"]
+vision-cuda = ["vision-burn", "burn/cuda"]
+vision-metal = ["vision-burn", "burn/metal"]
+vision-rocm = ["vision-burn", "burn/rocm"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = []
 rdma-probe = []
@@ -236,6 +244,13 @@ sherpa-rs = { version = "0.6.8", optional = true }
 # Value::from_array(Array3).
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
 ndarray = { version = "0.17", optional = true }
+# Burn — camera-CV inference backend (replaces ort for vision). Architectures
+# are vendored under src/vision/generated/ (build-time ONNX→Burn codegen); the
+# backend is picked per platform via the `vision-*` features. Weights = runtime .bpk.
+# default-features = false drops burn-dataset (pulls rusqlite/libsqlite3-sys that
+# conflicts with our rusqlite). We only need std + nn + a backend (added per vision-*).
+burn = { version = "0.21", default-features = false, optional = true }
+burn-store = { version = "0.21", optional = true }
 rand_distr = { version = "0.6.0", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
