@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
     MetricsSink, PiiRulesStore, ProgressSink, PromptStore, SttDispatcher, TtsCleaningStore,
-    TtsDispatcher,
+    TtsDispatcher, VisionDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
@@ -136,6 +136,7 @@ pub struct ExecutionContext {
     pub embeddings: Arc<dyn EmbeddingsDispatcher>,
     pub stt: Arc<dyn SttDispatcher>,
     pub tts: Arc<dyn TtsDispatcher>,
+    pub vision: Arc<dyn VisionDispatcher>,
     pub prompts: Arc<dyn PromptStore>,
     pub memory: Arc<dyn MemoryStore>,
     pub history: Arc<dyn ConversationHistoryStore>,
@@ -679,6 +680,7 @@ pub mod test_support {
             embeddings: Arc::new(StubEmbeddings),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
+            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),

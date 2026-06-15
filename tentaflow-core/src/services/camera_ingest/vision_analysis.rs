@@ -99,7 +99,7 @@ fn classifier() -> &'static OnceCell<Option<std::sync::Arc<Mutex<StateClassifier
     &CLASSIFIER
 }
 
-async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassifier>>> {
+pub(crate) async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassifier>>> {
     classifier()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match StateClassifier::load() {
@@ -125,7 +125,7 @@ fn ocr() -> &'static OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> {
     &OCR
 }
 
-async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
+pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
     ocr()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match PlateOcr::load() {
