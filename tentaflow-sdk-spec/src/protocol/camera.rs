@@ -201,6 +201,10 @@ pub struct CameraInfoOut {
     pub retention_class: String,
     #[n(12)]
     pub profile: String,
+    /// Per-camera analysis Flow id (empty/absent = none assigned). Lets the UI
+    /// show + preselect the camera's current analysis flow.
+    #[n(13)]
+    pub analysis_flow_id: Option<String>,
 }
 
 /// Output of `camera_list_v1`.
@@ -435,6 +439,7 @@ mod tests {
             last_frame_at: Some(1_700_000_000_000),
             retention_class: "C".into(),
             profile: "default".into(),
+            analysis_flow_id: Some("00000000-0000-4000-8000-000000000020".into()),
         });
     }
 

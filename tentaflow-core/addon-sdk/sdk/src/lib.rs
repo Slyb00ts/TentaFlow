@@ -1855,6 +1855,8 @@ pub struct CameraInfo {
     pub last_frame_at: Option<i64>,
     pub retention_class: String,
     pub profile: String,
+    /// Per-camera analysis Flow id (None/empty = none assigned).
+    pub analysis_flow_id: Option<String>,
 }
 
 impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
@@ -1873,6 +1875,7 @@ impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
             last_frame_at: o.last_frame_at,
             retention_class: o.retention_class,
             profile: o.profile,
+            analysis_flow_id: o.analysis_flow_id,
         }
     }
 }
@@ -2229,6 +2232,7 @@ pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
             last_frame_at: None,
             retention_class: String::new(),
             profile: String::new(),
+            analysis_flow_id: None,
         })
         .collect())
 }
