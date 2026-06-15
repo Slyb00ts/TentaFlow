@@ -130,6 +130,20 @@ impl FlowRequestMeta {
     }
 }
 
+/// Process-global handle to the constructed FlowDispatcher, so non-flow callers
+/// (the camera cold path) can run a camera's assigned analysis flow. Set once by
+/// the router after construction; `None` until then (cold path falls back to the
+/// hardcoded enrichment).
+static GLOBAL_FLOW_DISPATCHER: std::sync::OnceLock<Arc<FlowDispatcher>> =
+    std::sync::OnceLock::new();
+
+pub fn set_global_flow_dispatcher(d: Arc<FlowDispatcher>) {
+    let _ = GLOBAL_FLOW_DISPATCHER.set(d);
+}
+pub fn global_flow_dispatcher() -> Option<Arc<FlowDispatcher>> {
+    GLOBAL_FLOW_DISPATCHER.get().cloned()
+}
+
 pub struct FlowDispatcher {
     db: DbPool,
     cache: FlowCache,
@@ -153,6 +167,12 @@ pub struct FlowDispatcher {
     /// `build_registry`); runner trzyma `Weak<AdapterRegistry>`, więc cykl
     /// registry→adapter→slot→runner→registry jest przerwany.
     subflow_runner: SubflowRunnerSlot,
+    /// Ephemeral in-memory blob layer overlaid in front of the durable store for
+    /// `ctx.blobs`. The camera cold path puts a raw frame here, dispatches the
+    /// analysis flow (whose nodes read it via the composite), then deletes it —
+    /// so per-frame frames never hit disk and a frame delete can never touch a
+    /// durable blob. See [`crate::flow_engine::blob_store::CompositeBlobStore`].
+    frame_blobs: Arc<dyn BlobStore>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -240,24 +260,40 @@ impl FlowDispatcher {
         // auditing every `llm` node in every flow per call. The node id matches
         // the routing layer's gateway (local hostname; the mesh registry isn't
         // populated yet at FlowDispatcher::new).
+        // Ephemeral frame layer for the camera cold path: nodes read frames via
+        // the composite `ctx.blobs`, but durable node-produced blobs still write
+        // to (and GC from) the original persistent store. Built BEFORE the
+        // capability dispatchers so the LLM/TTS/STT dispatchers (which resolve
+        // image/audio BlobRefs straight from the request, e.g. `vision_llm`
+        // feeding a camera frame to a multimodal model) share the same composite
+        // and can therefore see the ephemeral frame, not just durable blobs.
+        let frame_blobs: Arc<dyn BlobStore> =
+            Arc::new(crate::flow_engine::blob_store::EphemeralBlobStore::new());
+        let ctx_blobs: Arc<dyn BlobStore> = Arc::new(
+            crate::flow_engine::blob_store::CompositeBlobStore::new(
+                frame_blobs.clone(),
+                blobs.clone(),
+            ),
+        );
+
         let audit_node_id = crate::mesh::node_info_collector::local_hostname();
         let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(
             runtime_slot.clone(),
-            blobs.clone(),
+            ctx_blobs.clone(),
             Some(db.clone()),
             audit_node_id,
         ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
-            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
+            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(runtime_slot, blobs.clone()));
+            Arc::new(SttDispatcherImpl::new(runtime_slot, ctx_blobs.clone()));
         let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
 
         let ctx_factory = Arc::new(ContextFactory {
             clock,
-            blobs,
+            blobs: ctx_blobs,
             llm,
             embeddings,
             stt,
@@ -295,7 +331,15 @@ impl FlowDispatcher {
             addon_flow_blocks: parking_lot::RwLock::new(None),
             agent_service,
             subflow_runner,
+            frame_blobs,
         }
+    }
+
+    /// Ephemeral frame store for the camera cold path (put/delete a transient RGB
+    /// frame around an analysis-flow dispatch). Distinct from [`Self::blobs`],
+    /// which is the durable store.
+    pub fn frame_blobs(&self) -> Arc<dyn BlobStore> {
+        self.frame_blobs.clone()
     }
 
     pub fn registry(&self) -> &Arc<AdapterRegistry> {

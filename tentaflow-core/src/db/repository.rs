@@ -17424,6 +17424,21 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Per-camera analysis Flow id (the cold path runs it on a detection event).
+/// `None` (NULL or empty) = no flow assigned → default hardcoded enrichment.
+pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT analysis_flow_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(id.filter(|s| !s.is_empty()))
+}
+
 /// Applies a partial update. Returns `Ok(false)` if no row matched
 /// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
 /// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
