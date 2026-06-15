@@ -211,6 +211,26 @@ pub struct CameraListOut {
     pub camera: Vec<CameraInfoOut>,
 }
 
+/// One assignable camera-analysis flow (id + display name), for the per-camera
+/// analysis-flow selector.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraAnalysisFlowOut {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub name: String,
+}
+
+/// Output of `camera_analysis_flows_list_v1` — the active flows assignable as a
+/// camera's analysis flow (scoped to `service_type='camera_analysis'`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraAnalysisFlowsOut {
+    #[n(0)]
+    pub flows: Vec<CameraAnalysisFlowOut>,
+}
+
 /// Output of `camera_snapshot_v1`. `data_b64` is the base64-encoded RGB24
 /// frame buffer.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]

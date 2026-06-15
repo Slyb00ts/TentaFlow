@@ -368,6 +368,7 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_get_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -1894,6 +1895,14 @@ pub struct CameraUpdateSpec {
     pub analysis_flow_id: Option<String>,
 }
 
+/// One assignable camera-analysis flow (id + display name) from
+/// [`camera_analysis_flows`], for populating the per-camera flow selector.
+#[derive(Debug, Clone)]
+pub struct CameraAnalysisFlow {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameraHealthInfo {
     pub camera_id: String,
@@ -2022,6 +2031,21 @@ pub fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
     let bytes = call_host_no_input(camera_list_v1)?;
     let resp: tentaflow_sdk_spec::CameraListOut = decode_cbor(&bytes)?;
     Ok(resp.camera.into_iter().map(CameraInfo::from).collect())
+}
+
+/// Lists the flows assignable as a camera's analysis flow (`(id, name)`), for
+/// the per-camera flow selector. Read-only; needs `cameras.read`.
+pub fn camera_analysis_flows() -> Result<Vec<CameraAnalysisFlow>, AbiError> {
+    let bytes = call_host_no_input(camera_analysis_flows_list_v1)?;
+    let resp: tentaflow_sdk_spec::CameraAnalysisFlowsOut = decode_cbor(&bytes)?;
+    Ok(resp
+        .flows
+        .into_iter()
+        .map(|f| CameraAnalysisFlow {
+            id: f.id,
+            name: f.name,
+        })
+        .collect())
 }
 
 /// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
