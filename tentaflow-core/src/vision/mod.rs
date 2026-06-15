@@ -14,6 +14,7 @@
 //       miedzy requestami.
 // =============================================================================
 
+pub mod camera_cv_models;
 pub mod nms;
 pub mod preprocessing;
 pub mod resize;

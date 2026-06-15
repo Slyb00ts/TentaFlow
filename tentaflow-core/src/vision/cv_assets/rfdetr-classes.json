@@ -1,0 +1,22 @@
+{
+  "classes": [
+    "tablica_adr",
+    "tablica_rejestracyjna",
+    "nalepka_2.1",
+    "nalepka_2.2",
+    "nalepka_2.3",
+    "nalepka_3",
+    "nalepka_4.1",
+    "nalepka_4.2",
+    "nalepka_4.3",
+    "nalepka_5.1",
+    "nalepka_5.2",
+    "nalepka_6.1",
+    "nalepka_8",
+    "nalepka_9",
+    "znak_srodowiskowy",
+    "termometr",
+    "nalepka_nieznana"
+  ],
+  "resolution": 560
+}

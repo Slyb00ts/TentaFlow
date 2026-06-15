@@ -1,0 +1,30 @@
+# =============================================================================
+# Manifest serwisu Plate-OCR — odczyt tablic rejestracyjnych.
+# Embedded native: fast-plate-ocr ONNX (uint8 NHWC) ładowany przez ONNX
+# Runtime (ort). Wagi pobierane deploy-time z release URL; konfiguracja
+# alfabetu/wymiarów wbudowana w binarkę.
+# =============================================================================
+
+[engine]
+id = "plate-ocr"
+category = "vision"
+name = "Plate OCR"
+description_pl = "Odczyt tablic rejestracyjnych (fast-plate-ocr, alfabet 0-9 A-Z, do 9 znaków). Wejście grayscale 70x140, wyjście 9x37."
+description_en = "License plate OCR (fast-plate-ocr, 0-9 A-Z alphabet, up to 9 chars). Grayscale 70x140 input, 9x37 output."
+homepage = "https://github.com/ankandrew/fast-plate-ocr"
+license = "MIT"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "fast-plate-2026"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-vision-gpu"
+
+[[model_preset]]
+id = "plate-ocr-fast"
+display_name = "Plate OCR (fast-plate)"
+repo = "https://models.tentaflow.local/orlen/plate-ocr/v1"
+recommended = true
