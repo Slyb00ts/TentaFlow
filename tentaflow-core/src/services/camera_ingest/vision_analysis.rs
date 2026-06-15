@@ -163,9 +163,13 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
 /// amortized across the batch — the fleet throughput lever.
 const MAX_BATCH: usize = 16;
 
-/// Engine scan granularity. The single engine task wakes this often and runs
-/// every camera whose per-FPS deadline has elapsed.
-const BASE_TICK: Duration = Duration::from_millis(20);
+/// Longest idle nap when no camera is due. The loop normally runs back-to-back
+/// (continuous batching); this only caps how stale the "nothing due" wait can be
+/// (e.g. when the registry is empty) so newly added cameras start promptly.
+const IDLE_POLL_MAX: Duration = Duration::from_millis(20);
+
+/// Shortest idle nap, to avoid busy-spinning when the next deadline is imminent.
+const IDLE_POLL_MIN: Duration = Duration::from_millis(1);
 
 /// How often each camera's `analysis_fps` is re-read from the core DB so an
 /// operator's runtime change applies without restarting anything.
@@ -243,15 +247,20 @@ async fn engine_loop() {
     let ocr = get_ocr().await;
     info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
 
-    let mut ticker = tokio::time::interval(BASE_TICK);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
+    // form the next one from whatever became due while the previous inference ran,
+    // so the GPU stays back-to-back under load instead of idling to a fixed timer.
+    // A fixed tick would cap throughput at MAX_BATCH/tick and waste GPU whenever a
+    // batch finishes faster than the tick — which is exactly what FP16/TensorRT do.
     loop {
-        ticker.tick().await;
         let now = std::time::Instant::now();
 
         // Collect due cameras + which need an FPS re-read (no DB under the lock).
+        // Also track the soonest upcoming deadline so an idle wait sleeps exactly
+        // until the next camera is due, not a fixed interval.
         let mut due: Vec<String> = Vec::new();
         let mut recheck: Vec<String> = Vec::new();
+        let mut earliest_next: Option<std::time::Instant> = None;
         {
             let reg = cameras().lock().unwrap();
             for (id, slot) in reg.iter() {
@@ -260,10 +269,20 @@ async fn engine_loop() {
                     if slot.next_fps_check <= now {
                         recheck.push(id.clone());
                     }
+                } else {
+                    earliest_next = Some(match earliest_next {
+                        Some(e) => e.min(slot.next_due),
+                        None => slot.next_due,
+                    });
                 }
             }
         }
         if due.is_empty() {
+            let wait = earliest_next
+                .map(|t| t.saturating_duration_since(now))
+                .unwrap_or(IDLE_POLL_MAX)
+                .clamp(IDLE_POLL_MIN, IDLE_POLL_MAX);
+            tokio::time::sleep(wait).await;
             continue;
         }
         // Re-read changed FPS values outside the lock.
