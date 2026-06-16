@@ -2619,6 +2619,30 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
 }
 
 // Widok LIVE treningu detekcji + polling (reużywa ftPollTimer/stopFtPolling).
+// Wczytuje plik obrazu i zmniejsza do maxDim (dłuższy bok) na canvasie, zwraca
+// JPEG base64. Detekcja działa w niskiej rozdzielczości, więc nie ma sensu słać
+// pełnego zdjęcia z aparatu (i tak przekroczyłoby limit ramki WS).
+function downscaleImageToB64(file, maxDim) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height || 1));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      resolve({ b64: dataUrl.split(',')[1] || '', mime: 'image/jpeg' });
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('nie można wczytać obrazu')); };
+    img.src = url;
+  });
+}
+
 // Formatuje liczbę bajtów do czytelnej jednostki (B/KB/MB/GB).
 function fmtBytes(n) {
   const b = Number(n) || 0;
@@ -2929,7 +2953,7 @@ function openRecogDetectPanel(p, modelId, modelName) {
   modal.setAttribute('size', 'lg');
   modal.innerHTML = `
     <div slot="body">
-      <p class="ml-studio-export-intro">Wgraj zdjęcie (do ~0,9 MB) — model wykryje obiekty i zwróci klasy + ramki. Większe zdjęcia: zmniejsz przed wgraniem.</p>
+      <p class="ml-studio-export-intro">Wgraj zdjęcie — model wykryje obiekty i zwróci klasy + ramki. Duże zdjęcia są automatycznie zmniejszane (do 1280 px) przed wysłaniem.</p>
       <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
         <tf-file-input id="ml-studio-detect-file" accept="image/*" label="Zdjęcie do detekcji" style="flex:1;min-width:240px"></tf-file-input>
         <tf-input type="number" id="ml-studio-detect-threshold" label="Próg pewności" value="0.5" min="0" max="1" step="0.05" style="width:140px"></tf-input>
@@ -2953,20 +2977,18 @@ function openRecogDetectPanel(p, modelId, modelName) {
     const file = files && files.length ? files[0] : null;
     if (!file) return;
     const result = modal.querySelector('#ml-studio-detect-result');
-    if (file.size > 900 * 1024) {
-      if (result) result.innerHTML = '<div class="ml-studio-ft-done-msg error">Zdjęcie za duże (limit ~0,9 MB). Zmniejsz je i spróbuj ponownie.</div>';
-      return;
-    }
-    if (result) result.innerHTML = '<tf-spinner></tf-spinner> detekcja…';
+    if (result) result.innerHTML = '<tf-spinner></tf-spinner> przygotowanie obrazu…';
     try {
-      const buf = await file.arrayBuffer();
-      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      // Detekcja działa w rozdzielczości ≤640 px, więc zmniejszamy zdjęcie po
+      // stronie klienta (≤1280 px JPEG) — szybciej i nie przekracza limitu ramki WS.
+      const { b64, mime } = await downscaleImageToB64(file, 1280);
+      if (result) result.innerHTML = '<tf-spinner></tf-spinner> detekcja…';
       const threshold = Number(modal.querySelector('#ml-studio-detect-threshold')?.value ?? 0.5);
       const resp = await ApiBinary.one('mlStudioRecogDetectRequest', { modelId, threshold, imageB64: b64 });
       if (resp.error) throw new Error(resp.error);
       let dets = [];
       try { dets = JSON.parse(resp.detectionsJson ?? resp.detections_json ?? '[]'); } catch (_) { dets = []; }
-      renderDetections(result, b64, file.type, dets, resp.width, resp.height);
+      renderDetections(result, b64, mime, dets, resp.width, resp.height);
     } catch (err) {
       if (result) result.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Detekcja nieudana: ${escapeHtml(err.message || String(err))}</div>`;
     }
