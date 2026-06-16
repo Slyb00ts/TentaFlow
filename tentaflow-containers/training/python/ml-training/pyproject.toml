@@ -26,14 +26,12 @@ dependencies = [
 
 # Flash Attention 2 — opcjonalny przyspieszacz uwagi (Ampere+). Serwis używa go
 # automatycznie gdy `flash_attn` jest zaimportowalny, inaczej spada na `sdpa`
-# (wbudowany fused attention PyTorcha). Koło prebuilt pod torch2.4/cu12/cp312;
-# instalacja wymaga --no-build-isolation (torch musi już być w środowisku):
-#   uv pip install --no-build-isolation flash-attn  (lub konkretne koło z releases)
-# Trzymane jako extra, bo budowa ze źródeł jest długa i zależna od toolchainu CUDA.
-[project.optional-dependencies]
-flash = [
-    "flash-attn==2.6.3",
-]
+# (wbudowany fused attention PyTorcha). NIE jest deklarowany jako zależność
+# projektu, bo flash-attn nie deklaruje torcha jako build-dep i `uv sync`
+# próbowałby budować go ze źródeł (długo / wymaga torcha) → wywala cały sync.
+# Instalacja PO `uv sync` (torch już obecny), prebuilt wheel bez build-isolation:
+#   uv pip install --no-build-isolation \
+#     https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 
 # torch z kołami CUDA 12.1 (PyPI domyślnie serwuje wariant CPU). uv bierze torch
 # wyłącznie z tego indeksu, resztę pakietów z PyPI.
