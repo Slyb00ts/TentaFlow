@@ -849,6 +849,41 @@ def _resolve_nproc(req: TrainRequest) -> int:
     return max(1, min(want, avail))
 
 
+def _iface_routing_to(master_addr: str) -> Optional[str]:
+    """Nazwa lokalnego interfejsu, którym węzeł realnie dociera do `master_addr`.
+    Host multi-homed (kilka kart/podsieci) bez tego = NCCL/Gloo próbują WSZYSTKICH
+    interfejsów i wieszają się na tym, który nie widzi mastera. Sztuczka: UDP
+    connect (bez wysyłki pakietów) → IP wyjściowe; potem dopasowanie do interfejsu."""
+    import socket as _socket
+
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            s.connect((master_addr, 9))  # discard port; brak realnej transmisji
+            local_ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:  # noqa: BLE001
+        return None
+    # Mapowanie local_ip → nazwa interfejsu (parsujemy `ip -o -4 addr`).
+    try:
+        out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            # format: "<idx>: <iface> inet <ip>/<prefix> ..."
+            if len(parts) >= 4 and parts[2] == "inet":
+                iface = parts[1]
+                ip = parts[3].split("/")[0]
+                if ip == local_ip:
+                    return iface
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _build_torchrun_cmd(
     req: TrainRequest, spec_path: str, status_path: str, job_id: str, nproc: int
 ) -> list[str]:
@@ -967,6 +1002,14 @@ def train(req: TrainRequest) -> dict[str, Any]:
         cmd = _build_torchrun_cmd(req, spec_path, status_path, job_id, nproc)
         env = dict(os.environ)
         env["TOKENIZERS_PARALLELISM"] = "false"
+        # Multi-node: przypnij NCCL/Gloo do interfejsu, którym REALNIE dosięgamy
+        # mastera. Bez tego host multi-homed (kilka podsieci) wiesza rendezvous/
+        # collective na nieosiągalnej karcie. Nie nadpisujemy, gdy user ustawił ręcznie.
+        if req.dist and req.dist.nnodes > 1 and req.dist.master_addr:
+            iface = _iface_routing_to(req.dist.master_addr)
+            if iface:
+                env.setdefault("NCCL_SOCKET_IFNAME", iface)
+                env.setdefault("GLOO_SOCKET_IFNAME", iface)
         log_fh = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
         with _JOBS_LOCK:
