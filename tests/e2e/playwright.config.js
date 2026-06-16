@@ -28,6 +28,7 @@ module.exports = defineConfig({
     { name: 'tentavision-panel', testMatch: 'tentavision-panel.spec.js' },
     { name: 'tentavision-cameras', testMatch: 'tentavision-cameras.spec.js' },
     { name: 'tentavision-camera-flow', testMatch: 'tentavision-camera-flow.spec.js' },
+    { name: 'tentavision-real-camera', testMatch: 'tentavision-real-camera.spec.js' },
     { name: 'tentavision-dashboard', testMatch: 'tentavision-dashboard.spec.js' },
     { name: 'tentavision-profiles', testMatch: 'tentavision-profiles.spec.js' },
     { name: 'tentavision-alarms', testMatch: 'tentavision-alarms.spec.js' },
