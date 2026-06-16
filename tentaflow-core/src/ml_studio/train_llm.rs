@@ -454,6 +454,106 @@ pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// A-side WORKER multi-rig: A bierze udział w treningu rozproszonym jako rank>0
+/// (node_rank z `dist`). Czyta LOKALNY dataset, POST /train do LOKALNEGO
+/// ml-training z `dist` (rendezvous na master_addr=węzeł rank-0). Model zapisuje
+/// rank-0 (na węźle B) — tu tylko współliczymy gradienty i logujemy. NIE dotyka
+/// rekordu runu (run prowadzi węzeł rank-0 przez ścieżkę zdalnego statusu).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ft_local_worker(
+    run_id: String,
+    owner_user_id: String,
+    dataset_id: String,
+    base_model: String,
+    method: String,
+    objective: String,
+    teacher_model: Option<String>,
+    hyperparams: MlStudioFtHyperparams,
+    dist_json: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = run_local_worker(
+            &owner_user_id,
+            &dataset_id,
+            &base_model,
+            &method,
+            &objective,
+            teacher_model.as_deref(),
+            &hyperparams,
+            &dist_json,
+        )
+        .await
+        {
+            tracing::warn!(run_id = %run_id, error = %e, "multi-rig: lokalny worker (rank>0) padł");
+        } else {
+            tracing::info!(run_id = %run_id, "multi-rig: lokalny worker (rank>0) zakończony");
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_local_worker(
+    owner_user_id: &str,
+    dataset_id: &str,
+    base_model: &str,
+    method: &str,
+    objective: &str,
+    teacher_model: Option<&str>,
+    hyperparams: &MlStudioFtHyperparams,
+    dist_json: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let endpoint = resolve_endpoint()?;
+    let raw = repository::get_dataset_raw(owner_user_id, dataset_id)?;
+    let dataset = repository::get_dataset(owner_user_id, dataset_id)?
+        .ok_or_else(|| anyhow::anyhow!("dataset not found"))?;
+    let records = parse_records(&raw, &dataset.kind)?;
+    if records.is_empty() {
+        anyhow::bail!("dataset produced no usable records");
+    }
+    let (train_data, eval_data) = split_eval(records);
+    let body = json!({
+        "base_model": base_model,
+        "train_data": train_data,
+        "eval_data": eval_data,
+        "method": method,
+        "objective": objective,
+        "teacher_model": teacher_model,
+        "hyperparams": {
+            "epochs": hyperparams.epochs,
+            "lr": hyperparams.learning_rate,
+            "batch_size": hyperparams.batch_size,
+            "grad_accum": hyperparams.grad_accum_steps,
+            "lora_r": hyperparams.lora_r,
+            "lora_alpha": hyperparams.lora_alpha,
+            "lora_dropout": hyperparams.lora_dropout,
+            "max_seq_len": hyperparams.max_seq_len,
+        },
+        "output_dir": format!("ml_studio/worker/{}", dataset_id),
+        "merge_adapter": false,
+        "dist": dist_json,
+    });
+    let base = endpoint.trim_end_matches('/').to_string();
+    let url = format!("{}/train", base);
+    let job_id = tokio::task::spawn_blocking(move || post_train(&url, body)).await??;
+    // Polling do końca — rank>0 nie zapisuje modelu, tylko musi dożyć końca DDP.
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let status_url = format!("{}/status/{}", base, job_id);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("worker timed out");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let u = status_url.clone();
+        let st = tokio::task::spawn_blocking(move || get_status(&u)).await??;
+        match st.status.as_str() {
+            "running" => continue,
+            "succeeded" => return Ok(()),
+            "failed" => anyhow::bail!(st.error.unwrap_or_else(|| "worker failed".into())),
+            other => anyhow::bail!("unknown worker status '{}'", other),
+        }
+    }
+}
+
 /// B-side (odbiorca `MlTrainStatus` dla joba LLM): surowy JSON statusu z serwisu.
 pub async fn mesh_train_status_llm(run_id: &str) -> anyhow::Result<String> {
     let (base, job_id) = mesh_jobs_llm()

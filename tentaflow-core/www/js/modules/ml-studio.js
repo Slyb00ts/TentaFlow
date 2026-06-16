@@ -1990,6 +1990,10 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
       toast('KD wymaga modelu-nauczyciela (repo HF).', 'error');
       return;
     }
+    if (cfg.multiRig && !cfg.targetNodeId) {
+      toast('Multi-rig (rozproszony) wymaga wybrania węzła zdalnego jako master.', 'error');
+      return;
+    }
     const runBtn = byId('ml-studio-ft-run');
     runBtn?.setAttribute('disabled', '');
     try {
@@ -2003,6 +2007,11 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
         mergeAdapter: cfg.method !== 'full' && Boolean(cfg.mergeAdapter),
         targetNodeId: cfg.targetNodeId || undefined,
         numGpus: cfg.numGpus || 0,
+        // Multi-rig: A wypełni masterAddr (LAN-IP węzła zdalnego); UI deklaruje
+        // tylko liczbę węzłów i port rendezvous. nnodes=2 (A + wybrany rig).
+        dist: (cfg.multiRig && cfg.targetNodeId)
+          ? { nnodes: 2, nodeRank: 0, masterAddr: '', masterPort: 29500 }
+          : undefined,
         hyperparams: {
           learningRate: cfg.hyperparams.learningRate,
           batchSize: cfg.hyperparams.batchSize,
