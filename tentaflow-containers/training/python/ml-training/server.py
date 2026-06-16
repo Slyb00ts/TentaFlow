@@ -849,13 +849,15 @@ def _resolve_nproc(req: TrainRequest) -> int:
     return max(1, min(want, avail))
 
 
-def _iface_routing_to(master_addr: str) -> Optional[str]:
-    """Nazwa lokalnego interfejsu, którym węzeł realnie dociera do `master_addr`.
-    Host multi-homed (kilka kart/podsieci) bez tego = NCCL/Gloo próbują WSZYSTKICH
-    interfejsów i wieszają się na tym, który nie widzi mastera. Sztuczka: UDP
-    connect (bez wysyłki pakietów) → IP wyjściowe; potem dopasowanie do interfejsu."""
+def _local_route_to(master_addr: str) -> tuple[Optional[str], Optional[str]]:
+    """(local_ip, iface) którym węzeł REALNIE dociera do `master_addr`. Sztuczka:
+    UDP connect (bez wysyłki) → IP wyjściowe → dopasowanie do interfejsu. Używane:
+    (1) `--local-addr` torchrun, żeby węzeł ogłaszał SWOJE IP, a nie hostname (który
+    może rozwiązywać się na zły/publiczny adres przez DNS); (2) NCCL_SOCKET_IFNAME,
+    bo host multi-homed bez tego wiesza collective na nieosiągalnej karcie."""
     import socket as _socket
 
+    local_ip: Optional[str] = None
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         try:
@@ -864,8 +866,8 @@ def _iface_routing_to(master_addr: str) -> Optional[str]:
         finally:
             s.close()
     except Exception:  # noqa: BLE001
-        return None
-    # Mapowanie local_ip → nazwa interfejsu (parsujemy `ip -o -4 addr`).
+        return (None, None)
+    iface: Optional[str] = None
     try:
         out = subprocess.run(
             ["ip", "-o", "-4", "addr", "show"],
@@ -873,15 +875,12 @@ def _iface_routing_to(master_addr: str) -> Optional[str]:
         ).stdout
         for line in out.splitlines():
             parts = line.split()
-            # format: "<idx>: <iface> inet <ip>/<prefix> ..."
-            if len(parts) >= 4 and parts[2] == "inet":
+            if len(parts) >= 4 and parts[2] == "inet" and parts[3].split("/")[0] == local_ip:
                 iface = parts[1]
-                ip = parts[3].split("/")[0]
-                if ip == local_ip:
-                    return iface
+                break
     except Exception:  # noqa: BLE001
-        return None
-    return None
+        iface = None
+    return (local_ip, iface)
 
 
 def _build_torchrun_cmd(
@@ -908,6 +907,13 @@ def _build_torchrun_cmd(
             "--rdzv-endpoint", f"{d.master_addr}:{d.master_port}",
             "--rdzv-id", rdzv_id,
         ]
+        # --local-addr: węzeł ogłasza SWOJE IP (nie hostname). Bez tego c10d store
+        # rozgłasza hostname (np. "hazai"), który u peera potrafi rozwiązać się na
+        # zły/publiczny adres przez DNS → connect fail. local_ip = IP, którym TEN
+        # węzeł dociera do mastera (dla rank-0 to jego własny master_addr).
+        local_ip, _ = _local_route_to(d.master_addr)
+        if local_ip:
+            cmd += ["--local-addr", local_ip]
     else:
         cmd += ["--standalone", "--nnodes", "1", "--nproc-per-node", str(nproc)]
     cmd += [
@@ -1006,7 +1012,7 @@ def train(req: TrainRequest) -> dict[str, Any]:
         # mastera. Bez tego host multi-homed (kilka podsieci) wiesza rendezvous/
         # collective na nieosiągalnej karcie. Nie nadpisujemy, gdy user ustawił ręcznie.
         if req.dist and req.dist.nnodes > 1 and req.dist.master_addr:
-            iface = _iface_routing_to(req.dist.master_addr)
+            _lip, iface = _local_route_to(req.dist.master_addr)
             if iface:
                 env.setdefault("NCCL_SOCKET_IFNAME", iface)
                 env.setdefault("GLOO_SOCKET_IFNAME", iface)
