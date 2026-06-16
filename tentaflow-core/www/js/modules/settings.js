@@ -397,12 +397,108 @@ function renderStorageTab() {
         </tf-table>
       </div>
     </div>
+
+    ${renderInstallLocationsCard(root)}
+  `;
+}
+
+// Karta konfigurowalnych lokalizacji instalacji (modele AI, kontenery, cache).
+// Klucze settings sa per-wezel — backend waliduje sciezke i stosuje ja na zywo.
+function renderInstallLocationsCard(root) {
+  // Korzen z raportu storage uzywamy do podpowiedzi domyslnych sciezek; gdy go
+  // brak, dajemy generyczny opis "<home>".
+  const base = (root || '').replace(/\/+$/, '') || '<home>';
+  const fields = [
+    {
+      key: 'models_dir',
+      label: 'Katalog modeli AI',
+      placeholder: `domyślnie: ${base}/models`,
+    },
+    {
+      key: 'containers_dir',
+      label: 'Katalog kontenerów / bundli',
+      placeholder: `domyślnie: ${base}/containers`,
+    },
+    {
+      key: 'cache_dir',
+      label: 'Katalog cache (venv, vLLM)',
+      placeholder: `domyślnie: ${base}/cache`,
+    },
+  ];
+
+  const rows = fields.map((f) => `
+    <div class="form-row">
+      <tf-input
+        id="install-${escapeAttr(f.key)}"
+        data-install-key="${escapeAttr(f.key)}"
+        label="${escapeAttr(f.label)}"
+        value="${escapeAttr(getSetting(f.key, ''))}"
+        placeholder="${escapeAttr(f.placeholder)}"
+      ></tf-input>
+    </div>
+  `).join('');
+
+  return `
+    <div class="card" style="margin-top:16px;">
+      <div class="card-header">
+        <h3>Lokalizacje instalacji</h3>
+      </div>
+      <div class="card-body">
+        <p class="form-hint" style="margin:0 0 16px;">
+          Gdzie TentaFlow instaluje modele AI, kontenery/bundle i cache. Zmiana dotyczy
+          NOWYCH pobrań/instalacji — istniejące pliki pozostają w starej lokalizacji.
+          Ustawienie jest per-węzeł (nie synchronizuje się w meshu).
+        </p>
+        ${rows}
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+          ${sprite('info')}
+          <span class="form-hint" style="margin:0;">
+            Wskaż katalog na szybkim/dużym dysku lub współdzielonym NAS. Wymaga uprawnień
+            zapisu — błędna ścieżka zostanie odrzucona.
+          </span>
+        </div>
+        <div style="margin-top:16px;">
+          <tf-button variant="primary" icon="check" id="install-paths-save">Zapisz ścieżki</tf-button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
 function bindStorageTab() {
   byId('storage-refresh')?.addEventListener('click', loadStorageReport);
+  bindInstallLocations();
   renderStoragePathsTable();
+}
+
+// Zapis trzech sciezek instalacji jednym przyciskiem. Backend waliduje kazda
+// sciezke i stosuje ja na zywo, wiec po sukcesie odswiezamy raport (rozmiary
+// i sciezki obszarow moga sie zmienic).
+function bindInstallLocations() {
+  byId('install-paths-save')?.addEventListener('click', async () => {
+    const keys = ['models_dir', 'containers_dir', 'cache_dir'];
+    const values = keys.map((key) => {
+      const value = byId(`install-${key}`)?.value?.trim() || '';
+      return { key, value };
+    });
+
+    // Ostrzezenie klienta: niepusta sciezka powinna byc bezwzgledna (zaczynac
+    // sie od "/"). Pozwalamy zapisac — backend i tak waliduje i moze odrzucic.
+    const relative = values.find((v) => v.value && !v.value.startsWith('/'));
+    if (relative) {
+      toast(`Ścieżka "${relative.value}" nie jest bezwzględna (nie zaczyna się od "/").`, 'warning');
+    }
+
+    try {
+      for (const { key, value } of values) {
+        await saveSettingKey(key, value);
+      }
+      toast('Zapisano lokalizacje instalacji', 'success');
+      await loadStorageReport();
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  });
 }
 
 async function loadStorageReport() {

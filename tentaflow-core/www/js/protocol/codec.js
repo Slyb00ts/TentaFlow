@@ -2495,15 +2495,19 @@ export const encode = {
   /**
    * MessageBody::MlStudioBody(TabularTrainRequest) — train the tabular baseline
    * on a dataset's target column and get a ranked leaderboard back.
-   * payload: { projectId, datasetId, targetColumn, task: 'classification'|'regression' }.
+   * payload: { projectId, datasetId, targetColumn, task: 'classification'|'regression', engine?: 'rust'|'autogluon' }.
    */
   mlStudioTabularTrainRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
+    // engine wybiera silnik treningu (rust domyślny / autogluon przez serwis);
+    // pusty string gdy nie podano — backend potraktuje to jak silnik rust.
+    const engine = payload.engine ?? payload.engine_id ?? '';
     const body = _wasm.encodeMlStudioTabularTrainRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.targetColumn ?? payload.target_column ?? ''),
       String(payload.task ?? 'classification'),
+      engine ? String(engine) : undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -2572,6 +2576,290 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeMlStudioProjectResourcesRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ModelsListRequest) — lista wytrenowanych modeli
+   * projektu (zakładka Modele). payload: { projectId }.
+   */
+  mlStudioModelsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioModelsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(TrainingRunsListRequest) — historia treningów
+   * projektu (zakładka Treningi). payload: { projectId }.
+   */
+  mlStudioTrainingRunsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioTrainingRunsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ProjectGrantsListRequest) — granty zasobów
+   * przydzielone projektowi (member-dostępne). payload: { projectId }.
+   */
+  mlStudioProjectGrantsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioProjectGrantsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(FtTrainStartRequest) — startuje ASYNCHRONICZNY
+   * fine-tuning LLM. Odpowiedź wraca natychmiast z runId; postęp odpytuj przez
+   * mlStudioFtTrainStatusRequest.
+   * payload: { projectId, datasetId, baseModel, method, objective,
+   *            mergeAdapter?, hyperparams: { learningRate, batchSize,
+   *            gradAccumSteps, epochs, loraR, loraAlpha, loraDropout,
+   *            maxSeqLen } }
+   */
+  mlStudioFtTrainStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const hp = payload.hyperparams ?? {};
+    const body = _wasm.encodeMlStudioFtTrainStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.baseModel ?? payload.base_model ?? ''),
+      String(payload.method ?? 'lora'),
+      String(payload.objective ?? 'sft'),
+      (payload.teacherModel ?? payload.teacher_model) || undefined,
+      Number(hp.learningRate ?? hp.learning_rate ?? 2e-4),
+      (hp.batchSize ?? hp.batch_size ?? 1) >>> 0,
+      (hp.gradAccumSteps ?? hp.grad_accum_steps ?? 8) >>> 0,
+      (hp.epochs ?? 3) >>> 0,
+      (hp.loraR ?? hp.lora_r ?? 16) >>> 0,
+      (hp.loraAlpha ?? hp.lora_alpha ?? 32) >>> 0,
+      Number(hp.loraDropout ?? hp.lora_dropout ?? 0.05),
+      (hp.maxSeqLen ?? hp.max_seq_len ?? 1024) >>> 0,
+      Boolean(payload.mergeAdapter ?? payload.merge_adapter ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(FtTrainStatusRequest) — polling postępu
+   * fine-tuningu LLM. Zwraca status + krzywą straty (lossCurve) do wykresu.
+   * payload: { runId }.
+   */
+  mlStudioFtTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioFtTrainStatusRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogTrainStartRequest) — startuje ASYNCHRONICZNY
+   * trening detekcji RF-DETR na datasecie COCO. Odpowiedź natychmiast z runId;
+   * postęp (epoka, loss, mAP@50) odpytuj przez mlStudioRecogTrainStatusRequest.
+   * payload: { projectId, datasetId, variant, hyperparams }.
+   */
+  mlStudioRecogTrainStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const hp = payload.hyperparams ?? {};
+    const body = _wasm.encodeMlStudioRecogTrainStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.variant ?? 'base'),
+      (hp.epochs ?? 50) >>> 0,
+      (hp.batchSize ?? hp.batch_size ?? 4) >>> 0,
+      (hp.gradAccum ?? hp.grad_accum ?? 4) >>> 0,
+      Number(hp.learningRate ?? hp.learning_rate ?? 1e-4),
+      (hp.resolution ?? 560) >>> 0,
+      Boolean(hp.earlyStopping ?? hp.early_stopping ?? true),
+      (payload.targetNodeId ?? payload.target_node_id) || undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogTrainStatusRequest) — polling postępu
+   * treningu detekcji. Zwraca status + krzywą (epoch, train_loss, map50).
+   * payload: { runId }.
+   */
+  mlStudioRecogTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogTrainStatusRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogDetectRequest) — detekcja na obrazie
+   * wytrenowanym modelem recognition. payload: { modelId, threshold, imageB64 }.
+   * Zwraca detectionsJson (lista detekcji) + width/height.
+   */
+  mlStudioRecogDetectRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogDetectRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      Number(payload.threshold ?? 0.5),
+      String(payload.imageB64 ?? payload.image_b64 ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MlStudioBody(RecogImagesListRequest) — lista obrazów datasetu do galerii
+   * anotacji. payload: { datasetId }. Zwraca imagesJson + categoriesJson. */
+  mlStudioRecogImagesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogImagesListRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(RecogImageRequest) — jeden obraz (downscaled b64) + jego bboxy.
+   * payload: { datasetId, imageId }. */
+  mlStudioRecogImageRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogImageRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.imageId ?? payload.image_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(RecogSaveAnnotationsRequest) — zapis bboxów obrazu do COCO.
+   * payload: { datasetId, imageId, annotationsJson }. */
+  mlStudioRecogSaveAnnotationsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogSaveAnnotationsRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.imageId ?? payload.image_id ?? ''),
+      String(payload.annotationsJson ?? payload.annotations_json ?? '[]'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogDatasetRegisterRequest) — rejestruje dataset
+   * COCO przez ŚCIEŻKĘ do katalogu na serwerze (duże zbiory obrazów ponad limit
+   * ramki WS). payload: { projectId, name, path }.
+   */
+  mlStudioRecogDatasetRegisterRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogDatasetRegisterRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.name ?? ''),
+      String(payload.path ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(FtExportRequest) — startuje ASYNCHRONICZNY eksport
+   * wytrenowanego modelu FT do GGUF. Odpowiedź wraca natychmiast ze statusem
+   * 'running'; postęp odpytuj przez mlStudioFtExportStatusRequest.
+   * payload: { modelId, outtype } (outtype: 'f16'|'q8_0').
+   */
+  mlStudioFtExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioFtExportRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      String(payload.outtype ?? 'q8_0'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(FtExportStatusRequest) — polling postępu eksportu
+   * GGUF. Zwraca status + ggufPath + sizeBytes po sukcesie.
+   * payload: { modelId }.
+   */
+  mlStudioFtExportStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioFtExportStatusRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(FtDeployRequest) — DEPLOY wytrenowanego modelu FT
+   * (lokalny GGUF po eksporcie) jako embedded serwisu inferencji llama.cpp.
+   * Domyka cykl FT: trenuj→eksportuj→DEPLOY→używaj. Odpowiedź zawiera modelName
+   * (alias w routingu /v1) + status ('deploying'|'failed').
+   * payload: { modelId }.
+   */
+  mlStudioFtDeployRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioFtDeployRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

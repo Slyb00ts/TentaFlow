@@ -27,7 +27,65 @@
 // =============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
+
+/// Runtime nadpisania lokalizacji instalacji sterowane z Ustawien
+/// (`models_dir`, `containers_dir`, `cache_dir`). `None` = uzyj domyslnej
+/// sciezki pod `tentaflow_home()`. Trzymane jako node-local — te klucze NIE
+/// sa synchronizowane miedzy nodami (rozne dyski na roznych maszynach).
+struct PathOverrides {
+    models: Option<PathBuf>,
+    containers: Option<PathBuf>,
+    cache: Option<PathBuf>,
+}
+
+/// `RwLock::new` i `None` sa const, wiec static inicjalizuje sie bez OnceLock.
+/// Override czytane przy KAZDYM wywolaniu paths (tani read-lock) — celowo nie
+/// cache'owane w OnceLock, zeby zmiana ustawienia dzialala natychmiast.
+static PATH_OVERRIDES: RwLock<PathOverrides> = RwLock::new(PathOverrides {
+    models: None,
+    containers: None,
+    cache: None,
+});
+
+/// Zamienia opcjonalny string ustawienia na sciezke: pusty/bialy → None
+/// (uzyj domyslnej), niepusty → `Some(PathBuf)`.
+fn override_path(value: Option<String>) -> Option<PathBuf> {
+    value.and_then(|v| {
+        if v.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(v))
+        }
+    })
+}
+
+/// Ustawia runtime nadpisania lokalizacji. Wolane przy starcie po wczytaniu
+/// ustawien z bazy oraz na zywo po zapisie ustawienia w `settings_update`.
+pub fn set_path_overrides(
+    models: Option<String>,
+    containers: Option<String>,
+    cache: Option<String>,
+) {
+    let mut guard = PATH_OVERRIDES
+        .write()
+        .expect("PATH_OVERRIDES write lock zatruty");
+    guard.models = override_path(models);
+    guard.containers = override_path(containers);
+    guard.cache = override_path(cache);
+}
+
+/// Getter aktualnych nadpisan (UI / debug).
+pub fn path_overrides() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    let guard = PATH_OVERRIDES
+        .read()
+        .expect("PATH_OVERRIDES read lock zatruty");
+    (
+        guard.models.clone(),
+        guard.containers.clone(),
+        guard.cache.clone(),
+    )
+}
 
 /// Directory where TentaFlow keeps persistent runtime data (SQLite, HMAC
 /// keys, container bundles, model cache). Resolved once at startup and
@@ -191,6 +249,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// get HF_HOME/TORCH_HOME pointed at it. The same Bielik-11B pulled by
 /// Docker vLLM and native vLLM lives as one physical copy here.
 pub fn models_root() -> PathBuf {
+    if let Some(over) = PATH_OVERRIDES
+        .read()
+        .expect("PATH_OVERRIDES read lock zatruty")
+        .models
+        .clone()
+    {
+        return over;
+    }
     tentaflow_home().join("models")
 }
 
@@ -253,9 +319,22 @@ pub fn vllm_cache_dir() -> PathBuf {
 /// strategies resolve manifest `context_path` / `binary_path` /
 /// `bundle_path` against this root.
 pub fn containers_root() -> PathBuf {
-    tentaflow_home()
-        .join("containers")
-        .join("tentaflow-containers")
+    containers_install_root().join("tentaflow-containers")
+}
+
+/// Katalog instalacji kontenerow/bundli. Override `containers_dir` przekierowuje
+/// go na inny dysk; inaczej `tentaflow_home()/containers`. `containers_root()`
+/// (rozpakowany bundle) lezy w jego podkatalogu `tentaflow-containers/`.
+pub fn containers_install_root() -> PathBuf {
+    if let Some(over) = PATH_OVERRIDES
+        .read()
+        .expect("PATH_OVERRIDES read lock zatruty")
+        .containers
+        .clone()
+    {
+        return over;
+    }
+    tentaflow_home().join("containers")
 }
 
 /// Persistent application data (sqlite database, runtime state).
@@ -280,10 +359,27 @@ pub fn legal_root_dir() -> PathBuf {
 /// `TENTAFLOW_CACHE_DIR` so tests / power users can redirect heavy venvs
 /// onto a non-default disk.
 pub fn cache_dir() -> PathBuf {
+    // Priorytet: env (testy / power-userzy) > override z ustawien > domyslna.
     if let Ok(v) = std::env::var("TENTAFLOW_CACHE_DIR") {
         return PathBuf::from(v);
     }
+    if let Some(over) = PATH_OVERRIDES
+        .read()
+        .expect("PATH_OVERRIDES read lock zatruty")
+        .cache
+        .clone()
+    {
+        return over;
+    }
     tentaflow_home().join("cache")
+}
+
+/// Katalog na artefakty treningu ML Studio (adaptery LoRA, scalone modele,
+/// pliki GGUF z eksportu). Serwis `ml-training` dostaje to jako `ARTIFACTS_ROOT`.
+/// Leży pod `cache_dir()` — podąża za override'em (np. `/mnt/d`), więc
+/// wielogigabajtowe artefakty NIE lądują na dysku root przy `tentaflow_home`.
+pub fn ml_artifacts_dir() -> PathBuf {
+    cache_dir().join("ml-training-artifacts")
 }
 
 /// Idempotent: creates `data/`, `models/`, `models/torch/`, `cache/`, and
@@ -294,15 +390,19 @@ pub fn cache_dir() -> PathBuf {
 pub fn ensure_app_dirs() -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     let home = tentaflow_home().to_path_buf();
+    // data/ ZOSTAJE pod tentaflow_home — baza nie wedruje miedzy dyskami.
     std::fs::create_dir_all(home.join("data"))?;
-    std::fs::create_dir_all(home.join("models"))?;
-    std::fs::create_dir_all(home.join("models").join("torch"))?;
-    std::fs::create_dir_all(home.join("models").join("vision"))?;
-    std::fs::create_dir_all(home.join("models").join("audio"))?;
+    // models/, cache/, containers/ respektuja runtime override (nowe lokalizacje
+    // powstaja po ustawieniu modeli_dir/containers_dir/cache_dir).
+    let models = models_root();
+    std::fs::create_dir_all(&models)?;
+    std::fs::create_dir_all(models.join("torch"))?;
+    std::fs::create_dir_all(models.join("vision"))?;
+    std::fs::create_dir_all(models.join("audio"))?;
     std::fs::create_dir_all(cache_dir())?;
     std::fs::create_dir_all(vllm_cache_dir())?;
 
-    let containers_parent = home.join("containers");
+    let containers_parent = containers_install_root();
     std::fs::create_dir_all(&containers_parent)?;
 
     if !crate::deploy::bundle::is_embedded() {
@@ -340,6 +440,11 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Testy ktore czytaja/zapisuja globalny `PATH_OVERRIDES` musza biec
+    /// szeregowo — inaczej override ustawiony przez jeden test wycieka do
+    /// odczytu `models_root()` w innym (rownolegle watki, jeden proces).
+    static OVERRIDE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_override_works() {
         let tmp = tempfile::tempdir().unwrap();
@@ -351,16 +456,34 @@ mod tests {
     }
 
     #[test]
+    fn models_override_redirects_root() {
+        // Globalny RwLock jest wspoldzielony miedzy testami: ustaw override,
+        // sprawdz, a NA KONIEC przywroc None, zeby nie psuc innych testow.
+        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().to_string_lossy().to_string();
+        set_path_overrides(Some(target), None, None);
+        assert_eq!(models_root(), tmp.path());
+        // Pusty string traktowany jak brak override.
+        set_path_overrides(Some("   ".to_string()), None, None);
+        assert_eq!(models_root(), tentaflow_home().join("models"));
+        set_path_overrides(None, None, None);
+        assert_eq!(models_root(), tentaflow_home().join("models"));
+    }
+
+    #[test]
     fn hf_home_equals_models_root() {
         // Critical invariant: HF_HOME must be the shared root, not a
         // subdir — otherwise Docker and native users each get their own
         // HF cache and re-download the same models.
+        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(hf_home(), models_root());
     }
 
     #[test]
     fn torch_home_is_subdir_of_models_root() {
         // torch and HF can't share a root (both claim `hub/`).
+        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         assert!(torch_home().starts_with(models_root()));
         assert!(torch_home() != models_root());
     }

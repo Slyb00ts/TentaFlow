@@ -246,7 +246,13 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         Some(&ctx.state.local_node_id),
     );
 
-    let role = if user.is_admin { "admin" } else { "user" };
+    let role = if user.is_admin || user.role == "admin" {
+        "admin"
+    } else if user.role == "power_user" {
+        "power_user"
+    } else {
+        "user"
+    };
 
     let user_id_bytes = uuid_to_user_id_bytes(&user.id)?;
 
@@ -271,8 +277,10 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
         user_id: user_id_bytes,
         username: user.username,
-        role: if user.is_admin {
+        role: if user.is_admin || user.role == "admin" {
             "admin".into()
+        } else if user.role == "power_user" {
+            "power_user".into()
         } else {
             "user".into()
         },
@@ -1846,6 +1854,30 @@ pub fn settings_update(
         }
     };
 
+    // Konfigurowalne lokalizacje instalacji — node-local, walidowane i
+    // stosowane na zywo po zapisie.
+    const PATH_SETTING_KEYS: [&str; 3] = ["models_dir", "containers_dir", "cache_dir"];
+    let touches_path_settings = payload
+        .entries
+        .iter()
+        .any(|e| PATH_SETTING_KEYS.contains(&e.key.as_str()));
+
+    // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
+    // odrzucamy caly request, zeby nie zapisac nieuzywalnej lokalizacji.
+    for entry in &payload.entries {
+        if PATH_SETTING_KEYS.contains(&entry.key.as_str()) {
+            let trimmed = entry.value.trim();
+            if !trimmed.is_empty() {
+                if let Err(e) = std::fs::create_dir_all(trimmed) {
+                    return Err(ProtocolError::bad_request(format!(
+                        "Nie można utworzyć katalogu '{}' dla ustawienia '{}': {}",
+                        trimmed, entry.key, e
+                    )));
+                }
+            }
+        }
+    }
+
     let mut applied = 0u32;
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     for entry in &payload.entries {
@@ -1871,6 +1903,22 @@ pub fn settings_update(
             Ok(_) => applied += 1,
             Err(e) => tracing::warn!("settings_update '{}' failed: {}", entry.key, e),
         }
+    }
+
+    // Zastosuj nowe lokalizacje na zywo: odczytaj aktualne 3 wartosci z bazy,
+    // ustaw override i utworz nowe katalogi (idempotentne).
+    if touches_path_settings {
+        let models = repository::get_setting(&ctx.state.db, "models_dir")
+            .ok()
+            .flatten();
+        let containers = repository::get_setting(&ctx.state.db, "containers_dir")
+            .ok()
+            .flatten();
+        let cache = repository::get_setting(&ctx.state.db, "cache_dir")
+            .ok()
+            .flatten();
+        crate::paths::set_path_overrides(models, containers, cache);
+        let _ = crate::paths::ensure_app_dirs();
     }
 
     let _ = repository::log_audit(
@@ -7106,6 +7154,23 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             for gid in group_ids {
                 let _ = repository::add_user_to_group(db, gid, &user_id);
             }
+            // Bez wiersza org_memberships sesja binary-WS rozwiazuje sie do
+            // org_context=None i wszystkie sciezki filtrowane po org (ML Studio,
+            // kamery, compliance) odrzucaja requesty tego usera. Rola org mapuje
+            // sie z roli konta. Idempotentne przez PK (org_id, user_id).
+            let org_role = match role.as_str() {
+                "admin" => "role-org-admin",
+                "power_user" => "role-org-operator",
+                _ => "role-org-viewer",
+            };
+            crate::services::org::repo::add_membership(
+                db,
+                crate::services::org::DEFAULT_ORG_ID,
+                &user_id,
+                org_role,
+                "system",
+            )
+            .map_err(|e| iam_err(anyhow::anyhow!("org membership: {}", e)))?;
             P::ResCreateUser { user_id }
         }
         P::ReqUpdateUser {

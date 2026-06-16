@@ -14,8 +14,8 @@ import '/js/components/tf-chip.js';
 import '/js/components/tf-badge.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
-import '/js/components/tf-modal.js';
 import '/js/components/tf-radio.js';
+import '/js/components/tf-modal.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-file-input.js';
@@ -25,6 +25,7 @@ import '/js/components/tf-detail-header.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
+import '/js/components/tf-progress-bar.js';
 
 let projects = [];
 let projectTypes = [];
@@ -36,6 +37,36 @@ let resourceNodes = [];
 // Cached current user (from AuthMeRequest) so the sharing screen can mark the
 // "(Ty)" row and resolve self-identity for owner gating across mount/unmount.
 let currentUser = null;
+
+// Konfiguracja fine-tuningu LLM per projekt (zakładka „Model bazowy"), żeby
+// zakładka „Trening" mogła odczytać wybór modelu/metody/hiperparametrów. Klucz =
+// projectId. Trzymane w pamięci modułu — krótko żyjący wybór kreatora, nie stan
+// backendu (ten powstaje dopiero po starcie treningu jako runId).
+const ftConfig = {};
+
+// Interwał pollingu statusu treningu FT (jeden na raz w widoku). Czyszczony przy
+// każdym przełączeniu zakładki (renderPanel) i przy opuszczeniu ekranu (unmount),
+// żeby żaden timer nie wisiał po wyjściu z widoku LIVE.
+let ftPollTimer = null;
+
+function stopFtPolling() {
+  if (ftPollTimer !== null) {
+    clearInterval(ftPollTimer);
+    ftPollTimer = null;
+  }
+}
+
+// Interwał pollingu statusu eksportu modelu FT do GGUF (jeden modal na raz).
+// Czyszczony przy zamknięciu modala oraz w unmount, żeby żaden timer nie wisiał
+// po wyjściu z widoku — analogicznie do stopFtPolling treningu live.
+let ftExportPollTimer = null;
+
+function stopFtExportPolling() {
+  if (ftExportPollTimer !== null) {
+    clearInterval(ftExportPollTimer);
+    ftExportPollTimer = null;
+  }
+}
 
 // Human label + sprite per project role. Owner is rendered as an accent badge,
 // the rest as info badges / chips (matches p02 legend).
@@ -98,6 +129,27 @@ function statusTone(status) {
   return 'accent';
 }
 
+// Polish label for a backend status slug, shown on the status pill. Unknown
+// values fall back to the raw string so we never hide real backend states.
+const STATUS_LABEL = {
+  active: 'aktywny',
+  ready: 'gotowy',
+  done: 'gotowy',
+  draft: 'szkic',
+  training: 'trening',
+  running: 'w toku',
+  error: 'błąd',
+  failed: 'błąd',
+  archived: 'zarchiwizowany',
+  paused: 'wstrzymany',
+};
+
+function statusLabel(status) {
+  const s = String(status || '').toLowerCase();
+  if (!s) return '—';
+  return STATUS_LABEL[s] || status;
+}
+
 const MlStudioScreen = {
   get title() { return 'ML Studio'; },
 
@@ -110,6 +162,9 @@ const MlStudioScreen = {
     }
     if (params && params.projectId) {
       return `<div id="ml-studio-detail" class="ml-studio-detail"></div>`;
+    }
+    if (params && params.create) {
+      return `<div id="ml-studio-wizard" class="ml-studio-wizard"></div>`;
     }
     return `
       <div class="page-header">
@@ -125,7 +180,7 @@ const MlStudioScreen = {
 
       <tf-filter-chips id="ml-studio-filters" mode="single"></tf-filter-chips>
 
-      <div id="ml-studio-list" class="ml-studio-grid"></div>
+      <div id="ml-studio-list" class="ml-studio-list"></div>
     `;
   },
 
@@ -142,8 +197,12 @@ const MlStudioScreen = {
       await showDetail(params.projectId);
       return;
     }
+    if (params && params.create) {
+      await showCreateWizard();
+      return;
+    }
     byId('ml-studio-refresh')?.addEventListener('click', loadAll);
-    byId('ml-studio-new')?.addEventListener('click', openCreateModal);
+    byId('ml-studio-new')?.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
 
     const filters = byId('ml-studio-filters');
     filters?.addEventListener('change', (e) => {
@@ -158,6 +217,8 @@ const MlStudioScreen = {
     // projectTypes is the backend type catalogue (slug → label) and is cached
     // across mount/unmount so the detail view keeps real type labels instead of
     // falling back to the raw slug when entered directly via the router.
+    stopFtPolling();
+    stopFtExportPolling();
     projects = [];
     activeTypeFilter = 'all';
     detailProjectId = null;
@@ -236,6 +297,20 @@ function projectId(p) {
   return p.projectId ?? p.project_id ?? '';
 }
 
+// Inicjały do awatara member-chip. Działa dla nazwy wyświetlanej z wielu słów
+// ("Anna Kowalska" → "AK") oraz dla identyfikatorów/tokenów typu "user-1a2b".
+// Bierzemy pierwsze litery maks. dwóch pierwszych słów, a dla jednego słowa
+// (lub UUID bez separatorów) dwa pierwsze znaki.
+function initialsFromId(id) {
+  const s = String(id || '').trim();
+  if (!s) return '?';
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
+  const parts = s.split(/[-_]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return s.slice(0, 2).toUpperCase();
+}
+
 // Ownership flag straight from the backend (ProjectsListResponse / detail carry
 // `isOwner`). Falls back to comparing the project `role` to "owner" when the
 // flag is absent so the split still works against older payloads.
@@ -259,8 +334,35 @@ async function ensureCurrentUser() {
   return currentUser;
 }
 
+// authMe niesie userId jako 16 SUROWYCH BAJTÓW, a członkowie projektu mają
+// user_id jako kanoniczny string UUID — bez konwersji porównanie uid === selfId
+// nigdy by nie pasowało, więc tu zamieniamy bajty na kanoniczny UUID.
+function uuidFromBytes(bytes) {
+  const hex = Array.from(bytes, (b) => (b & 0xff).toString(16).padStart(2, '0'));
+  return [
+    hex.slice(0, 4).join(''),
+    hex.slice(4, 6).join(''),
+    hex.slice(6, 8).join(''),
+    hex.slice(8, 10).join(''),
+    hex.slice(10, 16).join(''),
+  ].join('-');
+}
+
 function currentUserId() {
-  return currentUser ? String(currentUser.userId ?? currentUser.user_id ?? '') : '';
+  if (!currentUser) return '';
+  const raw = currentUser.userId ?? currentUser.user_id ?? '';
+  if (raw == null) return '';
+  if (typeof raw === 'string') return raw.trim();
+  let bytes = null;
+  if (raw instanceof Uint8Array) {
+    bytes = raw;
+  } else if (raw instanceof ArrayBuffer) {
+    bytes = new Uint8Array(raw);
+  } else if (Array.isArray(raw)) {
+    bytes = raw;
+  }
+  if (bytes && bytes.length === 16) return uuidFromBytes(bytes);
+  return String(raw);
 }
 
 // Admin gating mirrors app.js: role comes from AuthMeRequest, admin === 'admin'.
@@ -303,7 +405,7 @@ function renderList() {
     btn.setAttribute('variant', 'primary');
     btn.setAttribute('icon', 'plus');
     btn.textContent = 'Nowy projekt';
-    btn.addEventListener('click', openCreateModal);
+    btn.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
     empty.appendChild(btn);
     host.appendChild(empty);
     return;
@@ -337,7 +439,7 @@ function renderList() {
       Router.navigate('ml-studio', { projectId: el.dataset.projectId });
     });
   });
-  host.querySelector('[data-new-project]')?.addEventListener('click', openCreateModal);
+  host.querySelector('[data-new-project]')?.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
 }
 
 function sectionHead(icon, title, count, tone, sub) {
@@ -355,8 +457,8 @@ function projectCard(p, owned) {
   const slug = projectType(p);
   const datasetCount = p.datasetCount ?? p.dataset_count ?? 0;
   const modelCount = p.modelCount ?? p.model_count ?? 0;
-  const created = formatDate(p.createdAt ?? p.created_at);
-  const updated = formatDate(p.updatedAt ?? p.updated_at);
+  const trainingCount = p.trainingCount ?? p.training_count ?? 0;
+  const updated = formatRelative(p.updatedAt ?? p.updated_at);
 
   // Owner strip: "Właściciel: Ty" with a share action for my projects; the
   // guest role chip (Edytor/Przeglądający) for shared-with-me projects.
@@ -380,17 +482,17 @@ function projectCard(p, owned) {
           <div class="ml-studio-card-name">${escapeHtml(p.name || '(bez nazwy)')}</div>
           <div class="ml-studio-card-type">${escapeHtml(typeLabel(slug))}</div>
         </div>
-        <tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(p.status || '—')}"></tf-badge>
+        <tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(statusLabel(p.status))}"></tf-badge>
       </div>
       ${ownerStrip}
       <p class="ml-studio-card-desc">${escapeHtml(p.description || 'Bez opisu.')}</p>
       <div class="ml-studio-card-stats">
         <div class="ml-studio-stat"><div class="v">${datasetCount}</div><div class="l">datasety</div></div>
         <div class="ml-studio-stat"><div class="v">${modelCount}</div><div class="l">modele</div></div>
+        <div class="ml-studio-stat"><div class="v">${trainingCount}</div><div class="l">treningi</div></div>
       </div>
       <div class="ml-studio-card-foot">
-        <span class="ml-studio-card-meta">${sprite('clock')} utworzony ${escapeHtml(created)}</span>
-        <span class="ml-studio-card-meta">edytowany ${escapeHtml(updated)}</span>
+        <span class="ml-studio-card-meta">${sprite('clock')} edytowany ${escapeHtml(updated)}</span>
       </div>
     </article>
   `;
@@ -408,99 +510,301 @@ function newProjectCard() {
   `;
 }
 
-function openCreateModal() {
+// =============================================================================
+// Kreator projektu (p01) — 4-krokowy wizard: nazwa/opis → typ → dane → podsumowanie.
+// Typ projektu determinuje dalsze kroki WEWNĄTRZ projektu (TYPE_TABS), więc krok 2
+// pokazuje edukacyjną mapę "co dalej". Stan żyje lokalnie w domknięciu, dzięki czemu
+// re-render kroku zachowuje wpisane wartości.
+// =============================================================================
+
+// Typy fine-tuningowe wybierają model bazowy/nauczyciela dopiero w samym projekcie,
+// nie w kreatorze — krok 4 dodaje dla nich osobną notkę zamiast udawać wybór modelu.
+const FT_TYPES = new Set(['ft_llm', 'ft_vision_audio', 'distillation']);
+
+async function showCreateWizard() {
+  const host = byId('ml-studio-wizard');
+  if (!host) return;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+
+  await ensureProjectTypes();
   if (!projectTypes.length) {
-    toast('Lista typów projektów niedostępna — odśwież.', 'error');
+    host.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'alert');
+    empty.setAttribute('title', 'Lista typów projektów niedostępna');
+    empty.setAttribute('message', 'Nie udało się pobrać typów projektów z Core — wróć do listy i odśwież.');
+    const back = document.createElement('tf-button');
+    back.setAttribute('variant', 'primary');
+    back.textContent = 'Wróć do projektów';
+    back.addEventListener('click', () => Router.navigate('ml-studio'));
+    empty.appendChild(back);
+    host.appendChild(empty);
     return;
   }
-  const existing = byId('ml-studio-create-modal');
-  if (existing) existing.remove();
 
-  const modal = document.createElement('tf-modal');
-  modal.id = 'ml-studio-create-modal';
-  modal.setAttribute('title', 'Nowy projekt');
-  modal.setAttribute('subtitle', 'Typ projektu określa dalsze kroki i całe „wnętrze” projektu.');
-  modal.setAttribute('size', 'lg');
+  const state = {
+    step: 1,
+    name: '',
+    description: '',
+    type: projectTypes[0].slug,
+    file: null,
+  };
 
-  const body = document.createElement('div');
-  body.setAttribute('slot', 'body');
-  body.innerHTML = `
-    <div class="ml-studio-form">
-      <tf-input id="ml-studio-name" label="Nazwa projektu" placeholder="np. Rozpoznawanie znaków ADR" required></tf-input>
-      <tf-textarea id="ml-studio-desc" label="Opis" rows="3" placeholder="Krótko: cel projektu i dane wejściowe."></tf-textarea>
-      <div class="ml-studio-type-field">
-        <tf-radio-group
-          id="ml-studio-types"
-          name="ml-studio-type"
-          label="Typ projektu"
-          cards
-          value="${escapeAttr(projectTypes[0].slug)}">
-          ${projectTypes.map((t) => `
-            <tf-radio card value="${escapeAttr(t.slug)}">
-              <span class="tf-radio-card-group__icon">${sprite(typeIcon(t.slug))}</span>
-              <span class="tf-radio-card-group__body">
-                <span class="tf-radio-card-group__title">${escapeHtml(t.label)}</span>
-                <span class="tf-radio-card-group__description">${escapeHtml(t.description)}</span>
-              </span>
-            </tf-radio>
-          `).join('')}
-        </tf-radio-group>
+  const STEP_META = [
+    { label: 'Nazwa i opis', desc: 'Krok 1' },
+    { label: 'Typ projektu', desc: 'Krok 2' },
+    { label: 'Dane i źródła', desc: 'Krok 3' },
+    { label: 'Schemat / model', desc: 'Krok 4' },
+  ];
+
+  host.innerHTML = `
+    <div class="ml-studio-detail-top">
+      <div class="ml-studio-breadcrumb">
+        <span class="ml-studio-crumb">ML Studio</span>
+        ${sprite('chevron-right')}
+        <span class="ml-studio-crumb current">Nowy projekt</span>
       </div>
     </div>
+
+    <section class="ml-studio-wizard-card">
+      <div id="ml-studio-stepper" class="ml-studio-stepper"></div>
+      <div id="ml-studio-wizard-body" class="ml-studio-wizard-body"></div>
+      <div id="ml-studio-wizard-actions" class="ml-studio-wizard-actions"></div>
+    </section>
   `;
 
-  const footer = document.createElement('div');
-  footer.setAttribute('slot', 'footer');
-  const cancel = document.createElement('tf-button');
-  cancel.setAttribute('variant', 'ghost');
-  cancel.textContent = 'Anuluj';
-  const submit = document.createElement('tf-button');
-  submit.setAttribute('variant', 'primary');
-  submit.setAttribute('icon', 'check');
-  submit.textContent = 'Utwórz projekt';
-  footer.append(cancel, submit);
+  const stepperEl = byId('ml-studio-stepper');
+  const bodyEl = byId('ml-studio-wizard-body');
+  const actionsEl = byId('ml-studio-wizard-actions');
 
-  modal.append(body, footer);
-  document.body.appendChild(modal);
-  modal.open = true;
+  // Plan kroków wewnątrz projektu dla wybranego typu — używany i w mapie "co dalej"
+  // (krok 2), i w podsumowaniu (krok 4). To realny TYPE_TABS, nie wymyślona lista.
+  function typePlan(slug) {
+    return TYPE_TABS[slug] || ['Dane', 'Trening', 'Modele'];
+  }
 
-  let selectedType = projectTypes[0].slug;
+  function planFlowHtml(slug) {
+    return typePlan(slug)
+      .map((s) => `<span class="ml-studio-ns-pill">${escapeHtml(s)}</span>`)
+      .join(`<span class="ml-studio-ns-arrow">${sprite('chevron-right')}</span>`);
+  }
 
-  // tf-radio-group emits `change` with detail.value (tf-radio.js:162-165).
-  const typeGroup = body.querySelector('#ml-studio-types');
-  typeGroup?.addEventListener('change', (e) => {
-    selectedType = e.detail?.value || selectedType;
-  });
+  function renderStepper() {
+    stepperEl.innerHTML = STEP_META.map((m, i) => {
+      const n = i + 1;
+      const stateClass = n < state.step ? 'ml-studio-step--done'
+        : n === state.step ? 'ml-studio-step--active' : '';
+      const numInner = n < state.step ? sprite('check') : String(n);
+      const lineClass = n < state.step ? 'ml-studio-s-line--done' : '';
+      const line = i < STEP_META.length - 1
+        ? `<div class="ml-studio-s-line ${lineClass}"></div>` : '';
+      return `
+        <div class="ml-studio-step ${stateClass}">
+          <div class="ml-studio-step-num">${numInner}</div>
+          <div class="ml-studio-step-meta">
+            <div class="ml-studio-s-label">${escapeHtml(m.label)}</div>
+            <div class="ml-studio-s-desc">${escapeHtml(m.desc)}</div>
+          </div>
+        </div>
+        ${line}
+      `;
+    }).join('');
+  }
 
-  const close = () => { modal.open = false; modal.remove(); };
-  cancel.addEventListener('click', close);
-  modal.addEventListener('close', () => modal.remove());
+  // Krok 2 — panel "co dalej" pod kafelkami: aktualizuje się przy zmianie typu.
+  function renderNextSteps() {
+    const panel = byId('ml-studio-wiz-nextsteps');
+    if (!panel) return;
+    const lbl = typeLabel(state.type);
+    panel.innerHTML = `
+      <div class="ml-studio-ns-title">${sprite('info')} Co dalej dla typu „${escapeHtml(lbl)}”</div>
+      <div class="ml-studio-ns-flow">${planFlowHtml(state.type)}</div>
+      <p class="ml-studio-ns-note">Wybrany typ determinuje kolejne kroki wewnątrz projektu — inny typ prowadzi do innej ścieżki pracy.</p>
+    `;
+  }
 
-  submit.addEventListener('click', async () => {
-    const name = byId('ml-studio-name')?.value?.trim() || '';
-    const description = byId('ml-studio-desc')?.value?.trim() || '';
-    if (!name) {
+  function renderStep() {
+    if (state.step === 1) {
+      bodyEl.innerHTML = `
+        <div class="ml-studio-form">
+          <tf-input id="ml-studio-wiz-name" label="Nazwa projektu" required
+            placeholder="np. Rozpoznawanie znaków ADR" value="${escapeAttr(state.name)}"></tf-input>
+          <tf-textarea id="ml-studio-wiz-desc" label="Opis" rows="3"
+            placeholder="Krótko: cel projektu i dane wejściowe." value="${escapeAttr(state.description)}"></tf-textarea>
+        </div>
+      `;
+      byId('ml-studio-wiz-name')?.addEventListener('input', (e) => { state.name = e.target.value; });
+      byId('ml-studio-wiz-desc')?.addEventListener('input', (e) => { state.description = e.target.value; });
+      return;
+    }
+
+    if (state.step === 2) {
+      bodyEl.innerHTML = `
+        <div class="ml-studio-type-field">
+          <tf-radio-group id="ml-studio-wiz-types" name="ml-studio-wiz-type" cards
+            value="${escapeAttr(state.type)}">
+            ${projectTypes.map((t) => `
+              <tf-radio card value="${escapeAttr(t.slug)}">
+                <span class="tf-radio-card-group__icon">${sprite(typeIcon(t.slug))}</span>
+                <span class="tf-radio-card-group__body">
+                  <span class="tf-radio-card-group__title">${escapeHtml(t.label)}</span>
+                  <span class="tf-radio-card-group__description">${escapeHtml(t.description)}</span>
+                </span>
+              </tf-radio>
+            `).join('')}
+          </tf-radio-group>
+        </div>
+        <div id="ml-studio-wiz-nextsteps" class="ml-studio-next-steps"></div>
+      `;
+      // tf-radio-group emituje `change` z detail.value (tf-radio.js).
+      byId('ml-studio-wiz-types')?.addEventListener('change', (e) => {
+        state.type = e.detail?.value || state.type;
+        renderNextSteps();
+      });
+      renderNextSteps();
+      return;
+    }
+
+    if (state.step === 3) {
+      const hasFile = !!state.file;
+      bodyEl.innerHTML = `
+        <div class="ml-studio-wiz-data">
+          <tf-file-input id="ml-studio-wiz-file" accept=".csv,.xlsx"
+            label="Przeciągnij plik lub kliknij"></tf-file-input>
+          <div id="ml-studio-wiz-file-info" class="ml-studio-wiz-file-info" ${hasFile ? '' : 'hidden'}></div>
+          <div class="ml-studio-wiz-sources">
+            <tf-chip status="ok" icon="check" label="CSV"></tf-chip>
+            <tf-chip status="ok" icon="check" label="XLSX"></tf-chip>
+            <tf-chip status="info" label="Baza danych · wkrótce" class="ml-studio-wiz-source-soon"></tf-chip>
+            <tf-chip status="info" label="API · wkrótce" class="ml-studio-wiz-source-soon"></tf-chip>
+          </div>
+          <p class="ml-studio-wiz-hint">${sprite('info')} Dane możesz też dodać później w zakładce Dane — ten krok jest opcjonalny.</p>
+        </div>
+      `;
+      const fileInfo = byId('ml-studio-wiz-file-info');
+      const renderFileInfo = () => {
+        if (!state.file) { fileInfo.hidden = true; fileInfo.innerHTML = ''; return; }
+        fileInfo.hidden = false;
+        fileInfo.innerHTML = `
+          <span class="ml-studio-wiz-file-name">${sprite('database')} ${escapeHtml(state.file.name)}</span>
+          <span class="ml-studio-wiz-file-size">${formatFileSize(state.file.size)}</span>
+          <tf-button variant="ghost" size="sm" icon="trash" id="ml-studio-wiz-file-remove">Usuń</tf-button>
+        `;
+        byId('ml-studio-wiz-file-remove')?.addEventListener('click', () => {
+          state.file = null;
+          renderFileInfo();
+        });
+      };
+      // tf-file-input emituje `change` z detail.files (FileList) — tf-file-input.js.
+      byId('ml-studio-wiz-file')?.addEventListener('change', (e) => {
+        const files = e.detail?.files;
+        state.file = files && files.length ? files[0] : null;
+        renderFileInfo();
+      });
+      renderFileInfo();
+      return;
+    }
+
+    // Krok 4 — podsumowanie. Zero fałszywych kontrolek: schemat kolumn wykrywa się
+    // dopiero z pliku po utworzeniu projektu (zakładka Dane), więc piszemy to wprost.
+    const dataStatus = state.file
+      ? `plik „${escapeHtml(state.file.name)}” (${formatFileSize(state.file.size)}) zostanie wgrany i sprofilowany po utworzeniu projektu`
+      : 'dane dodasz później w zakładce Dane';
+    const ftNote = FT_TYPES.has(state.type)
+      ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} Model bazowy${state.type === 'distillation' ? ' / nauczyciela' : ''} wybierzesz już w projekcie — w zakładce „${state.type === 'distillation' ? 'Nauczyciel' : 'Model bazowy'}”.</div>`
+      : '';
+    bodyEl.innerHTML = `
+      <div class="ml-studio-wiz-summary">
+        <div class="ml-studio-wiz-summary-title">${sprite('check')} Co otrzymasz</div>
+        <dl class="ml-studio-wiz-summary-list">
+          <dt>Nazwa projektu</dt>
+          <dd>${escapeHtml(state.name || '—')}</dd>
+          <dt>Typ projektu</dt>
+          <dd><tf-badge tone="accent" value="${escapeAttr(typeLabel(state.type))}"></tf-badge></dd>
+          <dt>Plan kroków</dt>
+          <dd><div class="ml-studio-ns-flow">${planFlowHtml(state.type)}</div></dd>
+          <dt>Dane</dt>
+          <dd>${dataStatus}</dd>
+        </dl>
+        ${ftNote}
+        <p class="ml-studio-wiz-hint">${sprite('info')} Schemat kolumn jest wykrywany z pliku po utworzeniu projektu (w zakładce Dane) — nic nie jest predefiniowane na tym etapie.</p>
+      </div>
+    `;
+  }
+
+  function renderActions() {
+    const isFirst = state.step === 1;
+    const isLast = state.step === 4;
+    actionsEl.innerHTML = `
+      <tf-button variant="ghost" id="ml-studio-wiz-cancel">Anuluj</tf-button>
+      <div class="ml-studio-wiz-actions-right">
+        <tf-button variant="ghost" icon="chevron-left" id="ml-studio-wiz-back" ${isFirst ? 'disabled' : ''}>Wstecz</tf-button>
+        ${isLast
+          ? `<tf-button variant="primary" icon="check" id="ml-studio-wiz-create">Utwórz projekt</tf-button>`
+          : `<tf-button variant="primary" trailing-icon="chevron-right" id="ml-studio-wiz-next">Dalej</tf-button>`}
+      </div>
+    `;
+    byId('ml-studio-wiz-cancel')?.addEventListener('click', () => Router.navigate('ml-studio'));
+    byId('ml-studio-wiz-back')?.addEventListener('click', () => {
+      if (state.step > 1) { state.step -= 1; renderAll(); }
+    });
+    byId('ml-studio-wiz-next')?.addEventListener('click', () => {
+      if (state.step === 1 && !state.name.trim()) {
+        toast('Podaj nazwę projektu.', 'error');
+        return;
+      }
+      state.step += 1;
+      renderAll();
+    });
+    byId('ml-studio-wiz-create')?.addEventListener('click', createFromWizard);
+  }
+
+  async function createFromWizard() {
+    const createBtn = byId('ml-studio-wiz-create');
+    if (!state.name.trim()) {
+      state.step = 1;
+      renderAll();
       toast('Podaj nazwę projektu.', 'error');
       return;
     }
-    submit.setAttribute('loading', '');
+    createBtn?.setAttribute('loading', '');
+    createBtn?.setAttribute('disabled', '');
     try {
       const resp = await ApiBinary.one('mlStudioProjectCreateRequest', {
-        name,
-        description,
-        projectType: selectedType,
+        name: state.name.trim(),
+        description: state.description.trim(),
+        projectType: state.type,
       });
       const created = resp.project || {};
-      toast('Projekt utworzony', 'success');
-      close();
-      await loadAll();
       const newId = created.projectId ?? created.project_id;
+      if (state.file && newId) {
+        await uploadDataset(newId, state.file);
+      }
+      toast('Projekt utworzony', 'success');
       if (newId) Router.navigate('ml-studio', { projectId: newId });
+      else Router.navigate('ml-studio');
     } catch (err) {
-      submit.removeAttribute('loading');
+      createBtn?.removeAttribute('loading');
+      createBtn?.removeAttribute('disabled');
       toast(`Tworzenie projektu: ${err.message}`, 'error');
     }
-  });
+  }
+
+  function renderAll() {
+    renderStepper();
+    renderStep();
+    renderActions();
+  }
+
+  renderAll();
+}
+
+function formatFileSize(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toLocaleString('pl-PL', { maximumFractionDigits: 1 })} MB`;
+  if (n >= 1024) return `${(n / 1024).toLocaleString('pl-PL', { maximumFractionDigits: 1 })} KB`;
+  return `${formatNumber(n)} B`;
 }
 
 async function showDetail(projectId) {
@@ -535,12 +839,10 @@ async function showDetail(projectId) {
 
 function renderDetail(host, p) {
   const slug = p.projectType ?? p.project_type ?? '';
-  const modelCount = p.modelCount ?? p.model_count ?? 0;
-  const created = formatDate(p.createdAt ?? p.created_at);
-  const updated = formatDate(p.updatedAt ?? p.updated_at);
-  // Every project type gets a "Zasoby" tab (§11.3) appended after its type-aware
-  // tabs — it shows the mesh resources allocated to this project.
-  const tabs = [...(TYPE_TABS[slug] || ['Przegląd', 'Dane', 'Treningi', 'Modele']), 'Zasoby'];
+  // "Przegląd" jest zawsze pierwszą zakładką (stan projektu na jednym ekranie),
+  // a "Zasoby" zawsze ostatnią (§11.3 — zasoby mesh przydzielone projektowi).
+  // Żaden wpis TYPE_TABS nie zawiera "Przegląd", więc bez duplikatów.
+  const tabs = ['Przegląd', ...(TYPE_TABS[slug] || ['Dane', 'Treningi', 'Modele']), 'Zasoby'];
 
   host.innerHTML = `
     <div class="ml-studio-detail-top">
@@ -551,18 +853,11 @@ function renderDetail(host, p) {
       title="${escapeAttr(p.name || '(bez nazwy)')}"
       subtitle="${escapeAttr(typeLabel(slug))}"
       icon="${escapeAttr(typeIcon(slug))}">
-      <span slot="badges"><tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(p.status || '—')}"></tf-badge></span>
+      <span slot="badges"><tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(statusLabel(p.status))}"></tf-badge></span>
       ${isOwnerProject(p) ? `<span slot="actions"><tf-button variant="outline" icon="share" id="ml-studio-manage-access">Zarządzaj dostępem</tf-button></span>` : ''}
     </tf-detail-header>
 
     <p class="ml-studio-detail-desc">${escapeHtml(p.description || 'Bez opisu.')}</p>
-
-    <div class="ml-studio-detail-stats">
-      <tf-stat-card label="Modele" value="${modelCount}" icon="brain"></tf-stat-card>
-      <tf-stat-card label="Status" value="${escapeAttr(p.status || '—')}" icon="check"></tf-stat-card>
-      <tf-stat-card label="Utworzony" value="${escapeAttr(created)}" icon="clock"></tf-stat-card>
-      <tf-stat-card label="Edytowany" value="${escapeAttr(updated)}" icon="clock"></tf-stat-card>
-    </div>
 
     <tf-tabs id="ml-studio-tabs" value="ml-tab-0">
       ${tabs.map((t, i) => `<tf-tab id="ml-tab-${i}" label="${escapeAttr(t)}"></tf-tab>`).join('')}
@@ -577,17 +872,64 @@ function renderDetail(host, p) {
   });
 
   const tabsEl = byId('ml-studio-tabs');
+  // Pozwala skrótom z zakładki "Przegląd" przełączać aktywną zakładkę:
+  // tf-tabs przyjmuje value="ml-tab-N" i sam wyemituje `change`, ale tutaj
+  // wołamy renderPanel wprost, bo ustawienie value nie zawsze re-emituje event.
+  const selectTab = (label) => {
+    const i = tabs.indexOf(label);
+    if (i >= 0) {
+      const el = byId('ml-studio-tabs');
+      if (el) el.value = 'ml-tab-' + i;
+      renderPanel('ml-tab-' + i);
+    }
+  };
   const renderPanel = (tabId) => {
     const panel = byId('ml-studio-tab-panel');
     if (!panel) return;
+    // Każde przełączenie zakładki zatrzymuje polling treningu FT oraz eksportu
+    // GGUF — żaden interwał nie przeżywa wyjścia z zakładki.
+    stopFtPolling();
+    stopFtExportPolling();
     const idx = Number(String(tabId ?? '').replace('ml-tab-', ''));
     const label = tabs[Number.isNaN(idx) ? 0 : idx] || tabs[0];
+    if (label === 'Przegląd') {
+      renderOverviewTab(panel, p, { tabs, selectTab });
+      return;
+    }
+    if (label === 'Model bazowy' && slug === 'ft_llm') {
+      renderFtModelTab(panel, p);
+      return;
+    }
+    if (label === 'Schemat' && slug === 'recognition') {
+      renderRecogTrainTab(panel, p, { selectTab });
+      return;
+    }
+    if (label === 'Dane' && slug === 'recognition') {
+      renderRecogDataTab(panel, p);
+      return;
+    }
+    if (label === 'Anotacje' && slug === 'recognition') {
+      renderRecogAnnotateTab(panel, p);
+      return;
+    }
     if (label === 'Dane') {
       renderDataTab(panel, projectId(p));
       return;
     }
+    if (label === 'Trening' && slug === 'ft_llm') {
+      renderFtTrainTab(panel, p, { selectTab });
+      return;
+    }
     if (label === 'Trenuj') {
       renderTrainTab(panel, projectId(p));
+      return;
+    }
+    if (label === 'Modele') {
+      renderModelsTab(panel, p);
+      return;
+    }
+    if (label === 'Treningi') {
+      renderRunsTab(panel, p);
       return;
     }
     if (label === 'Zasoby') {
@@ -608,6 +950,302 @@ function renderDetail(host, p) {
     renderPanel(e.detail?.value);
   });
   renderPanel('ml-tab-0');
+}
+
+// =============================================================================
+// Zakładka "Przegląd" — stan projektu na jednym ekranie: KPI z pochodzeniem,
+// członkowie, przydzielone zasoby mesh, ostatnie joby, modele projektu i skróty
+// do pozostałych zakładek. Każde wywołanie API jest izolowane w try/catch, więc
+// niedostępny endpoint degraduje do pustej sekcji zamiast wywalać całą zakładkę.
+// =============================================================================
+
+// Status joba/modelu → para {tone, label} dla tf-badge. Reużywa istniejących
+// helperów statusTone/statusLabel, ale domyka kilka slugów specyficznych dla
+// jobów treningowych (succeeded/finished), których nie pokrywa STATUS_LABEL.
+function runBadge(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'succeeded' || s === 'finished' || s === 'completed') return { tone: 'success', label: 'gotowy' };
+  return { tone: statusTone(s), label: statusLabel(s) };
+}
+
+async function renderOverviewTab(panel, p, { tabs, selectTab }) {
+  const pid = projectId(p);
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+
+  // KPI domenowe z payloadu projektu — liczba członków uzupełniana po pobraniu.
+  const datasetCount = p.datasetCount ?? p.dataset_count ?? 0;
+  const modelCount = p.modelCount ?? p.model_count ?? 0;
+  const trainingCount = p.trainingCount ?? p.training_count ?? 0;
+
+  // Członkowie — potrzebni także do KPI "Członkowie", więc pobieramy najpierw.
+  let members = [];
+  try {
+    const resp = await ApiBinary.one('mlStudioProjectMembersListRequest', { projectId: pid });
+    members = Array.isArray(resp.members) ? resp.members : [];
+  } catch (_) {
+    members = [];
+  }
+
+  const owner = isOwnerProject(p);
+  const selfId = currentUserId();
+  const shareNav = () => Router.navigate('ml-studio', { projectId: pid, share: true });
+  const adminNav = () => Router.navigate('ml-studio', { admin: 'resources' });
+
+  const kpi = (icon, label, value, delta) => `
+    <div class="ml-studio-kpi">
+      <div class="label">${sprite(icon)}${escapeHtml(label)}</div>
+      <div class="value">${escapeHtml(String(value))}</div>
+      <div class="delta">${escapeHtml(delta)}</div>
+    </div>`;
+
+  const kpiGrid = `
+    <div class="ml-studio-kpi-grid">
+      ${kpi('image', 'Datasety', datasetCount, 'z zakładki Dane')}
+      ${kpi('catalog', 'Modele', modelCount, 'wytrenowane wersje w projekcie')}
+      ${kpi('brain', 'Treningi', trainingCount, 'uruchomione joby treningowe')}
+      ${kpi('users', 'Członkowie', members.length, 'właściciel + osoby z dostępem')}
+    </div>`;
+
+  // Mini-lista członków: awatar z inicjałów, nazwa = displayName (fallback userId), rola jako tf-chip.
+  const memberChips = members.map((m) => {
+    const uid = String(m.userId ?? m.user_id ?? '');
+    const name = m.displayName ?? m.display_name ?? uid;
+    const role = String(m.role ?? '').toLowerCase();
+    const isSelf = (selfId && uid === selfId) || role === 'owner' && !selfId;
+    const tone = role === 'owner' ? 'accent' : 'info';
+    return `
+      <div class="ml-studio-member-chip">
+        <div class="m-av">${escapeHtml(initialsFromId(name))}</div>
+        <div>
+          <div class="m-nm">${escapeHtml(name || '—')}${isSelf ? ' <span class="ml-studio-member-self">(Ty)</span>' : ''}</div>
+          <div class="m-rl">${escapeHtml(formatRelative(m.createdAt ?? m.created_at))}</div>
+        </div>
+        <tf-chip status="${tone}" icon="${escapeAttr(ROLE_ICON[role] || 'eye')}" label="${escapeAttr(roleLabel(role))}"></tf-chip>
+      </div>`;
+  }).join('');
+
+  const membersSection = `
+    <div class="ml-studio-section-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('users')} Członkowie projektu <span class="ml-studio-section-sub">— właściciel i osoby z dostępem</span></div>
+        ${owner ? '<tf-button variant="ghost" icon="share" id="ml-studio-ov-share">Zarządzaj dostępem</tf-button>' : ''}
+      </div>
+      <div class="ml-studio-members-row" id="ml-studio-ov-members">
+        ${memberChips || '<span class="ml-studio-section-sub">Brak członków do wyświetlenia.</span>'}
+      </div>
+    </div>`;
+
+  panel.innerHTML = `
+    ${kpiGrid}
+    ${membersSection}
+    <div class="ml-studio-section-card" id="ml-studio-ov-resources-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('host')} Zasoby przydzielone <span class="ml-studio-section-sub">— GPU/nody dostępne dla treningu</span></div>
+        <tf-button variant="ghost" icon="host" id="ml-studio-ov-resources-admin">Zarządzaj (admin)</tf-button>
+      </div>
+      <div id="ml-studio-ov-resources"></div>
+    </div>
+    <div class="ml-studio-section-card" id="ml-studio-ov-runs-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('clock')} Ostatnie joby <span class="ml-studio-section-sub">— tylko tego projektu</span></div>
+      </div>
+      <div id="ml-studio-ov-runs"></div>
+    </div>
+    <div class="ml-studio-section-card" id="ml-studio-ov-models-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('catalog')} Modele projektu <span class="ml-studio-section-sub">— wersje wyprodukowane tutaj</span></div>
+      </div>
+      <div id="ml-studio-ov-models"></div>
+    </div>
+    <div class="ml-studio-section-card">
+      <div class="ml-studio-section-card-head">
+        <div class="title">${sprite('play')} Szybkie skróty</div>
+      </div>
+      <div class="ml-studio-shortcut-grid" id="ml-studio-ov-shortcuts"></div>
+    </div>
+  `;
+
+  // Akcje członków (owner): zarządzanie dostępem + "Zaproś" — oba na ekran share.
+  byId('ml-studio-ov-share')?.addEventListener('click', shareNav);
+  if (owner) {
+    const inviteBtn = document.createElement('tf-button');
+    inviteBtn.setAttribute('variant', 'outline');
+    inviteBtn.setAttribute('icon', 'plus');
+    inviteBtn.textContent = 'Zaproś';
+    inviteBtn.addEventListener('click', shareNav);
+    byId('ml-studio-ov-members')?.appendChild(inviteBtn);
+  }
+  byId('ml-studio-ov-resources-admin')?.addEventListener('click', adminNav);
+
+  // Zasoby przydzielone — istniejący endpoint member-dostępny.
+  try {
+    const resp = await ApiBinary.one('mlStudioProjectResourcesRequest', { projectId: pid });
+    const grants = Array.isArray(resp.grants) ? resp.grants : [];
+    const host = byId('ml-studio-ov-resources');
+    if (host) {
+      if (!grants.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'host');
+        empty.setAttribute('title', 'Brak przydzielonych zasobów mesh');
+        empty.setAttribute('message', 'Ten projekt nie ma jeszcze przydzielonych zasobów. Przydziela je administrator z puli mesh.');
+        const btn = document.createElement('tf-button');
+        btn.setAttribute('variant', 'primary');
+        btn.setAttribute('icon', 'host');
+        btn.textContent = 'Przejdź do Zasobów';
+        btn.addEventListener('click', adminNav);
+        empty.appendChild(btn);
+        host.appendChild(empty);
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="resource" label="Zasób"></tf-column>
+          <tf-column key="node" label="Node"></tf-column>
+          <tf-column key="quota" label="Limit"></tf-column>
+          <tf-column key="status" label="Status" renderer="html"></tf-column>
+        `;
+        table.rows = grants.map((g) => {
+          const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
+          const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '');
+          const nid = String(g.nodeId ?? g.node_id ?? '');
+          return {
+            resource: resourceRef || resourceKind || '—',
+            node: g.hostname || (nid ? nid.slice(0, 12) : '—'),
+            quota: g.quota ? String(g.quota) : '—',
+            status: '<tf-badge tone="success" value="przydzielone"></tf-badge>',
+          };
+        });
+        host.appendChild(table);
+      }
+    }
+  } catch (_) {
+    const host = byId('ml-studio-ov-resources');
+    if (host) {
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'host');
+      empty.setAttribute('title', 'Brak przydzielonych zasobów mesh');
+      empty.setAttribute('message', 'Nie udało się odczytać przydziałów zasobów dla tego projektu.');
+      host.appendChild(empty);
+    }
+  }
+
+  // Ostatnie joby treningowe — max 5 najnowszych.
+  try {
+    const resp = await ApiBinary.one('mlStudioTrainingRunsListRequest', { projectId: pid });
+    const runs = Array.isArray(resp.runs) ? resp.runs : [];
+    const host = byId('ml-studio-ov-runs');
+    if (host) {
+      if (!runs.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'brain');
+        empty.setAttribute('title', 'Brak treningów');
+        empty.setAttribute('message', 'Uruchom trening w zakładce Trenuj/Trening — joby tego projektu pojawią się tutaj.');
+        host.appendChild(empty);
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="job" label="Job" renderer="html"></tf-column>
+          <tf-column key="status" label="Status" renderer="html"></tf-column>
+          <tf-column key="time" label="Czas"></tf-column>
+        `;
+        table.rows = runs.slice(0, 5).map((r) => {
+          const runId = String(r.runId ?? r.run_id ?? '');
+          const b = runBadge(r.status);
+          return {
+            job: `<span class="ml-studio-mono">${escapeHtml(runId.slice(0, 8) || '—')}</span>`,
+            status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+            time: formatRelative(r.finishedAt ?? r.finished_at ?? r.startedAt ?? r.started_at),
+          };
+        });
+        host.appendChild(table);
+      }
+    }
+  } catch (_) {
+    const host = byId('ml-studio-ov-runs');
+    if (host) {
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'brain');
+      empty.setAttribute('title', 'Brak treningów');
+      empty.setAttribute('message', 'Uruchom trening w zakładce Trenuj/Trening — joby tego projektu pojawią się tutaj.');
+      host.appendChild(empty);
+    }
+  }
+
+  // Modele projektu.
+  try {
+    const resp = await ApiBinary.one('mlStudioModelsListRequest', { projectId: pid });
+    const models = Array.isArray(resp.models) ? resp.models : [];
+    const host = byId('ml-studio-ov-models');
+    if (host) {
+      if (!models.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'catalog');
+        empty.setAttribute('title', 'Brak modeli');
+        empty.setAttribute('message', 'Modele pojawią się tutaj po udanym treningu.');
+        host.appendChild(empty);
+      } else {
+        const table = document.createElement('tf-table');
+        table.setAttribute('variant', 'lined');
+        table.innerHTML = `
+          <tf-column key="model" label="Model"></tf-column>
+          <tf-column key="framework" label="Framework"></tf-column>
+          <tf-column key="status" label="Status" renderer="html"></tf-column>
+          <tf-column key="createdAt" label="Utworzony"></tf-column>
+        `;
+        table.rows = models.map((m) => {
+          const b = runBadge(m.status);
+          return {
+            model: String(m.name ?? m.modelId ?? m.model_id ?? '—'),
+            framework: String(m.framework ?? '—') || '—',
+            status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+            createdAt: formatRelative(m.createdAt ?? m.created_at),
+          };
+        });
+        host.appendChild(table);
+      }
+    }
+  } catch (_) {
+    const host = byId('ml-studio-ov-models');
+    if (host) {
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'catalog');
+      empty.setAttribute('title', 'Brak modeli');
+      empty.setAttribute('message', 'Modele pojawią się tutaj po udanym treningu.');
+      host.appendChild(empty);
+    }
+  }
+
+  // Szybkie skróty do pozostałych zakładek (bez "Przegląd"). Ikona per skrót.
+  const shortcutsHost = byId('ml-studio-ov-shortcuts');
+  if (shortcutsHost) {
+    const slug = p.projectType ?? p.project_type ?? '';
+    const shortcutIcon = (label) => {
+      if (label === 'Dane' || label === 'Korpus') return 'image';
+      if (label === 'Zasoby') return 'host';
+      if (label === 'Treningi' || label === 'Trening' || label === 'Trenuj') return 'brain';
+      if (label === 'Modele') return 'catalog';
+      return typeIcon(slug);
+    };
+    tabs.filter((t) => t !== 'Przegląd').forEach((label) => {
+      // Kafel-skrót jest blokiem nawigacyjnym (jak <a> w mockupie), nie prymitywem
+      // UI — daje pełną kontrolę nad układem ikona+tytuł. Dostępność: role=button
+      // + obsługa klawiatury (Enter/Spacja), bo to element interaktywny.
+      const card = document.createElement('div');
+      card.className = 'ml-studio-shortcut-card';
+      card.setAttribute('role', 'button');
+      card.setAttribute('tabindex', '0');
+      card.innerHTML = `
+        <div class="sc-ico">${sprite(shortcutIcon(label))}</div>
+        <div class="sc-title">${escapeHtml(label)}</div>`;
+      const go = () => selectTab(label);
+      card.addEventListener('click', go);
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+      });
+      shortcutsHost.appendChild(card);
+    });
+  }
 }
 
 // =============================================================================
@@ -901,6 +1539,1815 @@ function taskLabel(task) {
   return task === 'regression' ? 'regresja' : 'klasyfikacja';
 }
 
+// =============================================================================
+// Fine-tuning LLM (typ projektu ft_llm) — zakładki „Model bazowy" (f00+f01) i
+// „Trening" (f02). Wybór modelu/metody/hiperparametrów trafia do ftConfig[pid],
+// a zakładka Trening startuje asynchroniczny job (mlStudioFtTrainStartRequest) i
+// odpytuje postęp co 2 s (mlStudioFtTrainStatusRequest) z krzywą loss.
+// =============================================================================
+
+// Presety modeli bazowych zgodne z manifestem ml-training. „source" rozróżnia
+// model dostępny w serwisie od pobieranego z HuggingFace (chip pochodzenia w f00).
+const FT_BASE_MODELS = [
+  {
+    id: 'Qwen/Qwen3.5-0.8B',
+    name: 'Qwen3.5-0.8B',
+    sub: 'Mały, szybki — zalecany start dla większości fine-tuningów',
+    params: '0.8 B',
+    context: '32k',
+    license: 'Apache-2.0',
+    source: 'serwis',
+    recommended: true,
+  },
+  {
+    id: 'meta-llama/Llama-3.2-1B',
+    name: 'Llama-3.2-1B',
+    sub: 'Kompaktowy bazowy Llama — dobry kompromis jakość/koszt',
+    params: '1 B',
+    context: '128k',
+    license: 'Llama 3.2 Comm.',
+    source: 'hf',
+  },
+  {
+    id: 'Qwen/Qwen2.5-7B',
+    name: 'Qwen2.5-7B',
+    sub: 'Większy bazowy — wyższa jakość kosztem VRAM i czasu',
+    params: '7 B',
+    context: '128k',
+    license: 'Apache-2.0',
+    source: 'hf',
+  },
+];
+
+// Parametryzacja (oś 2) — karty z badge szacowanej VRAM. Wartości jak w f01.
+const FT_METHODS = [
+  { id: 'qlora', name: 'QLoRA', desc: '4-bit baza + adaptery LoRA. Najniższa VRAM.', vram: '~8 GB', tone: 'low', lora: true },
+  { id: 'lora', name: 'LoRA', desc: 'Baza 16-bit + adaptery. Lepsza jakość niż QLoRA.', vram: '~16 GB', tone: 'mid', lora: true },
+  { id: 'dora', name: 'DoRA', desc: 'LoRA z dekompozycją wagi — wyższa wierność.', vram: '~18 GB', tone: 'high', lora: true },
+  { id: 'full', name: 'Full', desc: 'Pełny fine-tune wszystkich wag. Najlepsza jakość.', vram: '~24 GB', tone: 'max', lora: false },
+];
+
+// Cel treningu (oś 1).
+const FT_OBJECTIVES = [
+  { id: 'sft', name: 'SFT', desc: 'Supervised fine-tuning (pary wejście→wyjście).' },
+  { id: 'dpo', name: 'DPO', desc: 'Direct Preference Optimization (odpowiedź lepsza/gorsza).' },
+  { id: 'kd', name: 'KD', desc: 'Knowledge Distillation (student uczy się od nauczyciela).' },
+];
+
+// Hiperparametry: domyślne + zakres dla tf-input type=number. lora=true → pole
+// chowane przy method=full (nie ma adapterów LoRA przy pełnym fine-tunie).
+const FT_HYPERPARAMS = [
+  { key: 'learningRate', label: 'learning rate', def: 2e-4, step: '0.00001', min: 0 },
+  { key: 'batchSize', label: 'batch size', def: 8, step: '1', min: 1 },
+  { key: 'gradAccumSteps', label: 'grad accum', def: 4, step: '1', min: 1 },
+  { key: 'epochs', label: 'epoki', def: 3, step: '1', min: 1 },
+  { key: 'loraR', label: 'LoRA r (rank)', def: 16, step: '1', min: 1, lora: true },
+  { key: 'loraAlpha', label: 'LoRA alpha', def: 32, step: '1', min: 1, lora: true },
+  { key: 'loraDropout', label: 'LoRA dropout', def: 0.05, step: '0.01', min: 0, lora: true },
+  { key: 'maxSeqLen', label: 'max seq len', def: 512, step: '1', min: 1 },
+];
+
+// Domyślna konfiguracja FT dla projektu, w którym jej jeszcze nie ma.
+function defaultFtConfig() {
+  const hyperparams = {};
+  for (const h of FT_HYPERPARAMS) hyperparams[h.key] = h.def;
+  return {
+    baseModel: FT_BASE_MODELS[0].id,
+    customRepo: '',
+    method: 'qlora',
+    objective: 'sft',
+    mergeAdapter: false,
+    hyperparams,
+  };
+}
+
+function getFtConfig(pid) {
+  if (!ftConfig[pid]) ftConfig[pid] = defaultFtConfig();
+  return ftConfig[pid];
+}
+
+// Etykieta źródła modelu (chip pochodzenia).
+function ftSourceChip(source) {
+  if (source === 'serwis') return '<span class="ml-studio-ft-origin serwis">dostępny w serwisie</span>';
+  return '<span class="ml-studio-ft-origin hf">pobierany z HuggingFace</span>';
+}
+
+function methodLabel(id) {
+  return (FT_METHODS.find((m) => m.id === id) || {}).name || id;
+}
+
+function objectiveLabel(id) {
+  return (FT_OBJECTIVES.find((o) => o.id === id) || {}).name || String(id).toUpperCase();
+}
+
+// =============================================================================
+// Zakładka „Model bazowy" — f00 (wybór modelu) + f01 (metoda i hiperparametry).
+// Auto-zapis do ftConfig[pid] przy każdej zmianie, plus jawny przycisk „Zapisz".
+// =============================================================================
+function renderFtModelTab(panel, p) {
+  const pid = projectId(p);
+  const cfg = getFtConfig(pid);
+
+  const modelCards = FT_BASE_MODELS.map((m) => `
+    <button type="button" class="ml-studio-train-engine-card ml-studio-ft-model-card${cfg.baseModel === m.id ? ' selected' : ''}"
+            data-model="${escapeAttr(m.id)}" aria-pressed="${cfg.baseModel === m.id}">
+      <div class="ml-studio-train-engine-ico">${sprite('brain')}</div>
+      <div class="ml-studio-train-engine-body">
+        <div class="ml-studio-train-engine-title">${escapeHtml(m.name)}${m.recommended ? ' <span class="ml-studio-ft-rec">zalecany</span>' : ''}</div>
+        <p class="ml-studio-train-engine-text">${escapeHtml(m.sub)}</p>
+        <div class="ml-studio-ft-spec">
+          <span class="sp">parametry<b>${escapeHtml(m.params)}</b></span>
+          <span class="sp">kontekst<b>${escapeHtml(m.context)}</b></span>
+          <span class="sp">licencja<b>${escapeHtml(m.license)}</b></span>
+        </div>
+        <div class="ml-studio-ft-origin-row">${ftSourceChip(m.source)}<span class="ml-studio-ft-cap">capability: generacja LLM</span></div>
+      </div>
+    </button>
+  `).join('');
+
+  const customSelected = cfg.baseModel === '__custom__';
+  const customCard = `
+    <button type="button" class="ml-studio-train-engine-card ml-studio-ft-model-card${customSelected ? ' selected' : ''}"
+            data-model="__custom__" aria-pressed="${customSelected}">
+      <div class="ml-studio-train-engine-ico">${sprite('plus')}</div>
+      <div class="ml-studio-train-engine-body">
+        <div class="ml-studio-train-engine-title">Własny z HuggingFace</div>
+        <p class="ml-studio-train-engine-text">Wskaż dowolne repo HF zdolne do generacji LLM.</p>
+        <tf-input id="ml-studio-ft-custom-repo" placeholder="np. Qwen/Qwen3.5-0.8B-Instruct"
+                  value="${escapeAttr(cfg.customRepo || '')}"></tf-input>
+        <div class="ml-studio-ft-origin-row">${ftSourceChip('hf')}<span class="ml-studio-ft-cap">capability sprawdzany po podaniu repo</span></div>
+      </div>
+    </button>
+  `;
+
+  const objectiveCards = FT_OBJECTIVES.map((o) => `
+    <button type="button" class="ml-studio-ft-axis-card${cfg.objective === o.id ? ' selected' : ''}"
+            data-objective="${escapeAttr(o.id)}" aria-pressed="${cfg.objective === o.id}">
+      <div class="ml-studio-ft-axis-name">${escapeHtml(o.name)}</div>
+      <p class="ml-studio-ft-axis-desc">${escapeHtml(o.desc)}</p>
+    </button>
+  `).join('');
+
+  const methodCards = FT_METHODS.map((m) => `
+    <button type="button" class="ml-studio-train-engine-card ml-studio-ft-method-card${cfg.method === m.id ? ' selected' : ''}"
+            data-method="${escapeAttr(m.id)}" aria-pressed="${cfg.method === m.id}">
+      <div class="ml-studio-train-engine-body">
+        <div class="ml-studio-train-engine-title">${escapeHtml(m.name)}</div>
+        <p class="ml-studio-train-engine-text">${escapeHtml(m.desc)}</p>
+        <span class="ml-studio-ft-vram ${escapeAttr(m.tone)}">${escapeHtml(m.vram)} VRAM</span>
+      </div>
+    </button>
+  `).join('');
+
+  const hpInputs = FT_HYPERPARAMS.map((h) => `
+    <div class="ml-studio-ft-hp-field${h.lora ? ' ml-studio-ft-lora-field' : ''}">
+      <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-ft-hp-${escapeAttr(h.key)}"
+                value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+    </div>
+  `).join('');
+
+  panel.innerHTML = `
+    <div class="ml-studio-ft">
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('package')} Model bazowy
+          <span class="ml-studio-data-hint">model, który dotrenujemy na danych z zakładki „Dane"</span>
+        </div>
+        <div class="ml-studio-train-engine-grid ml-studio-ft-model-grid" id="ml-studio-ft-models">
+          ${modelCards}
+          ${customCard}
+        </div>
+      </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Metoda treningu
+          <span class="ml-studio-data-hint">dwie osie: cel × parametryzacja</span>
+        </div>
+        <div class="ml-studio-ft-axis-label">Oś 1 — Cel</div>
+        <div class="ml-studio-ft-axis-grid" id="ml-studio-ft-objectives">${objectiveCards}</div>
+        <div class="ml-studio-ft-teacher-field" id="ml-studio-ft-teacher-field"
+             style="${cfg.objective === 'kd' ? '' : 'display:none'};margin:8px 0 4px">
+          <tf-input label="Model-nauczyciel (repo HF)" id="ml-studio-ft-teacher"
+                    value="${escapeAttr(cfg.teacherModel || '')}"
+                    placeholder="np. Qwen/Qwen2.5-7B-Instruct"
+                    hint="Większy, mocniejszy model — student uczy się jego rozkładu (KD)."></tf-input>
+        </div>
+        <div class="ml-studio-ft-axis-label">Oś 2 — Parametryzacja</div>
+        <div class="ml-studio-train-engine-grid ml-studio-ft-method-grid" id="ml-studio-ft-methods">${methodCards}</div>
+        <div class="ml-studio-ft-combo" id="ml-studio-ft-combo"></div>
+      </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry
+          <span class="ml-studio-data-hint">sensowne domyślne — dostosuj w razie potrzeby</span>
+        </div>
+        <div class="ml-studio-ft-hp-grid" id="ml-studio-ft-hp">${hpInputs}</div>
+      </section>
+
+      <div class="ml-studio-data-origin">
+        <div class="ml-studio-data-origin-ico">${sprite('info')}</div>
+        <div>
+          <div class="ml-studio-data-origin-title">Dane treningowe wgrywasz w zakładce „Dane".</div>
+          <p class="ml-studio-data-origin-text">Fine-tuning używa wgranego zbioru (JSONL lub CSV z kolumnami <code>text</code> albo <code>prompt</code>+<code>response</code>). Backend sam parsuje format. Trening uruchamiasz w zakładce „Trening".</p>
+        </div>
+      </div>
+
+      <div class="ml-studio-train-actions">
+        <tf-button variant="primary" icon="check" id="ml-studio-ft-save">Zapisz konfigurację</tf-button>
+      </div>
+    </div>
+  `;
+
+  const comboEl = byId('ml-studio-ft-combo');
+  const updateCombo = () => {
+    if (!comboEl) return;
+    const m = FT_METHODS.find((x) => x.id === cfg.method);
+    comboEl.innerHTML = `
+      <span class="ml-studio-ft-combo-eq">${escapeHtml(objectiveLabel(cfg.objective))} <span class="op">×</span> ${escapeHtml(methodLabel(cfg.method))}</span>
+      <span class="ml-studio-ft-combo-vram">${escapeHtml(m ? m.vram : '')} VRAM</span>
+    `;
+  };
+
+  // Pola LoRA nie mają sensu przy Full fine-tune — chowamy je w tym trybie.
+  const updateLoraVisibility = () => {
+    const hide = cfg.method === 'full';
+    panel.querySelectorAll('.ml-studio-ft-lora-field').forEach((el) => {
+      el.hidden = hide;
+    });
+  };
+
+  // Wybór karty modelu.
+  byId('ml-studio-ft-models')?.querySelectorAll('.ml-studio-ft-model-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      cfg.baseModel = card.getAttribute('data-model');
+      panel.querySelectorAll('.ml-studio-ft-model-card').forEach((c) => {
+        const on = c === card;
+        c.classList.toggle('selected', on);
+        c.setAttribute('aria-pressed', String(on));
+      });
+    });
+  });
+  // Repo HF: zapis do customRepo; wpisanie repo nie kradnie zaznaczenia karty,
+  // ale klik w pole zaznacza kartę „Własny".
+  const customRepoInput = byId('ml-studio-ft-custom-repo');
+  customRepoInput?.addEventListener('input', () => {
+    cfg.customRepo = customRepoInput.value || '';
+  });
+  customRepoInput?.addEventListener('focus', () => {
+    cfg.baseModel = '__custom__';
+    panel.querySelectorAll('.ml-studio-ft-model-card').forEach((c) => {
+      const on = c.getAttribute('data-model') === '__custom__';
+      c.classList.toggle('selected', on);
+      c.setAttribute('aria-pressed', String(on));
+    });
+  });
+
+  // Wybór celu (oś 1).
+  byId('ml-studio-ft-objectives')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      cfg.objective = card.getAttribute('data-objective');
+      panel.querySelectorAll('.ml-studio-ft-axis-card').forEach((c) => {
+        const on = c === card;
+        c.classList.toggle('selected', on);
+        c.setAttribute('aria-pressed', String(on));
+      });
+      // Pole nauczyciela tylko dla KD.
+      const tf = byId('ml-studio-ft-teacher-field');
+      if (tf) tf.style.display = cfg.objective === 'kd' ? '' : 'none';
+      updateCombo();
+    });
+  });
+
+  // Auto-zapis modelu-nauczyciela (KD).
+  byId('ml-studio-ft-teacher')?.addEventListener('input', (e) => {
+    cfg.teacherModel = (e.target.value || '').trim();
+  });
+
+  // Wybór parametryzacji (oś 2).
+  byId('ml-studio-ft-methods')?.querySelectorAll('.ml-studio-ft-method-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      cfg.method = card.getAttribute('data-method');
+      panel.querySelectorAll('.ml-studio-ft-method-card').forEach((c) => {
+        const on = c === card;
+        c.classList.toggle('selected', on);
+        c.setAttribute('aria-pressed', String(on));
+      });
+      updateCombo();
+      updateLoraVisibility();
+    });
+  });
+
+  // Auto-zapis hiperparametrów (liczby).
+  for (const h of FT_HYPERPARAMS) {
+    const el = byId('ml-studio-ft-hp-' + h.key);
+    el?.addEventListener('input', () => {
+      const num = Number(el.value);
+      if (!Number.isNaN(num)) cfg.hyperparams[h.key] = num;
+    });
+  }
+
+  byId('ml-studio-ft-save')?.addEventListener('click', () => {
+    if (cfg.baseModel === '__custom__' && !String(cfg.customRepo || '').trim()) {
+      toast('Podaj repo HuggingFace dla modelu „Własny".', 'error');
+      return;
+    }
+    toast('Zapisano konfigurację fine-tuningu.', 'success');
+  });
+
+  updateCombo();
+  updateLoraVisibility();
+}
+
+// Efektywny identyfikator modelu bazowego (repo HF gdy wybrano „Własny").
+function ftEffectiveBaseModel(cfg) {
+  if (cfg.baseModel === '__custom__') return String(cfg.customRepo || '').trim();
+  return cfg.baseModel;
+}
+
+// =============================================================================
+// Zakładka „Trening" (f02) — podsumowanie konfiguracji, wybór datasetu, start
+// jobu i widok LIVE z pollingiem statusu (pasek postępu, KPI, krzywa loss).
+// =============================================================================
+function renderFtTrainTab(panel, p, { selectTab }) {
+  const pid = projectId(p);
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid })
+    .then((resp) => {
+      const datasets = Array.isArray(resp.datasets) ? resp.datasets : [];
+      renderFtTrainContent(panel, p, pid, datasets, { selectTab });
+    })
+    .catch((err) => {
+      panel.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać zbiorów');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      panel.appendChild(empty);
+    });
+}
+
+function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
+  // Brak danych → kierujemy do zakładki Dane.
+  if (!datasets.length) {
+    panel.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'database');
+    empty.setAttribute('title', 'Brak zbioru treningowego');
+    empty.setAttribute('message', 'Najpierw wgraj zbiór treningowy w zakładce „Dane" (JSONL lub CSV z kolumnami text albo prompt+response).');
+    panel.appendChild(empty);
+    return;
+  }
+  // Brak konfiguracji → kierujemy do zakładki Model bazowy.
+  if (!ftConfig[pid]) {
+    panel.innerHTML = '';
+    const empty = document.createElement('tf-empty-state');
+    empty.setAttribute('icon', 'sparkle');
+    empty.setAttribute('title', 'Skonfiguruj fine-tuning');
+    empty.setAttribute('message', 'Skonfiguruj model i metodę w zakładce „Model bazowy", zanim uruchomisz trening.');
+    panel.appendChild(empty);
+    return;
+  }
+
+  const cfg = ftConfig[pid];
+  const datasetOptions = datasets.map((d) => ({
+    value: String(d.datasetId ?? d.dataset_id ?? ''),
+    label: d.name || '(bez nazwy)',
+  }));
+  const onlyOne = datasetOptions.length === 1;
+
+  panel.innerHTML = `
+    <div class="ml-studio-ft">
+      <section class="ml-studio-data-card" id="ml-studio-ft-setup">
+        <div class="ml-studio-data-head">${sprite('cpu')} Konfiguracja treningu
+          <span class="ml-studio-data-hint">podsumowanie z zakładki „Model bazowy"</span>
+        </div>
+        <div class="ml-studio-ft-summary">
+          <div class="ml-studio-ft-sum-line"><span class="k">Model bazowy</span><span class="v">${escapeHtml(ftEffectiveBaseModel(cfg) || '(brak)')}</span></div>
+          <div class="ml-studio-ft-sum-line"><span class="k">Metoda</span><span class="v">${escapeHtml(objectiveLabel(cfg.objective))} × ${escapeHtml(methodLabel(cfg.method))}</span></div>
+          <div class="ml-studio-ft-sum-line"><span class="k">Hiperparametry</span><span class="v">lr ${escapeHtml(String(cfg.hyperparams.learningRate))} · batch ${escapeHtml(String(cfg.hyperparams.batchSize))} · ${escapeHtml(String(cfg.hyperparams.epochs))} epoki</span></div>
+        </div>
+        ${onlyOne ? '' : '<tf-select id="ml-studio-ft-dataset" label="Zbiór treningowy"></tf-select>'}
+        <div class="ml-studio-train-actions">
+          <tf-button variant="primary" icon="play" id="ml-studio-ft-run">Uruchom trening</tf-button>
+        </div>
+      </section>
+
+      <div id="ml-studio-ft-live"></div>
+    </div>
+  `;
+
+  let datasetId = datasetOptions[0].value;
+  if (!onlyOne) {
+    const sel = byId('ml-studio-ft-dataset');
+    sel?.setOptions(datasetOptions, datasetId);
+    sel?.addEventListener('change', (e) => {
+      datasetId = e.detail?.value || sel.value || datasetId;
+    });
+  }
+
+  byId('ml-studio-ft-run')?.addEventListener('click', async () => {
+    const baseModel = ftEffectiveBaseModel(cfg);
+    if (!baseModel) {
+      toast('Brak modelu bazowego — uzupełnij go w zakładce „Model bazowy".', 'error');
+      return;
+    }
+    if (!datasetId) {
+      toast('Wybierz zbiór treningowy.', 'error');
+      return;
+    }
+    const teacherModel = (cfg.teacherModel || '').trim();
+    if (cfg.objective === 'kd' && !teacherModel) {
+      toast('KD wymaga modelu-nauczyciela (repo HF).', 'error');
+      return;
+    }
+    const runBtn = byId('ml-studio-ft-run');
+    runBtn?.setAttribute('disabled', '');
+    try {
+      const payload = {
+        projectId: pid,
+        datasetId,
+        baseModel,
+        method: cfg.method,
+        objective: cfg.objective,
+        teacherModel: cfg.objective === 'kd' ? teacherModel : null,
+        mergeAdapter: cfg.method !== 'full' && Boolean(cfg.mergeAdapter),
+        hyperparams: {
+          learningRate: cfg.hyperparams.learningRate,
+          batchSize: cfg.hyperparams.batchSize,
+          gradAccumSteps: cfg.hyperparams.gradAccumSteps,
+          epochs: cfg.hyperparams.epochs,
+          loraR: cfg.hyperparams.loraR,
+          loraAlpha: cfg.hyperparams.loraAlpha,
+          loraDropout: cfg.hyperparams.loraDropout,
+          maxSeqLen: cfg.hyperparams.maxSeqLen,
+        },
+      };
+      const resp = await ApiBinary.one('mlStudioFtTrainStartRequest', payload);
+      const runId = resp.runId ?? resp.run_id;
+      if (!runId) throw new Error('Backend nie zwrócił runId.');
+      // Po starcie chowamy konfigurację i pokazujemy widok LIVE z pollingiem.
+      const setup = byId('ml-studio-ft-setup');
+      if (setup) setup.hidden = true;
+      startFtLive(byId('ml-studio-ft-live'), runId, { selectTab });
+    } catch (err) {
+      runBtn?.removeAttribute('disabled');
+      toast(`Start treningu: ${err.message}`, 'error');
+    }
+  });
+}
+
+// Widok LIVE + polling co 2 s. Renderuje pasek postępu, KPI i krzywą loss (SVG)
+// z danych statusu. Interwał czyszczony przez stopFtPolling (przy zakończeniu,
+// przełączeniu zakładki lub unmount ekranu).
+function startFtLive(host, runId, { selectTab }) {
+  if (!host) return;
+  stopFtPolling();
+  host.innerHTML = `
+    <section class="ml-studio-data-card ml-studio-ft-live">
+      <div class="ml-studio-data-head">${sprite('cpu')} Trening na żywo
+        <span class="ml-studio-ft-status" id="ml-studio-ft-status-badge"><tf-badge tone="warning" value="trening trwa"></tf-badge></span>
+      </div>
+      <div class="ml-studio-ft-progress">
+        <div class="ml-studio-ft-progress-meta" id="ml-studio-ft-progress-meta">krok 0</div>
+        <tf-progress-bar id="ml-studio-ft-progress-bar" value="0" tone="accent"></tf-progress-bar>
+      </div>
+      <div class="ml-studio-ft-kpi-grid" id="ml-studio-ft-kpi"></div>
+      <div class="ml-studio-ft-chart-wrap">
+        <div class="ml-studio-ft-chart-head">
+          <span class="ml-studio-ft-chart-title">Krzywa loss</span>
+          <span class="ml-studio-ft-chart-legend">
+            <span class="lg"><span class="sw train"></span>train</span>
+            <span class="lg"><span class="sw eval"></span>eval</span>
+          </span>
+        </div>
+        <div id="ml-studio-ft-chart"></div>
+      </div>
+      <div class="ml-studio-ft-done" id="ml-studio-ft-done" hidden></div>
+    </section>
+  `;
+
+  const renderStatus = (st) => {
+    const status = String(st.status || 'running');
+    const step = Number(st.step ?? 0);
+    const totalSteps = Number(st.totalSteps ?? st.total_steps ?? 0);
+    const trainLoss = st.trainLoss ?? st.train_loss;
+    const evalLoss = st.evalLoss ?? st.eval_loss;
+    const curve = Array.isArray(st.lossCurve ?? st.loss_curve) ? (st.lossCurve ?? st.loss_curve) : [];
+
+    // Pasek postępu — gdy znamy totalSteps liczymy procent, inaczej spinner.
+    const meta = byId('ml-studio-ft-progress-meta');
+    const bar = byId('ml-studio-ft-progress-bar');
+    if (totalSteps > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((step / totalSteps) * 100)));
+      if (meta) meta.textContent = `krok ${step} / ${totalSteps} · ${pct}%`;
+      if (bar) bar.setAttribute('value', String(pct));
+    } else if (meta) {
+      meta.innerHTML = `<tf-spinner size="sm"></tf-spinner> trwa — krok ${step}`;
+      if (bar) bar.setAttribute('value', '0');
+    }
+
+    // KPI: tylko realne wartości ze statusu.
+    const kpi = byId('ml-studio-ft-kpi');
+    if (kpi) {
+      kpi.innerHTML = `
+        <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${trainLoss != null ? Number(trainLoss).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">eval loss</div><div class="val">${evalLoss != null ? Number(evalLoss).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">krok</div><div class="val">${step}${totalSteps > 0 ? ' / ' + totalSteps : ''}</div></div>
+      `;
+    }
+
+    // Krzywa loss (inline SVG).
+    const chart = byId('ml-studio-ft-chart');
+    if (chart) chart.innerHTML = renderLossChart(curve);
+
+    // Badge statusu.
+    const badge = byId('ml-studio-ft-status-badge');
+    if (badge) {
+      if (status === 'succeeded') badge.innerHTML = '<tf-badge tone="success" value="zakończony"></tf-badge>';
+      else if (status === 'failed') badge.innerHTML = '<tf-badge tone="danger" value="błąd"></tf-badge>';
+      else badge.innerHTML = '<tf-badge tone="warning" value="trening trwa"></tf-badge>';
+    }
+
+    if (status === 'succeeded') {
+      stopFtPolling();
+      const done = byId('ml-studio-ft-done');
+      if (done) {
+        done.hidden = false;
+        done.innerHTML = `
+          <div class="ml-studio-ft-done-msg">${sprite('check')} Trening zakończony — model dostępny w zakładce „Modele".</div>
+          <tf-button variant="outline" icon="layers" id="ml-studio-ft-goto-models">Przejdź do Modele</tf-button>
+        `;
+        byId('ml-studio-ft-goto-models')?.addEventListener('click', () => selectTab && selectTab('Modele'));
+      }
+      toast('Fine-tuning zakończony.', 'success');
+    } else if (status === 'failed') {
+      stopFtPolling();
+      toast(`Trening nieudany: ${st.error || 'nieznany błąd'}`, 'error');
+      const done = byId('ml-studio-ft-done');
+      if (done) {
+        done.hidden = false;
+        done.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(st.error || 'Trening zakończył się błędem.')}</div>`;
+      }
+    }
+  };
+
+  const poll = async () => {
+    try {
+      const st = await ApiBinary.one('mlStudioFtTrainStatusRequest', { runId });
+      renderStatus(st);
+    } catch (err) {
+      stopFtPolling();
+      toast(`Polling statusu: ${err.message}`, 'error');
+    }
+  };
+
+  poll();
+  ftPollTimer = setInterval(poll, 2000);
+}
+
+// Krzywa loss jako inline SVG: oś X = step, Y = loss; dwie linie (train/eval).
+// Skalowanie do min/max obu serii. Brak punktów → komunikat „brak danych".
+function renderLossChart(curve) {
+  const points = (curve || [])
+    .map((c) => ({
+      step: Number(c.step ?? 0),
+      train: c.trainLoss ?? c.train_loss,
+      evalv: c.evalLoss ?? c.eval_loss,
+    }))
+    .filter((c) => Number.isFinite(c.step));
+  if (points.length < 2) {
+    return '<div class="ml-studio-ft-chart-empty">Krzywa pojawi się po pierwszych krokach treningu.</div>';
+  }
+
+  const W = 600;
+  const H = 220;
+  const padX = 8;
+  const padY = 12;
+  const steps = points.map((p) => p.step);
+  const minStep = Math.min(...steps);
+  const maxStep = Math.max(...steps);
+  const losses = [];
+  for (const p of points) {
+    if (Number.isFinite(p.train)) losses.push(p.train);
+    if (Number.isFinite(p.evalv)) losses.push(p.evalv);
+  }
+  const minLoss = Math.min(...losses);
+  const maxLoss = Math.max(...losses);
+  const spanStep = maxStep - minStep || 1;
+  const spanLoss = maxLoss - minLoss || 1;
+
+  const x = (s) => padX + ((s - minStep) / spanStep) * (W - 2 * padX);
+  const y = (l) => padY + (1 - (l - minLoss) / spanLoss) * (H - 2 * padY);
+
+  const pathFor = (sel) => {
+    const segs = [];
+    let started = false;
+    for (const p of points) {
+      const v = sel(p);
+      if (!Number.isFinite(v)) continue;
+      segs.push(`${started ? 'L' : 'M'}${x(p.step).toFixed(1)},${y(v).toFixed(1)}`);
+      started = true;
+    }
+    return segs.join(' ');
+  };
+
+  const trainPath = pathFor((p) => p.train);
+  const evalPath = pathFor((p) => p.evalv);
+  const grid = [40, 100, 160].map((gy) => `<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" class="grid"/>`).join('');
+
+  return `
+    <svg class="ml-studio-ft-loss-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Krzywa loss">
+      <g>${grid}</g>
+      ${trainPath ? `<path class="line train" d="${trainPath}"/>` : ''}
+      ${evalPath ? `<path class="line eval" d="${evalPath}"/>` : ''}
+    </svg>
+  `;
+}
+
+// =============================================================================
+// Recognition (RF-DETR) — zakładki detekcji obiektów. Dataset COCO podajemy
+// PRZEZ ŚCIEŻKĘ do katalogu na serwerze (zbiory obrazów >> limit ramki WS).
+// =============================================================================
+
+const RECOG_VARIANTS = [
+  { id: 'nano', name: 'Nano', desc: 'Najszybszy, najmniejszy — szybki PoC.' },
+  { id: 'small', name: 'Small', desc: 'Kompromis szybkość/jakość.' },
+  { id: 'medium', name: 'Medium', desc: 'Lepsza jakość, większy koszt.' },
+  { id: 'base', name: 'Base', desc: 'Domyślny — dobra jakość (560px).' },
+  { id: 'large', name: 'Large', desc: 'Najlepsza jakość, najwięcej VRAM.' },
+];
+
+const RECOG_HP = [
+  { key: 'epochs', label: 'epoki', def: 50, step: '1', min: 1 },
+  { key: 'batchSize', label: 'batch size', def: 4, step: '1', min: 1 },
+  { key: 'gradAccum', label: 'grad accum', def: 4, step: '1', min: 1 },
+  { key: 'learningRate', label: 'learning rate', def: 1e-4, step: '0.00001', min: 0 },
+  { key: 'resolution', label: 'rozdzielczość', def: 560, step: '28', min: 196 },
+];
+
+const recogCfg = {};
+function defaultRecogCfg() {
+  const hyperparams = {};
+  for (const h of RECOG_HP) hyperparams[h.key] = h.def;
+  return { datasetId: '', variant: 'base', targetNodeId: '', earlyStopping: true, hyperparams };
+}
+function getRecogCfg(pid) {
+  if (!recogCfg[pid]) recogCfg[pid] = defaultRecogCfg();
+  return recogCfg[pid];
+}
+
+// Zakładka "Dane" dla recognition: rejestracja datasetu COCO przez ścieżkę.
+function renderRecogDataTab(panel, p) {
+  const pid = projectId(p);
+  panel.innerHTML = `
+    <div class="ml-studio-data">
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('database')} Dataset COCO (katalog na serwerze)
+          <span class="ml-studio-data-hint">splity train/valid/test z _annotations.coco.json + obrazy</span>
+        </div>
+        <p class="ml-studio-data-origin-text" style="margin:0 0 10px">Zbiory detekcji to dziesiątki/setki MB obrazów — podajesz ŚCIEŻKĘ do katalogu COCO na węźle (nie wgrywasz bajtów). Klasy i liczba obrazów są czytane z plików COCO.</p>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+          <tf-input id="ml-studio-recog-path" label="Ścieżka katalogu COCO" placeholder="/home/.../dataset_aug" style="flex:1;min-width:260px"></tf-input>
+          <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. Acme ADR" style="min-width:180px"></tf-input>
+          <tf-button variant="primary" icon="plus" id="ml-studio-recog-register">Zarejestruj dataset</tf-button>
+        </div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('database')} Zarejestrowane zbiory</div>
+        <div id="ml-studio-datasets"></div>
+      </section>
+    </div>
+  `;
+  byId('ml-studio-recog-register')?.addEventListener('click', async () => {
+    const path = (byId('ml-studio-recog-path')?.value || '').trim();
+    const name = (byId('ml-studio-recog-name')?.value || '').trim();
+    if (!path) { toast('Podaj ścieżkę katalogu COCO.', 'error'); return; }
+    const btn = byId('ml-studio-recog-register');
+    btn?.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('mlStudioRecogDatasetRegisterRequest', { projectId: pid, name, path });
+      const d = resp.dataset || {};
+      const classes = d.columnCount ?? d.column_count ?? 0;
+      const imgs = d.rowCount ?? d.row_count ?? 0;
+      toast(`Dataset zarejestrowany: ${imgs} obrazów, ${classes} klas.`, 'success');
+      loadDatasets(pid);
+    } catch (err) {
+      toast(`Rejestracja datasetu: ${err.message}`, 'error');
+    } finally {
+      btn?.removeAttribute('disabled');
+    }
+  });
+  loadDatasets(pid);
+}
+
+// Zakładka "Anotacje" — edytor bboxów COCO: galeria obrazów + płótno z rysowaniem,
+// przesuwaniem, resize (uchwyty), zmianą klasy, usuwaniem; zapis do COCO.
+function renderRecogAnnotateTab(panel, p) {
+  const pid = projectId(p);
+  // Stan edytora.
+  const S = {
+    datasetId: '', images: [], categories: [], curIdx: -1,
+    origW: 0, origH: 0, boxes: [], sel: -1, dirty: false,
+    drag: null, // {mode:'new'|'move'|'resize', handle, startX, startY, orig}
+  };
+
+  panel.innerHTML = `
+    <div class="ml-studio-annot">
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Edytor anotacji (COCO)
+          <span class="ml-studio-data-hint">rysuj/przesuwaj/zmieniaj rozmiar ramek, ustaw klasę, zapisz</span>
+        </div>
+        <tf-select id="ml-studio-annot-dataset" label="Dataset COCO"></tf-select>
+      </section>
+      <div class="ml-studio-annot-body">
+        <section class="ml-studio-data-card" style="max-height:70vh;overflow:auto">
+          <div class="ml-studio-data-head">Obrazy <span id="ml-studio-annot-count" class="ml-studio-data-hint"></span></div>
+          <div id="ml-studio-annot-gallery"></div>
+        </section>
+        <section class="ml-studio-data-card">
+          <div id="ml-studio-annot-toolbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"></div>
+          <div id="ml-studio-annot-stage" style="position:relative;max-width:100%;background:var(--bg-3);border:1px solid var(--border);border-radius:var(--radius-sm);min-height:240px"></div>
+          <div id="ml-studio-annot-hint" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
+        </section>
+      </div>
+    </div>
+  `;
+
+  // Lista datasetów coco_path do selecta.
+  (async () => {
+    const sel = byId('ml-studio-annot-dataset');
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+      const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path');
+      const opts = list.map((d) => ({ value: d.datasetId ?? d.dataset_id, label: `${d.name} (${d.rowCount ?? d.row_count ?? 0} obr.)` }));
+      if (sel?.setOptions) sel.setOptions(opts, opts.length ? opts[0].value : null);
+      else if (sel) sel.innerHTML = opts.map((o) => `<option value="${escapeAttr(o.value)}">${escapeHtml(o.label)}</option>`).join('');
+      if (opts.length) { S.datasetId = opts[0].value; await loadImages(); }
+      sel?.addEventListener('change', async (e) => { S.datasetId = e.detail?.value || sel.value; await loadImages(); });
+    } catch (err) { byId('ml-studio-annot-gallery').innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+  })();
+
+  async function loadImages() {
+    const gal = byId('ml-studio-annot-gallery');
+    gal.innerHTML = '<tf-spinner></tf-spinner>';
+    try {
+      const resp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: S.datasetId });
+      S.images = JSON.parse(resp.imagesJson ?? resp.images_json ?? '[]');
+      S.categories = JSON.parse(resp.categoriesJson ?? resp.categories_json ?? '[]');
+      byId('ml-studio-annot-count').textContent = `(${S.images.length})`;
+      renderGallery();
+      if (S.images.length) selectImage(0);
+      else { byId('ml-studio-annot-stage').innerHTML = '<div class="ml-studio-ft-chart-empty">Brak obrazów w datasecie.</div>'; }
+    } catch (err) { gal.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+  }
+
+  function renderGallery() {
+    const gal = byId('ml-studio-annot-gallery');
+    gal.innerHTML = S.images.map((im, i) => `
+      <div class="ml-studio-annot-thumb${i === S.curIdx ? ' active' : ''}" data-idx="${i}"
+           style="padding:6px 8px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between;gap:6px;${i === S.curIdx ? 'background:var(--accent-glow)' : ''}">
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(im.file_name)}</span>
+        <span class="ml-studio-data-hint">${im.ann_count}</span>
+      </div>`).join('');
+    gal.querySelectorAll('.ml-studio-annot-thumb').forEach((el) => {
+      el.addEventListener('click', () => maybeLeave(() => selectImage(Number(el.getAttribute('data-idx')))));
+    });
+  }
+
+  function maybeLeave(fn) {
+    if (S.dirty && !confirm('Masz niezapisane zmiany. Porzucić je?')) return;
+    fn();
+  }
+
+  async function selectImage(idx) {
+    if (idx < 0 || idx >= S.images.length) return;
+    S.curIdx = idx; S.sel = -1; S.dirty = false;
+    renderGallery();
+    const stage = byId('ml-studio-annot-stage');
+    stage.innerHTML = '<tf-spinner></tf-spinner>';
+    try {
+      const im = S.images[idx];
+      const resp = await ApiBinary.one('mlStudioRecogImageRequest', { datasetId: S.datasetId, imageId: im.image_id });
+      if (resp.error) throw new Error(resp.error);
+      S.origW = resp.origWidth ?? resp.orig_width ?? im.width;
+      S.origH = resp.origHeight ?? resp.orig_height ?? im.height;
+      const anns = JSON.parse(resp.annotationsJson ?? resp.annotations_json ?? '[]');
+      S.boxes = anns.map((a) => ({ category_id: a.category_id, x: a.bbox[0], y: a.bbox[1], w: a.bbox[2], h: a.bbox[3] }));
+      renderStage(`data:${resp.mime || 'image/jpeg'};base64,${resp.imageB64 ?? resp.image_b64}`);
+      renderToolbar();
+    } catch (err) { stage.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+  }
+
+  function catName(id) { const c = S.categories.find((c) => c.id === id); return c ? c.name : String(id); }
+  function catColor(id) { return `hsl(${(id * 67) % 360} 85% 55%)`; }
+  function defaultCat() { return S.categories.length ? S.categories[S.categories.length > 1 && S.categories[0].id === 0 ? 1 : 0].id : 0; }
+
+  function renderToolbar() {
+    const tb = byId('ml-studio-annot-toolbar');
+    const catOpts = S.categories.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+    tb.innerHTML = `
+      <button class="btn btn-secondary" id="annot-prev">◀</button>
+      <span class="ml-studio-data-hint" id="annot-pos">${S.curIdx + 1}/${S.images.length}</span>
+      <button class="btn btn-secondary" id="annot-next">▶</button>
+      <span style="margin-left:8px">Klasa zazn.:</span>
+      <select id="annot-cat" class="ml-studio-annot-cat">${catOpts}</select>
+      <button class="btn btn-secondary" id="annot-del">Usuń ramkę</button>
+      <button class="btn btn-primary" id="annot-save" style="margin-left:auto">Zapisz anotacje</button>`;
+    byId('annot-prev').onclick = () => maybeLeave(() => selectImage(S.curIdx - 1));
+    byId('annot-next').onclick = () => maybeLeave(() => selectImage(S.curIdx + 1));
+    byId('annot-del').onclick = () => { if (S.sel >= 0) { S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); } };
+    byId('annot-save').onclick = saveAnns;
+    byId('annot-cat').onchange = (e) => { if (S.sel >= 0) { S.boxes[S.sel].category_id = Number(e.target.value); S.dirty = true; drawBoxes(); } };
+    byId('ml-studio-annot-hint').textContent = 'Rysuj ramkę: przeciągnij na pustym. Zaznacz: klik. Przesuń: przeciągnij wnętrze. Skaluj: narożniki. Usuń: klawisz Delete.';
+  }
+
+  function renderStage(src) {
+    const stage = byId('ml-studio-annot-stage');
+    stage.innerHTML = `
+      <img id="annot-img" src="${src}" style="display:block;width:100%;height:auto;user-select:none;-webkit-user-drag:none"/>
+      <svg id="annot-svg" viewBox="0 0 ${S.origW} ${S.origH}" preserveAspectRatio="none"
+           style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair"></svg>`;
+    const svg = byId('annot-svg');
+    svg.addEventListener('pointerdown', onDown);
+    svg.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    drawBoxes();
+  }
+
+  // Konwersja: klient px → współrzędne oryginału (viewBox).
+  function toOrig(ev) {
+    const svg = byId('annot-svg'); const r = svg.getBoundingClientRect();
+    return { x: ((ev.clientX - r.left) / r.width) * S.origW, y: ((ev.clientY - r.top) / r.height) * S.origH };
+  }
+
+  function drawBoxes() {
+    const svg = byId('annot-svg'); if (!svg) return;
+    const hs = Math.max(6, S.origW / 120); // rozmiar uchwytu w jednostkach oryginału
+    let html = '';
+    S.boxes.forEach((b, i) => {
+      const col = catColor(b.category_id); const seld = i === S.sel;
+      html += `<rect data-box="${i}" x="${b.x}" y="${b.y}" width="${Math.max(0, b.w)}" height="${Math.max(0, b.h)}"
+        fill="${seld ? col.replace('hsl', 'hsla').replace(')', ',0.15)') : 'none'}" stroke="${col}" stroke-width="${Math.max(2, S.origW / 400)}"/>`;
+      html += `<text x="${b.x}" y="${Math.max(hs, b.y - 4)}" fill="${col}" font-size="${Math.max(11, S.origW / 55)}" font-weight="700" style="pointer-events:none">${escapeHtml(catName(b.category_id))}</text>`;
+      if (seld) {
+        const corners = [[b.x, b.y, 'nw'], [b.x + b.w, b.y, 'ne'], [b.x, b.y + b.h, 'sw'], [b.x + b.w, b.y + b.h, 'se']];
+        for (const [cx, cy, h] of corners) {
+          html += `<rect class="annot-handle" data-box="${i}" data-handle="${h}" x="${cx - hs / 2}" y="${cy - hs / 2}" width="${hs}" height="${hs}" fill="#fff" stroke="${col}" stroke-width="1" style="cursor:nwse-resize"/>`;
+        }
+      }
+    });
+    svg.innerHTML = html;
+  }
+
+  function onDown(ev) {
+    ev.preventDefault();
+    const t = ev.target; const p0 = toOrig(ev);
+    if (t.classList && t.classList.contains('annot-handle')) {
+      S.sel = Number(t.getAttribute('data-box'));
+      S.drag = { mode: 'resize', handle: t.getAttribute('data-handle'), orig: { ...S.boxes[S.sel] } };
+    } else if (t.hasAttribute && t.hasAttribute('data-box')) {
+      S.sel = Number(t.getAttribute('data-box'));
+      S.drag = { mode: 'move', startX: p0.x, startY: p0.y, orig: { ...S.boxes[S.sel] } };
+      syncCatSelect();
+    } else {
+      // Nowa ramka.
+      const b = { category_id: Number(byId('annot-cat')?.value ?? defaultCat()), x: p0.x, y: p0.y, w: 0, h: 0 };
+      S.boxes.push(b); S.sel = S.boxes.length - 1;
+      S.drag = { mode: 'new', startX: p0.x, startY: p0.y };
+    }
+    drawBoxes();
+  }
+
+  function onMove(ev) {
+    if (!S.drag) return;
+    const p1 = toOrig(ev); const b = S.boxes[S.sel]; if (!b) return;
+    if (S.drag.mode === 'new') {
+      b.x = Math.min(S.drag.startX, p1.x); b.y = Math.min(S.drag.startY, p1.y);
+      b.w = Math.abs(p1.x - S.drag.startX); b.h = Math.abs(p1.y - S.drag.startY);
+    } else if (S.drag.mode === 'move') {
+      const dx = p1.x - S.drag.startX, dy = p1.y - S.drag.startY;
+      b.x = clamp(S.drag.orig.x + dx, 0, S.origW - b.w); b.y = clamp(S.drag.orig.y + dy, 0, S.origH - b.h);
+    } else if (S.drag.mode === 'resize') {
+      const o = S.drag.orig; const h = S.drag.handle;
+      let x1 = o.x, y1 = o.y, x2 = o.x + o.w, y2 = o.y + o.h;
+      if (h.includes('w')) x1 = p1.x; if (h.includes('e')) x2 = p1.x;
+      if (h.includes('n')) y1 = p1.y; if (h.includes('s')) y2 = p1.y;
+      b.x = Math.min(x1, x2); b.y = Math.min(y1, y2); b.w = Math.abs(x2 - x1); b.h = Math.abs(y2 - y1);
+    }
+    S.dirty = true; drawBoxes();
+  }
+
+  function onUp() {
+    if (!S.drag) return;
+    const b = S.boxes[S.sel];
+    if (S.drag.mode === 'new' && b && (b.w < 3 || b.h < 3)) { S.boxes.splice(S.sel, 1); S.sel = -1; } // za mała = anuluj
+    S.drag = null; syncCatSelect(); drawBoxes();
+  }
+
+  function syncCatSelect() { const s = byId('annot-cat'); if (s && S.sel >= 0) s.value = String(S.boxes[S.sel].category_id); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  async function saveAnns() {
+    const btn = byId('annot-save'); btn?.setAttribute('disabled', '');
+    try {
+      const anns = S.boxes.filter((b) => b.w >= 3 && b.h >= 3).map((b) => ({
+        category_id: b.category_id, bbox: [Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)],
+      }));
+      const resp = await ApiBinary.one('mlStudioRecogSaveAnnotationsRequest', {
+        datasetId: S.datasetId, imageId: S.images[S.curIdx].image_id, annotationsJson: JSON.stringify(anns),
+      });
+      if (!resp.ok) throw new Error(resp.error || 'zapis nieudany');
+      S.dirty = false;
+      S.images[S.curIdx].ann_count = anns.length; renderGallery();
+      toast('Anotacje zapisane.', 'success');
+    } catch (err) { toast(`Zapis anotacji: ${err.message}`, 'error'); }
+    finally { btn?.removeAttribute('disabled'); }
+  }
+
+  // Klawisz Delete usuwa zaznaczoną ramkę (gdy zakładka aktywna).
+  const keyHandler = (e) => {
+    if ((e.key === 'Delete' || e.key === 'Backspace') && S.sel >= 0 && byId('annot-svg')) {
+      S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); e.preventDefault();
+    }
+  };
+  document.addEventListener('keydown', keyHandler);
+}
+
+// Zakładka "Schemat" dla recognition: wybór datasetu + wariantu + hiperparametry
+// + start treningu. Po starcie przechodzi w widok LIVE (startRecogLive).
+function renderRecogTrainTab(panel, p, { selectTab }) {
+  const pid = projectId(p);
+  const cfg = getRecogCfg(pid);
+  const variantCards = RECOG_VARIANTS.map((v) => `
+    <button type="button" class="ml-studio-ft-axis-card${cfg.variant === v.id ? ' selected' : ''}"
+            data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.variant === v.id}">
+      <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
+      <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
+    </button>`).join('');
+  const hpInputs = RECOG_HP.map((h) => `
+    <div class="ml-studio-ft-hp-field">
+      <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-recog-hp-${escapeAttr(h.key)}"
+                value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+    </div>`).join('');
+
+  panel.innerHTML = `
+    <div class="ml-studio-ft">
+      <div id="ml-studio-recog-setup">
+        <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('database')} Zbiór treningowy (COCO)</div>
+          <tf-select id="ml-studio-recog-dataset" label="Dataset" placeholder="wybierz zarejestrowany dataset COCO"></tf-select>
+          <div id="ml-studio-recog-classes" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
+        </section>
+        <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('image')} Wariant modelu RF-DETR</div>
+          <div class="ml-studio-ft-axis-grid" id="ml-studio-recog-variants">${variantCards}</div>
+        </section>
+        <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('services')} Węzeł treningu (mesh)
+            <span class="ml-studio-data-hint">trening lokalnie albo na zdalnym węźle (Node B); dataset COCO musi być widoczny na wybranym węźle</span>
+          </div>
+          <tf-select id="ml-studio-recog-node" label="Węzeł"></tf-select>
+        </section>
+        <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+          <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        </section>
+        <div class="ml-studio-ft-actions">
+          <tf-button variant="primary" icon="play" id="ml-studio-recog-run">Uruchom trening</tf-button>
+        </div>
+      </div>
+      <div id="ml-studio-recog-live"></div>
+    </div>
+  `;
+
+  // Lista datasetów COCO do selecta.
+  (async () => {
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+      const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path' || (d.kind || '') === 'coco');
+      const sel = byId('ml-studio-recog-dataset');
+      if (sel) {
+        sel.innerHTML = list.map((d) => `<option value="${escapeAttr(d.datasetId ?? d.dataset_id)}">${escapeHtml(d.name)} (${d.rowCount ?? d.row_count ?? 0} obr.)</option>`).join('');
+        if (list.length) {
+          cfg.datasetId = cfg.datasetId || (list[0].datasetId ?? list[0].dataset_id);
+          sel.value = cfg.datasetId;
+          showRecogClasses(list, cfg.datasetId);
+        }
+      }
+      sel?.addEventListener('change', (e) => {
+        cfg.datasetId = e.detail?.value || sel.value;
+        showRecogClasses(list, cfg.datasetId);
+      });
+    } catch (_) { /* brak datasetów — select pusty */ }
+  })();
+
+  function showRecogClasses(list, dsId) {
+    const d = list.find((x) => (x.datasetId ?? x.dataset_id) === dsId);
+    const box = byId('ml-studio-recog-classes');
+    if (!box || !d) return;
+    let prof = d.profileJson ?? d.profile_json;
+    try { prof = typeof prof === 'string' ? JSON.parse(prof) : prof; } catch (_) { prof = null; }
+    const classes = (prof && prof.classes) || [];
+    const splits = (prof && prof.splits) || [];
+    box.innerHTML = classes.length
+      ? `${sprite('info')} ${classes.length} klas: ${classes.map(escapeHtml).join(', ')} · splity: ${splits.map(escapeHtml).join('/')}`
+      : '';
+  }
+
+  // Lista węzłów mesh do wyboru miejsca treningu (lokalnie / Node B).
+  (async () => {
+    const nodeSel = byId('ml-studio-recog-node');
+    if (!nodeSel) return;
+    const opts = [{ value: '', label: 'Lokalnie (ten węzeł)' }];
+    try {
+      const resp = await ApiBinary.one('meshNodeListRequest');
+      for (const n of (resp.nodes || [])) {
+        const id = String(n.nodeId ?? n.node_id ?? '');
+        if (id) opts.push({ value: id, label: `${n.hostname || id.slice(0, 12)} (zdalny)` });
+      }
+    } catch (_) { /* brak mesh — tylko lokalnie */ }
+    if (typeof nodeSel.setOptions === 'function') nodeSel.setOptions(opts, '');
+    else nodeSel.innerHTML = opts.map((o) => `<option value="${escapeAttr(o.value)}">${escapeHtml(o.label)}</option>`).join('');
+    nodeSel.addEventListener('change', (e) => { cfg.targetNodeId = e.detail?.value || nodeSel.value || ''; });
+  })();
+
+  byId('ml-studio-recog-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      cfg.variant = card.getAttribute('data-variant');
+      panel.querySelectorAll('#ml-studio-recog-variants .ml-studio-ft-axis-card').forEach((c) => {
+        const on = c === card;
+        c.classList.toggle('selected', on);
+        c.setAttribute('aria-pressed', String(on));
+      });
+    });
+  });
+  for (const h of RECOG_HP) {
+    byId('ml-studio-recog-hp-' + h.key)?.addEventListener('input', (e) => {
+      const v = Number(e.target.value);
+      if (Number.isFinite(v)) cfg.hyperparams[h.key] = v;
+    });
+  }
+
+  byId('ml-studio-recog-run')?.addEventListener('click', async () => {
+    if (!cfg.datasetId) { toast('Wybierz zarejestrowany dataset COCO.', 'error'); return; }
+    const btn = byId('ml-studio-recog-run');
+    btn?.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
+        projectId: pid,
+        datasetId: cfg.datasetId,
+        variant: cfg.variant,
+        targetNodeId: cfg.targetNodeId || '',
+        hyperparams: {
+          epochs: cfg.hyperparams.epochs,
+          batchSize: cfg.hyperparams.batchSize,
+          gradAccum: cfg.hyperparams.gradAccum,
+          learningRate: cfg.hyperparams.learningRate,
+          resolution: cfg.hyperparams.resolution,
+          earlyStopping: cfg.earlyStopping,
+        },
+      });
+      const runId = resp.runId ?? resp.run_id;
+      if (!runId) throw new Error('Backend nie zwrócił runId.');
+      const setup = byId('ml-studio-recog-setup');
+      if (setup) setup.hidden = true;
+      startRecogLive(byId('ml-studio-recog-live'), runId, { selectTab });
+    } catch (err) {
+      btn?.removeAttribute('disabled');
+      toast(`Start treningu: ${err.message}`, 'error');
+    }
+  });
+}
+
+// Widok LIVE treningu detekcji + polling (reużywa ftPollTimer/stopFtPolling).
+// Formatuje liczbę bajtów do czytelnej jednostki (B/KB/MB/GB).
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+// Prędkość transferu (bajty/s) → czytelne /s.
+function fmtRate(bps) {
+  const r = Number(bps) || 0;
+  return r > 0 ? `${fmtBytes(r)}/s` : '—';
+}
+
+function startRecogLive(host, runId, { selectTab }) {
+  if (!host) return;
+  stopFtPolling();
+  host.innerHTML = `
+    <section class="ml-studio-data-card ml-studio-ft-live">
+      <div class="ml-studio-data-head">${sprite('cpu')} Trening detekcji na żywo
+        <span class="ml-studio-ft-status" id="ml-studio-recog-badge"><tf-badge tone="warning" value="trening trwa"></tf-badge></span>
+      </div>
+      <div class="ml-studio-ft-progress">
+        <div class="ml-studio-ft-progress-meta" id="ml-studio-recog-meta">epoka 0</div>
+        <tf-progress-bar id="ml-studio-recog-bar" value="0" tone="accent"></tf-progress-bar>
+      </div>
+      <div class="ml-studio-ft-kpi-grid" id="ml-studio-recog-kpi"></div>
+      <div class="ml-studio-ft-chart-wrap">
+        <div class="ml-studio-ft-chart-head">
+          <span class="ml-studio-ft-chart-title">Krzywa: train loss + mAP@50</span>
+          <span class="ml-studio-ft-chart-legend">
+            <span class="lg"><span class="sw train"></span>train loss</span>
+            <span class="lg"><span class="sw eval"></span>mAP@50</span>
+          </span>
+        </div>
+        <div id="ml-studio-recog-chart"></div>
+      </div>
+      <div class="ml-studio-ft-done" id="ml-studio-recog-done" hidden></div>
+    </section>
+  `;
+
+  const renderStatus = (st) => {
+    const status = String(st.status || 'running');
+    // Faza transferu datasetu przez mesh (trening na zdalnym węźle B): pasek
+    // postępu z prędkością B/s. Błąd dopiero przy stallu (po stronie Core).
+    if (status === 'syncing') {
+      const syncPhase = String(st.syncPhase ?? st.sync_phase ?? 'syncing');
+      const sent = Number(st.syncBytesSent ?? st.sync_bytes_sent ?? 0);
+      const tot = Number(st.syncBytesTotal ?? st.sync_bytes_total ?? 0);
+      const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
+      const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
+      const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
+        : syncPhase === 'starting' ? 'uruchamianie treningu na węźle'
+        : 'transfer datasetu przez mesh';
+      const meta = byId('ml-studio-recog-meta');
+      const bar = byId('ml-studio-recog-bar');
+      if (meta) {
+        meta.innerHTML = syncPhase === 'syncing'
+          ? `${phaseLabel} · ${fmtBytes(sent)} / ${fmtBytes(tot)} · ${pct}% · ${fmtRate(rate)}`
+          : `<tf-spinner size="sm"></tf-spinner> ${phaseLabel}`;
+      }
+      if (bar) bar.setAttribute('value', String(pct));
+      const kpi = byId('ml-studio-recog-kpi');
+      if (kpi) {
+        kpi.innerHTML = `
+          <div class="ml-studio-ft-kpi"><div class="lbl">wysłano</div><div class="val">${fmtBytes(sent)}</div></div>
+          <div class="ml-studio-ft-kpi"><div class="lbl">rozmiar</div><div class="val">${fmtBytes(tot)}</div></div>
+          <div class="ml-studio-ft-kpi"><div class="lbl">prędkość</div><div class="val">${fmtRate(rate)}</div></div>
+        `;
+      }
+      const chart = byId('ml-studio-recog-chart');
+      if (chart) chart.innerHTML = `<div class="ml-studio-ft-sync-note">${sprite('cloud')} Dataset przenoszony na węzeł treningowy przez mesh. Trening ruszy po zmaterializowaniu danych.</div>`;
+      const badge = byId('ml-studio-recog-badge');
+      if (badge) badge.innerHTML = '<tf-badge tone="info" value="transfer danych"></tf-badge>';
+      return;
+    }
+    const epoch = Number(st.epoch ?? 0);
+    const total = Number(st.totalEpochs ?? st.total_epochs ?? 0);
+    const loss = st.trainLoss ?? st.train_loss;
+    const map50 = st.map50;
+    const curve = Array.isArray(st.curve) ? st.curve : [];
+    const meta = byId('ml-studio-recog-meta');
+    const bar = byId('ml-studio-recog-bar');
+    if (total > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((epoch / total) * 100)));
+      if (meta) meta.textContent = `epoka ${epoch} / ${total} · ${pct}%`;
+      if (bar) bar.setAttribute('value', String(pct));
+    } else if (meta) {
+      meta.innerHTML = `<tf-spinner size="sm"></tf-spinner> trwa — epoka ${epoch}`;
+    }
+    const kpi = byId('ml-studio-recog-kpi');
+    if (kpi) {
+      kpi.innerHTML = `
+        <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${loss != null ? Number(loss).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">mAP@50</div><div class="val">${map50 != null ? Number(map50).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">epoka</div><div class="val">${epoch}${total > 0 ? ' / ' + total : ''}</div></div>
+      `;
+    }
+    const chart = byId('ml-studio-recog-chart');
+    if (chart) chart.innerHTML = renderRecogChart(curve);
+    const badge = byId('ml-studio-recog-badge');
+    if (badge) {
+      if (status === 'succeeded') badge.innerHTML = '<tf-badge tone="success" value="zakończony"></tf-badge>';
+      else if (status === 'failed') badge.innerHTML = '<tf-badge tone="danger" value="błąd"></tf-badge>';
+      else badge.innerHTML = '<tf-badge tone="warning" value="trening trwa"></tf-badge>';
+    }
+    if (status === 'succeeded') {
+      stopFtPolling();
+      const done = byId('ml-studio-recog-done');
+      if (done) {
+        done.hidden = false;
+        done.innerHTML = `<div class="ml-studio-ft-done-msg">${sprite('check')} Trening zakończony — model w zakładce „Modele".</div>
+          <tf-button variant="outline" icon="layers" id="ml-studio-recog-goto-models">Przejdź do Modele</tf-button>`;
+        byId('ml-studio-recog-goto-models')?.addEventListener('click', () => selectTab && selectTab('Modele'));
+      }
+      toast('Trening detekcji zakończony.', 'success');
+    } else if (status === 'failed') {
+      stopFtPolling();
+      toast(`Trening nieudany: ${st.error || 'nieznany błąd'}`, 'error');
+      const done = byId('ml-studio-recog-done');
+      if (done) { done.hidden = false; done.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(st.error || 'Trening zakończył się błędem.')}</div>`; }
+    }
+  };
+
+  const poll = async () => {
+    try {
+      const st = await ApiBinary.one('mlStudioRecogTrainStatusRequest', { runId });
+      renderStatus(st);
+    } catch (err) {
+      stopFtPolling();
+      toast(`Polling statusu: ${err.message}`, 'error');
+    }
+  };
+  poll();
+  ftPollTimer = setInterval(poll, 2500);
+}
+
+// Krzywa detekcji: oś X = epoka, lewa seria = train loss, prawa = mAP@50.
+// Obie serie skalowane niezależnie do własnego min/max (różne jednostki).
+function renderRecogChart(curve) {
+  const points = (curve || [])
+    .map((c) => ({ epoch: Number(c.epoch ?? 0), loss: c.trainLoss ?? c.train_loss, map: c.map50 }))
+    .filter((c) => Number.isFinite(c.epoch));
+  if (points.length < 2) {
+    return '<div class="ml-studio-ft-chart-empty">Krzywa pojawi się po pierwszych epokach treningu.</div>';
+  }
+  const W = 600, H = 220, padX = 8, padY = 12;
+  const epochs = points.map((p) => p.epoch);
+  const minE = Math.min(...epochs), maxE = Math.max(...epochs);
+  const spanE = maxE - minE || 1;
+  const x = (e) => padX + ((e - minE) / spanE) * (W - 2 * padX);
+  const scale = (vals) => {
+    const fin = vals.filter(Number.isFinite);
+    const lo = fin.length ? Math.min(...fin) : 0;
+    const hi = fin.length ? Math.max(...fin) : 1;
+    const span = hi - lo || 1;
+    return (v) => padY + (1 - (v - lo) / span) * (H - 2 * padY);
+  };
+  const yLoss = scale(points.map((p) => p.loss));
+  const yMap = scale(points.map((p) => p.map));
+  const pathFor = (sel, yf) => {
+    const segs = []; let started = false;
+    for (const p of points) {
+      const v = sel(p);
+      if (!Number.isFinite(v)) continue;
+      segs.push(`${started ? 'L' : 'M'}${x(p.epoch).toFixed(1)},${yf(v).toFixed(1)}`);
+      started = true;
+    }
+    return segs.join(' ');
+  };
+  const lossPath = pathFor((p) => p.loss, yLoss);
+  const mapPath = pathFor((p) => p.map, yMap);
+  const grid = [40, 100, 160].map((gy) => `<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" class="grid"/>`).join('');
+  return `
+    <svg class="ml-studio-ft-loss-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Krzywa treningu detekcji">
+      <g>${grid}</g>
+      ${lossPath ? `<path class="line train" d="${lossPath}"/>` : ''}
+      ${mapPath ? `<path class="line eval" d="${mapPath}"/>` : ''}
+    </svg>
+  `;
+}
+
+// =============================================================================
+// Zakładka "Modele" — lista wytrenowanych modeli projektu (wszystkie typy).
+// Pusto → tf-empty-state; inaczej tf-table z metrykami z metricsJson.
+// =============================================================================
+
+// Wyciąga skrótowe metryki z metricsJson modelu (np. "acc 0.94" / "loss 1.2").
+// Zwraca pusty string, gdy JSON nie zawiera znanych pól — wtedy kolumna pokaże "—".
+function modelMetricsSummary(metricsJson) {
+  if (!metricsJson) return '';
+  let m = metricsJson;
+  if (typeof m === 'string') {
+    try { m = JSON.parse(m); } catch (_) { return ''; }
+  }
+  if (!m || typeof m !== 'object') return '';
+  const parts = [];
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const acc = num(m.accuracy ?? m.acc);
+  const f1 = num(m.f1 ?? m.f1_score ?? m.f1Score);
+  const loss = num(m.train_loss ?? m.trainLoss ?? m.eval_loss ?? m.evalLoss ?? m.loss);
+  if (acc != null) parts.push(`acc ${acc.toFixed(2)}`);
+  if (f1 != null) parts.push(`f1 ${f1.toFixed(2)}`);
+  if (loss != null) parts.push(`loss ${loss.toFixed(2)}`);
+  return parts.join(' · ');
+}
+
+function renderModelsTab(panel, p) {
+  const pid = projectId(p);
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioModelsListRequest', { projectId: pid })
+    .then((resp) => {
+      const models = Array.isArray(resp.models) ? resp.models : [];
+      panel.innerHTML = '';
+      if (!models.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'catalog');
+        empty.setAttribute('title', 'Brak modeli');
+        empty.setAttribute('message', 'Brak modeli — pojawią się po udanym treningu.');
+        panel.appendChild(empty);
+        return;
+      }
+      const card = document.createElement('div');
+      card.className = 'ml-studio-section-card';
+      card.innerHTML = `
+        <div class="ml-studio-section-card-head">
+          <div class="title">${sprite('catalog')} Modele <span class="ml-studio-section-sub">— wytrenowane wersje w projekcie</span></div>
+        </div>
+        <div id="ml-studio-models-table"></div>
+      `;
+      panel.appendChild(card);
+
+      const table = document.createElement('tf-table');
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="model" label="Model"></tf-column>
+        <tf-column key="framework" label="Silnik"></tf-column>
+        <tf-column key="baseModel" label="Model bazowy"></tf-column>
+        <tf-column key="status" label="Status" renderer="html"></tf-column>
+        <tf-column key="metrics" label="Metryki"></tf-column>
+        <tf-column key="createdAt" label="Utworzony"></tf-column>
+      `;
+      table.rows = models.map((m) => {
+        const b = runBadge(m.status);
+        const metrics = modelMetricsSummary(m.metricsJson ?? m.metrics_json);
+        const modelId = String(m.modelId ?? m.model_id ?? '');
+        const baseModel = String(m.baseModel ?? m.base_model ?? '');
+        const modelName = String(m.name ?? (modelId || '—'));
+        return {
+          model: modelName,
+          framework: String(m.framework ?? '—') || '—',
+          baseModel: baseModel || '—',
+          status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+          metrics: metrics || '—',
+          createdAt: formatRelative(m.createdAt ?? m.created_at),
+          // Pola pomocnicze do buildera akcji (nie kolumny — tf-table ich nie renderuje).
+          _modelId: modelId,
+          _modelName: modelName,
+          // Model detekcji (RF-DETR) → akcja „Wykryj"; model FT (adapter, niepuste
+          // baseModel) → „Eksportuj GGUF"; tabularne → brak akcji.
+          _isRecog: String(m.framework ?? '') === 'rfdetr',
+          _canExport: Boolean(modelId && baseModel.trim().length > 0 && String(m.framework ?? '') !== 'rfdetr'),
+        };
+      });
+      // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
+      // handlerem klika — działa w shadow DOM (delegacja z light DOM by nie złapała).
+      table.rowActions = (row) => {
+        if (!row) return null;
+        if (row._isRecog) {
+          const btn = document.createElement('tf-button');
+          btn.setAttribute('size', 'sm');
+          btn.setAttribute('variant', 'outline');
+          btn.setAttribute('icon', 'image');
+          btn.textContent = 'Wykryj na zdjęciu';
+          btn.addEventListener('click', () => openRecogDetectPanel(p, row._modelId, row._modelName));
+          return btn;
+        }
+        if (!row._canExport) return null;
+        const btn = document.createElement('tf-button');
+        btn.setAttribute('size', 'sm');
+        btn.setAttribute('variant', 'outline');
+        btn.setAttribute('icon', 'package');
+        btn.textContent = 'Eksportuj GGUF';
+        btn.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+        return btn;
+      };
+      const tableHost = byId('ml-studio-models-table');
+      tableHost?.appendChild(table);
+    })
+    .catch((err) => {
+      panel.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać modeli');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      panel.appendChild(empty);
+    });
+}
+
+// Detekcja na zdjęciu modelem RF-DETR (R4). Modal: upload małego obrazu +
+// próg → mlStudioRecogDetectRequest → lista detekcji + nakładka bboxów na obraz.
+function openRecogDetectPanel(p, modelId, modelName) {
+  if (!modelId) return;
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', `Detekcja — ${modelName}`);
+  modal.setAttribute('size', 'lg');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Wgraj zdjęcie (do ~0,9 MB) — model wykryje obiekty i zwróci klasy + ramki. Większe zdjęcia: zmniejsz przed wgraniem.</p>
+      <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px">
+        <tf-file-input id="ml-studio-detect-file" accept="image/*" label="Zdjęcie do detekcji" style="flex:1;min-width:240px"></tf-file-input>
+        <tf-input type="number" id="ml-studio-detect-threshold" label="Próg pewności" value="0.5" min="0" max="1" step="0.05" style="width:140px"></tf-input>
+      </div>
+      <div id="ml-studio-detect-result"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-detect-close>Zamknij</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  // tf-modal pokazuje backdrop/kartę tylko z atrybutem `open` (tf-modal.js:123).
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-detect-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+
+  const fileInput = modal.querySelector('#ml-studio-detect-file');
+  fileInput?.addEventListener('change', async (e) => {
+    const files = e.detail?.files;
+    const file = files && files.length ? files[0] : null;
+    if (!file) return;
+    const result = modal.querySelector('#ml-studio-detect-result');
+    if (file.size > 900 * 1024) {
+      if (result) result.innerHTML = '<div class="ml-studio-ft-done-msg error">Zdjęcie za duże (limit ~0,9 MB). Zmniejsz je i spróbuj ponownie.</div>';
+      return;
+    }
+    if (result) result.innerHTML = '<tf-spinner></tf-spinner> detekcja…';
+    try {
+      const buf = await file.arrayBuffer();
+      const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const threshold = Number(modal.querySelector('#ml-studio-detect-threshold')?.value ?? 0.5);
+      const resp = await ApiBinary.one('mlStudioRecogDetectRequest', { modelId, threshold, imageB64: b64 });
+      if (resp.error) throw new Error(resp.error);
+      let dets = [];
+      try { dets = JSON.parse(resp.detectionsJson ?? resp.detections_json ?? '[]'); } catch (_) { dets = []; }
+      renderDetections(result, b64, file.type, dets, resp.width, resp.height);
+    } catch (err) {
+      if (result) result.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Detekcja nieudana: ${escapeHtml(err.message || String(err))}</div>`;
+    }
+  });
+}
+
+// Render detekcji: obraz z nałożonymi ramkami (SVG overlay) + lista klas.
+function renderDetections(host, b64, mime, dets, width, height) {
+  if (!host) return;
+  if (!dets.length) {
+    host.innerHTML = '<div class="ml-studio-ft-done-msg">Brak detekcji powyżej progu — obniż próg pewności i spróbuj ponownie.</div>';
+    return;
+  }
+  const W = width || 1000, H = height || 1000;
+  const boxes = dets.map((d, i) => {
+    const [x1, y1, x2, y2] = d.bbox_xyxy || d.bboxXyxy || [0, 0, 0, 0];
+    const hue = (i * 67) % 360;
+    return `<rect x="${x1}" y="${y1}" width="${Math.max(0, x2 - x1)}" height="${Math.max(0, y2 - y1)}"
+      fill="none" stroke="hsl(${hue} 90% 55%)" stroke-width="${Math.max(2, W / 300)}"/>
+      <text x="${x1}" y="${Math.max(12, y1 - 4)}" fill="hsl(${hue} 90% 55%)" font-size="${Math.max(12, W / 50)}" font-weight="700">${escapeHtml(d.class_name ?? d.className ?? '')} ${(Number(d.score) * 100).toFixed(0)}%</text>`;
+  }).join('');
+  const list = dets.map((d) => `<li><strong>${escapeHtml(d.class_name ?? d.className ?? '')}</strong> — ${(Number(d.score) * 100).toFixed(1)}%</li>`).join('');
+  host.innerHTML = `
+    <div style="position:relative;max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden">
+      <img src="data:${mime || 'image/jpeg'};base64,${b64}" style="display:block;width:100%;height:auto"/>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%">${boxes}</svg>
+    </div>
+    <div class="ml-studio-data-head" style="margin-top:10px">${sprite('check')} Wykryto ${dets.length} obiektów</div>
+    <ul class="ml-studio-detect-list">${list}</ul>
+  `;
+}
+
+// =============================================================================
+// Eksport modelu FT do GGUF (f03). Modal: wybór outtype (f16 / q8_0), start
+// async przez mlStudioFtExportRequest, polling co 2s mlStudioFtExportStatusRequest,
+// na końcu ścieżka + rozmiar pliku. Interwał czyszczony przy zamknięciu modala
+// oraz w unmount/przy zmianie zakładki (stopFtExportPolling).
+// =============================================================================
+function openFtExportPanel(p, modelId, modelName) {
+  if (!modelId) return;
+  stopFtExportPolling();
+
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('size', 'md');
+  modal.setAttribute('title', `Eksport do GGUF — ${modelName || modelId}`);
+
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body');
+  body.className = 'ml-studio-export-body';
+
+  const footer = document.createElement('div');
+  footer.setAttribute('slot', 'footer');
+  footer.className = 'ml-studio-export-footer';
+
+  modal.appendChild(body);
+  modal.appendChild(footer);
+
+  // Sprzątanie pollingu przy każdym zamknięciu modala (ESC, backdrop, krzyżyk).
+  modal.addEventListener('close', () => {
+    stopFtExportPolling();
+    modal.remove();
+  }, { once: true });
+
+  // Zamknięcie z przycisków footera — zdejmuje atrybut i emituje 'close',
+  // żeby zadziałał wspólny handler sprzątający (tf-modal nie ma publicznego close()).
+  const closeModal = () => {
+    modal.removeAttribute('open');
+    modal.dispatchEvent(new CustomEvent('close', { bubbles: true }));
+  };
+
+  // Widok 1: wybór formatu kwantyzacji + akcja startu eksportu.
+  const renderForm = () => {
+    body.innerHTML = `
+      <p class="ml-studio-export-intro">Wybierz precyzję pliku GGUF. Adapter LoRA zostanie scalony z modelem bazowym i przekonwertowany do jednego pliku <code>.gguf</code> gotowego dla llama.cpp.</p>
+      <tf-radio-group id="ml-studio-export-outtype" name="ml-studio-export-outtype" value="q4_k_m">
+        <tf-radio value="q4_k_m" label="GGUF Q4_K_M (4-bit)" hint="Najmniejszy plik dobrej jakości — zalecane do deployu."></tf-radio>
+        <tf-radio value="q5_k_m" label="GGUF Q5_K_M (5-bit)" hint="Większy niż Q4, lepsza jakość."></tf-radio>
+        <tf-radio value="q6_k" label="GGUF Q6_K (6-bit)" hint="Bliski q8_0 jakością, mniejszy plik."></tf-radio>
+        <tf-radio value="q8_0" label="GGUF q8_0 (8-bit)" hint="Nieznaczna utrata jakości, większy plik."></tf-radio>
+        <tf-radio value="f16" label="GGUF f16 (pełna precyzja)" hint="Największy plik, bez utraty jakości względem wag bazowych."></tf-radio>
+      </tf-radio-group>
+    `;
+    footer.innerHTML = `
+      <tf-button variant="ghost" data-export-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="package" id="ml-studio-export-start">Eksportuj do GGUF</tf-button>
+    `;
+    footer.querySelector('[data-export-close]')?.addEventListener('click', () => closeModal());
+    byId('ml-studio-export-start')?.addEventListener('click', startExport);
+  };
+
+  // Widok 2: postęp scalania + konwersji (spinner), polling w tle.
+  const renderProgress = () => {
+    body.innerHTML = `
+      <div class="ml-studio-export-progress">
+        <tf-spinner size="md"></tf-spinner>
+        <div class="ml-studio-export-progress-text">Eksportowanie — scalanie adaptera i konwersja do GGUF…</div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" data-export-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-export-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  // Widok 3: wynik — ścieżka pliku na węźle + rozmiar + akcja deployu do inferencji.
+  const renderResult = (st) => {
+    const ggufPath = String(st.ggufPath ?? st.gguf_path ?? '');
+    const size = formatFileSize(st.sizeBytes ?? st.size_bytes);
+    body.innerHTML = `
+      <div class="ml-studio-export-result">
+        <div class="ml-studio-export-result-head">
+          ${sprite('check')} <span>Eksport zakończony</span>
+          <tf-badge tone="success" value="Gotowe"></tf-badge>
+        </div>
+        <div class="ml-studio-export-result-row">
+          <span class="lbl">Plik GGUF</span>
+          <span class="ml-studio-mono ml-studio-export-path">${escapeHtml(ggufPath || '—')}</span>
+        </div>
+        <div class="ml-studio-export-result-row">
+          <span class="lbl">Rozmiar</span>
+          <span class="val">${size}</span>
+        </div>
+        <p class="ml-studio-export-note">Plik GGUF zapisany na węźle — gotowy do pobrania/deployu.</p>
+        <div class="ml-studio-export-deploy" id="ml-studio-export-deploy"></div>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="primary" data-export-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-export-close]')?.addEventListener('click', () => closeModal());
+    renderDeployIdle();
+  };
+
+  // Sekcja deployu wewnątrz widoku wyniku — stan początkowy z przyciskiem.
+  const renderDeployIdle = () => {
+    const slot = byId('ml-studio-export-deploy');
+    if (!slot) return;
+    slot.innerHTML = `
+      <tf-button variant="primary" icon="cpu" id="ml-studio-export-deploy-btn">Deploy do inferencji</tf-button>
+    `;
+    byId('ml-studio-export-deploy-btn')?.addEventListener('click', startDeploy);
+  };
+
+  // Stan w trakcie wdrażania — spinner, przycisk zablokowany przez podmianę widoku.
+  const renderDeploying = () => {
+    const slot = byId('ml-studio-export-deploy');
+    if (!slot) return;
+    slot.innerHTML = `
+      <div class="ml-studio-export-deploy-progress">
+        <tf-spinner size="sm"></tf-spinner>
+        <span>Wdrażanie modelu do inferencji…</span>
+      </div>
+    `;
+  };
+
+  // Sukces wdrożenia — nazwa modelu (mono) + jak go odpytać.
+  const renderDeploySuccess = (name) => {
+    const slot = byId('ml-studio-export-deploy');
+    if (!slot) return;
+    const safe = escapeHtml(name || modelName || modelId);
+    slot.innerHTML = `
+      <div class="ml-studio-export-deploy-ok">
+        ${sprite('check')} <span>Model wdrożony do inferencji jako «<code class="ml-studio-mono">${safe}</code>». Możesz go odpytać przez API <code class="ml-studio-mono">/v1</code> lub w czacie (model: <code class="ml-studio-mono">${safe}</code>).</span>
+      </div>
+    `;
+  };
+
+  // Błąd wdrożenia — komunikat + ponowienie akcji.
+  const renderDeployError = (message) => {
+    const slot = byId('ml-studio-export-deploy');
+    if (!slot) return;
+    slot.innerHTML = `
+      <div class="ml-studio-export-deploy-error">
+        ${sprite('alert')} <span>Wdrożenie nieudane: ${escapeHtml(message || 'nieznany błąd.')}</span>
+      </div>
+      <tf-button variant="ghost" icon="cpu" id="ml-studio-export-deploy-btn">Spróbuj ponownie</tf-button>
+    `;
+    byId('ml-studio-export-deploy-btn')?.addEventListener('click', startDeploy);
+  };
+
+  // Wdrożenie wytrenowanego modelu jako serwis inferencji llama.cpp.
+  // Start jest synchroniczny — status "deploying" w odpowiedzi = serwis ruszył OK.
+  const startDeploy = async () => {
+    const btn = byId('ml-studio-export-deploy-btn');
+    if (btn) btn.setAttribute('disabled', '');
+    renderDeploying();
+    try {
+      const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId });
+      const status = String(resp?.status || '');
+      if (status === 'deploying') {
+        renderDeploySuccess(resp?.modelName);
+      } else {
+        const msg = String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia.';
+        toast(msg, 'error');
+        renderDeployError(msg);
+      }
+    } catch (err) {
+      const msg = err.message || 'Nie udało się wdrożyć modelu.';
+      toast(msg, 'error');
+      renderDeployError(msg);
+    }
+  };
+
+  const renderError = (message) => {
+    body.innerHTML = `
+      <div class="ml-studio-export-error">
+        ${sprite('alert')} <span>${escapeHtml(message || 'Eksport nie powiódł się.')}</span>
+      </div>
+    `;
+    footer.innerHTML = `<tf-button variant="ghost" data-export-close>Zamknij</tf-button>`;
+    footer.querySelector('[data-export-close]')?.addEventListener('click', () => closeModal());
+  };
+
+  // Polling statusu co 2s — kończy się na succeeded/failed (czyści interwał).
+  const startPolling = () => {
+    stopFtExportPolling();
+    const poll = async () => {
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioFtExportStatusRequest', { modelId });
+      } catch (err) {
+        stopFtExportPolling();
+        renderError(err.message || 'Błąd protokołu ML Studio.');
+        return;
+      }
+      const status = String(st.status || 'running');
+      if (status === 'succeeded') {
+        stopFtExportPolling();
+        renderResult(st);
+      } else if (status === 'failed') {
+        stopFtExportPolling();
+        const msg = String(st.error ?? '') || 'Eksport nie powiódł się.';
+        toast(msg, 'error');
+        renderError(msg);
+      }
+    };
+    ftExportPollTimer = setInterval(poll, 2000);
+    poll();
+  };
+
+  const startExport = async () => {
+    const outtype = byId('ml-studio-export-outtype')?.value || 'q8_0';
+    const startBtn = byId('ml-studio-export-start');
+    if (startBtn) startBtn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('mlStudioFtExportRequest', { modelId, outtype });
+      if (String(resp?.status || '') === 'running') {
+        renderProgress();
+        startPolling();
+      } else {
+        renderError('Nieoczekiwany stan eksportu.');
+      }
+    } catch (err) {
+      if (startBtn) startBtn.removeAttribute('disabled');
+      toast(err.message || 'Nie udało się uruchomić eksportu.', 'error');
+    }
+  };
+
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  renderForm();
+}
+
+// =============================================================================
+// Zakładka "Treningi" — historia jobów treningowych projektu. Klik w wiersz
+// pokazuje pod tabelą KPI wybranego runa i krzywą loss z metrics_history
+// (mlStudioFtTrainStatusRequest działa dla KAŻDEGO runa, też zakończonego).
+// =============================================================================
+
+function renderRunsTab(panel, p) {
+  const pid = projectId(p);
+  panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioTrainingRunsListRequest', { projectId: pid })
+    .then((resp) => {
+      const runs = Array.isArray(resp.runs) ? resp.runs : [];
+      panel.innerHTML = '';
+      if (!runs.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'brain');
+        empty.setAttribute('title', 'Brak treningów');
+        empty.setAttribute('message', 'Brak treningów — uruchom job w zakładce Trenuj/Trening.');
+        panel.appendChild(empty);
+        return;
+      }
+
+      const card = document.createElement('div');
+      card.className = 'ml-studio-section-card';
+      card.innerHTML = `
+        <div class="ml-studio-section-card-head">
+          <div class="title">${sprite('clock')} Treningi <span class="ml-studio-section-sub">— kliknij wiersz, aby zobaczyć krzywą loss</span></div>
+        </div>
+        <div id="ml-studio-runs-table"></div>
+      `;
+      panel.appendChild(card);
+
+      // Sekcja szczegółów wybranego runa — wypełniana po kliknięciu wiersza.
+      const detail = document.createElement('div');
+      detail.id = 'ml-studio-run-detail';
+      detail.hidden = true;
+      panel.appendChild(detail);
+
+      const table = document.createElement('tf-table');
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="run" label="Run" renderer="html"></tf-column>
+        <tf-column key="status" label="Status" renderer="html"></tf-column>
+        <tf-column key="started" label="Start"></tf-column>
+        <tf-column key="finished" label="Koniec"></tf-column>
+      `;
+      table.rows = runs.map((r) => {
+        const runId = String(r.runId ?? r.run_id ?? '');
+        const b = runBadge(r.status);
+        const finished = r.finishedAt ?? r.finished_at;
+        return {
+          runId,
+          run: `<span class="ml-studio-mono">${escapeHtml(runId.slice(0, 8) || '—')}</span>`,
+          status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+          started: formatRelative(r.startedAt ?? r.started_at),
+          finished: finished ? formatRelative(finished) : '—',
+        };
+      });
+      table.addEventListener('row-click', (e) => {
+        const runId = e.detail?.row?.runId;
+        if (runId) renderRunDetail(detail, runId);
+      });
+      byId('ml-studio-runs-table')?.appendChild(table);
+    })
+    .catch((err) => {
+      panel.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać treningów');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      panel.appendChild(empty);
+    });
+}
+
+// Szczegóły wybranego runa: status + KPI (train/eval loss, krok) + krzywa loss.
+// Reużywa renderLossChart (ten sam helper co live trening FT).
+function renderRunDetail(host, runId) {
+  host.hidden = false;
+  host.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+  ApiBinary.one('mlStudioFtTrainStatusRequest', { runId })
+    .then((st) => {
+      const status = String(st.status || 'running');
+      const step = Number(st.step ?? 0);
+      const totalSteps = Number(st.totalSteps ?? st.total_steps ?? 0);
+      const trainLoss = st.trainLoss ?? st.train_loss;
+      const evalLoss = st.evalLoss ?? st.eval_loss;
+      const curve = Array.isArray(st.lossCurve ?? st.loss_curve) ? (st.lossCurve ?? st.loss_curve) : [];
+      const b = runBadge(status);
+      host.innerHTML = `
+        <div class="ml-studio-section-card">
+          <div class="ml-studio-section-card-head">
+            <div class="title">${sprite('brain')} Run <span class="ml-studio-mono">${escapeHtml(String(runId).slice(0, 8))}</span> <tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge></div>
+          </div>
+          <div class="ml-studio-ft-kpi-grid">
+            <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${trainLoss != null ? Number(trainLoss).toFixed(4) : '—'}</div></div>
+            <div class="ml-studio-ft-kpi"><div class="lbl">eval loss</div><div class="val">${evalLoss != null ? Number(evalLoss).toFixed(4) : '—'}</div></div>
+            <div class="ml-studio-ft-kpi"><div class="lbl">krok</div><div class="val">${step}${totalSteps > 0 ? ' / ' + totalSteps : ''}</div></div>
+          </div>
+          <div class="ml-studio-ft-chart-wrap">
+            <div class="ml-studio-ft-chart-head">
+              <span class="ml-studio-ft-chart-title">Krzywa loss</span>
+              <span class="ml-studio-ft-chart-legend">
+                <span class="lg"><span class="sw train"></span>train</span>
+                <span class="lg"><span class="sw eval"></span>eval</span>
+              </span>
+            </div>
+            ${renderLossChart(curve)}
+          </div>
+        </div>
+      `;
+    })
+    .catch((err) => {
+      host.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'alert');
+      empty.setAttribute('title', 'Nie udało się wczytać szczegółów');
+      empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+      host.appendChild(empty);
+    });
+}
+
 // Per-tab state lives on the panel element so re-entering the tab starts clean
 // and concurrent projects never cross-talk.
 function renderTrainTab(panel, pid) {
@@ -949,18 +3396,35 @@ function renderTrainContent(panel, pid, datasets) {
       </section>
 
       <section class="ml-studio-data-card">
-        <div class="ml-studio-data-head">${sprite('cpu')} Silnik treningu</div>
-        <div class="ml-studio-train-engine">
-          <div class="ml-studio-train-engine-ico">${sprite('cpu')}</div>
-          <div>
-            <div class="ml-studio-train-engine-title">Klasyczny ML (Rust)</div>
-            <p class="ml-studio-train-engine-text">Regresja logistyczna / liniowa + model bazowy (baseline), uczone natywnie w Rust — bez GPU. Cięższy AutoML (AutoGluon) podłączymy w kolejnym plastrze.</p>
-            <div class="ml-studio-train-engine-tags">
-              <tf-chip status="accent" label="Rust"></tf-chip>
-              <tf-chip status="info" label="bez GPU"></tf-chip>
-              <tf-chip status="info" label="baseline"></tf-chip>
+        <div class="ml-studio-data-head">${sprite('cpu')} Silnik treningu
+          <span class="ml-studio-data-hint">wybierz, czym wytrenować model — szybkim silnikiem natywnym albo automatycznym AutoML</span>
+        </div>
+        <div class="ml-studio-train-engine-grid" id="ml-studio-train-engine-grid">
+          <button type="button" class="ml-studio-train-engine-card selected" data-engine="rust" aria-pressed="true">
+            <div class="ml-studio-train-engine-ico">${sprite('cpu')}</div>
+            <div class="ml-studio-train-engine-body">
+              <div class="ml-studio-train-engine-title">Klasyczny ML (Rust)</div>
+              <p class="ml-studio-train-engine-text">Drzewa decyzyjne + regresja (smartcore), uczone natywnie w Rust — szybko, on-device, bez GPU.</p>
+              <div class="ml-studio-train-engine-tags">
+                <tf-chip status="accent" label="Rust"></tf-chip>
+                <tf-chip status="info" label="on-device"></tf-chip>
+                <tf-chip status="info" label="bez GPU"></tf-chip>
+              </div>
             </div>
-          </div>
+          </button>
+          <button type="button" class="ml-studio-train-engine-card" data-engine="autogluon" aria-pressed="false" disabled>
+            <div class="ml-studio-train-engine-ico ml-studio-train-engine-ico-automl">${sprite('sparkle')}</div>
+            <div class="ml-studio-train-engine-body">
+              <div class="ml-studio-train-engine-title">AutoML (AutoGluon)</div>
+              <p class="ml-studio-train-engine-text">Automatyczny ensemble (LightGBM/CatBoost/XGBoost…) z leaderboardem — najwyższa jakość. Python, NVIDIA/CPU.</p>
+              <div class="ml-studio-train-engine-tags">
+                <tf-chip status="accent" label="AutoML"></tf-chip>
+                <tf-chip status="info" label="Python"></tf-chip>
+                <tf-chip status="info" label="GPU/CPU"></tf-chip>
+              </div>
+              <div class="ml-studio-train-engine-hint" id="ml-studio-train-engine-hint" hidden></div>
+            </div>
+          </button>
         </div>
         <div class="ml-studio-train-actions">
           <tf-button variant="primary" icon="play" id="ml-studio-train-run" disabled>Trenuj</tf-button>
@@ -977,8 +3441,10 @@ function renderTrainContent(panel, pid, datasets) {
     </div>
   `;
 
-  // Local selection state — datasetId / its profile / chosen target column / task.
-  const state = { datasetId: '', profile: null, target: '', task: 'classification' };
+  // Local selection state — datasetId / its profile / chosen target column / task
+  // / selected training engine ('rust' is always available, 'autogluon' only when
+  // the AutoGluon service is running in the mesh).
+  const state = { datasetId: '', profile: null, target: '', task: 'classification', engine: 'rust' };
 
   const datasetSel = byId('ml-studio-train-dataset');
   const targetSel = byId('ml-studio-train-target');
@@ -1062,7 +3528,69 @@ function renderTrainContent(panel, pid, datasets) {
     if (col) renderTrainCallout(col, state.task);
   });
 
+  setupEnginePicker(state);
+
   runBtn?.addEventListener('click', () => runTraining(pid, state, runBtn));
+}
+
+// Engine availability: AutoGluon runs as a mesh service (engine_id=autogluon-training,
+// category=training). It is selectable only when at least one such service is in the
+// 'running' state. The Rust engine is native and always available. The card stays
+// disabled (with a hint pointing to Serwisy) until availability resolves; the backend
+// still validates `engine`, so a stale/raced state degrades to a toast on Trenuj.
+async function setupEnginePicker(state) {
+  const grid = byId('ml-studio-train-engine-grid');
+  if (!grid) return;
+  const autoCard = grid.querySelector('[data-engine="autogluon"]');
+  const hint = byId('ml-studio-train-engine-hint');
+
+  const select = (engine) => {
+    state.engine = engine;
+    grid.querySelectorAll('.ml-studio-train-engine-card').forEach((card) => {
+      const on = card.dataset.engine === engine;
+      card.classList.toggle('selected', on);
+      card.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  };
+
+  grid.querySelectorAll('.ml-studio-train-engine-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      if (card.hasAttribute('disabled')) return;
+      select(card.dataset.engine);
+    });
+  });
+
+  // Resolve AutoGluon availability from the live service list. On any error we keep
+  // the card disabled with a hint — the user can still train on Rust.
+  try {
+    const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
+    const running = (Array.isArray(services) ? services : []).some((s) =>
+      (s.engine_id || s.engineId || '') === 'autogluon-training'
+      && (s.category || '') === 'training'
+      && (s.status || '').toLowerCase() === 'running');
+    if (running && autoCard) {
+      autoCard.removeAttribute('disabled');
+      if (hint) hint.hidden = true;
+    } else if (autoCard) {
+      autoCard.setAttribute('disabled', '');
+      showEngineHint(hint, 'Uruchom serwis „AutoGluon (Tabular AutoML)" w');
+    }
+  } catch (err) {
+    if (autoCard) autoCard.setAttribute('disabled', '');
+    showEngineHint(hint, 'Nie udało się sprawdzić serwisów — uruchom „AutoGluon (Tabular AutoML)" w');
+  }
+}
+
+// Renders the "uruchom serwis w Serwisach" hint with a real link into the Serwisy
+// module (SPA navigation, not an href the hash-less router would ignore).
+function showEngineHint(hint, prefix) {
+  if (!hint) return;
+  hint.hidden = false;
+  hint.innerHTML = `${sprite('info')} ${escapeHtml(prefix)} <button type="button" class="ml-studio-train-engine-hint-link">Serwisach</button>.`;
+  hint.querySelector('.ml-studio-train-engine-hint-link')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    Router.navigate('services');
+  });
 }
 
 // The callout is the provenance of "wykryto N klas": for a categorical target it
@@ -1107,12 +3635,16 @@ async function runTraining(pid, state, runBtn) {
   }
   runBtn.setAttribute('loading', '');
   runBtn.setAttribute('disabled', '');
+  if (state.engine === 'autogluon') {
+    toast('Trening AutoML może potrwać — uruchamiam serwis…', 'info');
+  }
   try {
     const resp = await ApiBinary.one('mlStudioTabularTrainRequest', {
       projectId: pid,
       datasetId: state.datasetId,
       targetColumn: state.target,
       task: state.task,
+      engine: state.engine,
     });
     renderLeaderboard(resp, state);
     toast('Trening zakończony — leaderboard gotowy', 'success');
@@ -1198,11 +3730,13 @@ function renderLeaderboard(resp, state) {
   table.innerHTML = isRegression
     ? `
       <tf-column key="model" label="Model" renderer="html"></tf-column>
+      <tf-column key="framework" label="Silnik"></tf-column>
       <tf-column key="rmse" label="RMSE" renderer="num"></tf-column>
       <tf-column key="trainSecs" label="Czas" renderer="num"></tf-column>
     `
     : `
       <tf-column key="model" label="Model" renderer="html"></tf-column>
+      <tf-column key="framework" label="Silnik"></tf-column>
       <tf-column key="accuracy" label="Dokładność" renderer="num"></tf-column>
       <tf-column key="f1Macro" label="F1 (macro)" renderer="num"></tf-column>
       <tf-column key="trainSecs" label="Czas" renderer="num"></tf-column>
@@ -1215,6 +3749,7 @@ function renderLeaderboard(resp, state) {
       : `<span>${escapeHtml(name)}</span>`;
     const row = {
       model: nameHtml,
+      framework: String(m.framework ?? m.framework_name ?? '—') || '—',
       trainSecs: fmtSecs(m.trainSecs ?? m.train_secs),
     };
     if (isRegression) {
@@ -1358,6 +3893,7 @@ function renderMembersTable(pid, project, members, isOwner) {
 
   table.rows = members.map((m) => {
     const uid = memberUserId(m);
+    const name = m.displayName ?? m.display_name ?? uid;
     const role = String(m.role ?? '').toLowerCase();
     const status = String(m.status ?? 'active').toLowerCase();
     const isSelf = selfId && uid === selfId;
@@ -1365,7 +3901,7 @@ function renderMembersTable(pid, project, members, isOwner) {
 
     const userHtml = `
       <div class="ml-studio-member-cell">
-        <span class="ml-studio-member-id">${escapeHtml(uid || '—')}${isSelf ? ' <span class="ml-studio-member-self">(Ty)</span>' : ''}</span>
+        <span class="ml-studio-member-id">${escapeHtml(name || '—')}${isSelf ? ' <span class="ml-studio-member-self">(Ty)</span>' : ''}</span>
       </div>`;
 
     // Owner role is always a static badge; for the rest the owner gets an inline
@@ -1879,6 +4415,24 @@ function formatDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString('pl-PL');
+}
+
+// Relative "X temu" label for the card footer (matches the mockup, which shows a
+// single "edytowany 12 min temu" line). Falls back to absolute date for old rows.
+function formatRelative(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const diffSec = Math.round((Date.now() - date.getTime()) / 1000);
+  if (diffSec < 0) return 'przed chwilą';
+  if (diffSec < 60) return 'przed chwilą';
+  const min = Math.floor(diffSec / 60);
+  if (min < 60) return `${min} min temu`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours} ${plural(hours, 'godz.', 'godz.', 'godz.')} temu`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} ${plural(days, 'dzień', 'dni', 'dni')} temu`;
+  return date.toLocaleDateString('pl-PL');
 }
 
 function plural(n, one, few, many) {

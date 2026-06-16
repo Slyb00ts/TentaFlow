@@ -1,18 +1,35 @@
-// ===== File: ml_studio/train_tabular.rs — pure-Rust tabular baseline trainer =====
+// ===== File: ml_studio/train_tabular.rs — Rust-native multi-model tabular trainer =====
 //
-// Real, dependency-free supervised learning for ML Studio's tabular baseline.
-// Given a parsed table (headers + string rows) and a target column, it encodes
-// features (numeric standardization + one-hot categoricals + mean/most-frequent
-// imputation), splits a deterministic train/holdout set and trains REAL models
-// by gradient descent:
-//   - classification: multinomial logistic regression (softmax) vs a
-//     most-frequent-class baseline; scored by accuracy + macro-F1,
-//   - regression: ordinary linear regression (full-batch gradient descent) vs a
-//     mean baseline; scored by RMSE + R^2.
-// Everything is bounded (rows/features) and every failure is a `Result`, never a
-// panic. No GPU, no Python, no extra crates — just ndarray-free loops over Vecs.
+// Real, on-device supervised learning for ML Studio's tabular leaderboard. No
+// Python, no C, no GPU — only pure-Rust crates, so it builds and runs identically
+// on Android as on the desktop. Given a parsed table (headers + string rows) and a
+// target column, it encodes features (numeric standardization + one-hot
+// categoricals + mean/most-frequent imputation), splits a deterministic
+// train/holdout set and trains several REAL models on the same split:
+//   - classification: hand-written multinomial logistic regression (softmax) and a
+//     most-frequent-class baseline, plus a smartcore decision tree and random
+//     forest; scored by accuracy + macro-F1,
+//   - regression: hand-written linear regression (full-batch gradient descent) and
+//     a mean baseline, plus a smartcore decision-tree and random-forest regressor;
+//     scored by RMSE + R^2.
+// The smartcore models use an explicit seed so the leaderboard is reproducible.
+// Everything is bounded (rows/features) and every failure on the data path is a
+// `Result` or a skipped model — never a panic.
 
 use anyhow::{bail, Result};
+use smartcore::ensemble::random_forest_classifier::{
+    RandomForestClassifier, RandomForestClassifierParameters,
+};
+use smartcore::ensemble::random_forest_regressor::{
+    RandomForestRegressor, RandomForestRegressorParameters,
+};
+use smartcore::linalg::basic::matrix::DenseMatrix;
+use smartcore::tree::decision_tree_classifier::{
+    DecisionTreeClassifier, DecisionTreeClassifierParameters,
+};
+use smartcore::tree::decision_tree_regressor::{
+    DecisionTreeRegressor, DecisionTreeRegressorParameters,
+};
 
 /// Hard cap on training rows. Beyond this the table is truncated (the trainer is
 /// a CPU baseline, not a large-scale learner).
@@ -56,6 +73,22 @@ const LEARNING_RATE: f64 = 0.2;
 /// L2 regularization strength (weight decay) — keeps weights bounded on
 /// separable or collinear data without distorting the fit.
 const L2_LAMBDA: f64 = 1e-4;
+
+/// Stable framework label for the smartcore (pure-Rust) tree/forest models.
+const SMARTCORE_FRAMEWORK: &str = "smartcore (Rust)";
+
+/// Seed for smartcore's random forest / tree split sampling. A fixed value keeps
+/// the leaderboard reproducible across runs (deterministic tests).
+const SMARTCORE_SEED: u64 = 0x5EED;
+
+/// Number of trees in the random forest. Kept small because the trainer is a
+/// CPU-only on-device learner on bounded data — 50 trees is enough signal for a
+/// leaderboard entry without making training slow.
+const RF_N_TREES: u16 = 50;
+
+/// Maximum tree depth for both the decision tree and the forest's trees. Bounding
+/// depth keeps training fast and prevents pathological deep trees on noisy data.
+const TREE_MAX_DEPTH: u16 = 12;
 
 /// The kind of supervised task the caller requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,10 +558,35 @@ fn train_classification(
             train_secs: baseline_secs,
         },
     ];
+
+    // smartcore — drzewo decyzyjne i las losowy na TYM SAMYM splicie. Te modele
+    // moga zawiesc na zdegenerowanych danych (np. pojedyncza cecha bez wariancji);
+    // wtedy logujemy ostrzezenie i pomijamy wpis, nie przerywajac calego treningu.
+    if let Some(x_train) = dense_from_indices(enc, &split.train) {
+        let y_train: Vec<i64> = split.train.iter().map(|&i| y[i] as i64).collect();
+        let truth = &baseline_truth;
+
+        match fit_tree_classifier(&x_train, &y_train, n_classes, enc, split, truth) {
+            Ok(entry) => leaderboard.push(entry),
+            Err(e) => tracing::warn!(error = %e, "smartcore decision tree (classification) skipped"),
+        }
+        match fit_forest_classifier(&x_train, &y_train, n_classes, enc, split, truth) {
+            Ok(entry) => leaderboard.push(entry),
+            Err(e) => tracing::warn!(error = %e, "smartcore random forest (classification) skipped"),
+        }
+    } else {
+        tracing::warn!("smartcore classifiers skipped: empty training matrix");
+    }
+
     leaderboard.sort_by(|a, b| {
-        b.f1_macro
-            .partial_cmp(&a.f1_macro)
+        b.accuracy
+            .partial_cmp(&a.accuracy)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.f1_macro
+                    .partial_cmp(&a.f1_macro)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
     let best_model_name = leaderboard[0].model_name.clone();
     let best_loss_curve = if best_model_name == "Regresja logistyczna" {
@@ -720,11 +778,33 @@ fn train_regression(
             train_secs: baseline_secs,
         },
     ];
-    // Lower RMSE is better.
+
+    // smartcore — drzewo i las regresyjny na tym samym splicie; bledy fit pomijamy.
+    if let Some(x_train) = dense_from_indices(enc, &split.train) {
+        let y_train: Vec<f64> = split.train.iter().map(|&i| y[i]).collect();
+        let truth = &holdout_truth;
+
+        match fit_tree_regressor(&x_train, &y_train, enc, split, truth) {
+            Ok(entry) => leaderboard.push(entry),
+            Err(e) => tracing::warn!(error = %e, "smartcore decision tree (regression) skipped"),
+        }
+        match fit_forest_regressor(&x_train, &y_train, enc, split, truth) {
+            Ok(entry) => leaderboard.push(entry),
+            Err(e) => tracing::warn!(error = %e, "smartcore random forest (regression) skipped"),
+        }
+    } else {
+        tracing::warn!("smartcore regressors skipped: empty training matrix");
+    }
+
+    // Lower RMSE is better; tie-break on higher R^2.
     leaderboard.sort_by(|a, b| {
         a.rmse
             .partial_cmp(&b.rmse)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.r2.partial_cmp(&a.r2)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
     let best_model_name = leaderboard[0].model_name.clone();
     let best_loss_curve = if best_model_name == "Regresja liniowa" {
@@ -762,6 +842,181 @@ fn regression_metrics(truth: &[f64], pred: &[f64]) -> (f64, f64) {
     let rmse = (ss_res / n).sqrt();
     let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
     (rmse, r2)
+}
+
+// ----------------------------------------------------------------------------
+// smartcore models (pure-Rust decision tree + random forest). Shared helpers.
+// ----------------------------------------------------------------------------
+
+/// Builds a smartcore `DenseMatrix<f64>` from the rows of `enc.matrix` selected by
+/// `idx` (a train or holdout index list). Returns `None` when the selection or the
+/// feature width is empty — `DenseMatrix::from_2d_vec` rejects empty input, so the
+/// caller skips the smartcore models instead of erroring the whole run.
+fn dense_from_indices(enc: &Encoded, idx: &[usize]) -> Option<DenseMatrix<f64>> {
+    if idx.is_empty() || enc.feature_names.is_empty() {
+        return None;
+    }
+    let rows: Vec<Vec<f64>> = idx.iter().map(|&i| enc.matrix[i].clone()).collect();
+    DenseMatrix::from_2d_vec(&rows).ok()
+}
+
+/// Scores a fitted smartcore classifier on the holdout set: builds the holdout
+/// matrix, predicts, casts the `i64` class indices back to `usize` and reuses
+/// `classification_metrics`. `truth` is the per-holdout true class index.
+fn score_classifier<F>(
+    enc: &Encoded,
+    split: &Split,
+    n_classes: usize,
+    truth: &[usize],
+    predict: F,
+) -> Result<(f64, f64)>
+where
+    F: Fn(&DenseMatrix<f64>) -> Result<Vec<i64>>,
+{
+    let x_holdout = dense_from_indices(enc, &split.holdout)
+        .ok_or_else(|| anyhow::anyhow!("empty holdout matrix"))?;
+    let raw = predict(&x_holdout)?;
+    let pred: Vec<usize> = raw
+        .into_iter()
+        .map(|c| if c < 0 { 0 } else { c as usize })
+        .collect();
+    Ok(classification_metrics(truth, &pred, n_classes))
+}
+
+/// Scores a fitted smartcore regressor on the holdout set via `regression_metrics`.
+fn score_regressor<F>(
+    enc: &Encoded,
+    split: &Split,
+    truth: &[f64],
+    predict: F,
+) -> Result<(f64, f64)>
+where
+    F: Fn(&DenseMatrix<f64>) -> Result<Vec<f64>>,
+{
+    let x_holdout = dense_from_indices(enc, &split.holdout)
+        .ok_or_else(|| anyhow::anyhow!("empty holdout matrix"))?;
+    let pred = predict(&x_holdout)?;
+    Ok(regression_metrics(truth, &pred))
+}
+
+fn fit_tree_classifier(
+    x_train: &DenseMatrix<f64>,
+    y_train: &[i64],
+    n_classes: usize,
+    enc: &Encoded,
+    split: &Split,
+    truth: &[usize],
+) -> Result<LeaderboardEntry> {
+    let start = std::time::Instant::now();
+    // Pojedyncze drzewo jest deterministyczne (brak losowego samplingu cech),
+    // ale ustawiamy seed jawnie dla powtarzalnosci tie-breakow w splitach.
+    let mut params = DecisionTreeClassifierParameters::default().with_max_depth(TREE_MAX_DEPTH);
+    params.seed = Some(SMARTCORE_SEED);
+    let model = DecisionTreeClassifier::fit(x_train, &y_train.to_vec(), params)
+        .map_err(|e| anyhow::anyhow!("smartcore tree fit failed: {e}"))?;
+    let (acc, f1) = score_classifier(enc, split, n_classes, truth, |x| {
+        model
+            .predict(x)
+            .map_err(|e| anyhow::anyhow!("smartcore tree predict failed: {e}"))
+    })?;
+    Ok(LeaderboardEntry {
+        model_name: "Drzewo decyzyjne".to_string(),
+        framework: SMARTCORE_FRAMEWORK.to_string(),
+        accuracy: Some(acc),
+        f1_macro: Some(f1),
+        rmse: None,
+        r2: None,
+        train_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn fit_forest_classifier(
+    x_train: &DenseMatrix<f64>,
+    y_train: &[i64],
+    n_classes: usize,
+    enc: &Encoded,
+    split: &Split,
+    truth: &[usize],
+) -> Result<LeaderboardEntry> {
+    let start = std::time::Instant::now();
+    let params = RandomForestClassifierParameters::default()
+        .with_n_trees(RF_N_TREES)
+        .with_max_depth(TREE_MAX_DEPTH)
+        .with_seed(SMARTCORE_SEED);
+    let model = RandomForestClassifier::fit(x_train, &y_train.to_vec(), params)
+        .map_err(|e| anyhow::anyhow!("smartcore forest fit failed: {e}"))?;
+    let (acc, f1) = score_classifier(enc, split, n_classes, truth, |x| {
+        model
+            .predict(x)
+            .map_err(|e| anyhow::anyhow!("smartcore forest predict failed: {e}"))
+    })?;
+    Ok(LeaderboardEntry {
+        model_name: "Las losowy".to_string(),
+        framework: SMARTCORE_FRAMEWORK.to_string(),
+        accuracy: Some(acc),
+        f1_macro: Some(f1),
+        rmse: None,
+        r2: None,
+        train_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn fit_tree_regressor(
+    x_train: &DenseMatrix<f64>,
+    y_train: &[f64],
+    enc: &Encoded,
+    split: &Split,
+    truth: &[f64],
+) -> Result<LeaderboardEntry> {
+    let start = std::time::Instant::now();
+    let mut params = DecisionTreeRegressorParameters::default().with_max_depth(TREE_MAX_DEPTH);
+    params.seed = Some(SMARTCORE_SEED);
+    let model = DecisionTreeRegressor::fit(x_train, &y_train.to_vec(), params)
+        .map_err(|e| anyhow::anyhow!("smartcore tree regressor fit failed: {e}"))?;
+    let (rmse, r2) = score_regressor(enc, split, truth, |x| {
+        model
+            .predict(x)
+            .map_err(|e| anyhow::anyhow!("smartcore tree regressor predict failed: {e}"))
+    })?;
+    Ok(LeaderboardEntry {
+        model_name: "Drzewo decyzyjne".to_string(),
+        framework: SMARTCORE_FRAMEWORK.to_string(),
+        accuracy: None,
+        f1_macro: None,
+        rmse: Some(rmse),
+        r2: Some(r2),
+        train_secs: start.elapsed().as_secs_f64(),
+    })
+}
+
+fn fit_forest_regressor(
+    x_train: &DenseMatrix<f64>,
+    y_train: &[f64],
+    enc: &Encoded,
+    split: &Split,
+    truth: &[f64],
+) -> Result<LeaderboardEntry> {
+    let start = std::time::Instant::now();
+    let params = RandomForestRegressorParameters::default()
+        .with_n_trees(RF_N_TREES as usize)
+        .with_max_depth(TREE_MAX_DEPTH)
+        .with_seed(SMARTCORE_SEED);
+    let model = RandomForestRegressor::fit(x_train, &y_train.to_vec(), params)
+        .map_err(|e| anyhow::anyhow!("smartcore forest regressor fit failed: {e}"))?;
+    let (rmse, r2) = score_regressor(enc, split, truth, |x| {
+        model
+            .predict(x)
+            .map_err(|e| anyhow::anyhow!("smartcore forest regressor predict failed: {e}"))
+    })?;
+    Ok(LeaderboardEntry {
+        model_name: "Las losowy".to_string(),
+        framework: SMARTCORE_FRAMEWORK.to_string(),
+        accuracy: None,
+        f1_macro: None,
+        rmse: Some(rmse),
+        r2: Some(r2),
+        train_secs: start.elapsed().as_secs_f64(),
+    })
 }
 
 #[cfg(test)]
@@ -923,6 +1178,87 @@ mod tests {
         let out = train_tabular(&headers, &rows, "tier", Task::Classification)
             .expect("categorical target with repeats must train");
         assert_eq!(out.class_labels.len(), 3);
+    }
+
+    #[test]
+    fn smartcore_classification_models_on_leaderboard() {
+        // Te same separowalne dane co logreg — sprawdzamy ze smartcore drzewo i
+        // las trafiaja na leaderboard z poprawnym frameworkiem i sensownymi
+        // metrykami (accuracy/F1 w [0,1], drzewa ucza sie wzorca > baseline).
+        let headers = h(&["x1", "x2", "label"]);
+        let mut rows = Vec::new();
+        for a in -10..10 {
+            for b in -10..10 {
+                let x1 = a as f64 * 0.5;
+                let x2 = b as f64 * 0.5;
+                let label = if x1 + x2 > 0.0 { "yes" } else { "no" };
+                rows.push(row(&[&x1.to_string(), &x2.to_string(), label]));
+            }
+        }
+        let out = train_tabular(&headers, &rows, "label", Task::Classification).unwrap();
+
+        let tree = out
+            .leaderboard
+            .iter()
+            .find(|e| e.model_name == "Drzewo decyzyjne")
+            .expect("decision tree entry missing");
+        let forest = out
+            .leaderboard
+            .iter()
+            .find(|e| e.model_name == "Las losowy")
+            .expect("random forest entry missing");
+        assert_eq!(tree.framework, "smartcore (Rust)");
+        assert_eq!(forest.framework, "smartcore (Rust)");
+        for e in [tree, forest] {
+            let acc = e.accuracy.expect("classification entry needs accuracy");
+            assert!((0.0..=1.0).contains(&acc), "accuracy out of range: {acc}");
+            let f1 = e.f1_macro.expect("classification entry needs f1");
+            assert!((0.0..=1.0).contains(&f1), "f1 out of range: {f1}");
+            assert!(e.rmse.is_none() && e.r2.is_none());
+        }
+        // Na separowalnych danych drzewa musza realnie sie uczyc (powyzej losowego).
+        assert!(tree.accuracy.unwrap() > 0.7, "tree acc: {:?}", tree.accuracy);
+        assert!(
+            forest.accuracy.unwrap() > 0.7,
+            "forest acc: {:?}",
+            forest.accuracy
+        );
+    }
+
+    #[test]
+    fn smartcore_regression_models_on_leaderboard() {
+        // y = 3*x + 2 — drzewo i las regresyjny trafiaja na leaderboard z
+        // metrykami RMSE/R^2 i frameworkiem smartcore.
+        let headers = h(&["x", "city", "y"]);
+        let mut rows = Vec::new();
+        for i in 0..120 {
+            let x = i as f64 * 0.1;
+            let y = 3.0 * x + 2.0;
+            let city = if i % 2 == 0 { "A" } else { "B" };
+            rows.push(row(&[&x.to_string(), city, &y.to_string()]));
+        }
+        let out = train_tabular(&headers, &rows, "y", Task::Regression).unwrap();
+
+        let tree = out
+            .leaderboard
+            .iter()
+            .find(|e| e.model_name == "Drzewo decyzyjne")
+            .expect("decision tree regressor missing");
+        let forest = out
+            .leaderboard
+            .iter()
+            .find(|e| e.model_name == "Las losowy")
+            .expect("random forest regressor missing");
+        assert_eq!(tree.framework, "smartcore (Rust)");
+        assert_eq!(forest.framework, "smartcore (Rust)");
+        for e in [tree, forest] {
+            let rmse = e.rmse.expect("regression entry needs rmse");
+            assert!(rmse.is_finite() && rmse >= 0.0, "bad rmse: {rmse}");
+            assert!(e.r2.is_some(), "regression entry needs r2");
+            assert!(e.accuracy.is_none() && e.f1_macro.is_none());
+        }
+        // Najlepszy wpis (po sortowaniu wg RMSE) musi byc spojny z best_model_name.
+        assert_eq!(out.best_model_name, out.leaderboard[0].model_name);
     }
 
     #[test]

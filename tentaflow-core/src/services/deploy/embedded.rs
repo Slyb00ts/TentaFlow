@@ -313,7 +313,43 @@ impl EmbeddedDeploy {
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from)
                 .filter(|p| p.exists());
-            let model_path = if let Some(path) = persisted {
+            // Bypass downloadu dla LOKALNEGO GGUF (cykl FT: trenuj→eksportuj→
+            // DEPLOY). Model FT po eksporcie nie żyje w repo HF — jego `.gguf`
+            // leży na dysku pod absolutną ścieżką (`gguf_path` z eksportu, np.
+            // /mnt/.../exports/<id>/model-q8_0.gguf). `model_file` niesie tu tę
+            // ścieżkę WPROST, więc gdy jest absolutna pomijamy ModelStore i
+            // ładujemy plik bez sieci. Relatywna ścieżka = nazwa pliku w repo HF
+            // (istniejąca ścieżka download poniżej).
+            let local_gguf = selection
+                .model_file
+                .as_deref()
+                .map(Path::new)
+                .filter(|p| p.is_absolute());
+            if let Some(local) = local_gguf {
+                if !local.exists() {
+                    return Err(DeployError::Other(format!(
+                        "lokalny GGUF nie istnieje: {}",
+                        local.display()
+                    )));
+                }
+                if local
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| !e.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(true)
+                {
+                    return Err(DeployError::Other(format!(
+                        "lokalna ścieżka modelu nie jest plikiem .gguf: {}",
+                        local.display()
+                    )));
+                }
+                if let Some(s) = &self.log_sink {
+                    s.info(&format!("[model] using local GGUF: {}", local.display()));
+                }
+            }
+            let model_path = if let Some(local) = local_gguf {
+                local.to_path_buf()
+            } else if let Some(path) = persisted {
                 path
             } else {
                 if selection.repo.starts_with("http://") || selection.repo.starts_with("https://") {
