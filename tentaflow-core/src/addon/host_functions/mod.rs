@@ -35,6 +35,8 @@ pub mod ui;
 pub mod user;
 pub mod vector;
 pub mod web_research;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 
 use anyhow::Result;
 
@@ -141,6 +143,9 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "http_request", http::http_request)
         .map_err(|e| anyhow::anyhow!("Rejestracja http_request: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "http_raw_v1", http::http_raw_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja http_raw_v1: {e}"))?;
 
     linker
         .func_wrap(
@@ -473,6 +478,38 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
                 camera_metadata::camera_metadata_poll_v1,
             )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_metadata_poll_v1: {e}"))?;
+    }
+
+    // --- Generic WebRTC channel API (robot/device transport; dumb pipe) ---
+    #[cfg(feature = "webrtc")]
+    {
+        linker
+            .func_wrap("tentaflow", "webrtc_connect_v1", webrtc::webrtc_connect_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_connect_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "webrtc_set_answer_v1", webrtc::webrtc_set_answer_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_set_answer_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "webrtc_state_v1", webrtc::webrtc_state_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_state_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "webrtc_send_v1", webrtc::webrtc_send_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_send_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "webrtc_drain_v1", webrtc::webrtc_drain_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_drain_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "webrtc_close_v1", webrtc::webrtc_close_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_close_v1: {e}"))?;
+        // Backed-camera registration bridges webrtc + camera; needs both.
+        #[cfg(feature = "camera")]
+        linker
+            .func_wrap(
+                "tentaflow",
+                "webrtc_register_camera_v1",
+                camera::camera_register_backed_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_register_camera_v1: {e}"))?;
     }
 
     Ok(())

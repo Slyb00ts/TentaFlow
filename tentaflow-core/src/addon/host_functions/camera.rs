@@ -214,6 +214,18 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
         count
     );
     for row in rows {
+        // Backed (WebRTC) cameras have no live track after a restart — the
+        // channel that fed them is gone. Hard-delete the stale row instead of
+        // trying to bring up a dead session; the addon re-registers on reconnect.
+        #[cfg(feature = "webrtc")]
+        if row.vendor == "webrtc" {
+            let _ = crate::db::repository::delete_camera_hard(
+                &pool,
+                &row.owner_addon_id,
+                &row.camera_id,
+            );
+            continue;
+        }
         let resolution = match (row.resolution_width, row.resolution_height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
             _ => None,
@@ -256,6 +268,161 @@ pub async fn shutdown_camera_supervisor_global() {
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
     }
+}
+
+/// Tear down a backed (WebRTC) camera — called by the webrtc host module when a
+/// channel closes / its addon unloads, so the supervisor session + DB row do not
+/// leak. Best-effort: the supervisor removal is spawned (non-blocking) and the
+/// row is hard-deleted (ephemeral camera, no audit retention).
+#[cfg(feature = "webrtc")]
+pub fn remove_backed_camera(owner_addon_id: &str, camera_id: &str) {
+    if let (Some(sup), Ok(handle)) = (SUPERVISOR.get(), tokio::runtime::Handle::try_current()) {
+        let sup = sup.clone();
+        let cid = camera_id.to_string();
+        handle.spawn(async move {
+            let _ = sup.remove_camera(&cid).await;
+        });
+    }
+    if let Some(pool) = crate::db::global_pool() {
+        let _ = crate::db::repository::delete_camera_hard(&pool, owner_addon_id, camera_id);
+    }
+}
+
+/// Bind a WebRTC channel's video track to a camera consumable by the normal
+/// camera/streaming stack. Takes the channel's H.264 byte stream, starts a
+/// backed supervisor session, persists a `vendor='webrtc'` row, and records the
+/// channel→camera link so teardown removes it.
+#[cfg(feature = "webrtc")]
+pub fn camera_register_backed_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.register_backed",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: tentaflow_sdk_spec::WebRtcRegisterCameraInput =
+        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
+            Ok(v) => v,
+            Err(e) => return e.as_i32(),
+        };
+    let target_fps = input.target_fps.clamp(1, 60);
+    let analysis_fps = input.analysis_fps.clamp(1, 60);
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+    let org_id_for_insert = caller.data().org_id.clone();
+
+    // Take the channel's video stream (single consumer; destructive).
+    let rx = match crate::addon::host_functions::webrtc::take_channel_video(
+        &addon_id,
+        &input.channel_id,
+    ) {
+        Some(rx) => rx,
+        None => {
+            audit(
+                caller.data(),
+                "camera.register_backed",
+                Some(&input.channel_id),
+                RiskClass::A,
+                "error",
+                Some("no_video_or_taken"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+    };
+
+    let camera_id = format!("cam_{}", uuid::Uuid::new_v4());
+    let cfg = CameraConfig {
+        camera_id: camera_id.clone(),
+        vendor: "webrtc".to_string(),
+        url: input.channel_id.clone(), // marker only; the source is the live rx
+        target_fps,
+        resolution: None,
+        owner_addon_id: Some(addon_id.clone()),
+        credentials_encrypted: None,
+        decoder_override: None,
+    };
+    let sup = match run_async(get_or_init_supervisor()) {
+        Ok(s) => s,
+        Err(e) => return e.as_i32(),
+    };
+    if let Err(e) = run_async(sup.add_webrtc_camera(cfg, rx)) {
+        audit(
+            caller.data(),
+            "camera.register_backed",
+            Some(&camera_id),
+            RiskClass::A,
+            "error",
+            Some(&format!("session_start_failed: {e}")),
+        );
+        return map_ingest_error(&e).as_i32();
+    }
+    // Record the reverse-index BEFORE the DB insert so a concurrent
+    // webrtc_close always tears the backed session down (no orphan).
+    crate::addon::host_functions::webrtc::bind_camera(&addon_id, &input.channel_id, &camera_id);
+    if let Err(e) = insert_camera(
+        &db,
+        &camera_id,
+        &addon_id,
+        &input.display_name,
+        "webrtc",
+        &input.channel_id,
+        target_fps as i64,
+        analysis_fps as i64,
+        None,
+        None,
+        "C",
+        "default",
+        None,
+        None,
+        None,
+        org_id_for_insert.as_deref(),
+    ) {
+        warn!("camera.register_backed insert_camera failed (compensating): {e}");
+        let _ = run_async(sup.remove_camera(&camera_id));
+        audit(
+            caller.data(),
+            "camera.register_backed",
+            Some(&camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_insert_failed"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    audit(
+        caller.data(),
+        "camera.register_backed",
+        Some(&camera_id),
+        RiskClass::A,
+        "ok",
+        None,
+    );
+    let out = tentaflow_sdk_spec::WebRtcRegisterCameraOutput { camera_id };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 /// Latest decoded RGB24 frame for a camera, taken from the running session's

@@ -437,6 +437,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_analysis_flow_id_column",
             MigrationStep::Rust(cameras_add_analysis_flow_id_column),
         ),
+        (
+            80,
+            "cameras_vendor_check_webrtc",
+            MigrationStep::Sql(CAMERAS_VENDOR_CHECK_WEBRTC),
+        ),
     ]
 }
 
@@ -3461,6 +3466,72 @@ SELECT
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
     onvif_url, onvif_profile_token, metadata_supported,
     COALESCE(org_id, 'org-default')
+FROM cameras;
+
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
+
+PRAGMA foreign_keys = ON;
+"#;
+
+// Adds the 'webrtc' vendor (robot/device backed cameras) to the CHECK. Rebuilds
+// the table because SQLite cannot alter a CHECK in place. Schema mirrors the
+// CURRENT cameras table: CAMERAS_VENDOR_CHECK_LOCAL_SOURCES + the later
+// analysis_fps (v78) and analysis_flow_id (v79) columns. Ungated by feature —
+// the schema must be identical regardless of build features.
+const CAMERAS_VENDOR_CHECK_WEBRTC: &str = r#"
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS cameras_new;
+
+CREATE TABLE cameras_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL,
+    onvif_url TEXT NULL,
+    onvif_profile_token TEXT NULL,
+    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1)),
+    org_id TEXT NOT NULL DEFAULT 'org-default',
+    analysis_fps INTEGER NOT NULL DEFAULT 10,
+    analysis_flow_id TEXT NULL
+);
+
+INSERT INTO cameras_new (
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported, org_id,
+    analysis_fps, analysis_flow_id
+)
+SELECT
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported,
+    COALESCE(org_id, 'org-default'), analysis_fps, analysis_flow_id
 FROM cameras;
 
 DROP TABLE cameras;

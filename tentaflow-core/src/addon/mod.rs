@@ -1100,6 +1100,11 @@ impl AddonManager {
         // Deaktywuj aliasy posiadane przez addon — czytamy owner table wprost
         // (manifest moze byc juz nieosiagalny). Owner rows zostaja dla audytu.
         self.deactivate_aliases_owned_by_addon(addon_id);
+
+        // Zamknij i usun wszystkie kanaly WebRTC tego addonu (peer connections
+        // nie moga przeciekac po unload/disable/uninstall).
+        #[cfg(feature = "webrtc")]
+        crate::addon::host_functions::webrtc::cleanup_addon_channels(addon_id);
     }
 
     /// Instaluje NOWA instancje pakietu z katalogu pod wlasnym addon_id i
