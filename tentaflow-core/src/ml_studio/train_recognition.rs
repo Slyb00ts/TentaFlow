@@ -278,11 +278,16 @@ pub fn mesh_dataset_cache(hash: &str) -> std::path::PathBuf {
     crate::paths::cache_dir().join("ml-recog-mesh").join(hash)
 }
 
-/// Czy cache pod hashem ma JAKIKOLWIEK plik (generyczny dedup, nie-COCO-specyficzny).
-fn cache_has_data(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut rd| rd.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
-        .unwrap_or(false)
+/// Marker kompletnego rozpakowania (pisany dopiero PO udanym unzip). Dedup
+/// sprawdza JEGO obecność, nie „jakikolwiek plik" — częściowe/zerwane
+/// rozpakowanie nie zostanie uznane za gotowe i transfer się powtórzy.
+fn cache_complete_marker(dir: &Path) -> std::path::PathBuf {
+    dir.join(".complete")
+}
+
+/// Czy dataset pod hashem jest KOMPLETNIE zmaterializowany (marker `.complete`).
+fn cache_complete(dir: &Path) -> bool {
+    cache_complete_marker(dir).is_file()
 }
 
 /// sha256 surowych bajtów (content-hash blobu, np. datasetu JSONL dla LLM).
@@ -349,6 +354,36 @@ pub fn recog_sync_progress(run_id: &str) -> Option<DatasetSyncProgress> {
 pub fn clear_recog_sync(run_id: &str) {
     if let Ok(mut m) = recog_sync_map().lock() {
         m.remove(run_id);
+    }
+}
+
+// Licznik kolejnych nieudanych pollingów statusu zdalnego runu (Node B nieosiągalny
+// / zgubił job po restarcie). Po przekroczeniu progu run domykamy jako failed,
+// zamiast trzymać go w „running" w nieskończoność.
+static REMOTE_POLL_FAILS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+    std::sync::OnceLock::new();
+const REMOTE_POLL_FAIL_LIMIT: u32 = 15;
+
+fn remote_poll_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    REMOTE_POLL_FAILS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Rejestruje wynik pollingu zdalnego statusu. `ok=true` zeruje licznik; `false`
+/// inkrementuje i zwraca true gdy próg przekroczony (czas domknąć run jako failed).
+pub fn note_remote_poll(run_id: &str, ok: bool) -> bool {
+    let Ok(mut m) = remote_poll_map().lock() else { return false };
+    if ok {
+        m.remove(run_id);
+        false
+    } else {
+        let n = m.entry(run_id.to_string()).or_insert(0);
+        *n += 1;
+        if *n >= REMOTE_POLL_FAIL_LIMIT {
+            m.remove(run_id);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -580,9 +615,10 @@ pub fn mesh_dataset_chunk(
     data_b64: &str,
 ) -> anyhow::Result<bool> {
     let cache = mesh_dataset_cache(hash);
-    // Dedup generyczny: dataset (po content-hashu) już zmaterializowany na tym
-    // węźle (cache ma jakikolwiek plik) — wspólny zasób / wcześniejszy transfer.
-    if cache.is_dir() && cache_has_data(&cache) {
+    // Dedup: dataset (po content-hashu) KOMPLETNIE zmaterializowany na tym węźle
+    // (marker .complete) — wspólny zasób / wcześniejszy transfer. Częściowe
+    // rozpakowanie nie ma markera → transfer się powtórzy (brak treningu na ułomku).
+    if cache_complete(&cache) {
         return Ok(true);
     }
     let bytes = base64::engine::general_purpose::STANDARD
@@ -605,6 +641,9 @@ pub fn mesh_dataset_chunk(
         map.remove(hash);
         drop(map);
         unpack_coco(&zip_bytes, &cache)?;
+        // Marker kompletności PO udanym rozpakowaniu — dopiero teraz dedup
+        // (cache_complete) uzna dataset za gotowy. Brak markera = niekompletny.
+        let _ = std::fs::write(cache_complete_marker(&cache), b"ok");
     }
     Ok(false)
 }
