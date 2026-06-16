@@ -17,6 +17,8 @@ use super::fakefile::ensure_gst_initialized;
 use super::session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, SessionCommand, SnapshotData,
 };
+#[cfg(feature = "webrtc")]
+use super::session::spawn_webrtc_session;
 use super::stream_publisher::Mp4StreamPublisher;
 use crate::services::stream_hub::StreamHub;
 
@@ -52,22 +54,46 @@ impl CameraIngestSupervisor {
     }
 
     pub async fn add_camera(&self, config: CameraConfig) -> Result<()> {
-        // First-pass quota + duplicate check under a read lock. The write
-        // lock below re-checks both — racing adds between this snapshot and
-        // the insert could otherwise blow past the cap.
-        {
-            let g = self.registry.read().await;
-            check_caps(
-                &g,
-                self.global_cap,
-                self.per_addon_cap,
-                config.owner_addon_id.as_deref(),
-            )?;
-            if g.contains_key(&config.camera_id) {
-                return Err(CameraIngestError::AlreadyExists(config.camera_id.clone()));
-            }
-        }
+        self.precheck_add(&config).await?;
         let handle = spawn_session(config)?;
+        self.insert_handle(handle).await
+    }
+
+    /// Add a camera backed by a live WebRTC video track (H.264 Annex-B over
+    /// `rx`). Same quota/race handling as `add_camera`, but the source is a live
+    /// handle rather than a URL, so it goes through `spawn_webrtc_session`.
+    #[cfg(feature = "webrtc")]
+    pub async fn add_webrtc_camera(
+        &self,
+        config: CameraConfig,
+        rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()> {
+        self.precheck_add(&config).await?;
+        let handle = spawn_webrtc_session(config, rx)?;
+        self.insert_handle(handle).await
+    }
+
+    /// First-pass quota + duplicate check under a read lock. `insert_handle`
+    /// re-checks under the write lock — racing adds between this snapshot and
+    /// the insert could otherwise blow past the cap.
+    async fn precheck_add(&self, config: &CameraConfig) -> Result<()> {
+        let g = self.registry.read().await;
+        check_caps(
+            &g,
+            self.global_cap,
+            self.per_addon_cap,
+            config.owner_addon_id.as_deref(),
+        )?;
+        if g.contains_key(&config.camera_id) {
+            return Err(CameraIngestError::AlreadyExists(config.camera_id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Register a freshly spawned session handle: re-check caps/duplicates under
+    /// the write lock, insert + wire the stream factory, or tear the session
+    /// back down on a race / quota loss.
+    async fn insert_handle(&self, handle: CameraHandle) -> Result<()> {
         enum Outcome {
             Raced,
             QuotaExceeded(String),
@@ -95,9 +121,6 @@ impl CameraIngestSupervisor {
                 return Ok(());
             }
         };
-        // The write lock is released; safe to await teardown without blocking
-        // other supervisor callers. `handle` was moved into the registry only
-        // in the Inserted branch above, so on Raced/QuotaExceeded we still own it.
         match outcome {
             Outcome::Raced => {
                 let id = handle.id.clone();

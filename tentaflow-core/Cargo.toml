@@ -56,6 +56,10 @@ test-support = []
 # (gst-plugins-base, -good, -bad). Default builds stay slim; enable
 # `--features camera` for Router/Desktop where camera ingest is needed.
 camera = ["dep:gstreamer", "dep:gstreamer-app"]
+# Generic WebRTC channel host ABI (webrtc.* host fns) — exposes the
+# tentaflow-hardware WebRtcChannel to addons (robot/device transport). Off by
+# default; pulls webrtc-rs via tentaflow-hardware. Enable for robot-capable nodes.
+webrtc = ["dep:tentaflow-hardware"]
 # Jedna flaga GPU per backend wlacza lokalne LLM. Konkretny backend GPU
 # wynika z natywnych bibliotek zbudowanych przez scripts/native-libs/build-all.sh.
 gpu-cuda = ["inference-llamacpp"]
@@ -230,6 +234,9 @@ gstreamer-app = { version = "0.23", optional = true }
 
 # Inference — llama.cpp (optional)
 tentaflow-wrappers = { path = "../tentaflow-wrappers", optional = true }
+
+# Generic WebRTC channel for robot/device transport (optional, feature "webrtc")
+tentaflow-hardware = { path = "../tentaflow-hardware", optional = true }
 
 # STT — Whisper (optional)
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.

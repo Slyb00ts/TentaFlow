@@ -6,6 +6,8 @@
 //       logika rozmiaru payloadu i retry semantics nie byla duplikowana.
 // =============================================================================
 
+use std::cell::RefCell;
+
 use minicbor::{Decode, Encode};
 
 use super::super::errors::AbiError;
@@ -68,12 +70,45 @@ pub fn write_cbor_capped<T: Encode<()>>(
     out_len_ptr: i32,
     kind: PayloadKind,
 ) -> i32 {
-    let mut serialized = Vec::new();
-    if minicbor::encode(value, &mut serialized).is_err() {
-        return AbiError::Operation.as_i32();
+    // Reused per-thread CBOR scratch buffer: encoding a host-fn response no
+    // longer allocates+frees a fresh Vec each call (just grows once, then reuses
+    // the capacity). This is the multi-threaded tokio host, so the buffer is
+    // thread_local (no cross-thread sharing). wasmtime host calls are synchronous
+    // and never re-enter the guest mid-call, and this helper does not call itself
+    // recursively within one host call — so the borrow cannot be held while the
+    // same thread encodes again. try_borrow_mut + fresh-Vec fallback is purely
+    // defensive against any future reentrant caller (avoids a panic).
+    thread_local! {
+        static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
-    if enforce_payload_size(serialized.len(), kind).is_err() {
-        return AbiError::PayloadTooLarge.as_i32();
-    }
-    write_output_with_retry_semantics(memory, caller, &serialized, out_ptr, out_cap, out_len_ptr)
+
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            if minicbor::encode(value, &mut *buf).is_err() {
+                return AbiError::Operation.as_i32();
+            }
+            if enforce_payload_size(buf.len(), kind).is_err() {
+                return AbiError::PayloadTooLarge.as_i32();
+            }
+            write_output_with_retry_semantics(memory, caller, &buf, out_ptr, out_cap, out_len_ptr)
+        }
+        Err(_) => {
+            let mut serialized = Vec::new();
+            if minicbor::encode(value, &mut serialized).is_err() {
+                return AbiError::Operation.as_i32();
+            }
+            if enforce_payload_size(serialized.len(), kind).is_err() {
+                return AbiError::PayloadTooLarge.as_i32();
+            }
+            write_output_with_retry_semantics(
+                memory,
+                caller,
+                &serialized,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+            )
+        }
+    })
 }

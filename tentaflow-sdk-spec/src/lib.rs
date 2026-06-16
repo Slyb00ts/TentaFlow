@@ -61,6 +61,13 @@ pub use protocol::{
         StreamCloseInput, StreamCloseOutput, StreamNextInput, StreamNextOutput,
         StreamSubscribeFilter, StreamSubscribeInput, StreamSubscribeOutput,
     },
+    webrtc::{
+        WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput,
+        WebRtcDrainOutput, WebRtcDrainOutputRef, WebRtcMessage, WebRtcRegisterCameraInput,
+        WebRtcRegisterCameraOutput,
+        WebRtcSendInput, WebRtcSetAnswerInput, WebRtcStateInput, WebRtcStateOutput,
+        WebRtcStatusOutput,
+    },
     ui::{
         a11y::{Accessibility, EventKind, Visibility},
         action::{Action, ActionAck, ActionStatus, FieldError, FormFieldMap, FormFieldValue, ParamEntry},

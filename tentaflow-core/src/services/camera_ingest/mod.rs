@@ -21,6 +21,8 @@ pub mod rtsp;
 pub mod session;
 pub mod stream_publisher;
 pub mod supervisor;
+#[cfg(feature = "webrtc")]
+pub mod webrtc_source;
 
 #[cfg(feature = "inference-vision-gpu")]
 pub mod vision_analysis;
