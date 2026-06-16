@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, OnceCell};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::services::detection_bus::Detection;
 
@@ -612,22 +612,27 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         };
         // If the camera has an assigned analysis Flow, run it (it owns the
         // OCR/classify/verdict/alert logic); otherwise fall back to the default
-        // hardcoded enrichment.
-        if let (Some(flow_id), Some(disp)) = (
-            camera_flow_id(&camera_id),
-            crate::flow_engine::dispatcher::global_flow_dispatcher(),
-        ) {
-            // Detach: a flow can run up to its per-frame deadline, so awaiting it
-            // here would head-of-line block every other camera's enrichment. The
-            // spawned task owns `slot`, releasing this camera's in-flight slot +
-            // bytes when the flow finishes. Per-camera in-flight = 1 (admit_cold)
-            // bounds a camera to one concurrent run; the byte budget bounds the
-            // fleet — so detaching stays bounded.
-            tokio::spawn(async move {
-                let _slot = slot;
-                run_camera_flow(disp, flow_id, camera_id, frame, w, h, detections).await;
-            });
-            continue;
+        // hardcoded enrichment. Empty-detection events carry a dropped (0-byte)
+        // frame and have nothing to enrich/decide, so they skip the flow and
+        // fall through to publish an empty set (clearing the overlay) — running
+        // the flow on a dropped frame would only fail the vision nodes.
+        if !detections.is_empty() {
+            if let (Some(flow_id), Some(disp)) = (
+                camera_flow_id(&camera_id),
+                crate::flow_engine::dispatcher::global_flow_dispatcher(),
+            ) {
+                // Detach: a flow can run up to its per-frame deadline, so awaiting
+                // it here would head-of-line block every other camera's enrichment.
+                // The spawned task owns `slot`, releasing this camera's in-flight
+                // slot + bytes when the flow finishes. Per-camera in-flight = 1
+                // (admit_cold) bounds a camera to one concurrent run; the byte
+                // budget bounds the fleet — so detaching stays bounded.
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    run_camera_flow(disp, flow_id, camera_id, frame, w, h, detections).await;
+                });
+                continue;
+            }
         }
         let _slot = slot;
         let classifier = classifier.clone();
@@ -744,7 +749,22 @@ async fn run_camera_flow(
     let mut meta = FlowRequestMeta::new(format!("cam-{camera_id}"));
     meta.deadline = Some(Instant::now() + CAMERA_FLOW_DEADLINE);
     match disp.dispatch_by_flow_id(flow_id.clone(), env, meta).await {
-        Ok(outcome) => publish_flow_detections(&camera_id, detections, outcome),
+        Ok(outcome) => {
+            // One concise per-run line so operators can see the assigned flow
+            // actually executed on a detection frame + its verdict.
+            let verdict = outcome
+                .final_envelope
+                .meta
+                .get("verdict")
+                .and_then(|v| v.get("decision"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("-");
+            debug!(
+                "[vision_analysis] flow {flow_id} ran for {camera_id}: {} detections, verdict={verdict}",
+                detections.len()
+            );
+            publish_flow_detections(&camera_id, detections, outcome);
+        }
         Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
     }
     // Ephemeral frame: drop the in-memory blob now that the flow has read it, so
