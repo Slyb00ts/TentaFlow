@@ -558,6 +558,9 @@ impl AddonManager {
         let engine = runtime::create_engine()?;
 
         let event_bus = Arc::new(EventBus::new());
+        // Publish a process-global handle so core flow nodes (camera_alert) can
+        // emit events to subscribed addons without threading the bus through.
+        event_bus::set_global_event_bus(event_bus.clone());
         let permission_checker = Arc::new(PermissionChecker::new(db.clone()));
 
         // Warm-up cache uprawnien — zaladuj wszystko z DB do cache
