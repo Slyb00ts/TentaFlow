@@ -48,7 +48,7 @@ const CAMERA_ANALYSIS_FLOW_ID: &str = "00000000-0000-4000-8000-000000000020";
 
 /// Graf domyslnego flow analizy kamery (patrz `seed_camera_analysis_flow`).
 /// Stala (nie literal w funkcji), zeby test mogl go zwalidowac + skompilowac.
-const CAMERA_ANALYSIS_FLOW_JSON: &str = r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"ocr","type":"vision_ocr","position":{"x":220,"y":0},"config":{"alias":"tentavision-ocr"}},{"id":"classify","type":"vision_classify","position":{"x":440,"y":0},"config":{"alias":"tentavision-action"}}],"edges":[{"from_node":"trigger","to_node":"ocr","from_port":"image","to_port":"in","data_type":"image"},{"from_node":"ocr","to_node":"classify","from_port":"out","to_port":"in","data_type":"image"}]}"#;
+const CAMERA_ANALYSIS_FLOW_JSON: &str = r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"ocr","type":"vision_ocr","position":{"x":220,"y":0},"config":{"alias":"tentavision-ocr"}},{"id":"classify","type":"vision_classify","position":{"x":440,"y":0},"config":{"alias":"tentavision-action"}},{"id":"verdict","type":"camera_verdict","position":{"x":660,"y":0},"config":{}}],"edges":[{"from_node":"trigger","to_node":"ocr","from_port":"image","to_port":"in","data_type":"image"},{"from_node":"ocr","to_node":"classify","from_port":"out","to_port":"in","data_type":"image"},{"from_node":"classify","to_node":"verdict","from_port":"out","to_port":"in","data_type":"image"}]}"#;
 
 /// Seeduje domyslne dane. Leci przy kazdym starcie i jest idempotentne
 /// (INSERT OR IGNORE), wiec dopelnia braki na istniejacych bazach — m.in.
@@ -1146,7 +1146,8 @@ mod tests {
         use crate::flow_engine::cache::CompiledFlow;
         use crate::flow_engine::node_adapter::AdapterRegistry;
         use crate::flow_engine::node_adapters::{
-            TriggerNodeAdapter, VisionClassifyNodeAdapter, VisionOcrNodeAdapter,
+            CameraVerdictNodeAdapter, TriggerNodeAdapter, VisionClassifyNodeAdapter,
+            VisionOcrNodeAdapter,
         };
         use std::sync::Arc;
 
@@ -1167,6 +1168,7 @@ mod tests {
         reg.register(Arc::new(TriggerNodeAdapter::new()));
         reg.register(Arc::new(VisionOcrNodeAdapter::new()));
         reg.register(Arc::new(VisionClassifyNodeAdapter::new()));
+        reg.register(Arc::new(CameraVerdictNodeAdapter::new()));
         CompiledFlow::from_json(super::CAMERA_ANALYSIS_FLOW_ID, &flow_json, &reg)
             .expect("camera analysis flow compiles");
     }

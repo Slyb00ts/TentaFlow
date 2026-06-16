@@ -37,7 +37,8 @@ use crate::flow_engine::executor::{execute_blocking, execute_streaming, Streamin
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
-    AwaitSubagentsNodeAdapter, CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
+    AwaitSubagentsNodeAdapter, CameraVerdictNodeAdapter, CombineNodeAdapter,
+    CompactContextNodeAdapter, ConditionNodeAdapter,
     ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PersistTurnNodeAdapter,
@@ -977,6 +978,7 @@ fn build_registry(
         Arc::new(VisionNodeAdapter::new()),
         Arc::new(VisionOcrNodeAdapter::new()),
         Arc::new(VisionClassifyNodeAdapter::new()),
+        Arc::new(CameraVerdictNodeAdapter::new()),
         // ask_user (§3.13 C) — BPMN User Task: no dependency slot, it uses the
         // process-global interaction registry + run manager.
         Arc::new(AskUserNodeAdapter::new()),
