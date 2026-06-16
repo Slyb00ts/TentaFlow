@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -66,8 +67,19 @@ _JOBS: dict[str, "JobState"] = {}
 _JOBS_LOCK = threading.Lock()
 
 # Jeden trening naraz na proces. Trening LLM wysyca GPU/RAM — równoległe joby
-# kończą się OOM. Slot jest zwalniany przez worker po zakończeniu (sukces/błąd).
+# kończą się OOM. Slot jest zwalniany przez serwer gdy proces workera kończy się.
 _TRAIN_SLOT = threading.Semaphore(1)
+
+# Trening biegnie jako PODPROCES `torchrun` (multi-GPU/multi-node DDP), nie wątek.
+# Serwer śledzi proces + plik statusu pisany przez ranka 0; status czytamy z pliku.
+# _PROCS: job_id -> {"proc", "status_path", "log_path", "released"}.
+_PROCS: dict[str, dict[str, Any]] = {}
+
+# Ustawiane TYLKO w trybie workera (podproces torchrun). W trybie serwera puste.
+# Worker pisze snapshot statusu do pliku — ranga > 0 nic nie pisze (jeden plik).
+_STATUS_FILE: Optional[str] = None
+_RANK = int(os.environ.get("RANK", "0"))
+_LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
 # Eksport (merge LoRA + konwersja GGUF) ma własny rejestr stanów i własny slot.
 # Merge ładuje cały model bazowy do RAM, więc jeden eksport naraz na proces.
@@ -211,6 +223,18 @@ class Hyperparams(BaseModel):
     max_seq_len: int = Field(default=1024, ge=8, le=8192)
 
 
+class DistConfig(BaseModel):
+    """Konfiguracja treningu rozproszonego (multi-GPU / multi-rig). Dla single-node
+    multi-GPU wystarczy nnodes=1 (torchrun --standalone). Multi-rig: nnodes>1 +
+    node_rank per węzeł + wspólny master_addr/master_port (rendezvous c10d)."""
+    nnodes: int = Field(default=1, ge=1, le=64)
+    node_rank: int = Field(default=0, ge=0, le=63)
+    # GPU na ten węzeł (None → wszystkie dostępne lokalnie).
+    nproc_per_node: Optional[int] = Field(default=None, ge=1, le=64)
+    master_addr: str = ""
+    master_port: int = Field(default=29500, ge=1024, le=65535)
+
+
 class TrainRequest(BaseModel):
     job_id: Optional[str] = None
     base_model: str
@@ -224,6 +248,10 @@ class TrainRequest(BaseModel):
     hyperparams: Hyperparams = Field(default_factory=Hyperparams)
     output_dir: str
     merge_adapter: bool = False
+    # Multi-GPU na TYM węźle (None → wszystkie GPU). Skrót dla single-node.
+    num_gpus: Optional[int] = Field(default=None, ge=1, le=64)
+    # Trening rozproszony (multi-rig). None → single-node (num_gpus decyduje).
+    dist: Optional[DistConfig] = None
 
 
 def _update(job_id: str, **changes: Any) -> None:
@@ -233,6 +261,17 @@ def _update(job_id: str, **changes: Any) -> None:
             return
         for key, value in changes.items():
             setattr(st, key, value)
+        snap = st.snapshot()
+    # W trybie workera flush snapshotu do pliku statusu (czyta go serwer). Tylko
+    # ranga 0 pisze — pozostałe procesy DDP liczą to samo, jeden plik wystarcza.
+    if _STATUS_FILE and _RANK == 0:
+        try:
+            tmp = f"{_STATUS_FILE}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh)
+            os.replace(tmp, _STATUS_FILE)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class ProgressCallback(TrainerCallback):
@@ -337,10 +376,27 @@ def _load_tokenizer(base_model: str):  # noqa: ANN001
     return tokenizer
 
 
+def _attn_impl() -> str:
+    """Flash Attention 2 gdy pakiet `flash_attn` jest dostępny — inaczej `sdpa`
+    (wbudowany w PyTorch fused attention, też szybki). FA2 wymaga GPU bf16/fp16."""
+    if not torch.cuda.is_available():
+        return "eager"
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except Exception:  # noqa: BLE001
+        return "sdpa"
+
+
 def _load_model(base_model: str, method: str):  # noqa: ANN001
-    """Ładuje model bazowy. QLoRA → 4-bit nf4 + double quant; reszta → bf16/fp16."""
+    """Ładuje model bazowy. QLoRA → 4-bit nf4 + double quant; reszta → bf16/fp16.
+    Pod DDP (torchrun) każda ranga ładuje na SWÓJ GPU (LOCAL_RANK)."""
     compute_dtype = torch.bfloat16 if _supports_bf16() else torch.float16
-    common = dict(trust_remote_code=ALLOW_REMOTE_CODE)
+    common = dict(
+        trust_remote_code=ALLOW_REMOTE_CODE,
+        attn_implementation=_attn_impl(),
+    )
     if method == "qlora":
         bnb = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -348,17 +404,21 @@ def _load_model(base_model: str, method: str):  # noqa: ANN001
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=compute_dtype,
         )
-        # QLoRA pins the quantized weights to a single GPU at load time;
-        # `device_map="auto"` would shard onto meta tensors and break training.
+        # QLoRA przypina skwantyzowane wagi do JEDNEGO GPU przy ładowaniu. Pod DDP
+        # każda ranga musi użyć SWOJEJ karty (LOCAL_RANK), inaczej wszystkie wejdą
+        # na GPU0. `device_map="auto"` shardowałby na meta-tensory i psuł trening.
         model = AutoModelForCausalLM.from_pretrained(
-            base_model, quantization_config=bnb, device_map={"": 0}, **common
+            base_model,
+            quantization_config=bnb,
+            device_map={"": _LOCAL_RANK},
+            **common,
         )
         from peft import prepare_model_for_kbit_training
 
         model = prepare_model_for_kbit_training(model)
         return model
     # LoRA / full: load on CPU (no device_map → no meta tensors); the Trainer
-    # moves the model to the GPU itself. `device_map="auto"` here triggers
+    # moves the model to the per-rank GPU itself. `device_map="auto"` here triggers
     # "Cannot copy out of meta tensor" during training.
     return AutoModelForCausalLM.from_pretrained(
         base_model, torch_dtype=compute_dtype, **common
@@ -562,48 +622,65 @@ def _save_artifact(trainer, tokenizer, req: TrainRequest) -> str:  # noqa: ANN00
     Gdy `merge_adapter=True` i metoda to lora/qlora/dora, łączy wagi adaptera z bazą
     i zapisuje samodzielny model do podkatalogu `merged/`.
     """
+    # Pod DDP synchronizujemy rangi przed zapisem, a sam zapis robi tylko ranga 0
+    # (trainer.save_model i tak jest rank-aware; merge robimy jawnie na randze 0).
+    try:
+        trainer.accelerator.wait_for_everyone()
+    except Exception:  # noqa: BLE001
+        pass
     os.makedirs(req.output_dir, exist_ok=True)
     trainer.save_model(req.output_dir)
-    tokenizer.save_pretrained(req.output_dir)
+    if _RANK == 0:
+        tokenizer.save_pretrained(req.output_dir)
 
     if req.merge_adapter and req.method in ("lora", "qlora", "dora"):
         merged_dir = os.path.join(req.output_dir, "merged")
-        os.makedirs(merged_dir, exist_ok=True)
-        merged = trainer.model.merge_and_unload()
-        merged.save_pretrained(merged_dir)
-        tokenizer.save_pretrained(merged_dir)
+        if _RANK == 0:
+            os.makedirs(merged_dir, exist_ok=True)
+            merged = trainer.model.merge_and_unload()
+            merged.save_pretrained(merged_dir)
+            tokenizer.save_pretrained(merged_dir)
         return merged_dir
 
     return req.output_dir
 
 
-def _train_worker(req: TrainRequest, job_id: str) -> None:
-    # Slot współbieżności trzymamy przez cały czas treningu i zwalniamy w finally,
-    # niezależnie od wyniku — inaczej kolejne joby byłyby blokowane na zawsze.
+def _run_objective(req: TrainRequest, job_id: str) -> str:
+    if req.objective == "dpo":
+        return _run_dpo(req, job_id)
+    if req.objective == "kd":
+        return _run_kd(req, job_id)
+    if req.objective == "sft":
+        return _run_sft(req, job_id)
+    raise ValueError(f"unknown objective: {req.objective}")
+
+
+def worker_main(spec_path: str, status_path: str, job_id: str) -> int:
+    """Wejście PODPROCESU `torchrun` (jedna ranga = jeden GPU). Uruchamiany przez
+    `python server.py worker ...`. Trener HF sam robi DDP z env RANK/LOCAL_RANK/
+    WORLD_SIZE ustawionych przez torchrun. Status pisze do pliku tylko ranga 0."""
+    global _STATUS_FILE
+    _STATUS_FILE = status_path
+    with open(spec_path, "r", encoding="utf-8") as fh:
+        req = TrainRequest(**json.load(fh))
+    with _JOBS_LOCK:
+        _JOBS[job_id] = JobState(job_id=job_id, output_dir=req.output_dir)
+    rc = 0
     try:
-        if req.objective == "dpo":
-            artifact = _run_dpo(req, job_id)
-        elif req.objective == "kd":
-            artifact = _run_kd(req, job_id)
-        elif req.objective == "sft":
-            artifact = _run_sft(req, job_id)
-        else:
-            raise ValueError(f"unknown objective: {req.objective}")
+        artifact = _run_objective(req, job_id)
         _update(job_id, status="succeeded", artifact_path=artifact)
     except torch.cuda.OutOfMemoryError as exc:  # noqa: PERF203
         torch.cuda.empty_cache()
         _update(job_id, status="failed", error=f"CUDA OOM: {exc}")
+        rc = 1
     except Exception as exc:  # noqa: BLE001
         _update(
             job_id,
             status="failed",
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         )
+        rc = 1
     finally:
-        # Zwalniamy VRAM po KAŻDYM jobie (sukces/błąd) — inaczej żyjący proces
-        # ml-training trzyma wagi modelu (KD ładuje dwa!) i kolejne treningi
-        # wchodzą na wysycone GPU → OOM. Lokalne referencje modeli w _run_* są
-        # już poza zasięgiem, więc gc.collect()+empty_cache odzyskuje pamięć.
         try:
             import gc
 
@@ -612,7 +689,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                 torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
             pass
-        _TRAIN_SLOT.release()
+    return rc
 
 
 def _update_export(export_id: str, **changes: Any) -> None:
@@ -753,6 +830,90 @@ def health() -> dict[str, Any]:
     }
 
 
+def _resolve_nproc(req: TrainRequest) -> int:
+    """Liczba procesów (GPU) na TYM węźle: z dist.nproc_per_node / num_gpus, ucięta
+    do realnie dostępnych kart. Min 1 (CPU/1 GPU)."""
+    avail = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    avail = max(1, avail)
+    want = None
+    if req.dist and req.dist.nproc_per_node:
+        want = req.dist.nproc_per_node
+    elif req.num_gpus:
+        want = req.num_gpus
+    if want is None:
+        return avail
+    return max(1, min(want, avail))
+
+
+def _build_torchrun_cmd(
+    req: TrainRequest, spec_path: str, status_path: str, job_id: str, nproc: int
+) -> list[str]:
+    """Buduje komendę torchrun: single-node (--standalone) lub multi-node
+    (--nnodes/--node-rank/--rdzv-endpoint c10d) dla treningu rozproszonego."""
+    cmd = [sys.executable, "-m", "torch.distributed.run"]
+    d = req.dist
+    if d and d.nnodes > 1:
+        if not d.master_addr:
+            raise ValueError("dist.master_addr wymagany dla nnodes>1")
+        cmd += [
+            "--nnodes", str(d.nnodes),
+            "--node-rank", str(d.node_rank),
+            "--nproc-per-node", str(nproc),
+            "--rdzv-backend", "c10d",
+            "--rdzv-endpoint", f"{d.master_addr}:{d.master_port}",
+            "--rdzv-id", job_id,
+        ]
+    else:
+        cmd += ["--standalone", "--nnodes", "1", "--nproc-per-node", str(nproc)]
+    cmd += [
+        os.path.abspath(__file__),
+        "worker",
+        "--spec", spec_path,
+        "--status", status_path,
+        "--job", job_id,
+    ]
+    return cmd
+
+
+def _apply_snapshot(st: "JobState", snap: dict[str, Any]) -> None:
+    for key in ("status", "step", "total_steps", "train_loss", "eval_loss", "error", "artifact_path"):
+        if key in snap and snap[key] is not None:
+            setattr(st, key, snap[key])
+
+
+def _tail(path: str, n: int = 4000) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()[-n:]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _reap_train(job_id: str) -> None:
+    """Czeka na proces torchrun, finalizuje status i ZWALNIA slot (zawsze)."""
+    info = _PROCS.get(job_id)
+    if not info:
+        return
+    proc = info["proc"]
+    rc = proc.wait()
+    try:
+        snap = json.loads(_tail(info["status_path"], 100_000) or "{}")
+    except Exception:  # noqa: BLE001
+        snap = {}
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        if st is not None:
+            if snap:
+                _apply_snapshot(st, snap)
+            if st.status == "running":
+                # Proces padł nie zostawiając terminalnego statusu → błąd z logu.
+                st.status = "failed"
+                st.error = f"worker torchrun zakończył się rc={rc}\n{_tail(info['log_path'])}"
+        if not info.get("released"):
+            _TRAIN_SLOT.release()
+            info["released"] = True
+
+
 @app.post("/train")
 def train(req: TrainRequest) -> dict[str, Any]:
     if req.method not in ("lora", "qlora", "dora", "full"):
@@ -780,31 +941,65 @@ def train(req: TrainRequest) -> dict[str, Any]:
         with _JOBS_LOCK:
             if job_id in _JOBS and _JOBS[job_id].status == "running":
                 raise HTTPException(409, f"job {job_id} already running")
-            _JOBS[job_id] = JobState(job_id=job_id, output_dir=req.output_dir)
 
-        thread = threading.Thread(
-            target=_train_worker,
-            args=(req, job_id),
-            name=f"train-{job_id}",
-            daemon=True,
-        )
-        thread.start()
-    except BaseException:
-        # Nie udało się wystartować workera (np. konflikt 409) — slot musi wrócić,
-        # bo worker, który by go zwolnił, nigdy nie ruszył.
+        os.makedirs(req.output_dir, exist_ok=True)
+        spec_path = os.path.join(req.output_dir, ".train_spec.json")
+        status_path = os.path.join(req.output_dir, ".train_status.json")
+        log_path = os.path.join(req.output_dir, ".train.log")
+        with open(spec_path, "w", encoding="utf-8") as fh:
+            json.dump(req.model_dump(), fh)
+        nproc = _resolve_nproc(req)
+        nnodes = req.dist.nnodes if req.dist else 1
+        world = nproc * nnodes
+        # Wstępny status na dysku, żeby /status działał zanim ranga 0 cokolwiek napisze.
+        with open(status_path, "w", encoding="utf-8") as fh:
+            json.dump({"job_id": job_id, "status": "running", "step": 0, "total_steps": 0}, fh)
+        cmd = _build_torchrun_cmd(req, spec_path, status_path, job_id, nproc)
+        env = dict(os.environ)
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        log_fh = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+        with _JOBS_LOCK:
+            st = JobState(job_id=job_id, output_dir=req.output_dir)
+            st.total_steps = 0
+            _JOBS[job_id] = st
+            _PROCS[job_id] = {
+                "proc": proc,
+                "status_path": status_path,
+                "log_path": log_path,
+                "released": False,
+                "world_size": world,
+            }
+        threading.Thread(target=_reap_train, args=(job_id,), name=f"reap-{job_id}", daemon=True).start()
+    except HTTPException:
         _TRAIN_SLOT.release()
         raise
+    except BaseException as exc:
+        _TRAIN_SLOT.release()
+        raise HTTPException(500, f"failed to launch training: {exc}") from exc
 
-    return {"job_id": job_id, "status": "running"}
+    return {"job_id": job_id, "status": "running", "world_size": world}
 
 
 @app.get("/status/{job_id}")
 def status(job_id: str) -> dict[str, Any]:
     with _JOBS_LOCK:
         st = _JOBS.get(job_id)
+        info = _PROCS.get(job_id)
         if st is None:
             raise HTTPException(404, f"unknown job: {job_id}")
-        return st.snapshot()
+        # Status pisze ranga 0 do pliku — wczytaj najświeższy snapshot.
+        if info:
+            try:
+                snap = json.loads(_tail(info["status_path"], 100_000) or "{}")
+                if snap:
+                    _apply_snapshot(st, snap)
+            except Exception:  # noqa: BLE001
+                pass
+        out = st.snapshot()
+        if info:
+            out["world_size"] = info.get("world_size", 1)
+        return out
 
 
 @app.get("/models/{job_id}/path")
@@ -869,3 +1064,17 @@ def export_status(export_id: str) -> dict[str, Any]:
         if st is None:
             raise HTTPException(404, f"unknown export: {export_id}")
         return st.snapshot()
+
+
+# Wejście PODPROCESU treningu (torchrun uruchamia `python server.py worker ...`).
+# Serwer FastAPI startuje przez `uvicorn server:app`, więc ten blok go nie dotyczy.
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ml-training worker (torchrun child)")
+    parser.add_argument("mode", choices=["worker"])
+    parser.add_argument("--spec", required=True)
+    parser.add_argument("--status", required=True)
+    parser.add_argument("--job", required=True)
+    _args = parser.parse_args()
+    sys.exit(worker_main(_args.spec, _args.status, _args.job))
