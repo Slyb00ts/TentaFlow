@@ -464,6 +464,17 @@ pub enum MeshCommandType {
         total: u32,
         data_b64: String,
     },
+    /// ML Studio: detekcja NA TYM nodzie wytrenowanym tu modelem (checkpoint
+    /// lokalny na odbiorcy). Inicjator (Node A) wysyła checkpoint_path + klasy +
+    /// wariant + próg + obraz (base64); odbiorca woła swój lokalny serwis i
+    /// zwraca `MlDetectResult`. Pozwala testować z A model żyjący na B.
+    MlDetect {
+        checkpoint_path: String,
+        class_names_json: String,
+        variant: String,
+        threshold: f64,
+        image_b64: String,
+    },
 }
 
 // =============================================================================
@@ -531,6 +542,14 @@ pub enum MeshCommandResponsePayload {
     /// ML Studio: ack chunku datasetu. `have_already` = odbiorca ma już ten
     /// dataset (hash) → nadawca może przerwać transfer.
     MlDatasetChunkResult { have_already: bool },
+    /// ML Studio: wynik detekcji na odbiorcy (detekcje JSON + wymiary obrazu;
+    /// `error` gdy serwis zawiódł).
+    MlDetectResult {
+        detections_json: String,
+        width: u32,
+        height: u32,
+        error: Option<String>,
+    },
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
@@ -706,6 +725,13 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("seq", seq)
                 .field("total", total)
                 .field("chunk_len", &data_b64.len())
+                .finish(),
+            Self::MlDetect { checkpoint_path, variant, threshold, image_b64, .. } => f
+                .debug_struct("MlDetect")
+                .field("checkpoint", checkpoint_path)
+                .field("variant", variant)
+                .field("threshold", threshold)
+                .field("image_len", &image_b64.len())
                 .finish(),
         }
     }

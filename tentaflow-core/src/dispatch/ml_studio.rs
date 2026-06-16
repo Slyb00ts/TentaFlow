@@ -1778,18 +1778,72 @@ pub async fn ml_studio_recog_detect(
         return Err(ProtocolError::bad_request("model bez class_names"));
     }
 
-    let outcome = crate::ml_studio::train_recognition::run_detect(
-        checkpoint,
-        class_names,
-        variant,
-        payload.threshold,
-        payload.image_b64.clone(),
-    )
-    .await;
+    // Węzeł, na którym żyje checkpoint (zapisany przy treningu). Pusty/local →
+    // detekcja lokalna. Inny → komenda mesh MlDetect do tego węzła (checkpoint
+    // tam, my tu nie mamy pliku). Cała komunikacja A↔B przez mesh — A nigdy nie
+    // woła zdalnego serwisu bezpośrednio.
+    let local_node = ctx.state.local_node_id.to_string();
+    let model_node = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+        .map(str::to_string);
 
-    let (detections_json, width, height, error) = match outcome {
-        Ok((dj, w, h)) => (dj, w, h, None),
-        Err(e) => ("[]".to_string(), 0, 0, Some(e.to_string())),
+    let (detections_json, width, height, error) = match model_node {
+        Some(node) => {
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            if let Some(security) = ctx.state.mesh_security.as_ref() {
+                if !security.is_trusted(&node) {
+                    return Err(ProtocolError::bad_request(format!(
+                        "peer {} is not trusted",
+                        node
+                    )));
+                }
+            }
+            let class_names_json = serde_json::to_string(&class_names).unwrap_or_else(|_| "[]".into());
+            let cmd = tentaflow_protocol::mesh::MeshCommandType::MlDetect {
+                checkpoint_path: checkpoint,
+                class_names_json,
+                variant,
+                threshold: payload.threshold,
+                image_b64: payload.image_b64.clone(),
+            };
+            match iroh.send_command_and_wait(&node, cmd, 120).await {
+                Ok(resp) => {
+                    if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlDetectResult {
+                        detections_json,
+                        width,
+                        height,
+                        error,
+                    } = resp.payload
+                    {
+                        (detections_json, width, height, error)
+                    } else if !resp.ok {
+                        ("[]".to_string(), 0, 0, resp.error.or(Some("remote detect failed".into())))
+                    } else {
+                        ("[]".to_string(), 0, 0, Some("unexpected mesh detect response".into()))
+                    }
+                }
+                Err(e) => ("[]".to_string(), 0, 0, Some(format!("mesh detect: {}", e))),
+            }
+        }
+        None => {
+            let outcome = crate::ml_studio::train_recognition::run_detect(
+                checkpoint,
+                class_names,
+                variant,
+                payload.threshold,
+                payload.image_b64.clone(),
+            )
+            .await;
+            match outcome {
+                Ok((dj, w, h)) => (dj, w, h, None),
+                Err(e) => ("[]".to_string(), 0, 0, Some(e.to_string())),
+            }
+        }
     };
 
     Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogDetectResponse(
