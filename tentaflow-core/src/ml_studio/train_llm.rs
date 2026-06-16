@@ -484,7 +484,14 @@ pub fn spawn_ft_local_worker(
         )
         .await
         {
-            tracing::warn!(run_id = %run_id, error = %e, "multi-rig: lokalny worker (rank>0) padł");
+            // Worker rank>0 padł → cały trening rozproszony jest nieważny.
+            // Domykamy run jako failed (B i tak utknie/padnie na rendezvous/DDP).
+            tracing::warn!(run_id = %run_id, error = %e, "multi-rig: lokalny worker (rank>0) padł — run failed");
+            let _ = repository::set_training_run_error(
+                &run_id,
+                &format!("multi-rig: lokalny worker (rank>0) padł: {}", e),
+            );
+            let _ = repository::update_training_run_status(&run_id, "failed");
         } else {
             tracing::info!(run_id = %run_id, "multi-rig: lokalny worker (rank>0) zakończony");
         }
