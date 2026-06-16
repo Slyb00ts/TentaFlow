@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 
 const A_URL = 'https://localhost:8095/';
 const CREDS = { username: 'power1', password: 'power123' };
-const B_ID = '9e7ba4c35219dacb6e687c5afbbf95d8ba021121d1a67c7f601f53e481b6ad83';
+const B_ID = '3b226fa884a5de60a03602223397975fbc84164de79847e8c4fc3ff4f55f1404';
 const PROJECT_ID = '42d36027-1118-47b4-9552-2dd273a0b82e';
 const DATASET_ID = 'b18cd9e4-0c3f-45f8-ab5c-2a631357a16e';
 
@@ -39,7 +39,7 @@ async function evalApi(page, fn, arg) {
       datasetId: a.DATASET_ID,
       variant: 'nano',
       targetNodeId: a.B_ID,
-      hyperparams: { epochs: 3, batchSize: 4, gradAccum: 1, learningRate: 1e-4, resolution: 560, earlyStopping: false },
+      hyperparams: { epochs: 3, batchSize: 4, gradAccum: 1, learningRate: 1e-4, resolution: 512, earlyStopping: false },
     }, { timeoutMs: 180000 }), { PROJECT_ID, DATASET_ID, B_ID });
     console.log('[A] train start ->', JSON.stringify(start));
     const runId = start.runId || start.run_id;
@@ -56,7 +56,16 @@ async function evalApi(page, fn, arg) {
         const arr = typeof curve === 'string' ? JSON.parse(curve) : curve;
         if (Array.isArray(arr) && arr.length) lastPt = JSON.stringify(arr[arr.length - 1]);
       } catch {}
-      if (status !== lastStatus || lastPt) console.log(`[A] poll ${i}: status=${status} last=${lastPt}`);
+      if (status === 'syncing') {
+        const ph = st.syncPhase ?? st.sync_phase;
+        const sent = Number(st.syncBytesSent ?? st.sync_bytes_sent ?? 0);
+        const tot = Number(st.syncBytesTotal ?? st.sync_bytes_total ?? 0);
+        const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
+        const pct = tot > 0 ? Math.round((sent / tot) * 100) : 0;
+        console.log(`[A] poll ${i}: SYNC phase=${ph} ${sent}/${tot}B ${pct}% rate=${(rate / 1024).toFixed(0)}KB/s`);
+      } else if (status !== lastStatus || lastPt) {
+        console.log(`[A] poll ${i}: status=${status} last=${lastPt}`);
+      }
       lastStatus = status;
       if (['succeeded', 'failed', 'completed', 'error'].includes(String(status))) {
         console.log('[A] FINAL status:', status, JSON.stringify(st).slice(0, 600));

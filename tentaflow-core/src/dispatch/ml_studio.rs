@@ -1519,6 +1519,11 @@ pub async fn ml_studio_recog_train_status(
 
     let epoch = curve_raw.iter().map(|(e, _, _)| *e).max().unwrap_or(0).max(0) as u64;
     let total_epochs = recog_total_epochs(&run.config_json);
+    // Błąd treningu (np. z węzła B) zapisany w config_json.$.error — zwróć go do UI.
+    let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("error")?.as_str().map(String::from))
+        .filter(|_| run.status == "failed");
     let last = curve.last();
     let train_loss = last.and_then(|p| p.train_loss);
     let map50 = last.and_then(|p| p.map50);
@@ -1534,7 +1539,7 @@ pub async fn ml_studio_recog_train_status(
             // mAP@50:95 nie jest w krzywej (tylko map50/loss); finalne metryki są
             // w `models.metrics_json` po sukcesie. Tu zwracamy None.
             map50_95: None,
-            error: None,
+            error: run_error,
             curve,
             sync_phase: None,
             sync_bytes_sent: 0,
@@ -1716,6 +1721,9 @@ fn sync_remote_recog_status(
             let _ = repository::update_training_run_status(run_id, "succeeded");
         }
         "failed" => {
+            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+                let _ = repository::set_training_run_error(run_id, err);
+            }
             let _ = repository::update_training_run_status(run_id, "failed");
         }
         _ => {}

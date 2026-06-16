@@ -534,6 +534,20 @@ pub fn update_training_run_status(run_id: &str, status: &str) -> Result<()> {
     Ok(())
 }
 
+/// Zapisuje komunikat błędu treningu w `config_json` runu (klucz `$.error`),
+/// żeby status handler mógł go zwrócić do UI. Bez osobnej kolumny — błąd to
+/// metadana runu, a config_json jest jego workiem na metadane.
+pub fn set_training_run_error(run_id: &str, error: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE training_runs SET config_json = json_set(config_json, '$.error', ?2) \
+         WHERE run_id = ?1",
+        params![run_id, error],
+    )?;
+    Ok(())
+}
+
 /// Wiąże run z wytrenowanym modelem (po sukcesie treningu).
 pub fn set_training_run_model(run_id: &str, model_id: &str) -> Result<()> {
     let pool = super::db::pool()?;
