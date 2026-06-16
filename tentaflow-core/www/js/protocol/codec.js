@@ -2664,6 +2664,12 @@ export const encode = {
       Number(hp.loraDropout ?? hp.lora_dropout ?? 0.05),
       (hp.maxSeqLen ?? hp.max_seq_len ?? 1024) >>> 0,
       Boolean(payload.mergeAdapter ?? payload.merge_adapter ?? false),
+      (payload.targetNodeId ?? payload.target_node_id) || undefined,
+      (payload.numGpus ?? payload.num_gpus ?? 0) >>> 0,
+      (payload.dist?.nnodes ?? 0) >>> 0,
+      (payload.dist?.nodeRank ?? payload.dist?.node_rank ?? 0) >>> 0,
+      String(payload.dist?.masterAddr ?? payload.dist?.master_addr ?? ''),
+      (payload.dist?.masterPort ?? payload.dist?.master_port ?? 29500) >>> 0,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

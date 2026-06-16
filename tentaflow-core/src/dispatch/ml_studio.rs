@@ -1119,7 +1119,7 @@ pub fn ml_studio_project_grants_list(
 #[handler(variant = "MlStudioFtTrainStartRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
-pub fn ml_studio_ft_train_start(
+pub async fn ml_studio_ft_train_start(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -1150,6 +1150,15 @@ pub fn ml_studio_ft_train_start(
         ));
     }
 
+    // Węzeł docelowy (mesh): pusty/local → trening lokalny; inny → zlecenie na B.
+    let local_node = ctx.state.local_node_id.to_string();
+    let target_node = payload
+        .target_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+        .map(str::to_string);
+
     // Konfiguracja runu zapisana w `training_runs.config_json` — niesie pełny
     // opis treningu (do wglądu w UI i do `total_steps` w statusie).
     let hp = &payload.hyperparams;
@@ -1160,6 +1169,8 @@ pub fn ml_studio_ft_train_start(
         "teacher_model": payload.teacher_model,
         "dataset_id": payload.dataset_id,
         "merge_adapter": payload.merge_adapter,
+        "node_id": target_node.clone().unwrap_or_else(|| local_node.clone()),
+        "num_gpus": payload.num_gpus,
         "hyperparams": {
             "learning_rate": hp.learning_rate,
             "batch_size": hp.batch_size,
@@ -1175,33 +1186,109 @@ pub fn ml_studio_ft_train_start(
 
     let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
 
-    // Trening LLM trwa minuty → odpalamy task w tle i wracamy natychmiast.
-    // owner_user_id = org.user_id (task czyta dataset w imieniu właściciela org).
-    crate::ml_studio::train_llm::spawn_ft_training(
-        run_id.clone(),
-        payload.project_id.clone(),
-        org.user_id.clone(),
-        payload.dataset_id.clone(),
-        payload.base_model.clone(),
-        payload.method.clone(),
-        payload.objective.clone(),
-        payload.teacher_model.clone(),
-        payload.hyperparams.clone(),
-        payload.merge_adapter,
-    );
+    match target_node {
+        None => {
+            // Trening LOKALNY — task w tle (jak dotąd), z multi-GPU wg num_gpus.
+            crate::ml_studio::train_llm::spawn_ft_training(
+                run_id.clone(),
+                payload.project_id.clone(),
+                org.user_id.clone(),
+                payload.dataset_id.clone(),
+                payload.base_model.clone(),
+                payload.method.clone(),
+                payload.objective.clone(),
+                payload.teacher_model.clone(),
+                payload.hyperparams.clone(),
+                payload.merge_adapter,
+                payload.num_gpus,
+            );
+            Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
+                tentaflow_protocol::MlStudioFtTrainStartResponse {
+                    run_id,
+                    status: "running".to_string(),
+                },
+            )))
+        }
+        Some(target) => {
+            // Trening ZDALNY (mesh): dataset → blob hash → spec → transfer → MlTrainStart.
+            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            if raw.is_empty() {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request("dataset pusty"));
+            }
+            let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+            let dataset_hash = crate::ml_studio::train_recognition::blob_content_hash(&raw);
+            let dist_json = payload.dist.as_ref().map(|d| serde_json::json!({
+                "nnodes": d.nnodes,
+                "node_rank": d.node_rank,
+                "master_addr": d.master_addr,
+                "master_port": d.master_port,
+            }));
+            let spec_json = serde_json::json!({
+                "kind": "llm",
+                "dataset": format!("mesh:{}", dataset_hash),
+                "dataset_hash": dataset_hash,
+                "dataset_kind": dataset.kind,
+                "base_model": payload.base_model,
+                "method": payload.method,
+                "objective": payload.objective,
+                "teacher_model": payload.teacher_model,
+                "merge_adapter": payload.merge_adapter,
+                "num_gpus": payload.num_gpus,
+                "dist": dist_json,
+                "output_dir": format!("ml_studio/{}/{}", payload.project_id, run_id),
+                "hyperparams": {
+                    "lr": hp.learning_rate,
+                    "batch_size": hp.batch_size,
+                    "grad_accum": hp.grad_accum_steps,
+                    "epochs": hp.epochs,
+                    "lora_r": hp.lora_r,
+                    "lora_alpha": hp.lora_alpha,
+                    "lora_dropout": hp.lora_dropout,
+                    "max_seq_len": hp.max_seq_len,
+                },
+            })
+            .to_string();
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
-        tentaflow_protocol::MlStudioFtTrainStartResponse {
-            run_id,
-            status: "running".to_string(),
-        },
-    )))
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            if let Some(security) = ctx.state.mesh_security.as_ref() {
+                if !security.is_trusted(&target) {
+                    let _ = repository::update_training_run_status(&run_id, "failed");
+                    return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+                }
+            }
+            let zip_bytes = crate::ml_studio::train_recognition::zip_single_file("dataset.bin", &raw)
+                .map_err(|e| {
+                    let _ = repository::update_training_run_status(&run_id, "failed");
+                    ProtocolError::internal(format!("zip datasetu: {}", e))
+                })?;
+            let _ = repository::update_training_run_status(&run_id, "syncing");
+            crate::ml_studio::train_recognition::spawn_mesh_push_and_train(
+                iroh,
+                target,
+                run_id.clone(),
+                zip_bytes,
+                dataset_hash,
+                spec_json,
+            );
+            Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
+                tentaflow_protocol::MlStudioFtTrainStartResponse {
+                    run_id,
+                    status: "syncing".to_string(),
+                },
+            )))
+        }
+    }
 }
 
 #[handler(variant = "MlStudioFtTrainStatusRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
-pub fn ml_studio_ft_train_status(
+pub async fn ml_studio_ft_train_status(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -1210,10 +1297,87 @@ pub fn ml_studio_ft_train_status(
         _ => return Err(ProtocolError::bad_request("expected MlStudioFtTrainStatusRequest")),
     };
     let org = require_org(ctx)?;
-    let run = repository::get_training_run(&payload.run_id)
+    let mut run = repository::get_training_run(&payload.run_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
     require_project_member(&org.user_id, &run.project_id)?;
+
+    // Faza transferu datasetu przez mesh (trening zdalny) — pasek B/s.
+    if let Some(sp) = crate::ml_studio::train_recognition::recog_sync_progress(&payload.run_id) {
+        match sp.phase.as_str() {
+            "error" => {
+                let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
+                    tentaflow_protocol::MlStudioFtTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "failed".to_string(),
+                        step: 0,
+                        total_steps: 0,
+                        train_loss: None,
+                        eval_loss: None,
+                        error: sp.error.clone(),
+                        loss_curve: Vec::new(),
+                        sync_phase: Some("error".to_string()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: 0,
+                    },
+                )));
+            }
+            "training" => {
+                if run.status != "running" {
+                    let _ = repository::update_training_run_status(&payload.run_id, "running");
+                    run.status = "running".to_string();
+                }
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+            }
+            _ => {
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
+                    tentaflow_protocol::MlStudioFtTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "syncing".to_string(),
+                        step: 0,
+                        total_steps: 0,
+                        train_loss: None,
+                        eval_loss: None,
+                        error: None,
+                        loss_curve: Vec::new(),
+                        sync_phase: Some(sp.phase.clone()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: sp.rate_bps,
+                    },
+                )));
+            }
+        }
+    }
+
+    // Run ZDALNY (node_id != local i running): odpytaj B przez mesh + zapisz metryki.
+    let local_node = ctx.state.local_node_id.to_string();
+    let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    if let Some(node) = run_node.filter(|n| *n != local_node) {
+        if run.status == "running" {
+            if let Some(iroh) = ctx.state.quic_mesh.clone() {
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainStatus {
+                    run_id: payload.run_id.clone(),
+                };
+                if let Ok(resp) = iroh.send_command_and_wait(&node, cmd, 30).await {
+                    if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
+                        status_json,
+                    } = resp.payload
+                    {
+                        sync_remote_ft_status(&payload.run_id, &run, &status_json);
+                        if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                            run = updated;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let curve = repository::loss_curve_for_run(&payload.run_id).map_err(db_err)?;
     let loss_curve: Vec<tentaflow_protocol::MlStudioLossPoint> = curve
@@ -1231,6 +1395,11 @@ pub fn ml_studio_ft_train_status(
     let last = loss_curve.last();
     let train_loss = last.and_then(|p| p.train_loss);
     let eval_loss = last.and_then(|p| p.eval_loss);
+    // Błąd treningu (np. z węzła B) zapisany w config_json.$.error.
+    let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("error")?.as_str().map(String::from))
+        .filter(|_| run.status == "failed");
 
     Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
         tentaflow_protocol::MlStudioFtTrainStatusResponse {
@@ -1240,12 +1409,65 @@ pub fn ml_studio_ft_train_status(
             total_steps,
             train_loss,
             eval_loss,
-            // Stan błędu trzymamy w statusie ('failed'); szczegół tekstowy nie
-            // jest persystowany na runie, więc tu zostaje None.
-            error: None,
+            error: run_error,
             loss_curve,
+            sync_phase: None,
+            sync_bytes_sent: 0,
+            sync_bytes_total: 0,
+            sync_rate_bps: 0,
         },
     )))
+}
+
+/// Zapisuje metryki/stan zdalnego treningu LLM (z węzła B) do bazy A. Po sukcesie
+/// rejestruje model; przy błędzie zapisuje komunikat w config_json.$.error.
+fn sync_remote_ft_status(run_id: &str, run: &repository::TrainingRunRow, status_json: &str) {
+    let st: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let step = st.get("step").and_then(|v| v.as_i64()).unwrap_or(0);
+    let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
+    let eval_loss = st.get("eval_loss").and_then(|v| v.as_f64());
+    if let Some(l) = train_loss {
+        let _ = repository::record_training_metric(run_id, step, "train_loss", l);
+    }
+    if let Some(l) = eval_loss {
+        let _ = repository::record_training_metric(run_id, step, "eval_loss", l);
+    }
+    match status {
+        "succeeded" => {
+            let cfg: serde_json::Value =
+                serde_json::from_str(&run.config_json).unwrap_or(serde_json::json!({}));
+            let base_model = cfg.get("base_model").and_then(|v| v.as_str()).unwrap_or("");
+            let method = cfg.get("method").and_then(|v| v.as_str()).unwrap_or("lora");
+            let node = cfg.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+            let artifact = st.get("artifact_path").and_then(|v| v.as_str()).unwrap_or("");
+            let metrics_json = serde_json::json!({
+                "train_loss": train_loss,
+                "eval_loss": eval_loss,
+                "step": step,
+                "artifact_path": artifact,
+                "node_id": node,
+            })
+            .to_string();
+            let model_name = format!("{}-{}", base_model, method);
+            if let Ok(model_id) =
+                repository::insert_model(&run.project_id, &model_name, "huggingface", base_model, &metrics_json)
+            {
+                let _ = repository::set_training_run_model(run_id, &model_id);
+            }
+            let _ = repository::update_training_run_status(run_id, "succeeded");
+        }
+        "failed" => {
+            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+                let _ = repository::set_training_run_error(run_id, err);
+            }
+            let _ = repository::update_training_run_status(run_id, "failed");
+        }
+        _ => {}
+    }
 }
 
 /// Wylicza `total_steps` z `config_json` runu: epochs × ceil(rows/(batch×accum)).

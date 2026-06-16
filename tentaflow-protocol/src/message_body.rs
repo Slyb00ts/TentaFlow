@@ -1492,6 +1492,27 @@ pub struct MlStudioFtTrainStartRequest {
     pub teacher_model: Option<String>,
     pub hyperparams: MlStudioFtHyperparams,
     pub merge_adapter: bool,
+    /// Węzeł docelowy treningu (mesh). Pusty/None → trening lokalny na tym węźle;
+    /// inny node_id → zlecenie przez mesh (komenda MlTrainStart kind="llm").
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+    /// Liczba GPU na węźle treningowym (None → wszystkie dostępne). Multi-GPU DDP.
+    #[serde(default)]
+    pub num_gpus: Option<u32>,
+    /// Konfiguracja treningu rozproszonego między węzłami (multi-rig). None →
+    /// single-node (num_gpus decyduje o liczbie kart).
+    #[serde(default)]
+    pub dist: Option<MlStudioDistConfig>,
+}
+
+/// Konfiguracja treningu rozproszonego multi-node (multi-rig). Mapuje wprost na
+/// argumenty `torchrun --nnodes/--node-rank/--rdzv-endpoint` po stronie serwisu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistConfig {
+    pub nnodes: u32,
+    pub node_rank: u32,
+    pub master_addr: String,
+    pub master_port: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1523,6 +1544,16 @@ pub struct MlStudioFtTrainStatusResponse {
     pub eval_loss: Option<f64>,
     pub error: Option<String>,
     pub loss_curve: Vec<MlStudioLossPoint>,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping"|"syncing"|
+    /// "starting"; None gdy lokalnie lub po zmaterializowaniu. UI: pasek B/s.
+    #[serde(default)]
+    pub sync_phase: Option<String>,
+    #[serde(default)]
+    pub sync_bytes_sent: u64,
+    #[serde(default)]
+    pub sync_bytes_total: u64,
+    #[serde(default)]
+    pub sync_rate_bps: u64,
 }
 
 // ----- Recognition (RF-DETR detekcja obiektów) — trening na COCO -----

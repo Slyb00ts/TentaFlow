@@ -488,6 +488,7 @@ pub use message_body::{
     MlStudioModelsListResponse,
     MlStudioProjectGrantsListRequest,
     MlStudioProjectGrantsListResponse,
+    MlStudioDistConfig,
     MlStudioFtHyperparams,
     MlStudioFtTrainStartRequest,
     MlStudioFtTrainStartResponse,

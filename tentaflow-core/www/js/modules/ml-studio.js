@@ -1926,6 +1926,11 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
           <div class="ml-studio-ft-sum-line"><span class="k">Hiperparametry</span><span class="v">lr ${escapeHtml(String(cfg.hyperparams.learningRate))} · batch ${escapeHtml(String(cfg.hyperparams.batchSize))} · ${escapeHtml(String(cfg.hyperparams.epochs))} epoki</span></div>
         </div>
         ${onlyOne ? '' : '<tf-select id="ml-studio-ft-dataset" label="Zbiór treningowy"></tf-select>'}
+        <div class="ml-studio-ft-resources" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">
+          <tf-select id="ml-studio-ft-node" label="Węzeł treningowy" style="flex:1;min-width:200px"></tf-select>
+          <tf-input type="number" id="ml-studio-ft-gpus" label="GPU (0 = wszystkie)" value="0" min="0" max="64" step="1" style="width:150px"></tf-input>
+          <tf-toggle id="ml-studio-ft-multirig" label="Multi-rig (rozproszony)"></tf-toggle>
+        </div>
         <div class="ml-studio-train-actions">
           <tf-button variant="primary" icon="play" id="ml-studio-ft-run">Uruchom trening</tf-button>
         </div>
@@ -1943,6 +1948,32 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
       datasetId = e.detail?.value || sel.value || datasetId;
     });
   }
+
+  // Węzeł treningowy: „Lokalnie" + węzły mesh (zaufane). Pusty target = lokalnie.
+  cfg.targetNodeId = cfg.targetNodeId || '';
+  cfg.numGpus = cfg.numGpus ?? 0;
+  cfg.multiRig = Boolean(cfg.multiRig);
+  const nodeSel = byId('ml-studio-ft-node');
+  if (nodeSel) {
+    nodeSel.setOptions([{ value: '', label: 'Lokalnie (ten węzeł)' }], cfg.targetNodeId);
+    ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
+      const opts = [{ value: '', label: 'Lokalnie (ten węzeł)' }];
+      (nodes || []).forEach((n) => {
+        const id = n.nodeId || n.node_id;
+        if (!id) return;
+        const host = n.hostname || n.host || '';
+        opts.push({ value: id, label: `${host || id.slice(0, 12)} (${id.slice(0, 8)}…)` });
+      });
+      nodeSel.setOptions(opts, cfg.targetNodeId);
+    }).catch(() => {});
+    nodeSel.addEventListener('change', (e) => { cfg.targetNodeId = e.detail?.value || nodeSel.value || ''; });
+  }
+  byId('ml-studio-ft-gpus')?.addEventListener('change', (e) => {
+    cfg.numGpus = Math.max(0, parseInt(e.detail?.value ?? e.target?.value ?? '0', 10) || 0);
+  });
+  byId('ml-studio-ft-multirig')?.addEventListener('change', (e) => {
+    cfg.multiRig = Boolean(e.detail?.checked ?? e.target?.checked);
+  });
 
   byId('ml-studio-ft-run')?.addEventListener('click', async () => {
     const baseModel = ftEffectiveBaseModel(cfg);
@@ -1970,6 +2001,8 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
         objective: cfg.objective,
         teacherModel: cfg.objective === 'kd' ? teacherModel : null,
         mergeAdapter: cfg.method !== 'full' && Boolean(cfg.mergeAdapter),
+        targetNodeId: cfg.targetNodeId || undefined,
+        numGpus: cfg.numGpus || 0,
         hyperparams: {
           learningRate: cfg.hyperparams.learningRate,
           batchSize: cfg.hyperparams.batchSize,
@@ -2027,6 +2060,35 @@ function startFtLive(host, runId, { selectTab }) {
 
   const renderStatus = (st) => {
     const status = String(st.status || 'running');
+    // Faza transferu datasetu przez mesh (trening na zdalnym węźle) — pasek B/s.
+    if (status === 'syncing') {
+      const syncPhase = String(st.syncPhase ?? st.sync_phase ?? 'syncing');
+      const sent = Number(st.syncBytesSent ?? st.sync_bytes_sent ?? 0);
+      const tot = Number(st.syncBytesTotal ?? st.sync_bytes_total ?? 0);
+      const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
+      const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
+      const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
+        : syncPhase === 'starting' ? 'uruchamianie treningu na węźle'
+        : 'transfer datasetu przez mesh';
+      const meta = byId('ml-studio-ft-progress-meta');
+      const bar = byId('ml-studio-ft-progress-bar');
+      if (meta) {
+        meta.innerHTML = syncPhase === 'syncing'
+          ? `${phaseLabel} · ${fmtBytes(sent)} / ${fmtBytes(tot)} · ${pct}% · ${fmtRate(rate)}`
+          : `<tf-spinner size="sm"></tf-spinner> ${phaseLabel}`;
+      }
+      if (bar) bar.setAttribute('value', String(pct));
+      const kpi = byId('ml-studio-ft-kpi');
+      if (kpi) {
+        kpi.innerHTML = `
+          <div class="ml-studio-ft-kpi"><div class="lbl">wysłano</div><div class="val">${fmtBytes(sent)}</div></div>
+          <div class="ml-studio-ft-kpi"><div class="lbl">rozmiar</div><div class="val">${fmtBytes(tot)}</div></div>
+          <div class="ml-studio-ft-kpi"><div class="lbl">prędkość</div><div class="val">${fmtRate(rate)}</div></div>`;
+      }
+      const badge = byId('ml-studio-ft-badge');
+      if (badge) badge.innerHTML = '<tf-badge tone="info" value="transfer danych"></tf-badge>';
+      return;
+    }
     const step = Number(st.step ?? 0);
     const totalSteps = Number(st.totalSteps ?? st.total_steps ?? 0);
     const trainLoss = st.trainLoss ?? st.train_loss;
