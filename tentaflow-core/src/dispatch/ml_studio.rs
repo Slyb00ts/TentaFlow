@@ -1255,11 +1255,15 @@ pub async fn ml_studio_ft_train_start(
             let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
                 ProtocolError::internal("mesh transport not available on this node")
             })?;
-            if let Some(security) = ctx.state.mesh_security.as_ref() {
-                if !security.is_trusted(&target) {
-                    let _ = repository::update_training_run_status(&run_id, "failed");
-                    return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
-                }
+            // Fail-closed: brak mesh_security = nie potrafimy zweryfikować zaufania,
+            // więc NIE wolno wysłać datasetu ani zlecić treningu nieznanemu peerowi.
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
             }
             let zip_bytes = crate::ml_studio::train_recognition::zip_single_file("dataset.bin", &raw)
                 .map_err(|e| {
@@ -1364,16 +1368,35 @@ pub async fn ml_studio_ft_train_status(
                 let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainStatus {
                     run_id: payload.run_id.clone(),
                 };
+                let mut ok = false;
                 if let Ok(resp) = iroh.send_command_and_wait(&node, cmd, 30).await {
-                    if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
-                        status_json,
-                    } = resp.payload
-                    {
-                        sync_remote_ft_status(&payload.run_id, &run, &status_json);
-                        if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
-                            run = updated;
+                    if resp.ok {
+                        if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
+                            status_json,
+                        } = resp.payload
+                        {
+                            sync_remote_ft_status(&payload.run_id, &run, &status_json);
+                            if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                                run = updated;
+                            }
+                            ok = true;
                         }
                     }
+                }
+                // Węzeł nieosiągalny / zgubił job → po progu domknij run jako failed.
+                if !ok
+                    && crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, false)
+                {
+                    let _ = repository::set_training_run_error(
+                        &payload.run_id,
+                        "węzeł treningowy nieosiągalny — trening przerwany",
+                    );
+                    let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                    if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                        run = updated;
+                    }
+                } else if ok {
+                    crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, true);
                 }
             }
         }
@@ -1592,11 +1615,15 @@ pub async fn ml_studio_recog_train_start(
             let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
                 ProtocolError::internal("mesh transport not available on this node")
             })?;
-            if let Some(security) = ctx.state.mesh_security.as_ref() {
-                if !security.is_trusted(&target) {
-                    let _ = repository::update_training_run_status(&run_id, "failed");
-                    return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
-                }
+            // Fail-closed: brak mesh_security = nie potrafimy zweryfikować zaufania,
+            // więc NIE wolno wysłać datasetu ani zlecić treningu nieznanemu peerowi.
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
             }
 
             // Transfer datasetu + start treningu biegną ASYNCHRONICZNIE w tle —
@@ -1713,17 +1740,34 @@ pub async fn ml_studio_recog_train_status(
                 let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainStatus {
                     run_id: payload.run_id.clone(),
                 };
+                let mut ok = false;
                 if let Ok(resp) = iroh.send_command_and_wait(&node, cmd, 30).await {
-                    if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
-                        status_json,
-                    } = resp.payload
-                    {
-                        sync_remote_recog_status(&org.user_id, &payload.run_id, &run, &status_json);
-                        // Odśwież run po ewentualnym domknięciu.
-                        if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
-                            run = updated;
+                    if resp.ok {
+                        if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
+                            status_json,
+                        } = resp.payload
+                        {
+                            sync_remote_recog_status(&org.user_id, &payload.run_id, &run, &status_json);
+                            if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                                run = updated;
+                            }
+                            ok = true;
                         }
                     }
+                }
+                if !ok
+                    && crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, false)
+                {
+                    let _ = repository::set_training_run_error(
+                        &payload.run_id,
+                        "węzeł treningowy nieosiągalny — trening przerwany",
+                    );
+                    let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                    if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                        run = updated;
+                    }
+                } else if ok {
+                    crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, true);
                 }
             }
         }
@@ -2017,13 +2061,15 @@ pub async fn ml_studio_recog_detect(
             let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
                 ProtocolError::internal("mesh transport not available on this node")
             })?;
-            if let Some(security) = ctx.state.mesh_security.as_ref() {
-                if !security.is_trusted(&node) {
-                    return Err(ProtocolError::bad_request(format!(
-                        "peer {} is not trusted",
-                        node
-                    )));
-                }
+            // Fail-closed: brak mesh_security = nie weryfikujemy zaufania → odmowa.
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&node) {
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    node
+                )));
             }
             let class_names_json = serde_json::to_string(&class_names).unwrap_or_else(|_| "[]".into());
             let cmd = tentaflow_protocol::mesh::MeshCommandType::MlDetect {
