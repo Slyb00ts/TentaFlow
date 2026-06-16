@@ -1236,12 +1236,7 @@ pub async fn ml_studio_ft_train_start(
                     .state
                     .mesh_peer_store
                     .get(&target)
-                    .and_then(|p| {
-                        p.addresses
-                            .iter()
-                            .find(|a| a.is_ipv4() && !a.is_loopback())
-                            .map(|a| a.to_string())
-                    })
+                    .and_then(|p| pick_lan_ipv4(&p.addresses))
                     .ok_or_else(|| {
                         let _ = repository::update_training_run_status(&run_id, "failed");
                         ProtocolError::bad_request(format!(
@@ -1493,6 +1488,34 @@ pub async fn ml_studio_ft_train_status(
             sync_rate_bps: 0,
         },
     )))
+}
+
+/// Wybiera najlepszy adres LAN IPv4 peera dla rendezvous treningu (master_addr).
+/// Preferuje sieci prywatne LAN (192.168/16, 10/8) ponad mostki kontenerowe
+/// (172.16/12 — typowo docker), odrzuca loopback i link-local (169.254). NCCL/
+/// rendezvous to bezpośrednie TCP poza meshem, więc adres musi być realnie LAN.
+fn pick_lan_ipv4(addresses: &[std::net::IpAddr]) -> Option<String> {
+    let v4: Vec<std::net::Ipv4Addr> = addresses
+        .iter()
+        .filter_map(|a| match a {
+            std::net::IpAddr::V4(v) => Some(*v),
+            _ => None,
+        })
+        .filter(|v| !v.is_loopback() && !v.is_link_local() && !v.is_unspecified())
+        .collect();
+    let score = |v: &std::net::Ipv4Addr| -> u8 {
+        let o = v.octets();
+        if o[0] == 192 && o[1] == 168 {
+            0
+        } else if o[0] == 10 {
+            1
+        } else if v.is_private() {
+            2
+        } else {
+            3
+        }
+    };
+    v4.into_iter().min_by_key(|v| score(v)).map(|v| v.to_string())
 }
 
 /// Zapisuje metryki/stan zdalnego treningu LLM (z węzła B) do bazy A. Po sukcesie

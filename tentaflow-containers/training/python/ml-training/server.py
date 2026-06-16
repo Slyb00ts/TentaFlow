@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -859,7 +860,11 @@ def _build_torchrun_cmd(
         if not d.master_addr:
             raise ValueError("dist.master_addr wymagany dla nnodes>1")
         # rdzv-id MUSI być wspólny między węzłami (run_id), nie lokalny job_id.
+        # Walidacja: tylko [A-Za-z0-9._-], max 128 — chroni torchrun/log przed
+        # śmieciowym/wstrzykniętym wejściem (rdzv_id bywa z zewnątrz).
         rdzv_id = d.rdzv_id or job_id
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", rdzv_id or ""):
+            raise ValueError(f"invalid rdzv_id: {rdzv_id!r}")
         cmd += [
             "--nnodes", str(d.nnodes),
             "--node-rank", str(d.node_rank),
