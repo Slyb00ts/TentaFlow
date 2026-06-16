@@ -290,8 +290,10 @@ async function renderApp() {
         items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
       }))
       .filter((section) => section.items.length > 0);
-    const userClass = isAdmin ? 'admin' : 'user';
-    const roleLabel = I18n.t(isAdmin ? 'role.administrator' : 'role.user');
+    const userClass = isAdmin ? 'admin' : isPowerUser ? 'power' : 'user';
+    const roleLabel = I18n.t(
+      isAdmin ? 'role.administrator' : isPowerUser ? 'users.role_power' : 'role.user',
+    );
     const logoutLabel = I18n.t('nav.logout');
 
     root.innerHTML = `

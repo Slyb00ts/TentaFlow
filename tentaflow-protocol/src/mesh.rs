@@ -441,6 +441,29 @@ pub enum MeshCommandType {
     OauthPoll {
         flow_id: String,
     },
+    /// ML Studio: uruchom trening NA TYM nodzie (odbiorca). `spec_json` niesie
+    /// pełną specyfikację (kind, dataset_dir, class_names, variant, hyperparams,
+    /// output_dir). Odbiorca startuje swój lokalny serwis treningowy i śledzi
+    /// job pod `run_id`. Odpowiedź: Empty (ok/error). Appended at END.
+    MlTrainStart {
+        run_id: String,
+        spec_json: String,
+    },
+    /// ML Studio: status zdalnego treningu o `run_id` (odbiorca odpytuje swój
+    /// lokalny serwis). Odpowiedź: `MlTrainStatusResult { status_json }`.
+    MlTrainStatus {
+        run_id: String,
+    },
+    /// ML Studio: transfer datasetu COCO przez mesh (chunk zip-a, content-addr
+    /// po `dataset_hash`). Odbiorca składa zip i rozpakowuje do cache pod hashem.
+    /// Dedup: gdy odbiorca MA już ten hash, zwraca `have_already=true` (nadawca
+    /// przerywa). Odpowiedź: `MlDatasetChunkResult { have_already }`.
+    MlDatasetChunk {
+        dataset_hash: String,
+        seq: u32,
+        total: u32,
+        data_b64: String,
+    },
 }
 
 // =============================================================================
@@ -502,6 +525,12 @@ pub enum MeshCommandResponsePayload {
     },
     /// Serialized WebResearchResponse JSON produced by the receiver.
     WebResearchResult { response_json: String },
+    /// ML Studio: status zdalnego treningu (JSON: status/epoch/total_epochs/
+    /// train_loss/map50/map50_95/artifact_path/error) produkowany przez odbiorcę.
+    MlTrainStatusResult { status_json: String },
+    /// ML Studio: ack chunku datasetu. `have_already` = odbiorca ma już ten
+    /// dataset (hash) → nadawca może przerwać transfer.
+    MlDatasetChunkResult { have_already: bool },
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
@@ -662,6 +691,22 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("provider", provider)
                 .finish(),
             Self::OauthPoll { .. } => write!(f, "OauthPoll"),
+            Self::MlTrainStart { run_id, spec_json } => f
+                .debug_struct("MlTrainStart")
+                .field("run_id", run_id)
+                .field("spec_len", &spec_json.len())
+                .finish(),
+            Self::MlTrainStatus { run_id } => f
+                .debug_struct("MlTrainStatus")
+                .field("run_id", run_id)
+                .finish(),
+            Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
+                .debug_struct("MlDatasetChunk")
+                .field("hash", &&dataset_hash[..dataset_hash.len().min(12)])
+                .field("seq", seq)
+                .field("total", total)
+                .field("chunk_len", &data_b64.len())
+                .finish(),
         }
     }
 }

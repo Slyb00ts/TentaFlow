@@ -399,6 +399,57 @@ impl MeshCommandExecutor {
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
             MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
             MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
+            MeshCommandType::MlTrainStart { run_id, spec_json } => {
+                self.handle_ml_train_start(run_id, spec_json).await
+            }
+            MeshCommandType::MlTrainStatus { run_id } => self.handle_ml_train_status(run_id).await,
+            MeshCommandType::MlDatasetChunk {
+                dataset_hash,
+                seq,
+                total,
+                data_b64,
+            } => self.handle_ml_dataset_chunk(dataset_hash, seq, total, data_b64).await,
+        }
+    }
+
+    /// Owner side: przyjmuje chunk datasetu COCO (zip) i składa go do cache pod
+    /// hashem. Dedup: gdy dataset (hash) już jest, zwraca have_already=true.
+    async fn handle_ml_dataset_chunk(
+        &self,
+        dataset_hash: String,
+        seq: u32,
+        total: u32,
+        data_b64: String,
+    ) -> CommandResponse {
+        match crate::ml_studio::train_recognition::mesh_dataset_chunk(
+            &dataset_hash,
+            seq,
+            total,
+            &data_b64,
+        ) {
+            Ok(have_already) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlDatasetChunkResult { have_already })
+            }
+            Err(e) => CommandResponse::fail(format!("mesh dataset chunk: {}", e)),
+        }
+    }
+
+    /// Owner side: uruchamia trening NA TYM nodzie przez lokalny serwis treningowy
+    /// (ML Studio mesh-distributed). `run_id` jest kluczem śledzenia po stronie
+    /// odbiorcy; inicjator (Node A) odpytuje przez `MlTrainStatus`.
+    async fn handle_ml_train_start(&self, run_id: String, spec_json: String) -> CommandResponse {
+        match crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await {
+            Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+            Err(e) => CommandResponse::fail(format!("mesh train start: {}", e)),
+        }
+    }
+
+    async fn handle_ml_train_status(&self, run_id: String) -> CommandResponse {
+        match crate::ml_studio::train_recognition::mesh_train_status(&run_id).await {
+            Ok(status_json) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlTrainStatusResult { status_json })
+            }
+            Err(e) => CommandResponse::fail(format!("mesh train status: {}", e)),
         }
     }
 

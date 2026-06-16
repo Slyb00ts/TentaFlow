@@ -1086,6 +1086,7 @@ pub struct MlStudioProjectSummary {
     pub status: String,
     pub dataset_count: u32,
     pub model_count: u32,
+    pub training_count: u32,
     /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
     pub role: String,
     /// Convenience flag for the UI: the requesting user owns this project.
@@ -1157,6 +1158,7 @@ pub struct MlStudioProjectTypesListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioProjectMember {
     pub user_id: String,
+    pub display_name: String,
     pub role: String,
     pub status: String,
     pub invited_by: String,
@@ -1171,6 +1173,65 @@ pub struct MlStudioProjectMembersListRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioProjectMembersListResponse {
     pub members: Vec<MlStudioProjectMember>,
+}
+
+/// One training-run row for the project overview tab (`Przegląd`). Mirrors the
+/// `training_runs` table; `model_id`/`started_at`/`finished_at` are NULL until the
+/// run produces a model or transitions state.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunSummary {
+    pub run_id: String,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunsListResponse {
+    pub runs: Vec<MlStudioTrainingRunSummary>,
+}
+
+/// One model row for the project overview tab. Mirrors the `models` table;
+/// `metrics_json` carries the serialized metric snapshot for the model card.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelSummary {
+    pub model_id: String,
+    pub name: String,
+    pub framework: String,
+    pub base_model: String,
+    pub status: String,
+    pub metrics_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelsListResponse {
+    pub models: Vec<MlStudioModelSummary>,
+}
+
+/// Member-accessible view of the resource grants allocated to one project,
+/// reusing `MlStudioResourceGrant`. The admin-wide `ResourceGrantsList` stays
+/// Admin-only; this one is gated by project membership.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectGrantsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectGrantsListResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1254,6 +1315,10 @@ pub struct DatasetSummary {
     pub row_count: u64,
     pub column_count: u32,
     pub created_at: String,
+    /// Profil datasetu (JSON): dla COCO niesie `classes`/`splits`/`image_count`,
+    /// dla tabel `TableProfile`. UI recognition czyta z niego listę klas.
+    #[serde(default)]
+    pub profile_json: String,
 }
 
 /// Upload a tabular file (CSV/XLSX) into a project for profiling. `bytes` is the
@@ -1365,6 +1430,10 @@ pub struct MlStudioTabularTrainRequest {
     pub dataset_id: String,
     pub target_column: String,
     pub task: String,
+    /// Wybór silnika treningu: `None`/`""`/`"rust"` → wbudowany silnik Rust
+    /// (domyślny, kompatybilny wstecz); `"autogluon"` → zewnętrzny serwis HTTP
+    /// AutoGluon. Pole na końcu structu, żeby starsi klienci dekodowali bez zmian.
+    pub engine: Option<String>,
 }
 
 /// One leaderboard row returned by a tabular training run. Classification fills
@@ -1391,6 +1460,268 @@ pub struct MlStudioTabularTrainResponse {
     pub train_rows: u64,
     pub holdout_rows: u64,
     pub leaderboard: Vec<MlStudioTabularLeaderboardEntry>,
+}
+
+/// Hiperparametry asynchronicznego fine-tuningu LLM. Lustro pól, których
+/// oczekuje serwis ml-training (`hyperparams{...}` w `POST /train`). Wartości
+/// idą wprost do serwisu; Core ich nie waliduje poza zakresem typu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtHyperparams {
+    pub learning_rate: f64,
+    pub batch_size: u32,
+    pub grad_accum_steps: u32,
+    pub epochs: u32,
+    pub lora_r: u32,
+    pub lora_alpha: u32,
+    pub lora_dropout: f64,
+    pub max_seq_len: u32,
+}
+
+/// Żądanie startu fine-tuningu LLM. Trening biegnie ASYNCHRONICZNIE w tle Core
+/// (zob. `train_llm.rs`), więc odpowiedź wraca natychmiast z `run_id`, a UI
+/// odpytuje postęp przez `MlStudioFtTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub base_model: String,
+    pub method: String,
+    pub objective: String,
+    /// Model-nauczyciel dla KD (objective=="kd"); None dla sft/dpo.
+    #[serde(default)]
+    pub teacher_model: Option<String>,
+    pub hyperparams: MlStudioFtHyperparams,
+    pub merge_adapter: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Pojedynczy punkt krzywej straty (krok treningu) do wykresu w UI (f02).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLossPoint {
+    pub step: u64,
+    pub train_loss: Option<f64>,
+    pub eval_loss: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub step: u64,
+    pub total_steps: u64,
+    pub train_loss: Option<f64>,
+    pub eval_loss: Option<f64>,
+    pub error: Option<String>,
+    pub loss_curve: Vec<MlStudioLossPoint>,
+}
+
+// ----- Recognition (RF-DETR detekcja obiektów) — trening na COCO -----
+
+/// Rejestracja datasetu COCO przez ŚCIEŻKĘ do katalogu na serwerze (a nie
+/// upload bajtów) — zbiory detekcji to dziesiątki/setki MB obrazów, ponad limit
+/// ramki WS (~0.9 MB). Katalog musi mieć splity z `_annotations.coco.json`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDatasetRegisterRequest {
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDatasetRegisterResponse {
+    pub dataset: DatasetSummary,
+}
+
+/// Detekcja na obrazie wytrenowanym modelem recognition. `image_b64` to małe
+/// zdjęcie (limit ramki WS ~0.9MB). Odpowiedź niesie detekcje jako JSON
+/// (`detections_json`: [{class_id,class_name,score,bbox_xyxy}]) — bez osobnych
+/// struktur per-detekcja w warstwie wasm.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDetectRequest {
+    pub model_id: String,
+    pub threshold: f64,
+    pub image_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDetectResponse {
+    pub detections_json: String,
+    pub width: u32,
+    pub height: u32,
+    pub error: Option<String>,
+}
+
+// ----- Recognition: edytor anotacji (galeria + edycja bboxów COCO) -----
+
+/// Lista obrazów datasetu COCO do galerii anotacji. `images_json` =
+/// [{image_id,file_name,split,width,height,ann_count}] (image_id syntetyczny
+/// "split|coco_id"), `categories_json` = [{id,name}].
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImagesListRequest {
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImagesListResponse {
+    pub images_json: String,
+    pub categories_json: String,
+}
+
+/// Pobranie jednego obrazu (przeskalowanego do wyświetlenia) + jego anotacji.
+/// `annotations_json` = [{id,category_id,bbox:[x,y,w,h]}] w ORYGINALNYCH
+/// współrzędnych; UI mapuje na przeskalowany obraz przez orig_width/height.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImageRequest {
+    pub dataset_id: String,
+    pub image_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImageResponse {
+    pub image_b64: String,
+    pub mime: String,
+    pub orig_width: u32,
+    pub orig_height: u32,
+    pub annotations_json: String,
+    pub error: Option<String>,
+}
+
+/// Zapis anotacji jednego obrazu z powrotem do `_annotations.coco.json` splitu.
+/// `annotations_json` = [{category_id,bbox:[x,y,w,h]}] w ORYGINALNYCH współrz.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogSaveAnnotationsRequest {
+    pub dataset_id: String,
+    pub image_id: String,
+    pub annotations_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogSaveAnnotationsResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogHyperparams {
+    pub epochs: u32,
+    pub batch_size: u32,
+    pub grad_accum: u32,
+    pub learning_rate: f64,
+    pub resolution: u32,
+    pub early_stopping: bool,
+}
+
+/// Start treningu detekcji RF-DETR. Dataset to COCO (zip) wgrany wcześniej.
+/// Biegnie ASYNCHRONICZNIE (zob. `train_recognition.rs`); UI pyta o postęp przez
+/// `MlStudioRecogTrainStatusRequest`. `variant` = nano|small|medium|base|large.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub variant: String,
+    pub hyperparams: MlStudioRecogHyperparams,
+    /// Mesh-distributed: węzeł docelowy treningu. None/pusty/local → trening
+    /// lokalny; inny node_id → trening uruchamiany na zdalnym węźle (Node B)
+    /// przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Punkt krzywej treningu detekcji (epoka): train loss + mAP@50 do wykresu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogMetricPoint {
+    pub epoch: u64,
+    pub train_loss: Option<f64>,
+    pub map50: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub epoch: u64,
+    pub total_epochs: u64,
+    pub train_loss: Option<f64>,
+    pub map50: Option<f64>,
+    pub map50_95: Option<f64>,
+    pub error: Option<String>,
+    pub curve: Vec<MlStudioRecogMetricPoint>,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping" | "syncing"
+    /// | "starting"; None gdy lokalnie lub gdy transfer zakończony i trening leci
+    /// na węźle B. UI pokazuje pasek postępu z prędkością B/s w fazie "syncing".
+    pub sync_phase: Option<String>,
+    pub sync_bytes_sent: u64,
+    pub sync_bytes_total: u64,
+    pub sync_rate_bps: u64,
+}
+
+/// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
+/// konwersja) trwa, więc biegnie ASYNCHRONICZNIE w tle Core (zob.
+/// `export_llm.rs`); odpowiedź wraca natychmiast, a UI odpytuje przez
+/// `MlStudioFtExportStatusRequest`. `outtype` to format kwantyzacji: "f16"|"q8_0".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportRequest {
+    pub model_id: String,
+    pub outtype: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportResponse {
+    pub model_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportStatusRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportStatusResponse {
+    pub model_id: String,
+    pub status: String,
+    pub gguf_path: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Żądanie DEPLOY wytrenowanego modelu FT (lokalny GGUF po eksporcie) jako
+/// embedded serwisu inferencji llama.cpp. Domyka cykl FT: trenuj→eksportuj→
+/// DEPLOY→używaj. Deploy biegnie przez istniejący `service_manifest_deploy`
+/// (engine `llama-cpp`, `native` embedded); model staje się dostępny pod
+/// aliasem `model_name` w routingu `/v1`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtDeployRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtDeployResponse {
+    pub model_id: String,
+    pub model_name: String,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -1427,6 +1758,36 @@ pub enum MlStudioPayload {
     ResourceGrantRevokeResponse(MlStudioResourceGrantRevokeResponse),
     ProjectResourcesRequest(MlStudioProjectResourcesRequest),
     ProjectResourcesResponse(MlStudioProjectResourcesResponse),
+    TrainingRunsListRequest(MlStudioTrainingRunsListRequest),
+    TrainingRunsListResponse(MlStudioTrainingRunsListResponse),
+    ModelsListRequest(MlStudioModelsListRequest),
+    ModelsListResponse(MlStudioModelsListResponse),
+    ProjectGrantsListRequest(MlStudioProjectGrantsListRequest),
+    ProjectGrantsListResponse(MlStudioProjectGrantsListResponse),
+    FtTrainStartRequest(MlStudioFtTrainStartRequest),
+    FtTrainStartResponse(MlStudioFtTrainStartResponse),
+    FtTrainStatusRequest(MlStudioFtTrainStatusRequest),
+    FtTrainStatusResponse(MlStudioFtTrainStatusResponse),
+    FtExportRequest(MlStudioFtExportRequest),
+    FtExportResponse(MlStudioFtExportResponse),
+    FtExportStatusRequest(MlStudioFtExportStatusRequest),
+    FtExportStatusResponse(MlStudioFtExportStatusResponse),
+    FtDeployRequest(MlStudioFtDeployRequest),
+    FtDeployResponse(MlStudioFtDeployResponse),
+    RecogTrainStartRequest(MlStudioRecogTrainStartRequest),
+    RecogTrainStartResponse(MlStudioRecogTrainStartResponse),
+    RecogTrainStatusRequest(MlStudioRecogTrainStatusRequest),
+    RecogTrainStatusResponse(MlStudioRecogTrainStatusResponse),
+    RecogDatasetRegisterRequest(MlStudioRecogDatasetRegisterRequest),
+    RecogDatasetRegisterResponse(MlStudioRecogDatasetRegisterResponse),
+    RecogDetectRequest(MlStudioRecogDetectRequest),
+    RecogDetectResponse(MlStudioRecogDetectResponse),
+    RecogImagesListRequest(MlStudioRecogImagesListRequest),
+    RecogImagesListResponse(MlStudioRecogImagesListResponse),
+    RecogImageRequest(MlStudioRecogImageRequest),
+    RecogImageResponse(MlStudioRecogImageResponse),
+    RecogSaveAnnotationsRequest(MlStudioRecogSaveAnnotationsRequest),
+    RecogSaveAnnotationsResponse(MlStudioRecogSaveAnnotationsResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

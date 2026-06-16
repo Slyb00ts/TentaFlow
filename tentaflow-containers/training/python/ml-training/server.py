@@ -11,6 +11,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import traceback
 import uuid
@@ -33,7 +37,23 @@ app = FastAPI(title="TentaFlow ML Training", version="1.0.0")
 # Wszystkie artefakty muszą lądować pod jednym, zaufanym katalogiem. Dowolne
 # `output_dir` z requestu jest sprowadzane do podkatalogu pod ARTIFACTS_ROOT,
 # co odcina path traversal (np. "../../etc").
-ARTIFACTS_ROOT = os.path.realpath(os.environ.get("ARTIFACTS_ROOT", "/out"))
+# Domyślnie kontener Dockera ustawia ARTIFACTS_ROOT=/out (zamontowany wolumen).
+# W deployu NATYWNYM (python-bundle) /out nie istnieje i nie jest zapisywalny,
+# więc fallback to katalog w HOME procesu serwisu (zapisywalny, trwały).
+_DEFAULT_ARTIFACTS_ROOT = os.path.join(os.path.expanduser("~"), ".tentaflow", "ml-training-out")
+ARTIFACTS_ROOT = os.path.realpath(os.environ.get("ARTIFACTS_ROOT") or _DEFAULT_ARTIFACTS_ROOT)
+os.makedirs(ARTIFACTS_ROOT, exist_ok=True)
+
+# Paski postępu tqdm (Trainer ORAZ datasets.map) piszą na stderr. Gdy supervisor
+# zamknie/zapcha pipe → BrokenPipeError ubija trening na etapie _prepare_dataset.
+# Wyłączamy je globalnie — postęp i loss raportujemy przez TrainerCallback do /status.
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+try:
+    import datasets as _datasets
+    _datasets.disable_progress_bars()
+except Exception:
+    pass
 
 # Zdalny kod modelu (custom architektury z HF) jest wyłączony domyślnie — to
 # wykonywanie cudzego Pythona przy ładowaniu wag. Włącz świadomie przez env.
@@ -48,6 +68,45 @@ _JOBS_LOCK = threading.Lock()
 # Jeden trening naraz na proces. Trening LLM wysyca GPU/RAM — równoległe joby
 # kończą się OOM. Slot jest zwalniany przez worker po zakończeniu (sukces/błąd).
 _TRAIN_SLOT = threading.Semaphore(1)
+
+# Eksport (merge LoRA + konwersja GGUF) ma własny rejestr stanów i własny slot.
+# Merge ładuje cały model bazowy do RAM, więc jeden eksport naraz na proces.
+_EXPORTS: dict[str, "ExportState"] = {}
+_EXPORTS_LOCK = threading.Lock()
+_EXPORT_SLOT = threading.Semaphore(1)
+
+# Katalog z narzędziami llama.cpp (skrypt convert_hf_to_gguf.py + gguf-py/).
+# Nadpisywalny przez env; fallback do cache native-libs TentaFlow.
+LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR") or os.path.expanduser(
+    "~/.cache/tentaflow-native-libs/src/llama.cpp"
+)
+
+# Typy produkowane wprost przez convert_hf_to_gguf.py (bez kwantyzacji K).
+_CONVERT_OUTTYPES = ("f16", "q8_0")
+# Typy K-quant wymagające binarki llama-quantize (konwersja f16 → docelowy typ).
+# Klucz = wartość API (lowercase), wartość = nazwa typu dla llama-quantize.
+_QUANTIZE_OUTTYPES = {
+    "q2_k": "Q2_K",
+    "q3_k_m": "Q3_K_M",
+    "q4_k_s": "Q4_K_S",
+    "q4_k_m": "Q4_K_M",
+    "q5_k_m": "Q5_K_M",
+    "q6_k": "Q6_K",
+}
+_ALLOWED_OUTTYPES = _CONVERT_OUTTYPES + tuple(_QUANTIZE_OUTTYPES)
+
+
+def _find_quantize_bin() -> Optional[str]:
+    """Lokalizuje binarkę llama-quantize: env LLAMA_QUANTIZE_BIN, potem typowe
+    katalogi build pod LLAMA_CPP_DIR. None gdy brak (K-quant niedostępny)."""
+    env_bin = os.environ.get("LLAMA_QUANTIZE_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    for sub in ("build-quantize/bin", "build/bin", "build-quantize", "build"):
+        cand = os.path.join(LLAMA_CPP_DIR, sub, "llama-quantize")
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def _sanitize_output_dir(output_dir: str) -> str:
@@ -116,6 +175,31 @@ class JobState:
         }
 
 
+@dataclass
+class ExportState:
+    export_id: str
+    status: str = "running"  # running | succeeded | failed
+    gguf_path: Optional[str] = None
+    size_bytes: Optional[int] = None
+    error: Optional[str] = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "export_id": self.export_id,
+            "status": self.status,
+            "gguf_path": self.gguf_path,
+            "size_bytes": self.size_bytes,
+            "error": self.error,
+        }
+
+
+class ExportRequest(BaseModel):
+    adapter_path: str
+    base_model: str
+    outtype: str = "f16"  # f16 | q8_0
+    export_id: Optional[str] = None
+
+
 class Hyperparams(BaseModel):
     epochs: float = Field(default=3.0, ge=1.0, le=50.0)
     lr: float = Field(default=2e-4, gt=0.0, le=1.0)
@@ -132,8 +216,11 @@ class TrainRequest(BaseModel):
     base_model: str
     train_data: list[dict[str, Any]] = Field(min_length=1)
     eval_data: Optional[list[dict[str, Any]]] = None
-    method: str = "lora"  # lora | qlora | full
-    objective: str = "sft"  # sft | dpo
+    method: str = "lora"  # lora | qlora | dora | full
+    objective: str = "sft"  # sft | dpo | kd
+    # KD (knowledge distillation): repo-id modelu-nauczyciela (zwykle większy,
+    # mocniejszy). Wymagane gdy objective=="kd"; ignorowane dla sft/dpo.
+    teacher_model: Optional[str] = None
     hyperparams: Hyperparams = Field(default_factory=Hyperparams)
     output_dir: str
     merge_adapter: bool = False
@@ -164,8 +251,13 @@ class ProgressCallback(TrainerCallback):
         if not logs:
             return
         changes: dict[str, Any] = {}
+        # Per-krok Trainer loguje {"loss": ...}; podsumowanie po treningu
+        # {"train_loss": ...} (inny klucz). Łapiemy oba, żeby także krótkie
+        # przebiegi (mało kroków) raportowały train_loss do /status i krzywej.
         if "loss" in logs:
             changes["train_loss"] = float(logs["loss"])
+        elif "train_loss" in logs:
+            changes["train_loss"] = float(logs["train_loss"])
         if "eval_loss" in logs:
             changes["eval_loss"] = float(logs["eval_loss"])
         if changes:
@@ -209,7 +301,7 @@ def _format_record(record: dict[str, Any], tokenizer) -> str:  # noqa: ANN001
     )
 
 
-def _lora_config(hp: Hyperparams):  # noqa: ANN001
+def _lora_config(hp: Hyperparams, use_dora: bool = False):  # noqa: ANN001
     from peft import LoraConfig
 
     return LoraConfig(
@@ -218,11 +310,21 @@ def _lora_config(hp: Hyperparams):  # noqa: ANN001
         lora_dropout=hp.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
+        # DoRA = LoRA z dekompozycją wagi na magnitudę+kierunek (use_dora=True).
+        # Wyższa wierność kosztem nieco wolniejszego treningu; ten sam adapter.
+        use_dora=use_dora,
         # Brak jawnej listy → peft wybiera wszystkie projekcje liniowe poza
         # output head (target_modules="all-linear"), co działa dla Qwen/Llama
         # bez ręcznego mapowania nazw per architektura.
         target_modules="all-linear",
     )
+
+
+def _peft_config_for(req: TrainRequest):  # noqa: ANN001
+    """Zwraca peft config dla metody: full→None, dora→LoRA+use_dora, lora/qlora→LoRA."""
+    if req.method == "full":
+        return None
+    return _lora_config(req.hyperparams, use_dora=req.method == "dora")
 
 
 def _load_tokenizer(base_model: str):  # noqa: ANN001
@@ -295,10 +397,13 @@ def _run_sft(req: TrainRequest, job_id: str) -> str:
         logging_steps=1,
         save_strategy="no",
         report_to=[],
+        # tqdm pisze pasek postępu na stderr; gdy supervisor zamknie/zapcha pipe
+        # → BrokenPipeError ubija trening. Wyłączamy paski (loss leci przez callback).
+        disable_tqdm=True,
         eval_strategy="epoch" if eval_ds is not None else "no",
     )
 
-    peft_config = None if req.method == "full" else _lora_config(hp)
+    peft_config = _peft_config_for(req)
 
     # trl 0.12.1: SFTTrainer przyjmuje tokenizer= (deprecation, ale działa);
     # processing_class doszedł dopiero w nowszym trl.
@@ -357,10 +462,13 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
         logging_steps=1,
         save_strategy="no",
         report_to=[],
+        # tqdm pisze pasek postępu na stderr; gdy supervisor zamknie/zapcha pipe
+        # → BrokenPipeError ubija trening. Wyłączamy paski (loss leci przez callback).
+        disable_tqdm=True,
         eval_strategy="epoch" if eval_ds is not None else "no",
     )
 
-    peft_config = None if req.method == "full" else _lora_config(hp)
+    peft_config = _peft_config_for(req)
 
     # trl 0.12.1: DPOTrainer przyjmuje tokenizer= (deprecation, ale działa).
     trainer = DPOTrainer(
@@ -376,17 +484,89 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
     return _save_artifact(trainer, tokenizer, req)
 
 
+def _to_messages(record: dict[str, Any]) -> dict[str, Any]:
+    """Mapuje rekord {prompt,response} na format konwersacyjny `messages`
+    wymagany przez DataCollatorForChatML (GKD). Brak response → sama tura usera."""
+    prompt = record.get("prompt") or record.get("text") or ""
+    response = record.get("response") or record.get("completion") or ""
+    messages = [{"role": "user", "content": prompt}]
+    if response:
+        messages.append({"role": "assistant", "content": response})
+    return {"messages": messages}
+
+
+def _run_kd(req: TrainRequest, job_id: str) -> str:
+    """Knowledge distillation (GKD) — student uczy się rozkładu nauczyciela.
+    Student = base_model (+LoRA/QLoRA); teacher = req.teacher_model (większy)."""
+    from trl import GKDConfig, GKDTrainer
+
+    if not req.teacher_model or not req.teacher_model.strip():
+        raise ValueError("KD requires 'teacher_model' (repo-id modelu-nauczyciela)")
+    _validate_base_model(req.teacher_model)
+
+    tokenizer = _load_tokenizer(req.base_model)
+    model = _load_model(req.base_model, req.method)
+
+    train_ds = Dataset.from_list([_to_messages(r) for r in req.train_data])
+    eval_ds = (
+        Dataset.from_list([_to_messages(r) for r in req.eval_data])
+        if req.eval_data
+        else None
+    )
+
+    hp = req.hyperparams
+    use_bf16 = _supports_bf16()
+    gkd_config = GKDConfig(
+        output_dir=req.output_dir,
+        num_train_epochs=hp.epochs,
+        per_device_train_batch_size=hp.batch_size,
+        gradient_accumulation_steps=hp.grad_accum,
+        learning_rate=hp.lr,
+        max_seq_length=hp.max_seq_len,
+        # lmbda=on-policy frac, beta=interpolacja JSD, temperatura softmaxu.
+        lmbda=0.5,
+        beta=0.5,
+        temperature=0.9,
+        max_new_tokens=hp.max_seq_len // 2,
+        bf16=use_bf16,
+        fp16=not use_bf16,
+        logging_steps=1,
+        save_strategy="no",
+        report_to=[],
+        disable_tqdm=True,
+        eval_strategy="epoch" if eval_ds is not None else "no",
+    )
+
+    peft_config = _peft_config_for(req)
+
+    # Teacher ładowany przez trainer z teacher_model_name_or_path (w eval-mode,
+    # bez gradientów). Student dostaje peft_config gdy lora/qlora.
+    gkd_config.teacher_model_name_or_path = req.teacher_model
+    trainer = GKDTrainer(
+        model=model,
+        teacher_model=req.teacher_model,
+        args=gkd_config,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+        callbacks=[ProgressCallback(job_id)],
+    )
+    trainer.train()
+    return _save_artifact(trainer, tokenizer, req)
+
+
 def _save_artifact(trainer, tokenizer, req: TrainRequest) -> str:  # noqa: ANN001
     """Zapisuje adapter (LoRA/QLoRA) lub pełny model do output_dir.
 
-    Gdy `merge_adapter=True` i metoda to lora/qlora, łączy wagi adaptera z bazą
+    Gdy `merge_adapter=True` i metoda to lora/qlora/dora, łączy wagi adaptera z bazą
     i zapisuje samodzielny model do podkatalogu `merged/`.
     """
     os.makedirs(req.output_dir, exist_ok=True)
     trainer.save_model(req.output_dir)
     tokenizer.save_pretrained(req.output_dir)
 
-    if req.merge_adapter and req.method in ("lora", "qlora"):
+    if req.merge_adapter and req.method in ("lora", "qlora", "dora"):
         merged_dir = os.path.join(req.output_dir, "merged")
         os.makedirs(merged_dir, exist_ok=True)
         merged = trainer.model.merge_and_unload()
@@ -403,6 +583,8 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
     try:
         if req.objective == "dpo":
             artifact = _run_dpo(req, job_id)
+        elif req.objective == "kd":
+            artifact = _run_kd(req, job_id)
         elif req.objective == "sft":
             artifact = _run_sft(req, job_id)
         else:
@@ -418,7 +600,147 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         )
     finally:
+        # Zwalniamy VRAM po KAŻDYM jobie (sukces/błąd) — inaczej żyjący proces
+        # ml-training trzyma wagi modelu (KD ładuje dwa!) i kolejne treningi
+        # wchodzą na wysycone GPU → OOM. Lokalne referencje modeli w _run_* są
+        # już poza zasięgiem, więc gc.collect()+empty_cache odzyskuje pamięć.
+        try:
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
         _TRAIN_SLOT.release()
+
+
+def _update_export(export_id: str, **changes: Any) -> None:
+    with _EXPORTS_LOCK:
+        st = _EXPORTS.get(export_id)
+        if st is None:
+            return
+        for key, value in changes.items():
+            setattr(st, key, value)
+
+
+def _resolve_base_path(base_model: str) -> str:
+    """Zwraca lokalną ścieżkę modelu bazowego dla konwertera.
+
+    Najpierw próbuje `from_pretrained(base_model)` (jak trening — model jest w
+    cache HF_HOME, więc to działa offline). Gdy się nie uda, rozwija repo-id przez
+    `snapshot_download(local_files_only=True)` i zwraca ścieżkę katalogu. Sam
+    `base_model` (repo-id lub katalog) jest zwracany, bo `from_pretrained` go
+    przyjmuje — pełną ścieżkę zwracamy tylko gdy fallback był konieczny.
+    """
+    try:
+        AutoModelForCausalLM.from_pretrained(
+            base_model, torch_dtype=torch.float16, trust_remote_code=ALLOW_REMOTE_CODE
+        )
+        return base_model
+    except Exception:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(base_model, local_files_only=True)
+
+
+def _export_worker(req: ExportRequest, export_id: str) -> None:
+    # Slot eksportu trzymamy przez całą operację (merge model w RAM) i zwalniamy
+    # w finally — niezależnie od wyniku, żeby nie zablokować kolejnych eksportów.
+    work: Optional[str] = None
+    try:
+        if not os.path.isdir(LLAMA_CPP_DIR):
+            raise RuntimeError(
+                f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
+            )
+        convert_script = os.path.join(LLAMA_CPP_DIR, "convert_hf_to_gguf.py")
+        if not os.path.exists(convert_script):
+            raise RuntimeError(
+                f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
+            )
+
+        base_path = _resolve_base_path(req.base_model)
+
+        work = tempfile.mkdtemp(prefix="tf-export-")
+        base = AutoModelForCausalLM.from_pretrained(
+            base_path, torch_dtype=torch.float16, trust_remote_code=ALLOW_REMOTE_CODE
+        )
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(base, req.adapter_path).merge_and_unload()
+        merged_dir = os.path.join(work, "merged")
+        model.save_pretrained(merged_dir, safe_serialization=True)
+        AutoTokenizer.from_pretrained(
+            base_path, trust_remote_code=ALLOW_REMOTE_CODE
+        ).save_pretrained(merged_dir)
+
+        out_dir = os.path.join(ARTIFACTS_ROOT, "exports", export_id)
+        os.makedirs(out_dir, exist_ok=True)
+        env = dict(os.environ, PYTHONPATH=os.path.join(LLAMA_CPP_DIR, "gguf-py"))
+
+        # K-quant (Q4_K_M itd.) konwerter robi w dwóch krokach: najpierw f16
+        # GGUF, potem llama-quantize do typu docelowego. f16/q8_0 idą wprost.
+        is_kquant = req.outtype in _QUANTIZE_OUTTYPES
+        convert_outtype = "f16" if is_kquant else req.outtype
+        gguf_path = os.path.join(out_dir, f"model-{req.outtype}.gguf")
+        convert_path = (
+            os.path.join(out_dir, "model-f16-intermediate.gguf")
+            if is_kquant
+            else gguf_path
+        )
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                convert_script,
+                merged_dir,
+                "--outfile",
+                convert_path,
+                "--outtype",
+                convert_outtype,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0 or not os.path.exists(convert_path):
+            raise RuntimeError("GGUF convert failed: " + r.stderr[-1500:])
+
+        if is_kquant:
+            quant_bin = _find_quantize_bin()
+            if quant_bin is None:
+                raise RuntimeError(
+                    "llama-quantize niedostępny — zbuduj go (cmake --target "
+                    "llama-quantize) lub ustaw LLAMA_QUANTIZE_BIN; f16/q8_0 nie "
+                    "wymagają binarki"
+                )
+            q = subprocess.run(
+                [quant_bin, convert_path, gguf_path, _QUANTIZE_OUTTYPES[req.outtype]],
+                capture_output=True,
+                text=True,
+            )
+            # Sprzątamy pośredni f16 niezależnie od wyniku — bywa duży (~1 GB).
+            try:
+                os.remove(convert_path)
+            except OSError:
+                pass
+            if q.returncode != 0 or not os.path.exists(gguf_path):
+                raise RuntimeError("llama-quantize failed: " + q.stderr[-1500:])
+
+        size = os.path.getsize(gguf_path)
+        _update_export(
+            export_id, status="succeeded", gguf_path=gguf_path, size_bytes=size
+        )
+    except Exception as exc:  # noqa: BLE001
+        _update_export(
+            export_id,
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+        )
+    finally:
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
+        _EXPORT_SLOT.release()
 
 
 @app.get("/health")
@@ -433,10 +755,12 @@ def health() -> dict[str, Any]:
 
 @app.post("/train")
 def train(req: TrainRequest) -> dict[str, Any]:
-    if req.method not in ("lora", "qlora", "full"):
+    if req.method not in ("lora", "qlora", "dora", "full"):
         raise HTTPException(400, f"invalid method: {req.method}")
-    if req.objective not in ("sft", "dpo"):
+    if req.objective not in ("sft", "dpo", "kd"):
         raise HTTPException(400, f"invalid objective: {req.objective}")
+    if req.objective == "kd" and not (req.teacher_model or "").strip():
+        raise HTTPException(400, "objective 'kd' requires 'teacher_model'")
 
     # Walidacja wejścia PRZED zajęciem slotu/utworzeniem joba — błędne żądanie
     # nie może uruchomić treningu ani zablokować kolejki.
@@ -492,3 +816,56 @@ def model_path(job_id: str) -> dict[str, Any]:
         if st.status != "succeeded" or not st.artifact_path:
             raise HTTPException(409, f"job {job_id} has no artifact (status={st.status})")
         return {"job_id": job_id, "artifact_path": st.artifact_path}
+
+
+@app.post("/export")
+def export(req: ExportRequest) -> dict[str, Any]:
+    if req.outtype not in _ALLOWED_OUTTYPES:
+        raise HTTPException(
+            400, f"invalid outtype: {req.outtype} (allowed: {_ALLOWED_OUTTYPES})"
+        )
+    try:
+        _validate_base_model(req.base_model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not req.adapter_path or not os.path.isdir(req.adapter_path):
+        raise HTTPException(400, f"adapter_path is not a directory: {req.adapter_path}")
+    if not os.path.exists(os.path.join(req.adapter_path, "adapter_config.json")):
+        raise HTTPException(
+            400, f"adapter_path has no adapter_config.json: {req.adapter_path}"
+        )
+
+    export_id = req.export_id or uuid.uuid4().hex
+
+    # Jeden eksport naraz: gdy slot zajęty, odmawiamy 429 bez tworzenia stanu.
+    if not _EXPORT_SLOT.acquire(blocking=False):
+        raise HTTPException(429, "another export is already running")
+
+    try:
+        with _EXPORTS_LOCK:
+            if export_id in _EXPORTS and _EXPORTS[export_id].status == "running":
+                raise HTTPException(409, f"export {export_id} already running")
+            _EXPORTS[export_id] = ExportState(export_id=export_id)
+
+        thread = threading.Thread(
+            target=_export_worker,
+            args=(req, export_id),
+            name=f"export-{export_id}",
+            daemon=True,
+        )
+        thread.start()
+    except BaseException:
+        # Worker, który zwolniłby slot, nigdy nie ruszył — slot musi wrócić.
+        _EXPORT_SLOT.release()
+        raise
+
+    return {"export_id": export_id}
+
+
+@app.get("/export_status/{export_id}")
+def export_status(export_id: str) -> dict[str, Any]:
+    with _EXPORTS_LOCK:
+        st = _EXPORTS.get(export_id)
+        if st is None:
+            raise HTTPException(404, f"unknown export: {export_id}")
+        return st.snapshot()

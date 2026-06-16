@@ -4,8 +4,8 @@ use anyhow::{bail, Result};
 use rusqlite::{params, OptionalExtension};
 
 use super::models::{
-    Dataset, MemberStatus, Project, ProjectMember, ProjectRole, ProjectSummary, ProjectType,
-    ResourceGrant, GRANT_RESOURCE_KINDS, GRANT_SUBJECT_KINDS,
+    Dataset, MemberStatus, ModelSummary, Project, ProjectMember, ProjectRole, ProjectSummary,
+    ProjectType, ResourceGrant, TrainingRunSummary, GRANT_RESOURCE_KINDS, GRANT_SUBJECT_KINDS,
 };
 
 /// Lists projects the user is an active member of (owner or invited),
@@ -20,6 +20,7 @@ pub fn list_projects(user_id: &str) -> Result<Vec<ProjectSummary>> {
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
                 (SELECT COUNT(*) FROM models m WHERE m.project_id = p.project_id), \
                 (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id), \
+                (SELECT COUNT(*) FROM training_runs t WHERE t.project_id = p.project_id), \
                 pm.role \
          FROM projects p \
          JOIN project_members pm ON pm.project_id = p.project_id \
@@ -94,6 +95,7 @@ pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSumm
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
                 (SELECT COUNT(*) FROM models m WHERE m.project_id = p.project_id), \
                 (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id), \
+                (SELECT COUNT(*) FROM training_runs t WHERE t.project_id = p.project_id), \
                 pm.role \
          FROM projects p \
          JOIN project_members pm ON pm.project_id = p.project_id \
@@ -135,6 +137,40 @@ pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
     let rows = stmt.query_map(params![project_id], read_member)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Rozwiązuje nazwy wyświetlane użytkowników z katalogu CORE (`user_accounts`).
+/// Lookup jest per-id w pętli, bo `project_members` żyje w `ml_studio.db`, a
+/// `user_accounts` w bazie CORE (osobny pool) — to inne pliki SQLite, więc nie da
+/// się zrobić JOIN-a między bazami w jednym zapytaniu. Zwraca mapę id→nazwa tylko
+/// dla znalezionych wierszy; gdy CORE jest niedostępne lub id nie istnieje,
+/// pomija je (frontend ma własny fallback do UUID). Nie panikuje przy błędzie.
+pub fn resolve_display_names(
+    user_ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(core) = crate::db::global_pool() else {
+        return out;
+    };
+    let Ok(conn) = core.lock() else {
+        return out;
+    };
+    for id in user_ids {
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(display_name, ''), NULLIF(username, ''), id) \
+                 FROM user_accounts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(name) = name {
+            out.insert(id.clone(), name);
+        }
+    }
+    out
 }
 
 /// Invites a user to a project with a grantable role (`editor`/`viewer`). Only
@@ -462,6 +498,252 @@ pub fn record_training_result(
     Ok((run_id, model_id))
 }
 
+/// Tworzy wiersz `training_runs` w stanie `running` dla asynchronicznego
+/// fine-tuningu LLM. W odróżnieniu od `record_training_result` (który zapisuje
+/// gotowy wynik jednym transactem) ten run jest „żywy" — task w tle aktualizuje
+/// jego status i metryki przez kolejne wywołania. Zwraca wygenerowany `run_id`.
+pub fn create_training_run(project_id: &str, config_json: &str) -> Result<String> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO training_runs (run_id, project_id, status, config_json, started_at) \
+         VALUES (?1, ?2, 'running', ?3, datetime('now'))",
+        params![run_id, project_id, config_json],
+    )?;
+    Ok(run_id)
+}
+
+/// Aktualizuje status runu. Gdy status nie jest już `running` (terminalny:
+/// `succeeded`/`failed`), ustawia także `finished_at`, bo run się zakończył.
+pub fn update_training_run_status(run_id: &str, status: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    if status == "running" {
+        conn.execute(
+            "UPDATE training_runs SET status = ?2 WHERE run_id = ?1",
+            params![run_id, status],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE training_runs SET status = ?2, finished_at = datetime('now') \
+             WHERE run_id = ?1",
+            params![run_id, status],
+        )?;
+    }
+    Ok(())
+}
+
+/// Wiąże run z wytrenowanym modelem (po sukcesie treningu).
+pub fn set_training_run_model(run_id: &str, model_id: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE training_runs SET model_id = ?2 WHERE run_id = ?1",
+        params![run_id, model_id],
+    )?;
+    Ok(())
+}
+
+/// Dopisuje pojedynczą metrykę treningu (np. `train_loss`/`eval_loss`) dla
+/// danego kroku. Wołane na żywo z taska w tle przy każdym statusie z serwisu.
+pub fn record_training_metric(run_id: &str, step: i64, key: &str, value: f64) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO metrics_history (run_id, step, metric_key, metric_value) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![run_id, step, key, value],
+    )?;
+    Ok(())
+}
+
+/// Wstawia model wytrenowany asynchronicznie (poza transactem
+/// `record_training_result`) i zwraca jego `model_id`. Używane po sukcesie
+/// fine-tuningu LLM — run jest już utworzony, więc model dopinamy osobno przez
+/// `set_training_run_model`.
+pub fn insert_model(
+    project_id: &str,
+    name: &str,
+    framework: &str,
+    base_model: &str,
+    metrics_json: &str,
+) -> Result<String> {
+    let model_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO models \
+             (model_id, project_id, name, framework, base_model, metrics_json, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'trained')",
+        params![model_id, project_id, name, framework, base_model, metrics_json],
+    )?;
+    Ok(model_id)
+}
+
+/// Jeden wiersz `models` z polami potrzebnymi do eksportu GGUF i autoryzacji.
+/// `project_id` służy do `require_project_member`, `base_model` + `metrics_json`
+/// (skąd handler wyłuskuje `artifact_path`) zasilają żądanie eksportu.
+pub struct ModelRow {
+    pub model_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub framework: String,
+    pub base_model: String,
+    pub metrics_json: String,
+    pub status: String,
+}
+
+/// Pobiera pojedynczy model po `model_id`. Bez autoryzacji — handler bramkuje
+/// dostęp przez `project_id` (członkostwo w projekcie). Zwraca `None` gdy brak.
+pub fn get_model(model_id: &str) -> Result<Option<ModelRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row = conn
+        .query_row(
+            "SELECT model_id, project_id, name, framework, base_model, metrics_json, status \
+             FROM models WHERE model_id = ?1",
+            params![model_id],
+            |row| {
+                Ok(ModelRow {
+                    model_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    name: row.get(2)?,
+                    framework: row.get(3)?,
+                    base_model: row.get(4)?,
+                    metrics_json: row.get(5)?,
+                    status: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Nadpisuje `metrics_json` modelu. Używane przez task eksportu w tle do zapisu
+/// stanu (`export_status`/`gguf_path`/...) wmergowanego w istniejący JSON metryk.
+pub fn update_model_metrics(model_id: &str, metrics_json: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE models SET metrics_json = ?1 WHERE model_id = ?2",
+        params![metrics_json, model_id],
+    )?;
+    Ok(())
+}
+
+/// Jeden run z `project_id`, do autoryzacji w handlerze statusu (status
+/// odpytuje członek projektu, do którego należy run). Zwraca `None` gdy brak.
+pub struct TrainingRunRow {
+    pub run_id: String,
+    pub project_id: String,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
+pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row = conn
+        .query_row(
+            "SELECT run_id, project_id, model_id, status, config_json, started_at, finished_at \
+             FROM training_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(TrainingRunRow {
+                    run_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    status: row.get(3)?,
+                    config_json: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Buduje krzywą straty runu z `metrics_history`: pivotuje wiersze
+/// `metric_key in ('train_loss','eval_loss')` per `step`, zwracając listę
+/// `(step, train_loss, eval_loss)` posortowaną rosnąco po kroku. Brakująca
+/// metryka dla danego kroku zostaje `None`.
+pub fn loss_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 AND metric_key IN ('train_loss', 'eval_loss') \
+         ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    // Pivot: agregujemy per step zachowując kolejność pierwszego wystąpienia
+    // (kroki rosną monotonicznie, więc wystarczy lista + indeks ostatniego kroku).
+    let mut curve: Vec<(i64, Option<f64>, Option<f64>)> = Vec::new();
+    for r in rows {
+        let (step, key, value) = r?;
+        let entry = match curve.last_mut() {
+            Some(last) if last.0 == step => last,
+            _ => {
+                curve.push((step, None, None));
+                curve.last_mut().expect("just pushed")
+            }
+        };
+        match key.as_str() {
+            "train_loss" => entry.1 = Some(value),
+            "eval_loss" => entry.2 = Some(value),
+            _ => {}
+        }
+    }
+    Ok(curve)
+}
+
+/// Krzywa treningu detekcji: pivot metryk per epoka (step=epoka) na
+/// (epoch, train_loss, map50). Analogiczne do `loss_curve_for_run`, ale dla
+/// metryk recognition (`train_loss` + `map50`).
+pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 AND metric_key IN ('train_loss', 'map50') \
+         ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    let mut curve: Vec<(i64, Option<f64>, Option<f64>)> = Vec::new();
+    for r in rows {
+        let (step, key, value) = r?;
+        let entry = match curve.last_mut() {
+            Some(last) if last.0 == step => last,
+            _ => {
+                curve.push((step, None, None));
+                curve.last_mut().expect("just pushed")
+            }
+        };
+        match key.as_str() {
+            "train_loss" => entry.1 = Some(value),
+            "map50" => entry.2 = Some(value),
+            _ => {}
+        }
+    }
+    Ok(curve)
+}
+
 /// Returns the number of registered models for a project.
 pub fn count_models_per_project(project_id: &str) -> Result<u32> {
     let pool = super::db::pool()?;
@@ -597,6 +879,60 @@ pub fn create_grant(
     .map_err(Into::into)
 }
 
+/// Lists every training run of a project, most recently active first (finished
+/// runs by finish time, otherwise by start time). No authorization here; callers
+/// gate visibility by project membership.
+pub fn list_training_runs(project_id: &str) -> Result<Vec<TrainingRunSummary>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT run_id, model_id, status, config_json, started_at, finished_at \
+         FROM training_runs WHERE project_id = ?1 \
+         ORDER BY COALESCE(finished_at, started_at) DESC, run_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_training_run)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists every model of a project, newest first. No authorization here; callers
+/// gate visibility by project membership.
+pub fn list_models(project_id: &str) -> Result<Vec<ModelSummary>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT model_id, name, framework, base_model, status, metrics_json, created_at \
+         FROM models WHERE project_id = ?1 \
+         ORDER BY created_at DESC, model_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_model)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn read_training_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrainingRunSummary> {
+    Ok(TrainingRunSummary {
+        run_id: row.get(0)?,
+        model_id: row.get(1)?,
+        status: row.get(2)?,
+        config_json: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+    })
+}
+
+fn read_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelSummary> {
+    Ok(ModelSummary {
+        model_id: row.get(0)?,
+        name: row.get(1)?,
+        framework: row.get(2)?,
+        base_model: row.get(3)?,
+        status: row.get(4)?,
+        metrics_json: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
 /// Lists every resource grant, newest first. Admin-wide view — no subject
 /// scoping. Caller gates visibility (admin-only).
 pub fn list_grants() -> Result<Vec<ResourceGrant>> {
@@ -669,12 +1005,14 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
     };
     let model_count = row.get::<_, i64>(9)?.max(0) as u32;
     let dataset_count = row.get::<_, i64>(10)?.max(0) as u32;
-    let role: String = row.get(11)?;
+    let training_count = row.get::<_, i64>(11)?.max(0) as u32;
+    let role: String = row.get(12)?;
     let is_owner = role == ProjectRole::Owner.slug();
     Ok(ProjectSummary {
         project,
         model_count,
         dataset_count,
+        training_count,
         role,
         is_owner,
     })

@@ -197,6 +197,32 @@ pub struct ResourceGrant {
     pub created_at: String,
 }
 
+/// One training-run row from `training_runs`, used by the project overview tab.
+/// `model_id`/`started_at`/`finished_at` are NULL until the run produces a model
+/// or changes state, hence the `Option<String>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingRunSummary {
+    pub run_id: String,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// One model row from `models`, used by the project overview tab. `metrics_json`
+/// carries the serialized metric snapshot for the model card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSummary {
+    pub model_id: String,
+    pub name: String,
+    pub framework: String,
+    pub base_model: String,
+    pub status: String,
+    pub metrics_json: String,
+    pub created_at: String,
+}
+
 /// Allowed `subject_kind` values for a resource grant.
 pub const GRANT_SUBJECT_KINDS: [&str; 3] = ["user", "group", "project"];
 
@@ -210,6 +236,7 @@ pub struct ProjectSummary {
     pub project: Project,
     pub model_count: u32,
     pub dataset_count: u32,
+    pub training_count: u32,
     /// Role of the requesting user within this project (`owner`/`editor`/`viewer`).
     pub role: String,
     /// Convenience flag: the requesting user is the project owner.
