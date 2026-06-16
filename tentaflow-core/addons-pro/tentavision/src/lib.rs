@@ -82,6 +82,15 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+    fn camera_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_update_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
@@ -254,6 +263,43 @@ where
         out.truncate(out_len as usize);
         return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
+}
+
+/// Lists the flows assignable as a camera's analysis flow (`(id, name)`),
+/// scoped host-side to `service_type='camera_analysis'`.
+fn host_camera_analysis_flows() -> Result<Vec<(String, String)>, AbiError> {
+    let out: tentaflow_sdk_spec::CameraAnalysisFlowsOut =
+        call_cbor_out(camera_analysis_flows_list_v1)?;
+    Ok(out.flows.into_iter().map(|f| (f.id, f.name)).collect())
+}
+
+/// Reads one camera's authoritative info from core (carries `analysis_flow_id`,
+/// which the addon's own SQLite mirror does not store).
+fn host_camera_get(camera_id: &str) -> Result<tentaflow_sdk_spec::CameraInfoOut, AbiError> {
+    let input = tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.into(),
+    };
+    call_cbor_in_out(&input, camera_get_v1)
+}
+
+/// Sets (or, with `None`, clears) a camera's analysis flow via core. Empty string
+/// on the wire is the documented "clear" signal for `analysis_flow_id`.
+fn host_camera_set_flow(
+    camera_id: &str,
+    flow_id: Option<&str>,
+) -> Result<tentaflow_sdk_spec::CameraInfoOut, AbiError> {
+    let input = tentaflow_sdk_spec::CameraUpdateInput {
+        camera_id: camera_id.into(),
+        display_name: None,
+        target_fps: None,
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: None,
+        profile: None,
+        analysis_fps: None,
+        analysis_flow_id: Some(flow_id.unwrap_or("").into()),
+    };
+    call_cbor_in_out(&input, camera_update_v1)
 }
 
 /// Reads a JSON response from a host function with the read-only
@@ -1464,6 +1510,8 @@ struct PanelState {
     cameras_filter: String,
     // Camera selected via a table row click, pending a delete confirmation.
     camera_pending_remove: Option<String>,
+    // Camera whose analysis-flow selector is open (its "Flow" row action).
+    camera_flow_edit: Option<String>,
     error_message: Option<String>,
     success_message: Option<String>,
     discover: DiscoverState,
@@ -2055,6 +2103,7 @@ impl PanelState {
             current_panel: String::new(),
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
             camera_pending_remove: None,
+            camera_flow_edit: None,
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -2324,14 +2373,26 @@ fn render_panel(panel_id: &str) {
     // the Table mounts with rows already in the store snapshot — otherwise its
     // first rebuild sees an empty rows_path and leaves the empty-state visible.
     if panel_id == "cameras" {
-        let overlay = PENDING_CAMERA_ROWS
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-            .map(|rows| vec![StateEntry {
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_CAMERA_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
                 path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
                 value: rows,
-            }]);
+            });
+        }
+        // When the flow selector is open, preselect it with the camera's current
+        // analysis flow (read from core — the addon mirror has no flow id).
+        if let Some(id) = with_state(|s| s.camera_flow_edit.clone()) {
+            let current = host_camera_get(&id)
+                .ok()
+                .and_then(|c| c.analysis_flow_id)
+                .unwrap_or_default();
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("camera_flow_select".into())]),
+                value: Value::Text(current),
+            });
+        }
+        let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "profiles" {
         let mut entries: Vec<StateEntry> = Vec::new();
@@ -2506,6 +2567,9 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
         "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
         "camera-remove" => handle_camera_remove(params),
+        "camera-flow-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-flow-cancel" => { with_state(|s| { s.camera_flow_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-flow-change" => handle_camera_flow_change(params),
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
         "cameras-refresh" => handle_camera_refresh_status(),
@@ -3032,6 +3096,39 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     match db::delete_camera(&camera_id) {
         Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Commits the analysis-flow pick for a camera. The Select sends `camera_id`
+/// (handler param) + `value` (chosen flow id; empty = clear). Assignment +
+/// validation (flow exists/active) happen in the core `camera_update_v1` host fn.
+fn handle_camera_flow_change(params: &JsonValue) -> JsonValue {
+    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if camera_id.is_empty() {
+        with_state(|s| { s.error_message = Some("Brak kamery do przypisania flow.".to_string()); });
+        return json!({"ok":false,"error":"empty camera_id"});
+    }
+    let flow = if value.is_empty() { None } else { Some(value.as_str()) };
+    match host_camera_set_flow(&camera_id, flow) {
+        Ok(_) => {
+            with_state(|s| {
+                s.camera_flow_edit = None;
+                s.success_message = Some(if flow.is_some() {
+                    "Przypisano flow analizy do kamery.".to_string()
+                } else {
+                    "Usunięto przypisanie flow (wbudowana analiza).".to_string()
+                });
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać flow: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4396,6 +4493,16 @@ fn build_cameras_content() -> Component {
         }
     }
 
+    // The analysis-flow selector appears above the table for the camera whose
+    // "Flow analizy" row action was clicked.
+    if let Some(edit) = with_state(|s| s.camera_flow_edit.clone()) {
+        if cameras.iter().any(|c| c.id == edit) {
+            children.push(build_camera_flow_config(&edit, &cameras));
+        } else {
+            with_state(|s| s.camera_flow_edit = None);
+        }
+    }
+
     if cameras.is_empty() {
         // No outer Outlined Card: the dashboard pushes its sections straight
         // into the stack, so wrapping these in card(None, ...) would draw a
@@ -4515,6 +4622,10 @@ fn build_cameras_table() -> Component {
     // `camera-row-select` only arms the pending-remove confirmation bar
     // (`build_camera_remove_confirm`); the real `camera-remove` runs from that
     // bar's explicit Usuń button.
+    // The per-row "⋯" menu also carries the analysis-flow assignment. The Table
+    // injects the clicked camera_id into the action params (as `row_id` /
+    // `camera_id`), so this opens the flow selector for that camera.
+    let flow_action = button("Flow analizy", "camera-flow-edit", "ghost");
     let remove_action = button("Usuń", "camera-row-select", "destructive");
 
     TableComp {
@@ -4531,7 +4642,7 @@ fn build_cameras_table() -> Component {
         sticky_columns: 0,
         pagination: None,
         empty_state: None,
-        row_actions: vec![remove_action],
+        row_actions: vec![flow_action, remove_action],
         bulk_actions: vec![],
         virtualize: false,
         row_expandable: false,
@@ -4558,6 +4669,73 @@ fn build_camera_remove_confirm(camera_id: &str, cameras: &[db::CameraRow]) -> Co
         text_styled(&alloc::format!("Usunąć kamerę \"{}\"?", name), "body_strong"),
         text("Tej operacji nie można cofnąć."),
         stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// Analysis-flow selector for the selected camera. The Select lists the active
+/// `camera_analysis` flows (plus a "no flow" clear option) and commits the pick
+/// immediately via `camera-flow-change` (carrying `camera_id`); the cold path
+/// then runs the assigned flow on every detection event. The current value is
+/// preselected by seeding the bound `camera_flow_select` store key in
+/// `render_panel` (read from core, since the addon mirror has no flow id).
+fn build_camera_flow_config(camera_id: &str, cameras: &[db::CameraRow]) -> Component {
+    let name = cameras
+        .iter()
+        .find(|c| c.id == camera_id)
+        .map(|c| c.name.as_str())
+        .unwrap_or(camera_id);
+
+    let mut options = vec![SelectOption {
+        value: SelectValue::Text(String::new()),
+        label: lit("— bez flow (wbudowana analiza) —"),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }];
+    match host_camera_analysis_flows() {
+        Ok(flows) => {
+            for (id, fname) in flows {
+                options.push(SelectOption {
+                    value: SelectValue::Text(id),
+                    label: lit(&fname),
+                    icon: None,
+                    disabled: false,
+                    group_id: None,
+                    description: None,
+                });
+            }
+        }
+        Err(e) => {
+            return card(None, vec![stack_v(vec![
+                text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+                alert(
+                    &alloc::format!("Nie udało się pobrać listy flow: {}", abi_message(e)),
+                    "critical",
+                ),
+                button("Zamknij", "camera-flow-cancel", "ghost"),
+            ])]);
+        }
+    }
+
+    let mut selector = select("Flow analizy", options, "camera_flow_select");
+    let mut params = CborMap::default();
+    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    selector.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "camera-flow-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+        text("Wybrany flow uruchamia się na każdej detekcji z tej kamery."),
+        selector,
+        button("Zamknij", "camera-flow-cancel", "ghost"),
     ])])
 }
 
