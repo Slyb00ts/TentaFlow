@@ -48,7 +48,7 @@ const CAMERA_ANALYSIS_FLOW_ID: &str = "00000000-0000-4000-8000-000000000020";
 
 /// Graf domyslnego flow analizy kamery (patrz `seed_camera_analysis_flow`).
 /// Stala (nie literal w funkcji), zeby test mogl go zwalidowac + skompilowac.
-const CAMERA_ANALYSIS_FLOW_JSON: &str = r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"route","type":"condition","position":{"x":220,"y":0},"config":{"expression":"has(meta.detections) && meta.detections.exists(d, d.klasa == \"tablica_rejestracyjna\")"}},{"id":"ocr","type":"vision_ocr","position":{"x":460,"y":-80},"config":{"alias":"tentavision-ocr"}},{"id":"classify","type":"vision_classify","position":{"x":460,"y":80},"config":{"alias":"tentavision-action"}}],"edges":[{"from_node":"trigger","to_node":"route","from_port":"image","to_port":"in","data_type":"image"},{"from_node":"route","to_node":"ocr","from_port":"true","to_port":"in"},{"from_node":"route","to_node":"classify","from_port":"false","to_port":"in"}]}"#;
+const CAMERA_ANALYSIS_FLOW_JSON: &str = r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"ocr","type":"vision_ocr","position":{"x":220,"y":0},"config":{"alias":"tentavision-ocr"}},{"id":"classify","type":"vision_classify","position":{"x":440,"y":0},"config":{"alias":"tentavision-action"}}],"edges":[{"from_node":"trigger","to_node":"ocr","from_port":"image","to_port":"in","data_type":"image"},{"from_node":"ocr","to_node":"classify","from_port":"out","to_port":"in","data_type":"image"}]}"#;
 
 /// Seeduje domyslne dane. Leci przy kazdym starcie i jest idempotentne
 /// (INSERT OR IGNORE), wiec dopelnia braki na istniejacych bazach — m.in.
@@ -914,14 +914,14 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
 }
 
 /// Seeduje domyslny flow analizy kamery (ADR PoC). Graf:
-/// `trigger -> condition(route) -> vision_ocr (true) / vision_classify (false)`.
-/// Condition routuje po klasie detekcji: gdy w klatce jest tablica
-/// rejestracyjna -> OCR, w przeciwnym razie -> klasyfikacja stanu nalepek.
-/// Brak wezla `output` — kazda galaz konczy sie wezlem wizyjnym (lisc), bo
-/// `output` ma tylko typowane porty (text/audio/image/...), a `vision_classify`
-/// zwraca `Json` (brak portu). Status `active`, is_default=1 zeby UI/seed mogly
-/// go znalezc po `service_type='camera_analysis'`. Idempotentne (guard po
-/// nazwie ORAZ stalym id, jak Default Chat).
+/// `trigger -> vision_ocr -> vision_classify`. Oba wezly wizyjne iteruja po
+/// `meta["detections"]` z detektora, kadruja bbox kazdej pasujacej detekcji i
+/// wzbogacaja ja per-crop: `vision_ocr` czyta tablice rejestracyjne (`tekst`),
+/// `vision_classify` klasyfikuje stan nalepek/znakow (`stan`). Frame Image jest
+/// przepuszczany niezmieniony, wiec drugi wezel widzi te sama klatke; wzbogacone
+/// `meta["detections"]` trafiaja z powrotem na overlay. Status `active`,
+/// is_default=1 zeby UI/seed mogly go znalezc po `service_type='camera_analysis'`.
+/// Idempotentne (guard po nazwie ORAZ stalym id, jak Default Chat).
 fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
     const NAME: &str = "Camera Analysis";
     const DESCRIPTION: &str =
@@ -1146,8 +1146,7 @@ mod tests {
         use crate::flow_engine::cache::CompiledFlow;
         use crate::flow_engine::node_adapter::AdapterRegistry;
         use crate::flow_engine::node_adapters::{
-            ConditionNodeAdapter, TriggerNodeAdapter, VisionClassifyNodeAdapter,
-            VisionOcrNodeAdapter,
+            TriggerNodeAdapter, VisionClassifyNodeAdapter, VisionOcrNodeAdapter,
         };
         use std::sync::Arc;
 
@@ -1166,64 +1165,10 @@ mod tests {
 
         let mut reg = AdapterRegistry::new();
         reg.register(Arc::new(TriggerNodeAdapter::new()));
-        reg.register(Arc::new(ConditionNodeAdapter::new()));
         reg.register(Arc::new(VisionOcrNodeAdapter::new()));
         reg.register(Arc::new(VisionClassifyNodeAdapter::new()));
         CompiledFlow::from_json(super::CAMERA_ANALYSIS_FLOW_ID, &flow_json, &reg)
             .expect("camera analysis flow compiles");
-    }
-
-    /// Wyrazenie CEL routera routuje na galaz OCR gdy w klatce jest tablica
-    /// rejestracyjna, a na galaz klasyfikacji w przeciwnym razie. Czyta REALNE
-    /// wyrazenie z grafu seedu (bez driftu).
-    #[test]
-    fn camera_analysis_cel_routes_on_plate() {
-        use crate::flow_engine::envelope::FlowValue;
-        use crate::flow_engine::expr::{evaluate_bool, ExprScope};
-        use crate::flow_engine::types::FlowDefinition;
-        use std::collections::{BTreeMap, HashMap};
-
-        let def: FlowDefinition =
-            serde_json::from_str(super::CAMERA_ANALYSIS_FLOW_JSON).unwrap();
-        let expr = def
-            .nodes
-            .iter()
-            .find(|n| n.id == "route")
-            .and_then(|n| n.config.get("expression"))
-            .and_then(|v| v.as_str())
-            .expect("route node has expression")
-            .to_string();
-
-        let vars = BTreeMap::new();
-        let artifacts = HashMap::new();
-        let payload = FlowValue::Empty;
-        let extras: [(&str, serde_json::Value); 0] = [];
-        let eval = |dets: serde_json::Value| {
-            let meta: BTreeMap<String, serde_json::Value> =
-                BTreeMap::from([("detections".to_string(), dets)]);
-            let scope = ExprScope {
-                vars: &vars,
-                payload: &payload,
-                artifacts: &artifacts,
-                meta: &meta,
-                extras: &extras,
-            };
-            evaluate_bool(&expr, &scope, None).unwrap()
-        };
-
-        assert!(
-            eval(serde_json::json!([
-                {"klasa": "tablica_rejestracyjna", "bbox": [0, 0, 0, 0], "score": 0.9, "stan": [], "tekst": null}
-            ])),
-            "tablica rejestracyjna -> galaz OCR (true)"
-        );
-        assert!(
-            !eval(serde_json::json!([
-                {"klasa": "nalepka_adr", "bbox": [0, 0, 0, 0], "score": 0.9, "stan": [], "tekst": null}
-            ])),
-            "brak tablicy -> galaz klasyfikacji (false)"
-        );
-        assert!(!eval(serde_json::json!([])), "brak detekcji -> false");
     }
 
     /// T1.2 — swieza baza ma dokladnie 5 promptow transcription_summarization
