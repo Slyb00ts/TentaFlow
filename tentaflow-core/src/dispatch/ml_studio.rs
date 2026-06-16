@@ -1220,12 +1220,49 @@ pub async fn ml_studio_ft_train_start(
                 .map_err(db_err)?
                 .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
             let dataset_hash = crate::ml_studio::train_recognition::blob_content_hash(&raw);
-            let dist_json = payload.dist.as_ref().map(|d| serde_json::json!({
-                "nnodes": d.nnodes,
-                "node_rank": d.node_rank,
-                "master_addr": d.master_addr,
-                "master_port": d.master_port,
-            }));
+            // Multi-rig (dist.nnodes>1): A = orkiestrator + worker rank-1, B = master
+            // rank-0. master_addr = LAN-IP B z rejestru mesh (mDNS) — „mamy IP, bo po
+            // nich się łączymy". Pojedynczy węzeł (dist None/nnodes<=1) → B trenuje sam.
+            let multi_rig = payload.dist.as_ref().map(|d| d.nnodes > 1).unwrap_or(false);
+            let nnodes = payload.dist.as_ref().map(|d| d.nnodes).unwrap_or(1);
+            let master_port = payload
+                .dist
+                .as_ref()
+                .map(|d| d.master_port)
+                .filter(|p| *p >= 1024)
+                .unwrap_or(29500);
+            let (dist_json, a_dist_opt) = if multi_rig {
+                let b_ip = ctx
+                    .state
+                    .mesh_peer_store
+                    .get(&target)
+                    .and_then(|p| {
+                        p.addresses
+                            .iter()
+                            .find(|a| a.is_ipv4() && !a.is_loopback())
+                            .map(|a| a.to_string())
+                    })
+                    .ok_or_else(|| {
+                        let _ = repository::update_training_run_status(&run_id, "failed");
+                        ProtocolError::bad_request(format!(
+                            "multi-rig: brak adresu LAN węzła {} w rejestrze mesh",
+                            target
+                        ))
+                    })?;
+                // rdzv_id WSPÓLNY dla wszystkich węzłów (run_id) — inaczej każdy
+                // węzeł utworzyłby osobną grupę rendezvous i nigdy by się nie spiął.
+                let b = serde_json::json!({
+                    "nnodes": nnodes, "node_rank": 0, "master_addr": b_ip,
+                    "master_port": master_port, "rdzv_id": run_id,
+                });
+                let a = serde_json::json!({
+                    "nnodes": nnodes, "node_rank": 1, "master_addr": b_ip,
+                    "master_port": master_port, "rdzv_id": run_id,
+                });
+                (Some(b), Some(a))
+            } else {
+                (None, None)
+            };
             let spec_json = serde_json::json!({
                 "kind": "llm",
                 "dataset": format!("mesh:{}", dataset_hash),
@@ -1279,6 +1316,22 @@ pub async fn ml_studio_ft_train_start(
                 dataset_hash,
                 spec_json,
             );
+            // Multi-rig: A dołącza jako worker rank-1 (lokalne GPU) do rendezvous
+            // hostowanego przez B (rank-0). Model zapisuje rank-0 (na B); tu tylko
+            // współliczymy gradienty. Dataset A czyta lokalnie (B dostał przez mesh).
+            if let Some(a_dist) = a_dist_opt {
+                crate::ml_studio::train_llm::spawn_ft_local_worker(
+                    run_id.clone(),
+                    org.user_id.clone(),
+                    payload.dataset_id.clone(),
+                    payload.base_model.clone(),
+                    payload.method.clone(),
+                    payload.objective.clone(),
+                    payload.teacher_model.clone(),
+                    payload.hyperparams.clone(),
+                    a_dist,
+                );
+            }
             Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
                 tentaflow_protocol::MlStudioFtTrainStartResponse {
                     run_id,

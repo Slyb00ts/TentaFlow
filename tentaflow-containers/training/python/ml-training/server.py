@@ -233,6 +233,9 @@ class DistConfig(BaseModel):
     nproc_per_node: Optional[int] = Field(default=None, ge=1, le=64)
     master_addr: str = ""
     master_port: int = Field(default=29500, ge=1024, le=65535)
+    # Wspólny identyfikator rendezvous dla WSZYSTKICH węzłów jednego treningu
+    # (zwykle run_id z ML Studio). Bez wspólnego rdzv_id węzły nie spięłyby się.
+    rdzv_id: Optional[str] = None
 
 
 class TrainRequest(BaseModel):
@@ -855,13 +858,15 @@ def _build_torchrun_cmd(
     if d and d.nnodes > 1:
         if not d.master_addr:
             raise ValueError("dist.master_addr wymagany dla nnodes>1")
+        # rdzv-id MUSI być wspólny między węzłami (run_id), nie lokalny job_id.
+        rdzv_id = d.rdzv_id or job_id
         cmd += [
             "--nnodes", str(d.nnodes),
             "--node-rank", str(d.node_rank),
             "--nproc-per-node", str(nproc),
             "--rdzv-backend", "c10d",
             "--rdzv-endpoint", f"{d.master_addr}:{d.master_port}",
-            "--rdzv-id", job_id,
+            "--rdzv-id", rdzv_id,
         ]
     else:
         cmd += ["--standalone", "--nnodes", "1", "--nproc-per-node", str(nproc)]
