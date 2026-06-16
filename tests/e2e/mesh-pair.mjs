@@ -1,7 +1,7 @@
 import { chromium } from 'playwright';
 
 const A_URL = 'https://localhost:8095/';
-const B_URL = 'https://192.168.11.26:8095/';
+const B_URL = 'https://192.168.11.26:8090/';
 const CREDS = { username: 'admin', password: 'admin123' };
 
 async function login(page, url, label) {
