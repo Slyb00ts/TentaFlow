@@ -409,6 +409,55 @@ impl MeshCommandExecutor {
                 total,
                 data_b64,
             } => self.handle_ml_dataset_chunk(dataset_hash, seq, total, data_b64).await,
+            MeshCommandType::MlDetect {
+                checkpoint_path,
+                class_names_json,
+                variant,
+                threshold,
+                image_b64,
+            } => {
+                self.handle_ml_detect(checkpoint_path, class_names_json, variant, threshold, image_b64)
+                    .await
+            }
+        }
+    }
+
+    /// Owner side: detekcja NA TYM nodzie modelem, którego checkpoint żyje tutaj
+    /// (np. wytrenowanym lokalnie). Inicjator (Node A) wysyła checkpoint + klasy +
+    /// obraz; my wołamy lokalny serwis i zwracamy wynik. Umożliwia testowanie z A.
+    async fn handle_ml_detect(
+        &self,
+        checkpoint_path: String,
+        class_names_json: String,
+        variant: String,
+        threshold: f64,
+        image_b64: String,
+    ) -> CommandResponse {
+        let class_names: Vec<String> =
+            serde_json::from_str(&class_names_json).unwrap_or_default();
+        match crate::ml_studio::train_recognition::run_detect(
+            checkpoint_path,
+            class_names,
+            variant,
+            threshold,
+            image_b64,
+        )
+        .await
+        {
+            Ok((detections_json, width, height)) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlDetectResult {
+                    detections_json,
+                    width,
+                    height,
+                    error: None,
+                })
+            }
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlDetectResult {
+                detections_json: "[]".to_string(),
+                width: 0,
+                height: 0,
+                error: Some(e.to_string()),
+            }),
         }
     }
 
