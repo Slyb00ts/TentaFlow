@@ -272,9 +272,39 @@ fn ds_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec
     MESH_DS_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Katalog cache dla datasetu COCO przyniesionego przez mesh (content-addr po hash).
-fn mesh_dataset_cache(hash: &str) -> std::path::PathBuf {
+/// Katalog cache dla datasetu przyniesionego przez mesh (content-addr po hash).
+/// Wspólny dla recognition (COCO dir) i LLM (blob JSONL) — adresowanie po hashu.
+pub fn mesh_dataset_cache(hash: &str) -> std::path::PathBuf {
     crate::paths::cache_dir().join("ml-recog-mesh").join(hash)
+}
+
+/// Czy cache pod hashem ma JAKIKOLWIEK plik (generyczny dedup, nie-COCO-specyficzny).
+fn cache_has_data(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut rd| rd.any(|e| e.map(|e| e.path().is_file()).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// sha256 surowych bajtów (content-hash blobu, np. datasetu JSONL dla LLM).
+pub fn blob_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Pakuje pojedynczy blob do zip-a (jedna pozycja `name`) — do transferu mesh
+/// blobów nie-katalogowych (dataset LLM). Współdzieli format z `zip_dir`.
+pub fn zip_single_file(name: &str, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut cursor);
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file(name, opts)?;
+    zip.write_all(bytes)?;
+    zip.finish()?;
+    Ok(cursor.into_inner())
 }
 
 // Stała: brak postępu transferu przez tyle = błąd. NIE liczymy sztywnego deadline
@@ -340,11 +370,52 @@ pub fn spawn_mesh_dataset_push_and_train(
     spec_json: String,
 ) {
     tokio::spawn(async move {
-        if let Err(err) =
-            mesh_push_and_train(&iroh, &target, &run_id, &dataset_dir, &dataset_hash, &spec_json)
-                .await
-        {
+        let zipped = {
+            set_recog_sync(
+                &run_id,
+                DatasetSyncProgress { phase: "zipping".into(), ..Default::default() },
+            );
+            let dir = std::path::PathBuf::from(&dataset_dir);
+            tokio::task::spawn_blocking(move || zip_dir(&dir)).await
+        };
+        let result = match zipped {
+            Ok(Ok(zip_bytes)) => {
+                mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json)
+                    .await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(anyhow::anyhow!("zip join: {}", e)),
+        };
+        if let Err(err) = result {
             tracing::warn!(run_id = %run_id, error = %err, "mesh dataset push/train failed");
+            set_recog_sync(
+                &run_id,
+                DatasetSyncProgress {
+                    phase: "error".into(),
+                    error: Some(err.to_string()),
+                    ..Default::default()
+                },
+            );
+            let _ = repository::update_training_run_status(&run_id, "failed");
+        }
+    });
+}
+
+/// Wariant generyczny: transfer GOTOWEGO zip-a (np. spakowany blob JSONL dla LLM)
+/// + start treningu na B. Współdzieli pasek postępu/stall i `MlTrainStart`.
+pub fn spawn_mesh_push_and_train(
+    iroh: std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    target: String,
+    run_id: String,
+    zip_bytes: Vec<u8>,
+    dataset_hash: String,
+    spec_json: String,
+) {
+    tokio::spawn(async move {
+        if let Err(err) =
+            mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json).await
+        {
+            tracing::warn!(run_id = %run_id, error = %err, "mesh blob push/train failed");
             set_recog_sync(
                 &run_id,
                 DatasetSyncProgress {
@@ -362,22 +433,13 @@ async fn mesh_push_and_train(
     iroh: &crate::mesh::iroh_manager::IrohMeshManager,
     target: &str,
     run_id: &str,
-    dataset_dir: &str,
+    zip_bytes: Vec<u8>,
     dataset_hash: &str,
     spec_json: &str,
 ) -> anyhow::Result<()> {
     use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
     use tokio::time::Instant;
 
-    set_recog_sync(
-        run_id,
-        DatasetSyncProgress {
-            phase: "zipping".into(),
-            ..Default::default()
-        },
-    );
-    let dir = std::path::PathBuf::from(dataset_dir);
-    let zip_bytes = tokio::task::spawn_blocking(move || zip_dir(&dir)).await??;
     let total_bytes = zip_bytes.len() as u64;
     let total_chunks = zip_bytes.len().div_ceil(SYNC_CHUNK_BYTES).max(1) as u32;
     set_recog_sync(
@@ -518,8 +580,9 @@ pub fn mesh_dataset_chunk(
     data_b64: &str,
 ) -> anyhow::Result<bool> {
     let cache = mesh_dataset_cache(hash);
-    // Dedup: dataset już zmaterializowany (ma jakikolwiek _annotations.coco.json).
-    if cache.is_dir() && !coco_class_names_from_dir(&cache).is_empty() {
+    // Dedup generyczny: dataset (po content-hashu) już zmaterializowany na tym
+    // węźle (cache ma jakikolwiek plik) — wspólny zasób / wcześniejszy transfer.
+    if cache.is_dir() && cache_has_data(&cache) {
         return Ok(true);
     }
     let bytes = base64::engine::general_purpose::STANDARD

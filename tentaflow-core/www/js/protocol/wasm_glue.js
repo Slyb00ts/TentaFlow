@@ -3417,9 +3417,15 @@ export function encodeMlStudioFtExportStatusRequest(model_id) {
  * @param {number} lora_dropout
  * @param {number} max_seq_len
  * @param {boolean} merge_adapter
+ * @param {string | null | undefined} target_node_id
+ * @param {number} num_gpus
+ * @param {number} dist_nnodes
+ * @param {number} dist_node_rank
+ * @param {string} dist_master_addr
+ * @param {number} dist_master_port
  * @returns {Uint8Array}
  */
-export function encodeMlStudioFtTrainStartRequest(project_id, dataset_id, base_model, method, objective, teacher_model, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter) {
+export function encodeMlStudioFtTrainStartRequest(project_id, dataset_id, base_model, method, objective, teacher_model, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter, target_node_id, num_gpus, dist_nnodes, dist_node_rank, dist_master_addr, dist_master_port) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -3432,13 +3438,17 @@ export function encodeMlStudioFtTrainStartRequest(project_id, dataset_id, base_m
     const len4 = WASM_VECTOR_LEN;
     var ptr5 = isLikeNone(teacher_model) ? 0 : passStringToWasm0(teacher_model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len5 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioFtTrainStartRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter);
+    var ptr6 = isLikeNone(target_node_id) ? 0 : passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    const ptr7 = passStringToWasm0(dist_master_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len7 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtTrainStartRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter, ptr6, len6, num_gpus, dist_nnodes, dist_node_rank, ptr7, len7, dist_master_port);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v9 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v7;
+    return v9;
 }
 
 /**

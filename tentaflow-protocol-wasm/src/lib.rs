@@ -1790,7 +1790,24 @@ pub fn encode_ml_studio_ft_train_start_request(
     lora_dropout: f64,
     max_seq_len: u32,
     merge_adapter: bool,
+    target_node_id: Option<String>,
+    num_gpus: u32,
+    dist_nnodes: u32,
+    dist_node_rank: u32,
+    dist_master_addr: String,
+    dist_master_port: u32,
 ) -> Result<Vec<u8>, JsError> {
+    // nnodes>1 → trening rozproszony (multi-rig); inaczej single-node.
+    let dist = if dist_nnodes > 1 {
+        Some(tentaflow_protocol::MlStudioDistConfig {
+            nnodes: dist_nnodes,
+            node_rank: dist_node_rank,
+            master_addr: dist_master_addr,
+            master_port: dist_master_port,
+        })
+    } else {
+        None
+    };
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::FtTrainStartRequest(
             tentaflow_protocol::MlStudioFtTrainStartRequest {
@@ -1811,6 +1828,9 @@ pub fn encode_ml_studio_ft_train_start_request(
                     max_seq_len,
                 },
                 merge_adapter,
+                target_node_id: target_node_id.filter(|s| !s.is_empty()),
+                num_gpus: if num_gpus == 0 { None } else { Some(num_gpus) },
+                dist,
             },
         ),
     ))
@@ -8105,6 +8125,22 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             }
             set(obj, "lossCurve", ml_studio_loss_curve_to_js(&resp.loss_curve).into());
             set(obj, "loss_curve", ml_studio_loss_curve_to_js(&resp.loss_curve).into());
+            match resp.sync_phase {
+                Some(p) => {
+                    set(obj, "syncPhase", p.clone().into());
+                    set(obj, "sync_phase", p.into());
+                }
+                None => {
+                    set(obj, "syncPhase", JsValue::NULL);
+                    set(obj, "sync_phase", JsValue::NULL);
+                }
+            }
+            set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
+            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
+            set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
         }
         tentaflow_protocol::MlStudioPayload::FtExportRequest(req) => {
             set(obj, "variant", "MlStudioFtExportRequest".into());

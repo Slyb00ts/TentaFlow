@@ -487,14 +487,31 @@ impl MeshCommandExecutor {
     /// (ML Studio mesh-distributed). `run_id` jest kluczem śledzenia po stronie
     /// odbiorcy; inicjator (Node A) odpytuje przez `MlTrainStatus`.
     async fn handle_ml_train_start(&self, run_id: String, spec_json: String) -> CommandResponse {
-        match crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await {
+        // spec.kind rozróżnia tor: "llm" → ml-training, inaczej recognition (rfdetr).
+        let kind = serde_json::from_str::<serde_json::Value>(&spec_json)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(String::from))
+            .unwrap_or_default();
+        let res = if kind == "llm" {
+            crate::ml_studio::train_llm::mesh_train_start_llm(&run_id, &spec_json).await
+        } else {
+            crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
+        };
+        match res {
             Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
             Err(e) => CommandResponse::fail(format!("mesh train start: {}", e)),
         }
     }
 
     async fn handle_ml_train_status(&self, run_id: String) -> CommandResponse {
-        match crate::ml_studio::train_recognition::mesh_train_status(&run_id).await {
+        // Router statusu: jeśli to job LLM zlecony tu przez mesh → ml-training,
+        // inaczej recognition. Jeden run_id istnieje tylko w jednym z rejestrów.
+        let res = if crate::ml_studio::train_llm::is_llm_mesh_job(&run_id) {
+            crate::ml_studio::train_llm::mesh_train_status_llm(&run_id).await
+        } else {
+            crate::ml_studio::train_recognition::mesh_train_status(&run_id).await
+        };
+        match res {
             Ok(status_json) => {
                 CommandResponse::ok(MeshCommandResponsePayload::MlTrainStatusResult { status_json })
             }

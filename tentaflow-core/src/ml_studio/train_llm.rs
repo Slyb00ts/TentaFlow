@@ -49,6 +49,7 @@ pub fn spawn_ft_training(
     teacher_model: Option<String>,
     hyperparams: MlStudioFtHyperparams,
     merge_adapter: bool,
+    num_gpus: Option<u32>,
 ) {
     tokio::spawn(async move {
         if let Err(err) = run_training(
@@ -62,6 +63,7 @@ pub fn spawn_ft_training(
             teacher_model.as_deref(),
             &hyperparams,
             merge_adapter,
+            num_gpus,
         )
         .await
         {
@@ -90,6 +92,7 @@ async fn run_training(
     teacher_model: Option<&str>,
     hyperparams: &MlStudioFtHyperparams,
     merge_adapter: bool,
+    num_gpus: Option<u32>,
 ) -> anyhow::Result<()> {
     // 1. Service discovery: serwis ml-training z kategorii "training". Pool CORE
     //    przez `global_pool` (task nie ma `ctx.state.db`).
@@ -127,6 +130,8 @@ async fn run_training(
         },
         "output_dir": output_dir,
         "merge_adapter": merge_adapter,
+        // Multi-GPU lokalnie: None → wszystkie karty tego węzła (torchrun DDP).
+        "num_gpus": num_gpus,
     });
 
     let base = endpoint.trim_end_matches('/').to_string();
@@ -355,4 +360,120 @@ fn get_status(url: &str) -> anyhow::Result<StatusResponse> {
     resp.body_mut()
         .read_json()
         .map_err(|e| anyhow::anyhow!("decode /status response: {}", e))
+}
+
+// =============================================================================
+// B-side: trening LLM zlecony przez mesh (komenda MlTrainStart kind="llm").
+// Mapowanie run_id (klucz inicjatora A) → (base_url, job_id lokalnego serwisu).
+// =============================================================================
+static MESH_JOBS_LLM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+> = std::sync::OnceLock::new();
+
+fn mesh_jobs_llm() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>>
+{
+    MESH_JOBS_LLM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Czy `run_id` to job FT LLM zlecony na tym węźle przez mesh (router statusu).
+pub fn is_llm_mesh_job(run_id: &str) -> bool {
+    mesh_jobs_llm()
+        .lock()
+        .map(|m| m.contains_key(run_id))
+        .unwrap_or(false)
+}
+
+/// B-side (odbiorca `MlTrainStart` z `kind="llm"`): czyta dataset JSONL przyniesiony
+/// przez mesh (cache content-addr po hashu), waliduje hash, parsuje rekordy i
+/// zleca trening LOKALNEMU serwisowi `ml-training` (multi-GPU/dist wg specu).
+pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Result<()> {
+    let spec: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let dataset_ref = spec
+        .get("dataset")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("spec bez dataset"))?;
+    let hash = dataset_ref
+        .strip_prefix("mesh:")
+        .ok_or_else(|| anyhow::anyhow!("dataset LLM musi być mesh:<hash>"))?;
+    let cache = crate::ml_studio::train_recognition::mesh_dataset_cache(hash);
+    let blob_path = cache.join("dataset.bin");
+    if !blob_path.is_file() {
+        anyhow::bail!("dataset LLM nie zmaterializowany na tym węźle (hash {})", hash);
+    }
+    let raw = std::fs::read(&blob_path)?;
+    // Weryfikacja wspólnego zasobu / integralności transferu: hash bajtów == spec.
+    if let Some(expected) = spec.get("dataset_hash").and_then(|v| v.as_str()) {
+        let actual = crate::ml_studio::train_recognition::blob_content_hash(&raw);
+        if actual != expected {
+            anyhow::bail!(
+                "dataset LLM hash mismatch (oczekiwano {}, jest {})",
+                &expected[..expected.len().min(12)],
+                &actual[..actual.len().min(12)]
+            );
+        }
+    }
+    // Format datasetu zachowany z A (jsonl/csv/xlsx) — parser musi go znać.
+    let kind = spec.get("dataset_kind").and_then(|v| v.as_str()).unwrap_or("jsonl");
+    let records = parse_records(&raw, kind)?;
+    if records.is_empty() {
+        anyhow::bail!("dataset LLM nie dał użytecznych rekordów");
+    }
+    let (train_data, eval_data) = split_eval(records);
+
+    let endpoint = resolve_endpoint()?;
+    let base = endpoint.trim_end_matches('/').to_string();
+    let hp = spec.get("hyperparams").cloned().unwrap_or(json!({}));
+    let mut train_body = json!({
+        "base_model": spec.get("base_model").and_then(|v| v.as_str()).unwrap_or(""),
+        "train_data": train_data,
+        "eval_data": eval_data,
+        "method": spec.get("method").and_then(|v| v.as_str()).unwrap_or("lora"),
+        "objective": spec.get("objective").and_then(|v| v.as_str()).unwrap_or("sft"),
+        "teacher_model": spec.get("teacher_model").cloned().unwrap_or(serde_json::Value::Null),
+        "hyperparams": hp,
+        "output_dir": spec.get("output_dir").and_then(|v| v.as_str()).unwrap_or("ml_studio/mesh"),
+        "merge_adapter": spec.get("merge_adapter").and_then(|v| v.as_bool()).unwrap_or(false),
+    });
+    // Multi-GPU / multi-node: przekazujemy num_gpus i dist do serwisu (torchrun).
+    if let Some(n) = spec.get("num_gpus").and_then(|v| v.as_u64()) {
+        train_body["num_gpus"] = json!(n);
+    }
+    if let Some(dist) = spec.get("dist") {
+        if !dist.is_null() {
+            train_body["dist"] = dist.clone();
+        }
+    }
+
+    let url = format!("{}/train", base);
+    let job_id = tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??;
+    mesh_jobs_llm()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs_llm lock poisoned"))?
+        .insert(run_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlTrainStatus` dla joba LLM): surowy JSON statusu z serwisu.
+pub async fn mesh_train_status_llm(run_id: &str) -> anyhow::Result<String> {
+    let (base, job_id) = mesh_jobs_llm()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs_llm lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany job LLM mesh: {}", run_id))?;
+    let url = format!("{}/status/{}", base, job_id);
+    tokio::task::spawn_blocking(move || get_status_raw(&url)).await?
+}
+
+/// Surowy GET /status — zwraca body jako String (proxy statusu do inicjatora A).
+fn get_status_raw(url: &str) -> anyhow::Result<String> {
+    let http = http_agent();
+    let mut resp = http
+        .get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET {} failed: {}", url, e))?;
+    resp.body_mut()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("read /status body: {}", e))
 }
