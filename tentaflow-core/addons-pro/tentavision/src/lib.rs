@@ -112,7 +112,27 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn alias_list_available_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn event_subscribe(
+        event_type_ptr: i32, event_type_len: i32,
+        filter_json_ptr: i32, filter_json_len: i32,
+    ) -> i32;
 }
+
+/// Subscribes the addon to a system event type so its `on_event` is invoked for
+/// each matching event. No filter (pass 0/0). Needs the `events` permission.
+fn subscribe_event(event_type: &str) -> i32 {
+    unsafe {
+        event_subscribe(
+            event_type.as_ptr() as i32,
+            event_type.len() as i32,
+            0,
+            0,
+        )
+    }
+}
+
+/// Event type the camera_alert flow node emits on an alarm verdict.
+const CAMERA_ALARM_EVENT: &str = "camera.alarm";
 
 // =============================================================================
 // Host function wrappers
@@ -2173,6 +2193,9 @@ pub extern "C" fn on_install() -> i32 { 0 }
 pub extern "C" fn on_start() -> i32 {
     install_panic_hook();
     log::info("TentaVision: on_start (CBOR SDK)");
+    // Receive camera.alarm events emitted by the camera_alert flow node so an
+    // alarm verdict from a camera's analysis flow lands in the alarms table.
+    subscribe_event(CAMERA_ALARM_EVENT);
     send_initial_shell();
     render_panel("overview");
     0
@@ -2185,7 +2208,37 @@ pub extern "C" fn on_stop() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn on_event(_input_ptr: i32, _input_len: i32) -> i32 { 0 }
+pub extern "C" fn on_event(input_ptr: i32, input_len: i32) -> i32 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize)
+    };
+    let event: JsonValue = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if event.get("event_type").and_then(|v| v.as_str()) == Some(CAMERA_ALARM_EVENT) {
+        handle_camera_alarm_event(event.get("payload").unwrap_or(&JsonValue::Null));
+    }
+    0
+}
+
+/// Persists a `camera.alarm` event (emitted by the camera_alert flow node) as a
+/// row in the addon's alarms table. Best-effort: a malformed payload or DB error
+/// is logged, not fatal (the event bus must not be wedged by one bad alarm).
+fn handle_camera_alarm_event(payload: &JsonValue) {
+    let camera_id = payload.get("camera_id").and_then(|v| v.as_str()).unwrap_or("");
+    if camera_id.is_empty() {
+        log::warn("TentaVision: camera.alarm bez camera_id — pomijam");
+        return;
+    }
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("Alarm ADR");
+    let severity = payload.get("severity").and_then(|v| v.as_str()).unwrap_or("high");
+    let ts = db::now_secs();
+    match db::insert_alarm(camera_id, severity, "adr", reason, ts) {
+        Ok(id) => log::info(&alloc::format!("TentaVision: alarm {} zapisany dla {}", id, camera_id)),
+        Err(e) => log::error(&alloc::format!("TentaVision: zapis alarmu nieudany: {}", abi_message(e))),
+    }
+}
 
 /// Called by host when user opens a panel on an already-running instance.
 /// Re-emits PanelShell + SlotContent without restarting the addon.

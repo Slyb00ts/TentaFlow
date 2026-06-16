@@ -121,7 +121,9 @@ mod tests {
     use super::*;
     use crate::flow_engine::dispatchers::{VisionClassifyRequest, VisionDispatcher};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
-    use crate::flow_engine::node_adapters::VisionClassifyNodeAdapter;
+    use crate::flow_engine::node_adapters::{
+        CameraAlertNodeAdapter, CameraVerdictNodeAdapter, VisionClassifyNodeAdapter,
+    };
     use std::sync::{Arc, Mutex};
 
     /// Fake VisionDispatcher: records the (w,h) of every crop it receives and
@@ -232,5 +234,29 @@ mod tests {
         // The non-worthy detection is untouched by both nodes.
         assert_eq!(enriched[2].tekst, None);
         assert!(enriched[2].stan.is_empty());
+
+        // Continue the chain: verdict over the enriched detections, then alert.
+        // Readable plate + clean placard → verdict "ok" → alert not emitted.
+        let verdict_input = NodeInput {
+            from_node_id: "vision_classify".into(),
+            from_port: "out".into(),
+            envelope: Arc::new(after_cls),
+        };
+        let after_verdict = CameraVerdictNodeAdapter::new()
+            .execute(&node("camera_verdict"), &[verdict_input], &ctx)
+            .await
+            .unwrap();
+        assert_eq!(after_verdict.meta.get("verdict").unwrap()["decision"], "ok");
+
+        let alert_input = NodeInput {
+            from_node_id: "camera_verdict".into(),
+            from_port: "out".into(),
+            envelope: Arc::new(after_verdict),
+        };
+        let after_alert = CameraAlertNodeAdapter::new()
+            .execute(&node("camera_alert"), &[alert_input], &ctx)
+            .await
+            .unwrap();
+        assert_eq!(after_alert.meta.get("alert").unwrap()["emitted"], false);
     }
 }
