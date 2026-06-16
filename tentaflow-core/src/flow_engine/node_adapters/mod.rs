@@ -39,6 +39,7 @@ pub mod tts;
 pub mod tts_clean;
 pub mod variable_merge;
 pub mod vision_classify;
+pub mod vision_crop;
 pub mod vision_llm;
 pub mod vision_ocr;
 

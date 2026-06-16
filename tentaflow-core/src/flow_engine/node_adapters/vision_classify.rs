@@ -1,9 +1,10 @@
 // =============================================================================
 // Plik: flow_engine/node_adapters/vision_classify.rs
-// Opis: vision_classify node — multi-label condition tags for a placard/label
-//       RGB crop via the VisionDispatcher. Input = Image (raw RGB24 + dims);
-//       output = Json (array of tag strings), mirrored to meta["stan"] for
-//       downstream condition/verdict. Model via node.config["alias"]
+// Opis: vision_classify node — multi-label condition tags per detection.
+//       Iterates the frame's detections (meta["detections"]), crops each
+//       placard/label/sign box and classifies that crop via the VisionDispatcher,
+//       writing the tags into the detection's `stan`. Passes the frame Image
+//       through unchanged (+ enriched detections). Model via node.config["alias"]
 //       (default tentavision-action).
 // =============================================================================
 
@@ -13,10 +14,19 @@ use async_trait::async_trait;
 use crate::flow_engine::dispatchers::VisionClassifyRequest;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::node_adapters::vision_crop::crop_detection;
 use crate::flow_engine::types::{FlowDataType, FlowNode};
+use crate::services::detection_bus::Detection;
 
 const NODE_TYPE: &str = "vision_classify";
 const DEFAULT_ALIAS: &str = "tentavision-action";
+
+/// Detection classes whose crop carries a classifiable condition/state
+/// (hazard placards, environmental signs, thermometers). Mirrors the hardcoded
+/// enrich path's `wants_state`.
+fn wants_state(klasa: &str) -> bool {
+    klasa.starts_with("nalepka") || klasa == "znak_srodowiskowy" || klasa == "termometr"
+}
 
 pub struct VisionClassifyNodeAdapter;
 
@@ -35,7 +45,9 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
         vec![PortSpec::new("in", FlowDataType::Image)]
     }
     fn output_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("out", FlowDataType::Json)]
+        // Passes the frame through so a downstream vision node sees the same
+        // Image; only meta["detections"] is enriched.
+        vec![PortSpec::new("out", FlowDataType::Image)]
     }
 
     async fn execute(
@@ -55,7 +67,6 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
         };
         let (w, h) = dims.ok_or_else(|| anyhow!("vision_classify: image has no dims"))?;
         let rgb = ctx.blobs.get(&blob_ref).await?;
-        // Contract: raw RGB24. Reject encoded/mismatched blobs with a clear error.
         let expected = w as usize * h as usize * 3;
         if rgb.len() != expected {
             return Err(anyhow!(
@@ -74,25 +85,36 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
             .unwrap_or(DEFAULT_ALIAS)
             .to_string();
 
-        let tags = ctx
-            .vision
-            .classify(VisionClassifyRequest {
-                rgb,
-                width: w,
-                height: h,
-                alias,
-                caller_addon_id: None,
-            })
-            .await?;
-
-        let json = serde_json::Value::Array(
-            tags.iter()
-                .map(|t| serde_json::Value::String(t.clone()))
-                .collect(),
-        );
         let mut out = (*envelope).clone();
-        out.meta.insert("stan".into(), json.clone());
-        out.payload = FlowValue::Json(json);
+        let mut detections: Vec<Detection> = match out.meta.get("detections") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                anyhow!("vision_classify: meta[detections] not a Detection list: {e}")
+            })?,
+            None => return Ok(out), // No detections to enrich — pass through.
+        };
+
+        for det in detections.iter_mut() {
+            if !wants_state(&det.klasa) {
+                continue;
+            }
+            let Some(crop) = crop_detection(&rgb, w, h, det.bbox) else {
+                continue;
+            };
+            let tags = ctx
+                .vision
+                .classify(VisionClassifyRequest {
+                    rgb: crop.rgb,
+                    width: crop.width,
+                    height: crop.height,
+                    alias: alias.clone(),
+                    caller_addon_id: None,
+                })
+                .await?;
+            det.stan = tags;
+        }
+
+        out.meta
+            .insert("detections".into(), serde_json::to_value(&detections)?);
         Ok(out)
     }
 }

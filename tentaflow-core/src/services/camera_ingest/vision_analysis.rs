@@ -763,11 +763,18 @@ fn publish_flow_detections(
     original: Vec<Detection>,
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
 ) {
-    let enriched = outcome
-        .final_envelope
-        .meta
-        .get("detections")
-        .and_then(|v| serde_json::from_value::<Vec<Detection>>(v.clone()).ok());
+    let enriched = match outcome.final_envelope.meta.get("detections") {
+        Some(v) => match serde_json::from_value::<Vec<Detection>>(v.clone()) {
+            Ok(dets) => Some(dets),
+            Err(e) => {
+                // The flow left a detections value the overlay can't read — fall
+                // back to the detector boxes rather than silently dropping them.
+                warn!("[vision_analysis] flow {camera_id}: meta[detections] unparseable, publishing original: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     detection_bus::publish_detections(camera_id, enriched.unwrap_or(original));
 }
 
