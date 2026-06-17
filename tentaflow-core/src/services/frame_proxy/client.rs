@@ -97,25 +97,56 @@ impl FrameProxyClient {
     }
 }
 
-/// Top-level entry point. Sends the request, awaits the matching response,
-/// returns the bytes + metadata on Found. The pending oneshot is removed
-/// from the map on every exit path (Ok or Err) so the map cannot grow
-/// unbounded under repeated timeouts.
+/// Fetch a frame from `peer_id` BY its storage-layer `raw_ref` (the
+/// Service-to-Core pickup mesh-fallback path).
 pub async fn fetch_from_peer(
     iroh: &IrohMeshManager,
     peer_id: &str,
     raw_ref: &str,
     timeout: Duration,
 ) -> Result<(Vec<u8>, FrameMetadataWire), FrameProxyError> {
-    let client = super::frame_proxy_client();
     let request_id = format!("fp-{}", Uuid::new_v4());
-
-    let rx = client.register(&request_id);
-
     let request = FrameProxyRequestPayload {
         raw_ref: raw_ref.to_string(),
         request_id: request_id.clone(),
+        camera_id: None,
     };
+    send_and_await(iroh, peer_id, request_id, request, timeout).await
+}
+
+/// Fetch the peer's MOST RECENT frame for a NODE-LOCAL `camera_id`. The
+/// requester only knows the robot's camera id (camera rows are never synced),
+/// not the peer's opaque `frame_<uuid>` ref — the owner resolves the latest
+/// frame for that camera. Used by the dashboard live-tile cross-node path.
+pub async fn fetch_latest_for_camera(
+    iroh: &IrohMeshManager,
+    peer_id: &str,
+    camera_id: &str,
+    timeout: Duration,
+) -> Result<(Vec<u8>, FrameMetadataWire), FrameProxyError> {
+    let request_id = format!("fp-{}", Uuid::new_v4());
+    let request = FrameProxyRequestPayload {
+        raw_ref: String::new(),
+        request_id: request_id.clone(),
+        camera_id: Some(camera_id.to_string()),
+    };
+    send_and_await(iroh, peer_id, request_id, request, timeout).await
+}
+
+/// Shared send + await for both request variants. Registers the oneshot, sends
+/// the CBOR request, and awaits the matching response with a timeout. The
+/// pending oneshot is removed on every exit path (Ok or Err) so the map cannot
+/// grow unbounded under repeated timeouts.
+async fn send_and_await(
+    iroh: &IrohMeshManager,
+    peer_id: &str,
+    request_id: String,
+    request: FrameProxyRequestPayload,
+    timeout: Duration,
+) -> Result<(Vec<u8>, FrameMetadataWire), FrameProxyError> {
+    let client = super::frame_proxy_client();
+    let rx = client.register(&request_id);
+
     let bytes = crate::mesh::cbor::encode(&request).map_err(|e| {
         client.cancel(&request_id);
         FrameProxyError::Encode(e.to_string())

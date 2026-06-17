@@ -2267,13 +2267,24 @@ fn spawn_quic_event_handler(
                                 &local_node_id,
                             ) {
                                 Some(key) => {
+                                    // Trust the transport identity, not the
+                                    // self-claimed per-robot `node_id`: a trusted
+                                    // peer must not advertise a robot owned by (or
+                                    // spoofing) another node. Force every robot's
+                                    // node_id to the authenticated sender before it
+                                    // can enter the registry.
+                                    let robots =
+                                        crate::mesh::robot_dispatch::normalize_advertised_node_id(
+                                            payload.robots,
+                                            key,
+                                        );
                                     debug!(
                                         peer = %from_node_id,
-                                        count = payload.robots.len(),
+                                        count = robots.len(),
                                         "RobotsAnnounce: replace_node"
                                     );
                                     crate::mesh::robot_dispatch::global()
-                                        .replace_node(key, payload.robots);
+                                        .replace_node(key, robots);
                                 }
                                 None => {
                                     if payload.from_node_id != from_node_id
@@ -2663,7 +2674,6 @@ fn spawn_quic_event_handler(
                     if !is_trusted {
                         debug!(
                             peer = %from_node_id,
-                            raw_ref = %payload.raw_ref,
                             request_id = %payload.request_id,
                             "FrameProxyRequest from untrusted peer — dropped"
                         );

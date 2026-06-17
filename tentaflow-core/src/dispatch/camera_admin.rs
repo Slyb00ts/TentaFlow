@@ -748,6 +748,19 @@ async fn camera_frame_url(
         }
     };
     if !exists {
+        // Not a local camera. It may belong to a robot owned by a trust-paired
+        // mesh node (camera rows are node-local and never synced, so the row is
+        // absent here by design). If a remote robot advertises this camera_id,
+        // serve it through the existing frame_proxy mechanism. Authorization for
+        // this path: the caller already holds `camera.read` (checked above), and
+        // the owning robot only appears in the registry when its announce came
+        // from a trusted peer — so we deliberately do NOT call
+        // `camera_exists_in_org` for the remote path (the row isn't local).
+        if let Some(owner_node) =
+            remote_camera_owner(&ctx.state.local_node_id, &org.org_id, &req.camera_id)
+        {
+            return serve_remote_camera_frame(ctx, org, &req, &owner_node).await;
+        }
         // Static reason — never echo camera_id (cross-tenant probe defense).
         audit_frame_url(
             ctx,
@@ -815,6 +828,161 @@ async fn camera_frame_url(
         &serde_json::json!({
             "ttl_secs": req.ttl_secs,
             "camera_id": req.camera_id,
+        }),
+    );
+
+    Ok(CameraFrameUrlResponse {
+        signed_url,
+        expires_at_ms: issued.expiry_unix_ms as i64,
+    })
+}
+
+/// Resolve the trusted mesh node that owns `camera_id` via the robot registry.
+/// Returns the owning REMOTE node id when exactly one advertised robot on a node
+/// other than us carries this camera AND that robot's tenant matches the caller's
+/// `caller_org_id`; `None` otherwise. The registry only contains robots announced
+/// by trust-paired peers, so a hit implies a trusted owner — but trust +
+/// `camera.read` alone do not scope tenants, so the org match is REQUIRED here to
+/// stop a node in org-A reading an org-B robot's camera on the same mesh.
+/// `None` also covers our own camera (handled by the local path) and the
+/// ambiguous case (2+ nodes claim the same camera id), which is logged.
+fn remote_camera_owner(
+    local_node_id: &str,
+    caller_org_id: &str,
+    camera_id: &str,
+) -> Option<String> {
+    let mut owners: Vec<String> = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .filter(|r| r.node_id != local_node_id)
+        .filter(|r| r.camera_id.as_deref() == Some(camera_id))
+        // Tenant scope: the advertised robot's org must equal the caller's org.
+        .filter(|r| r.org_id == caller_org_id)
+        .map(|r| r.node_id)
+        .collect();
+    owners.sort();
+    owners.dedup();
+    match owners.as_slice() {
+        [only] => Some(only.clone()),
+        [] => None,
+        // Ambiguous: 2+ trusted nodes (same org) advertise this camera id. Fail
+        // closed, but log so it is diagnosable — count only, never echo any
+        // tenant-probe data beyond the camera_id the caller already supplied.
+        many => {
+            tracing::warn!(
+                event = "ambiguous_remote_camera_owner",
+                camera_id = %camera_id,
+                owner_count = many.len(),
+                "multiple trusted nodes advertise the same camera id; refusing to pick one"
+            );
+            None
+        }
+    }
+}
+
+/// Fetch the latest frame for a remote robot camera from its owning node over the
+/// existing frame_proxy mesh mechanism, inject the bytes into THIS node's
+/// frame_storage under a fresh ref, and mint a normal signed `/frames/<ref>` URL
+/// (same issuer as the local path). The dashboard tile then GETs the URL locally
+/// with zero JS / `api/frames.rs` change.
+async fn serve_remote_camera_frame(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    req: &CameraFrameUrlRequest,
+    owner_node: &str,
+) -> Result<CameraFrameUrlResponse, ProtocolError> {
+    let Some(iroh) = ctx.state.quic_mesh.as_ref() else {
+        audit_frame_url(
+            ctx,
+            org,
+            "error",
+            None,
+            &serde_json::json!({"reason": "mesh_unavailable"}),
+        );
+        return Err(ProtocolError::internal("mesh_unavailable"));
+    };
+
+    let (bytes, meta) = match crate::services::frame_proxy::fetch_latest_for_camera(
+        iroh,
+        owner_node,
+        &req.camera_id,
+        crate::services::frame_proxy::DEFAULT_FETCH_TIMEOUT,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(crate::services::frame_proxy::FrameProxyError::NotFound(_)) => {
+            audit_frame_url(
+                ctx,
+                org,
+                "denied",
+                None,
+                &serde_json::json!({"reason": "no_frame_available"}),
+            );
+            return Err(ProtocolError::not_found("no_frame_available"));
+        }
+        Err(e) => {
+            tracing::warn!(owner = %owner_node, "camera.frame_url remote fetch failed: {e}");
+            audit_frame_url(
+                ctx,
+                org,
+                "error",
+                None,
+                &serde_json::json!({"reason": "remote_fetch_failed"}),
+            );
+            return Err(ProtocolError::internal("remote_fetch_failed"));
+        }
+    };
+
+    // Mirror the local pixel-format set (rgb24 is the only variant produced by
+    // the F1a pipeline; unknown wire names map to it conservatively).
+    let pixel_format = match meta.pixel_format.as_str() {
+        "rgb24" => crate::services::frame_storage::FramePixelFormat::Rgb24,
+        _ => crate::services::frame_storage::FramePixelFormat::Rgb24,
+    };
+    let frame_size_bytes = bytes.len();
+    let stored = crate::services::frame_storage::StoredFrame {
+        metadata: crate::services::frame_storage::FrameMetadata {
+            camera_id: req.camera_id.clone(),
+            width: meta.width,
+            height: meta.height,
+            pixel_format,
+            timestamp_unix_ms: meta.timestamp_unix_ms,
+            pts: None,
+            frame_size_bytes,
+        },
+        data: std::sync::Arc::from(bytes.into_boxed_slice()),
+        created_at: Instant::now(),
+    };
+    let frame_ref = crate::services::frame_storage().insert(stored);
+
+    let issued = match crate::services::frame_url_issuer()
+        .issue(frame_ref.as_str().to_string(), req.ttl_secs as u64)
+    {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("camera.frame_url remote issue failed: {e}");
+            audit_frame_url(
+                ctx,
+                org,
+                "error",
+                None,
+                &serde_json::json!({"reason": "issue_failed"}),
+            );
+            return Err(ProtocolError::internal("issue_failed"));
+        }
+    };
+    let signed_url = format!("/frames/{}?{}", frame_ref.as_str(), issued.query_string());
+    audit_frame_url(
+        ctx,
+        org,
+        "success",
+        Some(req.camera_id.as_str()),
+        &serde_json::json!({
+            "ttl_secs": req.ttl_secs,
+            "camera_id": req.camera_id,
+            "source": "mesh_remote",
+            "owner_node": owner_node,
         }),
     );
 
