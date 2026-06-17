@@ -441,6 +441,60 @@ impl MeshCommandExecutor {
                 message,
                 max_tokens,
             } => self.handle_ml_chat(model_name, message, max_tokens).await,
+            MeshCommandType::MlArtifactPushTo {
+                src_path,
+                target_node_id,
+            } => self.handle_ml_artifact_push_to(src_path, target_node_id).await,
+            MeshCommandType::MlArtifactChunk {
+                transfer_id,
+                name,
+                seq,
+                total,
+                data_b64,
+            } => match crate::ml_studio::mesh_artifact::recv_chunk(
+                &transfer_id,
+                &name,
+                seq,
+                total,
+                &data_b64,
+            ) {
+                Ok((_, local_path)) => CommandResponse::ok(
+                    MeshCommandResponsePayload::MlArtifactChunkResult {
+                        local_path,
+                        error: None,
+                    },
+                ),
+                Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactChunkResult {
+                    local_path: String::new(),
+                    error: Some(e.to_string()),
+                }),
+            },
+        }
+    }
+
+    /// Owner side (węzeł-źródło): pakuje katalog artefaktu i streamuje go do
+    /// `target_node_id` przez mesh. Wymaga `iroh` z service-action context.
+    async fn handle_ml_artifact_push_to(
+        &self,
+        src_path: String,
+        target_node_id: String,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("service action context not configured");
+        };
+        match crate::ml_studio::mesh_artifact::push_dir_to(&ctx.iroh, &target_node_id, &src_path)
+            .await
+        {
+            Ok(target_path) => CommandResponse::ok(
+                MeshCommandResponsePayload::MlArtifactPushResult {
+                    target_path,
+                    error: None,
+                },
+            ),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
+                target_path: String::new(),
+                error: Some(e.to_string()),
+            }),
         }
     }
 

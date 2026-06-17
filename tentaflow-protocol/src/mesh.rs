@@ -496,6 +496,23 @@ pub enum MeshCommandType {
         message: String,
         max_tokens: u32,
     },
+    /// ML Studio: zlecenie węzłowi-źródłu spakowania katalogu artefaktu `src_path`
+    /// i wypchnięcia go (komendą `MlArtifactChunk`) do `target_node_id`. Odpowiedź:
+    /// `MlArtifactPushResult { target_path }`. Appended at END.
+    MlArtifactPushTo {
+        src_path: String,
+        target_node_id: String,
+    },
+    /// ML Studio: jeden fragment ZIP-a artefaktu modelu strumieniowanego między
+    /// węzłami. Odbiorca składa po `transfer_id`, po komplecie rozpakowuje do
+    /// lokalnego katalogu i zwraca `MlArtifactChunkResult { local_path }`. Appended at END.
+    MlArtifactChunk {
+        transfer_id: String,
+        name: String,
+        seq: u32,
+        total: u32,
+        data_b64: String,
+    },
 }
 
 // =============================================================================
@@ -594,6 +611,18 @@ pub enum MeshCommandResponsePayload {
     /// Appended at END (kolejność = wire compat).
     MlChatResult {
         answer: String,
+        error: Option<String>,
+    },
+    /// ML Studio: ack fragmentu artefaktu. Po komplecie `local_path` = katalog
+    /// artefaktu rozpakowany na odbiorcy. Appended at END.
+    MlArtifactChunkResult {
+        local_path: String,
+        error: Option<String>,
+    },
+    /// ML Studio: wynik wypchnięcia artefaktu do węzła docelowego — ścieżka
+    /// katalogu artefaktu NA węźle docelowym. Appended at END.
+    MlArtifactPushResult {
+        target_path: String,
         error: Option<String>,
     },
 }
@@ -777,6 +806,19 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("model_name", model_name)
                 .field("max_tokens", max_tokens)
                 .field("message_len", &message.len())
+                .finish(),
+            Self::MlArtifactPushTo { src_path, target_node_id } => f
+                .debug_struct("MlArtifactPushTo")
+                .field("src_path", src_path)
+                .field("target_node_id", target_node_id)
+                .finish(),
+            Self::MlArtifactChunk { transfer_id, name, seq, total, data_b64 } => f
+                .debug_struct("MlArtifactChunk")
+                .field("transfer_id", transfer_id)
+                .field("name", name)
+                .field("seq", seq)
+                .field("total", total)
+                .field("data_len", &data_b64.len())
                 .finish(),
         }
     }

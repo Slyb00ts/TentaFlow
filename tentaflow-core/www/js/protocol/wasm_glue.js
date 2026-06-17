@@ -3402,18 +3402,21 @@ export function encodeMlStudioFtChatRequest(model_id, message, max_tokens) {
 
 /**
  * @param {string} model_id
+ * @param {string} target_node_id
  * @returns {Uint8Array}
  */
-export function encodeMlStudioFtDeployRequest(model_id) {
+export function encodeMlStudioFtDeployRequest(model_id, target_node_id) {
     const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioFtDeployRequest(ptr0, len0);
+    const ptr1 = passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtDeployRequest(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
+    return v3;
 }
 
 /**

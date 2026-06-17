@@ -2893,6 +2893,7 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeMlStudioFtDeployRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

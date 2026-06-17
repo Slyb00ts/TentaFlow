@@ -2600,49 +2600,98 @@ pub async fn ml_studio_ft_deploy(
     let is_mlx = !gguf_path.to_ascii_lowercase().ends_with(".gguf");
     let engine_id = if is_mlx { "mlx" } else { "llama-cpp" };
 
-    // config_json dla embedded: `model_file` niesie ABSOLUTNĄ ścieżkę — dla
-    // llama.cpp plik GGUF, dla MLX KATALOG safetensors. embedded.rs rozpozna ją
-    // jako lokalny model i pominie download HF.
-    let config_json = serde_json::json!({
-        "model_repo": model_name,
-        "model_file": gguf_path,
-        "ctx_size": 2048,
-    })
-    .to_string();
-
-    // Węzeł, na którym żyje GGUF (zapisany przy treningu/eksporcie). Dla modeli
-    // z mesh `gguf_path` jest ścieżką NA tym węźle — deploy musi tam trafić, bo
-    // plik nie istnieje lokalnie. `service_manifest_deploy` sam forwarduje deploy
-    // przez mesh (ServiceDeployRemote), gdy node_id != lokalny.
+    // Węzeł, na którym ŻYJE artefakt (zapisany przy treningu/eksporcie). Węzeł
+    // DOCELOWY deployu = `target_node_id` z requestu (UI) albo węzeł artefaktu.
     let local_node = ctx.state.local_node_id.to_string();
-    let deploy_node = metrics
+    let artifact_node = metrics
         .get("node_id")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| local_node.clone());
+    let deploy_node = if payload.target_node_id.trim().is_empty() {
+        artifact_node.clone()
+    } else {
+        payload.target_node_id.trim().to_string()
+    };
 
-    // Fail-closed dla deployu zdalnego: zanim `service_manifest_deploy` forwarduje
-    // przez mesh, sami weryfikujemy zaufanie. Bez `mesh_security` (None) odmawiamy —
-    // service_manifest_deploy pomija check, gdy security jest None, więc gwarancję
-    // dajemy tutaj, spójnie ze ścieżką czatu/detekcji.
-    if deploy_node != local_node {
+    // Fail-closed: każdy zdalny węzeł (artefaktu lub docelowy) musi być zaufany.
+    // Bez `mesh_security` odmawiamy (service_manifest_deploy pomija check gdy None).
+    if artifact_node != local_node || deploy_node != local_node {
         let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
             ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
         })?;
-        if !security.is_trusted(&deploy_node) {
-            return Err(ProtocolError::bad_request(format!(
-                "peer {} is not trusted",
-                deploy_node
-            )));
+        for node in [&artifact_node, &deploy_node] {
+            if *node != local_node && !security.is_trusted(node) {
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
+            }
         }
     }
+
+    // Transfer artefaktu na węzeł docelowy, gdy żyje gdzie indziej (build na B,
+    // deploy na C). Wspierane dla modeli MLX (katalog safetensors). Zwraca ścieżkę
+    // artefaktu NA węźle docelowym. Gdy deploy na węźle artefaktu — bez transferu.
+    let deploy_path = if deploy_node == artifact_node {
+        gguf_path.clone()
+    } else {
+        if !is_mlx {
+            return Err(ProtocolError::bad_request(
+                "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
+            ));
+        }
+        let iroh = ctx
+            .state
+            .quic_mesh
+            .clone()
+            .ok_or_else(|| ProtocolError::internal("mesh transport niedostępny na tym węźle"))?;
+        if artifact_node == local_node {
+            crate::ml_studio::mesh_artifact::push_dir_to(&iroh, &deploy_node, &gguf_path)
+                .await
+                .map_err(|e| ProtocolError::internal(format!("transfer artefaktu: {}", e)))?
+        } else {
+            // Węzeł artefaktu (B) pcha wprost do węzła docelowego (C) — pełny mesh.
+            let cmd = tentaflow_protocol::mesh::MeshCommandType::MlArtifactPushTo {
+                src_path: gguf_path.clone(),
+                target_node_id: deploy_node.clone(),
+            };
+            let resp = iroh
+                .send_command_and_wait(&artifact_node, cmd, 600)
+                .await
+                .map_err(|e| ProtocolError::internal(format!("zlecenie transferu B→C: {}", e)))?;
+            match resp.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::MlArtifactPushResult {
+                    target_path,
+                    error,
+                } => {
+                    if let Some(err) = error {
+                        return Err(ProtocolError::internal(format!("transfer B→C: {}", err)));
+                    }
+                    target_path
+                }
+                _ if !resp.ok => {
+                    return Err(ProtocolError::internal(
+                        resp.error.unwrap_or_else(|| "transfer B→C nieudany".into()),
+                    ))
+                }
+                _ => return Err(ProtocolError::internal("nieoczekiwana odpowiedź transferu B→C")),
+            }
+        }
+    };
+
+    // config_json dla embedded: `model_file` to ABSOLUTNA ścieżka NA węźle docelowym
+    // (po ewentualnym transferze) — plik GGUF lub katalog MLX safetensors.
+    let config_json = serde_json::json!({
+        "model_repo": model_name,
+        "model_file": deploy_path,
+        "ctx_size": 2048,
+    })
+    .to_string();
 
     let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
         engine_id: engine_id.to_string(),
         deploy_method: "native".to_string(),
-        node_id: deploy_node,
+        node_id: deploy_node.clone(),
         config_json,
     };
 
@@ -2669,6 +2718,9 @@ pub async fn ml_studio_ft_deploy(
             "inference_status".to_string(),
             serde_json::json!(if error.is_none() { "deploying" } else { "failed" }),
         );
+        // Węzeł, na którym model JEST WDROŻONY (może być inny niż węzeł artefaktu
+        // po transferze B→C). Czat routuje zapytania właśnie tam.
+        obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
     }
     repository::update_model_metrics(&payload.model_id, &merged.to_string()).map_err(db_err)?;
 
@@ -2719,9 +2771,13 @@ pub async fn ml_studio_ft_chat(
 
     let max_tokens = payload.max_tokens.clamp(1, 2048);
 
+    // Routujemy do węzła, na którym model JEST WDROŻONY (`inference_node` ustawiane
+    // przy deployu, może być inne niż węzeł artefaktu po transferze B→C). Fallback
+    // do `node_id` dla modeli wdrożonych przed wprowadzeniem `inference_node`.
     let local_node = ctx.state.local_node_id.to_string();
     let model_node = metrics
-        .get("node_id")
+        .get("inference_node")
+        .or_else(|| metrics.get("node_id"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != local_node)
