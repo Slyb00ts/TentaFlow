@@ -475,6 +475,19 @@ pub enum MeshCommandType {
         threshold: f64,
         image_b64: String,
     },
+    /// ML Studio: eksport GGUF NA TYM nodzie modelu, którego adapter żyje tutaj
+    /// (wytrenowany lokalnie/przez mesh). `spec_json` niesie adapter_path/base_model/
+    /// outtype/export_id. Odbiorca startuje eksport na swoim ml-training; inicjator
+    /// odpytuje przez `MlExportStatus`. Odpowiedź: Empty (ok/error).
+    MlExport {
+        export_id: String,
+        spec_json: String,
+    },
+    /// ML Studio: status zdalnego eksportu GGUF o `export_id`. Odpowiedź:
+    /// `MlExportStatusResult { status_json }`.
+    MlExportStatus {
+        export_id: String,
+    },
 }
 
 // =============================================================================
@@ -550,6 +563,9 @@ pub enum MeshCommandResponsePayload {
         height: u32,
         error: Option<String>,
     },
+    /// ML Studio: status zdalnego eksportu GGUF (JSON: status/gguf_path/error)
+    /// produkowany przez odbiorcę.
+    MlExportStatusResult { status_json: String },
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
@@ -732,6 +748,15 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("variant", variant)
                 .field("threshold", threshold)
                 .field("image_len", &image_b64.len())
+                .finish(),
+            Self::MlExport { export_id, spec_json } => f
+                .debug_struct("MlExport")
+                .field("export_id", export_id)
+                .field("spec_len", &spec_json.len())
+                .finish(),
+            Self::MlExportStatus { export_id } => f
+                .debug_struct("MlExportStatus")
+                .field("export_id", export_id)
                 .finish(),
         }
     }

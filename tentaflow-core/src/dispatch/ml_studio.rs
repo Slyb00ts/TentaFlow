@@ -2239,18 +2239,53 @@ pub fn ml_studio_ft_export_start(
         .ok_or_else(|| ProtocolError::bad_request("model nie ma artefaktu do eksportu"))?
         .to_string();
 
+    // Węzeł, na którym żyje adapter (zapisany przy treningu). Pusty/local →
+    // eksport lokalny; inny → eksport przez mesh na właścicielu adaptera.
+    let local_node = ctx.state.local_node_id.to_string();
+    let model_node = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+        .map(str::to_string);
+
     // Oznacz model jako eksportowany ZANIM odpalimy task — UI od razu widzi
     // `running`, a task w tle merguje finalny stan.
     let running_metrics = set_export_status_running(&metrics);
     repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
 
-    crate::ml_studio::export_llm::spawn_ft_export(
-        payload.model_id.clone(),
-        model.base_model.clone(),
-        adapter_path,
-        payload.outtype.clone(),
-        running_metrics,
-    );
+    match model_node {
+        Some(node) => {
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            // Fail-closed: brak mesh_security = nie weryfikujemy zaufania → odmowa.
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&node) {
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
+            }
+            crate::ml_studio::export_llm::spawn_ft_export_mesh(
+                iroh,
+                node,
+                payload.model_id.clone(),
+                model.base_model.clone(),
+                adapter_path,
+                payload.outtype.clone(),
+                running_metrics,
+            );
+        }
+        None => {
+            crate::ml_studio::export_llm::spawn_ft_export(
+                payload.model_id.clone(),
+                model.base_model.clone(),
+                adapter_path,
+                payload.outtype.clone(),
+                running_metrics,
+            );
+        }
+    }
 
     Ok(MessageBody::MlStudioBody(MlStudioPayload::FtExportResponse(
         tentaflow_protocol::MlStudioFtExportResponse {

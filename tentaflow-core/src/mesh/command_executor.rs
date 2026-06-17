@@ -419,6 +419,20 @@ impl MeshCommandExecutor {
                 self.handle_ml_detect(checkpoint_path, class_names_json, variant, threshold, image_b64)
                     .await
             }
+            MeshCommandType::MlExport { export_id, spec_json } => {
+                match crate::ml_studio::export_llm::mesh_export_start(&export_id, &spec_json).await {
+                    Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                    Err(e) => CommandResponse::fail(format!("mesh export start: {}", e)),
+                }
+            }
+            MeshCommandType::MlExportStatus { export_id } => {
+                match crate::ml_studio::export_llm::mesh_export_status(&export_id).await {
+                    Ok(status_json) => CommandResponse::ok(
+                        MeshCommandResponsePayload::MlExportStatusResult { status_json },
+                    ),
+                    Err(e) => CommandResponse::fail(format!("mesh export status: {}", e)),
+                }
+            }
         }
     }
 
