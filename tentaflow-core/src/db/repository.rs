@@ -17319,6 +17319,12 @@ pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) 
         "DELETE FROM cameras WHERE camera_id = ?1 AND owner_addon_id = ?2",
         rusqlite::params![camera_id, owner_addon_id],
     )?;
+    // Drop any cross-addon grants so a future camera reusing this id can't
+    // inherit stale access.
+    conn.execute(
+        "DELETE FROM camera_grants WHERE camera_id = ?1",
+        rusqlite::params![camera_id],
+    )?;
     Ok(())
 }
 
@@ -17411,6 +17417,169 @@ pub fn get_camera_for_addon(
         )
         .optional()?;
     Ok(row)
+}
+
+/// Returns the active row identified by `camera_id` in the supplied org,
+/// regardless of owning addon. Used by read paths that widen access via a grant
+/// (the caller MUST still gate on [`can_read_camera`] before returning the row,
+/// and surface `NotFound` rather than leaking existence when denied).
+#[cfg(feature = "camera")]
+pub fn get_camera_in_org(
+    pool: &DbPool,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<Option<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL"
+    );
+    let row = conn
+        .query_row(
+            &sql,
+            rusqlite::params![camera_id, resolved_org],
+            row_to_camera,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Central cross-addon camera read authorization. Returns `true` when `addon_id`
+/// may read/view `camera_id` in `org_id`: either it OWNS the active camera, or a
+/// `camera_grants` row grants it (or `'*'`) `level='read'` on that active camera.
+/// This is the ONE predicate every camera read path (get / discovery / stream
+/// subscribe / frame read) must consult — knowing a `camera_id` is never enough.
+#[cfg(feature = "camera")]
+pub fn can_read_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let allowed: bool = conn.query_row(
+        "SELECT EXISTS(\
+             SELECT 1 FROM cameras \
+             WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL \
+               AND owner_addon_id = ?3\
+         ) OR EXISTS(\
+             SELECT 1 FROM camera_grants g \
+             JOIN cameras c ON c.camera_id = g.camera_id \
+             WHERE g.camera_id = ?1 AND g.org_id = ?2 AND g.level = 'read' \
+               AND g.grantee_addon_id IN (?3, '*') \
+               AND c.org_id = ?2 AND c.removed_at IS NULL\
+         )",
+        rusqlite::params![camera_id, resolved_org, addon_id],
+        |r| r.get(0),
+    )?;
+    Ok(allowed)
+}
+
+/// Lists every active camera `addon_id` may read in `org_id`: owned cameras
+/// UNION cameras granted to it (or `'*'`). Powers cross-addon discovery
+/// (`camera_list_accessible_v1`) so a consumer addon (e.g. TentaVision) can see a
+/// camera owned by another addon (e.g. go2) once a grant exists.
+#[cfg(feature = "camera")]
+pub fn list_accessible_cameras(
+    pool: &DbPool,
+    addon_id: &str,
+    org_id: Option<&str>,
+) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras c \
+         WHERE c.org_id = ?2 AND c.removed_at IS NULL AND (\
+             c.owner_addon_id = ?1 \
+             OR EXISTS(\
+                 SELECT 1 FROM camera_grants g \
+                 WHERE g.camera_id = c.camera_id AND g.org_id = ?2 \
+                   AND g.level = 'read' AND g.grantee_addon_id IN (?1, '*')\
+             )\
+         ) ORDER BY c.camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id, resolved_org], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Creates (idempotent) a cross-addon read grant. Authorization to grant
+/// (camera owner or admin) is enforced by the caller (host-fn layer); this only
+/// persists the row. `created_by` is the granting user_id or addon_id.
+#[cfg(feature = "camera")]
+pub fn grant_camera(
+    pool: &DbPool,
+    camera_id: &str,
+    grantee_addon_id: &str,
+    level: &str,
+    org_id: &str,
+    created_by: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO camera_grants (camera_id, grantee_addon_id, level, org_id, created_at, created_by) \
+         VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5) \
+         ON CONFLICT(camera_id, grantee_addon_id, level) DO UPDATE SET \
+             org_id = excluded.org_id, created_at = excluded.created_at, created_by = excluded.created_by",
+        rusqlite::params![camera_id, grantee_addon_id, level, org_id, created_by],
+    )?;
+    Ok(())
+}
+
+/// Revokes a cross-addon grant. Returns the number of rows removed (0 = no such
+/// grant). Owner/admin authorization enforced by the caller.
+#[cfg(feature = "camera")]
+pub fn revoke_camera_grant(
+    pool: &DbPool,
+    camera_id: &str,
+    grantee_addon_id: &str,
+    level: &str,
+    org_id: &str,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM camera_grants \
+         WHERE camera_id = ?1 AND grantee_addon_id = ?2 AND level = ?3 AND org_id = ?4",
+        rusqlite::params![camera_id, grantee_addon_id, level, org_id],
+    )?;
+    Ok(n)
+}
+
+/// Lists the grants on a camera (`(grantee_addon_id, level, created_by)`),
+/// org-scoped, for the owner/admin grants UI.
+#[cfg(feature = "camera")]
+pub fn list_camera_grants(
+    pool: &DbPool,
+    camera_id: &str,
+    org_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT grantee_addon_id, level, created_by FROM camera_grants \
+         WHERE camera_id = ?1 AND org_id = ?2 ORDER BY grantee_addon_id, level",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![camera_id, org_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Removes all grants for a camera (called when the camera is hard-deleted so no
+/// orphan grants linger). Returns rows removed.
+#[cfg(feature = "camera")]
+pub fn delete_camera_grants(pool: &DbPool, camera_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM camera_grants WHERE camera_id = ?1",
+        rusqlite::params![camera_id],
+    )?;
+    Ok(n)
 }
 
 /// Returns the configured AI analysis frame rate for one camera (`0` =
@@ -17545,6 +17714,14 @@ pub fn soft_delete_camera(
          WHERE owner_addon_id = ?2 AND camera_id = ?3 AND org_id = ?4 AND removed_at IS NULL",
         rusqlite::params![now, addon_id, camera_id, resolved_org],
     )?;
+    // Drop cross-addon grants on removal so a re-registered camera reusing this
+    // id can't inherit stale access.
+    if n > 0 {
+        conn.execute(
+            "DELETE FROM camera_grants WHERE camera_id = ?1",
+            rusqlite::params![camera_id],
+        )?;
+    }
     Ok(n > 0)
 }
 

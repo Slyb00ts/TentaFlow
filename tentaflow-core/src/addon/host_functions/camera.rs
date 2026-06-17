@@ -30,10 +30,11 @@ use tracing::warn;
 
 use tentaflow_sdk_spec::{
     CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
-    CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut, CameraHealthOut,
-    CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut, CameraSnapshotOut,
-    CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput, DiscoveredCameraOut,
-    LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut, CameraGrantInfo,
+    CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut, CameraHealthOut,
+    CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut, CameraRevokeInput,
+    CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput,
+    DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
@@ -42,8 +43,10 @@ use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmC
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    get_camera_for_addon, insert_camera, list_cameras_for_addon, set_camera_credentials_encrypted,
-    set_camera_onvif_resolved, soft_delete_camera, update_camera, CameraPatch, CameraRow,
+    can_read_camera, get_camera_for_addon, get_camera_in_org, grant_camera, insert_camera,
+    list_accessible_cameras, list_camera_grants, list_cameras_for_addon, revoke_camera_grant,
+    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera, update_camera,
+    CameraPatch, CameraRow,
 };
 use crate::services::camera_ingest::{
     credentials::credentials_cipher, list_local_devices, start_supervisor, CameraConfig,
@@ -513,6 +516,8 @@ async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> Came
         retention_class: row.retention_class,
         profile: row.profile,
         analysis_flow_id: row.analysis_flow_id,
+        owner_addon_id: None,
+        access_level: None,
     }
 }
 
@@ -1324,6 +1329,572 @@ pub fn camera_list_v1(
 }
 
 // =============================================================================
+// Host function: camera_list_accessible_v1
+// =============================================================================
+//
+// Cross-addon discovery: lists every active camera the calling addon may read in
+// its org — cameras it owns UNION cameras granted to it (or `'*'`). Each entry
+// carries `owner_addon_id` and `access_level` ("owner"|"granted") so a consumer
+// addon (e.g. TentaVision) can tell which cameras come from a grant.
+
+pub fn camera_list_accessible_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.list_accessible",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+    let org = caller.data().org_id.clone();
+    let rows = match list_accessible_cameras(&db, &addon_id, org.as_deref()) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.list_accessible",
+                None,
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let out = run_async(async {
+        let sup = match get_or_init_supervisor().await {
+            Ok(s) => s,
+            Err(_) => return Err(AbiError::Operation),
+        };
+        let mut list = Vec::with_capacity(rows.len());
+        for r in rows {
+            let owner = r.owner_addon_id.clone();
+            let mut info = build_camera_info(&sup, r).await;
+            let is_owner = owner == addon_id;
+            info.owner_addon_id = Some(owner);
+            info.access_level = Some(if is_owner { "owner" } else { "granted" }.to_string());
+            // The url can embed credentials (e.g. rtsp://user:pass@host) — never
+            // expose it to a non-owner grantee.
+            if !is_owner {
+                info.url = String::new();
+            }
+            list.push(info);
+        }
+        Ok(CameraListOut { camera: list })
+    });
+    let out = match out {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.list_accessible",
+                None,
+                RiskClass::B,
+                "error",
+                Some("supervisor_unavailable"),
+            );
+            return e.as_i32();
+        }
+    };
+    audit(
+        caller.data(),
+        "camera.list_accessible",
+        None,
+        RiskClass::B,
+        "ok",
+        None,
+    );
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Grant authorization helper
+// =============================================================================
+
+/// Authorizes a grant-management op (grant / revoke / list grants) on
+/// `camera_id`. Allowed when the caller is an explicit system call OR owns the
+/// active camera in its org. A non-owner non-system addon is denied even if it
+/// merely holds a read grant — only the owner (or the host) administers grants.
+///
+/// Returns `Ok(true)` when authorized, `Ok(false)` when denied (caller surfaces
+/// `NotFound` to avoid leaking existence), `Err` on DB failure.
+fn authorize_grant_admin(
+    state: &AddonState,
+    camera_id: &str,
+) -> std::result::Result<bool, AbiError> {
+    if state.is_system_call {
+        return Ok(true);
+    }
+    match get_camera_for_addon(&state.db, &state.addon_id, camera_id, state.org_id.as_deref()) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(_) => Err(AbiError::Operation),
+    }
+}
+
+/// Allowlisted grant levels. v1 supports cross-addon read only.
+fn grant_level_valid(level: &str) -> bool {
+    matches!(level, "read")
+}
+
+// =============================================================================
+// Host function: camera_grant_v1
+// =============================================================================
+
+pub fn camera_grant_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.grant",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraGrantInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.grant",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if !camera_id_valid(&input.camera_id) {
+        audit(
+            caller.data(),
+            "camera.grant",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    if !grant_level_valid(&input.level) {
+        audit(
+            caller.data(),
+            "camera.grant",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "denied",
+            Some("level_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    if input.grantee_addon_id.is_empty() || input.grantee_addon_id.len() > 256 {
+        audit(
+            caller.data(),
+            "camera.grant",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "denied",
+            Some("grantee_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    match authorize_grant_admin(caller.data(), &input.camera_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                caller.data(),
+                "camera.grant",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_owner"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.grant",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
+            return e.as_i32();
+        }
+    }
+    let org = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let created_by = caller
+        .data()
+        .user_id
+        .clone()
+        .unwrap_or_else(|| caller.data().addon_id.clone());
+    if grant_camera(
+        &caller.data().db.clone(),
+        &input.camera_id,
+        &input.grantee_addon_id,
+        &input.level,
+        &org,
+        &created_by,
+    )
+    .is_err()
+    {
+        audit(
+            caller.data(),
+            "camera.grant",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "error",
+            Some("db_error"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    audit(
+        caller.data(),
+        "camera.grant",
+        Some(&input.camera_id),
+        RiskClass::A,
+        "ok",
+        None,
+    );
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &CameraGrantOut { ok: true },
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_revoke_v1
+// =============================================================================
+
+pub fn camera_revoke_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.revoke",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraRevokeInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.revoke",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if !camera_id_valid(&input.camera_id) {
+        audit(
+            caller.data(),
+            "camera.revoke",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("camera_id_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    if !grant_level_valid(&input.level) {
+        audit(
+            caller.data(),
+            "camera.revoke",
+            Some(&input.camera_id),
+            RiskClass::A,
+            "denied",
+            Some("level_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    match authorize_grant_admin(caller.data(), &input.camera_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                caller.data(),
+                "camera.revoke",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "denied",
+                Some("not_owner"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.revoke",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
+            return e.as_i32();
+        }
+    }
+    let org = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let removed = match revoke_camera_grant(
+        &caller.data().db.clone(),
+        &input.camera_id,
+        &input.grantee_addon_id,
+        &input.level,
+        &org,
+    ) {
+        Ok(n) => n,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.revoke",
+                Some(&input.camera_id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    audit(
+        caller.data(),
+        "camera.revoke",
+        Some(&input.camera_id),
+        RiskClass::A,
+        if removed > 0 { "ok" } else { "ok_noop" },
+        None,
+    );
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &CameraGrantOut { ok: removed > 0 },
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_grants_list_v1
+// =============================================================================
+
+pub fn camera_grants_list_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.grants_list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraGrantListInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.grants_list",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if !camera_id_valid(&input.camera_id) {
+        audit(
+            caller.data(),
+            "camera.grants_list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("camera_id_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    match authorize_grant_admin(caller.data(), &input.camera_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                caller.data(),
+                "camera.grants_list",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_owner"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.grants_list",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return e.as_i32();
+        }
+    }
+    let org = caller
+        .data()
+        .org_id
+        .clone()
+        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+    let grants = match list_camera_grants(&caller.data().db.clone(), &input.camera_id, &org) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.grants_list",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let out = CameraGrantListOut {
+        grants: grants
+            .into_iter()
+            .map(|(grantee_addon_id, level, created_by)| CameraGrantInfo {
+                grantee_addon_id,
+                level,
+                created_by,
+            })
+            .collect(),
+    };
+    audit(
+        caller.data(),
+        "camera.grants_list",
+        Some(&input.camera_id),
+        RiskClass::B,
+        "ok",
+        None,
+    );
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
 // Host function: camera_local_devices_v1
 // =============================================================================
 //
@@ -1445,12 +2016,36 @@ pub fn camera_get_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let db = caller.data().db.clone();
-    let row = match get_camera_for_addon(
-        &db,
-        &addon_id,
-        &input.camera_id,
-        caller.data().org_id.as_deref(),
-    ) {
+    let org = caller.data().org_id.clone();
+    // Read widens to granted addons: gate on `can_read_camera` (owner OR grant),
+    // then fetch ignoring the owner filter. A denied caller gets NotFound so the
+    // existence of another addon's camera id is never leaked.
+    match can_read_camera(&db, &addon_id, &input.camera_id, org.as_deref()) {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                caller.data(),
+                "camera.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_found_or_not_authorized"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    }
+    let row = match get_camera_in_org(&db, &input.camera_id, org.as_deref()) {
         Ok(Some(r)) => r,
         Ok(None) => {
             audit(
@@ -1459,7 +2054,7 @@ pub fn camera_get_v1(
                 Some(&input.camera_id),
                 RiskClass::B,
                 "denied",
-                Some("not_found_or_not_owned"),
+                Some("not_found_or_not_authorized"),
             );
             return AbiError::NotFound.as_i32();
         }
@@ -1475,13 +2070,15 @@ pub fn camera_get_v1(
             return AbiError::Operation.as_i32();
         }
     };
+    let owner = row.owner_addon_id.clone();
+    let is_owner = owner == addon_id;
     let info = run_async(async {
         match get_or_init_supervisor().await {
             Ok(sup) => Some(build_camera_info(&sup, row.clone()).await),
             Err(_) => None,
         }
     });
-    let info = match info {
+    let mut info = match info {
         Some(v) => v,
         None => CameraInfoOut {
             camera_id: row.camera_id,
@@ -1498,8 +2095,17 @@ pub fn camera_get_v1(
             retention_class: row.retention_class,
             profile: row.profile,
             analysis_flow_id: row.analysis_flow_id,
+            owner_addon_id: None,
+            access_level: None,
         },
     };
+    info.owner_addon_id = Some(owner);
+    info.access_level = Some(if is_owner { "owner" } else { "granted" }.to_string());
+    // The url can embed credentials (e.g. rtsp://user:pass@host) — never expose
+    // it to a non-owner grantee.
+    if !is_owner {
+        info.url = String::new();
+    }
     audit(
         caller.data(),
         "camera.get",
@@ -1896,6 +2502,8 @@ pub fn camera_update_v1(
                 retention_class: row.retention_class,
                 profile: row.profile,
                 analysis_flow_id: row.analysis_flow_id,
+                owner_addon_id: None,
+                access_level: None,
             }
         }
     });

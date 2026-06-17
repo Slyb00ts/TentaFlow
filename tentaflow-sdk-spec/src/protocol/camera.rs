@@ -205,6 +205,16 @@ pub struct CameraInfoOut {
     /// show + preselect the camera's current analysis flow.
     #[n(13)]
     pub analysis_flow_id: Option<String>,
+    /// Owning addon id of the camera. Populated by `camera_list_accessible_v1`
+    /// so a consumer addon can tell which cameras it owns vs. has via a grant.
+    /// `None` on legacy owner-only surfaces that never set it.
+    #[n(14)]
+    pub owner_addon_id: Option<String>,
+    /// Access level of the calling addon to this camera: `"owner"` when the
+    /// caller owns it, `"granted"` when reached through a cross-addon grant.
+    /// `None` on surfaces that do not compute it.
+    #[n(15)]
+    pub access_level: Option<String>,
 }
 
 /// Output of `camera_list_v1`.
@@ -213,6 +223,68 @@ pub struct CameraInfoOut {
 pub struct CameraListOut {
     #[n(0)]
     pub camera: Vec<CameraInfoOut>,
+}
+
+/// Input for `camera_grant_v1` — creates a cross-addon read grant. `level` is
+/// an allowlisted access level (currently only `"read"`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraGrantInput {
+    #[n(0)]
+    pub camera_id: String,
+    #[n(1)]
+    pub grantee_addon_id: String,
+    #[n(2)]
+    pub level: String,
+}
+
+/// Input for `camera_revoke_v1` — removes a previously issued grant.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraRevokeInput {
+    #[n(0)]
+    pub camera_id: String,
+    #[n(1)]
+    pub grantee_addon_id: String,
+    #[n(2)]
+    pub level: String,
+}
+
+/// Output of `camera_grant_v1` / `camera_revoke_v1`. `ok` is `true` when the
+/// grant was created (grant) or an existing grant was removed (revoke).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraGrantOut {
+    #[n(0)]
+    pub ok: bool,
+}
+
+/// One grant on a camera, as listed by `camera_grants_list_v1`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraGrantInfo {
+    #[n(0)]
+    pub grantee_addon_id: String,
+    #[n(1)]
+    pub level: String,
+    #[n(2)]
+    pub created_by: String,
+}
+
+/// Input for `camera_grants_list_v1` — the camera whose grants to list.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraGrantListInput {
+    #[n(0)]
+    pub camera_id: String,
+}
+
+/// Output of `camera_grants_list_v1`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraGrantListOut {
+    #[n(0)]
+    pub grants: Vec<CameraGrantInfo>,
 }
 
 /// One assignable camera-analysis flow (id + display name), for the per-camera
@@ -440,6 +512,59 @@ mod tests {
             retention_class: "C".into(),
             profile: "default".into(),
             analysis_flow_id: Some("00000000-0000-4000-8000-000000000020".into()),
+            owner_addon_id: Some("go2".into()),
+            access_level: Some("granted".into()),
+        });
+    }
+
+    #[test]
+    fn roundtrip_grant_input() {
+        roundtrip(&CameraGrantInput {
+            camera_id: "cam_00000000-0000-0000-0000-000000000000".into(),
+            grantee_addon_id: "tentavision".into(),
+            level: "read".into(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_revoke_input() {
+        roundtrip(&CameraRevokeInput {
+            camera_id: "cam_00000000-0000-0000-0000-000000000000".into(),
+            grantee_addon_id: "tentavision".into(),
+            level: "read".into(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_grant_out() {
+        roundtrip(&CameraGrantOut { ok: true });
+    }
+
+    #[test]
+    fn roundtrip_grant_info() {
+        roundtrip(&CameraGrantInfo {
+            grantee_addon_id: "tentavision".into(),
+            level: "read".into(),
+            created_by: "user_42".into(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_grant_list_input() {
+        roundtrip(&CameraGrantListInput {
+            camera_id: "cam_00000000-0000-0000-0000-000000000000".into(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_grant_list_out() {
+        roundtrip(&CameraGrantListOut { grants: vec![] });
+        roundtrip(&CameraGrantListOut {
+            grants: vec![CameraGrantInfo {
+                grantee_addon_id: "*".into(),
+                level: "read".into(),
+                created_by: "go2".into(),
+            }],
         });
     }
 
