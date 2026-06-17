@@ -17,7 +17,6 @@ use super::fakefile::ensure_gst_initialized;
 use super::session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, SessionCommand, SnapshotData,
 };
-#[cfg(feature = "webrtc")]
 use super::session::spawn_webrtc_session;
 use super::stream_publisher::Mp4StreamPublisher;
 use crate::services::stream_hub::StreamHub;
@@ -62,7 +61,6 @@ impl CameraIngestSupervisor {
     /// Add a camera backed by a live WebRTC video track (H.264 Annex-B over
     /// `rx`). Same quota/race handling as `add_camera`, but the source is a live
     /// handle rather than a URL, so it goes through `spawn_webrtc_session`.
-    #[cfg(feature = "webrtc")]
     pub async fn add_webrtc_camera(
         &self,
         config: CameraConfig,

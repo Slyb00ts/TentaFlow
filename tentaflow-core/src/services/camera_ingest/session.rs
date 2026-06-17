@@ -259,7 +259,6 @@ fn spawn_local_inner(
 /// Spawn a camera session backed by a WebRTC video track (H.264 Annex-B over
 /// `rx`). Separate from `spawn_session` because the source is a live handle, not
 /// a URL — the supervisor's backed-camera path supplies the receiver.
-#[cfg(feature = "webrtc")]
 pub fn spawn_webrtc_session(
     config: CameraConfig,
     rx: mpsc::Receiver<bytes::Bytes>,
@@ -300,7 +299,6 @@ pub fn spawn_webrtc_session(
 enum SessionSource {
     File(std::path::PathBuf),
     Local,
-    #[cfg(feature = "webrtc")]
     WebRtc(mpsc::Receiver<bytes::Bytes>),
 }
 
@@ -310,7 +308,6 @@ enum SessionSource {
 enum SourceKind {
     File,
     Local,
-    #[cfg(feature = "webrtc")]
     WebRtc,
 }
 
@@ -335,17 +332,14 @@ async fn run_session(
     let source_kind = match &source {
         SessionSource::File(_) => SourceKind::File,
         SessionSource::Local => SourceKind::Local,
-        #[cfg(feature = "webrtc")]
         SessionSource::WebRtc(_) => SourceKind::WebRtc,
     };
-    #[cfg(feature = "webrtc")]
     let mut webrtc_pump: Option<tokio::task::JoinHandle<()>> = None;
     let pipeline = match source {
         SessionSource::File(ref path) => {
             build_pipeline(path, cam_id.clone(), mailbox.clone(), counters.clone())
         }
         SessionSource::Local => build_local_pipeline(&config, mailbox.clone(), counters.clone()),
-        #[cfg(feature = "webrtc")]
         SessionSource::WebRtc(rx) => {
             match super::webrtc_source::build_webrtc_pipeline(
                 &config,
@@ -393,7 +387,6 @@ async fn run_session(
             None,
         );
         let _ = pipeline.pipeline.set_state(gst::State::Null);
-        #[cfg(feature = "webrtc")]
         if let Some(h) = webrtc_pump.take() {
             h.abort();
         }
@@ -427,7 +420,6 @@ async fn run_session(
                     Some(SessionCommand::Stop) | None => {
                         publish(&health_tx, &cam_id, CameraStatus::Stopping, None, &counters, fps_window.back().copied());
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
-                        #[cfg(feature = "webrtc")]
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
                         }
@@ -522,7 +514,6 @@ async fn run_session(
                                     drain_until_stop(&mut cmd_rx, &health_tx).await;
                                     return;
                                 }
-                                #[cfg(feature = "webrtc")]
                                 SourceKind::WebRtc => {
                                     let reason = "webrtc video stream ended";
                                     publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, fps_window.back().copied());
@@ -540,7 +531,6 @@ async fn run_session(
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
                             publish(&health_tx, &cam_id, CameraStatus::Error, Some(text.clone()), &counters, fps_window.back().copied());
                             let _ = pipeline.pipeline.set_state(gst::State::Null);
-                            #[cfg(feature = "webrtc")]
                             if let Some(h) = webrtc_pump.take() {
                                 h.abort();
                             }
@@ -575,7 +565,6 @@ async fn run_session(
                         let reason = "no frames within warmup window";
                         publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, None);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
-                        #[cfg(feature = "webrtc")]
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
                         }
