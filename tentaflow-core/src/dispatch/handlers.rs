@@ -4120,10 +4120,17 @@ pub async fn deploy_vllm_recommend(
         .map(|g| g.memory_gb)
         .fold(f64::INFINITY, f64::min);
 
-    let kv_dtype = payload
-        .kv_cache_dtype
-        .clone()
-        .unwrap_or_else(|| "auto".to_string());
+    // DeepSeek V4 serwuje uwagę przez kernel FlashMLA w układzie fp8, który
+    // twardo wymaga fp8 kv-cache (vLLM asertuje "FlashMLA fp8 layout only
+    // supports fp8 kv-cache" i ubija engine przy `auto`). Gdy user sam nie
+    // wybrał dtype, domyślamy fp8 dla tej rodziny — inaczej każdy deploy V4 pada.
+    let kv_dtype = payload.kv_cache_dtype.clone().unwrap_or_else(|| {
+        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") {
+            "fp8".to_string()
+        } else {
+            "auto".to_string()
+        }
+    });
     let gpu_mem_util = payload.gpu_memory_utilization.unwrap_or(0.9);
 
     let lock_ctx = payload.lock_max_model_len.unwrap_or(false);

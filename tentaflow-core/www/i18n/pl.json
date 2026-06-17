@@ -1102,6 +1102,8 @@
         "batch_hint": "vLLM --max-num-batched-tokens — driver szczytu aktywacji. Domyślnie 8192.",
         "quant_label": "Kwantyzacja wag (override)",
         "quant_hint": "Puste = dtype ze źródłowego config.json. Override przelicza wagi dla AWQ/GPTQ/FP8/NVFP4, żeby zmieścić model na GPU.",
+        "trust_remote_code_label": "Zaufaj zdalnemu kodowi (--trust-remote-code)",
+        "trust_remote_code_hint": "Pozwala repo modelu wykonać własny kod przy ładowaniu. Wymagane przez część modeli (Gemma 4, DeepSeek V4). Domyślnie włączone — wyłącz dla niezaufanego repo.",
         "quant_opt_source": "Ze źródła (config.json)",
         "mlx_title": "Limit pamięci i kontekst (MLX)",
         "mlx_subtitle": "Apple unified memory — ustaw, ile maksymalnie pamięci model może użyć. Runtime przerwie zadanie czystym błędem zamiast OOM, gdy kontekst tego nie zmieści.",
