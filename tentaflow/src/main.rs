@@ -730,6 +730,7 @@ async fn run_server(args: Args) -> Result<()> {
                                             port_allocator,
                                             iroh: mesh_mgr.clone(),
                                             router: router.clone(),
+                                            addon_manager: addon_manager.clone(),
                                         },
                                     )
                                     .await;

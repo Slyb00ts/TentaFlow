@@ -413,7 +413,13 @@ install_base() {
                 lld
                 git
                 git-lfs
-                java-17-openjdk-devel
+                # System JDK, only needed to build the Android APK (Gradle). The
+                # repo-local gradlew bootstrap downloads its own Temurin 17 when
+                # the system Java is too new, so the exact version here doesn't
+                # matter — `java-latest-openjdk-devel` always exists across Fedora
+                # releases (F44 already dropped java-17/21), and --skip-unavailable
+                # below keeps setup resilient anyway.
+                java-latest-openjdk-devel
                 unzip
                 pkg-config
                 # sherpa-onnx (Eigen/openfst) buduje z -static-libstdc++ -static-libgcc;
@@ -437,8 +443,10 @@ install_base() {
                 sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
-            run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-17-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
+            # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
+            run_privileged dnf install -y --skip-unavailable "${pkgs[@]}"
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -735,6 +743,31 @@ install_rust() {
 
     # Upewnij sie ze mamy stable
     rustup default stable
+
+    # rustup shim MUSI byc na PATH przed ewentualnym systemowym cargo (apt/distro
+    # potrafi miec stare 1.75) — inaczej build uzyje starego cargo mimo rustupa.
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    # Wymus minimalna wersje: zaleznosci wymagaja feature `edition2024`, ktora
+    # ustabilizowano dopiero w Rust 1.85. Stary toolchain (np. systemowy 1.75)
+    # wywala build z "feature `edition2024` is required". Fail-loud z instrukcja.
+    local min_rust="1.85.0"
+    local cur_rust
+    cur_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
+    if [[ -z "$cur_rust" ]] || \
+       [[ "$(printf '%s\n%s\n' "$min_rust" "$cur_rust" | sort -V | head -1)" != "$min_rust" ]]; then
+        log_warn "Aktywny rustc=${cur_rust:-brak} < ${min_rust}; probuje rustup update stable..."
+        rustup update stable --no-self-update
+        rustup default stable
+        cur_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
+    fi
+    if [[ -z "$cur_rust" ]] || \
+       [[ "$(printf '%s\n%s\n' "$min_rust" "$cur_rust" | sort -V | head -1)" != "$min_rust" ]]; then
+        log_error "Rust ${cur_rust:-brak} jest za stary (wymagane >= ${min_rust} dla edition2024)."
+        log_error "Aktywny cargo: $(command -v cargo 2>/dev/null || echo brak)"
+        log_error "Jesli to systemowy Rust (apt/distro): usun go (np. 'apt remove rustc cargo') albo upewnij sie ze ~/.cargo/bin jest PIERWSZE w PATH, i uruchom ponownie."
+        exit 1
+    fi
 
     log_ok "Rust: $(rustc --version)"
     INSTALLED+=("rust-stable")
@@ -1137,14 +1170,17 @@ install_android_gstreamer_sdk() {
     local sha_path="$archive_path.sha256sum"
 
     mkdir -p "$download_dir" "$target_dir"
-    if [[ ! -f "$archive_path" ]]; then
-        log_info "Pobieranie GStreamer Android SDK ${gst_version} (~939 MB)..."
-        curl -fL --progress-bar -o "$archive_path" "$archive_url"
+    # Small checksum first; use it to decide whether the (possibly partial)
+    # archive is already complete and valid — skip the 939 MB download if so.
+    curl -fL -o "$sha_path" "$sha_url"
+    if [[ -f "$archive_path" ]] && ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1 ); then
+        log_ok "Archiwum GStreamer Android ${gst_version} juz pobrane (checksum OK) — pomijam download."
+    else
+        log_info "Pobieranie GStreamer Android SDK ${gst_version} (~939 MB, wznawialne)..."
+        # -C - wznawia przerwane pobieranie zamiast startowac od zera.
+        curl -fL -C - --progress-bar -o "$archive_path" "$archive_url"
+        ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" )
     fi
-    if [[ ! -f "$sha_path" ]]; then
-        curl -fL -o "$sha_path" "$sha_url"
-    fi
-    ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" )
 
     log_info "Wypakowuje GStreamer Android SDK do $target_dir..."
     rm -rf "$target_dir"
@@ -1233,14 +1269,25 @@ install_vulkan() {
             INSTALLED+=("vulkan-sdk")
             ;;
         debian)
+            # Core, required for the Vulkan llama.cpp backend: loader+headers,
+            # shader compiler, SPIR-V tools.
             local pkgs=(
                 libvulkan-dev
-                vulkan-validationlayers-dev
                 glslang-dev
                 spirv-tools
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
+            # Validation layers are debug-only and the package name churns across
+            # Ubuntu releases — 24.04 dropped `vulkan-validationlayers-dev` in
+            # favour of `vulkan-validationlayers` + `vulkan-utility-libraries-dev`.
+            # apt has no --skip-unavailable, so install each best-effort (a missing
+            # debug layer must never abort setup).
+            for opt in vulkan-validationlayers vulkan-validationlayers-dev vulkan-utility-libraries-dev; do
+                if run_privileged apt-get install -y "$opt" >/dev/null 2>&1; then
+                    log_ok "  + $opt"
+                fi
+            done
             INSTALLED+=("vulkan-sdk")
             ;;
         fedora)
@@ -1702,6 +1749,25 @@ print_summary() {
     echo ""
 }
 
+# --- vLLM deployment recipes (refresh vendored snapshot) ---
+
+# A snapshot is committed in tentaflow-core/vllm-recipes/recipes.json.gz and
+# embedded into the binary, so this is a best-effort freshness refresh — never
+# fatal. Offline / no network just keeps the committed snapshot.
+update_vllm_recipes() {
+    log_section "vLLM recipes"
+    local script="$(dirname "$0")/update-vllm-recipes.sh"
+    if [[ ! -f "$script" ]]; then
+        log_warn "update-vllm-recipes.sh nie znaleziony — pomijam (zostaje snapshot z repo)."
+        return
+    fi
+    if bash "$script" >/dev/null 2>&1; then
+        log_ok "Snapshot recipe vLLM odswiezony."
+    else
+        log_warn "Nie udalo sie odswiezyc recipe (offline?) — zostaje wbudowany snapshot."
+    fi
+}
+
 # --- Main ---
 
 main() {
@@ -1729,10 +1795,15 @@ main() {
     install_base
     install_git_lfs
     ensure_docker
-    install_zvec
+    # Rust + WASM toolchain FIRST: it is foundational (native builds may use cargo)
+    # and must never be skipped by a `set -e` abort in a later fragile native step.
+    # A zvec failure on a fresh rig used to leave the box with an old/system Rust
+    # and no wasm-bindgen -> Rust 1.75 build errors + dashboard wasm_glue 404.
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_zvec
+    update_vllm_recipes
     install_android_rust_tools
     install_android_gstreamer_sdk
     install_android_gradle_runner

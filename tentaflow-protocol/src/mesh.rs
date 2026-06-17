@@ -503,6 +503,14 @@ pub enum MeshCommandType {
         src_path: String,
         target_node_id: String,
     },
+    /// Cross-node robot control. The receiver owns the robot addon; it decodes
+    /// the opaque `RobotControlRequest` (CBOR), re-checks trust + timing +
+    /// permission, sanitizes the action and dispatches it to the local robot
+    /// addon, returning a `RobotControlResult`. Opaque CBOR keeps this crate free
+    /// of robot types (like `VectorOp`). Appended at END (ciborium index rule).
+    RobotControl {
+        request_cbor: Vec<u8>,
+    },
 }
 
 // =============================================================================
@@ -608,6 +616,13 @@ pub enum MeshCommandResponsePayload {
     MlArtifactPushResult {
         target_path: String,
         error: Option<String>,
+    },
+    /// Opaque CBOR `RobotControlResponse` produced by the receiver running a
+    /// forwarded `RobotControl` against its local robot addon. A rejection
+    /// (timing/permission/unknown-robot) is carried as a successful response with
+    /// the encoded `RobotControlResponse::rejected(...)`. Appended at END.
+    RobotControlResult {
+        result_cbor: Vec<u8>,
     },
 }
 
@@ -796,6 +811,10 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("src_path", src_path)
                 .field("target_node_id", target_node_id)
                 .finish(),
+            Self::RobotControl { request_cbor } => f
+                .debug_struct("RobotControl")
+                .field("request_len", &request_cbor.len())
+                .finish(),
         }
     }
 }
@@ -881,6 +900,12 @@ pub const MESH_MSG_SYNC_SNAPSHOT_RESPONSE: u8 = 0x4C;
 /// czlonkowie) po mutacji create/update/delete. Odbiorca tylko zapisuje
 /// snapshot lokalnie — nigdy nie re-broadcastuje (anty-petla).
 pub const MESH_MSG_ROUTING_SYNC: u8 = 0x4D;
+/// Periodyczny anti-drift broadcast pelnego zestawu robotow nalezacych do
+/// tego noda (`RobotsAnnouncePayload`). Mirror `MESH_MSG_SERVICES_ANNOUNCE` —
+/// odbiorca robi `replace_node` w in-memory rejestrze robotow, dzieki czemu
+/// resolver `resolve_robot_owner` widzi, ktory node posiada dany robot.
+/// Trusted-peer only (nie ma go na liscie pre-trust).
+pub const MESH_MSG_ROBOTS_ANNOUNCE: u8 = 0x4E;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)

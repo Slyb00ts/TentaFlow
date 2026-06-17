@@ -127,6 +127,10 @@ export async function openDeployWizard(engineId, opts = {}) {
       // np. NVFP4) albo `model_preset.quantization`. Pusty = dtype ze zrodla
       // (config.json). User moze zmienic w trybie manual i przeliczyc.
       quantization: null,
+      // vLLM `--trust-remote-code`: pozwala repo modelu wykonac wlasny kod przy
+      // ladowaniu (wymagane przez Gemma 4, DeepSeek V4 i inne z custom kodem).
+      // Default ON dla wygody; user moze zdjac dla nieufnego repo.
+      trust_remote_code: true,
       // MLX-only: budzet pamieci (MB) dla Apple unified memory. Backend liczy
       // realny `pool_tokens` (engine='mlx') z tego budzetu + wybranych kv-bits.
       // Default 16 GB — 8 GB jest mniejsze niz wagi modelu 7B+, wiec wizard
@@ -1091,6 +1095,19 @@ function renderAutoAlert(rec) {
   const r = rec.recommended || {};
   const args = rec.recommended_vllm_args || '';
   const warnings = rec.warnings || [];
+  // Official vLLM recipe (recipes.vllm.ai) badge: signals that expert flags +
+  // per-GPU env were pre-filled from the matched recipe. Args stay editable.
+  const recipeEnv = rec.recommended_env || {};
+  const envList = Object.keys(recipeEnv);
+  const recipeBadge = rec.recipe_applied
+    ? `<div style="margin-top:10px; padding:8px 10px; background:#e8f5e9; border:1px solid #66bb6a; border-radius:6px; font-size:12px; color:#1b5e20;">
+        ✓ ${escapeHtml(tAdv('recipe_applied', { id: rec.recipe_applied }))}${
+          envList.length
+            ? `<br><span style="font-size:11px;">env: ${envList.map((k) => `<code>${escapeHtml(k)}=${escapeHtml(String(recipeEnv[k]))}</code>`).join(' ')}</span>`
+            : ''
+        }
+      </div>`
+    : '';
   // GPU compatibility: when the chosen GPU count doesn't fit the model
   // architecture (TP must divide num_attention_heads, PP must divide
   // num_hidden_layers), surface a warning chip with better-fitting counts.
@@ -1126,6 +1143,7 @@ function renderAutoAlert(rec) {
           seqs: r.max_num_seqs || 0,
           mu: (r.gpu_memory_utilization || 0.9).toFixed(2),
         }))}
+        ${recipeBadge}
         ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
         ${compatChip}
         ${warnings.length > 0 ? `<ul class="adv-alert-warn">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
@@ -1258,6 +1276,19 @@ function renderAdvancedManualControls(adv, rec) {
     </div>`;
   }
 
+  // `--trust-remote-code` toggle (vLLM-rodzina). Default ON — wiele repo (Gemma
+  // 4, DeepSeek V4) wymaga wlasnego kodu modelujacego. Zdjecie = bezpieczniejsze
+  // dla nieufnego repo (kod nie wykona sie przy ladowaniu).
+  let trustRowHtml = '';
+  if (isVllmFamilyEngine()) {
+    const on = adv.trust_remote_code !== false;
+    trustRowHtml = `
+    <div class="adv-form-row">
+      <label><tf-toggle id="edw-adv-trust" ${on ? 'checked' : ''}></tf-toggle> <span>${escapeHtml(tAdv('trust_remote_code_label'))}</span></label>
+      <div class="adv-hint">${escapeHtml(tAdv('trust_remote_code_hint'))}</div>
+    </div>`;
+  }
+
   // Sekcja KV cache — engine-aware. vLLM: jeden select (auto/fp8*) + opcjonalny
   // max-num-batched-tokens. llama.cpp: osobne K i V (f16..iq4_nl) + chip
   // flash-attention gdy kwantyzowane. Etykiety = realne tokeny CLI silnika
@@ -1366,6 +1397,8 @@ function renderAdvancedManualControls(adv, rec) {
     </div>
 
     ${quantRowHtml}
+
+    ${trustRowHtml}
 
     ${kvSectionHtml}
 
@@ -1618,6 +1651,16 @@ function bindAdvancedHandlers() {
       const v = e.detail?.value ?? quantSelect.value;
       selection.advanced.quantization = v || null;
       debounceRecompute(buildOverrides());
+    });
+  }
+
+  // `--trust-remote-code` toggle — czysto przelacznik flagi CLI, nie wplywa na
+  // estymacje VRAM, wiec bez recompute.
+  const trustToggle = document.getElementById('edw-adv-trust');
+  if (trustToggle) {
+    trustToggle.addEventListener('change', (e) => {
+      const v = e.detail?.checked ?? trustToggle.checked;
+      selection.advanced.trust_remote_code = !!v;
     });
   }
 
@@ -2450,7 +2493,12 @@ async function startDeploy() {
       // ktore backend traktuje jako "user explicit" i nadpisuje auto-clamp z
       // free VRAM. W trybie auto user nie wybral tej wartosci — wycinamy ja
       // ze stringa, zeby backend mogl ja policzyc z aktualnego stanu karty.
-      const raw = advancedRecommendation.recommended_vllm_args || '';
+      let raw = advancedRecommendation.recommended_vllm_args || '';
+      // `--trust-remote-code` przychodzi domyslnie z kalkulatora (default ON).
+      // Gdy user zdjal toggle, wycinamy je tutaj.
+      if (selection.advanced.trust_remote_code === false) {
+        raw = raw.replace(/--trust-remote-code\b/g, '');
+      }
       vllmArgs = raw.replace(/--gpu-memory-utilization(?:=|\s+)[^\s]+/g, '').replace(/\s+/g, ' ').trim() || null;
     } else {
       const a = selection.advanced;
@@ -2463,6 +2511,8 @@ async function startDeploy() {
         '--max-num-batched-tokens', String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)),
         '--enable-chunked-prefill',
       ];
+      // Default ON; user moze zdjac toggle dla nieufnego repo.
+      if (a.trust_remote_code !== false) parts.push('--trust-remote-code');
       const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
       const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
       if (tp > 1) parts.push('--tensor-parallel-size', String(tp));
@@ -2540,6 +2590,14 @@ async function startDeploy() {
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,
+    // Engine env from the matched vLLM recipe (e.g. VLLM_USE_FLASHINFER_MOE_FP4
+    // on Blackwell). Backend (`apply_engine_env`) injects these into the engine
+    // process env on both native and docker paths. Empty/missing = nothing extra.
+    engine_env: (advActive && advancedRecommendation
+      && advancedRecommendation.recommended_env
+      && Object.keys(advancedRecommendation.recommended_env).length)
+      ? advancedRecommendation.recommended_env
+      : undefined,
     // External cloud provider credentials. `api_key` is encrypted server-side
     // (never persisted in clear). `base_url`/`api_version` override the
     // manifest endpoint for generic openai-compatible / Azure engines.

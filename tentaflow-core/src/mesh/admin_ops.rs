@@ -913,6 +913,9 @@ pub fn revoke_trust(
             if let Err(e) = sec.unpair(&revoked_id) {
                 warn!("Blad unpair dla {}: {}", revoked_id, e);
             }
+            // Drop the revoked node's advertised robots immediately so the resolver
+            // can't route a command to it before the QUIC idle disconnect fires.
+            crate::mesh::robot_dispatch::global().remove_node(&revoked_id);
             sec.clear_revoking(&revoked_id);
             // Nie disconnectujemy — kaskadowe disconnect powodowaly failujace broadcasty.
             // Connection umrze po QUIC idle timeout (60s).
@@ -923,6 +926,7 @@ pub fn revoke_trust(
             error!(target_node = %node_id, "security.unpair failed: {}", e);
             AdminError::new(AdminErrorKind::Internal, "internal mesh error")
         })?;
+        crate::mesh::robot_dispatch::global().remove_node(node_id);
         security.clear_revoking(node_id);
     }
     let _ = delete_trusted_contact_hints(&security.db, node_id);

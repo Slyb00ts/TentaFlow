@@ -3737,6 +3737,15 @@ pub struct DeployVllmRecommendResponse {
     pub applied: DeployVllmConfig,
     pub auto_adjusted: Vec<String>,
     pub at_limit: bool,
+    /// Env vars from the matched vLLM recipe (e.g. VLLM_USE_FLASHINFER_MOE_FP4
+    /// on Blackwell). The wizard sends these back as `engine_env` on deploy.
+    /// Empty when no recipe matched the model.
+    #[serde(default)]
+    pub recommended_env: std::collections::HashMap<String, String>,
+    /// hf_id of the applied recipe (for the "recipe applied" GUI badge). None
+    /// when no recipe matched.
+    #[serde(default)]
+    pub recipe_applied: Option<String>,
 }
 
 // =============================================================================

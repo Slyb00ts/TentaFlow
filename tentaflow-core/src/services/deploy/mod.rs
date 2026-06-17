@@ -1297,6 +1297,39 @@ fn vllm_spec_method(method: &str) -> Option<&'static str> {
     }
 }
 
+/// Engine env passthrough from the deploy config `engine_env` object (e.g. the
+/// vLLM recipe's `VLLM_USE_FLASHINFER_MOE_FP4`). Shared by the native and docker
+/// deploy paths. Reserved runtime keys owned by the deploy flow are never
+/// overridden — recipes only set `VLLM_*`-style tuning vars, guarded defensively.
+pub(crate) fn apply_engine_env(
+    user_config: &serde_json::Value,
+    env: &mut HashMap<String, String>,
+) {
+    const RESERVED: &[&str] = &[
+        "PORT",
+        "MODEL",
+        "SERVED_MODEL_NAME",
+        "HF_TOKEN",
+        "HF_HOME",
+        "GPU_MEMORY_UTILIZATION",
+        "VLLM_ARGS",
+    ];
+    let Some(obj) = user_config.get("engine_env").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (k, v) in obj {
+        let key = k.trim();
+        if key.is_empty() || RESERVED.contains(&key) {
+            continue;
+        }
+        if let Some(val) = v.as_str() {
+            env.insert(key.to_string(), val.to_string());
+        } else if !v.is_null() {
+            env.insert(key.to_string(), v.to_string());
+        }
+    }
+}
+
 /// Builds the `VLLM_*` container env for a vLLM featured preset: NVFP4
 /// self-quantization (`VLLM_MODEL_QUANTIZE` / `VLLM_SPEC_DRAFT_QUANTIZE`) and
 /// speculative decoding (`VLLM_SPEC_METHOD` / `VLLM_SPEC_REPO` /
