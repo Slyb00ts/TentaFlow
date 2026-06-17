@@ -2992,12 +2992,15 @@ function renderModelsTab(panel, p) {
         const modelId = String(m.modelId ?? m.model_id ?? '');
         const baseModel = String(m.baseModel ?? m.base_model ?? '');
         const modelName = String(m.name ?? (modelId || '—'));
-        // Model wdrożony do inferencji → metryki niosą `inference_model_name`.
+        // Stan z metryk: wdrożony (`inference_model_name`) oraz wyeksportowany
+        // do GGUF (`export_status=succeeded` + `gguf_path`).
         let deployed = false;
+        let exported = false;
         try {
           const mj = JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
           deployed = Boolean(mj.inference_model_name);
-        } catch (_) { deployed = false; }
+          exported = mj.export_status === 'succeeded' && Boolean(mj.gguf_path);
+        } catch (_) { deployed = false; exported = false; }
         return {
           model: modelName,
           framework: String(m.framework ?? '—') || '—',
@@ -3013,6 +3016,7 @@ function renderModelsTab(panel, p) {
           _isRecog: String(m.framework ?? '') === 'rfdetr',
           _canExport: Boolean(modelId && baseModel.trim().length > 0 && String(m.framework ?? '') !== 'rfdetr'),
           _canChat: Boolean(modelId && deployed),
+          _canDeploy: Boolean(modelId && exported && !deployed && String(m.framework ?? '') !== 'rfdetr'),
         };
       });
       // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
@@ -3048,6 +3052,19 @@ function renderModelsTab(panel, p) {
             exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
             wrap.appendChild(exp);
           }
+          return wrap;
+        }
+        // Wyeksportowany, ale niewdrożony → bezpośredni „Wdróż" (bez ponownego eksportu).
+        if (row._canDeploy) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+          const dep = document.createElement('tf-button');
+          dep.setAttribute('size', 'sm');
+          dep.setAttribute('variant', 'primary');
+          dep.setAttribute('icon', 'cpu');
+          dep.textContent = 'Wdróż';
+          dep.addEventListener('click', () => deployFtModel(row._modelId, row._modelName, () => renderModelsTab(panel, p)));
+          wrap.appendChild(dep);
           return wrap;
         }
         if (!row._canExport) return null;
@@ -3148,6 +3165,26 @@ function renderDetections(host, b64, mime, dets, width, height) {
     <div class="ml-studio-data-head" style="margin-top:10px">${sprite('check')} Wykryto ${dets.length} obiektów</div>
     <ul class="ml-studio-detect-list">${list}</ul>
   `;
+}
+
+// Wdrożenie wyeksportowanego modelu FT do inferencji (bez ponownego eksportu).
+// Start jest synchroniczny — status "deploying" = serwis ruszył. Po sukcesie
+// odświeżamy zakładkę (`onDone`), żeby pojawiła się akcja „Zapytaj".
+async function deployFtModel(modelId, modelName, onDone) {
+  if (!modelId) return;
+  toast(`Wdrażanie „${modelName}"…`, 'info');
+  try {
+    const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId });
+    const status = String(resp?.status || '');
+    if (status === 'deploying') {
+      toast(`Model „${resp?.modelName || modelName}" wdrażany — odpytaj go przyciskiem „Zapytaj"`, 'success');
+      if (typeof onDone === 'function') onDone();
+    } else {
+      toast(String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia', 'error');
+    }
+  } catch (err) {
+    toast(`Wdrożenie nieudane: ${err.message}`, 'error');
+  }
 }
 
 // Czat z wdrożonym modelem FT (test/„użyj"). Modal: prompt → mlStudioFtChatRequest
