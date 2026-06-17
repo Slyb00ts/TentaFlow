@@ -401,6 +401,60 @@ pub fn plan_execution(
     })
 }
 
+/// Run a decided `RobotExecutionPlan` against the local robot addon and turn the
+/// raw addon result into a `RobotControlResponse`. The ONE local-execute
+/// implementation shared by the mesh RECEIVER (`command_executor::handle_robot_control`,
+/// for forwarded commands) and the SENDER (`robot_dispatch::dispatch_robot_action`,
+/// when the owning robot is local) — neither side reimplements the dispatch.
+///
+/// Synchronous: `call_tool` / `invoke_block` are blocking wasmtime calls, so both
+/// callers wrap this in `spawn_blocking`. `read_only` selects whether a successful
+/// result is serialized into `result_json` (Status snapshot) or collapsed to a
+/// bare `ok()`. Never logs `Move` velocity values.
+pub fn execute_robot_call(
+    addon_manager: &crate::addon::AddonManager,
+    plan: &RobotExecutionPlan,
+    read_only: bool,
+) -> RobotControlResponse {
+    let exec: anyhow::Result<serde_json::Value> = match &plan.call {
+        Go2Call::Tool { tool, params } => {
+            addon_manager.call_tool(&plan.addon_id, tool, params.clone(), &plan.actor_user_id)
+        }
+        Go2Call::Block { block_type, params } => {
+            match serde_json::to_vec(params) {
+                Ok(bytes) => addon_manager
+                    .invoke_block(
+                        &plan.addon_id,
+                        block_type,
+                        &bytes,
+                        Some(plan.actor_user_id.clone()),
+                        None,
+                        ROBOT_BLOCK_FUEL,
+                        None,
+                    )
+                    .and_then(|raw| {
+                        serde_json::from_slice::<serde_json::Value>(&raw)
+                            .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
+                    }),
+                Err(e) => Err(anyhow::anyhow!("encode block params: {e}")),
+            }
+        }
+    };
+    match exec {
+        Ok(json) => {
+            if read_only {
+                match serde_json::to_string(&json) {
+                    Ok(s) => RobotControlResponse::ok_with(s),
+                    Err(e) => RobotControlResponse::failed(format!("serialize status: {e}")),
+                }
+            } else {
+                RobotControlResponse::ok()
+            }
+        }
+        Err(e) => RobotControlResponse::failed(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
