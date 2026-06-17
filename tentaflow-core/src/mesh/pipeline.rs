@@ -413,6 +413,9 @@ pub async fn start_mesh_pipeline(
                 db_pool.clone(),
                 mesh_services_registry.clone(),
             );
+            if let Some(ref pool) = db_pool {
+                spawn_robot_advertiser(quic_mesh.clone(), local_node_id.clone(), pool.clone());
+            }
             spawn_slow_refresh(
                 mesh_peer_store.clone(),
                 local_node_id.clone(),
@@ -2785,6 +2788,60 @@ fn spawn_docker_cache() -> Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::
     docker_cache
 }
 
+/// Dedicated robot-discovery advertiser. Runs OFF the heartbeat sender's critical
+/// path on its own ~10 s interval so a slow/hung robot status read can never delay
+/// mesh heartbeats. Each tick refreshes this node's local advertisement (only
+/// PHYSICALLY CONNECTED robots, each status read bounded by `STATUS_CALL_TIMEOUT`)
+/// and broadcasts to trusted peers when the advertised SET changed since the last
+/// broadcast — so a remote node discovers a freshly-connected robot within ~10 s.
+/// Change detection is order-insensitive (`sort_advertised`), avoiding a rebroadcast
+/// storm when the set is steady. A periodic anti-drift FULL broadcast every ~5 min
+/// repairs registry drift after a dropped delta or a peer that joined without
+/// pull-on-connect. Trusted-only + identity-bound send semantics are identical to
+/// the heartbeat broadcast (`broadcast_ufp2_to_trusted`).
+fn spawn_robot_advertiser(
+    quic_mesh: Arc<IrohMeshManager>,
+    local_node_id: String,
+    db_pool: crate::db::DbPool,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut tick_count: u64 = 0;
+        let mut last_broadcast_robots: Vec<crate::mesh::robot_dispatch::AdvertisedRobot> =
+            Vec::new();
+        loop {
+            interval.tick().await;
+            tick_count += 1;
+            let robots = crate::mesh::robot_dispatch::sort_advertised(
+                crate::mesh::robot_dispatch::refresh_local_advertisement(&db_pool, &local_node_id)
+                    .await,
+            );
+            let changed = robots != last_broadcast_robots;
+            // Anti-drift FULL broadcast every ~5 min (30 ticks of 10 s).
+            let anti_drift = tick_count % 30 == 0;
+            if changed || anti_drift {
+                let payload = crate::mesh::robot_dispatch::RobotsAnnouncePayload {
+                    from_node_id: local_node_id.clone(),
+                    robots: robots.clone(),
+                };
+                if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                    let _ = quic_mesh
+                        .broadcast_ufp2_to_trusted(
+                            tentaflow_protocol::mesh::MESH_MSG_ROBOTS_ANNOUNCE,
+                            &bytes,
+                            None,
+                        )
+                        .await;
+                }
+                // Record the broadcast set (including empty) so the next tick only
+                // re-broadcasts on a real change. Storing the empty set lets an
+                // "all robots went offline" transition broadcast once, then go quiet.
+                last_broadcast_robots = robots;
+            }
+        }
+    });
+}
+
 /// [OPT] Heartbeat sender — co 500ms, zoptymalizowany pod 1000 peerow:
 /// - Pre-alokowany bufor serializacji (reuse miedzy iteracjami)
 /// - Metryki klonowane raz zamiast 3 razy (gpus, containers, networks)
@@ -2918,34 +2975,6 @@ fn spawn_heartbeat_sender(
                             }
                             Err(e) => {
                                 warn!(error = %e, "MeshServicesAnnounce: build_local_snapshot failed");
-                            }
-                        }
-                    }
-                }
-
-                // Robots registry — anti-drift snapshot broadcast co 600
-                // heartbeatow (~5 min), tak jak services-announce. Pozwala
-                // zdalnemu nodowi B odkryc, ktory node A posiada dany robot
-                // (resolver `resolve_robot_owner` czyta ten sam globalny rejestr).
-                if heartbeat_count % 600 == 0 {
-                    if let Some(ref pool) = db_pool {
-                        let robots = crate::mesh::robot_dispatch::refresh_local_advertisement(
-                            pool,
-                            &local_node_id,
-                        );
-                        if !robots.is_empty() {
-                            let payload = crate::mesh::robot_dispatch::RobotsAnnouncePayload {
-                                from_node_id: local_node_id.clone(),
-                                robots,
-                            };
-                            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
-                                let _ = quic_mesh
-                                    .broadcast_ufp2_to_trusted(
-                                        tentaflow_protocol::mesh::MESH_MSG_ROBOTS_ANNOUNCE,
-                                        &bytes,
-                                        None,
-                                    )
-                                    .await;
                             }
                         }
                     }

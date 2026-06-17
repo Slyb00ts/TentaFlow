@@ -161,6 +161,7 @@ async fn test_frame_proxy_request_decoded_and_event_emitted() {
     let req = FrameProxyRequestPayload {
         raw_ref: "frame-store/cam-1/abc-123".into(),
         request_id: "req-p3c1-1".into(),
+        camera_id: None,
     };
     let bytes = tentaflow_protocol::cbor::encode(&req).expect("encode request");
     a.send_frame_proxy_request(&b_hex, &bytes)
