@@ -736,6 +736,29 @@ async fn handle_peer_connected(
             }
         }
 
+        // Pull-on-connect for robots: ask the newly-connected peer for its full
+        // owned-robot snapshot. Without this, a node that joins later never
+        // discovers robots that were already advertised before it connected — the
+        // periodic ANNOUNCE would eventually fill the gap, but only after up to
+        // ~5 min. Mirrors the MeshServicesGet pull above; the response lands in
+        // the global robot registry via `RobotsGetResponseReceived`. Trusted-only
+        // (the responder re-checks trust — defense in depth).
+        let robots_pull = crate::mesh::robot_dispatch::RobotsGetPayload {
+            from_node_id: local_node_id.clone(),
+        };
+        if let Ok(bytes) = crate::mesh::cbor::encode(&robots_pull) {
+            if let Err(e) = qm_events
+                .send_ufp2_to_peer(
+                    &node_id,
+                    tentaflow_protocol::mesh::MESH_MSG_ROBOTS_GET,
+                    &bytes,
+                )
+                .await
+            {
+                debug!(peer = %node_id, "RobotsGet send failed: {}", e);
+            }
+        }
+
         match crate::sync::runtime::build_push_payload_for_target(&node_id, 128) {
             Ok(Some(payload)) => {
                 let op_count = payload.operations.len();
@@ -2307,6 +2330,184 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(IrohMeshEvent::RobotsGetReceived { from_node_id, .. }) => {
+                    // Peer asks for our complete owned-robot snapshot (pull-on-
+                    // connect). Trusted only — defense in depth, mirroring
+                    // ServicesGetReceived: the initiator already gates on trust,
+                    // but someone could open a raw stream.
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "RobotsGet od niezaufanego peera — ignoruje");
+                        continue;
+                    }
+                    // Serve the GET from the CACHED local snapshot the advertiser
+                    // refreshes every ~10 s — NO addon status-tool calls on the GET
+                    // path. Running status tools per GET let a noisy/compromised
+                    // trusted peer force repeated blocking status probes (DoS); the
+                    // in-memory read is cheap and the ~10 s staleness is acceptable.
+                    //
+                    // Org scope is NOT filtered here: like the existing SERVICES
+                    // discovery, the mesh advertises within the trust domain and the
+                    // requester's org cannot be trusted at the mesh layer. Per-org
+                    // visibility is enforced at the CONSUMPTION layer (the camera
+                    // path's `remote_camera_owner` filters `org_id == caller_org`;
+                    // the Robots dashboard list/control handlers filter by caller
+                    // org). Each advertised robot carries `org_id`, so that layer can
+                    // filter. A requester-declared org filter here would be bogus
+                    // (forgeable) and inconsistent with services discovery.
+                    let robots = crate::mesh::robot_dispatch::global()
+                        .local_robots(&local_node_id);
+                    let qm = qm_events.clone();
+                    let local = local_node_id.clone();
+                    let peer = from_node_id.clone();
+                    tokio::spawn(async move {
+                        let payload =
+                            crate::mesh::robot_dispatch::RobotsGetResponsePayload {
+                                from_node_id: local,
+                                robots,
+                            };
+                        let bytes = match crate::mesh::cbor::encode(&payload) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(error = %e, "RobotsGetResponse: CBOR encode failed");
+                                return;
+                            }
+                        };
+                        if let Err(e) = qm
+                            .send_ufp2_to_peer(
+                                &peer,
+                                tentaflow_protocol::mesh::MESH_MSG_ROBOTS_GET_RESPONSE,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            debug!(peer = %peer, "RobotsGetResponse send failed: {}", e);
+                        }
+                    });
+                }
+                Ok(IrohMeshEvent::RobotsGetResponseReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "RobotsGetResponse od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match crate::mesh::cbor::decode::<
+                        crate::mesh::robot_dispatch::RobotsGetResponsePayload,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            // Same identity binding as RobotsAnnounce: a trusted
+                            // peer must not advertise robots on behalf of another
+                            // node id, and every per-robot node_id is forced to the
+                            // transport sender so the registry can never trust a
+                            // spoofed owner (`remote_camera_owner`).
+                            match crate::mesh::robot_dispatch::bind_announce_sender(
+                                &payload.from_node_id,
+                                &from_node_id,
+                                &local_node_id,
+                            ) {
+                                Some(key) => {
+                                    let robots =
+                                        crate::mesh::robot_dispatch::normalize_advertised_node_id(
+                                            payload.robots,
+                                            key,
+                                        );
+                                    debug!(
+                                        peer = %from_node_id,
+                                        count = robots.len(),
+                                        "RobotsGetResponse: replace_node"
+                                    );
+                                    crate::mesh::robot_dispatch::global()
+                                        .replace_node(key, robots);
+                                }
+                                None => {
+                                    if payload.from_node_id != from_node_id
+                                        && payload.from_node_id != local_node_id
+                                    {
+                                        warn!(
+                                            peer = %from_node_id,
+                                            claimed = %payload.from_node_id,
+                                            "RobotsGetResponse: from_node_id mismatch — dropping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "RobotsGetResponse decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::RobotsUpdateReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "RobotsUpdate od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match crate::mesh::cbor::decode::<
+                        crate::mesh::robot_dispatch::RobotsUpdatePayload,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            // Identity binding (same as RobotsAnnounce): key on the
+                            // transport sender, never the self-claimed payload field,
+                            // and re-own the changed robot to the transport sender so
+                            // an Added/Updated delta cannot smuggle a spoofed node_id.
+                            match crate::mesh::robot_dispatch::bind_announce_sender(
+                                &payload.from_node_id,
+                                &from_node_id,
+                                &local_node_id,
+                            ) {
+                                Some(key) => {
+                                    use crate::mesh::robot_dispatch::RobotChange;
+                                    let change = match payload.change {
+                                        RobotChange::Added(robot) => RobotChange::Added(
+                                            crate::mesh::robot_dispatch::normalize_advertised_node_id(
+                                                vec![robot],
+                                                key,
+                                            )
+                                            .remove(0),
+                                        ),
+                                        RobotChange::Updated(robot) => RobotChange::Updated(
+                                            crate::mesh::robot_dispatch::normalize_advertised_node_id(
+                                                vec![robot],
+                                                key,
+                                            )
+                                            .remove(0),
+                                        ),
+                                        RobotChange::Removed(id) => RobotChange::Removed(id),
+                                    };
+                                    debug!(peer = %from_node_id, "RobotsUpdate: apply_change");
+                                    crate::mesh::robot_dispatch::global()
+                                        .apply_change(key, change);
+                                }
+                                None => {
+                                    if payload.from_node_id != from_node_id
+                                        && payload.from_node_id != local_node_id
+                                    {
+                                        warn!(
+                                            peer = %from_node_id,
+                                            claimed = %payload.from_node_id,
+                                            "RobotsUpdate: from_node_id mismatch — dropping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "RobotsUpdate decode error: {}", e);
+                        }
+                    }
+                }
                 Ok(IrohMeshEvent::AliasSyncReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&from_node_id),
@@ -2816,10 +3017,11 @@ fn spawn_robot_advertiser(
                 crate::mesh::robot_dispatch::refresh_local_advertisement(&db_pool, &local_node_id)
                     .await,
             );
-            let changed = robots != last_broadcast_robots;
-            // Anti-drift FULL broadcast every ~5 min (30 ticks of 10 s).
+            // Anti-drift FULL broadcast every ~5 min (30 ticks of 10 s): repairs
+            // any drift left by a dropped UPDATE delta or a peer that joined
+            // without the pull-on-connect path.
             let anti_drift = tick_count % 30 == 0;
-            if changed || anti_drift {
+            if anti_drift {
                 let payload = crate::mesh::robot_dispatch::RobotsAnnouncePayload {
                     from_node_id: local_node_id.clone(),
                     robots: robots.clone(),
@@ -2833,11 +3035,33 @@ fn spawn_robot_advertiser(
                         )
                         .await;
                 }
-                // Record the broadcast set (including empty) so the next tick only
-                // re-broadcasts on a real change. Storing the empty set lets an
-                // "all robots went offline" transition broadcast once, then go quiet.
-                last_broadcast_robots = robots;
+            } else {
+                // Steady state: push only the minimal delta vs the last broadcast
+                // set so peers update incrementally without a full snapshot each
+                // change. The keyed diff is order-insensitive, so a stable set
+                // produces zero changes (no spurious traffic).
+                let changes =
+                    crate::mesh::robot_dispatch::diff_advertised(&last_broadcast_robots, &robots);
+                for change in changes {
+                    let payload = crate::mesh::robot_dispatch::RobotsUpdatePayload {
+                        from_node_id: local_node_id.clone(),
+                        change,
+                    };
+                    if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                        let _ = quic_mesh
+                            .broadcast_ufp2_to_trusted(
+                                tentaflow_protocol::mesh::MESH_MSG_ROBOTS_UPDATE,
+                                &bytes,
+                                None,
+                            )
+                            .await;
+                    }
+                }
             }
+            // Record the broadcast set (including empty) so the next tick diffs
+            // against it. Storing the empty set lets an "all robots went offline"
+            // transition emit Removed deltas once, then go quiet.
+            last_broadcast_robots = robots;
         }
     });
 }

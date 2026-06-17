@@ -71,6 +71,23 @@ pub struct AdvertisedRobot {
     /// remote camera through the existing frame_proxy mechanism. `None` when the
     /// robot has not been granted a camera yet.
     pub camera_id: Option<String>,
+    /// Connection/telemetry status string from the owning addon's `<pkg>.status`
+    /// tool (e.g. "online"). Informational for any node browsing the mesh robot
+    /// catalog — ownership still gates on the online check, not this raw value.
+    /// Appended for wire compat: an old peer's announce decodes with an empty
+    /// status (`#[serde(default)]`, ciborium APPEND-AT-END rule).
+    #[serde(default)]
+    pub status: String,
+    /// Battery percentage (0..100) if the robot reports it, else `None`.
+    #[serde(default)]
+    pub battery_percent: Option<f32>,
+    /// Last measured round-trip latency to the physical robot in ms, if known.
+    #[serde(default)]
+    pub rtt_ms: Option<u32>,
+    /// Capability ids the robot exposes (e.g. "move", "sit"), advertised so a
+    /// controller node can present available actions without owning the addon.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// CBOR wire payload for the robot advertisement broadcast: one node's complete
@@ -80,6 +97,42 @@ pub struct AdvertisedRobot {
 pub struct RobotsAnnouncePayload {
     pub from_node_id: String,
     pub robots: Vec<AdvertisedRobot>,
+}
+
+/// Pull request: a newly-connected peer asks for our complete owned-robot set.
+/// Mirrors `MeshServicesGetPayload` — the responder replies with a full snapshot
+/// (`RobotsGetResponsePayload`), which the requester `replace_node`s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotsGetPayload {
+    pub from_node_id: String,
+}
+
+/// Response to a `RobotsGetPayload` — the full set of robots THIS node owns.
+/// Mirrors `MeshServicesGetResponsePayload` (full snapshot, idempotent
+/// `replace_node`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotsGetResponsePayload {
+    pub from_node_id: String,
+    pub robots: Vec<AdvertisedRobot>,
+}
+
+/// Push delta — emitted immediately after the local owned-robot set changes.
+/// Mirrors `MeshServicesUpdatePayload`: the receiver applies `change` to that
+/// node's view via `MeshRobotRegistry::apply_change`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotsUpdatePayload {
+    pub from_node_id: String,
+    pub change: RobotChange,
+}
+
+/// An incremental change to one node's advertised robots. Mirrors
+/// `tentaflow_protocol::message_body::ServiceChange` (Added/Updated/Removed),
+/// keyed by the robot's instance id string for the Removed case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RobotChange {
+    Added(AdvertisedRobot),
+    Updated(AdvertisedRobot),
+    Removed(String),
 }
 
 /// In-memory aggregator of robots advertised by every reachable mesh node plus
@@ -118,6 +171,34 @@ impl MeshRobotRegistry {
         }
     }
 
+    /// Apply an incremental change to `node_id`'s advertised robots. Mirrors
+    /// `MeshServicesRegistry::apply_change`: `Added`/`Updated` upsert by
+    /// `robot_id` (creating the node entry if absent — a delta may arrive before
+    /// any full snapshot), `Removed` filters by `robot_id` and drops the node
+    /// entry entirely once it holds no robots (so a node that lost its last robot
+    /// stops resolving).
+    pub fn apply_change(&self, node_id: &str, change: RobotChange) {
+        let mut g = self.by_node.write();
+        match change {
+            RobotChange::Added(robot) | RobotChange::Updated(robot) => {
+                let entry = g.entry(node_id.to_string()).or_default();
+                if let Some(slot) = entry.iter_mut().find(|r| r.robot_id == robot.robot_id) {
+                    *slot = robot;
+                } else {
+                    entry.push(robot);
+                }
+            }
+            RobotChange::Removed(robot_id) => {
+                if let Some(entry) = g.get_mut(node_id) {
+                    entry.retain(|r| r.robot_id != robot_id);
+                    if entry.is_empty() {
+                        g.remove(node_id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Drop a node's advertisements (peer disconnected / trust revoked).
     pub fn remove_node(&self, node_id: &str) {
         self.by_node.write().remove(node_id);
@@ -126,6 +207,18 @@ impl MeshRobotRegistry {
     /// Flat snapshot of every advertised robot across all known nodes.
     pub fn all(&self) -> Vec<AdvertisedRobot> {
         self.by_node.read().values().flatten().cloned().collect()
+    }
+
+    /// Snapshot of the robots THIS node owns, read straight from the cached local
+    /// entry the advertiser refreshes every ~10 s. Serves the `RobotsGet` reply
+    /// without re-running any addon status tool, so a trusted peer's GET is a cheap
+    /// in-memory read and cannot drive per-request status probes.
+    pub fn local_robots(&self, local_node_id: &str) -> Vec<AdvertisedRobot> {
+        self.by_node
+            .read()
+            .get(local_node_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -162,17 +255,18 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
         let Some(am) = addon_manager.as_ref() else {
             break;
         };
-        let (is_online, status_camera_id) =
-            read_robot_status(am, &c.addon_id, &c.package_id).await;
-        if !is_online {
+        let telemetry = read_robot_status(am, &c.addon_id, &c.package_id).await;
+        if !telemetry.is_online {
             continue;
         }
         // A successful online status may still omit camera_id (no camera yet);
         // preserve the last-known one across a transient camera gap so the
         // remote tile does not flicker. A genuine empty camera_id from an
         // online robot is honored.
-        let camera_id =
-            status_camera_id.or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
+        let camera_id = telemetry
+            .camera_id
+            .clone()
+            .or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
         // Tenant of this robot, read from the running addon instance's
         // `AddonState` (the only place a robot addon's org lives — the DB
         // `addons` row is org-agnostic). An instance with no org context
@@ -186,17 +280,48 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             node_id: local_node_id.to_string(),
             org_id,
             camera_id,
+            status: telemetry.status,
+            battery_percent: telemetry.battery_percent,
+            rtt_ms: telemetry.rtt_ms,
+            capabilities: telemetry.capabilities,
         });
     }
     global().replace_local(local_node_id, robots.clone());
     robots
 }
 
-/// Read a robot addon's read-only `<package>.status` tool and extract whether it
-/// is physically connected plus its current camera id. A tool failure is treated
-/// as NOT online (the robot cannot be proven connected, so it must not be
-/// advertised as owned) and is logged so a broken status tool is diagnosable. The
-/// online/camera parse itself is the PURE `parse_status_online` helper.
+/// PURE telemetry extracted from a robot addon's `<pkg>.status` tool result. A
+/// failed/timed-out status read is represented by `RobotStatusTelemetry::offline()`
+/// (the robot cannot be proven connected, so it must not be advertised as owned).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobotStatusTelemetry {
+    pub is_online: bool,
+    pub status: String,
+    pub camera_id: Option<String>,
+    pub battery_percent: Option<f32>,
+    pub rtt_ms: Option<u32>,
+    pub capabilities: Vec<String>,
+}
+
+impl RobotStatusTelemetry {
+    /// The offline sentinel used whenever the status tool cannot be read.
+    fn offline() -> Self {
+        Self {
+            is_online: false,
+            status: String::new(),
+            camera_id: None,
+            battery_percent: None,
+            rtt_ms: None,
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+/// Read a robot addon's read-only `<package>.status` tool and extract its
+/// telemetry (online state, camera id, battery, rtt, capabilities). A tool
+/// failure is treated as NOT online (the robot cannot be proven connected, so it
+/// must not be advertised as owned) and is logged so a broken status tool is
+/// diagnosable. The parse itself is the PURE `parse_status_telemetry` helper.
 ///
 /// `call_tool_preauthorized` is a synchronous, BLOCKING wasmtime call: it can hang
 /// if the addon instance is busy (e.g. its `on_tick` is stuck on a network call to
@@ -207,7 +332,7 @@ async fn read_robot_status(
     addon_manager: &Arc<crate::addon::AddonManager>,
     addon_id: &str,
     package_id: &str,
-) -> (bool, Option<String>) {
+) -> RobotStatusTelemetry {
     let tool = format!("{package_id}.status");
     let am = addon_manager.clone();
     let addon = addon_id.to_string();
@@ -220,14 +345,14 @@ async fn read_robot_status(
     )
     .await;
     match join {
-        Ok(Ok(Ok(result))) => parse_status_online(&result),
+        Ok(Ok(Ok(result))) => parse_status_telemetry(&result),
         Ok(Ok(Err(e))) => {
             warn!(
                 addon = %addon_id,
                 tool = %tool,
                 "robot advertise: status tool failed; treating robot as offline: {e}"
             );
-            (false, None)
+            RobotStatusTelemetry::offline()
         }
         Ok(Err(e)) => {
             warn!(
@@ -235,7 +360,7 @@ async fn read_robot_status(
                 tool = %tool,
                 "robot advertise: status task panicked; treating robot as offline: {e}"
             );
-            (false, None)
+            RobotStatusTelemetry::offline()
         }
         Err(_) => {
             warn!(
@@ -243,23 +368,52 @@ async fn read_robot_status(
                 tool = %tool,
                 "robot advertise: status tool timed out; treating robot as offline"
             );
-            (false, None)
+            RobotStatusTelemetry::offline()
         }
     }
 }
 
-/// PURE extraction of `(is_online, camera_id)` from a `status` tool result. The
-/// robot is online iff its `status` field, trimmed and compared case-insensitively,
-/// equals "online" (the same gate the go2 addon's `send_sport_gated` uses to decide
-/// local-vs-remote). Any other or missing value fails to offline. `camera_id` is a
-/// non-empty string or `None`.
-fn parse_status_online(status: &serde_json::Value) -> (bool, Option<String>) {
-    let is_online = status
+/// PURE extraction of telemetry from a `status` tool result. The robot is online
+/// iff its `status` field, trimmed and compared case-insensitively, equals
+/// "online" (the same gate the go2 addon's `send_sport_gated` uses to decide
+/// local-vs-remote). Any other or missing value fails to offline. `battery_pct`
+/// is honored only when non-negative (the go2 addon stores -1 for "unknown");
+/// `rtt_ms` likewise. `capabilities` is the optional string array.
+fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
+    let raw_status = status
         .get("status")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().eq_ignore_ascii_case("online"))
-        .unwrap_or(false);
-    (is_online, parse_status_camera_id(status))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let is_online = raw_status.eq_ignore_ascii_case("online");
+    let battery_percent = status
+        .get("battery_pct")
+        .and_then(|v| v.as_f64())
+        .filter(|n| *n >= 0.0)
+        .map(|n| n as f32);
+    let rtt_ms = status
+        .get("rtt_ms")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n >= 0)
+        .map(|n| n as u32);
+    let capabilities = status
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    RobotStatusTelemetry {
+        is_online,
+        status: raw_status,
+        camera_id: parse_status_camera_id(status),
+        battery_percent,
+        rtt_ms,
+        capabilities,
+    }
 }
 
 /// Last camera_id THIS node advertised for `addon_id` (its robot_id), read from
@@ -291,6 +445,63 @@ pub fn sort_advertised(mut robots: Vec<AdvertisedRobot>) -> Vec<AdvertisedRobot>
             .then_with(|| a.node_id.cmp(&b.node_id))
     });
     robots
+}
+
+/// PURE structural equality of two advertised robots, EXCLUDING the volatile
+/// `rtt_ms` telemetry. Used as the `Updated`-delta trigger so RTT jitter alone
+/// does not re-advertise. RTT is still CARRIED in the struct (the dashboard shows
+/// it) and is refreshed mesh-wide by the periodic anti-drift full ANNOUNCE; it
+/// just must not drive a per-tick `ROBOTS_UPDATE` broadcast storm given the ~10 s
+/// advertiser cadence. Every other field (id/node/org/camera/status/battery/
+/// capabilities) is structural: a real change in any of them re-advertises.
+/// `battery_percent` changes slowly, so keeping it in the trigger is safe.
+fn robots_structurally_equal(a: &AdvertisedRobot, b: &AdvertisedRobot) -> bool {
+    a.robot_id == b.robot_id
+        && a.package_id == b.package_id
+        && a.kind == b.kind
+        && a.node_id == b.node_id
+        && a.org_id == b.org_id
+        && a.camera_id == b.camera_id
+        && a.status == b.status
+        && a.battery_percent == b.battery_percent
+        && a.capabilities == b.capabilities
+}
+
+/// PURE diff of two advertised-robot snapshots keyed by `robot_id`. Produces the
+/// minimal `RobotChange` set the advertiser pushes as `MESH_MSG_ROBOTS_UPDATE`
+/// deltas instead of a full snapshot:
+///   - present in `new` but not `old` → `Added`
+///   - present in both but structurally changed → `Updated`
+///   - present in `old` but not `new` → `Removed`
+/// Unchanged robots produce nothing. Order-insensitive (keyed lookup), so the
+/// caller does not need to sort first for correctness. The `Updated` trigger uses
+/// `robots_structurally_equal` (NOT full `==`): a change in volatile `rtt_ms`
+/// alone does not emit a delta, preventing a per-tick broadcast storm. The new
+/// `rtt_ms` still rides along on any structural `Updated` and on the periodic full
+/// ANNOUNCE.
+pub fn diff_advertised(old: &[AdvertisedRobot], new: &[AdvertisedRobot]) -> Vec<RobotChange> {
+    use std::collections::HashMap;
+    let old_by_id: HashMap<&str, &AdvertisedRobot> =
+        old.iter().map(|r| (r.robot_id.as_str(), r)).collect();
+    let new_by_id: HashMap<&str, &AdvertisedRobot> =
+        new.iter().map(|r| (r.robot_id.as_str(), r)).collect();
+
+    let mut changes = Vec::new();
+    for robot in new {
+        match old_by_id.get(robot.robot_id.as_str()) {
+            None => changes.push(RobotChange::Added(robot.clone())),
+            Some(prev) if !robots_structurally_equal(prev, robot) => {
+                changes.push(RobotChange::Updated(robot.clone()))
+            }
+            Some(_) => {}
+        }
+    }
+    for robot in old {
+        if !new_by_id.contains_key(robot.robot_id.as_str()) {
+            changes.push(RobotChange::Removed(robot.robot_id.clone()));
+        }
+    }
+    changes
 }
 
 /// PURE extraction of a non-empty `camera_id` from a `status` tool result.
@@ -688,6 +899,10 @@ mod tests {
             node_id: node_id.to_string(),
             org_id: "org-1".to_string(),
             camera_id: None,
+            status: "online".to_string(),
+            battery_percent: Some(80.0),
+            rtt_ms: Some(12),
+            capabilities: vec!["move".to_string(), "sit".to_string()],
         }
     }
 
@@ -716,26 +931,32 @@ mod tests {
     #[test]
     fn parse_status_online_true_with_camera() {
         let status = serde_json::json!({ "status": "online", "camera_id": "cam-uuid" });
-        assert_eq!(parse_status_online(&status), (true, Some("cam-uuid".to_string())));
+        let t = parse_status_telemetry(&status);
+        assert!(t.is_online);
+        assert_eq!(t.camera_id.as_deref(), Some("cam-uuid"));
     }
 
     #[test]
     fn parse_status_online_true_without_camera() {
         let status = serde_json::json!({ "status": "online", "camera_id": "" });
-        assert_eq!(parse_status_online(&status), (true, None));
+        let t = parse_status_telemetry(&status);
+        assert!(t.is_online);
+        assert_eq!(t.camera_id, None);
     }
 
     #[test]
     fn parse_status_offline_is_not_online() {
         let status = serde_json::json!({ "status": "offline", "camera_id": "cam-uuid" });
         // Even with a camera id, an offline robot is not online (not advertised).
-        assert_eq!(parse_status_online(&status), (false, Some("cam-uuid".to_string())));
+        let t = parse_status_telemetry(&status);
+        assert!(!t.is_online);
+        assert_eq!(t.camera_id.as_deref(), Some("cam-uuid"));
     }
 
     #[test]
     fn parse_status_connecting_is_not_online() {
         let status = serde_json::json!({ "status": "connecting" });
-        assert_eq!(parse_status_online(&status), (false, None));
+        assert!(!parse_status_telemetry(&status).is_online);
     }
 
     #[test]
@@ -743,9 +964,8 @@ mod tests {
         // Mixed case and surrounding whitespace still count as online.
         for s in ["Online", " online ", "ONLINE", "\tOnLiNe\n"] {
             let status = serde_json::json!({ "status": s });
-            assert_eq!(
-                parse_status_online(&status),
-                (true, None),
+            assert!(
+                parse_status_telemetry(&status).is_online,
                 "status {s:?} should parse as online"
             );
         }
@@ -755,14 +975,14 @@ mod tests {
     fn parse_status_non_online_value_is_offline() {
         // A value that merely contains "online" but is not exactly it stays offline.
         let status = serde_json::json!({ "status": "online-but-degraded" });
-        assert_eq!(parse_status_online(&status), (false, None));
+        assert!(!parse_status_telemetry(&status).is_online);
     }
 
     #[test]
     fn parse_status_missing_field_is_not_online() {
         // A status-tool error result (only an "error" key) is not online.
         let status = serde_json::json!({ "error": "robot not found" });
-        assert_eq!(parse_status_online(&status), (false, None));
+        assert!(!parse_status_telemetry(&status).is_online);
     }
 
     // ----- resolver selection (PURE) -----
@@ -1008,6 +1228,290 @@ mod tests {
         assert_eq!(back.org_id, "");
         assert_eq!(back.camera_id.as_deref(), Some("cam-x"));
         assert_eq!(back.robot_id, "go2");
+        // New telemetry fields default when absent on the wire (ciborium
+        // APPEND-AT-END rule), so a new node never fails to decode an old peer.
+        assert_eq!(back.status, "");
+        assert_eq!(back.battery_percent, None);
+        assert_eq!(back.rtt_ms, None);
+        assert!(back.capabilities.is_empty());
+    }
+
+    /// Wire-compat: an announce from an OLD peer that carries `org_id` but NOT the
+    /// telemetry fields still decodes, with telemetry defaulting. This proves the
+    /// append-at-end ordering of the new fields after `camera_id`/`org_id`.
+    #[test]
+    fn advertised_robot_decodes_legacy_without_telemetry() {
+        #[derive(Serialize)]
+        struct PreTelemetryRobot {
+            robot_id: String,
+            package_id: String,
+            kind: Option<String>,
+            node_id: String,
+            org_id: String,
+            camera_id: Option<String>,
+        }
+        let legacy = PreTelemetryRobot {
+            robot_id: "go2".to_string(),
+            package_id: "go2".to_string(),
+            kind: Some("quadruped".to_string()),
+            node_id: "node-b".to_string(),
+            org_id: "org-acme".to_string(),
+            camera_id: None,
+        };
+        let bytes = crate::mesh::cbor::encode(&legacy).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back.org_id, "org-acme");
+        assert_eq!(back.status, "");
+        assert_eq!(back.battery_percent, None);
+        assert_eq!(back.rtt_ms, None);
+        assert!(back.capabilities.is_empty());
+    }
+
+    /// New telemetry fields round-trip through CBOR (Some + None + non-empty caps).
+    #[test]
+    fn advertised_robot_telemetry_roundtrips() {
+        let robot = ad("go2", "go2", "node-b");
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, robot);
+        assert_eq!(back.status, "online");
+        assert_eq!(back.battery_percent, Some(80.0));
+        assert_eq!(back.rtt_ms, Some(12));
+        assert_eq!(back.capabilities, vec!["move", "sit"]);
+    }
+
+    // ----- telemetry parse (PURE) -----
+
+    #[test]
+    fn parse_status_telemetry_full() {
+        let status = serde_json::json!({
+            "status": "online",
+            "camera_id": "cam-1",
+            "battery_pct": 73,
+            "rtt_ms": 18,
+            "capabilities": ["move", "sit", "stand_up"],
+        });
+        let t = parse_status_telemetry(&status);
+        assert!(t.is_online);
+        assert_eq!(t.status, "online");
+        assert_eq!(t.camera_id.as_deref(), Some("cam-1"));
+        assert_eq!(t.battery_percent, Some(73.0));
+        assert_eq!(t.rtt_ms, Some(18));
+        assert_eq!(t.capabilities, vec!["move", "sit", "stand_up"]);
+    }
+
+    #[test]
+    fn parse_status_telemetry_negative_battery_and_rtt_are_none() {
+        // The go2 addon stores -1 for unknown battery/rtt; that must not surface
+        // as a bogus negative reading on the wire.
+        let status = serde_json::json!({
+            "status": "online", "battery_pct": -1, "rtt_ms": -1,
+        });
+        let t = parse_status_telemetry(&status);
+        assert_eq!(t.battery_percent, None);
+        assert_eq!(t.rtt_ms, None);
+    }
+
+    #[test]
+    fn parse_status_telemetry_offline_keeps_raw_status() {
+        let status = serde_json::json!({ "status": "connecting" });
+        let t = parse_status_telemetry(&status);
+        assert!(!t.is_online);
+        assert_eq!(t.status, "connecting");
+        assert!(t.capabilities.is_empty());
+    }
+
+    #[test]
+    fn parse_status_telemetry_missing_status_is_offline() {
+        let status = serde_json::json!({ "error": "robot not found" });
+        let t = parse_status_telemetry(&status);
+        assert!(!t.is_online);
+        assert_eq!(t.status, "");
+    }
+
+    // ----- diff_advertised (PURE) -----
+
+    #[test]
+    fn diff_advertised_detects_added() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let new = vec![ad("go2", "go2", "node-a"), ad("spot", "spot", "node-a")];
+        let changes = diff_advertised(&old, &new);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(&changes[0], RobotChange::Added(r) if r.robot_id == "spot"));
+    }
+
+    #[test]
+    fn diff_advertised_detects_removed() {
+        let old = vec![ad("go2", "go2", "node-a"), ad("spot", "spot", "node-a")];
+        let new = vec![ad("go2", "go2", "node-a")];
+        let changes = diff_advertised(&old, &new);
+        assert_eq!(changes, vec![RobotChange::Removed("spot".to_string())]);
+    }
+
+    #[test]
+    fn diff_advertised_detects_updated_on_battery_change() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.battery_percent = Some(40.0);
+        let new = vec![changed.clone()];
+        let changes = diff_advertised(&old, &new);
+        assert_eq!(changes, vec![RobotChange::Updated(changed)]);
+    }
+
+    #[test]
+    fn diff_advertised_rtt_only_change_emits_nothing() {
+        // RTT jitter every ~10 s must NOT trigger an Updated delta, or the
+        // advertiser would broadcast ROBOTS_UPDATE on every tick.
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut jittered = ad("go2", "go2", "node-a");
+        jittered.rtt_ms = Some(999);
+        let new = vec![jittered];
+        assert!(diff_advertised(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn diff_advertised_status_change_emits_updated() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.status = "degraded".to_string();
+        let new = vec![changed.clone()];
+        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+    }
+
+    #[test]
+    fn diff_advertised_camera_change_emits_updated() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.camera_id = Some("cam-7".to_string());
+        let new = vec![changed.clone()];
+        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+    }
+
+    #[test]
+    fn diff_advertised_capability_change_emits_updated() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.capabilities = vec!["move".to_string()];
+        let new = vec![changed.clone()];
+        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+    }
+
+    #[test]
+    fn diff_advertised_carries_new_rtt_on_structural_update() {
+        // A structural change re-advertises and the fresh rtt rides along, so the
+        // dashboard's rtt stays current without a dedicated rtt-only delta.
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.status = "degraded".to_string();
+        changed.rtt_ms = Some(77);
+        let new = vec![changed.clone()];
+        let changes = diff_advertised(&old, &new);
+        assert_eq!(changes, vec![RobotChange::Updated(changed)]);
+        match &changes[0] {
+            RobotChange::Updated(r) => assert_eq!(r.rtt_ms, Some(77)),
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_advertised_no_change_is_empty() {
+        let old = vec![ad("go2", "go2", "node-a"), ad("spot", "spot", "node-a")];
+        // Same set, different order — keyed diff must report nothing.
+        let new = vec![ad("spot", "spot", "node-a"), ad("go2", "go2", "node-a")];
+        assert!(diff_advertised(&old, &new).is_empty());
+    }
+
+    // ----- registry apply_change (mirrors MeshServicesRegistry::apply_change) -----
+
+    #[test]
+    fn registry_apply_change_added_and_updated_upsert() {
+        let reg = MeshRobotRegistry::new();
+        reg.apply_change("node-b", RobotChange::Added(ad("go2", "go2", "node-b")));
+        assert_eq!(reg.all().len(), 1);
+        // Updated with the same robot_id replaces in place (no duplicate).
+        let mut updated = ad("go2", "go2", "node-b");
+        updated.battery_percent = Some(10.0);
+        reg.apply_change("node-b", RobotChange::Updated(updated.clone()));
+        let all = reg.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].battery_percent, Some(10.0));
+    }
+
+    #[test]
+    fn registry_apply_change_removed_drops_robot_and_empties_node() {
+        let reg = MeshRobotRegistry::new();
+        reg.apply_change("node-b", RobotChange::Added(ad("go2", "go2", "node-b")));
+        reg.apply_change("node-b", RobotChange::Added(ad("spot", "spot", "node-b")));
+        reg.apply_change("node-b", RobotChange::Removed("go2".to_string()));
+        let all = reg.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].robot_id, "spot");
+        // Removing the last robot drops the node entry entirely.
+        reg.apply_change("node-b", RobotChange::Removed("spot".to_string()));
+        assert!(reg.all().is_empty());
+    }
+
+    #[test]
+    fn registry_local_robots_filters_to_local_node() {
+        let reg = MeshRobotRegistry::new();
+        reg.replace_node("node-a", vec![ad("go2", "go2", "node-a")]);
+        reg.replace_node("node-b", vec![ad("spot", "spot", "node-b")]);
+        let local = reg.local_robots("node-a");
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].robot_id, "go2");
+        assert_eq!(local[0].node_id, "node-a");
+        // No local entry yet → empty, not an error.
+        assert!(reg.local_robots("node-c").is_empty());
+    }
+
+    #[test]
+    fn registry_local_robots_carries_org_id() {
+        // The cached-snapshot GET must keep org_id so the consumption layer can
+        // filter per caller org (mesh layer advertises within the trust domain).
+        let reg = MeshRobotRegistry::new();
+        reg.replace_node("node-a", vec![ad("go2", "go2", "node-a")]);
+        assert_eq!(reg.local_robots("node-a")[0].org_id, "org-1");
+    }
+
+    #[test]
+    fn robots_get_response_payload_roundtrip() {
+        let payload = RobotsGetResponsePayload {
+            from_node_id: "node-b".to_string(),
+            robots: vec![ad("go2", "go2", "node-b")],
+        };
+        let bytes = crate::mesh::cbor::encode(&payload).expect("encode");
+        let back: RobotsGetResponsePayload = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn robots_update_payload_roundtrip() {
+        let payload = RobotsUpdatePayload {
+            from_node_id: "node-b".to_string(),
+            change: RobotChange::Removed("go2".to_string()),
+        };
+        let bytes = crate::mesh::cbor::encode(&payload).expect("encode");
+        let back: RobotsUpdatePayload = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, payload);
+    }
+
+    /// The new triad discriminants are unique and the documented bytes.
+    #[test]
+    fn robots_triad_discriminants_are_unique() {
+        use tentaflow_protocol::mesh as m;
+        assert_eq!(m::MESH_MSG_ROBOTS_GET, 0x4F);
+        assert_eq!(m::MESH_MSG_ROBOTS_GET_RESPONSE, 0x50);
+        assert_eq!(m::MESH_MSG_ROBOTS_UPDATE, 0x51);
+        let all = [
+            m::MESH_MSG_ROBOTS_ANNOUNCE,
+            m::MESH_MSG_ROBOTS_GET,
+            m::MESH_MSG_ROBOTS_GET_RESPONSE,
+            m::MESH_MSG_ROBOTS_UPDATE,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "robot discriminants must be distinct");
     }
 
     #[test]
@@ -1234,6 +1738,10 @@ mod tests {
             node_id: node.to_string(),
             org_id: "org-1".to_string(),
             camera_id: Some(cam.to_string()),
+            status: "online".to_string(),
+            battery_percent: None,
+            rtt_ms: None,
+            capabilities: Vec::new(),
         };
 
         // A remote node advertises the SAME robot_id with its own camera id.
