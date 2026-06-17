@@ -1269,14 +1269,25 @@ install_vulkan() {
             INSTALLED+=("vulkan-sdk")
             ;;
         debian)
+            # Core, required for the Vulkan llama.cpp backend: loader+headers,
+            # shader compiler, SPIR-V tools.
             local pkgs=(
                 libvulkan-dev
-                vulkan-validationlayers-dev
                 glslang-dev
                 spirv-tools
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
+            # Validation layers are debug-only and the package name churns across
+            # Ubuntu releases — 24.04 dropped `vulkan-validationlayers-dev` in
+            # favour of `vulkan-validationlayers` + `vulkan-utility-libraries-dev`.
+            # apt has no --skip-unavailable, so install each best-effort (a missing
+            # debug layer must never abort setup).
+            for opt in vulkan-validationlayers vulkan-validationlayers-dev vulkan-utility-libraries-dev; do
+                if run_privileged apt-get install -y "$opt" >/dev/null 2>&1; then
+                    log_ok "  + $opt"
+                fi
+            done
             INSTALLED+=("vulkan-sdk")
             ;;
         fedora)
