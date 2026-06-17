@@ -106,7 +106,10 @@ _QUANTIZE_OUTTYPES = {
     "q5_k_m": "Q5_K_M",
     "q6_k": "Q6_K",
 }
-_ALLOWED_OUTTYPES = _CONVERT_OUTTYPES + tuple(_QUANTIZE_OUTTYPES)
+# Eksport MLX/safetensors: scalony model HF (LoRA→base) bez konwersji GGUF —
+# silnik MLX na Apple ładuje go wprost.
+_SAFETENSORS_OUTTYPES = ("mlx", "safetensors")
+_ALLOWED_OUTTYPES = _CONVERT_OUTTYPES + tuple(_QUANTIZE_OUTTYPES) + _SAFETENSORS_OUTTYPES
 
 
 def _find_quantize_bin() -> Optional[str]:
@@ -732,7 +735,7 @@ def _export_worker(req: ExportRequest, export_id: str) -> None:
     # Eksport MLX/safetensors: silnik MLX (Apple) ładuje model w formacie HF
     # safetensors WPROST — nie potrzeba konwersji GGUF ani narzędzi llama.cpp.
     # Produkujemy scalony (LoRA→base) model safetensors i zwracamy KATALOG.
-    is_safetensors = req.outtype in ("mlx", "safetensors")
+    is_safetensors = req.outtype in _SAFETENSORS_OUTTYPES
     try:
         if not is_safetensors:
             if not os.path.isdir(LLAMA_CPP_DIR):
