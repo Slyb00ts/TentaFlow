@@ -220,7 +220,6 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
         // Backed (WebRTC) cameras have no live track after a restart — the
         // channel that fed them is gone. Hard-delete the stale row instead of
         // trying to bring up a dead session; the addon re-registers on reconnect.
-        #[cfg(feature = "webrtc")]
         if row.vendor == "webrtc" {
             let _ = crate::db::repository::delete_camera_hard(
                 &pool,
@@ -277,7 +276,6 @@ pub async fn shutdown_camera_supervisor_global() {
 /// channel closes / its addon unloads, so the supervisor session + DB row do not
 /// leak. Best-effort: the supervisor removal is spawned (non-blocking) and the
 /// row is hard-deleted (ephemeral camera, no audit retention).
-#[cfg(feature = "webrtc")]
 pub fn remove_backed_camera(owner_addon_id: &str, camera_id: &str) {
     if let (Some(sup), Ok(handle)) = (SUPERVISOR.get(), tokio::runtime::Handle::try_current()) {
         let sup = sup.clone();
@@ -295,7 +293,6 @@ pub fn remove_backed_camera(owner_addon_id: &str, camera_id: &str) {
 /// camera/streaming stack. Takes the channel's H.264 byte stream, starts a
 /// backed supervisor session, persists a `vendor='webrtc'` row, and records the
 /// channel→camera link so teardown removes it.
-#[cfg(feature = "webrtc")]
 pub fn camera_register_backed_v1(
     mut caller: WasmCaller<'_, AddonState>,
     input_ptr: i32,

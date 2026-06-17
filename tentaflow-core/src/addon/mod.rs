@@ -1103,7 +1103,6 @@ impl AddonManager {
 
         // Zamknij i usun wszystkie kanaly WebRTC tego addonu (peer connections
         // nie moga przeciekac po unload/disable/uninstall).
-        #[cfg(feature = "webrtc")]
         crate::addon::host_functions::webrtc::cleanup_addon_channels(addon_id);
     }
 

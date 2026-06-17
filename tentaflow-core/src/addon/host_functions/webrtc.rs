@@ -7,7 +7,6 @@
 //          logic (signaling crypto, commands, safety) lives in the addon.
 // =============================================================================
 
-#![cfg(feature = "webrtc")]
 #![allow(clippy::too_many_arguments)]
 
 use std::sync::{Arc, Mutex, OnceLock};

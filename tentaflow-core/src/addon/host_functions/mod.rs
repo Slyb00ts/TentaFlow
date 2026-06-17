@@ -35,7 +35,6 @@ pub mod ui;
 pub mod user;
 pub mod vector;
 pub mod web_research;
-#[cfg(feature = "webrtc")]
 pub mod webrtc;
 
 use anyhow::Result;
@@ -501,7 +500,6 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     }
 
     // --- Generic WebRTC channel API (robot/device transport; dumb pipe) ---
-    #[cfg(feature = "webrtc")]
     {
         linker
             .func_wrap("tentaflow", "webrtc_connect_v1", webrtc::webrtc_connect_v1)

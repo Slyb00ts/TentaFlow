@@ -7,7 +7,6 @@
 //          the first appsrc pipeline in the repo.
 // =============================================================================
 
-#![cfg(feature = "webrtc")]
 
 use std::sync::Arc;
 
