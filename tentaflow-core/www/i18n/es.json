@@ -940,6 +940,8 @@
         "batch_hint": "vLLM --max-num-batched-tokens — controla el pico de activación. Por defecto 8192.",
         "quant_label": "Cuantización de pesos (override)",
         "quant_hint": "Vacío = dtype del config.json de origen. El override recalcula los pesos para AWQ/GPTQ/FP8/NVFP4 y ajustar el modelo a la GPU.",
+        "trust_remote_code_label": "Confiar en código remoto (--trust-remote-code)",
+        "trust_remote_code_hint": "Permite que el repo del modelo ejecute su propio código de carga. Requerido por algunos modelos (Gemma 4, DeepSeek V4). Activado por defecto — desactívalo para repos no confiables.",
         "quant_opt_source": "Del origen (config.json)",
         "mlx_title": "Presupuesto de memoria y contexto (MLX)",
         "mlx_subtitle": "Memoria unificada de Apple — define cuánta memoria puede usar el modelo como máximo. El runtime se detiene con un error limpio en lugar de OOM cuando el contexto no cabe.",

@@ -127,6 +127,10 @@ export async function openDeployWizard(engineId, opts = {}) {
       // np. NVFP4) albo `model_preset.quantization`. Pusty = dtype ze zrodla
       // (config.json). User moze zmienic w trybie manual i przeliczyc.
       quantization: null,
+      // vLLM `--trust-remote-code`: pozwala repo modelu wykonac wlasny kod przy
+      // ladowaniu (wymagane przez Gemma 4, DeepSeek V4 i inne z custom kodem).
+      // Default ON dla wygody; user moze zdjac dla nieufnego repo.
+      trust_remote_code: true,
       // MLX-only: budzet pamieci (MB) dla Apple unified memory. Backend liczy
       // realny `pool_tokens` (engine='mlx') z tego budzetu + wybranych kv-bits.
       // Default 16 GB — 8 GB jest mniejsze niz wagi modelu 7B+, wiec wizard
@@ -1258,6 +1262,19 @@ function renderAdvancedManualControls(adv, rec) {
     </div>`;
   }
 
+  // `--trust-remote-code` toggle (vLLM-rodzina). Default ON — wiele repo (Gemma
+  // 4, DeepSeek V4) wymaga wlasnego kodu modelujacego. Zdjecie = bezpieczniejsze
+  // dla nieufnego repo (kod nie wykona sie przy ladowaniu).
+  let trustRowHtml = '';
+  if (isVllmFamilyEngine()) {
+    const on = adv.trust_remote_code !== false;
+    trustRowHtml = `
+    <div class="adv-form-row">
+      <label><tf-toggle id="edw-adv-trust" ${on ? 'checked' : ''}></tf-toggle> <span>${escapeHtml(tAdv('trust_remote_code_label'))}</span></label>
+      <div class="adv-hint">${escapeHtml(tAdv('trust_remote_code_hint'))}</div>
+    </div>`;
+  }
+
   // Sekcja KV cache — engine-aware. vLLM: jeden select (auto/fp8*) + opcjonalny
   // max-num-batched-tokens. llama.cpp: osobne K i V (f16..iq4_nl) + chip
   // flash-attention gdy kwantyzowane. Etykiety = realne tokeny CLI silnika
@@ -1366,6 +1383,8 @@ function renderAdvancedManualControls(adv, rec) {
     </div>
 
     ${quantRowHtml}
+
+    ${trustRowHtml}
 
     ${kvSectionHtml}
 
@@ -1618,6 +1637,16 @@ function bindAdvancedHandlers() {
       const v = e.detail?.value ?? quantSelect.value;
       selection.advanced.quantization = v || null;
       debounceRecompute(buildOverrides());
+    });
+  }
+
+  // `--trust-remote-code` toggle — czysto przelacznik flagi CLI, nie wplywa na
+  // estymacje VRAM, wiec bez recompute.
+  const trustToggle = document.getElementById('edw-adv-trust');
+  if (trustToggle) {
+    trustToggle.addEventListener('change', (e) => {
+      const v = e.detail?.checked ?? trustToggle.checked;
+      selection.advanced.trust_remote_code = !!v;
     });
   }
 
@@ -2450,7 +2479,12 @@ async function startDeploy() {
       // ktore backend traktuje jako "user explicit" i nadpisuje auto-clamp z
       // free VRAM. W trybie auto user nie wybral tej wartosci — wycinamy ja
       // ze stringa, zeby backend mogl ja policzyc z aktualnego stanu karty.
-      const raw = advancedRecommendation.recommended_vllm_args || '';
+      let raw = advancedRecommendation.recommended_vllm_args || '';
+      // `--trust-remote-code` przychodzi domyslnie z kalkulatora (default ON).
+      // Gdy user zdjal toggle, wycinamy je tutaj.
+      if (selection.advanced.trust_remote_code === false) {
+        raw = raw.replace(/--trust-remote-code\b/g, '');
+      }
       vllmArgs = raw.replace(/--gpu-memory-utilization(?:=|\s+)[^\s]+/g, '').replace(/\s+/g, ' ').trim() || null;
     } else {
       const a = selection.advanced;
@@ -2463,6 +2497,8 @@ async function startDeploy() {
         '--max-num-batched-tokens', String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)),
         '--enable-chunked-prefill',
       ];
+      // Default ON; user moze zdjac toggle dla nieufnego repo.
+      if (a.trust_remote_code !== false) parts.push('--trust-remote-code');
       const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
       const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
       if (tp > 1) parts.push('--tensor-parallel-size', String(tp));

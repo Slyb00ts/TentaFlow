@@ -1194,7 +1194,10 @@ pub fn recommend_parallelism_vram_aware(
     let layers = model.num_hidden_layers.max(1);
 
     // Kandydaci czysci (TP*PP=gpu_count) + dzielniki heads/layers. Sortuj po TP
-    // rosnaco - preferuj minimalne TP (mniejszy comm overhead) ktore mimo to fits.
+    // malejaco - preferuj maksymalne TP (idealnie TP=gpu_count, PP=1): na
+    // datacenter GPU z NVLink (B300/H100) TP all-reduce jest tani, a wysokie TP
+    // shardu je wagi I KV najrowniej. PP wchodzi tylko gdy najwyzsze TP nie
+    // dzieli glowic albo nie miesci sie w VRAM (nizsze TP w kolejnych iteracjach).
     let mut candidates: Vec<(u32, u32)> = (1..=gpu_count)
         .filter(|tp| gpu_count % tp == 0)
         .map(|tp| (tp, gpu_count / tp))
@@ -1202,7 +1205,7 @@ pub fn recommend_parallelism_vram_aware(
             heads % (*tp as u64) == 0 && kv_heads % (*tp as u64) == 0 && layers % (*pp as u64) == 0
         })
         .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
     for (tp, pp) in &candidates {
         let probe = VramEstimateInput {
@@ -1226,10 +1229,11 @@ pub fn recommend_parallelism_vram_aware(
         }
     }
 
-    // Brak konfiguracji ktora miesci weights - zwracamy szeroka partycje;
-    // recommend handler zglosi warning OOM uzytkownikowi.
-    if let Some(largest_tp) = candidates.last() {
-        return *largest_tp;
+    // Brak konfiguracji ktora miesci weights - zwracamy najszersza partycje
+    // (max TP = najmniej VRAM/GPU); recommend handler zglosi warning OOM.
+    // Po sortowaniu malejacym to pierwszy kandydat.
+    if let Some(widest_tp) = candidates.first() {
+        return *widest_tp;
     }
     recommend_parallelism(model, gpu_count)
 }
@@ -1954,6 +1958,12 @@ pub fn parse_hf_config_with_override(
 /// (auto-defaults dla bundle native gdy user nie ustawil Advanced).
 pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    // Wiele nowoczesnych repo (Gemma 4, DeepSeek V4, modele z custom kodem
+    // modelujacym) wymaga `--trust-remote-code`, inaczej vLLM nie zaladuje
+    // architektury. Wlaczone domyslnie; GUI ma toggle ktory je zdejmuje dla
+    // nieufnego repo (default ON).
+    parts.push("--trust-remote-code".into());
 
     parts.push("--dtype".into());
     parts.push("auto".into());
