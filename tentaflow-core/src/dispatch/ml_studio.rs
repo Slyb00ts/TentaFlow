@@ -2629,28 +2629,21 @@ pub async fn ml_studio_ft_deploy(
         }
     }
 
-    // Transfer artefaktu na węzeł docelowy, gdy żyje gdzie indziej (build na B,
-    // deploy na C). Wspierane dla modeli MLX (katalog safetensors). Zwraca ścieżkę
-    // artefaktu NA węźle docelowym. Gdy deploy na węźle artefaktu — bez transferu.
-    let deploy_path = if deploy_node == artifact_node {
-        gguf_path.clone()
-    } else {
-        if !is_mlx {
-            return Err(ProtocolError::bad_request(
-                "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
-            ));
-        }
-        let iroh = ctx
-            .state
-            .quic_mesh
-            .clone()
-            .ok_or_else(|| ProtocolError::internal("mesh transport niedostępny na tym węźle"))?;
-        if artifact_node == local_node {
-            crate::ml_studio::mesh_artifact::push_dir_to(&iroh, &deploy_node, &gguf_path)
-                .await
-                .map_err(|e| ProtocolError::internal(format!("transfer artefaktu: {}", e)))?
+    // DEPLOY LOKALNY (węzeł docelowy = ten węzeł): synchronicznie. Szybki, bez
+    // transferu po sieci do innego węzła, więc nie grozi timeoutem przeglądarki.
+    // Ewentualny PULL artefaktu z węzła zdalnego (artefakt na B, deploy tu) też tu.
+    if deploy_node == local_node {
+        let deploy_path = if artifact_node == local_node {
+            gguf_path.clone()
         } else {
-            // Węzeł artefaktu (B) pcha wprost do węzła docelowego (C) — pełny mesh.
+            if !is_mlx {
+                return Err(ProtocolError::bad_request(
+                    "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
+                ));
+            }
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport niedostępny na tym węźle")
+            })?;
             let cmd = tentaflow_protocol::mesh::MeshCommandType::MlArtifactPushTo {
                 src_path: gguf_path.clone(),
                 target_node_id: deploy_node.clone(),
@@ -2658,83 +2651,292 @@ pub async fn ml_studio_ft_deploy(
             let resp = iroh
                 .send_command_and_wait(&artifact_node, cmd, 600)
                 .await
-                .map_err(|e| ProtocolError::internal(format!("zlecenie transferu B→C: {}", e)))?;
+                .map_err(|e| ProtocolError::internal(format!("zlecenie transferu artefaktu: {}", e)))?;
             match resp.payload {
                 tentaflow_protocol::mesh::MeshCommandResponsePayload::MlArtifactPushResult {
                     target_path,
                     error,
                 } => {
                     if let Some(err) = error {
-                        return Err(ProtocolError::internal(format!("transfer B→C: {}", err)));
+                        return Err(ProtocolError::internal(format!("transfer artefaktu: {}", err)));
                     }
                     target_path
                 }
                 _ if !resp.ok => {
                     return Err(ProtocolError::internal(
-                        resp.error.unwrap_or_else(|| "transfer B→C nieudany".into()),
+                        resp.error.unwrap_or_else(|| "transfer artefaktu nieudany".into()),
                     ))
                 }
-                _ => return Err(ProtocolError::internal("nieoczekiwana odpowiedź transferu B→C")),
+                _ => return Err(ProtocolError::internal("nieoczekiwana odpowiedź transferu artefaktu")),
+            }
+        };
+        let config_json = serde_json::json!({
+            "model_repo": model_name,
+            "model_file": deploy_path,
+            "ctx_size": 2048,
+        })
+        .to_string();
+        let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
+            engine_id: engine_id.to_string(),
+            deploy_method: "native".to_string(),
+            node_id: deploy_node.clone(),
+            config_json,
+        };
+        let (status, error) = match super::handlers::service_manifest_deploy(
+            &MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(deploy_req)),
+            ctx,
+        )
+        .await
+        {
+            // Deploy lokalny jest synchroniczny — sukces = serwis już wystartował,
+            // więc status odpowiedzi „deployed" (spójny z `inference_status` w metrykach
+            // i z obsługą w UI, które dla „deployed" zamyka modal od razu, bez pollingu).
+            Ok(_) => ("deployed".to_string(), None),
+            Err(e) => ("failed".to_string(), Some(e.to_string())),
+        };
+        let mut merged = metrics.clone();
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+            obj.insert(
+                "inference_status".to_string(),
+                serde_json::json!(if error.is_none() { "deployed" } else { "failed" }),
+            );
+            if error.is_none() {
+                obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
+            }
+        }
+        repository::update_model_metrics(&payload.model_id, &merged.to_string()).map_err(db_err)?;
+        return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtDeployResponse(
+            tentaflow_protocol::MlStudioFtDeployResponse {
+                model_id: payload.model_id.clone(),
+                model_name,
+                status,
+                error,
+            },
+        )));
+    }
+
+    // DEPLOY ZDALNY (węzeł docelowy ≠ ten węzeł): transfer artefaktu może iść
+    // dziesiątki sekund, a zdalny embedded przy starcie przebudowuje serwis i ACK
+    // bywa opóźniony — synchroniczne czekanie zawsze przebijało timeout przeglądarki.
+    // DETACHUJEMY: zapisujemy stan „deploying" od razu, zwracamy natychmiast, a
+    // transfer+deploy biegnie w tle. O porażce transferu decyduje WYŁĄCZNIE watchdog
+    // STALL (0 B/s przez ARTIFACT_STALL_SECS) — trwający transfer NIGDY nie pada na
+    // sztywny deadline. UI odpytuje metryki: pokazuje fazę/postęp, po sukcesie flip
+    // na „Zapytaj", po błędzie cofa do „Wdróż".
+    if !is_mlx && artifact_node != local_node {
+        return Err(ProtocolError::bad_request(
+            "transfer artefaktu między węzłami wspierany tylko dla modeli MLX (katalog)",
+        ));
+    }
+    let iroh = ctx
+        .state
+        .quic_mesh
+        .clone()
+        .ok_or_else(|| ProtocolError::internal("mesh transport niedostępny na tym węźle"))?;
+
+    // Optymistyczny zapis stanu — model NATYCHMIAST pokazuje się jako wdrażany pod
+    // tą nazwą (UI flip na „Zapytaj"); węzeł inferencji = węzeł docelowy. Ten stan
+    // jest BAZĄ dla wszystkich późniejszych zapisów w tle (zachowuje alias/węzeł).
+    let mut deploy_state = metrics.clone();
+    if let Some(obj) = deploy_state.as_object_mut() {
+        obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+        obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
+        obj.insert("inference_status".to_string(), serde_json::json!("transferring"));
+        obj.remove("inference_error");
+        obj.insert("inference_transfer_total".to_string(), serde_json::json!(0));
+        obj.insert("inference_transfer_sent".to_string(), serde_json::json!(0));
+        obj.insert("inference_transfer_rate".to_string(), serde_json::json!(0));
+    }
+    repository::update_model_metrics(&payload.model_id, &deploy_state.to_string()).map_err(db_err)?;
+
+    let model_id = payload.model_id.clone();
+    let model_name_bg = model_name.clone();
+    let engine_id_bg = engine_id.to_string();
+    tokio::spawn(async move {
+        run_remote_deploy(
+            iroh,
+            model_id,
+            model_name_bg,
+            engine_id_bg,
+            gguf_path,
+            artifact_node,
+            local_node,
+            deploy_node,
+        )
+        .await;
+    });
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtDeployResponse(
+        tentaflow_protocol::MlStudioFtDeployResponse {
+            model_id: payload.model_id.clone(),
+            model_name,
+            status: "deploying".to_string(),
+            error: None,
+        },
+    )))
+}
+
+/// Read-modify-write metryk modelu: czyta ŚWIEŻY `metrics_json` z DB, aplikuje
+/// `f` na obiekt i zapisuje. Dotyka tylko pól, które ruszy `f` — równoległy zapis
+/// innych pól (np. eksport) NIE jest nadpisywany stałą migawką (chroni przed
+/// wyścigiem, który zgłosił codex). Brak modelu / zły JSON → no-op.
+fn update_inference_metrics<F>(model_id: &str, f: F)
+where
+    F: FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+{
+    let Ok(Some(model)) = repository::get_model(model_id) else {
+        return;
+    };
+    let mut v: serde_json::Value =
+        serde_json::from_str(&model.metrics_json).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        f(obj);
+    }
+    let _ = repository::update_model_metrics(model_id, &v.to_string());
+}
+
+/// Ustawia `inference_status` (+ opcjonalny błąd) na ŚWIEŻO odczytanych metrykach.
+/// Przy błędzie cofa alias/węzeł, by UI wróciło do „Wdróż" (a nie martwe „Zapytaj").
+fn set_inference_status(model_id: &str, status: &str, error: Option<&str>) {
+    update_inference_metrics(model_id, |obj| {
+        obj.insert("inference_status".to_string(), serde_json::json!(status));
+        match error {
+            Some(e) => {
+                obj.insert("inference_error".to_string(), serde_json::json!(e));
+                obj.remove("inference_model_name");
+                obj.remove("inference_node");
+            }
+            None => {
+                obj.remove("inference_error");
+            }
+        }
+    });
+}
+
+/// Detachowany transfer artefaktu + deploy zdalny (węzeł docelowy ≠ ten węzeł).
+/// Faza „transferring" (z paskiem B/s gdy artefakt jest lokalny) → „deploying"
+/// (zdalny serwis wstaje) → „deployed"/„failed". O porażce transferu decyduje
+/// watchdog STALL wewnątrz `push_artifact_stream`, nie sztywny timeout.
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_deploy(
+    iroh: std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    model_id: String,
+    model_name: String,
+    engine_id: String,
+    gguf_path: String,
+    artifact_node: String,
+    local_node: String,
+    deploy_node: String,
+) {
+    use crate::ml_studio::mesh_artifact;
+
+    // Backstop na czekanie A→peer: właściwy timeout to watchdog STALL przy bajtach
+    // (w `push_artifact_stream` na węźle-źródle) — zwraca błąd w ~30 s od realnego
+    // zastoju. Ten deadline jest tylko zabezpieczeniem na „peer w ogóle nie
+    // odpowiada"; ustawiony hojnie, by AKTYWNY transfer wielkiego modelu (do 16 GiB)
+    // nigdy nie padł na sztywny limit — biegnie w tle, nie blokuje przeglądarki.
+    const PEER_WAIT_BACKSTOP_SECS: u64 = 3600;
+
+    // 1) Transfer artefaktu na węzeł docelowy. Gdy artefakt jest lokalny (A→C) —
+    //    pchamy wprost i raportujemy B/s do metryk (ticker). Gdy artefakt na innym
+    //    węźle (B→C) — zlecamy push węzłowi-źródłu; postęp bajtowy żyje tam, więc
+    //    pokazujemy tylko fazę.
+    let deploy_path = if artifact_node == local_node {
+        // Ticker: co ~1.2 s przepisuje postęp z mapy in-memory do metryk modelu
+        // (read-modify-write świeżego JSON), żeby UI rysowało pasek B/s przez polling.
+        let prog_id = model_id.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let ticker = tokio::spawn(async move {
+            while !stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(p) = mesh_artifact::artifact_progress(&prog_id) {
+                    update_inference_metrics(&prog_id, |obj| {
+                        obj.insert("inference_status".to_string(), serde_json::json!("transferring"));
+                        obj.insert("inference_transfer_total".to_string(), serde_json::json!(p.bytes_total));
+                        obj.insert("inference_transfer_sent".to_string(), serde_json::json!(p.bytes_sent));
+                        obj.insert("inference_transfer_rate".to_string(), serde_json::json!(p.rate_bps));
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            }
+        });
+        let res = mesh_artifact::push_dir_to(&iroh, &deploy_node, &gguf_path, Some(&model_id)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        ticker.abort();
+        mesh_artifact::clear_artifact_progress(&model_id);
+        match res {
+            Ok(p) => p,
+            Err(e) => {
+                set_inference_status(&model_id, "failed", Some(&format!("transfer artefaktu: {}", e)));
+                return;
+            }
+        }
+    } else {
+        set_inference_status(&model_id, "transferring", None);
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::MlArtifactPushTo {
+            src_path: gguf_path.clone(),
+            target_node_id: deploy_node.clone(),
+        };
+        match iroh.send_command_and_wait(&artifact_node, cmd, PEER_WAIT_BACKSTOP_SECS).await {
+            Ok(resp) => match resp.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::MlArtifactPushResult {
+                    target_path,
+                    error,
+                } => {
+                    if let Some(err) = error {
+                        set_inference_status(&model_id, "failed", Some(&format!("transfer B→C: {}", err)));
+                        return;
+                    }
+                    target_path
+                }
+                _ => {
+                    let msg = resp.error.unwrap_or_else(|| "transfer B→C nieudany".into());
+                    set_inference_status(&model_id, "failed", Some(&msg));
+                    return;
+                }
+            },
+            Err(e) => {
+                set_inference_status(&model_id, "failed", Some(&format!("zlecenie transferu B→C: {}", e)));
+                return;
             }
         }
     };
 
-    // config_json dla embedded: `model_file` to ABSOLUTNA ścieżka NA węźle docelowym
-    // (po ewentualnym transferze) — plik GGUF lub katalog MLX safetensors.
+    // 2) Zdalny deploy embedded — komenda ServiceDeployRemote do węzła docelowego.
+    set_inference_status(&model_id, "deploying", None);
     let config_json = serde_json::json!({
         "model_repo": model_name,
         "model_file": deploy_path,
         "ctx_size": 2048,
     })
     .to_string();
-
-    let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
-        engine_id: engine_id.to_string(),
+    let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
+        engine_id,
         deploy_method: "native".to_string(),
-        node_id: deploy_node.clone(),
         config_json,
     };
-
-    let deploy_outcome = super::handlers::service_manifest_deploy(
-        &MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(deploy_req)),
-        ctx,
-    )
-    .await;
-
-    let (status, error) = match deploy_outcome {
-        Ok(_) => ("deploying".to_string(), None),
-        Err(e) => ("failed".to_string(), Some(e.to_string())),
-    };
-
-    // Zapisz alias + stan inferencji na modelu (merge do metrics_json) — UI
-    // pokazuje od razu, że model jest wdrażany pod tą nazwą.
-    let mut merged = metrics.clone();
-    if let Some(obj) = merged.as_object_mut() {
-        obj.insert(
-            "inference_model_name".to_string(),
-            serde_json::json!(model_name),
-        );
-        obj.insert(
-            "inference_status".to_string(),
-            serde_json::json!(if error.is_none() { "deploying" } else { "failed" }),
-        );
-        // Węzeł, na którym model JEST WDROŻONY (może być inny niż węzeł artefaktu
-        // po transferze B→C). Czat routuje zapytania właśnie tam — ustawiamy TYLKO
-        // przy sukcesie, żeby po nieudanym deployu nie routować w pustkę.
-        if error.is_none() {
-            obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
+    match iroh.send_command_and_wait(&deploy_node, cmd, 180).await {
+        Ok(resp) if resp.ok => {
+            set_inference_status(&model_id, "deployed", None);
+        }
+        Ok(resp) => {
+            // JAWNY błąd z węzła docelowego (resp.ok=false): deploy realnie padł —
+            // NIE udajemy sukcesu, bo UI pokazałoby „Zapytaj" do nieistniejącego
+            // serwisu. Cofamy alias i raportujemy błąd.
+            let msg = resp.error.unwrap_or_else(|| "zdalny deploy zgłosił błąd".into());
+            tracing::warn!(model_id = %model_id, err = %msg, "remote deploy: węzeł docelowy zgłosił błąd");
+            set_inference_status(&model_id, "failed", Some(&msg));
+        }
+        Err(e) => {
+            // ZGUBIONY ACK (błąd transportu/strumienia): embedded przy starcie
+            // przebudowuje serwis i rwie strumień odpowiedzi, więc utrata ACK ≠ porażka.
+            // Optymistycznie „deployed" — czat jest realną weryfikacją gotowości i
+            // ujawni faktyczną porażkę, gdyby serwis jednak nie wstał.
+            tracing::warn!(model_id = %model_id, error = %e, "remote deploy: ACK zgubiony — optymistycznie deployed (czat zweryfikuje)");
+            set_inference_status(&model_id, "deployed", None);
         }
     }
-    repository::update_model_metrics(&payload.model_id, &merged.to_string()).map_err(db_err)?;
-
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtDeployResponse(
-        tentaflow_protocol::MlStudioFtDeployResponse {
-            model_id: payload.model_id.clone(),
-            model_name,
-            status,
-            error,
-        },
-    )))
 }
 
 /// Zapytanie do wdrożonego modelu FT (test/„użyj"). Model lokalny → inferencja

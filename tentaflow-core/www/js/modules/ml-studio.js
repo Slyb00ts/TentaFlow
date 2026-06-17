@@ -3061,7 +3061,7 @@ function renderModelsTab(panel, p) {
           dep.setAttribute('variant', 'primary');
           dep.setAttribute('icon', 'cpu');
           dep.textContent = 'Wdróż';
-          dep.addEventListener('click', () => deployFtModel(row._modelId, row._modelName, () => renderModelsTab(panel, p)));
+          dep.addEventListener('click', () => deployFtModel(row._modelId, row._modelName, () => renderModelsTab(panel, p), p));
           wrap.appendChild(dep);
           return wrap;
         }
@@ -3166,11 +3166,13 @@ function renderDetections(host, b64, mime, dets, width, height) {
 }
 
 // Wdrożenie wyeksportowanego modelu FT do inferencji (bez ponownego eksportu).
-// Start jest synchroniczny — status "deploying" = serwis ruszył. Po sukcesie
-// odświeżamy zakładkę (`onDone`), żeby pojawiła się akcja „Zapytaj".
-// Wdrożenie modelu — modal z wyborem węzła docelowego. Domyślnie węzeł artefaktu;
-// wybór innego węzła → Core przenosi artefakt przez mesh (np. model MLX z B na Mac C).
-async function deployFtModel(modelId, modelName, onDone) {
+// Deploy ZDALNY jest DETACHOWANY w Core: odpowiedź „deploying" wraca natychmiast,
+// a transfer artefaktu + start serwisu biegnie w tle. Modal NIE polega na timeoucie
+// requestu — po „deploying" odpytuje metryki modelu i pokazuje fazę/pasek B/s
+// (transfer ma watchdog STALL: 0 B/s przez ~30s = błąd, ale aktywny transfer nigdy
+// nie pada). Po „deployed" flip na „Zapytaj"; po „failed" pokaz błąd i wróć do „Wdróż".
+// Wybór innego węzła → Core przenosi artefakt przez mesh (np. model MLX z B na Mac C).
+async function deployFtModel(modelId, modelName, onDone, project) {
   if (!modelId) return;
   const modal = document.createElement('tf-modal');
   modal.setAttribute('variant', 'modal');
@@ -3207,28 +3209,92 @@ async function deployFtModel(modelId, modelName, onDone) {
   }).catch(() => {});
   sel?.addEventListener('change', (e) => { targetNodeId = e.detail?.value || sel.value || ''; });
 
+  // Odpytuje metryki modelu (faza/postęp transferu) i renderuje status w modalu.
+  // Zwraca obiekt metryk modelu lub null. NIE polega na timeoucie — czyta realny
+  // stan zapisany przez detachowany deploy w tle (transferring→deploying→deployed/failed).
+  const pollModelMetrics = async () => {
+    const pid = project ? projectId(project) : '';
+    if (!pid) return null;
+    try {
+      const resp = await ApiBinary.one('mlStudioModelsListRequest', { projectId: pid });
+      const models = Array.isArray(resp.models) ? resp.models : [];
+      const m = models.find((x) => String(x.modelId ?? x.model_id ?? '') === String(modelId));
+      if (!m) return null;
+      return JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
+    } catch (_) { return null; }
+  };
+
+  const renderDeployPhase = (st, mj) => {
+    if (!st) return;
+    const phase = String(mj?.inference_status ?? 'deploying');
+    if (phase === 'transferring') {
+      const sent = Number(mj.inference_transfer_sent ?? 0);
+      const tot = Number(mj.inference_transfer_total ?? 0);
+      const rate = Number(mj.inference_transfer_rate ?? 0);
+      const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
+      const detail = tot > 0
+        ? `${fmtBytes(sent)} / ${fmtBytes(tot)} · ${pct}% · ${fmtRate(rate)}`
+        : 'transfer artefaktu na węzeł docelowy…';
+      st.innerHTML = `<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Transfer artefaktu — ${detail}</span></div>`;
+    } else {
+      st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Uruchamianie serwisu na węźle docelowym…</span></div>';
+    }
+  };
+
   modal.querySelector('#ml-studio-deploy-go')?.addEventListener('click', async () => {
     const st = modal.querySelector('#ml-studio-deploy-status');
     modal.querySelector('#ml-studio-deploy-go')?.setAttribute('disabled', '');
-    if (st) st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Wdrażanie (transfer artefaktu może chwilę potrwać)…</span></div>';
+    if (st) st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Zlecam wdrożenie…</span></div>';
+    let resp;
     try {
-      const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId, targetNodeId });
-      const status = String(resp?.status || '');
-      if (status === 'deploying') {
-        toast(`Model „${resp?.modelName || modelName}" wdrażany — odpytaj go przyciskiem „Zapytaj"`, 'success');
-        close();
-        if (typeof onDone === 'function') onDone();
-      } else {
-        const msg = String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia';
-        toast(msg, 'error');
-        if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(msg)}</div>`;
-        modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
-      }
+      resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId, targetNodeId });
     } catch (err) {
       toast(`Wdrożenie nieudane: ${err.message}`, 'error');
       if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(err.message)}</div>`;
       modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
+      return;
     }
+    const status = String(resp?.status || '');
+    // „deployed" = deploy lokalny (synchroniczny) zakończony od razu.
+    if (status === 'deployed') {
+      toast(`Model „${resp?.modelName || modelName}" wdrożony`, 'success');
+      close();
+      if (typeof onDone === 'function') onDone();
+      return;
+    }
+    // „deploying" = deploy zdalny detachowany — polling fazy/postępu w tle.
+    if (status !== 'deploying') {
+      const msg = String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia';
+      toast(msg, 'error');
+      if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(msg)}</div>`;
+      modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
+      return;
+    }
+    // Polling do skutku — transfer ma własny watchdog STALL po stronie Core,
+    // więc tu NIE narzucamy sztywnego deadline; czekamy aż stan przejdzie w
+    // „deployed" albo „failed". Pasek B/s aktualizowany z metryk modelu.
+    if (st) renderDeployPhase(st, { inference_status: 'transferring' });
+    const tick = async () => {
+      if (!modal.isConnected) return;
+      const mj = await pollModelMetrics();
+      const phase = String(mj?.inference_status ?? 'deploying');
+      if (phase === 'deployed') {
+        toast(`Model „${resp?.modelName || modelName}" wdrożony — odpytaj go przyciskiem „Zapytaj"`, 'success');
+        close();
+        if (typeof onDone === 'function') onDone();
+        return;
+      }
+      if (phase === 'failed') {
+        const msg = String(mj?.inference_error ?? '') || 'Wdrożenie nieudane';
+        toast(msg, 'error');
+        if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(msg)}</div>`;
+        modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
+        return;
+      }
+      renderDeployPhase(st, mj || { inference_status: phase });
+      setTimeout(tick, 1500);
+    };
+    setTimeout(tick, 1200);
   });
 }
 
@@ -3439,7 +3505,8 @@ function openFtExportPanel(p, modelId, modelName) {
   };
 
   // Wdrożenie wytrenowanego modelu jako serwis inferencji llama.cpp.
-  // Start jest synchroniczny — status "deploying" w odpowiedzi = serwis ruszył OK.
+  // Deploy lokalny (z tego panelu) jest synchroniczny → status "deployed".
+  // Deploy zdalny jest detachowany → status "deploying" (serwis wstaje w tle).
   const startDeploy = async () => {
     const btn = byId('ml-studio-export-deploy-btn');
     if (btn) btn.setAttribute('disabled', '');
@@ -3447,7 +3514,7 @@ function openFtExportPanel(p, modelId, modelName) {
     try {
       const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId });
       const status = String(resp?.status || '');
-      if (status === 'deploying') {
+      if (status === 'deploying' || status === 'deployed') {
         renderDeploySuccess(resp?.modelName);
       } else {
         const msg = String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia.';

@@ -17,6 +17,52 @@ use crate::ml_studio::train_recognition::{blob_content_hash, zip_dir};
 /// `zip_len` od złośliwego peera).
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Ziarno strumienia: bajty przesuwamy porcjami tej wielkości, żeby watchdog
+/// STALL mógł działać na granulacji porcji (a nie całego pliku).
+pub const ARTIFACT_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Brak postępu transferu (0 B/s) przez tyle sekund = STALL → błąd. NIE liczymy
+/// sztywnego deadline na cały transfer: duży model może iść długo, a błędem jest
+/// dopiero zatrzymanie strumienia. Aktywny transfer NIGDY nie wywala timeoutu.
+pub const ARTIFACT_STALL_SECS: u64 = 30;
+
+/// Postęp transferu artefaktu (faza wdrożenia modelu na zdalny węzeł). Trzymane
+/// in-memory na węźle, który REALNIE pcha bajty (sender). Odpytywane przez UI
+/// (przez metryki modelu) do paska B/s — dokładnie jak transfer datasetu treningu.
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactTransferProgress {
+    pub bytes_sent: u64,
+    pub bytes_total: u64,
+    pub rate_bps: u64,
+}
+
+static ARTIFACT_PROGRESS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, ArtifactTransferProgress>>,
+> = std::sync::OnceLock::new();
+
+fn artifact_progress_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ArtifactTransferProgress>> {
+    ARTIFACT_PROGRESS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn set_artifact_progress_pub(key: &str, p: ArtifactTransferProgress) {
+    if let Ok(mut m) = artifact_progress_map().lock() {
+        m.insert(key.to_string(), p);
+    }
+}
+
+/// Bieżący postęp transferu artefaktu dla klucza (None gdy brak/zakończony).
+pub fn artifact_progress(key: &str) -> Option<ArtifactTransferProgress> {
+    artifact_progress_map().lock().ok()?.get(key).cloned()
+}
+
+/// Usuwa wpis postępu (po zakończeniu/błędzie transferu).
+pub fn clear_artifact_progress(key: &str) {
+    if let Ok(mut m) = artifact_progress_map().lock() {
+        m.remove(key);
+    }
+}
+
 /// Katalog, do którego węzeł docelowy rozpakowuje odebrane artefakty.
 fn artifact_dest_root() -> PathBuf {
     crate::paths::cache_dir().join("ml-studio").join("mesh-artifacts")
@@ -67,6 +113,7 @@ pub async fn push_dir_to(
     iroh: &crate::mesh::iroh_manager::IrohMeshManager,
     target_node_id: &str,
     src_dir: &str,
+    progress_key: Option<&str>,
 ) -> anyhow::Result<String> {
     if !Path::new(src_dir).is_dir() {
         anyhow::bail!("artefakt do transferu nie jest katalogiem: {}", src_dir);
@@ -76,7 +123,8 @@ pub async fn push_dir_to(
         anyhow::bail!("artefakt przekracza limit transferu ({} B)", zip.len());
     }
     let name = safe_artifact_name(src_dir);
-    iroh.push_artifact_stream(target_node_id, &name, &zip).await
+    iroh.push_artifact_stream(target_node_id, &name, &zip, progress_key)
+        .await
 }
 
 /// Węzeł docelowy (accept loop ALPN_ARTIFACT): czyta z bi-streamu
@@ -106,10 +154,36 @@ pub async fn recv_artifact_stream(
     if zip_len == 0 || zip_len > MAX_ARTIFACT_BYTES {
         anyhow::bail!("artifact recv: zła długość zip {}", zip_len);
     }
+    // Czytamy odczytami CZĄSTKOWYMI (`read`, nie `read_exact`) z watchdogiem STALL:
+    // każdy `read` zwraca, gdy tylko napłyną JAKIEKOLWIEK bajty, i ma świeży limit
+    // bezczynności (ARTIFACT_STALL_SECS). Dopóki choć bajt napływa w oknie, licznik
+    // się resetuje — transfer może trwać dowolnie długo i wolno. Timeout pojedynczego
+    // `read` = ZERO bajtów przez okno = STALL (a nie „za wolno").
     let mut zip = vec![0u8; zip_len as usize];
-    recv.read_exact(&mut zip)
-        .await
-        .map_err(|e| anyhow::anyhow!("artifact recv: zip: {e}"))?;
+    let mut filled = 0usize;
+    let stall = std::time::Duration::from_secs(ARTIFACT_STALL_SECS);
+    while filled < zip.len() {
+        match tokio::time::timeout(stall, recv.read(&mut zip[filled..])).await {
+            Ok(Ok(Some(0))) => anyhow::bail!(
+                "artifact recv: strumień zamknięty przedwcześnie ({}/{} B)",
+                filled,
+                zip.len()
+            ),
+            Ok(Ok(Some(n))) => filled += n,
+            Ok(Ok(None)) => anyhow::bail!(
+                "artifact recv: koniec strumienia przed pełnym zip ({}/{} B)",
+                filled,
+                zip.len()
+            ),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("artifact recv: zip: {e}")),
+            Err(_) => anyhow::bail!(
+                "artifact recv: transfer utknął — brak NOWYCH danych przez {}s ({}/{} B)",
+                ARTIFACT_STALL_SECS,
+                filled,
+                zip.len()
+            ),
+        }
+    }
     Ok((name, zip))
 }
 

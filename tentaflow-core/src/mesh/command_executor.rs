@@ -469,8 +469,13 @@ impl MeshCommandExecutor {
         let Some(ctx) = self.service_action_ctx().await else {
             return CommandResponse::fail("service action context not configured");
         };
-        match crate::ml_studio::mesh_artifact::push_dir_to(&ctx.iroh, &target_node_id, &src_path)
-            .await
+        match crate::ml_studio::mesh_artifact::push_dir_to(
+            &ctx.iroh,
+            &target_node_id,
+            &src_path,
+            None,
+        )
+        .await
         {
             Ok(target_path) => CommandResponse::ok(
                 MeshCommandResponsePayload::MlArtifactPushResult {
