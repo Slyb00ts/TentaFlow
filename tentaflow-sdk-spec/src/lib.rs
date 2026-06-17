@@ -23,9 +23,10 @@ pub use protocol::{
     camera::{
         CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
         CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut,
+        CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
         CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
-        CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput,
-        DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+        CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+        CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
     },
     camera_metadata::{
         MetadataFrameOut, MetadataItemOut, MetadataPollInput, MetadataPollOutput,

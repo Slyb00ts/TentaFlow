@@ -30,11 +30,16 @@ use tentaflow_sdk_spec::protocol::ui::{
     tokens::*,
 };
 use tentaflow_sdk_spec::{
-    Component, FailurePolicy, Handler, HandlerMap, PanelShell, StateEntry, UiPayload, Value,
-    WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput, WebRtcDrainOutput,
-    WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput, WebRtcSendInput, WebRtcSetAnswerInput,
-    WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
+    CameraGrantInput, CameraGrantOut, Component, FailurePolicy, Handler, HandlerMap, PanelShell,
+    StateEntry, UiPayload, Value, WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput,
+    WebRtcDrainInput, WebRtcDrainOutput, WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput,
+    WebRtcSendInput, WebRtcSetAnswerInput, WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
 };
+
+// The vision addon that consumes the robot camera. go2 grants it read access on
+// the backed camera so it appears in TentaVision without relaxing tenant
+// isolation for any other addon (least-privilege: one specific grantee, 'read').
+const VISION_ADDON_ID: &str = "tentavision";
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const ADDON_ID: &str = "go2";
@@ -81,6 +86,7 @@ extern "C" {
     fn webrtc_drain_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn webrtc_close_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn webrtc_register_camera_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 }
 
 // =============================================================================
@@ -277,6 +283,25 @@ fn wc_drain(channel_id: &str, max: u32) -> Result<WebRtcDrainOutput, AbiError> {
 fn wc_close(channel_id: &str) {
     let _: Result<WebRtcStatusOutput, _> =
         call_cbor_in_out(&WebRtcCloseInput { channel_id: channel_id.into() }, webrtc_close_v1);
+}
+
+/// Grant the vision addon read access to the robot camera so it shows up in
+/// TentaVision. go2 owns the camera, so the host's owner-gated grant accepts it.
+/// Best-effort: a failure (e.g. vision addon not installed) is logged, not fatal.
+fn grant_vision_camera(camera_id: &str) {
+    if camera_id.is_empty() {
+        return;
+    }
+    let input = CameraGrantInput {
+        camera_id: camera_id.into(),
+        grantee_addon_id: VISION_ADDON_ID.into(),
+        level: "read".into(),
+    };
+    match call_cbor_in_out::<_, CameraGrantOut>(&input, camera_grant_v1) {
+        Ok(o) if o.ok => log::info("go2: camera shared with tentavision"),
+        Ok(_) => log::warn("go2: camera grant returned not-ok"),
+        Err(e) => log::warn(&alloc::format!("go2: camera grant failed: {e}")),
+    }
 }
 
 // =============================================================================
@@ -567,6 +592,7 @@ fn tick() {
                                 Ok(true) => {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
+                                    grant_vision_camera(&cam_id);
                                     publish_event("go2.online", json!({ "camera_id": cam_id }));
                                     log::info("go2: online");
                                 }

@@ -324,6 +324,29 @@ fn enforce_subscribe_permission(
                 "camera.read permission required",
             ));
         }
+        // Org scoping: `camera.read` is not consent to read EVERY camera id. The
+        // camera must belong to the caller's org, else a user could subscribe to
+        // another tenant's stream by guessing its id. Cross-org / unknown id maps
+        // to NotFound so existence in another tenant is never leaked.
+        #[cfg(feature = "camera")]
+        {
+            return match crate::db::repository::camera_exists_in_org(
+                &ctx.state.db,
+                rest,
+                &org.org_id,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ProtocolError::not_found(format!(
+                    "stream_not_registered: {}{}",
+                    CAMERA_PREFIX, rest
+                ))),
+                Err(_) => Err(ProtocolError::new(
+                    ProtocolErrorCode::Internal,
+                    "camera org lookup failed",
+                )),
+            };
+        }
+        #[cfg(not(feature = "camera"))]
         return Ok(());
     }
     Err(ProtocolError::new(

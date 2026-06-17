@@ -442,8 +442,33 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_vendor_check_webrtc",
             MigrationStep::Sql(CAMERAS_VENDOR_CHECK_WEBRTC),
         ),
+        (
+            81,
+            "camera_grants_table",
+            MigrationStep::Sql(CAMERA_GRANTS_TABLE),
+        ),
     ]
 }
+
+// Cross-addon camera access grants. A camera is owned by one addon
+// (`cameras.owner_addon_id`); a grant lets ANOTHER addon read/view it without
+// relaxing the per-owner isolation everywhere else. `grantee_addon_id = '*'`
+// means org-wide. `level` is an allowlist (only 'read' today). Node-local like
+// `cameras` (not sync-replicated). Authorization to CREATE a grant (owner/admin)
+// is enforced at the host-fn layer, not here.
+const CAMERA_GRANTS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS camera_grants (
+    camera_id        TEXT NOT NULL,
+    grantee_addon_id TEXT NOT NULL,
+    level            TEXT NOT NULL DEFAULT 'read' CHECK(level IN ('read')),
+    org_id           TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    created_by       TEXT NOT NULL,
+    PRIMARY KEY (camera_id, grantee_addon_id, level)
+);
+CREATE INDEX IF NOT EXISTS idx_camera_grants_grantee ON camera_grants(grantee_addon_id, org_id);
+CREATE INDEX IF NOT EXISTS idx_camera_grants_camera ON camera_grants(camera_id);
+"#;
 
 /// Adds `analysis_flow_id` to `cameras` — the per-camera analysis Flow run by the
 /// cold path on a detection event. NULL/empty = no flow (cold path enriches with
