@@ -25,6 +25,9 @@ pub struct ServiceActionContext {
     pub db: DbPool,
     pub port_allocator: Arc<PortAllocator>,
     pub iroh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    /// Owning robot-control addons live here; the `RobotControl` handler resolves
+    /// the local robot addon and dispatches the sanitized action through it.
+    pub addon_manager: Arc<crate::addon::AddonManager>,
 }
 
 /// Odpowiedz na komende mesh — mapowana 1:1 na MeshMessage::MeshCommandResponse
@@ -67,6 +70,16 @@ pub struct MeshCommandExecutor {
     /// Service-action context wired in after AppState initialisation. `None`
     /// disables ServiceDeleteRemote / ServicePinRemote / ... handlers.
     service_actions: AsyncRwLock<Option<ServiceActionContext>>,
+    /// Duplicate suppression for cross-node robot commands (per from-node + actor
+    /// + robot + command_id). E-stop-class commands are never cached.
+    robot_idem: std::sync::Mutex<crate::mesh::robot_control::IdempotencyCache>,
+    /// Per-robot async serialization of the check→execute→record critical section
+    /// for NON-estop robot commands. Without it two concurrent identical commands
+    /// could both miss the idempotency cache and actuate twice. The std `robot_idem`
+    /// mutex only guards the brief get/record calls (never held across an await);
+    /// this async lock guards the whole critical section across the addon call.
+    /// E-stop-class actions BYPASS this lock entirely and execute immediately.
+    robot_exec_locks: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl MeshCommandExecutor {
@@ -76,6 +89,10 @@ impl MeshCommandExecutor {
             local_node_id,
             data_dir,
             service_actions: AsyncRwLock::new(None),
+            robot_idem: std::sync::Mutex::new(
+                crate::mesh::robot_control::IdempotencyCache::new(),
+            ),
+            robot_exec_locks: dashmap::DashMap::new(),
         }
     }
 
@@ -399,6 +416,9 @@ impl MeshCommandExecutor {
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
             MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
             MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
+            MeshCommandType::RobotControl { request_cbor } => {
+                self.handle_robot_control(from_node_id, request_cbor).await
+            }
         }
     }
 
@@ -460,6 +480,201 @@ impl MeshCommandExecutor {
             }
             Err(e) => CommandResponse::fail(format!("vector op task failed: {}", e)),
         }
+    }
+
+    /// Receiver side of a forwarded robot command. Re-checks everything (trust is
+    /// already enforced by `execute`): timing, idempotency, robot-addon
+    /// resolution, the actor's permission in the request org, then sanitizes the
+    /// action and dispatches it to the local robot addon. A pre-execution refusal
+    /// (expired / future-dated / unknown robot / permission denied / duplicate) is
+    /// returned as a SUCCESSFUL `RobotControlResult` carrying a `rejected`
+    /// response — only a missing context / undecodable request is a transport
+    /// fail. Move payloads are never logged (no raw movement values in audit).
+    async fn handle_robot_control(
+        &self,
+        from_node_id: &str,
+        request_cbor: Vec<u8>,
+    ) -> CommandResponse {
+        use crate::mesh::robot_control::{
+            plan_execution, validate_timing, Go2Call, IdemKey, RobotControlRequest,
+            RobotControlResponse,
+        };
+
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("robot control context not initialized");
+        };
+
+        let req: RobotControlRequest = match ciborium::de::from_reader(&request_cbor[..]) {
+            Ok(r) => r,
+            Err(e) => return CommandResponse::fail(format!("invalid robot control request: {e}")),
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let respond = |resp: RobotControlResponse| -> CommandResponse {
+            let mut buf = Vec::new();
+            match ciborium::ser::into_writer(&resp, &mut buf) {
+                Ok(()) => CommandResponse::ok(
+                    MeshCommandResponsePayload::RobotControlResult { result_cbor: buf },
+                ),
+                Err(e) => CommandResponse::fail(format!("encode robot control response: {e}")),
+            }
+        };
+
+        // Timing (expiry / clock-skew / move-duration). A refusal is a normal
+        // response, not a transport fail.
+        if let Err(reason) = validate_timing(&req, now_ms) {
+            warn!(
+                robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                action = %req.action.audit_label(), reason = ?reason,
+                "robot control rejected: timing"
+            );
+            return respond(RobotControlResponse::rejected(reason));
+        }
+
+        let idem_key = IdemKey::from_request(from_node_id, &req);
+
+        // Serialize the check→execute→record critical section per robot so two
+        // concurrent identical non-estop commands cannot both miss the cache and
+        // actuate twice. E-stop-class actions BYPASS the lock entirely: a stop
+        // must execute immediately and never wait behind a queued Move.
+        let _exec_guard = if req.action.is_estop_class() {
+            None
+        } else {
+            let lock = self
+                .robot_exec_locks
+                .entry(req.robot_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            Some(lock.lock_owned().await)
+        };
+
+        // Idempotency: a duplicate (non-estop) returns the cached response with no
+        // re-execution. Checked INSIDE the held per-robot lock so a concurrent
+        // duplicate observes the recorded response instead of re-executing. The
+        // std mutex is locked/unlocked here only (never held across an await).
+        if let Ok(cache) = self.robot_idem.lock() {
+            if let Some(prior) = cache.get(&idem_key, &req.action, now_ms) {
+                info!(
+                    robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                    action = %req.action.audit_label(),
+                    "robot control duplicate suppressed"
+                );
+                return respond(prior);
+            }
+        }
+
+        // Re-validate timing with a FRESH clock now that we may have waited behind
+        // another command for the per-robot lock: a fresh (cache-miss) command that
+        // validated just before its deadline must NOT execute after expiry. A
+        // duplicate already returned the cached response above, so this only gates
+        // never-executed commands. (E-stop bypassed the lock and skips expiry.)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(now_ms);
+        if let Err(reason) = validate_timing(&req, now_ms) {
+            warn!(
+                robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                action = %req.action.audit_label(), reason = ?reason,
+                "robot control rejected: timing (post-lock)"
+            );
+            return respond(RobotControlResponse::rejected(reason));
+        }
+
+        // Resolve the local robot addon (deny-by-default) + read its safety cap.
+        let resolved = resolve_robot_addon(&ctx.db, &req.robot_id);
+
+        // Authorize the actor on THIS node in the request org (never trust the
+        // caller's gate). Missing membership / permission both deny.
+        let authorized = crate::services::rbac::permissions::PermissionMatrix::global()
+            .has_permission(
+                &ctx.db,
+                &req.actor_user_id,
+                &req.org_id,
+                req.action.required_permission(),
+            )
+            .unwrap_or(false);
+
+        let plan = match plan_execution(&req, resolved.as_ref(), authorized) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                warn!(
+                    robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                    action = %req.action.audit_label(), reason = ?reason,
+                    "robot control rejected"
+                );
+                return respond(RobotControlResponse::rejected(reason));
+            }
+        };
+
+        // Dispatch the sanitized call into the addon. call_tool / invoke_block are
+        // synchronous wasmtime calls → run on a blocking thread (like web_research).
+        let addon_manager = ctx.addon_manager.clone();
+        let plan_addon = plan.addon_id.clone();
+        let plan_actor = plan.actor_user_id.clone();
+        let call = plan.call.clone();
+        let exec = tokio::task::spawn_blocking(move || match call {
+            Go2Call::Tool { tool, params } => {
+                addon_manager.call_tool(&plan_addon, &tool, params, &plan_actor)
+            }
+            Go2Call::Block { block_type, params } => {
+                let bytes = serde_json::to_vec(&params)
+                    .map_err(|e| anyhow::anyhow!("encode block params: {e}"))?;
+                let raw = addon_manager.invoke_block(
+                    &plan_addon,
+                    &block_type,
+                    &bytes,
+                    Some(plan_actor.clone()),
+                    None,
+                    crate::mesh::robot_control::ROBOT_BLOCK_FUEL,
+                    None,
+                )?;
+                serde_json::from_slice::<serde_json::Value>(&raw)
+                    .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
+            }
+        })
+        .await;
+
+        let resp = match exec {
+            Ok(Ok(json)) => {
+                if req.action.is_read_only() {
+                    match serde_json::to_string(&json) {
+                        Ok(s) => RobotControlResponse::ok_with(s),
+                        Err(e) => RobotControlResponse::failed(format!("serialize status: {e}")),
+                    }
+                } else {
+                    RobotControlResponse::ok()
+                }
+            }
+            Ok(Err(e)) => RobotControlResponse::failed(e.to_string()),
+            Err(e) => RobotControlResponse::failed(format!("robot control task failed: {e}")),
+        };
+
+        // Record idempotency (e-stop skipped inside record) + opportunistic evict.
+        if let Ok(mut cache) = self.robot_idem.lock() {
+            cache.record(idem_key, &req.action, resp.clone(), now_ms);
+            cache.evict_expired(now_ms);
+        }
+
+        if resp.ok {
+            info!(
+                robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                action = %req.action.audit_label(), addon = %plan.addon_id,
+                "robot control accepted"
+            );
+        } else {
+            warn!(
+                robot = %req.robot_id, actor = %req.actor_user_id, from = %from_node_id,
+                action = %req.action.audit_label(), addon = %plan.addon_id,
+                "robot control execution failed"
+            );
+        }
+
+        respond(resp)
     }
 
     async fn handle_web_research(&self, request_json: String) -> CommandResponse {
@@ -1796,6 +2011,111 @@ fn resolve_deploy_method(
     }
 }
 
+/// A single enabled robot-controlling addon instance candidate, distilled from
+/// the addon row + parsed manifest so the selection logic in
+/// [`select_robot_addon`] is pure and unit-testable without a DB.
+#[derive(Debug, Clone, PartialEq)]
+struct RobotAddonCandidate {
+    addon_id: String,
+    package_id: String,
+    max_velocity: f64,
+}
+
+/// Pure selection: pick the robot addon instance for `robot_id` from the set of
+/// enabled `[robot] controls_robot=true` candidates. Precise + unambiguous:
+///
+/// 1. EXACT addon-instance-id match (`addon_id == robot_id`) wins — the sender is
+///    expected to pass the concrete instance id, so this is unambiguous even with
+///    several go2-* instances installed.
+/// 2. Otherwise fall back to base/package-id match, but ONLY if exactly one
+///    candidate matches. If 2+ match, return `None` (UnknownRobot) rather than
+///    silently picking one — actuating the wrong robot would be unsafe.
+///
+/// Returns the resolved addon, plus a flag set when the package-id fallback was
+/// abandoned due to ambiguity (so the caller can `warn!`).
+fn select_robot_addon(
+    candidates: &[RobotAddonCandidate],
+    robot_id: &str,
+) -> (Option<crate::mesh::robot_control::ResolvedRobotAddon>, bool) {
+    if let Some(exact) = candidates.iter().find(|c| c.addon_id == robot_id) {
+        return (
+            Some(crate::mesh::robot_control::ResolvedRobotAddon {
+                addon_id: exact.addon_id.clone(),
+                max_velocity: exact.max_velocity,
+            }),
+            false,
+        );
+    }
+    let mut by_package = candidates.iter().filter(|c| {
+        let base = if c.package_id.is_empty() {
+            c.addon_id.as_str()
+        } else {
+            c.package_id.as_str()
+        };
+        base == robot_id
+    });
+    match (by_package.next(), by_package.next()) {
+        (Some(only), None) => (
+            Some(crate::mesh::robot_control::ResolvedRobotAddon {
+                addon_id: only.addon_id.clone(),
+                max_velocity: only.max_velocity,
+            }),
+            false,
+        ),
+        (Some(_), Some(_)) => (None, true),
+        _ => (None, false),
+    }
+}
+
+/// Deny-by-default resolver for the local robot-control addon owning `robot_id`.
+/// Enumerates INSTALLED + ENABLED addons, parses each manifest, keeps those
+/// carrying a `[robot] controls_robot=true` block, then defers to the pure
+/// [`select_robot_addon`] for the precise/unambiguous choice. The movement safety
+/// ceiling comes from `[robot.safety].max_linear_mps` (falling back to the
+/// protocol max). `None` → the caller rejects as UnknownRobot.
+fn resolve_robot_addon(
+    db: &DbPool,
+    robot_id: &str,
+) -> Option<crate::mesh::robot_control::ResolvedRobotAddon> {
+    let addons = crate::db::repository::list_addons(db).ok()?;
+    let mut candidates: Vec<RobotAddonCandidate> = Vec::new();
+    for a in addons {
+        if !a.is_enabled {
+            continue;
+        }
+        // `manifest_json` holds the RAW manifest.toml string.
+        let manifest = match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let Some(robot) = manifest.robot.as_ref() else {
+            continue;
+        };
+        if !robot.controls_robot {
+            continue;
+        }
+        let max_velocity = robot
+            .safety
+            .as_ref()
+            .and_then(|s| s.max_linear_mps)
+            .unwrap_or(crate::mesh::robot_control::MAX_VELOCITY);
+        candidates.push(RobotAddonCandidate {
+            addon_id: a.addon_id,
+            package_id: a.package_id,
+            max_velocity,
+        });
+    }
+    let (resolved, ambiguous) = select_robot_addon(&candidates, robot_id);
+    if ambiguous {
+        warn!(
+            robot = %robot_id,
+            "robot control: multiple enabled robot addons match the base/package id; \
+             refusing to pick one (pass the concrete addon instance id as robot_id)"
+        );
+    }
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1873,6 +2193,70 @@ mod tests {
             "spodziewano sie komunikatu o trust, mam: {}",
             err
         );
+    }
+
+    fn robot_candidate(addon_id: &str, package_id: &str, max_v: f64) -> RobotAddonCandidate {
+        RobotAddonCandidate {
+            addon_id: addon_id.to_string(),
+            package_id: package_id.to_string(),
+            max_velocity: max_v,
+        }
+    }
+
+    #[test]
+    fn select_robot_addon_exact_instance_id_wins() {
+        // Two go2 instances; robot_id is the concrete instance id → exact match,
+        // never ambiguous even though both share the go2 package id.
+        let cands = vec![
+            robot_candidate("go2-living-room", "go2", 0.5),
+            robot_candidate("go2-garage", "go2", 0.8),
+        ];
+        let (resolved, ambiguous) = select_robot_addon(&cands, "go2-garage");
+        assert!(!ambiguous);
+        let resolved = resolved.expect("exact match");
+        assert_eq!(resolved.addon_id, "go2-garage");
+        assert_eq!(resolved.max_velocity, 0.8);
+    }
+
+    #[test]
+    fn select_robot_addon_package_fallback_single_match() {
+        // Only one go2 instance, addressed by package/base id → unambiguous fallback.
+        let cands = vec![
+            robot_candidate("go2-only", "go2", 0.5),
+            robot_candidate("spot-1", "spot", 1.0),
+        ];
+        let (resolved, ambiguous) = select_robot_addon(&cands, "go2");
+        assert!(!ambiguous);
+        assert_eq!(resolved.expect("fallback").addon_id, "go2-only");
+    }
+
+    #[test]
+    fn select_robot_addon_ambiguous_package_match_returns_none() {
+        // Two enabled go2 instances addressed by package id → must NOT pick one.
+        let cands = vec![
+            robot_candidate("go2-a", "go2", 0.5),
+            robot_candidate("go2-b", "go2", 0.8),
+        ];
+        let (resolved, ambiguous) = select_robot_addon(&cands, "go2");
+        assert!(ambiguous, "two package matches must flag ambiguity");
+        assert!(resolved.is_none(), "ambiguous fallback must deny");
+    }
+
+    #[test]
+    fn select_robot_addon_no_match_is_unknown_robot() {
+        let cands = vec![robot_candidate("spot-1", "spot", 1.0)];
+        let (resolved, ambiguous) = select_robot_addon(&cands, "go2");
+        assert!(!ambiguous);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn select_robot_addon_empty_package_falls_back_to_addon_id() {
+        // An instance with no package_id is matched by its addon_id as the base.
+        let cands = vec![robot_candidate("go2", "", 0.5)];
+        let (resolved, ambiguous) = select_robot_addon(&cands, "go2");
+        assert!(!ambiguous);
+        assert_eq!(resolved.expect("base match").addon_id, "go2");
     }
 
     fn create_test_executor() -> MeshCommandExecutor {
