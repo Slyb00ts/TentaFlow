@@ -17582,6 +17582,109 @@ pub fn delete_camera_grants(pool: &DbPool, camera_id: &str) -> Result<usize> {
     Ok(n)
 }
 
+#[cfg(all(test, feature = "camera"))]
+mod camera_grant_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test db")
+    }
+
+    fn org() -> &'static str {
+        crate::services::org::DEFAULT_ORG_ID
+    }
+
+    fn seed_camera(pool: &DbPool, camera_id: &str, owner: &str, org_id: &str) {
+        insert_camera(
+            pool, camera_id, owner, "Cam", "webrtc", "", 30, 10, None, None, "C", "default",
+            None, None, None, Some(org_id),
+        )
+        .expect("seed camera");
+    }
+
+    #[test]
+    fn owner_reads_own_camera() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        assert!(can_read_camera(&db, "go2", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn non_owner_without_grant_is_denied() {
+        // The core IDOR case: an addon that neither owns nor was granted the
+        // camera must not be able to read it, even knowing the id.
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn grant_enables_read_and_revoke_disables_it() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        assert!(can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+        // A different, ungranted addon is still denied.
+        assert!(!can_read_camera(&db, "other", "cam1", Some(org())).unwrap());
+        assert_eq!(revoke_camera_grant(&db, "cam1", "tentavision", "read", org()).unwrap(), 1);
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn wildcard_grant_is_org_wide() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "*", "read", org(), "go2").unwrap();
+        assert!(can_read_camera(&db, "anyone", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn cross_org_grant_does_not_authorize() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        // The camera lives in the default org; a caller scoped to another org
+        // must not read it (cross-tenant isolation).
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some("org-other")).unwrap());
+    }
+
+    #[test]
+    fn removed_camera_is_invisible_and_grants_purged() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        assert!(soft_delete_camera(&db, "go2", "cam1", Some(org())).unwrap());
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+        assert!(list_camera_grants(&db, "cam1", org()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hard_delete_purges_grants() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        delete_camera_hard(&db, "go2", "cam1").unwrap();
+        assert!(list_camera_grants(&db, "cam1", org()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_accessible_returns_owned_and_granted_only() {
+        let db = db();
+        seed_camera(&db, "owned", "tentavision", org());
+        seed_camera(&db, "shared", "go2", org());
+        seed_camera(&db, "hidden", "other", org());
+        grant_camera(&db, "shared", "tentavision", "read", org(), "go2").unwrap();
+        let mut ids: Vec<String> = list_accessible_cameras(&db, "tentavision", Some(org()))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.camera_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["owned".to_string(), "shared".to_string()]);
+    }
+}
+
 /// Returns the configured AI analysis frame rate for one camera (`0` =
 /// unlimited / native cadence). Falls back to the default of `10` when the
 /// camera row is missing — the always-on analysis loop uses this to pace
