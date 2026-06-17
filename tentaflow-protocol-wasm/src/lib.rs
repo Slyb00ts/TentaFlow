@@ -7153,8 +7153,112 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "cbor", js_sys::Uint8Array::from(&bytes[..]).into());
         }
         MessageBody::MlStudioBody(payload) => decode_ml_studio_payload(&obj, payload),
+        MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
     }
     Ok(obj.into())
+}
+
+fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "robotId", r.robot_id.clone().into());
+    set(&obj, "robot_id", r.robot_id.clone().into());
+    set(&obj, "ownerNodeId", r.owner_node_id.clone().into());
+    set(&obj, "owner_node_id", r.owner_node_id.clone().into());
+    set(&obj, "isLocal", r.is_local.into());
+    set(&obj, "is_local", r.is_local.into());
+    match &r.kind {
+        Some(k) => set(&obj, "kind", k.clone().into()),
+        None => set(&obj, "kind", JsValue::NULL),
+    }
+    set(&obj, "status", r.status.clone().into());
+    match r.battery_percent {
+        Some(b) => {
+            set(&obj, "batteryPercent", (b as f64).into());
+            set(&obj, "battery_percent", (b as f64).into());
+        }
+        None => {
+            set(&obj, "batteryPercent", JsValue::NULL);
+            set(&obj, "battery_percent", JsValue::NULL);
+        }
+    }
+    match r.rtt_ms {
+        Some(rtt) => {
+            set(&obj, "rttMs", (rtt as f64).into());
+            set(&obj, "rtt_ms", (rtt as f64).into());
+        }
+        None => {
+            set(&obj, "rttMs", JsValue::NULL);
+            set(&obj, "rtt_ms", JsValue::NULL);
+        }
+    }
+    match &r.camera_id {
+        Some(c) => {
+            set(&obj, "cameraId", c.clone().into());
+            set(&obj, "camera_id", c.clone().into());
+        }
+        None => {
+            set(&obj, "cameraId", JsValue::NULL);
+            set(&obj, "camera_id", JsValue::NULL);
+        }
+    }
+    let caps = js_sys::Array::new();
+    for c in &r.capabilities {
+        caps.push(&JsValue::from(c.clone()));
+    }
+    set(&obj, "capabilities", caps.into());
+    obj
+}
+
+fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::RobotsPayload) {
+    use tentaflow_protocol::RobotsPayload as P;
+    match payload {
+        P::ListRequest(_) => set(obj, "variant", "RobotsListRequest".into()),
+        P::ListResponse(resp) => {
+            set(obj, "variant", "RobotsListResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &resp.robots {
+                arr.push(&robot_entry_to_js(r));
+            }
+            set(obj, "robots", arr.into());
+        }
+        P::ControlRequest(req) => {
+            set(obj, "variant", "RobotControlRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+            set(obj, "kind", req.action.kind.into());
+        }
+        P::ControlResponse(resp) => {
+            set(obj, "variant", "RobotControlResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.rejected {
+                Some(r) => set(obj, "rejected", r.into()),
+                None => set(obj, "rejected", JsValue::NULL),
+            }
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        P::CameraShareRequest(req) => {
+            set(obj, "variant", "RobotCameraShareRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+            set(obj, "cameraId", req.camera_id.clone().into());
+            set(obj, "camera_id", req.camera_id.into());
+        }
+        P::CameraShareResponse(resp) => {
+            set(obj, "variant", "RobotCameraShareResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            match resp.note {
+                Some(n) => set(obj, "note", n.into()),
+                None => set(obj, "note", JsValue::NULL),
+            }
+        }
+    }
 }
 
 fn ml_studio_summary_to_js(s: &tentaflow_protocol::MlStudioProjectSummary) -> js_sys::Object {
@@ -12336,4 +12440,55 @@ fn bind_ref_to_js(br: &tentaflow_sdk_spec::protocol::ui::bind::BindRef) -> Resul
         }
     }
     Ok(obj.into())
+}
+
+// ----- Robots core app -----
+
+/// MessageBody::RobotsBody(ListRequest) — org-scoped robot list.
+#[wasm_bindgen(js_name = encodeRobotsListRequest)]
+pub fn encode_robots_list_request() -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotsListRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::ListRequest(
+        RobotsListRequest,
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action to
+/// the robot's owning node. `kind` is one of: "move", "stop", "estop",
+/// "reset_estop", "recovery_stand", "stand_up", "stand_down", "sit", "hello",
+/// "stretch", "status". The `vx`/`vy`/`vyaw` axes apply to "move" only.
+#[wasm_bindgen(js_name = encodeRobotControlRequest)]
+pub fn encode_robot_control_request(
+    robot_id: String,
+    kind: String,
+    vx: f64,
+    vy: f64,
+    vyaw: f64,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotActionWire, RobotControlRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::ControlRequest(
+        RobotControlRequest {
+            robot_id,
+            action: RobotActionWire { kind, vx, vy, vyaw },
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
+/// TentaVision (local grant) or surface the remote-view note (remote robot).
+#[wasm_bindgen(js_name = encodeRobotCameraShareRequest)]
+pub fn encode_robot_camera_share_request(
+    robot_id: String,
+    camera_id: String,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotCameraShareRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::CameraShareRequest(
+        RobotCameraShareRequest {
+            robot_id,
+            camera_id,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
 }

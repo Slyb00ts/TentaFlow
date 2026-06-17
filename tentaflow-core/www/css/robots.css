@@ -1,0 +1,127 @@
+/* =============================================================================
+   Plik: robots.css
+   Opis: Style modułu Roboty — siatka kart robotów wykrytych w sieci mesh:
+         nagłówek karty ze statusem, metryki (bateria/RTT/węzeł), chipy
+         możliwości, kafelek live kamery oraz rząd przycisków sterowania.
+   ============================================================================= */
+
+.robots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.robots-loading {
+  display: flex;
+  justify-content: center;
+  padding: 48px 0;
+}
+
+.robots-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.robots-card-top {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.robots-card-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-glow);
+  color: var(--accent-2);
+}
+
+.robots-card-ico .icon {
+  width: 22px;
+  height: 22px;
+}
+
+.robots-card-name {
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.robots-card-kind {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.robots-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.robots-metric {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.robots-metric-ico {
+  display: inline-flex;
+  color: var(--text-3);
+}
+
+.robots-metric-ico .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.robots-metric-label {
+  color: var(--text-2);
+}
+
+.robots-metric-value {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.robots-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.robots-camera {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.robots-camera tf-live-camera-tile {
+  display: block;
+  width: 100%;
+  height: 180px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-2);
+}
+
+.robots-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}

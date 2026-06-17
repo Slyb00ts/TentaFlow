@@ -11,7 +11,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use tentaflow_sdk_spec::{RobotActionWire, RobotControlResponseWire, RobotDispatchInput};
+use tentaflow_sdk_spec::{RobotControlResponseWire, RobotDispatchInput};
 
 use super::abi_helpers::PayloadKind;
 use super::cbor_io::{read_input_cbor, write_cbor_capped};
@@ -37,30 +37,6 @@ fn audit(state: &AddonState, resource: Option<&str>, result: &str, reason: Optio
         result,
         reason,
     );
-}
-
-/// Map the SDK wire action to the core `RobotAction` allowlist. An unknown `kind`
-/// returns `None` so the host refuses it (the allowlist is closed — a controller
-/// can never smuggle an arbitrary command through this path).
-fn to_action(wire: &RobotActionWire) -> Option<RobotAction> {
-    Some(match wire.kind.as_str() {
-        "move" => RobotAction::Move {
-            vx: wire.vx,
-            vy: wire.vy,
-            vyaw: wire.vyaw,
-        },
-        "stop" => RobotAction::Stop,
-        "estop" => RobotAction::Estop,
-        "reset_estop" => RobotAction::ResetEstop,
-        "recovery_stand" => RobotAction::RecoveryStand,
-        "stand_up" => RobotAction::StandUp,
-        "stand_down" => RobotAction::StandDown,
-        "sit" => RobotAction::Sit,
-        "hello" => RobotAction::Hello,
-        "stretch" => RobotAction::Stretch,
-        "status" => RobotAction::Status,
-        _ => return None,
-    })
 }
 
 /// Stable refusal tag for the wire response (greppable, language-neutral).
@@ -110,7 +86,7 @@ pub fn robot_dispatch_v1(
             }
         };
 
-    let action = match to_action(&input.action) {
+    let action = match RobotAction::from_wire(&input.action) {
         Some(a) => a,
         None => {
             audit(

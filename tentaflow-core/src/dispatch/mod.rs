@@ -38,6 +38,7 @@ pub mod metrics;
 pub mod ml_studio;
 pub mod recorder;
 pub mod resume_token;
+pub mod robots;
 pub mod role_catalog;
 pub mod run_events;
 pub mod state;
@@ -550,6 +551,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(_) => {
                 "MlStudioProjectTypesListResponse"
             }
+        },
+        MessageBody::RobotsBody(p) => match p {
+            tentaflow_protocol::RobotsPayload::ListRequest(_) => "RobotsListRequest",
+            tentaflow_protocol::RobotsPayload::ListResponse(_) => "RobotsListResponse",
+            tentaflow_protocol::RobotsPayload::ControlRequest(_) => "RobotControlRequest",
+            tentaflow_protocol::RobotsPayload::ControlResponse(_) => "RobotControlResponse",
+            tentaflow_protocol::RobotsPayload::CameraShareRequest(_) => "RobotCameraShareRequest",
+            tentaflow_protocol::RobotsPayload::CameraShareResponse(_) => "RobotCameraShareResponse",
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",
