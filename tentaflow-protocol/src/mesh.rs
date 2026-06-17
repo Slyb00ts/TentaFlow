@@ -563,9 +563,6 @@ pub enum MeshCommandResponsePayload {
         height: u32,
         error: Option<String>,
     },
-    /// ML Studio: status zdalnego eksportu GGUF (JSON: status/gguf_path/error)
-    /// produkowany przez odbiorcę.
-    MlExportStatusResult { status_json: String },
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
@@ -582,6 +579,9 @@ pub enum MeshCommandResponsePayload {
         account_label: Option<String>,
         error: Option<String>,
     },
+    /// ML Studio: status zdalnego eksportu GGUF (JSON: status/gguf_path/error)
+    /// produkowany przez odbiorcę. Appended at END (kolejność = wire compat).
+    MlExportStatusResult { status_json: String },
 }
 
 impl std::fmt::Debug for MeshCommandType {

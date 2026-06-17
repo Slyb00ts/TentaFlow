@@ -255,6 +255,13 @@ pub fn is_mesh_export(export_id: &str) -> bool {
 /// `spec_json` (adapter_path/base_model/outtype/export_id). Adapter MUSI być na
 /// tym węźle (tu został wytrenowany). Inicjator (A) odpytuje przez `MlExportStatus`.
 pub async fn mesh_export_start(export_id: &str, spec_json: &str) -> anyhow::Result<()> {
+    // Fail-closed walidacja export_id (przychodzi od peera) — [A-Za-z0-9._-], ≤128.
+    if export_id.is_empty()
+        || export_id.len() > 128
+        || !export_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        anyhow::bail!("invalid export_id");
+    }
     let spec: Value = serde_json::from_str(spec_json)
         .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
     let adapter_path = spec.get("adapter_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -287,7 +294,19 @@ pub async fn mesh_export_status(export_id: &str) -> anyhow::Result<String> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("nieznany eksport mesh: {}", export_id))?;
     let url = format!("{}/export_status/{}", base, job_id);
-    tokio::task::spawn_blocking(move || get_export_status_raw(&url)).await?
+    let status_json = tokio::task::spawn_blocking(move || get_export_status_raw(&url)).await??;
+    // Sprzątanie: po stanie terminalnym usuwamy wpis z mapy (bez wycieku na życie procesu).
+    let terminal = serde_json::from_str::<Value>(&status_json)
+        .ok()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+        .map(|s| s == "succeeded" || s == "failed")
+        .unwrap_or(false);
+    if terminal {
+        if let Ok(mut m) = mesh_exports().lock() {
+            m.remove(export_id);
+        }
+    }
+    Ok(status_json)
 }
 
 /// A-side: eksport GGUF modelu, którego adapter żyje na węźle `target` (mesh).

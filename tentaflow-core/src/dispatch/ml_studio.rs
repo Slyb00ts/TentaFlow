@@ -2249,11 +2249,9 @@ pub fn ml_studio_ft_export_start(
         .filter(|s| !s.is_empty() && *s != local_node)
         .map(str::to_string);
 
-    // Oznacz model jako eksportowany ZANIM odpalimy task — UI od razu widzi
-    // `running`, a task w tle merguje finalny stan.
-    let running_metrics = set_export_status_running(&metrics);
-    repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
-
+    // Preflight (mesh/trust) PRZED oznaczeniem `running` — inaczej nieudany
+    // preflight zostawiłby model na zawsze w `running` (task piszący `failed`
+    // nigdy nie wystartował).
     match model_node {
         Some(node) => {
             let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
@@ -2266,6 +2264,9 @@ pub fn ml_studio_ft_export_start(
             if !security.is_trusted(&node) {
                 return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
             }
+            // Preflight OK → dopiero teraz oznacz `running` i odpal task.
+            let running_metrics = set_export_status_running(&metrics);
+            repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
             crate::ml_studio::export_llm::spawn_ft_export_mesh(
                 iroh,
                 node,
@@ -2277,6 +2278,8 @@ pub fn ml_studio_ft_export_start(
             );
         }
         None => {
+            let running_metrics = set_export_status_running(&metrics);
+            repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
             crate::ml_studio::export_llm::spawn_ft_export(
                 payload.model_id.clone(),
                 model.base_model.clone(),
