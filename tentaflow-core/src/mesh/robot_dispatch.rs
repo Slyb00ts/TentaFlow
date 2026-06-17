@@ -258,6 +258,37 @@ pub fn build_request(
     }
 }
 
+/// Bind an announce to its transport-authenticated sender: a trusted node must
+/// not advertise robots on behalf of another node id. Returns the registry key
+/// to use (the transport `from_node_id`) only when the self-claimed payload
+/// `from_node_id` matches it AND it is not our own echo; otherwise `None` (drop).
+/// PURE — mirrors the pipeline receive-handler guard for unit testing.
+pub fn bind_announce_sender<'a>(
+    payload_from_node_id: &str,
+    transport_from_node_id: &'a str,
+    local_node_id: &str,
+) -> Option<&'a str> {
+    if payload_from_node_id == local_node_id {
+        return None;
+    }
+    if payload_from_node_id != transport_from_node_id {
+        return None;
+    }
+    Some(transport_from_node_id)
+}
+
+/// Outbound trust gate decision (PURE). Given whether the target node is
+/// currently trusted, returns `Some(rejected(UntrustedPeer))` when the send must
+/// be refused, or `None` when it may proceed. Keeps the trust→reject mapping
+/// unit-testable without a live mesh handle.
+pub fn gate_untrusted_send(target_trusted: bool) -> Option<RobotControlResponse> {
+    if target_trusted {
+        None
+    } else {
+        Some(RobotControlResponse::rejected(RejectReason::UntrustedPeer))
+    }
+}
+
 /// The mesh-send dependency, abstracted so the routing decision is testable with
 /// a fake. The real impl forwards the CBOR-encoded request to the owning node as
 /// `MeshCommandType::RobotControl` and decodes the `RobotControlResult`.
@@ -291,6 +322,13 @@ impl RobotCommandSender for MeshRobotSender {
         node_id: &str,
         request: &RobotControlRequest,
     ) -> anyhow::Result<RobotControlResponse> {
+        // Outbound trust gate: never send a robot command to a node we no longer
+        // trust. A stale/revoked owner entry (until the registry cleanup lands)
+        // must not receive a command — refuse before touching the wire.
+        if let Some(rejection) = gate_untrusted_send(self.mesh.is_trusted(node_id)) {
+            warn!(node = %node_id, "robot dispatch: target node untrusted — refusing send");
+            return Ok(rejection);
+        }
         let mut request_cbor = Vec::new();
         ciborium::ser::into_writer(request, &mut request_cbor)
             .map_err(|e| anyhow::anyhow!("encode robot control request: {e}"))?;
@@ -589,6 +627,204 @@ mod tests {
         assert_eq!(fake.target(), None);
         let resp = RobotControlResponse::rejected(RejectReason::UnknownRobot);
         assert_eq!(resp.rejected, Some(RejectReason::UnknownRobot));
+    }
+
+    // ----- announce transport (cbor roundtrip + receive-handler logic) -----
+
+    #[test]
+    fn announce_payload_cbor_roundtrip() {
+        let payload = RobotsAnnouncePayload {
+            from_node_id: "node-b".to_string(),
+            robots: vec![
+                ad("go2-garage", "go2", "node-b"),
+                ad("spot-1", "spot", "node-b"),
+            ],
+        };
+        let bytes = crate::mesh::cbor::encode(&payload).expect("encode");
+        let back: RobotsAnnouncePayload = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn announce_payload_empty_roundtrip() {
+        let payload = RobotsAnnouncePayload {
+            from_node_id: "node-b".to_string(),
+            robots: vec![],
+        };
+        let bytes = crate::mesh::cbor::encode(&payload).expect("encode");
+        let back: RobotsAnnouncePayload = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, payload);
+        assert!(back.robots.is_empty());
+    }
+
+    /// Mirrors the pipeline receive-handler logic: a trusted peer's announce
+    /// for a DIFFERENT node populates that node's entry via `replace_node`.
+    #[test]
+    fn receive_handler_replace_node_populates_registry() {
+        let reg = MeshRobotRegistry::new();
+        let local = "node-local";
+        let payload = RobotsAnnouncePayload {
+            from_node_id: "node-b".to_string(),
+            robots: vec![ad("go2-garage", "go2", "node-b")],
+        };
+        // Decode -> self-check -> replace_node (the handler body, sans the
+        // trust gate which lives in the pipeline).
+        assert_ne!(payload.from_node_id, local);
+        reg.replace_node(&payload.from_node_id, payload.robots.clone());
+
+        let advertised = reg.all();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(
+            select_robot_owner(&advertised, "go2-garage", local),
+            RobotOwner::Remote("node-b".to_string())
+        );
+    }
+
+    /// A self-announce (from_node_id == local) is ignored: the handler skips
+    /// `replace_node`, so the registry is never overwritten by an echo of our
+    /// own broadcast.
+    #[test]
+    fn receive_handler_ignores_self_announce() {
+        let reg = MeshRobotRegistry::new();
+        let local = "node-local";
+        // Local node owns go2 (set by the advertiser).
+        reg.replace_local(local, vec![ad("go2", "go2", local)]);
+
+        let echo = RobotsAnnouncePayload {
+            from_node_id: local.to_string(),
+            robots: vec![],
+        };
+        // Handler guard: from_node_id == local -> skip replace_node entirely.
+        if echo.from_node_id != local {
+            reg.replace_node(&echo.from_node_id, echo.robots);
+        }
+        // Local entry survives the echo.
+        assert_eq!(reg.all().len(), 1);
+        assert_eq!(
+            select_robot_owner(&reg.all(), "go2", local),
+            RobotOwner::Local
+        );
+    }
+
+    /// The announce discriminant must not collide with any other mesh message
+    /// type and must be the documented byte.
+    #[test]
+    fn announce_discriminant_is_unique() {
+        use tentaflow_protocol::mesh as m;
+        assert_eq!(m::MESH_MSG_ROBOTS_ANNOUNCE, 0x4E);
+        let others = [
+            m::MESH_MSG_HEARTBEAT,
+            m::MESH_MSG_FORWARD_REQ,
+            m::MESH_MSG_MODEL_LIST,
+            m::MESH_MSG_NODE_INFO,
+            m::MESH_MSG_HELLO,
+            m::MESH_MSG_TOPOLOGY_ANNOUNCE,
+            m::MESH_MSG_KNOWN_PEERS,
+            m::MESH_MSG_PAIRING_REQUEST,
+            m::MESH_MSG_PAIRING_CONFIRM,
+            m::MESH_MSG_PAIRING_REJECT,
+            m::MESH_MSG_TRUST_REVOKED,
+            m::MESH_MSG_TRUSTED_KEYS_SYNC,
+            m::MESH_MSG_COMMAND,
+            m::MESH_MSG_COMMAND_RESPONSE,
+            m::MESH_MSG_DEPLOY_PROGRESS,
+            m::MESH_MSG_LOG_CHUNK,
+            m::MESH_MSG_STORAGE_PROXY_REQUEST,
+            m::MESH_MSG_STORAGE_PROXY_RESPONSE,
+            m::MESH_MSG_NODE_LEAVING,
+            m::MESH_MSG_FORWARD_STREAM_REQ,
+            m::MESH_MSG_ALIAS_SYNC,
+            m::MESH_MSG_SERVICES_GET,
+            m::MESH_MSG_SERVICES_GET_RESPONSE,
+            m::MESH_MSG_SERVICES_ANNOUNCE,
+            m::MESH_MSG_SERVICES_UPDATE,
+            m::MESH_MSG_HMAC_KEYS_SYNC,
+            m::MESH_MSG_FRAME_PROXY_REQUEST,
+            m::MESH_MSG_FRAME_PROXY_RESPONSE,
+            m::MESH_MSG_SYNC_PUSH,
+            m::MESH_MSG_SYNC_ACK,
+            m::MESH_MSG_SYNC_PULL,
+            m::MESH_MSG_SYNC_PULL_RESPONSE,
+            m::MESH_MSG_SYNC_SNAPSHOT_PULL,
+            m::MESH_MSG_SYNC_SNAPSHOT_RESPONSE,
+            m::MESH_MSG_ROUTING_SYNC,
+        ];
+        assert!(
+            !others.contains(&m::MESH_MSG_ROBOTS_ANNOUNCE),
+            "MESH_MSG_ROBOTS_ANNOUNCE collides with an existing mesh discriminant"
+        );
+    }
+
+    // ----- FIX 3: announce identity binding -----
+
+    #[test]
+    fn bind_announce_accepts_matching_sender() {
+        // payload.from_node_id == transport sender, not local → key on transport.
+        assert_eq!(
+            bind_announce_sender("node-b", "node-b", "node-local"),
+            Some("node-b")
+        );
+    }
+
+    #[test]
+    fn bind_announce_drops_spoofed_sender() {
+        // A trusted node-b advertising robots "on behalf of" node-c is dropped.
+        assert_eq!(
+            bind_announce_sender("node-c", "node-b", "node-local"),
+            None
+        );
+    }
+
+    #[test]
+    fn bind_announce_drops_self_echo() {
+        // Our own broadcast echoed back is ignored.
+        assert_eq!(
+            bind_announce_sender("node-local", "node-local", "node-local"),
+            None
+        );
+    }
+
+    #[test]
+    fn receive_handler_keys_on_transport_id_not_payload() {
+        // The registry must end up keyed by the transport sender. A matching
+        // announce populates that node; a spoofed one leaves the registry empty.
+        let reg = MeshRobotRegistry::new();
+        let local = "node-local";
+
+        let spoof = RobotsAnnouncePayload {
+            from_node_id: "node-c".to_string(),
+            robots: vec![ad("go2", "go2", "node-c")],
+        };
+        if let Some(key) = bind_announce_sender(&spoof.from_node_id, "node-b", local) {
+            reg.replace_node(key, spoof.robots);
+        }
+        assert!(reg.all().is_empty(), "spoofed announce must not populate registry");
+
+        let honest = RobotsAnnouncePayload {
+            from_node_id: "node-b".to_string(),
+            robots: vec![ad("go2-garage", "go2", "node-b")],
+        };
+        if let Some(key) = bind_announce_sender(&honest.from_node_id, "node-b", local) {
+            reg.replace_node(key, honest.robots);
+        }
+        assert_eq!(
+            select_robot_owner(&reg.all(), "go2-garage", local),
+            RobotOwner::Remote("node-b".to_string())
+        );
+    }
+
+    // ----- FIX 2: outbound trust gate -----
+
+    #[test]
+    fn untrusted_target_is_rejected_without_sending() {
+        let rejection = gate_untrusted_send(false).expect("untrusted must reject");
+        assert_eq!(rejection.rejected, Some(RejectReason::UntrustedPeer));
+        assert!(!rejection.ok);
+    }
+
+    #[test]
+    fn trusted_target_passes_the_gate() {
+        assert!(gate_untrusted_send(true).is_none());
     }
 
     #[test]

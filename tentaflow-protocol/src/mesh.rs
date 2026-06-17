@@ -766,6 +766,12 @@ pub const MESH_MSG_SYNC_SNAPSHOT_RESPONSE: u8 = 0x4C;
 /// czlonkowie) po mutacji create/update/delete. Odbiorca tylko zapisuje
 /// snapshot lokalnie — nigdy nie re-broadcastuje (anty-petla).
 pub const MESH_MSG_ROUTING_SYNC: u8 = 0x4D;
+/// Periodyczny anti-drift broadcast pelnego zestawu robotow nalezacych do
+/// tego noda (`RobotsAnnouncePayload`). Mirror `MESH_MSG_SERVICES_ANNOUNCE` —
+/// odbiorca robi `replace_node` w in-memory rejestrze robotow, dzieki czemu
+/// resolver `resolve_robot_owner` widzi, ktory node posiada dany robot.
+/// Trusted-peer only (nie ma go na liscie pre-trust).
+pub const MESH_MSG_ROBOTS_ANNOUNCE: u8 = 0x4E;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
