@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,13 @@ use crate::mesh::robot_control::{
 /// Default validity window for a NON-move action: a few seconds is ample for the
 /// command to reach the owner and execute, while still bounding replay.
 pub const DEFAULT_COMMAND_WINDOW_MS: u64 = 4_000;
+
+/// Hard deadline for a single robot `<package>.status` tool call during an
+/// advertisement refresh. The status read runs the addon's wasmtime instance,
+/// which may be busy or blocked on its own network call to an unreachable robot;
+/// a slow/hung instance must NOT stall the refresh (and, by extension, the mesh).
+/// On timeout the robot is treated exactly like the offline path: not advertised.
+const STATUS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A robot advertised on the mesh: which logical robot exists and which node owns
 /// it (has the physical link + the enabled `[robot]` addon). Compact on purpose —
@@ -134,81 +141,125 @@ pub fn global() -> &'static MeshRobotRegistry {
 /// Build this node's advertisement from its enabled robot addons and publish it
 /// into the global registry under `local_node_id`. Returns the list so the caller
 /// can also CBOR-encode + broadcast it to trusted peers.
-pub fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Vec<AdvertisedRobot> {
-    // The camera id lives in the robot addon's PRIVATE SQLite (`robot.camera_id`),
-    // which Core does not read directly. Resolve it through the addon's read-only
-    // `<package>.status` tool when the dispatch context (addon manager) is wired.
-    // This runs ~every 600 heartbeats, so a read-only tool call per owned robot is
-    // acceptable. A robot with no camera yet (or no wired context) stays `None`.
+pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Vec<AdvertisedRobot> {
+    // Ownership means PHYSICALLY CONNECTED, not merely installed. A node that has
+    // the robot addon installed but no live link (e.g. no physical access) must
+    // NOT advertise the robot, otherwise it would wrongly resolve itself as owner
+    // and never route control to the node that actually holds the connection.
+    //
+    // The connection state AND the camera id both live in the robot addon's
+    // PRIVATE SQLite, which Core does not read directly. Both are resolved through
+    // the addon's read-only `<package>.status` tool: its result carries `status`
+    // ("online" == connected) and `camera_id`. A robot whose status is not online
+    // is dropped from the advertisement entirely. This runs frequently (~every
+    // 10 s), so a read-only tool call per owned robot is acceptable.
     let addon_manager = dispatch_context().map(|c| c.addon_manager);
-    let robots: Vec<AdvertisedRobot> = crate::mesh::command_executor::collect_local_robot_addons(db)
-        .into_iter()
-        .map(|c| {
-            let camera_id = addon_manager
-                .as_ref()
-                .and_then(|am| {
-                    resolve_robot_camera_id(am, &c.addon_id, &c.package_id, local_node_id)
-                });
-            // Tenant of this robot, read from the running addon instance's
-            // `AddonState` (the only place a robot addon's org lives — the DB
-            // `addons` row is org-agnostic). An instance with no org context
-            // (system/boot start) advertises an empty org_id, which the
-            // requester-side scope check treats as a non-match.
-            let org_id = addon_manager
-                .as_ref()
-                .and_then(|am| am.instance_org_id(&c.addon_id))
-                .unwrap_or_default();
-            AdvertisedRobot {
-                robot_id: c.addon_id,
-                package_id: c.package_id,
-                kind: c.kind,
-                node_id: local_node_id.to_string(),
-                org_id,
-                camera_id,
-            }
-        })
-        .collect();
+    let candidates = crate::mesh::command_executor::collect_local_robot_addons(db);
+    let mut robots: Vec<AdvertisedRobot> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        // Without a wired addon manager we cannot read the status tool, so we
+        // cannot prove the robot is connected — do not advertise it.
+        let Some(am) = addon_manager.as_ref() else {
+            break;
+        };
+        let (is_online, status_camera_id) =
+            read_robot_status(am, &c.addon_id, &c.package_id).await;
+        if !is_online {
+            continue;
+        }
+        // A successful online status may still omit camera_id (no camera yet);
+        // preserve the last-known one across a transient camera gap so the
+        // remote tile does not flicker. A genuine empty camera_id from an
+        // online robot is honored.
+        let camera_id =
+            status_camera_id.or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
+        // Tenant of this robot, read from the running addon instance's
+        // `AddonState` (the only place a robot addon's org lives — the DB
+        // `addons` row is org-agnostic). An instance with no org context
+        // (system/boot start) advertises an empty org_id, which the
+        // requester-side scope check treats as a non-match.
+        let org_id = am.instance_org_id(&c.addon_id).unwrap_or_default();
+        robots.push(AdvertisedRobot {
+            robot_id: c.addon_id,
+            package_id: c.package_id,
+            kind: c.kind,
+            node_id: local_node_id.to_string(),
+            org_id,
+            camera_id,
+        });
+    }
     global().replace_local(local_node_id, robots.clone());
     robots
 }
 
-/// Pull a robot addon's current `camera_id` out of its read-only `status` tool.
-/// The tool name is `<package_id>.status` (e.g. `go2.status`) and its JSON result
-/// carries `camera_id`; an empty string or a missing/non-string field is treated
-/// as "no camera yet" (`None`). System-initiated call (advertiser), so it goes
-/// through `call_tool_preauthorized` — the advertiser already owns this local
-/// addon and the `status` tool is read-only.
+/// Read a robot addon's read-only `<package>.status` tool and extract whether it
+/// is physically connected plus its current camera id. A tool failure is treated
+/// as NOT online (the robot cannot be proven connected, so it must not be
+/// advertised as owned) and is logged so a broken status tool is diagnosable. The
+/// online/camera parse itself is the PURE `parse_status_online` helper.
 ///
-/// On a TRANSIENT status-tool failure the last-known advertised camera_id for
-/// this robot is preserved instead of clearing it to `None` — a clear would make
-/// the remote dashboard tile vanish until the next ~600-heartbeat refresh. Only a
-/// SUCCESSFUL status call returning an empty camera_id clears it (genuine
-/// removal). The failure is logged (warn) so a broken status tool is diagnosable.
-fn resolve_robot_camera_id(
+/// `call_tool_preauthorized` is a synchronous, BLOCKING wasmtime call: it can hang
+/// if the addon instance is busy (e.g. its `on_tick` is stuck on a network call to
+/// an unreachable robot). It therefore runs on the blocking pool under a hard
+/// `STATUS_CALL_TIMEOUT`. Timeout OR error → treat the robot as NOT online, so a
+/// slow/hung instance can never stall the refresh loop.
+async fn read_robot_status(
     addon_manager: &Arc<crate::addon::AddonManager>,
     addon_id: &str,
     package_id: &str,
-    local_node_id: &str,
-) -> Option<String> {
+) -> (bool, Option<String>) {
     let tool = format!("{package_id}.status");
-    match addon_manager.call_tool_preauthorized(
-        addon_id,
-        &tool,
-        serde_json::Value::Null,
-        "system",
-    ) {
-        Ok(result) => parse_status_camera_id(&result),
-        Err(e) => {
-            let last_known = last_advertised_camera_id(addon_id, local_node_id);
+    let am = addon_manager.clone();
+    let addon = addon_id.to_string();
+    let tool_name = tool.clone();
+    let join = tokio::time::timeout(
+        STATUS_CALL_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            am.call_tool_preauthorized(&addon, &tool_name, serde_json::Value::Null, "system")
+        }),
+    )
+    .await;
+    match join {
+        Ok(Ok(Ok(result))) => parse_status_online(&result),
+        Ok(Ok(Err(e))) => {
             warn!(
                 addon = %addon_id,
                 tool = %tool,
-                preserved_camera = last_known.is_some(),
-                "robot advertise: status tool failed; preserving last-known camera_id: {e}"
+                "robot advertise: status tool failed; treating robot as offline: {e}"
             );
-            last_known
+            (false, None)
+        }
+        Ok(Err(e)) => {
+            warn!(
+                addon = %addon_id,
+                tool = %tool,
+                "robot advertise: status task panicked; treating robot as offline: {e}"
+            );
+            (false, None)
+        }
+        Err(_) => {
+            warn!(
+                addon = %addon_id,
+                tool = %tool,
+                "robot advertise: status tool timed out; treating robot as offline"
+            );
+            (false, None)
         }
     }
+}
+
+/// PURE extraction of `(is_online, camera_id)` from a `status` tool result. The
+/// robot is online iff its `status` field, trimmed and compared case-insensitively,
+/// equals "online" (the same gate the go2 addon's `send_sport_gated` uses to decide
+/// local-vs-remote). Any other or missing value fails to offline. `camera_id` is a
+/// non-empty string or `None`.
+fn parse_status_online(status: &serde_json::Value) -> (bool, Option<String>) {
+    let is_online = status
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().eq_ignore_ascii_case("online"))
+        .unwrap_or(false);
+    (is_online, parse_status_camera_id(status))
 }
 
 /// Last camera_id THIS node advertised for `addon_id` (its robot_id), read from
@@ -225,6 +276,21 @@ fn last_advertised_camera_id(addon_id: &str, local_node_id: &str) -> Option<Stri
         .into_iter()
         .find(|r| r.robot_id == addon_id && r.node_id == local_node_id)
         .and_then(|r| r.camera_id)
+}
+
+/// Sort an advertised-robot list by a stable key (`robot_id`, then `node_id`) so
+/// the change-detection comparison in the periodic broadcaster is order-insensitive.
+/// `collect_local_robot_addons` does not guarantee a stable order, so comparing the
+/// raw `Vec` would spuriously detect a "change" every cycle and rebroadcast to all
+/// peers. Sorting both the new and the last-broadcast snapshot makes the comparison
+/// a set comparison without allocating a set. PURE.
+pub fn sort_advertised(mut robots: Vec<AdvertisedRobot>) -> Vec<AdvertisedRobot> {
+    robots.sort_by(|a, b| {
+        a.robot_id
+            .cmp(&b.robot_id)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    robots
 }
 
 /// PURE extraction of a non-empty `camera_id` from a `status` tool result.
@@ -349,15 +415,18 @@ pub fn select_robot_owner(
     }
 }
 
-/// Resolve the owner of `robot_id`. Local short-circuits on the DB (the
-/// authoritative local check via `resolve_robot_addon`) so a controller that also
-/// owns the robot never needs an advertisement to find itself. Otherwise defers
-/// to the PURE `select_robot_owner` over the advertised registry; an ambiguous
-/// match warns and returns `Unknown` (never actuate the wrong node's robot).
-pub fn resolve_robot_owner(db: &DbPool, local_node_id: &str, robot_id: &str) -> RobotOwner {
-    if crate::mesh::command_executor::resolve_robot_addon(db, robot_id).is_some() {
-        return RobotOwner::Local;
-    }
+/// Resolve the owner of `robot_id`. Ownership means PHYSICALLY CONNECTED, which
+/// is surfaced as an advertisement: a node only advertises a robot it can prove is
+/// online (see `refresh_local_advertisement`). So ownership is decided PURELY over
+/// the advertised registry via `select_robot_owner` — `Local` iff THIS node
+/// advertises the robot online, never merely because the addon is installed (an
+/// installed-but-offline node must route control to whoever holds the link). An
+/// ambiguous match (2+ nodes advertise the same id) warns and returns `Unknown`.
+///
+/// `db` is unused here intentionally: the installed-based DB check is the wrong
+/// signal for ownership; the INSTALLED addon is still resolved later by the
+/// Local-execute path and the receiver (which run only after ownership is known).
+pub fn resolve_robot_owner(_db: &DbPool, local_node_id: &str, robot_id: &str) -> RobotOwner {
     let advertised = global().all();
     let owner = select_robot_owner(&advertised, robot_id, local_node_id);
     if owner == RobotOwner::Unknown {
@@ -640,6 +709,60 @@ mod tests {
     fn parse_status_camera_id_missing_is_none() {
         let status = serde_json::json!({ "status": "offline" });
         assert_eq!(parse_status_camera_id(&status), None);
+    }
+
+    // ----- status online + camera parse (PURE) -----
+
+    #[test]
+    fn parse_status_online_true_with_camera() {
+        let status = serde_json::json!({ "status": "online", "camera_id": "cam-uuid" });
+        assert_eq!(parse_status_online(&status), (true, Some("cam-uuid".to_string())));
+    }
+
+    #[test]
+    fn parse_status_online_true_without_camera() {
+        let status = serde_json::json!({ "status": "online", "camera_id": "" });
+        assert_eq!(parse_status_online(&status), (true, None));
+    }
+
+    #[test]
+    fn parse_status_offline_is_not_online() {
+        let status = serde_json::json!({ "status": "offline", "camera_id": "cam-uuid" });
+        // Even with a camera id, an offline robot is not online (not advertised).
+        assert_eq!(parse_status_online(&status), (false, Some("cam-uuid".to_string())));
+    }
+
+    #[test]
+    fn parse_status_connecting_is_not_online() {
+        let status = serde_json::json!({ "status": "connecting" });
+        assert_eq!(parse_status_online(&status), (false, None));
+    }
+
+    #[test]
+    fn parse_status_online_is_case_and_whitespace_tolerant() {
+        // Mixed case and surrounding whitespace still count as online.
+        for s in ["Online", " online ", "ONLINE", "\tOnLiNe\n"] {
+            let status = serde_json::json!({ "status": s });
+            assert_eq!(
+                parse_status_online(&status),
+                (true, None),
+                "status {s:?} should parse as online"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_status_non_online_value_is_offline() {
+        // A value that merely contains "online" but is not exactly it stays offline.
+        let status = serde_json::json!({ "status": "online-but-degraded" });
+        assert_eq!(parse_status_online(&status), (false, None));
+    }
+
+    #[test]
+    fn parse_status_missing_field_is_not_online() {
+        // A status-tool error result (only an "error" key) is not online.
+        let status = serde_json::json!({ "error": "robot not found" });
+        assert_eq!(parse_status_online(&status), (false, None));
     }
 
     // ----- resolver selection (PURE) -----
@@ -1127,6 +1250,86 @@ mod tests {
 
         global().remove_node(local);
         global().remove_node(remote);
+    }
+
+    // ----- CHANGE 2: ownership = advertised(online), not installed -----
+
+    /// A node that has the robot addon INSTALLED but does NOT advertise it (robot
+    /// offline) must NOT resolve as Local. With a single remote peer advertising
+    /// the robot online, ownership resolves to that Remote node. The new
+    /// `resolve_robot_owner` is driven purely by the advertised registry, so this
+    /// is the exact decision it makes over `global().all()`.
+    #[test]
+    fn installed_but_not_advertised_resolves_remote() {
+        let robot = "chg2-go2";
+        let local = "chg2-node-local";
+        let remote = "chg2-node-remote";
+
+        // Local node does NOT advertise (installed but robot offline). A remote
+        // node advertises it online.
+        global().replace_node(remote, vec![ad(robot, "go2", remote)]);
+        assert_eq!(
+            select_robot_owner(&global().all(), robot, local),
+            RobotOwner::Remote(remote.to_string())
+        );
+
+        global().remove_node(remote);
+    }
+
+    /// When THIS node advertises the robot online, ownership is Local even though
+    /// a peer also advertises it (local-wins).
+    #[test]
+    fn advertised_locally_resolves_local() {
+        let robot = "chg2b-go2";
+        let local = "chg2b-node-local";
+        let remote = "chg2b-node-remote";
+
+        global().replace_node(local, vec![ad(robot, "go2", local)]);
+        global().replace_node(remote, vec![ad(robot, "go2", remote)]);
+        assert_eq!(
+            select_robot_owner(&global().all(), robot, local),
+            RobotOwner::Local
+        );
+
+        global().remove_node(local);
+        global().remove_node(remote);
+    }
+
+    /// Nobody advertises the robot (it is offline everywhere) → Unknown, so the
+    /// router rejects with UnknownRobot rather than actuating an offline robot.
+    #[test]
+    fn advertised_nowhere_resolves_unknown() {
+        let robot = "chg2c-go2";
+        let local = "chg2c-node-local";
+        assert_eq!(
+            select_robot_owner(&global().all(), robot, local),
+            RobotOwner::Unknown
+        );
+    }
+
+    #[test]
+    fn sort_advertised_is_order_insensitive_for_change_detection() {
+        // The same set in two different orders must sort to an identical vec, so the
+        // periodic broadcaster's `changed` check does not fire on a steady set.
+        let a = vec![
+            ad("spot-1", "spot", "node-b"),
+            ad("go2", "go2", "node-a"),
+            ad("go2", "go2", "node-b"),
+        ];
+        let b = vec![
+            ad("go2", "go2", "node-b"),
+            ad("spot-1", "spot", "node-b"),
+            ad("go2", "go2", "node-a"),
+        ];
+        let sa = sort_advertised(a);
+        let sb = sort_advertised(b);
+        assert_eq!(sa, sb, "same set in different orders must sort equal");
+        // Sort key is (robot_id, node_id): go2/node-a < go2/node-b < spot-1/node-b.
+        assert_eq!(sa[0].robot_id, "go2");
+        assert_eq!(sa[0].node_id, "node-a");
+        assert_eq!(sa[1].robot_id, "go2");
+        assert_eq!(sa[1].node_id, "node-b");
+        assert_eq!(sa[2].robot_id, "spot-1");
     }
 
     #[test]
