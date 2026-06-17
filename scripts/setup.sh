@@ -1727,6 +1727,25 @@ print_summary() {
     echo ""
 }
 
+# --- vLLM deployment recipes (refresh vendored snapshot) ---
+
+# A snapshot is committed in tentaflow-core/vllm-recipes/recipes.json.gz and
+# embedded into the binary, so this is a best-effort freshness refresh — never
+# fatal. Offline / no network just keeps the committed snapshot.
+update_vllm_recipes() {
+    log_section "vLLM recipes"
+    local script="$(dirname "$0")/update-vllm-recipes.sh"
+    if [[ ! -f "$script" ]]; then
+        log_warn "update-vllm-recipes.sh nie znaleziony — pomijam (zostaje snapshot z repo)."
+        return
+    fi
+    if bash "$script" >/dev/null 2>&1; then
+        log_ok "Snapshot recipe vLLM odswiezony."
+    else
+        log_warn "Nie udalo sie odswiezyc recipe (offline?) — zostaje wbudowany snapshot."
+    fi
+}
+
 # --- Main ---
 
 main() {
@@ -1762,6 +1781,7 @@ main() {
     install_wasm_target
     install_wasm_bindgen_cli
     install_zvec
+    update_vllm_recipes
     install_android_rust_tools
     install_android_gstreamer_sdk
     install_android_gradle_runner
