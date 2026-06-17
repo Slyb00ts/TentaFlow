@@ -410,16 +410,25 @@ fn parse_soc(bytes: &[u8]) -> Option<i64> {
 // =============================================================================
 
 fn do_connect() -> JsonValue {
+    log::info("go2: do_connect entered");
     let robot = db::get_robot().unwrap_or_default();
     let ip = if robot.ip.is_empty() { DEFAULT_IP.to_string() } else { robot.ip.clone() };
+    log::info(&alloc::format!("go2: do_connect ip={ip} status={}", robot.status));
     if db::ensure_robot(&ip).is_err() {
+        log::warn("go2: ensure_robot failed");
         return json!({ "error": "db init failed" });
     }
     // CAS: only one connect in flight.
     match db::try_begin_connect() {
-        Ok(true) => {}
-        Ok(false) => return json!({ "error": "already connecting or online" }),
-        Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
+        Ok(true) => log::info("go2: try_begin_connect won (status->connecting)"),
+        Ok(false) => {
+            log::warn("go2: try_begin_connect lost (already connecting/online)");
+            return json!({ "error": "already connecting or online" });
+        }
+        Err(e) => {
+            log::warn(&alloc::format!("go2: try_begin_connect db err: {e}"));
+            return json!({ "error": alloc::format!("db: {e}") });
+        }
     }
 
     let connect_in = WebRtcConnectInput {
@@ -435,15 +444,19 @@ fn do_connect() -> JsonValue {
     let out: WebRtcConnectOutput = match call_cbor_in_out(&connect_in, webrtc_connect_v1) {
         Ok(o) => o,
         Err(e) => {
+            log::warn(&alloc::format!("go2: webrtc_connect_v1 failed: {e}"));
             let _ = db::set_offline("error", &alloc::format!("webrtc_connect: {e}"));
             return json!({ "error": alloc::format!("webrtc_connect: {e}") });
         }
     };
     let channel_id = out.channel_id;
+    log::info(&alloc::format!("go2: webrtc channel created id={channel_id}, offer {} bytes", out.offer_sdp.len()));
 
     // Signaling: con_notify → con_ing (raw HTTP/1.0; reqwest fails on the robot).
     let result = (|| -> Result<String, String> {
+        log::info("go2: con_notify POST...");
         let (st, body) = http_raw(&alloc::format!("http://{ip}:9991/con_notify"), "", "")?;
+        log::info(&alloc::format!("go2: con_notify http {st}, {} bytes", body.len()));
         if st != 200 {
             return Err(alloc::format!("con_notify http {st}"));
         }
@@ -451,11 +464,13 @@ fn do_connect() -> JsonValue {
         let key = protocol::gen_session_key();
         let (path, ci_body) =
             protocol::build_con_ing(&identity, &key, &out.offer_sdp).map_err(|e| alloc::format!("build con_ing: {e}"))?;
+        log::info(&alloc::format!("go2: con_ing POST path={path}..."));
         let (st2, ans) = http_raw(
             &alloc::format!("http://{ip}:9991/{path}"),
             "application/x-www-form-urlencoded",
             &ci_body,
         )?;
+        log::info(&alloc::format!("go2: con_ing http {st2}, {} bytes", ans.len()));
         if st2 != 200 {
             return Err(alloc::format!("con_ing http {st2}"));
         }
@@ -465,11 +480,13 @@ fn do_connect() -> JsonValue {
     let answer_sdp = match result {
         Ok(a) => a,
         Err(e) => {
+            log::warn(&alloc::format!("go2: signaling failed: {e}"));
             wc_close(&channel_id);
             let _ = db::set_offline("error", &e);
             return json!({ "error": e });
         }
     };
+    log::info(&alloc::format!("go2: answer received {} bytes, set_answer...", answer_sdp.len()));
     let set_ans = WebRtcSetAnswerInput { channel_id: channel_id.clone(), answer_sdp };
     if let Err(e) = call_cbor_in_out::<_, WebRtcStatusOutput>(&set_ans, webrtc_set_answer_v1) {
         wc_close(&channel_id);
@@ -592,6 +609,14 @@ fn tick() {
                                 Ok(true) => {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
+                                    // Go2 only starts publishing the camera RTP after this
+                                    // app-level command; the recvonly transceiver alone is silent.
+                                    if !cam_id.is_empty() {
+                                        let _ = wc_send_text(
+                                            &robot.channel_id,
+                                            &json!({ "type": "vid", "topic": "", "data": "on" }).to_string(),
+                                        );
+                                    }
                                     grant_vision_camera(&cam_id);
                                     publish_event("go2.online", json!({ "camera_id": cam_id }));
                                     log::info("go2: online");
@@ -1007,8 +1032,13 @@ pub extern "C" fn on_request(
 ) -> i32 {
     let input = read_string(input_ptr, input_len);
     let req: JsonValue = serde_json::from_str(&input).unwrap_or(JsonValue::Null);
-    let tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");
+    let raw_tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(JsonValue::Null);
+    // Panel button actions arrive from the dashboard as `ui.<panel_id>.<action_id>`
+    // (ui_channel: format!("ui.{panel}.{action}")). Strip the panel prefix so the
+    // declared action_ids (go2.connect, go2.estop, …) route to handle(). Flow
+    // blocks come via invoke_block as `block.go2.*` with no ui prefix.
+    let tool = raw_tool.strip_prefix("ui.overview.").unwrap_or(raw_tool);
     let response = if let Some(block_type) = tool.strip_prefix("block.") {
         handle_block(block_type, &params)
     } else {
