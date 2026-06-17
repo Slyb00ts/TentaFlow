@@ -704,6 +704,19 @@ impl AddonManager {
         &self.flow_blocks_registry
     }
 
+    /// Owning org of a running addon instance, read from its `AddonState`. The
+    /// org context is fixed at start and lives only on the wasmtime Store (never
+    /// on the DB `addons` row, which is org-agnostic), so the mesh robot
+    /// advertiser must read it here to tenant-scope a robot's camera. Returns
+    /// `None` when the addon has no running instance, or the instance pre-dates a
+    /// real org context (system/boot start with `org_id == None`).
+    pub fn instance_org_id(&self, addon_id: &str) -> Option<String> {
+        let instances = self.instances.lock();
+        let list = instances.get(addon_id)?;
+        let first = list.first()?;
+        first.store.data().org_id.clone()
+    }
+
     /// Ustawia router do routowania requestow LLM z addonow
     pub fn set_router(&self, router: Arc<crate::routing::router::Router>) {
         *self.router.write() = Some(router);

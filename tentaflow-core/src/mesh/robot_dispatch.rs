@@ -49,6 +49,21 @@ pub struct AdvertisedRobot {
     pub kind: Option<String>,
     /// Endpoint-id hex of the node that owns this robot.
     pub node_id: String,
+    /// Owning organization (tenant) of the robot addon instance. A controller
+    /// node must only fetch a remote robot's camera when ITS OWN org matches this
+    /// — `camera.read` + trusted-registry membership alone do not scope tenants.
+    /// Appended last for wire compat: an old peer's announce decodes with
+    /// `org_id` defaulting to empty (`#[serde(default)]`, ciborium APPEND-AT-END
+    /// rule), which the requester-side scope check treats as a non-match.
+    #[serde(default)]
+    pub org_id: String,
+    /// The owning node's NODE-LOCAL camera id for this robot's video feed, if it
+    /// has one yet. Camera rows are never synced (they are node-local by design),
+    /// so a controller node otherwise has no way to know which camera id maps to
+    /// a remote robot — carrying it here lets the dashboard tile request the
+    /// remote camera through the existing frame_proxy mechanism. `None` when the
+    /// robot has not been granted a camera yet.
+    pub camera_id: Option<String>,
 }
 
 /// CBOR wire payload for the robot advertisement broadcast: one node's complete
@@ -120,17 +135,105 @@ pub fn global() -> &'static MeshRobotRegistry {
 /// into the global registry under `local_node_id`. Returns the list so the caller
 /// can also CBOR-encode + broadcast it to trusted peers.
 pub fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Vec<AdvertisedRobot> {
+    // The camera id lives in the robot addon's PRIVATE SQLite (`robot.camera_id`),
+    // which Core does not read directly. Resolve it through the addon's read-only
+    // `<package>.status` tool when the dispatch context (addon manager) is wired.
+    // This runs ~every 600 heartbeats, so a read-only tool call per owned robot is
+    // acceptable. A robot with no camera yet (or no wired context) stays `None`.
+    let addon_manager = dispatch_context().map(|c| c.addon_manager);
     let robots: Vec<AdvertisedRobot> = crate::mesh::command_executor::collect_local_robot_addons(db)
         .into_iter()
-        .map(|c| AdvertisedRobot {
-            robot_id: c.addon_id,
-            package_id: c.package_id,
-            kind: c.kind,
-            node_id: local_node_id.to_string(),
+        .map(|c| {
+            let camera_id = addon_manager
+                .as_ref()
+                .and_then(|am| {
+                    resolve_robot_camera_id(am, &c.addon_id, &c.package_id, local_node_id)
+                });
+            // Tenant of this robot, read from the running addon instance's
+            // `AddonState` (the only place a robot addon's org lives — the DB
+            // `addons` row is org-agnostic). An instance with no org context
+            // (system/boot start) advertises an empty org_id, which the
+            // requester-side scope check treats as a non-match.
+            let org_id = addon_manager
+                .as_ref()
+                .and_then(|am| am.instance_org_id(&c.addon_id))
+                .unwrap_or_default();
+            AdvertisedRobot {
+                robot_id: c.addon_id,
+                package_id: c.package_id,
+                kind: c.kind,
+                node_id: local_node_id.to_string(),
+                org_id,
+                camera_id,
+            }
         })
         .collect();
     global().replace_local(local_node_id, robots.clone());
     robots
+}
+
+/// Pull a robot addon's current `camera_id` out of its read-only `status` tool.
+/// The tool name is `<package_id>.status` (e.g. `go2.status`) and its JSON result
+/// carries `camera_id`; an empty string or a missing/non-string field is treated
+/// as "no camera yet" (`None`). System-initiated call (advertiser), so it goes
+/// through `call_tool_preauthorized` — the advertiser already owns this local
+/// addon and the `status` tool is read-only.
+///
+/// On a TRANSIENT status-tool failure the last-known advertised camera_id for
+/// this robot is preserved instead of clearing it to `None` — a clear would make
+/// the remote dashboard tile vanish until the next ~600-heartbeat refresh. Only a
+/// SUCCESSFUL status call returning an empty camera_id clears it (genuine
+/// removal). The failure is logged (warn) so a broken status tool is diagnosable.
+fn resolve_robot_camera_id(
+    addon_manager: &Arc<crate::addon::AddonManager>,
+    addon_id: &str,
+    package_id: &str,
+    local_node_id: &str,
+) -> Option<String> {
+    let tool = format!("{package_id}.status");
+    match addon_manager.call_tool_preauthorized(
+        addon_id,
+        &tool,
+        serde_json::Value::Null,
+        "system",
+    ) {
+        Ok(result) => parse_status_camera_id(&result),
+        Err(e) => {
+            let last_known = last_advertised_camera_id(addon_id, local_node_id);
+            warn!(
+                addon = %addon_id,
+                tool = %tool,
+                preserved_camera = last_known.is_some(),
+                "robot advertise: status tool failed; preserving last-known camera_id: {e}"
+            );
+            last_known
+        }
+    }
+}
+
+/// Last camera_id THIS node advertised for `addon_id` (its robot_id), read from
+/// the LOCAL entries of the global registry only. Used to survive a transient
+/// status failure without dropping the remote tile. The node filter is mandatory:
+/// the global registry also holds peers' robots, and a remote entry with the same
+/// robot_id must never be preserved as this node's advertised camera_id (that
+/// would feed `local_advertised_robot_cameras` and weaken the owner-side
+/// allowlist). `refresh_local_advertisement` writes local entries with
+/// `node_id == local_node_id`, so filtering on it is sufficient and exact.
+fn last_advertised_camera_id(addon_id: &str, local_node_id: &str) -> Option<String> {
+    global()
+        .all()
+        .into_iter()
+        .find(|r| r.robot_id == addon_id && r.node_id == local_node_id)
+        .and_then(|r| r.camera_id)
+}
+
+/// PURE extraction of a non-empty `camera_id` from a `status` tool result.
+fn parse_status_camera_id(status: &serde_json::Value) -> Option<String> {
+    status
+        .get("camera_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Process-global handle to the pieces `dispatch_robot_action` needs that are NOT
@@ -315,6 +418,24 @@ pub fn build_request(
     }
 }
 
+/// Force every advertised robot's `node_id` to the transport-authenticated
+/// sender. A node only legitimately advertises its OWN robots, so the per-robot
+/// `node_id` is never trusted from the wire: a trusted peer could otherwise embed
+/// a victim node's id in an `AdvertisedRobot` and have `remote_camera_owner`
+/// later trust that self-claimed id as the camera owner. Normalizing at the
+/// receive site guarantees the registry can never hold a robot whose `node_id`
+/// differs from the peer that announced it. Mirrors `refresh_local_advertisement`,
+/// which sets `node_id = local_node_id` for locally owned robots. PURE.
+pub fn normalize_advertised_node_id(
+    mut robots: Vec<AdvertisedRobot>,
+    sender_node_id: &str,
+) -> Vec<AdvertisedRobot> {
+    for robot in &mut robots {
+        robot.node_id = sender_node_id.to_string();
+    }
+    robots
+}
+
 /// Bind an announce to its transport-authenticated sender: a trusted node must
 /// not advertise robots on behalf of another node id. Returns the registry key
 /// to use (the transport `from_node_id`) only when the self-claimed payload
@@ -496,7 +617,29 @@ mod tests {
             package_id: package_id.to_string(),
             kind: Some("quadruped".to_string()),
             node_id: node_id.to_string(),
+            org_id: "org-1".to_string(),
+            camera_id: None,
         }
+    }
+
+    // ----- status camera_id extraction (PURE) -----
+
+    #[test]
+    fn parse_status_camera_id_present() {
+        let status = serde_json::json!({ "status": "online", "camera_id": "cam-uuid" });
+        assert_eq!(parse_status_camera_id(&status).as_deref(), Some("cam-uuid"));
+    }
+
+    #[test]
+    fn parse_status_camera_id_empty_is_none() {
+        let status = serde_json::json!({ "camera_id": "" });
+        assert_eq!(parse_status_camera_id(&status), None);
+    }
+
+    #[test]
+    fn parse_status_camera_id_missing_is_none() {
+        let status = serde_json::json!({ "status": "offline" });
+        assert_eq!(parse_status_camera_id(&status), None);
     }
 
     // ----- resolver selection (PURE) -----
@@ -690,16 +833,58 @@ mod tests {
 
     #[test]
     fn announce_payload_cbor_roundtrip() {
+        // First robot carries a camera_id, second does not — the CBOR form must
+        // round-trip both the Some and None cases of the field.
+        let mut with_camera = ad("go2-garage", "go2", "node-b");
+        with_camera.camera_id = Some("11111111-2222-4333-8444-555555555555".to_string());
         let payload = RobotsAnnouncePayload {
             from_node_id: "node-b".to_string(),
-            robots: vec![
-                ad("go2-garage", "go2", "node-b"),
-                ad("spot-1", "spot", "node-b"),
-            ],
+            robots: vec![with_camera, ad("spot-1", "spot", "node-b")],
         };
         let bytes = crate::mesh::cbor::encode(&payload).expect("encode");
         let back: RobotsAnnouncePayload = crate::mesh::cbor::decode(&bytes).expect("decode");
         assert_eq!(back, payload);
+        assert_eq!(
+            back.robots[0].camera_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(back.robots[1].camera_id, None);
+    }
+
+    #[test]
+    fn advertised_robot_org_id_roundtrips() {
+        let mut robot = ad("go2-garage", "go2", "node-b");
+        robot.org_id = "org-acme".to_string();
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back.org_id, "org-acme");
+        assert_eq!(back, robot);
+    }
+
+    /// Wire-compat: an announce from an OLD peer (no `org_id` field) decodes with
+    /// `org_id` defaulting to empty, so a new node never fails to decode it.
+    #[test]
+    fn advertised_robot_decodes_legacy_without_org_id() {
+        #[derive(Serialize)]
+        struct LegacyRobot {
+            robot_id: String,
+            package_id: String,
+            kind: Option<String>,
+            node_id: String,
+            camera_id: Option<String>,
+        }
+        let legacy = LegacyRobot {
+            robot_id: "go2".to_string(),
+            package_id: "go2".to_string(),
+            kind: Some("quadruped".to_string()),
+            node_id: "node-b".to_string(),
+            camera_id: Some("cam-x".to_string()),
+        };
+        let bytes = crate::mesh::cbor::encode(&legacy).expect("encode legacy");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode legacy");
+        assert_eq!(back.org_id, "");
+        assert_eq!(back.camera_id.as_deref(), Some("cam-x"));
+        assert_eq!(back.robot_id, "go2");
     }
 
     #[test]
@@ -882,6 +1067,66 @@ mod tests {
     #[test]
     fn trusted_target_passes_the_gate() {
         assert!(gate_untrusted_send(true).is_none());
+    }
+
+    // ----- P1-1: per-robot node_id spoofing in RobotsAnnounce -----
+
+    #[test]
+    fn normalize_overwrites_spoofed_per_robot_node_id() {
+        // A trusted peer "node-b" announces a robot that self-claims a victim
+        // node id ("node-victim"). Normalization must overwrite every robot's
+        // node_id with the transport-authenticated sender, so the registry can
+        // never trust a spoofed owner for `remote_camera_owner`.
+        let spoofed = vec![
+            ad("go2-garage", "go2", "node-victim"),
+            ad("spot-1", "spot", "node-other"),
+        ];
+        let normalized = normalize_advertised_node_id(spoofed, "node-b");
+        assert!(
+            normalized.iter().all(|r| r.node_id == "node-b"),
+            "every advertised robot must be re-owned to the transport sender"
+        );
+
+        // And the resolver then attributes ownership to the real sender, not the
+        // spoofed claim.
+        assert_eq!(
+            select_robot_owner(&normalized, "go2-garage", "node-local"),
+            RobotOwner::Remote("node-b".to_string())
+        );
+    }
+
+    // ----- P1-2: last-known camera lookup is node-scoped -----
+
+    #[test]
+    fn last_advertised_camera_id_ignores_remote_entry_with_same_robot_id() {
+        // Unique ids so this test does not race other tests sharing `global()`.
+        let robot_id = "p1p2-go2";
+        let local = "p1p2-node-local";
+        let remote = "p1p2-node-remote";
+
+        let with_cam = |node: &str, cam: &str| AdvertisedRobot {
+            robot_id: robot_id.to_string(),
+            package_id: "go2".to_string(),
+            kind: Some("quadruped".to_string()),
+            node_id: node.to_string(),
+            org_id: "org-1".to_string(),
+            camera_id: Some(cam.to_string()),
+        };
+
+        // A remote node advertises the SAME robot_id with its own camera id.
+        global().replace_node(remote, vec![with_cam(remote, "remote-cam")]);
+        // The remote entry must NOT be preserved as this node's last-known camera.
+        assert_eq!(last_advertised_camera_id(robot_id, local), None);
+
+        // Once this node advertises locally, only the LOCAL camera id is returned.
+        global().replace_node(local, vec![with_cam(local, "local-cam")]);
+        assert_eq!(
+            last_advertised_camera_id(robot_id, local).as_deref(),
+            Some("local-cam")
+        );
+
+        global().remove_node(local);
+        global().remove_node(remote);
     }
 
     #[test]
