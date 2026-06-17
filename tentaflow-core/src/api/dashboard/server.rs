@@ -182,6 +182,7 @@ impl DashboardServer {
                             db: db.clone(),
                             port_allocator: pa,
                             iroh: qm.clone(),
+                            router: router.clone(),
                         },
                     )
                     .await;

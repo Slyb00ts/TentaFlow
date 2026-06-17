@@ -1781,6 +1781,23 @@ pub struct MlStudioFtDeployResponse {
     pub error: Option<String>,
 }
 
+/// Zapytanie do wdrożonego modelu FT (test/„użyj"). Dashboard używa protokołu
+/// binarnego (nie REST /v1), a gdy model żyje na innym węźle mesh, Core proxuje
+/// zapytanie do węzła-właściciela komendą `MlChat`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtChatRequest {
+    pub model_id: String,
+    pub message: String,
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtChatResponse {
+    pub answer: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -1847,6 +1864,8 @@ pub enum MlStudioPayload {
     RecogSaveAnnotationsResponse(MlStudioRecogSaveAnnotationsResponse),
     DatasetUploadChunkRequest(MlStudioDatasetUploadChunkRequest),
     DatasetUploadChunkResponse(MlStudioDatasetUploadChunkResponse),
+    FtChatRequest(MlStudioFtChatRequest),
+    FtChatResponse(MlStudioFtChatResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

@@ -676,6 +676,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::FtDeployResponse(_) => {
                 "MlStudioFtDeployResponse"
             }
+            tentaflow_protocol::MlStudioPayload::FtChatRequest(_) => {
+                "MlStudioFtChatRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtChatResponse(_) => {
+                "MlStudioFtChatResponse"
+            }
             tentaflow_protocol::MlStudioPayload::RecogTrainStartRequest(_) => {
                 "MlStudioRecogTrainStartRequest"
             }

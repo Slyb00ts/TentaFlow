@@ -1906,6 +1906,24 @@ pub fn encode_ml_studio_ft_deploy_request(model_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioFtChatRequest)]
+pub fn encode_ml_studio_ft_chat_request(
+    model_id: String,
+    message: String,
+    max_tokens: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::FtChatRequest(
+            tentaflow_protocol::MlStudioFtChatRequest {
+                model_id,
+                message,
+                max_tokens,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioRecogTrainStartRequest)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
@@ -8251,6 +8269,22 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "modelName", resp.model_name.clone().into());
             set(obj, "model_name", resp.model_name.into());
             set(obj, "status", resp.status.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::FtChatRequest(req) => {
+            set(obj, "variant", "MlStudioFtChatRequest".into());
+            set(obj, "modelId", req.model_id.clone().into());
+            set(obj, "model_id", req.model_id.into());
+            set(obj, "message", req.message.into());
+            set(obj, "maxTokens", req.max_tokens.into());
+            set(obj, "max_tokens", req.max_tokens.into());
+        }
+        tentaflow_protocol::MlStudioPayload::FtChatResponse(resp) => {
+            set(obj, "variant", "MlStudioFtChatResponse".into());
+            set(obj, "answer", resp.answer.into());
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
