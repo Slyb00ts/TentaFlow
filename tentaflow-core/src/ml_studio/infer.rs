@@ -46,13 +46,22 @@ pub async fn run_local_chat(
         audio_input: None,
     };
 
-    let route_result = router
-        .route_chat_completion(request, None, None)
+    // Odpytanie modelu to SUROWA inferencja LLM — BEZ flow. `route_chat_completion`
+    // opakowuje request we flow (Default Chat), a tego nie chcemy przy zwykłym
+    // odpytaniu modelu (i tak działa cross-node: gdy model żyje na innym węźle,
+    // executor kieruje raw-inference do tego węzła, który NIE wykonuje flow).
+    let executor = router
+        .executor
+        .read()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("runtime executor niedostępny"))?;
+    let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None);
+    let response = executor
+        .execute_chat(request, &mut exec_ctx)
         .await
         .map_err(|e| anyhow::anyhow!("inferencja modelu '{}' nie powiodła się: {}", model_name, e))?;
 
-    let answer = route_result
-        .response
+    let answer = response
         .choices
         .first()
         .and_then(|choice| choice.message.content.as_ref())
