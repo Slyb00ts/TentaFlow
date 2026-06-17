@@ -503,16 +503,6 @@ pub enum MeshCommandType {
         src_path: String,
         target_node_id: String,
     },
-    /// ML Studio: jeden fragment ZIP-a artefaktu modelu strumieniowanego między
-    /// węzłami. Odbiorca składa po `transfer_id`, po komplecie rozpakowuje do
-    /// lokalnego katalogu i zwraca `MlArtifactChunkResult { local_path }`. Appended at END.
-    MlArtifactChunk {
-        transfer_id: String,
-        name: String,
-        seq: u32,
-        total: u32,
-        data_b64: String,
-    },
 }
 
 // =============================================================================
@@ -611,12 +601,6 @@ pub enum MeshCommandResponsePayload {
     /// Appended at END (kolejność = wire compat).
     MlChatResult {
         answer: String,
-        error: Option<String>,
-    },
-    /// ML Studio: ack fragmentu artefaktu. Po komplecie `local_path` = katalog
-    /// artefaktu rozpakowany na odbiorcy. Appended at END.
-    MlArtifactChunkResult {
-        local_path: String,
         error: Option<String>,
     },
     /// ML Studio: wynik wypchnięcia artefaktu do węzła docelowego — ścieżka
@@ -811,14 +795,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlArtifactPushTo")
                 .field("src_path", src_path)
                 .field("target_node_id", target_node_id)
-                .finish(),
-            Self::MlArtifactChunk { transfer_id, name, seq, total, data_b64 } => f
-                .debug_struct("MlArtifactChunk")
-                .field("transfer_id", transfer_id)
-                .field("name", name)
-                .field("seq", seq)
-                .field("total", total)
-                .field("data_len", &data_b64.len())
                 .finish(),
         }
     }
