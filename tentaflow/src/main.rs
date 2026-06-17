@@ -729,6 +729,7 @@ async fn run_server(args: Args) -> Result<()> {
                                             db: db.clone(),
                                             port_allocator,
                                             iroh: mesh_mgr.clone(),
+                                            router: router.clone(),
                                         },
                                     )
                                     .await;
