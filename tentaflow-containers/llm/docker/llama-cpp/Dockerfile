@@ -21,9 +21,7 @@ COPY vendor /build/vendor
 COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
 
 WORKDIR /build/tentaflow-containers/sidecar
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/tentaflow-containers/sidecar/target \
-    cargo build --release --bin tentaflow-sidecar \
+RUN cargo build --release --bin tentaflow-sidecar \
     && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
 # --- Stage 2: llama.cpp z CUDA + runtime ---
