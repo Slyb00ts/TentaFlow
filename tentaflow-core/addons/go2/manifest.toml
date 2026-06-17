@@ -104,6 +104,12 @@ description = "Otwieranie generycznego kanału WebRTC (peer + data channel + med
 risk = "high"
 
 [[permission]]
+id = "robot.control"
+display_name = "Sterowanie robotem przez mesh"
+description = "Routowanie akcji sterujących (ruch, pozy, e-stop) do węzła, który fizycznie posiada robota, gdy robot nie jest lokalnie online."
+risk = "high"
+
+[[permission]]
 id = "http.request"
 display_name = "Żądania HTTP"
 description = "Signaling con_notify/con_ing do robota w LAN (wymaga zatwierdzonej reguły sieciowej na host robota)."

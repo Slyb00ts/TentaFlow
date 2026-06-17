@@ -31,9 +31,10 @@ use tentaflow_sdk_spec::protocol::ui::{
 };
 use tentaflow_sdk_spec::{
     CameraGrantInput, CameraGrantOut, Component, FailurePolicy, Handler, HandlerMap, PanelShell,
-    StateEntry, UiPayload, Value, WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput,
-    WebRtcDrainInput, WebRtcDrainOutput, WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput,
-    WebRtcSendInput, WebRtcSetAnswerInput, WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
+    RobotActionWire, RobotControlResponseWire, RobotDispatchInput, StateEntry, UiPayload, Value,
+    WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput, WebRtcDrainOutput,
+    WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput, WebRtcSendInput, WebRtcSetAnswerInput,
+    WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
 };
 
 // The vision addon that consumes the robot camera. go2 grants it read access on
@@ -87,6 +88,7 @@ extern "C" {
     fn webrtc_close_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn webrtc_register_camera_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 }
 
 // =============================================================================
@@ -322,17 +324,80 @@ fn subscribe_msg(topic: &str) -> String {
     json!({ "type": "subscribe", "topic": topic }).to_string()
 }
 
+/// Map a local sport command `(api_id, parameter)` to the vendor-agnostic
+/// `RobotActionWire` used for cross-node dispatch. `parameter` is the go2 move
+/// JSON (`{"x","y","z"}`) for SPORT_MOVE; ignored otherwise. Returns `None` for
+/// an api_id with no remote-control equivalent (so the caller keeps it local).
+fn sport_to_action(api_id: u32, parameter: &str) -> Option<RobotActionWire> {
+    Some(match api_id {
+        SPORT_MOVE => {
+            let p: JsonValue = serde_json::from_str(parameter).unwrap_or(JsonValue::Null);
+            let axis = |k: &str| p.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0);
+            RobotActionWire::move_to(axis("x"), axis("y"), axis("z"))
+        }
+        SPORT_STOP_MOVE | SPORT_DAMP => RobotActionWire::simple("stop"),
+        SPORT_STAND_UP => RobotActionWire::simple("stand_up"),
+        SPORT_STAND_DOWN => RobotActionWire::simple("stand_down"),
+        SPORT_RECOVERY_STAND => RobotActionWire::simple("recovery_stand"),
+        SPORT_SIT => RobotActionWire::simple("sit"),
+        SPORT_HELLO => RobotActionWire::simple("hello"),
+        SPORT_STRETCH => RobotActionWire::simple("stretch"),
+        _ => return None,
+    })
+}
+
+/// Route a `RobotActionWire` to the owning node via the host. The host resolves
+/// the owner (this node if local, else a single remote mesh node) and runs the
+/// shared dispatch router. A robot-level refusal is a successful call carrying
+/// `rejected`; only an ABI failure surfaces as `Err`.
+fn robot_dispatch(action: RobotActionWire) -> Result<RobotControlResponseWire, AbiError> {
+    let input = RobotDispatchInput {
+        robot_id: ADDON_ID.into(),
+        action,
+    };
+    call_cbor_in_out(&input, robot_dispatch_v1)
+}
+
+/// Render a host `RobotControlResponseWire` as the addon's JSON result shape.
+fn dispatch_result_json(resp: RobotControlResponseWire) -> JsonValue {
+    if resp.ok {
+        match resp.result_json {
+            Some(s) => serde_json::from_str(&s).unwrap_or(json!({ "status": "sent" })),
+            None => json!({ "status": "sent" }),
+        }
+    } else if let Some(reason) = resp.rejected {
+        json!({ "error": alloc::format!("robot dispatch rejected: {reason}") })
+    } else {
+        json!({ "error": resp.error.unwrap_or_else(|| "robot dispatch failed".into()) })
+    }
+}
+
 /// Send a sport command with the e-stop + online gates. StopMove/Damp bypass the
-/// e-stop gate (they ARE the stop).
+/// e-stop gate (they ARE the stop). When the robot is NOT online on THIS node it
+/// is owned by another mesh node: route the equivalent `RobotAction` through the
+/// host dispatcher instead of failing — the owner re-checks trust, permission and
+/// safety before actuating.
 fn send_sport_gated(api_id: u32, parameter: &str) -> JsonValue {
     let robot = match db::get_robot() {
         Ok(r) => r,
         Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
     };
-    if robot.status != "online" || robot.channel_id.is_empty() {
-        return json!({ "error": "robot not online" });
-    }
     let is_stop = api_id == SPORT_STOP_MOVE || api_id == SPORT_DAMP;
+    if robot.status != "online" || robot.channel_id.is_empty() {
+        // Not locally online → robot lives on another node. The local e-stop
+        // latch is local-only; cross-node motion is governed by the owner, so we
+        // gate non-stop actions on the local latch here too (defense in depth).
+        if robot.estop_active && !is_stop {
+            return json!({ "error": "e-stop active — reset it first" });
+        }
+        return match sport_to_action(api_id, parameter) {
+            Some(action) => match robot_dispatch(action) {
+                Ok(resp) => dispatch_result_json(resp),
+                Err(e) => json!({ "error": alloc::format!("dispatch: {e}") }),
+            },
+            None => json!({ "error": "robot not online" }),
+        };
+    }
     if robot.estop_active && !is_stop {
         return json!({ "error": "e-stop active — reset it first" });
     }
@@ -521,14 +586,34 @@ fn do_disconnect() -> JsonValue {
 
 fn do_estop() -> JsonValue {
     let _ = db::set_estop(true);
+    let mut remote_warning: Option<String> = None;
     if let Ok(robot) = db::get_robot() {
         if robot.status == "online" && !robot.channel_id.is_empty() {
             let _ = wc_send_text(&robot.channel_id, &build_sport(SPORT_STOP_MOVE, ""));
             let _ = wc_send_text(&robot.channel_id, &build_sport(SPORT_DAMP, ""));
+        } else {
+            // Robot owned by another node — an e-stop must ALWAYS reach it. Route a
+            // stop (e-stop class: bypasses the addon robot.control gate, never
+            // blocked by latch/dedup) to the owner. Surface any failure so the UI
+            // never claims the robot stopped when the command did not get through.
+            match robot_dispatch(RobotActionWire::simple("stop")) {
+                Ok(resp) if resp.ok => {}
+                Ok(resp) => {
+                    remote_warning =
+                        Some(resp.rejected.or(resp.error).unwrap_or_else(|| "rejected".into()));
+                }
+                Err(e) => remote_warning = Some(alloc::format!("{e}")),
+            }
         }
     }
     publish_event("go2.estop", json!({ "active": true }));
-    json!({ "status": "estop_active" })
+    match remote_warning {
+        Some(w) => json!({
+            "status": "estop_active",
+            "warning": alloc::format!("e-stop latched locally but did NOT reach the robot: {w}")
+        }),
+        None => json!({ "status": "estop_active" }),
+    }
 }
 
 fn do_reset_estop() -> JsonValue {

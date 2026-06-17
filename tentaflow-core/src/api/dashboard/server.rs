@@ -186,11 +186,21 @@ impl DashboardServer {
                             db: db.clone(),
                             port_allocator: pa,
                             iroh: qm.clone(),
-                            addon_manager: am,
+                            addon_manager: am.clone(),
                         },
                     )
                     .await;
             }
+            // Wire the global robot-dispatch context so the `robot_dispatch_v1`
+            // host function can route a controller action to the owning node — the
+            // sender-side counterpart of the `RobotControl` receiver above.
+            crate::mesh::robot_dispatch::set_dispatch_context(
+                crate::mesh::robot_dispatch::RobotDispatchContext {
+                    iroh: qm.clone(),
+                    addon_manager: am,
+                    local_node_id: local_node_id.to_string(),
+                },
+            );
         }
 
         loop {
