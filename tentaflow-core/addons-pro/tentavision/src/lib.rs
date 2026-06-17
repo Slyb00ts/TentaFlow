@@ -90,6 +90,7 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+    fn camera_list_accessible_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
@@ -291,6 +292,17 @@ fn host_camera_analysis_flows() -> Result<Vec<(String, String)>, AbiError> {
     let out: tentaflow_sdk_spec::CameraAnalysisFlowsOut =
         call_cbor_out(camera_analysis_flows_list_v1)?;
     Ok(out.flows.into_iter().map(|f| (f.id, f.name)).collect())
+}
+
+/// Lists every camera this addon can access: cameras it owns UNION cameras
+/// granted to it by another addon (cross-addon share). Each entry carries
+/// `owner_addon_id` + `access_level` ("owner" | "granted"). For granted cameras
+/// the `url` is redacted host-side — live view goes through the dashboard stream
+/// keyed by `camera_id`, so the url is not needed for display or streaming.
+fn host_list_accessible_cameras() -> Result<Vec<tentaflow_sdk_spec::CameraInfoOut>, AbiError> {
+    let out: tentaflow_sdk_spec::CameraListOut =
+        call_cbor_out(camera_list_accessible_v1)?;
+    Ok(out.camera)
 }
 
 /// Reads one camera's authoritative info from core (carries `analysis_flow_id`,
@@ -4351,6 +4363,76 @@ fn live_grid_selector(current: u32) -> Component {
 /// the dashboard renderer plays fMP4 over the binary protocol AND attaches the
 /// detection overlay (also binary) on top. OFFLINE cameras degrade honestly to a
 /// placeholder for THAT tile only — no stream, no fabricated frame, no overlay.
+/// A camera shared into TentaVision by another addon (e.g. the go2 robot). It is
+/// NOT persisted in TentaVision's SQLite mirror — its lifecycle belongs to the
+/// owning addon — so it is merged into read-only surfaces at render time only.
+struct SharedCamera {
+    camera_id: String,
+    display_name: String,
+    /// Owning addon id (e.g. "go2"); shown as the share badge.
+    owner_addon_id: String,
+    status: String,
+}
+
+/// Fetches cameras GRANTED to TentaVision by another addon (cross-addon share),
+/// excluding the cameras TentaVision itself owns (those already come from
+/// `db::list_cameras`). Returns an empty list on any host error so a share
+/// outage never breaks the owned-camera surfaces.
+fn shared_cameras() -> Vec<SharedCamera> {
+    let accessible = match host_list_accessible_cameras() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(&alloc::format!(
+                "shared camera list unavailable: {}",
+                abi_message(e)
+            ));
+            return Vec::new();
+        }
+    };
+    accessible
+        .into_iter()
+        .filter(|c| c.access_level.as_deref() == Some("granted"))
+        .map(|c| SharedCamera {
+            camera_id: c.camera_id,
+            display_name: c.display_name,
+            owner_addon_id: c.owner_addon_id.unwrap_or_else(|| "shared".into()),
+            status: c.status,
+        })
+        .collect()
+}
+
+/// Live-view tile for a camera shared by another addon. Read-only: it carries a
+/// "shared" badge naming the owner and offers no mutation actions (assignment /
+/// delete / flow config live only on the owned-camera Cameras tab). Live view
+/// works because the dashboard stream subscribe is keyed by `camera_id` and the
+/// core enforces the grant when serving frames.
+fn shared_camera_tile(c: &SharedCamera) -> Component {
+    let online = c.status == "online";
+    let (status_label, status_tone) = if online {
+        ("online", "success")
+    } else if c.status == "offline" {
+        ("offline", "critical")
+    } else {
+        (c.status.as_str(), "warning")
+    };
+    let header = stack_h_gap("sm", vec![
+        chip_with_icon(&c.display_name, "neutral", "video"),
+        chip_toned(status_label, status_tone),
+        chip_toned(&alloc::format!("udostępniona · {}", c.owner_addon_id), "info"),
+    ]);
+
+    let body = if online {
+        live_video_tile(&c.camera_id)
+    } else {
+        empty_state(
+            &c.display_name,
+            Some("Offline — brak podglądu"),
+            Some("alert"),
+        )
+    };
+    card(None, vec![header, body])
+}
+
 fn live_camera_tile(c: &db::CameraRow) -> Component {
     let online = c.status == "online";
     let (status_label, status_tone) = if online {
@@ -4411,7 +4493,11 @@ fn build_live_content() -> Component {
         }
     };
 
-    if cameras.is_empty() {
+    // Cameras shared into TentaVision by another addon (e.g. the go2 robot) are
+    // merged into the live grid read-only — they are viewable but not editable.
+    let shared = shared_cameras();
+
+    if cameras.is_empty() && shared.is_empty() {
         // Empty state with a CTA that navigates to the Cameras tab so the user
         // can add a camera before any tile can appear.
         let cta = button_with_params(
@@ -4442,11 +4528,16 @@ fn build_live_content() -> Component {
         button_with_icon("Odśwież", "live-refresh", "secondary", "refresh"),
         live_grid_selector(size),
     ]);
-    // Only as many tiles as the chosen layout, capped by the real camera count.
-    let tiles: Vec<Component> = cameras.iter()
+    // Owned cameras first, then shared cameras; the whole set is capped by the
+    // chosen layout so the grid never exceeds its tile budget.
+    let mut tiles: Vec<Component> = cameras.iter()
         .take(size as usize)
         .map(live_camera_tile)
         .collect();
+    if tiles.len() < size as usize {
+        let remaining = size as usize - tiles.len();
+        tiles.extend(shared.iter().take(remaining).map(shared_camera_tile));
+    }
     let grid_comp = grid(columns, tiles);
     stack_v(vec![messages, toolbar, grid_comp])
 }
