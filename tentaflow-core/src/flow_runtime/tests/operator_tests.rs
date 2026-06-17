@@ -815,6 +815,7 @@ fn insert_test_camera(db: &DbPool, addon_id: &str, camera_id: &str) {
         "fake_file",
         "fake://test",
         5,
+        4,
         Some(4),
         Some(2),
         "B",

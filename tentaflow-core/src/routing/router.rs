@@ -279,12 +279,16 @@ impl Router {
                 }
             };
         let flow_dispatcher = db.map(|pool| {
-            Arc::new(FlowDispatcher::new(
+            let d = Arc::new(FlowDispatcher::new(
                 pool,
                 service_manager.clone(),
                 executor_slot.clone(),
                 blobs.clone(),
-            ))
+            ));
+            // Publish a global handle so the camera cold path can run a camera's
+            // assigned analysis flow (it has no other route to the dispatcher).
+            crate::flow_engine::dispatcher::set_global_flow_dispatcher(d.clone());
+            d
         });
 
         // Embedded inference handle — owned by `ModelRuntimeExecutor`,

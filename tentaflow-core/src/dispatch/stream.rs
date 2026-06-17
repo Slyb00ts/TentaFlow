@@ -307,6 +307,38 @@ fn user_id_from_ctx(ctx: &HandlerContext) -> Option<String> {
     None
 }
 
+/// Audit a denied camera stream subscribe. Never echoes the camera_id (a denied
+/// caller could be probing for ids in another tenant), only org + reason.
+#[cfg(feature = "camera")]
+fn audit_stream_denied(
+    ctx: &HandlerContext,
+    org: &crate::services::rbac::OrgContext,
+    reason: &str,
+) {
+    let user_uuid = match &ctx.session {
+        SessionAuth::UserSession { user_id, .. } => {
+            Some(uuid::Uuid::from_bytes(*user_id).to_string())
+        }
+        _ => None,
+    };
+    let details = serde_json::json!({ "reason": reason }).to_string();
+    let _ = crate::db::repository::log_audit_full(
+        &ctx.state.db,
+        user_uuid.as_deref(),
+        None,
+        "camera.stream_subscribe",
+        Some("camera"),
+        None,
+        Some(&details),
+        "info",
+        "C",
+        Some("denied"),
+        Some(org.org_id.as_str()),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+}
+
 fn enforce_subscribe_permission(
     ctx: &HandlerContext,
     stream_id: &str,
@@ -324,6 +356,33 @@ fn enforce_subscribe_permission(
                 "camera.read permission required",
             ));
         }
+        // Org scoping: `camera.read` is not consent to read EVERY camera id. The
+        // camera must belong to the caller's org, else a user could subscribe to
+        // another tenant's stream by guessing its id. Cross-org / unknown id maps
+        // to NotFound so existence in another tenant is never leaked.
+        #[cfg(feature = "camera")]
+        {
+            return match crate::db::repository::camera_exists_in_org(
+                &ctx.state.db,
+                rest,
+                &org.org_id,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    // Audit the cross-tenant probe; never echo the camera_id.
+                    audit_stream_denied(ctx, org, "camera_not_in_org");
+                    Err(ProtocolError::not_found(format!(
+                        "stream_not_registered: {}{}",
+                        CAMERA_PREFIX, rest
+                    )))
+                }
+                Err(_) => Err(ProtocolError::new(
+                    ProtocolErrorCode::Internal,
+                    "camera org lookup failed",
+                )),
+            };
+        }
+        #[cfg(not(feature = "camera"))]
         return Ok(());
     }
     Err(ProtocolError::new(

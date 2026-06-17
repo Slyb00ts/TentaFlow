@@ -427,7 +427,71 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addons_installed_bundle_hash_column",
             MigrationStep::Rust(addons_add_installed_bundle_hash_column),
         ),
+        (
+            78,
+            "cameras_analysis_fps_column",
+            MigrationStep::Rust(cameras_add_analysis_fps_column),
+        ),
+        (
+            79,
+            "cameras_analysis_flow_id_column",
+            MigrationStep::Rust(cameras_add_analysis_flow_id_column),
+        ),
+        (
+            80,
+            "cameras_vendor_check_webrtc",
+            MigrationStep::Sql(CAMERAS_VENDOR_CHECK_WEBRTC),
+        ),
+        (
+            81,
+            "camera_grants_table",
+            MigrationStep::Sql(CAMERA_GRANTS_TABLE),
+        ),
     ]
+}
+
+// Cross-addon camera access grants. A camera is owned by one addon
+// (`cameras.owner_addon_id`); a grant lets ANOTHER addon read/view it without
+// relaxing the per-owner isolation everywhere else. `grantee_addon_id = '*'`
+// means org-wide. `level` is an allowlist (only 'read' today). Node-local like
+// `cameras` (not sync-replicated). Authorization to CREATE a grant (owner/admin)
+// is enforced at the host-fn layer, not here.
+const CAMERA_GRANTS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS camera_grants (
+    camera_id        TEXT NOT NULL,
+    grantee_addon_id TEXT NOT NULL,
+    level            TEXT NOT NULL DEFAULT 'read' CHECK(level IN ('read')),
+    org_id           TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    created_by       TEXT NOT NULL,
+    PRIMARY KEY (camera_id, grantee_addon_id, level)
+);
+CREATE INDEX IF NOT EXISTS idx_camera_grants_grantee ON camera_grants(grantee_addon_id, org_id);
+CREATE INDEX IF NOT EXISTS idx_camera_grants_camera ON camera_grants(camera_id);
+"#;
+
+/// Adds `analysis_flow_id` to `cameras` — the per-camera analysis Flow run by the
+/// cold path on a detection event. NULL/empty = no flow (cold path enriches with
+/// the default hardcoded pipeline). Idempotent (column probe).
+fn cameras_add_analysis_flow_id_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "analysis_flow_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN analysis_flow_id TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Adds `analysis_fps` to `cameras` — the per-camera AI analysis frame rate
+/// honored by the always-on vision analysis loop. `0` means unlimited (run at
+/// the native frame cadence); the default of `10` matches
+/// `CAMERA_DEFAULT_ANALYSIS_FPS`. Idempotent — guarded by a column probe so a
+/// re-run on an already-migrated database is a no-op.
+fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "analysis_fps")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN analysis_fps INTEGER NOT NULL DEFAULT 10;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Adds `installed_bundle_hash` to `addons` (the instance table). It records the
@@ -3427,6 +3491,72 @@ SELECT
     fps_actual, last_frame_at, created_at, updated_at, removed_at,
     onvif_url, onvif_profile_token, metadata_supported,
     COALESCE(org_id, 'org-default')
+FROM cameras;
+
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
+
+PRAGMA foreign_keys = ON;
+"#;
+
+// Adds the 'webrtc' vendor (robot/device backed cameras) to the CHECK. Rebuilds
+// the table because SQLite cannot alter a CHECK in place. Schema mirrors the
+// CURRENT cameras table: CAMERAS_VENDOR_CHECK_LOCAL_SOURCES + the later
+// analysis_fps (v78) and analysis_flow_id (v79) columns. Ungated by feature —
+// the schema must be identical regardless of build features.
+const CAMERAS_VENDOR_CHECK_WEBRTC: &str = r#"
+PRAGMA foreign_keys = OFF;
+
+DROP TABLE IF EXISTS cameras_new;
+
+CREATE TABLE cameras_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    owner_addon_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    vendor TEXT NOT NULL CHECK(vendor IN ('fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc')),
+    url TEXT NOT NULL,
+    credentials_encrypted BLOB NULL,
+    profile TEXT NOT NULL DEFAULT 'default',
+    target_fps INTEGER NOT NULL DEFAULT 30 CHECK(target_fps > 0 AND target_fps <= 60),
+    resolution_width INTEGER NULL,
+    resolution_height INTEGER NULL,
+    retention_class TEXT NOT NULL DEFAULT 'C' CHECK(retention_class IN ('A','B','C','Unclassified')),
+    status TEXT NOT NULL DEFAULT 'offline' CHECK(status IN ('offline','online','error','starting','stopping')),
+    status_message TEXT NULL,
+    fps_actual REAL NULL,
+    last_frame_at INTEGER NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    removed_at INTEGER NULL,
+    onvif_url TEXT NULL,
+    onvif_profile_token TEXT NULL,
+    metadata_supported INTEGER NOT NULL DEFAULT 0 CHECK(metadata_supported IN (0,1)),
+    org_id TEXT NOT NULL DEFAULT 'org-default',
+    analysis_fps INTEGER NOT NULL DEFAULT 10,
+    analysis_flow_id TEXT NULL
+);
+
+INSERT INTO cameras_new (
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported, org_id,
+    analysis_fps, analysis_flow_id
+)
+SELECT
+    id, camera_id, owner_addon_id, display_name, vendor, url,
+    credentials_encrypted, profile, target_fps, resolution_width,
+    resolution_height, retention_class, status, status_message,
+    fps_actual, last_frame_at, created_at, updated_at, removed_at,
+    onvif_url, onvif_profile_token, metadata_supported,
+    COALESCE(org_id, 'org-default'), analysis_fps, analysis_flow_id
 FROM cameras;
 
 DROP TABLE cameras;

@@ -206,6 +206,7 @@ fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
         "fake_file",
         url,
         30,
+        10,
         None,
         None,
         "C",
@@ -276,6 +277,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -297,6 +299,7 @@ async fn supervisor_rejects_zero_and_oversized_fps() {
                 resolution: None,
                 owner_addon_id: None,
                 credentials_encrypted: None,
+                decoder_override: None,
             })
             .await
             .unwrap_err();
@@ -318,6 +321,7 @@ async fn supervisor_rejects_missing_file_url() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -498,6 +502,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             resolution: None,
             owner_addon_id: Some(owner.clone()),
             credentials_encrypted: None,
+            decoder_override: None,
         };
         match sup.add_camera(cfg).await {
             Ok(()) => added += 1,
@@ -524,6 +529,7 @@ async fn dos_quota_per_addon_blocks_after_cap() {
             resolution: None,
             owner_addon_id: Some(owner.clone()),
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await;
     let err = one_past.expect_err("33rd camera for the same owner MUST be QuotaExceeded");
@@ -553,6 +559,7 @@ async fn dos_quota_below_cap_succeeds() {
         resolution: None,
         owner_addon_id: Some(owner),
         credentials_encrypted: None,
+        decoder_override: None,
     };
     match sup.add_camera(cfg).await {
         Ok(()) => {}

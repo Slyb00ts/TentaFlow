@@ -1,0 +1,43 @@
+# =============================================================================
+# Crate: tentaflow-hardware
+# Purpose: Native device/robot integrations for TentaFlow, organized by vendor
+#          (src/<vendor>/<model>/). First device: Unitree Go2 (Air) — WebRTC LAN
+#          signaling + data-channel control + video ingress. The `protocol`
+#          feature is dependency-light (crypto/framing only) and compiles to
+#          wasm32 so the Go2 WASM addon shares the same signaling logic; the
+#          default `full` feature adds the native webrtc-rs session/channel.
+# =============================================================================
+[package]
+name = "tentaflow-hardware"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["full"]
+# Pure Go2 signaling crypto/framing — no webrtc/tokio/std::net, wasm32-compatible.
+protocol = []
+# Native WebRTC session + channel + video ingress (pulls webrtc-rs + tokio).
+full = ["protocol", "dep:tokio", "dep:webrtc", "dep:bytes"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+aes = "0.8"
+ecb = { version = "0.1", features = ["alloc"] }
+rsa = "0.9"
+md-5 = "0.10"
+rand = "0.8"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
+webrtc = { version = "0.17.1", optional = true }
+bytes = { version = "1.11.1", optional = true }
+memchr = "2"
+
+# The spike binary proves the full native stack against the real robot.
+[[bin]]
+name = "go2-spike"
+path = "src/bin/spike.rs"
+required-features = ["full"]

@@ -1,0 +1,30 @@
+# =============================================================================
+# Manifest serwisu RF-DETR ADR — detekcja oznaczeń ADR na cysternach.
+# Embedded native: model ONNX ładowany przez ONNX Runtime (ort, EP
+# TensorRT/CUDA/CPU). Wagi pobierane deploy-time z release URL (model_preset.repo);
+# konfiguracja klas jest wbudowana w binarkę.
+# =============================================================================
+
+[engine]
+id = "rfdetr-adr"
+category = "vision"
+name = "RF-DETR ADR"
+description_pl = "Detektor oznaczeń ADR na cysternach (17 klas: tablice ADR/rejestracyjne, nalepki klas niebezpieczeństwa, znak środowiskowy). RF-DETR 560x560, bez NMS."
+description_en = "ADR dangerous-goods marking detector for tanker trucks (17 classes). RF-DETR 560x560, no NMS."
+homepage = "https://github.com/roboflow/rf-detr"
+license = "Apache-2.0"
+icon = "yolo"
+default_port = 0
+api = "custom"
+version = "base-2026"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-vision-gpu"
+
+[[model_preset]]
+id = "rfdetr-adr-base"
+display_name = "RF-DETR ADR (base, 17 klas)"
+repo = "https://models.tentaflow.local/acme/rfdetr-adr/v1"
+recommended = true

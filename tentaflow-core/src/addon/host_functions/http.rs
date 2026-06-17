@@ -304,6 +304,155 @@ pub fn http_request(
     )
 }
 
+/// Path component of a URL (everything from the first `/` after the authority),
+/// defaulting to `/`.
+fn url_path(url: &str) -> String {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    match after_scheme.find('/') {
+        Some(i) => after_scheme[i..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Raw HTTP/1.0 + `Connection: close` POST over a plain TCP socket. Some embedded
+/// HTTP servers (e.g. the Unitree Go2 LAN signaling endpoint) close the
+/// connection mid-request when hit with hyper/reqwest HTTP/1.1 bodied POSTs, so
+/// `http_request` (reqwest) fails against them. This speaks the minimal HTTP/1.0
+/// dialect and reads the whole response to EOF. Header terminator may be CRLFCRLF
+/// or bare LFLF. Returns `(status, body)`.
+fn raw_http10_post(
+    addr: std::net::SocketAddr,
+    host_header: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(8))
+        .map_err(|e| format!("tcp connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(8)))
+        .ok();
+    let mut head = format!("POST {path} HTTP/1.0\r\nHost: {host_header}\r\nConnection: close\r\n");
+    if !content_type.is_empty() {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    stream.write_all(head.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    if !body.is_empty() {
+        stream.write_all(body).map_err(|e| format!("write body: {e}"))?;
+    }
+    stream.flush().ok();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| format!("read: {e}"))?;
+    let (idx, sep_len) = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4))
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2)))
+        .ok_or_else(|| format!("no HTTP header terminator ({} bytes)", raw.len()))?;
+    let header = String::from_utf8_lossy(&raw[..idx]);
+    let status = header
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body_text = String::from_utf8_lossy(&raw[idx + sep_len..]).trim().to_string();
+    Ok((status, body_text))
+}
+
+/// Generic raw-HTTP/1.0 POST host fn for quirky embedded servers (input JSON
+/// `{url, content_type?, body}` → output JSON `{status, body}`). Same SSRF /
+/// network-rule / permission gating as `http_request`; only the transport
+/// differs (raw TCP instead of reqwest).
+pub fn http_raw_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    request_json_ptr: i32,
+    request_json_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return ABI_ERR_OPERATION,
+    };
+    let request_str = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len) {
+        Some(s) => s.to_string(),
+        None => return ABI_ERR_OPERATION,
+    };
+    let request: serde_json::Value = match serde_json::from_str(&request_str) {
+        Ok(v) => v,
+        Err(_) => return ABI_ERR_OPERATION,
+    };
+    let url = match request.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.to_string(),
+        None => return ABI_ERR_OPERATION,
+    };
+    let (domain, port) = match extract_http_destination(&url) {
+        Some(d) => d,
+        None => return ABI_ERR_PERMISSION,
+    };
+    if !check_permission(caller.data(), "http.request", None) {
+        audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("brak uprawnienia 'http.request'"));
+        return ABI_ERR_PERMISSION;
+    }
+    let rule_match = match approved_destination_match(caller.data(), &domain, port) {
+        Some(m) => m,
+        None => {
+            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("brak zatwierdzonej network_rule"));
+            return ABI_ERR_PERMISSION;
+        }
+    };
+    let require_public = rule_match == ApprovedMatch::Wildcard;
+    if require_public && !is_safe_url(&url) {
+        audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("SSRF: adres lokalny (regula wildcard)"));
+        return ABI_ERR_PERMISSION;
+    }
+    let resolved = match resolve_destination(&domain, port, require_public) {
+        Some(a) => a,
+        None => {
+            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("DNS/SSRF resolution failed"));
+            return ABI_ERR_PERMISSION;
+        }
+    };
+    if let Some(ref rate_limiter) = caller.data().rate_limiter {
+        let addon_id = caller.data().addon_id.clone();
+        if rate_limiter.check(&addon_id, ResourceType::HttpRequests).is_err() {
+            return super::ABI_ERR_RATE_LIMIT;
+        }
+        rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
+    }
+    let addr = match resolved.first() {
+        Some(a) => *a,
+        None => return ABI_ERR_PERMISSION,
+    };
+    let content_type = request.get("content_type").and_then(|v| v.as_str()).unwrap_or("");
+    let body = request.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let path = url_path(&url);
+
+    let response_json = match raw_http10_post(addr, &domain, &path, content_type, body.as_bytes()) {
+        Ok((status, body)) => {
+            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "ok", None);
+            serde_json::json!({ "status": status, "body": body })
+        }
+        Err(e) => {
+            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "error", Some(&e));
+            serde_json::json!({ "status": 0, "body": "", "error": e })
+        }
+    };
+    let bytes = match serde_json::to_vec(&response_json) {
+        Ok(b) => b,
+        Err(_) => return ABI_ERR_OPERATION,
+    };
+    write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &bytes)
+}
+
 // =============================================================================
 // Funkcje pomocnicze
 // =============================================================================

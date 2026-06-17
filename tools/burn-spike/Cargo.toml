@@ -1,0 +1,19 @@
+[package]
+name = "burn-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+burn = { version = "0.21", features = ["wgpu", "ndarray"] }
+burn-store = "0.21"
+image = "0.25"
+
+[build-dependencies]
+burn-onnx = "0.21"
+
+[features]
+default = []
+cuda = ["burn/cuda"]
+vulkan = ["burn/vulkan"]
+wgpuf16 = []

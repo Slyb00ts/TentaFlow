@@ -924,7 +924,97 @@ impl SyncRuntime {
                 Err(e) => warn!("sync runtime: pominieto niepoprawny target outbox: {}", e),
             }
         }
+        // An addon instance is useless on a receiver without the package bytes it
+        // names, so route the package blob to the same targets in the same step.
+        if capture.resource_type == "core.addon_instance" {
+            if let (Some(package_id), Some(version)) = (
+                changed_field_string(&capture.changed_fields, "package_id"),
+                changed_field_string(&capture.changed_fields, "package_version"),
+            ) {
+                queued += self.queue_addon_package_blob(&capture.org_id, &package_id, &version)?;
+            }
+        }
         Ok(queued)
+    }
+
+    /// Enqueues a single operation into the outbox of each given node, skipping the
+    /// local node and any node that already holds it. Idempotent: re-running for the
+    /// same (op, nodes) is a no-op, so the blob-coupling paths can overlap safely.
+    fn queue_op_to_nodes(&self, op_id: OperationId, node_ids: &[String]) -> LedgerResult<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+        let existing = self.ledger.list_outbox_for_operation(op_id)?;
+        let mut queued = 0usize;
+        for node_id in node_ids {
+            if node_id == &self.local_node_id {
+                continue;
+            }
+            if existing
+                .iter()
+                .any(|entry| entry.target.as_str() == node_id.as_str())
+            {
+                continue;
+            }
+            match SyncTarget::new(node_id.clone()) {
+                Ok(sync_target) => {
+                    self.ledger.put_in_outbox(sync_target, op_id)?;
+                    queued += 1;
+                }
+                Err(e) => warn!("sync runtime: pominieto niepoprawny target outbox: {}", e),
+            }
+        }
+        Ok(queued)
+    }
+
+    /// Couples an uploaded addon package's already-ledgered blob (its chunk +
+    /// manifest operations) to the nodes that should receive the package, i.e. the
+    /// sync targets of the instances referencing it. Called whenever a
+    /// `core.addon_instance` op is routed (mint-time fan-out and permission
+    /// backfill) so the wasm bytes follow the instance row to every receiver. Bytes
+    /// captured before any instance exists are picked up here once the instance is
+    /// routed; bytes captured after the instance are routed by the blob-capture path
+    /// — together they close both orderings. No-op for bundled packages (which have
+    /// no blob) and while the blob is not yet in the ledger.
+    fn queue_addon_package_blob(
+        &self,
+        org_id: &str,
+        package_id: &str,
+        version: &str,
+    ) -> LedgerResult<usize> {
+        let node_ids = repository::list_sync_target_nodes_for_addon_package(
+            &self.db, org_id, package_id, version,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+        let blob_id = format!("addon-package:{package_id}:{version}");
+        let Some(sha) = repository::latest_blob_sha_for_blob_id(&self.db, &blob_id)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+        else {
+            return Ok(0);
+        };
+        let mut queued = 0usize;
+        for op in self.blob_operations_for_sha(&sha)? {
+            queued += self.queue_op_to_nodes(op.op_id, &node_ids)?;
+        }
+        Ok(queued)
+    }
+
+    /// All `core.blob` chunk + manifest operations for a content hash. Blob ops for
+    /// a given sha share the partition `core/blob/<sha[..2]>`, so this is a bounded
+    /// prefix scan, not a full ledger walk.
+    fn blob_operations_for_sha(&self, sha: &str) -> LedgerResult<Vec<SyncOperation>> {
+        let partition = PartitionId::new(format!("core/blob/{}", &sha[..2.min(sha.len())]))?;
+        let ops = self.ledger.get_operations(OperationQuery {
+            partition_id: partition,
+            limit: None,
+        })?;
+        Ok(ops
+            .into_iter()
+            .filter(|op| op.body.resource_type == "core.blob" && op.body.resource_id == sha)
+            .collect())
     }
 
     fn build_push_payload_for_target(
@@ -1089,6 +1179,22 @@ impl SyncRuntime {
                         enqueued += 1;
                     }
                     Err(e) => warn!("sync runtime: backfill skipping invalid target: {}", e),
+                }
+            }
+            // A newly-permitted node that now receives an addon instance must also
+            // receive its package bytes; the bare blob ops carry no permission of
+            // their own and are skipped by the resource gate above, so couple them
+            // to the instance's freshly-granted targets here.
+            if operation.body.resource_type == "core.addon_instance" {
+                if let (Some(package_id), Some(version)) = (
+                    changed_field_string(&operation.body.changed_fields, "package_id"),
+                    changed_field_string(&operation.body.changed_fields, "package_version"),
+                ) {
+                    enqueued += self.queue_addon_package_blob(
+                        &operation.body.org_id,
+                        &package_id,
+                        &version,
+                    )?;
                 }
             }
         }
@@ -2565,6 +2671,31 @@ impl SyncRuntime {
             file.seek(SeekFrom::Start(0))
                 .map_err(|e| SyncLedgerError::Runtime(format!("blob seek: {e}")))?;
         }
+        // Resolve the blob's targets once (they are identical for every chunk and
+        // the manifest). An addon-package blob has no policy/ACL of its own — its
+        // resource id is a content hash — so it routes to the targets of the
+        // instances that reference it. Any other blob falls back to its own
+        // `core.blob` sync policy.
+        let blob_target_nodes = match parse_addon_package_blob_id(&capture.blob_id) {
+            Some((package_id, version)) => repository::list_sync_target_nodes_for_addon_package(
+                &self.db,
+                &capture.org_id,
+                &package_id,
+                &version,
+            )
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?,
+            None => repository::list_sync_targets_for_resource(
+                &self.db,
+                &capture.org_id,
+                "core",
+                "core.blob",
+                &capture.sha256,
+            )
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+            .into_iter()
+            .map(|target| target.node_id)
+            .collect(),
+        };
         let mut queued_targets = 0usize;
         let mut chunk_index = 0u64;
         loop {
@@ -2583,35 +2714,17 @@ impl SyncRuntime {
                 &buffer[..read],
             )?;
             let append = self.ledger.append_operation(op, &self.signer)?;
-            queued_targets += self.queue_targets_for_resource(
-                &capture.org_id,
-                "core",
-                "core.blob",
-                &capture.sha256,
-                append.op_id,
-            )?;
+            queued_targets += self.queue_op_to_nodes(append.op_id, &blob_target_nodes)?;
             chunk_index = chunk_index.saturating_add(1);
         }
         if capture.size_bytes == 0 {
             let op = self.build_blob_chunk_operation(capture, policy_epoch, 0, chunk_count, &[])?;
             let append = self.ledger.append_operation(op, &self.signer)?;
-            queued_targets += self.queue_targets_for_resource(
-                &capture.org_id,
-                "core",
-                "core.blob",
-                &capture.sha256,
-                append.op_id,
-            )?;
+            queued_targets += self.queue_op_to_nodes(append.op_id, &blob_target_nodes)?;
         }
         let manifest = self.build_blob_manifest_operation(capture, policy_epoch, chunk_count)?;
         let append = self.ledger.append_operation(manifest, &self.signer)?;
-        queued_targets += self.queue_targets_for_resource(
-            &capture.org_id,
-            "core",
-            "core.blob",
-            &capture.sha256,
-            append.op_id,
-        )?;
+        queued_targets += self.queue_op_to_nodes(append.op_id, &blob_target_nodes)?;
         Ok(SqlCaptureRecordResult {
             op_id: append.op_id,
             queued_targets,
@@ -3344,6 +3457,27 @@ fn field_u64(operation: &SyncOperation, key: &str) -> LedgerResult<u64> {
             "sync operation missing u64 field: {key}"
         ))),
     }
+}
+
+/// Reads a string-valued field from a capture/operation field map, returning None
+/// when absent or not a string (e.g. a Delete capture carrying no columns).
+fn changed_field_string(fields: &BTreeMap<String, FieldValue>, key: &str) -> Option<String> {
+    match fields.get(key) {
+        Some(FieldValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Parses an `addon-package:<package_id>:<version>` blob id. `package_id` and
+/// semver `version` never contain `:`, so the first `:` after the prefix splits
+/// them unambiguously. Returns None for any other blob id.
+fn parse_addon_package_blob_id(blob_id: &str) -> Option<(String, String)> {
+    let rest = blob_id.strip_prefix("addon-package:")?;
+    let (package_id, version) = rest.split_once(':')?;
+    if package_id.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((package_id.to_string(), version.to_string()))
 }
 
 fn field_i64(operation: &SyncOperation, key: &str) -> LedgerResult<i64> {
@@ -5125,6 +5259,130 @@ mod tests {
             let stored = std::fs::read(target_path).expect("stored blob");
             assert_eq!(stored, bytes);
             assert!(!blob_chunk_dir(&sha).expect("chunk dir").exists());
+        });
+    }
+
+    /// Minimal installed-instance row so `installed_addon_ids_for_package` and the
+    /// `core.addon_instance` target resolution see the package as installed.
+    fn seed_installed_addon(db: &DbPool, package_id: &str, version: &str, addon_id: &str) {
+        let conn = db.lock().expect("db");
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, package_id, package_version) \
+             VALUES (?1, ?1, ?2, ?3, ?2)",
+            rusqlite::params![addon_id, version, package_id],
+        )
+        .expect("seed addon");
+    }
+
+    /// Records and ledgers an `addon-package:` blob the way an upload does (capture
+    /// row + chunked ledger operations). Returns the content hash.
+    fn record_addon_package_blob(
+        runtime: &SyncRuntime,
+        package_id: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> String {
+        let sha = hex::encode(sha256(bytes));
+        let dir = tempfile::tempdir().expect("blob dir");
+        let path = dir.path().join("pkg.tar.gz");
+        std::fs::write(&path, bytes).expect("write blob");
+        let capture = crate::sync::blob_capture::BlobWriteCapture::new(
+            "org-default",
+            format!("addon-package:{package_id}:{version}"),
+            &sha,
+            "application/gzip",
+            bytes.len() as u64,
+            path.to_string_lossy().to_string(),
+            None,
+        );
+        {
+            let conn = runtime.db.lock().expect("db");
+            crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)
+                .expect("record capture row");
+        }
+        runtime
+            .record_blob_capture(capture)
+            .expect("ledger blob capture");
+        sha
+    }
+
+    /// Regression: an uploaded addon package's bytes must reach a STANDARD trusted
+    /// peer — not only `authority`-profile nodes. The `core.blob` resource type has
+    /// no default sync policy and is not a "default core resource", so before the
+    /// instance-coupling fix the blob got zero targets and the addon showed up
+    /// installed on the peer with its wasm missing. Uses the real production
+    /// `ensure_default_core_sync_policies` (NOT a hand-seeded authority target).
+    #[test]
+    fn addon_package_blob_follows_instance_to_standard_node() {
+        with_tmp_home(|| {
+            let source = make_runtime(71);
+            let db = source.runtime.db.clone();
+            repository::ensure_default_core_sync_policies(&db).expect("default core policies");
+            repository::upsert_sync_node_identity(
+                &db,
+                "receiver-node",
+                "pub",
+                "ed25519",
+                "Receiver",
+                "server",
+                "trusted",
+                None,
+                "standard",
+            )
+            .expect("standard trusted node");
+
+            // Bytes captured BEFORE any instance references the package (the upload
+            // ordering): no instance → no targets → blob ops sit unrouted.
+            let sha = record_addon_package_blob(&source.runtime, "pkg-x", "1.0.0", b"wasm-bytes");
+            let blob_ops = source
+                .runtime
+                .blob_operations_for_sha(&sha)
+                .expect("blob ops");
+            assert!(!blob_ops.is_empty(), "blob must be chunked into the ledger");
+            for op in &blob_ops {
+                let outbox = source
+                    .runtime
+                    .ledger
+                    .list_outbox_for_operation(op.op_id)
+                    .expect("outbox");
+                assert!(
+                    outbox.is_empty(),
+                    "blob must not route before an instance references the package"
+                );
+            }
+
+            // Now the instance exists: the package's targets equal the instance's.
+            seed_installed_addon(&db, "pkg-x", "1.0.0", "inst-x");
+            let nodes = repository::list_sync_target_nodes_for_addon_package(
+                &db, "org-default", "pkg-x", "1.0.0",
+            )
+            .expect("package targets");
+            assert_eq!(nodes, vec!["receiver-node".to_string()]);
+
+            // Coupling the blob to the instance routes every blob op to the node.
+            let queued = source
+                .runtime
+                .queue_addon_package_blob("org-default", "pkg-x", "1.0.0")
+                .expect("queue addon package blob");
+            assert!(queued > 0, "blob ops must be queued to the standard node");
+            for op in &blob_ops {
+                let outbox = source
+                    .runtime
+                    .ledger
+                    .list_outbox_for_operation(op.op_id)
+                    .expect("outbox");
+                assert!(
+                    outbox.iter().any(|entry| entry.target.as_str() == "receiver-node"),
+                    "blob op missing outbox entry for the standard trusted node"
+                );
+            }
+
+            // Idempotent: re-running adds nothing.
+            let again = source
+                .runtime
+                .queue_addon_package_blob("org-default", "pkg-x", "1.0.0")
+                .expect("requeue addon package blob");
+            assert_eq!(again, 0, "blob coupling must be idempotent");
         });
     }
 

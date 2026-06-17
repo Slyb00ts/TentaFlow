@@ -1,0 +1,66 @@
+[
+  {
+    "type": "go2.stop",
+    "title": "Go2: STOP (e-stop)",
+    "category": "Robot · Go2",
+    "description": "Awaryjne zatrzymanie robota (StopMove + Damp) i włączenie trwałej blokady e-stop.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.recovery_stand",
+    "title": "Go2: RecoveryStand",
+    "category": "Robot · Go2",
+    "description": "Postaw robota do bezpiecznej pozycji stojącej.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.stand_up",
+    "title": "Go2: Wstań",
+    "category": "Robot · Go2",
+    "description": "Robot wstaje.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.stand_down",
+    "title": "Go2: Połóż się",
+    "category": "Robot · Go2",
+    "description": "Robot kładzie się.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.sit",
+    "title": "Go2: Siad",
+    "category": "Robot · Go2",
+    "description": "Robot siada.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.hello",
+    "title": "Go2: Przywitanie",
+    "category": "Robot · Go2",
+    "description": "Robot macha łapą (Hello).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.stretch",
+    "title": "Go2: Przeciąganie",
+    "category": "Robot · Go2",
+    "description": "Robot się przeciąga (Stretch).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.move",
+    "title": "Go2: Ruch",
+    "category": "Robot · Go2",
+    "description": "Ruch robota. Prędkości vx/vy/vyaw (zakres -1..1) odczytywane ze zmiennych flow; brak = 0.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  }
+]

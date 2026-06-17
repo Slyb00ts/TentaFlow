@@ -1,0 +1,156 @@
+# =============================================================================
+# Addon: go2 (Unitree Go2 robot control)
+# Owns ALL Go2 logic: LAN WebRTC signaling + crypto, sport commands, continuous
+# battery/RTT telemetry, durable e-stop, camera registration, flow blocks, panel.
+# The [robot] block is the universal capability descriptor the future "Robots"
+# app consumes to discover/register robot-control addons. See tentaflow-hardware/ROBOTS.md.
+# =============================================================================
+[addon]
+id = "go2"
+name = "Unitree Go2"
+version = "0.0.1"
+description = "Sterowanie robotem czworonożnym Unitree Go2 (Air) — ruch, pozy, akcje, telemetria, kamera, lidar przez WebRTC LAN."
+category = "robotics"
+keywords = ["robot", "quadruped", "unitree", "go2", "webrtc"]
+author = "TentaFlow"
+license = "Apache-2.0"
+icon = "robot"
+runtime = "wasmtime"
+platforms = ["linux"]
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "overview"
+title = "Unitree Go2"
+icon = "robot"
+description = "Sterowanie i podgląd robota Unitree Go2"
+sort_order = 60
+
+# Service tick drives the connection state machine (validation handshake) and
+# continuous telemetry (battery + RTT). 200ms so the validation challenge is
+# answered promptly; telemetry/publish is throttled inside on_tick.
+[service]
+enabled = true
+tick_interval_ms = 200
+
+# LAN signaling to the robot (con_notify / con_ing). Exact host — admin approves
+# the private address in the Network tab. Update host when the robot IP changes.
+[[network_rule]]
+id = "go2-webrtc-signaling"
+host = "192.168.0.190"
+port = 9991
+protocol = "tcp"
+description = "Unitree Go2 WebRTC LAN signaling (con_notify / con_ing over HTTP/TCP)."
+
+# ── Universal robot capability descriptor ────────────────────────────────────
+# The marker that THIS addon controls a robot. The Robots app discovers every
+# addon carrying a [robot] block and offers it when registering a new robot.
+# Cross-robot fields are intentionally generic so a drone/arm/rover addon
+# declares the same shape with different values. Schema: tentaflow-hardware/ROBOTS.md.
+[robot]
+controls_robot = true
+kind = "quadruped"           # quadruped | drone | arm | rover | humanoid | ...
+vendor = "unitree"
+model = "go2"
+variant = "air"
+display_name = "Unitree Go2"
+icon = "robot"
+transports = ["webrtc-lan"]  # how the controller reaches the robot
+
+# Connection parameters the Robots app collects when registering a robot of this
+# type (renders a generic typed form — each robot declares its own fields).
+[[robot.connection_param]]
+key = "ip"
+label = "Adres IP robota"
+type = "string"
+required = true
+placeholder = "192.168.0.190"
+
+[[robot.connection_param]]
+key = "serial"
+label = "Numer seryjny (do wykrywania w sieci, opcjonalnie)"
+type = "string"
+required = false
+
+# What the robot can do — lets the Robots app / Flow Builder expose controls,
+# status tiles and sensor previews uniformly across robot types.
+[robot.capabilities]
+locomotion = true                 # Move(vx, vy, vyaw)
+poses = true                      # StandUp/StandDown/RecoveryStand/Sit/Pose(euler,height)
+actions = ["hello", "stretch", "sit", "stand_up", "stand_down", "recovery_stand", "dance1", "dance2"]
+estop = true
+telemetry = ["battery", "imu", "pose", "mode"]
+camera = true                     # provides a video source (consumable by TentaVision)
+lidar = true                      # provides a point cloud (v2)
+audio = false
+
+# Movement safety envelope the controller enforces; the Robots app may show/edit.
+[robot.safety]
+max_linear_mps = 1.0
+max_yaw_rps = 1.0
+require_estop_clear = true
+
+# ── Permissions (forward declaration of what the Chunk 4 code will need) ──────
+[[permission]]
+id = "ui"
+display_name = "Renderowanie UI"
+description = "Renderowanie deklaratywnego UI panelu sterowania robotem."
+risk = "low"
+
+[[permission]]
+id = "webrtc.connect"
+display_name = "Połączenie WebRTC"
+description = "Otwieranie generycznego kanału WebRTC (peer + data channel + media→kamera) do urządzenia w LAN."
+risk = "high"
+
+[[permission]]
+id = "http.request"
+display_name = "Żądania HTTP"
+description = "Signaling con_notify/con_ing do robota w LAN (wymaga zatwierdzonej reguły sieciowej na host robota)."
+risk = "high"
+
+[[permission]]
+id = "cameras.write"
+display_name = "Rejestracja kamery robota"
+description = "Rejestracja kamery robota jako źródła (backed) dla podglądu i TentaVision."
+risk = "medium"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Bloczki Flow"
+description = "Udostępnianie bloczków sterowania robotem (ruch, pozy, akcje, e-stop) w Flow Builderze."
+risk = "high"
+
+[[permission]]
+id = "events"
+display_name = "Zdarzenia"
+description = "Publikacja/odbiór zdarzeń robota (online/offline, alarm, dotarł do celu)."
+risk = "low"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt SQL"
+description = "Odczyt konfiguracji robota z per-addon bazy."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis SQL"
+description = "Zapis konfiguracji/stanu robota w per-addon bazie."
+risk = "medium"
+
+[visibility]
+admin_only = false
+show_in_catalog = true
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 64
+fuel_limit = 200000000
+storage_total_mb = 20

@@ -130,6 +130,7 @@ const ADMIN_NAV = [
     items: [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
+      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain' },
     ],
   },
   {

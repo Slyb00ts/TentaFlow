@@ -17,6 +17,7 @@ pub mod quic_finder;
 pub mod stt_impl;
 pub mod tts_cleaning_impl;
 pub mod tts_impl;
+pub mod vision_impl;
 
 use std::sync::Arc;
 
@@ -51,3 +52,4 @@ pub use quic_finder::{QuicClientFinder, ServiceManagerQuicFinder};
 pub use stt_impl::SttDispatcherImpl;
 pub use tts_cleaning_impl::TtsCleaningStoreImpl;
 pub use tts_impl::TtsDispatcherImpl;
+pub use vision_impl::VisionDispatcherImpl;

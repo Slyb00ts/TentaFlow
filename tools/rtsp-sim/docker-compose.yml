@@ -1,0 +1,25 @@
+# =============================================================================
+# File: tools/rtsp-sim/docker-compose.yml
+# Purpose: MediaMTX RTSP server for the camera-fleet simulator. ffmpeg
+#          publishers (started by simulate.sh) push looped video files into it;
+#          TentaFlow then ingests rtsp://<host>:8554/<camNN> like real cameras.
+# =============================================================================
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: tf-rtsp-sim
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Plain RTSP only; the simulator publishes/reads on 8554. RTMP/HLS/WebRTC
+      # off to keep the surface minimal.
+      MTX_RTSP: "yes"
+      MTX_RTMP: "no"
+      MTX_HLS: "no"
+      MTX_WEBRTC: "no"
+      MTX_SRT: "no"
+      MTX_RTSPADDRESS: ":8554"
+      # Allow anonymous publish+read from localhost only by default; override via
+      # MTX_* env if you expose this beyond the host.
+      MTX_LOGLEVEL: "info"

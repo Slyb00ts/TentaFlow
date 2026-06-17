@@ -558,6 +558,9 @@ impl AddonManager {
         let engine = runtime::create_engine()?;
 
         let event_bus = Arc::new(EventBus::new());
+        // Publish a process-global handle so core flow nodes (camera_alert) can
+        // emit events to subscribed addons without threading the bus through.
+        event_bus::set_global_event_bus(event_bus.clone());
         let permission_checker = Arc::new(PermissionChecker::new(db.clone()));
 
         // Warm-up cache uprawnien — zaladuj wszystko z DB do cache
@@ -1097,6 +1100,10 @@ impl AddonManager {
         // Deaktywuj aliasy posiadane przez addon — czytamy owner table wprost
         // (manifest moze byc juz nieosiagalny). Owner rows zostaja dla audytu.
         self.deactivate_aliases_owned_by_addon(addon_id);
+
+        // Zamknij i usun wszystkie kanaly WebRTC tego addonu (peer connections
+        // nie moga przeciekac po unload/disable/uninstall).
+        crate::addon::host_functions::webrtc::cleanup_addon_channels(addon_id);
     }
 
     /// Instaluje NOWA instancje pakietu z katalogu pod wlasnym addon_id i

@@ -42,6 +42,7 @@ fn insert(db: &DbPool, camera_id: &str, owner: &str, url: &str) {
         "fake_file",
         url,
         30,
+        10,
         Some(1280),
         Some(720),
         "C",
@@ -177,6 +178,7 @@ fn db_re_insert_active_id_collides() {
         "fake_file",
         "/tmp/d2.mp4",
         30,
+        10,
         None,
         None,
         "C",
@@ -266,6 +268,7 @@ async fn supervisor_add_and_health_via_test_api() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     };
     sup.add_camera(cfg).await.expect("add");
 
@@ -290,6 +293,7 @@ async fn supervisor_rejects_unsupported_vendor() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -311,6 +315,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -325,6 +330,7 @@ async fn supervisor_rejects_fps_out_of_range() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -349,6 +355,7 @@ async fn supervisor_snapshot_returns_rgb24_frame() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     })
     .await
     .expect("add");
@@ -475,6 +482,7 @@ async fn supervisor_reset_drains_sessions_without_dropping_singleton() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .expect("add");
@@ -525,6 +533,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     })
     .await
     .expect("first add");
@@ -543,6 +552,7 @@ async fn supervisor_add_then_soft_delete_then_reuse_id() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     })
     .await
     .expect("re-add");
@@ -569,6 +579,7 @@ async fn supervisor_rejects_missing_file_path_fakefile() {
             resolution: None,
             owner_addon_id: None,
             credentials_encrypted: None,
+            decoder_override: None,
         })
         .await
         .unwrap_err();
@@ -605,6 +616,7 @@ async fn supervisor_fps_actual_approaches_target_after_warmup() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     })
     .await
     .expect("add");
@@ -637,6 +649,7 @@ async fn supervisor_remove_closes_streaming_bus() {
         resolution: None,
         owner_addon_id: None,
         credentials_encrypted: None,
+        decoder_override: None,
     })
     .await
     .expect("add");
