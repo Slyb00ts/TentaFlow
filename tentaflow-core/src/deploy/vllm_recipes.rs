@@ -61,20 +61,33 @@ fn embedded() -> &'static HashMap<String, RecipeEntry> {
 }
 
 /// vLLM kernel family for a GPU model name. Drives `hardware_overrides`
-/// (Hopper FP8 MoE, Blackwell FP4 MoE, AMD AITER). DGX B300 → blackwell.
+/// (Hopper FP8 MoE, Blackwell FP4 MoE, AMD AITER). Datacenter + Blackwell
+/// consumer/Spark map to a family; pre-Blackwell consumer (RTX 30/40 = Ampere/
+/// Ada) and unknowns return None → only the model's base recipe flags apply, no
+/// MoE env (those kernels don't exist there, so injecting them would break load).
 pub fn gpu_family(gpu_name: &str) -> Option<&'static str> {
     let n = gpu_name.to_lowercase();
+    // Blackwell: B100/B200/B300, GB200/GB300, GB10 (DGX Spark, sm_121),
+    // RTX 50xx + RTX PRO 6000 Blackwell.
     if n.contains("b300")
         || n.contains("b200")
         || n.contains("b100")
         || n.contains("gb300")
         || n.contains("gb200")
+        || n.contains("gb10")
+        || n.contains("spark")
         || n.contains("rtx 50")
         || n.contains("rtx pro 6000")
     {
         return Some("blackwell");
     }
-    if n.contains("h300") || n.contains("h200") || n.contains("h100") || n.contains("h800") {
+    // Hopper: H100/H200/H800, GH200 (Grace-Hopper).
+    if n.contains("h300")
+        || n.contains("h200")
+        || n.contains("h100")
+        || n.contains("h800")
+        || n.contains("gh200")
+    {
         return Some("hopper");
     }
     if n.contains("mi300") || n.contains("mi325") || n.contains("mi355") || n.contains("instinct") {
