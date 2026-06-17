@@ -3597,7 +3597,10 @@ pub async fn service_manifest_deploy(
             }
         }
         let resp = iroh
-            .send_command_and_wait(&target, cmd, 30)
+            // 120 s (nie 30): odbiorca embedded (np. MLX na Macu) przy deployu
+            // przebudowuje serwis i może odpowiedzieć z opóźnieniem; krótki timeout
+            // gubił ACK mimo udanego deployu (model wdrożony, UI nie widziało sukcesu).
+            .send_command_and_wait(&target, cmd, 120)
             .await
             .map_err(|e| ProtocolError::internal(e.to_string()))?;
         if !resp.ok {
