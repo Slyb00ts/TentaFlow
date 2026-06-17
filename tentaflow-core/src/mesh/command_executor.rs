@@ -496,8 +496,7 @@ impl MeshCommandExecutor {
         request_cbor: Vec<u8>,
     ) -> CommandResponse {
         use crate::mesh::robot_control::{
-            plan_execution, validate_timing, Go2Call, IdemKey, RobotControlRequest,
-            RobotControlResponse,
+            plan_execution, validate_timing, IdemKey, RobotControlRequest, RobotControlResponse,
         };
 
         let Some(ctx) = self.service_action_ctx().await else {
@@ -611,46 +610,24 @@ impl MeshCommandExecutor {
             }
         };
 
-        // Dispatch the sanitized call into the addon. call_tool / invoke_block are
-        // synchronous wasmtime calls → run on a blocking thread (like web_research).
+        // Dispatch the sanitized call into the addon through the ONE shared
+        // local-execute helper (sender(local) reuses the same code). call_tool /
+        // invoke_block are synchronous wasmtime calls → run on a blocking thread
+        // (like web_research).
         let addon_manager = ctx.addon_manager.clone();
-        let plan_addon = plan.addon_id.clone();
-        let plan_actor = plan.actor_user_id.clone();
-        let call = plan.call.clone();
-        let exec = tokio::task::spawn_blocking(move || match call {
-            Go2Call::Tool { tool, params } => {
-                addon_manager.call_tool(&plan_addon, &tool, params, &plan_actor)
-            }
-            Go2Call::Block { block_type, params } => {
-                let bytes = serde_json::to_vec(&params)
-                    .map_err(|e| anyhow::anyhow!("encode block params: {e}"))?;
-                let raw = addon_manager.invoke_block(
-                    &plan_addon,
-                    &block_type,
-                    &bytes,
-                    Some(plan_actor.clone()),
-                    None,
-                    crate::mesh::robot_control::ROBOT_BLOCK_FUEL,
-                    None,
-                )?;
-                serde_json::from_slice::<serde_json::Value>(&raw)
-                    .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
-            }
+        let plan_for_exec = plan.clone();
+        let read_only = req.action.is_read_only();
+        let exec = tokio::task::spawn_blocking(move || {
+            crate::mesh::robot_control::execute_robot_call(
+                &addon_manager,
+                &plan_for_exec,
+                read_only,
+            )
         })
         .await;
 
         let resp = match exec {
-            Ok(Ok(json)) => {
-                if req.action.is_read_only() {
-                    match serde_json::to_string(&json) {
-                        Ok(s) => RobotControlResponse::ok_with(s),
-                        Err(e) => RobotControlResponse::failed(format!("serialize status: {e}")),
-                    }
-                } else {
-                    RobotControlResponse::ok()
-                }
-            }
-            Ok(Err(e)) => RobotControlResponse::failed(e.to_string()),
+            Ok(resp) => resp,
             Err(e) => RobotControlResponse::failed(format!("robot control task failed: {e}")),
         };
 
@@ -2015,10 +1992,54 @@ fn resolve_deploy_method(
 /// the addon row + parsed manifest so the selection logic in
 /// [`select_robot_addon`] is pure and unit-testable without a DB.
 #[derive(Debug, Clone, PartialEq)]
-struct RobotAddonCandidate {
-    addon_id: String,
-    package_id: String,
-    max_velocity: f64,
+pub(crate) struct RobotAddonCandidate {
+    pub(crate) addon_id: String,
+    pub(crate) package_id: String,
+    pub(crate) max_velocity: f64,
+    /// Robot kind from manifest `[robot].kind` ("quadruped", "drone", ...).
+    /// Carried so the advertiser can publish it without re-parsing manifests.
+    pub(crate) kind: Option<String>,
+}
+
+/// Enumerate this node's INSTALLED + ENABLED robot-controlling addons: every
+/// addon whose manifest carries `[robot] controls_robot=true`. Single source of
+/// truth for both the receiver's [`resolve_robot_addon`] (precise pick for one
+/// `robot_id`) and the advertiser (publishes the full owned-robot list to the
+/// mesh). Each entry carries the instance id, package/base id, kind and the
+/// movement safety ceiling from `[robot.safety].max_linear_mps`.
+pub(crate) fn collect_local_robot_addons(db: &DbPool) -> Vec<RobotAddonCandidate> {
+    let Ok(addons) = crate::db::repository::list_addons(db) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<RobotAddonCandidate> = Vec::new();
+    for a in addons {
+        if !a.is_enabled {
+            continue;
+        }
+        // `manifest_json` holds the RAW manifest.toml string.
+        let manifest = match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let Some(robot) = manifest.robot.as_ref() else {
+            continue;
+        };
+        if !robot.controls_robot {
+            continue;
+        }
+        let max_velocity = robot
+            .safety
+            .as_ref()
+            .and_then(|s| s.max_linear_mps)
+            .unwrap_or(crate::mesh::robot_control::MAX_VELOCITY);
+        candidates.push(RobotAddonCandidate {
+            addon_id: a.addon_id,
+            package_id: a.package_id,
+            max_velocity,
+            kind: robot.kind.clone(),
+        });
+    }
+    candidates
 }
 
 /// Pure selection: pick the robot addon instance for `robot_id` from the set of
@@ -2033,7 +2054,7 @@ struct RobotAddonCandidate {
 ///
 /// Returns the resolved addon, plus a flag set when the package-id fallback was
 /// abandoned due to ambiguity (so the caller can `warn!`).
-fn select_robot_addon(
+pub(crate) fn select_robot_addon(
     candidates: &[RobotAddonCandidate],
     robot_id: &str,
 ) -> (Option<crate::mesh::robot_control::ResolvedRobotAddon>, bool) {
@@ -2073,38 +2094,11 @@ fn select_robot_addon(
 /// [`select_robot_addon`] for the precise/unambiguous choice. The movement safety
 /// ceiling comes from `[robot.safety].max_linear_mps` (falling back to the
 /// protocol max). `None` → the caller rejects as UnknownRobot.
-fn resolve_robot_addon(
+pub(crate) fn resolve_robot_addon(
     db: &DbPool,
     robot_id: &str,
 ) -> Option<crate::mesh::robot_control::ResolvedRobotAddon> {
-    let addons = crate::db::repository::list_addons(db).ok()?;
-    let mut candidates: Vec<RobotAddonCandidate> = Vec::new();
-    for a in addons {
-        if !a.is_enabled {
-            continue;
-        }
-        // `manifest_json` holds the RAW manifest.toml string.
-        let manifest = match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let Some(robot) = manifest.robot.as_ref() else {
-            continue;
-        };
-        if !robot.controls_robot {
-            continue;
-        }
-        let max_velocity = robot
-            .safety
-            .as_ref()
-            .and_then(|s| s.max_linear_mps)
-            .unwrap_or(crate::mesh::robot_control::MAX_VELOCITY);
-        candidates.push(RobotAddonCandidate {
-            addon_id: a.addon_id,
-            package_id: a.package_id,
-            max_velocity,
-        });
-    }
+    let candidates = collect_local_robot_addons(db);
     let (resolved, ambiguous) = select_robot_addon(&candidates, robot_id);
     if ambiguous {
         warn!(
@@ -2200,6 +2194,7 @@ mod tests {
             addon_id: addon_id.to_string(),
             package_id: package_id.to_string(),
             max_velocity: max_v,
+            kind: None,
         }
     }
 
