@@ -73,7 +73,7 @@ pub mod channels {
             0x01 => Some(0x0001..=0x07FF),
             0x02 => Some(0x0001..=0x00FF),
             0x03 => Some(0x0001..=0x00FF),
-            0x04 => Some(0x0010..=0x004D),
+            0x04 => Some(0x0010..=0x004E),
             0x05 => Some(0x0001..=0x00FF),
             0x06 => Some(0x0001..=0x00FF),
             0x07 => Some(0x0001..=0xFFFF),
@@ -123,8 +123,9 @@ mod tests {
         assert!(r.contains(&0x0010)); // HEARTBEAT
         assert!(r.contains(&0x004C)); // SYNC_SNAPSHOT_RESPONSE
         assert!(r.contains(&0x004D)); // ROUTING_SYNC
+        assert!(r.contains(&0x004E)); // ROBOTS_ANNOUNCE
         assert!(!r.contains(&0x000F));
-        assert!(!r.contains(&0x004E));
+        assert!(!r.contains(&0x004F));
     }
 
     #[test]
