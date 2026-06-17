@@ -7502,6 +7502,24 @@ pub fn set_user_role(pool: &DbPool, user_id: &str, role: &str) -> Result<()> {
     Ok(())
 }
 
+/// Zwraca `(role, is_admin)` uzytkownika z `user_accounts` lub `None` gdy nie istnieje.
+/// Zrodlo prawdy o rolach userow to baza CORE — ML Studio nie trzyma wlasnej kopii rol.
+pub fn get_user_role(pool: &DbPool, user_id: &str) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT role, is_admin FROM user_accounts WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| {
+                let role: String = row.get(0)?;
+                let is_admin: bool = row.get(1)?;
+                Ok((role, is_admin))
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
 /// Tworzy nowego uzytkownika w tabeli user_accounts.
 /// Zwraca ID nowo utworzonego wiersza.
 pub fn create_user_account(

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<!-- ===== Plik: admin-zasoby.html — Alokacja zasobów (widok admina): pula nodów mesh, przydział do osoby/grupy/projektu, aktywne przydziały ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — Administracja · Zasoby</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Karta noda mesh z listą GPU ----- */
+  .node-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .node-card { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px; }
+  .node-card.this-node { border-color: var(--accent-1); }
+  .node-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .node-head .node-ico { width: 32px; height: 32px; border-radius: var(--radius-sm); background: var(--bg-3);
+    display: flex; align-items: center; justify-content: center; color: var(--accent-2); flex-shrink: 0; }
+  .node-head .node-ico svg { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.8; }
+  .node-name { font-size: 13.5px; font-weight: 800; }
+  .node-name .mono { font-family: ui-monospace, monospace; font-weight: 700; color: var(--text-2); font-size: 11.5px; }
+  .node-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+  .gpu-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border);
+    font-size: 12px; }
+  .gpu-row .gpu-name { font-weight: 700; min-width: 96px; }
+  .gpu-row .gpu-vram { font-family: ui-monospace, monospace; color: var(--text-3); font-size: 11px; }
+  .gpu-row .gpu-status { margin-left: auto; }
+
+  .alloc-form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 18px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1"/><line x1="2" y1="20" x2="22" y2="20"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></symbol>
+  <symbol id="i-mesh" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><line x1="7" y1="6" x2="17" y2="6"/><line x1="6" y1="8" x2="11" y2="16"/><line x1="18" y1="8" x2="13" y2="16"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>Administracja — Zasoby (alokacja mesh-wide)</h1>
+  <p class="lead">
+    <strong>Domyślnie nikt nie ma żadnych zasobów.</strong> Użytkownik może założyć projekt, ale trening nie ruszy,
+    dopóki administrator nie przydzieli mu mocy obliczeniowej. Admin przydziela GPU/CPU/RAM z <strong>puli wszystkich
+    nodów mesh</strong> do wybranej osoby, grupy lub projektu. Będąc na jednym node widać i przydziela się karty
+    z każdego innego node sieci — scheduler treningu sam pokieruje job na node, na którym zasób przydzielono.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-lock"/></svg>Domyślnie pusto</h3>
+      <p>Bez aktywnego przydziału użytkownik/projekt nie ma mocy — kreatory treningu blokują start.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-mesh"/></svg>Pula mesh-wide</h3>
+      <p>Pula to suma kart wszystkich nodów. Z node A przydzielasz GPU z node B — zasób żyje fizycznie na swoim node.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Subject grantu</h3>
+      <p>Przydział wskazuje osobę, grupę lub projekt. Efektywne zasoby usera = suma grantów (user + grupy + projekty).</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">AZ</span>
+    <h2>Zasoby — pula nodów mesh, przydziały do osób/grup/projektów</h2>
+    <div class="desc">Widok administratora · alokacja mocy obliczeniowej mesh-wide.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Administrator</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">ML Studio</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb">Administracja</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Zasoby</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-cpu"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Zasoby <span class="chip accent"><svg class="icon"><use href="#i-shield"/></svg>tylko admin</span></div>
+            <div class="d-sub">Pula GPU/CPU/RAM wszystkich nodów mesh · przydziały do osób, grup i projektów</div>
+            <div class="d-badges">
+              <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>4 nody w mesh</span>
+              <span class="chip info"><svg class="icon"><use href="#i-cpu"/></svg>12 GPU w puli · 5 wolnych</span>
+              <span class="chip"><svg class="icon"><use href="#i-link"/></svg>0 aktywnych przydziałów</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj noda / GPU…"></div>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 1: Pula zasobów mesh (wszystkie nody) ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-mesh"/></svg>Pula zasobów mesh <span class="text-3">— wszystkie nody sieci</span></div>
+            <span class="hint">Jesteś na <strong>node-A · warszawa-gpu</strong> — widzisz i przydzielasz karty z każdego noda</span>
+          </div>
+          <div class="node-grid">
+
+            <!-- node A — bieżący node -->
+            <div class="node-card this-node">
+              <div class="node-head">
+                <div class="node-ico"><svg viewBox="0 0 24 24"><use href="#i-server"/></svg></div>
+                <div>
+                  <div class="node-name">warszawa-gpu <span class="mono">node-A</span> <span class="chip accent" style="margin-left:4px;">ten node</span></div>
+                  <div class="node-sub">stacja robocza · Ubuntu · online</div>
+                </div>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">RTX 4090</span><span class="gpu-vram">24 GB</span>
+                <span class="gpu-status"><span class="status-pill ok">przydzielone · projekt cysterny</span></span>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">RTX 4090</span><span class="gpu-vram">24 GB</span>
+                <span class="gpu-status"><span class="status-pill idle">wolne</span></span>
+              </div>
+            </div>
+
+            <!-- node B — DGX -->
+            <div class="node-card">
+              <div class="node-head">
+                <div class="node-ico"><svg viewBox="0 0 24 24"><use href="#i-server"/></svg></div>
+                <div>
+                  <div class="node-name">dgx-01 <span class="mono">node-B</span></div>
+                  <div class="node-sub">serwer treningowy · 8× akcelerator · online</div>
+                </div>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">B300 ×2</span><span class="gpu-vram">2× 288 GB</span>
+                <span class="gpu-status"><span class="status-pill warn">zajęte treningiem</span></span>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">B300 ×2</span><span class="gpu-vram">2× 288 GB</span>
+                <span class="gpu-status"><span class="status-pill ok">przydzielone · grupa Wizja</span></span>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">B300 ×4</span><span class="gpu-vram">4× 288 GB</span>
+                <span class="gpu-status"><span class="status-pill idle">wolne</span></span>
+              </div>
+            </div>
+
+            <!-- node C — laptop -->
+            <div class="node-card">
+              <div class="node-head">
+                <div class="node-ico"><svg viewBox="0 0 24 24"><use href="#i-laptop"/></svg></div>
+                <div>
+                  <div class="node-name">laptop-piotr <span class="mono">node-C</span></div>
+                  <div class="node-sub">laptop mobilny · online (przez mesh)</div>
+                </div>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">RTX 3080</span><span class="gpu-vram">16 GB</span>
+                <span class="gpu-status"><span class="status-pill idle">wolne</span></span>
+              </div>
+            </div>
+
+            <!-- node D — telefon -->
+            <div class="node-card">
+              <div class="node-head">
+                <div class="node-ico"><svg viewBox="0 0 24 24"><use href="#i-phone"/></svg></div>
+                <div>
+                  <div class="node-name">telefon-piotr <span class="mono">node-D</span></div>
+                  <div class="node-sub">urządzenie mobilne · online (przez mesh)</div>
+                </div>
+              </div>
+              <div class="gpu-row">
+                <span class="gpu-name">NPU</span><span class="gpu-vram">~12 TOPS</span>
+                <span class="gpu-status"><span class="status-pill idle">wolne · tylko lekkie zadania</span></span>
+              </div>
+            </div>
+
+          </div>
+          <div class="callout mt-md" style="display:flex;gap:12px;align-items:flex-start;padding:13px 16px;background:var(--accent-glow);border:1px solid var(--accent-1);border-radius:var(--radius);">
+            <svg class="icon icon-lg" style="color:var(--accent-2);flex-shrink:0;"><use href="#i-info"/></svg>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;">Pula = suma kart wszystkich nodów (<code>node_resources_get</code> przez mesh registry). Karty z
+              <strong>node-B (dgx-01)</strong> widać i przydziela się stąd, choć ten ekran działa na <strong>node-A</strong> —
+              fizycznie zasób zostaje na swoim node, a job zostanie tam przerzucony przez mesh stream.</p>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 2: Przydziel zasób ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-plus"/></svg>Przydziel zasób</div>
+            <span class="hint">grant: subject → zasób (node + GPU) + limit</span>
+          </div>
+
+          <div class="field">
+            <label>Subject przydziału</label>
+            <div class="segmented">
+              <button class="active"><svg class="icon"><use href="#i-user"/></svg>Osoba</button>
+              <button><svg class="icon"><use href="#i-users"/></svg>Grupa</button>
+              <button><svg class="icon"><use href="#i-folder"/></svg>Projekt</button>
+            </div>
+          </div>
+
+          <div class="alloc-form-grid">
+            <div class="field">
+              <label>Wybierz osobę</label>
+              <select class="select">
+                <option>anna.kowalska@euvic.pl</option>
+                <option>marek.nowak@euvic.pl</option>
+                <option>piotr.jarocki@euvic.pl</option>
+              </select>
+              <span class="hint">Przy „Grupa"/„Projekt" lista zmienia się na grupy / projekty.</span>
+            </div>
+            <div class="field">
+              <label>Node</label>
+              <select class="select">
+                <option>node-A · warszawa-gpu</option>
+                <option>node-B · dgx-01</option>
+                <option>node-C · laptop-piotr</option>
+                <option>node-D · telefon-piotr</option>
+              </select>
+              <span class="hint">Z dowolnego noda mesh — także zdalnego.</span>
+            </div>
+            <div class="field">
+              <label>Zasób (GPU)</label>
+              <select class="select">
+                <option>RTX 4090 #2 — wolne (24 GB)</option>
+                <option>B300 #5–#8 — wolne (4× 288 GB)</option>
+                <option>RTX 3080 — wolne (16 GB)</option>
+                <option>NPU — wolne (lekkie zadania)</option>
+              </select>
+              <span class="hint">Lista filtruje karty o statusie „wolne" na wybranym node.</span>
+            </div>
+            <div class="field">
+              <label>Limit przydziału</label>
+              <div class="flex gap-sm">
+                <input class="input" style="flex:1;" placeholder="np. 1" value="1">
+                <select class="select" style="flex:1.2;">
+                  <option>liczba GPU</option>
+                  <option>godziny GPU / dobę</option>
+                  <option>bez limitu</option>
+                </select>
+              </div>
+              <span class="hint">Quota zapisana w grancie (<code>resource_grants.quota</code>).</span>
+            </div>
+          </div>
+
+          <div class="flex justify-between mt-md">
+            <span class="text-xs text-3">Grant trafia do <code>resource_grants</code> i replikuje się przez Sync Ledger do uprawnionych nodów.</span>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Przydziel</button>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 3: Aktywne przydziały (DOMYŚLNIE PUSTO — §11.3) ===== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-link"/></svg>Aktywne przydziały</div>
+            <span class="hint">0 grantów · domyślnie nikt nie ma zasobów</span>
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;
+            padding:34px 24px;border:1px dashed var(--border-hover);border-radius:var(--radius);background:var(--bg-input);">
+            <svg class="icon icon-lg" style="width:34px;height:34px;color:var(--text-3);"><use href="#i-link"/></svg>
+            <div style="font-size:14px;font-weight:700;">Brak przydziałów</div>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;max-width:460px;">
+              Domyślnie nikt nie ma zasobów. Użyj formularza powyżej, by przydzielić GPU/CPU/RAM
+              osobie, grupie lub projektowi. Do tego czasu kreatory treningu pokazują
+              „brak przydzielonych zasobów, poproś administratora".</p>
+          </div>
+        </div>
+
+        <!-- ===== Sekcja 4: Ilustracja stanu PO PRZYDZIELENIU (przykład, NIE stan startowy) ===== -->
+        <div class="section-card" style="margin-bottom:0;border-style:dashed;opacity:0.92;">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-info"/></svg>Po przydzieleniu (przykład)</div>
+            <span class="chip warning"><svg class="icon"><use href="#i-info"/></svg>ilustracja — nie jest to stan startowy</span>
+          </div>
+          <p style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:12px;">
+            Tak wygląda sekcja „Aktywne przydziały" <strong>po</strong> dodaniu kilku grantów —
+            poglądowo, aby pokazać układ tabeli. Na świeżym środowisku ta lista jest pusta (patrz wyżej).</p>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Subject</th><th>Zasób (node + GPU)</th><th>Limit</th><th>Przydzielił</th><th>Data</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="chip"><svg class="icon"><use href="#i-folder"/></svg>projekt · Rozpoznawanie cystern</span></td>
+                <td class="mono">node-A · RTX 4090 #1</td>
+                <td>1 GPU</td>
+                <td>Piotr Jarocki</td>
+                <td>14 dni temu</td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Cofnij</button></td>
+              </tr>
+              <tr>
+                <td><span class="chip info"><svg class="icon"><use href="#i-users"/></svg>grupa · Wizja</span></td>
+                <td class="mono">node-B · B300 #3–#4</td>
+                <td>2 GPU · 8 h/dobę</td>
+                <td>Piotr Jarocki</td>
+                <td>6 dni temu</td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Cofnij</button></td>
+              </tr>
+              <tr>
+                <td><span class="chip accent"><svg class="icon"><use href="#i-user"/></svg>osoba · anna.kowalska</span></td>
+                <td class="mono">node-C · RTX 3080</td>
+                <td>bez limitu</td>
+                <td>Piotr Jarocki</td>
+                <td>2 dni temu</td>
+                <td><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Cofnij</button></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="callout mt-md" style="display:flex;gap:12px;align-items:flex-start;padding:13px 16px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);">
+            <svg class="icon icon-lg" style="color:var(--warning);flex-shrink:0;"><use href="#i-info"/></svg>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;"><strong>Domyślnie pula jest pusta dla użytkownika</strong> — bez żadnego z powyższych grantów (osoba,
+              któraś z jego grup lub projekt) trening się nie uruchomi. Kreatory treningu pokazują wtedy komunikat
+              „brak przydzielonych zasobów, poproś administratora".</p>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

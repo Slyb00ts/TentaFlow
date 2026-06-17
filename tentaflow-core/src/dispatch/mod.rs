@@ -550,6 +550,180 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(_) => {
                 "MlStudioProjectTypesListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListRequest(_) => {
+                "MlStudioProjectMembersListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListResponse(_) => {
+                "MlStudioProjectMembersListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteRequest(_) => {
+                "MlStudioProjectInviteRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteResponse(_) => {
+                "MlStudioProjectInviteResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveRequest(_) => {
+                "MlStudioProjectMemberRemoveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveResponse(_) => {
+                "MlStudioProjectMemberRemoveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetRequest(_) => {
+                "MlStudioProjectMemberRoleSetRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(_) => {
+                "MlStudioProjectMemberRoleSetResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(_) => {
+                "MlStudioDatasetUploadRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(_) => {
+                "MlStudioDatasetUploadResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(_) => {
+                "MlStudioDatasetUploadChunkRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkResponse(_) => {
+                "MlStudioDatasetUploadChunkResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListRequest(_) => {
+                "MlStudioDatasetsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListResponse(_) => {
+                "MlStudioDatasetsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileRequest(_) => {
+                "MlStudioDatasetProfileRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
+                "MlStudioDatasetProfileResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TabularTrainRequest(_) => {
+                "MlStudioTabularTrainRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TabularTrainResponse(_) => {
+                "MlStudioTabularTrainResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(_) => {
+                "MlStudioResourceGrantCreateRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantCreateResponse(_) => {
+                "MlStudioResourceGrantCreateResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantsListRequest(_) => {
+                "MlStudioResourceGrantsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantsListResponse(_) => {
+                "MlStudioResourceGrantsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeRequest(_) => {
+                "MlStudioResourceGrantRevokeRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeResponse(_) => {
+                "MlStudioResourceGrantRevokeResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectResourcesRequest(_) => {
+                "MlStudioProjectResourcesRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectResourcesResponse(_) => {
+                "MlStudioProjectResourcesResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainingRunsListRequest(_) => {
+                "MlStudioTrainingRunsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainingRunsListResponse(_) => {
+                "MlStudioTrainingRunsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ModelsListRequest(_) => {
+                "MlStudioModelsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ModelsListResponse(_) => {
+                "MlStudioModelsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectGrantsListRequest(_) => {
+                "MlStudioProjectGrantsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectGrantsListResponse(_) => {
+                "MlStudioProjectGrantsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStartRequest(_) => {
+                "MlStudioFtTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStartResponse(_) => {
+                "MlStudioFtTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(_) => {
+                "MlStudioFtTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStatusResponse(_) => {
+                "MlStudioFtTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportRequest(_) => {
+                "MlStudioFtExportRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportResponse(_) => {
+                "MlStudioFtExportResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportStatusRequest(_) => {
+                "MlStudioFtExportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportStatusResponse(_) => {
+                "MlStudioFtExportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtDeployRequest(_) => {
+                "MlStudioFtDeployRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtDeployResponse(_) => {
+                "MlStudioFtDeployResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtChatRequest(_) => {
+                "MlStudioFtChatRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtChatResponse(_) => {
+                "MlStudioFtChatResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStartRequest(_) => {
+                "MlStudioRecogTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStartResponse(_) => {
+                "MlStudioRecogTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStatusRequest(_) => {
+                "MlStudioRecogTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStatusResponse(_) => {
+                "MlStudioRecogTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(_) => {
+                "MlStudioRecogDatasetRegisterRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterResponse(_) => {
+                "MlStudioRecogDatasetRegisterResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDetectRequest(_) => {
+                "MlStudioRecogDetectRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDetectResponse(_) => {
+                "MlStudioRecogDetectResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImagesListRequest(_) => {
+                "MlStudioRecogImagesListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImagesListResponse(_) => {
+                "MlStudioRecogImagesListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImageRequest(_) => {
+                "MlStudioRecogImageRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImageResponse(_) => {
+                "MlStudioRecogImageResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsRequest(_) => {
+                "MlStudioRecogSaveAnnotationsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsResponse(_) => {
+                "MlStudioRecogSaveAnnotationsResponse"
+            }
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",

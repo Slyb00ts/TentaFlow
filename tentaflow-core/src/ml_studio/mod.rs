@@ -5,9 +5,18 @@
 // (`owner_user_id`/`org_id`) is referenced at the application level from the
 // request `HandlerContext`, never via SQL foreign keys into `tentaflow.db`.
 
+pub mod coco_annotate;
 pub mod db;
+pub mod export_llm;
+pub mod infer;
+pub mod mesh_artifact;
 pub mod models;
+pub mod profile;
 pub mod repository;
+pub mod train_autogluon;
+pub mod train_llm;
+pub mod train_recognition;
+pub mod train_tabular;
 
 use std::path::Path;
 

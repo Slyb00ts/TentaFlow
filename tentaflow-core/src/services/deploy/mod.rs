@@ -2369,6 +2369,7 @@ impl CategoryStr for crate::services::manifest::Engine {
             Model3dGen => "model-3d-gen",
             Agents => "agent",
             Tools => "tool",
+            Training => "training",
         }
     }
 
@@ -2387,6 +2388,7 @@ impl CategoryStr for crate::services::manifest::Engine {
             Model3dGen => "model-3d-gen",
             Agents => "agents",
             Tools => "tools",
+            Training => "training",
         }
     }
 }

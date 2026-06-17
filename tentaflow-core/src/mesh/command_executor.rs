@@ -25,6 +25,9 @@ pub struct ServiceActionContext {
     pub db: DbPool,
     pub port_allocator: Arc<PortAllocator>,
     pub iroh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    /// Router inferencji tego węzła — używany przez `MlChat`, by odpalić model
+    /// FT wdrożony lokalnie (na tym węźle) na zlecenie innego węzła mesh.
+    pub router: Arc<crate::routing::router::Router>,
     /// Owning robot-control addons live here; the `RobotControl` handler resolves
     /// the local robot addon and dispatches the sanitized action through it.
     pub addon_manager: Arc<crate::addon::AddonManager>,
@@ -416,9 +419,217 @@ impl MeshCommandExecutor {
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
             MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
             MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
+            MeshCommandType::MlTrainStart { run_id, spec_json } => {
+                self.handle_ml_train_start(run_id, spec_json).await
+            }
+            MeshCommandType::MlTrainStatus { run_id } => self.handle_ml_train_status(run_id).await,
+            MeshCommandType::MlDatasetChunk {
+                dataset_hash,
+                seq,
+                total,
+                data_b64,
+            } => self.handle_ml_dataset_chunk(dataset_hash, seq, total, data_b64).await,
+            MeshCommandType::MlDetect {
+                checkpoint_path,
+                class_names_json,
+                variant,
+                threshold,
+                image_b64,
+            } => {
+                self.handle_ml_detect(checkpoint_path, class_names_json, variant, threshold, image_b64)
+                    .await
+            }
+            MeshCommandType::MlExport { export_id, spec_json } => {
+                match crate::ml_studio::export_llm::mesh_export_start(&export_id, &spec_json).await {
+                    Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                    Err(e) => CommandResponse::fail(format!("mesh export start: {}", e)),
+                }
+            }
+            MeshCommandType::MlExportStatus { export_id } => {
+                match crate::ml_studio::export_llm::mesh_export_status(&export_id).await {
+                    Ok(status_json) => CommandResponse::ok(
+                        MeshCommandResponsePayload::MlExportStatusResult { status_json },
+                    ),
+                    Err(e) => CommandResponse::fail(format!("mesh export status: {}", e)),
+                }
+            }
+            MeshCommandType::MlChat {
+                model_name,
+                message,
+                max_tokens,
+            } => self.handle_ml_chat(model_name, message, max_tokens).await,
+            MeshCommandType::MlArtifactPushTo {
+                src_path,
+                target_node_id,
+            } => self.handle_ml_artifact_push_to(src_path, target_node_id).await,
             MeshCommandType::RobotControl { request_cbor } => {
                 self.handle_robot_control(from_node_id, request_cbor).await
             }
+        }
+    }
+
+    /// Owner side (węzeł-źródło): pakuje katalog artefaktu i streamuje go do
+    /// `target_node_id` przez mesh. Wymaga `iroh` z service-action context.
+    async fn handle_ml_artifact_push_to(
+        &self,
+        src_path: String,
+        target_node_id: String,
+    ) -> CommandResponse {
+        // Fail-closed: węzeł docelowy musi być zaufany lokalnie, a `src_path` musi
+        // być legalnym katalogiem artefaktu ML Studio (nie dowolny katalog na dysku).
+        if !self.security.is_trusted(&target_node_id) {
+            return CommandResponse::fail(format!("target {} nie jest zaufany", target_node_id));
+        }
+        if !crate::ml_studio::mesh_artifact::is_allowed_artifact_dir(&src_path) {
+            return CommandResponse::fail(format!(
+                "src_path nie jest dozwolonym katalogiem artefaktu: {}",
+                src_path
+            ));
+        }
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("service action context not configured");
+        };
+        match crate::ml_studio::mesh_artifact::push_dir_to(
+            &ctx.iroh,
+            &target_node_id,
+            &src_path,
+            None,
+        )
+        .await
+        {
+            Ok(target_path) => CommandResponse::ok(
+                MeshCommandResponsePayload::MlArtifactPushResult {
+                    target_path,
+                    error: None,
+                },
+            ),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
+                target_path: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Owner side: zapytanie do modelu FT wdrożonego NA TYM węźle (alias w lokalnym
+    /// routingu). Inicjator (Node A) przysyła `model_name` + tekst; odpalamy
+    /// inferencję lokalnym Routerem i zwracamy odpowiedź. Pozwala UŻYĆ z A modelu z B.
+    async fn handle_ml_chat(
+        &self,
+        model_name: String,
+        message: String,
+        max_tokens: u32,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("service action context not configured");
+        };
+        match crate::ml_studio::infer::run_local_chat(&ctx.router, &model_name, &message, max_tokens)
+            .await
+        {
+            Ok(answer) => CommandResponse::ok(MeshCommandResponsePayload::MlChatResult {
+                answer,
+                error: None,
+            }),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlChatResult {
+                answer: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Owner side: detekcja NA TYM nodzie modelem, którego checkpoint żyje tutaj
+    /// (np. wytrenowanym lokalnie). Inicjator (Node A) wysyła checkpoint + klasy +
+    /// obraz; my wołamy lokalny serwis i zwracamy wynik. Umożliwia testowanie z A.
+    async fn handle_ml_detect(
+        &self,
+        checkpoint_path: String,
+        class_names_json: String,
+        variant: String,
+        threshold: f64,
+        image_b64: String,
+    ) -> CommandResponse {
+        let class_names: Vec<String> =
+            serde_json::from_str(&class_names_json).unwrap_or_default();
+        match crate::ml_studio::train_recognition::run_detect(
+            checkpoint_path,
+            class_names,
+            variant,
+            threshold,
+            image_b64,
+        )
+        .await
+        {
+            Ok((detections_json, width, height)) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlDetectResult {
+                    detections_json,
+                    width,
+                    height,
+                    error: None,
+                })
+            }
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlDetectResult {
+                detections_json: "[]".to_string(),
+                width: 0,
+                height: 0,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Owner side: przyjmuje chunk datasetu COCO (zip) i składa go do cache pod
+    /// hashem. Dedup: gdy dataset (hash) już jest, zwraca have_already=true.
+    async fn handle_ml_dataset_chunk(
+        &self,
+        dataset_hash: String,
+        seq: u32,
+        total: u32,
+        data_b64: String,
+    ) -> CommandResponse {
+        match crate::ml_studio::train_recognition::mesh_dataset_chunk(
+            &dataset_hash,
+            seq,
+            total,
+            &data_b64,
+        ) {
+            Ok(have_already) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlDatasetChunkResult { have_already })
+            }
+            Err(e) => CommandResponse::fail(format!("mesh dataset chunk: {}", e)),
+        }
+    }
+
+    /// Owner side: uruchamia trening NA TYM nodzie przez lokalny serwis treningowy
+    /// (ML Studio mesh-distributed). `run_id` jest kluczem śledzenia po stronie
+    /// odbiorcy; inicjator (Node A) odpytuje przez `MlTrainStatus`.
+    async fn handle_ml_train_start(&self, run_id: String, spec_json: String) -> CommandResponse {
+        // spec.kind rozróżnia tor: "llm" → ml-training, inaczej recognition (rfdetr).
+        let kind = serde_json::from_str::<serde_json::Value>(&spec_json)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(String::from))
+            .unwrap_or_default();
+        let res = if kind == "llm" {
+            crate::ml_studio::train_llm::mesh_train_start_llm(&run_id, &spec_json).await
+        } else {
+            crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
+        };
+        match res {
+            Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+            Err(e) => CommandResponse::fail(format!("mesh train start: {}", e)),
+        }
+    }
+
+    async fn handle_ml_train_status(&self, run_id: String) -> CommandResponse {
+        // Router statusu: jeśli to job LLM zlecony tu przez mesh → ml-training,
+        // inaczej recognition. Jeden run_id istnieje tylko w jednym z rejestrów.
+        let res = if crate::ml_studio::train_llm::is_llm_mesh_job(&run_id) {
+            crate::ml_studio::train_llm::mesh_train_status_llm(&run_id).await
+        } else {
+            crate::ml_studio::train_recognition::mesh_train_status(&run_id).await
+        };
+        match res {
+            Ok(status_json) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlTrainStatusResult { status_json })
+            }
+            Err(e) => CommandResponse::fail(format!("mesh train status: {}", e)),
         }
     }
 

@@ -1074,12 +1074,19 @@ tf-tabs {
     border-bottom: 1px solid var(--tf-border);
   }
   .tf-table tr + tr td { border-top: 0; }
+  /* Tryb kart: etykieta (::before) NAD wartością. Wartość dostaje pełną szerokość
+     karty, więc szerokie badge/teksty/ID nie są przycinane na prawej krawędzi
+     (poprzedni układ label↔wartość w jednym wierszu obcinał szersze wartości). */
   .tf-table td {
-    padding: 4px 0;
+    padding: 6px 0;
     display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+  .tf-table td > * {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .tf-table td::before {
     content: attr(data-label);

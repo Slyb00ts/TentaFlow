@@ -67,6 +67,7 @@
   <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
   <symbol id="i-scale" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="m5 7 7-4 7 4"/><path d="m5 7-3 6h6z"/><path d="m19 7-3 6h6z"/></symbol>
   <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+  <symbol id="i-mesh" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><line x1="7" y1="6" x2="17" y2="6"/><line x1="6" y1="8" x2="11" y2="16"/><line x1="18" y1="8" x2="13" y2="16"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
   <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
 </defs>
@@ -116,6 +117,9 @@
         <div class="nav-section">
           <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
           <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
           <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
         </div>
         <div class="nav-section">
@@ -275,8 +279,54 @@ python train.py <span class="k">--objective</span> <span class="v">kd</span> <sp
         </div>
 
         <!-- Sekcja 3: Trening na żywo -->
+        <!-- Wykonanie: wybór node / trening rozproszony -->
         <div class="section-card">
-          <h3><svg class="icon"><use href="#i-zap"/></svg>Sekcja 3 — Trening na żywo (KD loss)</h3>
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-mesh"/></svg>Wykonanie <span class="text-3">— node wykonawczy z zasobów przydzielonych projektowi</span></div>
+            <a class="btn btn-ghost btn-sm" href="przeglad-projektu.html">Zasoby projektu<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+          <div class="flex gap-sm wrap" style="margin-bottom:12px;">
+            <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>ml_studio.db zsynchronizowana z mesh (Sync Ledger)</span>
+            <span class="chip info"><svg class="icon"><use href="#i-mesh"/></svg>dataset KD przeniesiony między node'ami przez mesh</span>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>Node — generacja nauczyciela (27B)</label>
+              <select class="select">
+                <option>dgx-01 (8× B300) · node-B · przez mesh</option>
+                <option>warszawa-gpu (2× RTX 4090) · node-A</option>
+              </select>
+              <span class="hint">Lista wyłącznie z zasobów przydzielonych temu projektowi przez administratora (granty). Nauczyciel 27B woła się na mocnym node; uczeń trenuje gdzie indziej.</span>
+            </div>
+            <div class="field">
+              <label>Node — trening ucznia (QLoRA)</label>
+              <select class="select">
+                <option>warszawa-gpu (2× RTX 4090) · node-A</option>
+                <option>dgx-01 (8× B300) · node-B · przez mesh</option>
+              </select>
+              <span class="hint">Wybór wyłącznie spośród zasobów przydzielonych temu projektowi (granty admina).</span>
+            </div>
+          </div>
+          <div class="toggle-row" style="margin-top:6px;">
+            <span class="toggle on"></span>
+            <span>Rozproszone: generacja na node-B + trening ucznia na node-A <span class="text-3">— dataset KD przenoszony przez mesh</span></span>
+          </div>
+        </div>
+
+        <!-- Wykonanie: alternatywny stan — brak przydzielonych zasobów (trening zablokowany) -->
+        <div class="section-card" style="border-color:rgba(245,158,11,0.35);">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--warning);"><use href="#i-info"/></svg>Wykonanie <span class="text-3">— stan: brak zasobów</span></div>
+            <span class="chip warning"><span class="dot"></span>trening zablokowany</span>
+          </div>
+          <div class="callout" style="display:flex;gap:12px;align-items:flex-start;padding:13px 16px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);">
+            <svg class="icon icon-lg" style="color:var(--warning);flex-shrink:0;"><use href="#i-info"/></svg>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;"><strong>Brak przydzielonych zasobów — trening niemożliwy.</strong> Destylacja wymaga node'a nauczyciela ORAZ node'a ucznia z grantu GPU. Bez przydziału oba pola są puste, a job nie wystartuje. Poproś administratora o przydział w sekcji <a href="admin-zasoby.html" style="color:var(--accent-2);">Zasoby</a>.</p>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-zap"/></svg>Sekcja 3 — Trening na żywo (KD loss) <span class="chip success" style="margin-left:8px;"><svg class="icon"><use href="#i-mesh"/></svg>rozproszony: node-B (nauczyciel) + node-A (uczeń)</span></h3>
           <div class="grid-ml-2-1">
             <div class="chart-wrap">
               <svg viewBox="0 0 480 200" preserveAspectRatio="none">
