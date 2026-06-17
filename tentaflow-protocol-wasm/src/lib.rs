@@ -1897,10 +1897,16 @@ pub fn encode_ml_studio_ft_export_status_request(model_id: String) -> Result<Vec
 }
 
 #[wasm_bindgen(js_name = encodeMlStudioFtDeployRequest)]
-pub fn encode_ml_studio_ft_deploy_request(model_id: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_ml_studio_ft_deploy_request(
+    model_id: String,
+    target_node_id: String,
+) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::FtDeployRequest(
-            tentaflow_protocol::MlStudioFtDeployRequest { model_id },
+            tentaflow_protocol::MlStudioFtDeployRequest {
+                model_id,
+                target_node_id,
+            },
         ),
     ))
     .map_err(|e| JsError::new(&e))

@@ -3168,21 +3168,68 @@ function renderDetections(host, b64, mime, dets, width, height) {
 // Wdrożenie wyeksportowanego modelu FT do inferencji (bez ponownego eksportu).
 // Start jest synchroniczny — status "deploying" = serwis ruszył. Po sukcesie
 // odświeżamy zakładkę (`onDone`), żeby pojawiła się akcja „Zapytaj".
+// Wdrożenie modelu — modal z wyborem węzła docelowego. Domyślnie węzeł artefaktu;
+// wybór innego węzła → Core przenosi artefakt przez mesh (np. model MLX z B na Mac C).
 async function deployFtModel(modelId, modelName, onDone) {
   if (!modelId) return;
-  toast(`Wdrażanie „${modelName}"…`, 'info');
-  try {
-    const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId });
-    const status = String(resp?.status || '');
-    if (status === 'deploying') {
-      toast(`Model „${resp?.modelName || modelName}" wdrażany — odpytaj go przyciskiem „Zapytaj"`, 'success');
-      if (typeof onDone === 'function') onDone();
-    } else {
-      toast(String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia', 'error');
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', `Wdróż model — ${modelName}`);
+  modal.setAttribute('size', 'md');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Wybierz węzeł docelowy. „Węzeł modelu" wdraża tam, gdzie powstał artefakt. Inny węzeł → Core przeniesie artefakt przez mesh (np. model MLX na Mac mini).</p>
+      <tf-select id="ml-studio-deploy-node" label="Węzeł docelowy"></tf-select>
+      <div id="ml-studio-deploy-status" style="margin-top:10px"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-deploy-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="cpu" id="ml-studio-deploy-go">Wdróż</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-deploy-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+
+  let targetNodeId = '';
+  const sel = modal.querySelector('#ml-studio-deploy-node');
+  sel?.setOptions([{ value: '', label: 'Węzeł modelu (domyślnie)' }], '');
+  ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
+    const opts = [{ value: '', label: 'Węzeł modelu (domyślnie)' }];
+    (nodes || []).forEach((n) => {
+      const id = n.nodeId ?? n.node_id ?? '';
+      const host = n.hostname ?? n.host ?? id.slice(0, 12);
+      if (id) opts.push({ value: id, label: `${host} (${id.slice(0, 8)})` });
+    });
+    sel?.setOptions(opts, '');
+  }).catch(() => {});
+  sel?.addEventListener('change', (e) => { targetNodeId = e.detail?.value || sel.value || ''; });
+
+  modal.querySelector('#ml-studio-deploy-go')?.addEventListener('click', async () => {
+    const st = modal.querySelector('#ml-studio-deploy-status');
+    modal.querySelector('#ml-studio-deploy-go')?.setAttribute('disabled', '');
+    if (st) st.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Wdrażanie (transfer artefaktu może chwilę potrwać)…</span></div>';
+    try {
+      const resp = await ApiBinary.one('mlStudioFtDeployRequest', { modelId, targetNodeId });
+      const status = String(resp?.status || '');
+      if (status === 'deploying') {
+        toast(`Model „${resp?.modelName || modelName}" wdrażany — odpytaj go przyciskiem „Zapytaj"`, 'success');
+        close();
+        if (typeof onDone === 'function') onDone();
+      } else {
+        const msg = String(resp?.error ?? '') || 'Nieoczekiwany stan wdrożenia';
+        toast(msg, 'error');
+        if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(msg)}</div>`;
+        modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
+      }
+    } catch (err) {
+      toast(`Wdrożenie nieudane: ${err.message}`, 'error');
+      if (st) st.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} ${escapeHtml(err.message)}</div>`;
+      modal.querySelector('#ml-studio-deploy-go')?.removeAttribute('disabled');
     }
-  } catch (err) {
-    toast(`Wdrożenie nieudane: ${err.message}`, 'error');
-  }
+  });
 }
 
 // Czat z wdrożonym modelem FT (test/„użyj"). Modal: prompt → mlStudioFtChatRequest
@@ -3292,6 +3339,7 @@ function openFtExportPanel(p, modelId, modelName) {
         <tf-radio value="q6_k" label="GGUF Q6_K (6-bit)" hint="Bliski q8_0 jakością, mniejszy plik."></tf-radio>
         <tf-radio value="q8_0" label="GGUF q8_0 (8-bit)" hint="Nieznaczna utrata jakości, większy plik."></tf-radio>
         <tf-radio value="f16" label="GGUF f16 (pełna precyzja)" hint="Największy plik, bez utraty jakości względem wag bazowych."></tf-radio>
+        <tf-radio value="mlx" label="MLX (Apple safetensors)" hint="Model do silnika MLX na macOS/Apple Silicon — deploy np. na Mac mini."></tf-radio>
       </tf-radio-group>
     `;
     footer.innerHTML = `

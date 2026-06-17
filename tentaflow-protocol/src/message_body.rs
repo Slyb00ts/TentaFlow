@@ -1771,6 +1771,10 @@ pub struct MlStudioFtExportStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioFtDeployRequest {
     pub model_id: String,
+    /// Węzeł docelowy deployu. Pusty = węzeł, na którym żyje artefakt (domyślne).
+    /// Inny niż węzeł artefaktu → Core przenosi artefakt przez mesh przed deployem.
+    #[serde(default)]
+    pub target_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
