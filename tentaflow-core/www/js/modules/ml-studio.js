@@ -1293,7 +1293,7 @@ function renderDataTab(panel, pid) {
         <div class="ml-studio-data-head">${sprite('cloud')} Źródło danych
           <span class="ml-studio-data-hint">Formaty: .csv · .xlsx · pierwszy wiersz = nagłówki kolumn</span>
         </div>
-        <tf-file-input id="ml-studio-data-file" accept=".csv,.xlsx" label="Przeciągnij plik lub kliknij, aby wgrać"></tf-file-input>
+        <tf-file-input id="ml-studio-data-file" accept=".csv,.xlsx,.jsonl,.json,.zip" label="Przeciągnij plik lub kliknij, aby wgrać"></tf-file-input>
       </section>
 
       <div class="ml-studio-data-origin">
@@ -1329,35 +1329,64 @@ function renderDataTab(panel, pid) {
   loadDatasets(pid);
 }
 
-// inline upload bounded by WS frame limit (1 MiB); larger datasets need chunked upload (future)
-const MAX_UPLOAD_BYTES = 900 * 1024;
+// Pojedyncza ramka WS ma limit ~1 MiB. Pliki ≤ CHUNK_SIZE idą jednym żądaniem,
+// większe są dzielone na fragmenty i sklejane po stronie serwera (chunked upload).
+const CHUNK_SIZE = 256 * 1024;
 
 async function uploadDataset(pid, file) {
   const filename = file.name || 'zbiór';
-  if (file.size > MAX_UPLOAD_BYTES) {
-    toast('Plik za duży (limit ~0,9 MB dla wgrywania w tej wersji). Większe zbiory: chunked upload w przygotowaniu.', 'error');
-    return;
-  }
   try {
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    const resp = await ApiBinary.one('mlStudioDatasetUploadRequest', {
-      projectId: pid,
-      name: nameFromFilename(filename),
-      filename,
-      bytes,
-    });
-    toast(`Wgrano „${filename}" — sprofilowano`, 'success');
-    await loadDatasets(pid);
-    const datasetId = resp.datasetId ?? resp.dataset_id
-      ?? resp.dataset?.datasetId ?? resp.dataset?.dataset_id;
-    if (resp.profile) {
-      renderProfile(resp.profile);
-    } else if (datasetId) {
-      await loadProfile(datasetId);
+    if (file.size <= CHUNK_SIZE) {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const resp = await ApiBinary.one('mlStudioDatasetUploadRequest', {
+        projectId: pid,
+        name: nameFromFilename(filename),
+        filename,
+        bytes,
+      });
+      await onDatasetUploaded(pid, filename, resp);
+      return;
     }
+
+    const buf = await file.arrayBuffer();
+    const all = new Uint8Array(buf);
+    const totalChunks = Math.ceil(all.length / CHUNK_SIZE);
+    const uploadId = (crypto.randomUUID && crypto.randomUUID())
+      || `up-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    const name = nameFromFilename(filename);
+
+    let resp = null;
+    for (let seq = 0; seq < totalChunks; seq += 1) {
+      const start = seq * CHUNK_SIZE;
+      const slice = all.subarray(start, Math.min(start + CHUNK_SIZE, all.length));
+      resp = await ApiBinary.one('mlStudioDatasetUploadChunkRequest', {
+        projectId: pid,
+        name,
+        filename,
+        uploadId,
+        seq,
+        totalChunks,
+        bytes: slice,
+      });
+      const pct = Math.round(((seq + 1) / totalChunks) * 100);
+      toast(`Wgrywanie „${filename}": ${pct}% (${seq + 1}/${totalChunks})`, 'info', 1500);
+    }
+    await onDatasetUploaded(pid, filename, resp);
   } catch (err) {
     toast(`Wgrywanie pliku: ${err.message}`, 'error');
+  }
+}
+
+async function onDatasetUploaded(pid, filename, resp) {
+  toast(`Wgrano „${filename}" — sprofilowano`, 'success');
+  await loadDatasets(pid);
+  const datasetId = resp?.datasetId ?? resp?.dataset_id
+    ?? resp?.dataset?.datasetId ?? resp?.dataset?.dataset_id;
+  if (resp?.profile) {
+    renderProfile(resp.profile);
+  } else if (datasetId) {
+    await loadProfile(datasetId);
   }
 }
 

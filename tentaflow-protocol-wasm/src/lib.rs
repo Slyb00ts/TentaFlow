@@ -1639,6 +1639,32 @@ pub fn encode_ml_studio_dataset_upload_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioDatasetUploadChunkRequest)]
+pub fn encode_ml_studio_dataset_upload_chunk_request(
+    project_id: String,
+    name: String,
+    filename: String,
+    upload_id: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(
+            tentaflow_protocol::MlStudioDatasetUploadChunkRequest {
+                project_id,
+                name,
+                filename,
+                upload_id,
+                seq,
+                total_chunks,
+                bytes,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioDatasetsListRequest)]
 pub fn encode_ml_studio_datasets_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -7922,6 +7948,30 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
         tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(resp) => {
             set(obj, "variant", "MlStudioDatasetUploadResponse".into());
             set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetUploadChunkRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "name", req.name.into());
+            set(obj, "filename", req.filename.into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "seq", req.seq.into());
+            set(obj, "totalChunks", req.total_chunks.into());
+            set(obj, "total_chunks", req.total_chunks.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetUploadChunkResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetUploadChunkResponse".into());
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            if let Some(ds) = &resp.dataset {
+                set(obj, "dataset", ml_studio_dataset_summary_to_js(ds).into());
+            }
         }
         tentaflow_protocol::MlStudioPayload::DatasetsListRequest(req) => {
             set(obj, "variant", "MlStudioDatasetsListRequest".into());

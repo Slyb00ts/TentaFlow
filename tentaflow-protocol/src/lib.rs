@@ -464,6 +464,8 @@ pub use message_body::{
     MlStudioProjectMemberRoleSetResponse,
     MlStudioDatasetUploadRequest,
     MlStudioDatasetUploadResponse,
+    MlStudioDatasetUploadChunkRequest,
+    MlStudioDatasetUploadChunkResponse,
     MlStudioDatasetsListRequest,
     MlStudioDatasetsListResponse,
     MlStudioDatasetProfileRequest,
