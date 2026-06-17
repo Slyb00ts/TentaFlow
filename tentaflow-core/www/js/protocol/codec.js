@@ -2464,6 +2464,33 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::MlStudioBody(DatasetUploadChunkRequest). Jeden fragment dużego
+   * pliku — klient dzieli plik na części o numerach seq (0..totalChunks) i wysyła
+   * je sekwencyjnie pod wspólnym uploadId. Serwer tworzy dataset po ostatnim
+   * fragmencie. payload: { projectId, name, filename, uploadId, seq, totalChunks, bytes }
+   */
+  mlStudioDatasetUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeMlStudioDatasetUploadChunkRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.name ?? ''),
+      String(payload.filename ?? ''),
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      Number(payload.seq ?? 0),
+      Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::MlStudioBody(DatasetsListRequest). payload: { projectId }. */
   mlStudioDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

@@ -633,11 +633,37 @@ pub fn ml_studio_dataset_upload(
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
     require_project_editor(&org.user_id, &payload.project_id)?;
 
+    let dataset = finalize_dataset_upload(
+        &org.user_id,
+        &payload.project_id,
+        &payload.name,
+        &payload.filename,
+        &payload.bytes,
+    )?;
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadResponse(
+        tentaflow_protocol::MlStudioDatasetUploadResponse {
+            dataset: to_dataset_summary(&dataset),
+        },
+    )))
+}
+
+/// Profiluje surowe bajty pliku (ZIP COCO albo tabela CSV/XLSX) i tworzy rekord
+/// datasetu. Wspólne dla uploadu jednoramkowego i fragmentowanego (chunked).
+fn finalize_dataset_upload(
+    user_id: &str,
+    project_id: &str,
+    name: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<Dataset, ProtocolError> {
     // Dataset detekcji to ZIP COCO (obrazy + _annotations.coco.json), nie tabela.
     // Rozpoznajemy go po rozszerzeniu .zip i profilujemy osobno (klasy z COCO).
-    let is_coco = payload.filename.to_ascii_lowercase().ends_with(".zip");
+    let lower = filename.to_ascii_lowercase();
+    let is_coco = lower.ends_with(".zip");
+    let is_jsonl = lower.ends_with(".jsonl") || lower.ends_with(".json");
     let (kind, row_count, column_count, profile_json) = if is_coco {
-        let prof = profile_coco_zip(&payload.bytes)
+        let prof = profile_coco_zip(bytes)
             .map_err(|e| ProtocolError::bad_request(format!("COCO profiling failed: {}", e)))?;
         let pj = serde_json::to_string(&prof).map_err(|e| ProtocolError::internal(e.to_string()))?;
         let classes = prof
@@ -647,34 +673,165 @@ pub fn ml_studio_dataset_upload(
             .unwrap_or(0);
         let images = prof.get("image_count").and_then(|c| c.as_u64()).unwrap_or(0);
         ("coco".to_string(), images, classes, pj)
+    } else if is_jsonl {
+        // Dataset SFT/DPO/KD: JSON Lines. Nie profilujemy kolumn jak tabeli —
+        // liczymy rekordy (niepuste linie) i zapamiętujemy klucze pierwszego
+        // rekordu, żeby UI mogło pokazać schemat (np. prompt/completion).
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| ProtocolError::bad_request("JSONL must be valid UTF-8"))?;
+        let mut records = 0u64;
+        let mut keys: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                ProtocolError::bad_request(format!("invalid JSONL at record {}: {}", records + 1, e))
+            })?;
+            if records == 0 {
+                if let Some(obj) = value.as_object() {
+                    keys = obj.keys().cloned().collect();
+                }
+            }
+            records += 1;
+        }
+        if records == 0 {
+            return Err(ProtocolError::bad_request("JSONL file has no records"));
+        }
+        let pj = serde_json::to_string(&serde_json::json!({
+            "format": "jsonl",
+            "record_count": records,
+            "fields": keys,
+        }))
+        .map_err(|e| ProtocolError::internal(e.to_string()))?;
+        ("jsonl".to_string(), records, keys.len() as u32, pj)
     } else {
-        let table = profile::profile_table(&payload.bytes, &payload.filename)
+        let table = profile::profile_table(bytes, filename)
             .map_err(|e| ProtocolError::bad_request(format!("profiling failed: {}", e)))?;
         let pj =
             serde_json::to_string(&table).map_err(|e| ProtocolError::internal(e.to_string()))?;
         (table.format.clone(), table.row_count, table.column_count, pj)
     };
 
-    let name = if payload.name.trim().is_empty() {
-        payload.filename.as_str()
-    } else {
-        payload.name.as_str()
-    };
-    let dataset = repository::create_dataset(
-        &org.user_id,
-        &payload.project_id,
-        name,
+    let dataset_name = if name.trim().is_empty() { filename } else { name };
+    repository::create_dataset(
+        user_id,
+        project_id,
+        dataset_name,
         &kind,
         row_count,
         column_count,
         &profile_json,
-        &payload.bytes,
+        bytes,
     )
-    .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))?;
+    .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))
+}
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadResponse(
-        tentaflow_protocol::MlStudioDatasetUploadResponse {
-            dataset: to_dataset_summary(&dataset),
+// Akumulator fragmentów uploadu: upload_id → (project_id, fragmenty wg seq,
+// total_chunks, suma bajtów). Wpis żyje tylko między pierwszym a ostatnim
+// fragmentem; po finalizacji jest usuwany. Limit chroni przed zalaniem pamięci.
+const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+struct UploadAccum {
+    project_id: String,
+    name: String,
+    filename: String,
+    total_chunks: u32,
+    chunks: Vec<Option<Vec<u8>>>,
+    received_bytes: u64,
+}
+
+static UPLOAD_ACCUM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, UploadAccum>>,
+> = std::sync::OnceLock::new();
+
+fn upload_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, UploadAccum>> {
+    UPLOAD_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[handler(variant = "MlStudioDatasetUploadChunkRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_upload_chunk(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadChunkRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetUploadChunkRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if payload.total_chunks == 0 || payload.seq >= payload.total_chunks {
+        return Err(ProtocolError::bad_request("invalid chunk seq/total"));
+    }
+    if payload.upload_id.trim().is_empty() || payload.upload_id.len() > 128 {
+        return Err(ProtocolError::bad_request("invalid upload_id"));
+    }
+
+    let (received_chunks, received_bytes, complete_bytes) = {
+        let mut map = upload_accum().lock().unwrap();
+        let entry = map.entry(payload.upload_id.clone()).or_insert_with(|| UploadAccum {
+            project_id: payload.project_id.clone(),
+            name: payload.name.clone(),
+            filename: payload.filename.clone(),
+            total_chunks: payload.total_chunks,
+            chunks: (0..payload.total_chunks).map(|_| None).collect(),
+            received_bytes: 0,
+        });
+
+        // Wszystkie fragmenty muszą zgadzać się co do projektu/pliku/liczby części.
+        if entry.project_id != payload.project_id || entry.total_chunks != payload.total_chunks {
+            map.remove(&payload.upload_id);
+            return Err(ProtocolError::bad_request("chunk metadata mismatch for upload_id"));
+        }
+
+        let idx = payload.seq as usize;
+        if entry.chunks[idx].is_none() {
+            entry.received_bytes += payload.bytes.len() as u64;
+            if entry.received_bytes as usize > MAX_UPLOAD_BYTES {
+                map.remove(&payload.upload_id);
+                return Err(ProtocolError::bad_request("upload exceeds size limit"));
+            }
+            entry.chunks[idx] = Some(payload.bytes.clone());
+        }
+
+        let received_chunks = entry.chunks.iter().filter(|c| c.is_some()).count() as u32;
+        let received_bytes = entry.received_bytes;
+
+        // Komplet — sklejamy fragmenty po kolei i usuwamy wpis z akumulatora.
+        let complete_bytes = if received_chunks == entry.total_chunks {
+            let mut joined = Vec::with_capacity(entry.received_bytes as usize);
+            for c in &entry.chunks {
+                joined.extend_from_slice(c.as_ref().unwrap());
+            }
+            let meta = map.remove(&payload.upload_id).unwrap();
+            Some((meta.name, meta.filename, joined))
+        } else {
+            None
+        };
+        (received_chunks, received_bytes, complete_bytes)
+    };
+
+    let dataset = if let Some((name, filename, bytes)) = complete_bytes {
+        let ds =
+            finalize_dataset_upload(&org.user_id, &payload.project_id, &name, &filename, &bytes)?;
+        Some(to_dataset_summary(&ds))
+    } else {
+        None
+    };
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadChunkResponse(
+        tentaflow_protocol::MlStudioDatasetUploadChunkResponse {
+            upload_id: payload.upload_id.clone(),
+            received_chunks,
+            received_bytes,
+            dataset,
         },
     )))
 }

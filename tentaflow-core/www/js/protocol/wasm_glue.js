@@ -3307,6 +3307,36 @@ export function encodeMlStudioDatasetProfileRequest(dataset_id) {
 }
 
 /**
+ * @param {string} project_id
+ * @param {string} name
+ * @param {string} filename
+ * @param {string} upload_id
+ * @param {number} seq
+ * @param {number} total_chunks
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioDatasetUploadChunkRequest(project_id, name, filename, upload_id, seq, total_chunks, bytes) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(filename, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(upload_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioDatasetUploadChunkRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, seq, total_chunks, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
  * Upload a tabular file for profiling. `bytes` arrives from JS as a Uint8Array
  * and wasm-bindgen materializes it directly into `Vec<u8>` — no base64 or copy
  * step on the JS side.

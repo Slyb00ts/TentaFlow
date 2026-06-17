@@ -580,6 +580,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(_) => {
                 "MlStudioDatasetUploadResponse"
             }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(_) => {
+                "MlStudioDatasetUploadChunkRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkResponse(_) => {
+                "MlStudioDatasetUploadChunkResponse"
+            }
             tentaflow_protocol::MlStudioPayload::DatasetsListRequest(_) => {
                 "MlStudioDatasetsListRequest"
             }

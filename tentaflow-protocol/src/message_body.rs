@@ -1337,6 +1337,32 @@ pub struct MlStudioDatasetUploadResponse {
     pub dataset: DatasetSummary,
 }
 
+/// Jeden fragment przesyłanego datasetu. Duże pliki (np. ZIP COCO, dataset SFT)
+/// przekraczają limit pojedynczej ramki WS, więc klient dzieli plik na części o
+/// numerach `seq` (0..total_chunks). Serwer akumuluje fragmenty po `upload_id` i
+/// tworzy dataset dopiero po odebraniu ostatniego fragmentu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadChunkRequest {
+    pub project_id: String,
+    pub name: String,
+    pub filename: String,
+    pub upload_id: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Odpowiedź na fragment uploadu. Dla fragmentów pośrednich `dataset` jest `None`
+/// i zwracamy postęp odebranych bajtów; po ostatnim fragmencie `dataset` zawiera
+/// utworzony rekord.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadChunkResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub dataset: Option<DatasetSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioDatasetsListRequest {
     pub project_id: String,
@@ -1819,6 +1845,8 @@ pub enum MlStudioPayload {
     RecogImageResponse(MlStudioRecogImageResponse),
     RecogSaveAnnotationsRequest(MlStudioRecogSaveAnnotationsRequest),
     RecogSaveAnnotationsResponse(MlStudioRecogSaveAnnotationsResponse),
+    DatasetUploadChunkRequest(MlStudioDatasetUploadChunkRequest),
+    DatasetUploadChunkResponse(MlStudioDatasetUploadChunkResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----
