@@ -4046,6 +4046,67 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
+ * TentaVision (local grant) or surface the remote-view note (remote robot).
+ * @param {string} robot_id
+ * @param {string} camera_id
+ * @returns {Uint8Array}
+ */
+export function encodeRobotCameraShareRequest(robot_id, camera_id) {
+    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(camera_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRobotCameraShareRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action to
+ * the robot's owning node. `kind` is one of: "move", "stop", "estop",
+ * "reset_estop", "recovery_stand", "stand_up", "stand_down", "sit", "hello",
+ * "stretch", "status". The `vx`/`vy`/`vyaw` axes apply to "move" only.
+ * @param {string} robot_id
+ * @param {string} kind
+ * @param {number} vx
+ * @param {number} vy
+ * @param {number} vyaw
+ * @returns {Uint8Array}
+ */
+export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw) {
+    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRobotControlRequest(ptr0, len0, ptr1, len1, vx, vy, vyaw);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::RobotsBody(ListRequest) — org-scoped robot list.
+ * @returns {Uint8Array}
+ */
+export function encodeRobotsListRequest() {
+    const ret = wasm.encodeRobotsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * MessageBody::RoleCatalogBody(CreateRequest) — payload jako JSON object
  * odpowiadajacy `RoleCatalogCreateRequest`. Translations sa parami
  * `[code, value]`; brak ikony / color_hint w obiekcie = None.
