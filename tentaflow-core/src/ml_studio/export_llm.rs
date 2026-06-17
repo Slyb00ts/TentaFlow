@@ -222,3 +222,159 @@ fn get_export_status(url: &str) -> anyhow::Result<ExportStatusResponse> {
         .read_json()
         .map_err(|e| anyhow::anyhow!("decode /export_status response: {}", e))
 }
+
+/// Surowy GET /export_status — body jako String (proxy statusu eksportu do A).
+fn get_export_status_raw(url: &str) -> anyhow::Result<String> {
+    let http = http_agent();
+    let mut resp = http
+        .get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET {} failed: {}", url, e))?;
+    resp.body_mut()
+        .read_to_string()
+        .map_err(|e| anyhow::anyhow!("read /export_status body: {}", e))
+}
+
+// =============================================================================
+// Eksport GGUF przez mesh: model wytrenowany na B (adapter na B) eksportowany Z A.
+// =============================================================================
+static MESH_EXPORTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+> = std::sync::OnceLock::new();
+
+fn mesh_exports() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>> {
+    MESH_EXPORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// B-side: czy `export_id` to eksport zlecony tu przez mesh (router statusu).
+pub fn is_mesh_export(export_id: &str) -> bool {
+    mesh_exports().lock().map(|m| m.contains_key(export_id)).unwrap_or(false)
+}
+
+/// B-side (odbiorca `MlExport`): startuje eksport GGUF na LOKALNYM ml-training wg
+/// `spec_json` (adapter_path/base_model/outtype/export_id). Adapter MUSI być na
+/// tym węźle (tu został wytrenowany). Inicjator (A) odpytuje przez `MlExportStatus`.
+pub async fn mesh_export_start(export_id: &str, spec_json: &str) -> anyhow::Result<()> {
+    let spec: Value = serde_json::from_str(spec_json)
+        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let adapter_path = spec.get("adapter_path").and_then(|v| v.as_str()).unwrap_or("");
+    if adapter_path.is_empty() || !std::path::Path::new(adapter_path).is_dir() {
+        anyhow::bail!("adapter eksportu niedostępny na tym węźle: {}", adapter_path);
+    }
+    let endpoint = resolve_endpoint()?;
+    let base = endpoint.trim_end_matches('/').to_string();
+    let body = json!({
+        "adapter_path": adapter_path,
+        "base_model": spec.get("base_model").and_then(|v| v.as_str()).unwrap_or(""),
+        "outtype": spec.get("outtype").and_then(|v| v.as_str()).unwrap_or("q8_0"),
+        "export_id": export_id,
+    });
+    let url = format!("{}/export", base);
+    let job_id = tokio::task::spawn_blocking(move || post_export(&url, body)).await??;
+    mesh_exports()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_exports lock poisoned"))?
+        .insert(export_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlExportStatus`): surowy JSON statusu eksportu z serwisu.
+pub async fn mesh_export_status(export_id: &str) -> anyhow::Result<String> {
+    let (base, job_id) = mesh_exports()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_exports lock poisoned"))?
+        .get(export_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany eksport mesh: {}", export_id))?;
+    let url = format!("{}/export_status/{}", base, job_id);
+    tokio::task::spawn_blocking(move || get_export_status_raw(&url)).await?
+}
+
+/// A-side: eksport GGUF modelu, którego adapter żyje na węźle `target` (mesh).
+/// Wysyła `MlExport` do B, odpytuje `MlExportStatus`, merguje gguf_path do metryk
+/// modelu w bazie A. GGUF ląduje NA B (gguf_path wskazuje ścieżkę na B).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ft_export_mesh(
+    iroh: std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    target: String,
+    model_id: String,
+    base_model: String,
+    adapter_path: String,
+    outtype: String,
+    current_metrics_json: String,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = run_export_mesh(
+            &iroh, &target, &model_id, &base_model, &adapter_path, &outtype, &current_metrics_json,
+        )
+        .await
+        {
+            tracing::warn!(model_id = %model_id, error = %err, "mesh GGUF export failed");
+            let merged = merge_export_state(&current_metrics_json, "failed", None, None, Some(&err.to_string()));
+            let _ = repository::update_model_metrics(&model_id, &merged);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_export_mesh(
+    iroh: &crate::mesh::iroh_manager::IrohMeshManager,
+    target: &str,
+    model_id: &str,
+    base_model: &str,
+    adapter_path: &str,
+    outtype: &str,
+    current_metrics_json: &str,
+) -> anyhow::Result<()> {
+    use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
+
+    let export_id = uuid::Uuid::new_v4().to_string();
+    let spec = json!({
+        "adapter_path": adapter_path,
+        "base_model": base_model,
+        "outtype": outtype,
+    })
+    .to_string();
+    let start = iroh
+        .send_command_and_wait(target, MeshCommandType::MlExport { export_id: export_id.clone(), spec_json: spec }, 30)
+        .await?;
+    if !start.ok {
+        anyhow::bail!(start.error.unwrap_or_else(|| "remote export start failed".into()));
+    }
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("mesh GGUF export timed out after {}s", JOB_TIMEOUT.as_secs());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let resp = iroh
+            .send_command_and_wait(target, MeshCommandType::MlExportStatus { export_id: export_id.clone() }, 30)
+            .await?;
+        let status_json = match resp.payload {
+            MeshCommandResponsePayload::MlExportStatusResult { status_json } => status_json,
+            _ => {
+                if !resp.ok {
+                    anyhow::bail!(resp.error.unwrap_or_else(|| "mesh export status failed".into()));
+                }
+                continue;
+            }
+        };
+        let st: ExportStatusResponse = serde_json::from_str(&status_json)
+            .map_err(|e| anyhow::anyhow!("parse export status: {}", e))?;
+        match st.status.as_str() {
+            "running" => continue,
+            "succeeded" => {
+                let gguf_path = st
+                    .gguf_path
+                    .ok_or_else(|| anyhow::anyhow!("export succeeded bez gguf_path"))?;
+                let merged = merge_export_state(current_metrics_json, "succeeded", Some(&gguf_path), st.size_bytes, None);
+                repository::update_model_metrics(model_id, &merged)?;
+                return Ok(());
+            }
+            "failed" => {
+                anyhow::bail!(st.error.unwrap_or_else(|| "remote export failed".into()));
+            }
+            other => anyhow::bail!("unknown remote export status '{}'", other),
+        }
+    }
+}
