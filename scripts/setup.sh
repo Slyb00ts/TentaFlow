@@ -413,7 +413,13 @@ install_base() {
                 lld
                 git
                 git-lfs
-                java-17-openjdk-devel
+                # System JDK, only needed to build the Android APK (Gradle). The
+                # repo-local gradlew bootstrap downloads its own Temurin 17 when
+                # the system Java is too new, so the exact version here doesn't
+                # matter — `java-latest-openjdk-devel` always exists across Fedora
+                # releases (F44 already dropped java-17/21), and --skip-unavailable
+                # below keeps setup resilient anyway.
+                java-latest-openjdk-devel
                 unzip
                 pkg-config
                 # sherpa-onnx (Eigen/openfst) buduje z -static-libstdc++ -static-libgcc;
@@ -437,8 +443,10 @@ install_base() {
                 sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
-            run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-17-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
+            # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
+            run_privileged dnf install -y --skip-unavailable "${pkgs[@]}"
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
