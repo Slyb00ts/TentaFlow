@@ -23,6 +23,7 @@ pub mod network;
 pub mod oauth;
 #[cfg(feature = "camera")]
 pub mod recording;
+pub mod robot;
 pub mod secrets;
 pub mod service;
 pub mod services;
@@ -528,6 +529,13 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
                 camera::camera_register_backed_v1,
             )
             .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_register_camera_v1: {e}"))?;
+    }
+
+    // --- Cross-node robot control (route an action to the owning node) ---
+    {
+        linker
+            .func_wrap("tentaflow", "robot_dispatch_v1", robot::robot_dispatch_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja robot_dispatch_v1: {e}"))?;
     }
 
     Ok(())

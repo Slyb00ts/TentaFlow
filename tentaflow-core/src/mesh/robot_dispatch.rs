@@ -133,6 +133,63 @@ pub fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Vec<Adve
     robots
 }
 
+/// Process-global handle to the pieces `dispatch_robot_action` needs that are NOT
+/// on a WASM host-function's `AddonState` (the iroh mesh manager, the addon
+/// manager, and this node's id). Wired once at startup next to the mesh command
+/// executor's `ServiceActionContext`, so the `robot_dispatch_v1` host function
+/// can route a controller action without threading AppState into every host call.
+#[derive(Clone)]
+pub struct RobotDispatchContext {
+    pub iroh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    pub addon_manager: Arc<crate::addon::AddonManager>,
+    pub local_node_id: String,
+}
+
+static DISPATCH_CTX: OnceLock<RwLock<Option<RobotDispatchContext>>> = OnceLock::new();
+
+fn dispatch_ctx_cell() -> &'static RwLock<Option<RobotDispatchContext>> {
+    DISPATCH_CTX.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the global dispatch context (startup wiring). Replaces any prior value
+/// so a re-init (e.g. test harness) does not leave a stale node id behind.
+pub fn set_dispatch_context(ctx: RobotDispatchContext) {
+    *dispatch_ctx_cell().write() = Some(ctx);
+}
+
+/// Snapshot of the dispatch context, or `None` before startup wired it.
+pub fn dispatch_context() -> Option<RobotDispatchContext> {
+    dispatch_ctx_cell().read().clone()
+}
+
+/// High-level entry used by the `robot_dispatch_v1` host function: build the real
+/// `MeshRobotSender` from the global context and run the shared router. Returns
+/// `None` only when the context is not wired yet (caller maps that to an ABI
+/// failure) — every robot-level outcome is a `Some(RobotControlResponse)`.
+pub async fn dispatch_robot_action_global(
+    action: RobotAction,
+    robot_id: &str,
+    actor_user_id: &str,
+    org_id: &str,
+    db: &DbPool,
+) -> Option<RobotControlResponse> {
+    let ctx = dispatch_context()?;
+    let sender = MeshRobotSender::new(ctx.iroh.clone());
+    Some(
+        dispatch_robot_action(
+            action,
+            robot_id,
+            actor_user_id,
+            org_id,
+            db,
+            &ctx.addon_manager,
+            &ctx.local_node_id,
+            &sender,
+        )
+        .await,
+    )
+}
+
 /// Where a `robot_id` lives. `Local` → this node owns it; `Remote` → a single
 /// other node advertises it; `Unknown` → nobody advertises it, OR it is
 /// ambiguous (2+ different nodes advertise the same id — never guess).

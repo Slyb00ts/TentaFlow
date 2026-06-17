@@ -50,6 +50,7 @@ pub use protocol::{
         RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput,
         SaveRecordingOut, StatsOut, StatsPerCamera, StatsTotals, UrlOut,
     },
+    robot::{RobotActionWire, RobotControlResponseWire, RobotDispatchInput},
     services::{
         GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
         ServiceListOutput,

@@ -716,6 +716,17 @@ async fn run_server(args: Args) -> Result<()> {
                             }
                         }
 
+                        // Sender-side robot-control context for the
+                        // `robot_dispatch_v1` host function (routes a controller
+                        // action to the node that physically owns the robot).
+                        tentaflow_core::mesh::robot_dispatch::set_dispatch_context(
+                            tentaflow_core::mesh::robot_dispatch::RobotDispatchContext {
+                                iroh: mesh_mgr.clone(),
+                                addon_manager: addon_manager.clone(),
+                                local_node_id: mesh_mgr.node_id(),
+                            },
+                        );
+
                         // Obsluga przychodzacych alias sync od zdalnych nodow
                         let router_for_alias = router.clone();
                         let mut alias_rx = mesh_mgr.subscribe();

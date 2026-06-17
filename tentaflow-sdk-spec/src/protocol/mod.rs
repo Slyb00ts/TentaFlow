@@ -19,6 +19,7 @@ pub mod frame;
 pub mod gate;
 pub mod ids;
 pub mod recording;
+pub mod robot;
 pub mod services;
 pub mod stream;
 pub mod streaming;
