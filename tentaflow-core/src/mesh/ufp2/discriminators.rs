@@ -140,6 +140,9 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_NODE_LEAVING
             | legacy::MESH_MSG_ROUTING_SYNC
             | legacy::MESH_MSG_ROBOTS_ANNOUNCE
+            | legacy::MESH_MSG_ROBOTS_GET
+            | legacy::MESH_MSG_ROBOTS_GET_RESPONSE
+            | legacy::MESH_MSG_ROBOTS_UPDATE
     )
 }
 
@@ -158,6 +161,9 @@ pub mod kinds {
     pub const ALIAS_SYNC: Kind = Kind(legacy::MESH_MSG_ALIAS_SYNC as u16);
     pub const ROUTING_SYNC: Kind = Kind(legacy::MESH_MSG_ROUTING_SYNC as u16);
     pub const ROBOTS_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_ROBOTS_ANNOUNCE as u16);
+    pub const ROBOTS_GET: Kind = Kind(legacy::MESH_MSG_ROBOTS_GET as u16);
+    pub const ROBOTS_GET_RESPONSE: Kind = Kind(legacy::MESH_MSG_ROBOTS_GET_RESPONSE as u16);
+    pub const ROBOTS_UPDATE: Kind = Kind(legacy::MESH_MSG_ROBOTS_UPDATE as u16);
     pub const NODE_LEAVING: Kind = Kind(legacy::MESH_MSG_NODE_LEAVING as u16);
     pub const HELLO: Kind = Kind(legacy::MESH_MSG_HELLO as u16);
     pub const TOPOLOGY_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_TOPOLOGY_ANNOUNCE as u16);
@@ -263,6 +269,9 @@ mod tests {
             legacy::MESH_MSG_NODE_LEAVING,
             legacy::MESH_MSG_ROUTING_SYNC,
             legacy::MESH_MSG_ROBOTS_ANNOUNCE,
+            legacy::MESH_MSG_ROBOTS_GET,
+            legacy::MESH_MSG_ROBOTS_GET_RESPONSE,
+            legacy::MESH_MSG_ROBOTS_UPDATE,
         ];
         for d in migrated {
             assert!(

@@ -772,6 +772,19 @@ pub const MESH_MSG_ROUTING_SYNC: u8 = 0x4D;
 /// resolver `resolve_robot_owner` widzi, ktory node posiada dany robot.
 /// Trusted-peer only (nie ma go na liscie pre-trust).
 pub const MESH_MSG_ROBOTS_ANNOUNCE: u8 = 0x4E;
+/// Pull-on-connect: nowo polaczony peer prosi o pelny snapshot robotow tego
+/// noda (`RobotsGetPayload`). Mirror `MESH_MSG_SERVICES_GET` — odbiorca
+/// odpowiada `MESH_MSG_ROBOTS_GET_RESPONSE`. Trusted-peer only.
+pub const MESH_MSG_ROBOTS_GET: u8 = 0x4F;
+/// Odpowiedz na `MESH_MSG_ROBOTS_GET` — pelen snapshot robotow lokalnego noda
+/// (`RobotsGetResponsePayload`). Mirror `MESH_MSG_SERVICES_GET_RESPONSE`.
+/// Trusted-peer only.
+pub const MESH_MSG_ROBOTS_GET_RESPONSE: u8 = 0x50;
+/// Push delta — wysylane natychmiast po lokalnej zmianie zestawu robotow
+/// (added/updated/removed). Mirror `MESH_MSG_SERVICES_UPDATE` — odbiorca
+/// aplikuje `change` na swoim widoku noda przez `apply_change`. Trusted-peer
+/// only.
+pub const MESH_MSG_ROBOTS_UPDATE: u8 = 0x51;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)

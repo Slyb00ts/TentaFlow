@@ -260,6 +260,22 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
+    /// Pull request: peer prosi nas o pelny snapshot lokalnych robotow
+    /// (`MESH_MSG_ROBOTS_GET`).
+    RobotsGetReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    /// Odpowiedz peera na nasz pull robotow (`MESH_MSG_ROBOTS_GET_RESPONSE`).
+    RobotsGetResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    /// Push delta robotow peera (`MESH_MSG_ROBOTS_UPDATE`).
+    RobotsUpdateReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
     SyncPushReceived {
         from_node_id: String,
         data: Vec<u8>,
@@ -2432,6 +2448,18 @@ impl IrohMeshManagerRef {
                 data: payload,
             },
             x if x == MESH_MSG_ROBOTS_ANNOUNCE => IrohMeshEvent::RobotsAnnounceReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_ROBOTS_GET => IrohMeshEvent::RobotsGetReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_ROBOTS_GET_RESPONSE => IrohMeshEvent::RobotsGetResponseReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_ROBOTS_UPDATE => IrohMeshEvent::RobotsUpdateReceived {
                 from_node_id: remote_hex,
                 data: payload,
             },

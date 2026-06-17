@@ -976,6 +976,13 @@ fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
             Ok(r) => json!({
                 "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
                 "estop_active": r.estop_active, "camera_id": r.camera_id,
+                // Capabilities the go2 driver exposes. Advertised on the mesh so a
+                // controller node can present available actions without owning the
+                // addon. Keep in sync with the `go2.action_*` / `go2.move_*` tools.
+                "capabilities": [
+                    "move", "sit", "stand_up", "stand_down", "recovery_stand",
+                    "hello", "stretch", "stop", "camera",
+                ],
             }),
             Err(e) => json!({ "error": alloc::format!("{e}") }),
         },
