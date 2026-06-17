@@ -36,6 +36,7 @@ tick_interval_ms = 200
 # LAN signaling to the robot (con_notify / con_ing). Exact host — admin approves
 # the private address in the Network tab. Update host when the robot IP changes.
 [[network_rule]]
+id = "go2-webrtc-signaling"
 host = "192.168.0.190"
 port = 9991
 protocol = "http"
