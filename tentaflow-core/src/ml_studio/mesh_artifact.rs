@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use base64::Engine;
 
@@ -17,11 +18,24 @@ use crate::ml_studio::train_recognition::{blob_content_hash, zip_dir};
 
 /// Rozmiar fragmentu (600 KiB surowych bajtów → ~800 KiB base64, pod limitem ramki).
 const ARTIFACT_CHUNK_BYTES: usize = 600 * 1024;
+/// Twarde limity chroniące odbiorcę przed DoS (ogromny `total`, brak finalizacji).
+const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_ARTIFACT_CHUNKS: u32 = 200_000;
+const MAX_TOTAL_RECV_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+const RECV_TTL: std::time::Duration = std::time::Duration::from_secs(900);
 
-/// Akumulator odbieranych fragmentów: transfer_id → fragmenty wg seq.
-static RECV: OnceLock<Mutex<HashMap<String, Vec<Option<Vec<u8>>>>>> = OnceLock::new();
+struct RecvAccum {
+    total: u32,
+    chunks: Vec<Option<Vec<u8>>>,
+    bytes: u64,
+    last_touch: Instant,
+}
 
-fn recv_map() -> &'static Mutex<HashMap<String, Vec<Option<Vec<u8>>>>> {
+/// Akumulator odbieranych fragmentów, kluczowany `(sender_node_id, transfer_id)`
+/// — różni nadawcy nie kolidują nawet przy tym samym content-hashu.
+static RECV: OnceLock<Mutex<HashMap<String, RecvAccum>>> = OnceLock::new();
+
+fn recv_map() -> &'static Mutex<HashMap<String, RecvAccum>> {
     RECV.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -41,6 +55,35 @@ fn safe_artifact_name(src_dir: &str) -> String {
         .unwrap_or_else(|| "model".to_string())
 }
 
+/// Czy `path` jest dozwoloną lokalizacją artefaktu (fail-closed dla `MlArtifactPushTo`
+/// od zdalnego węzła). Wymaga istniejącego KATALOGU pod znanym rootem ML Studio.
+pub fn is_allowed_artifact_dir(path: &str) -> bool {
+    let p = Path::new(path);
+    let canon = match std::fs::canonicalize(p) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if !canon.is_dir() {
+        return false;
+    }
+    let roots = [
+        crate::paths::cache_dir(),
+        crate::paths::data_dir(),
+        crate::paths::tentaflow_home().to_path_buf(),
+    ];
+    if roots.iter().any(|r| {
+        std::fs::canonicalize(r)
+            .map(|rc| canon.starts_with(&rc))
+            .unwrap_or(false)
+    }) {
+        return true;
+    }
+    // Artefakty treningowe lądują w `ml-training-out/exports/...` (poza home przy
+    // konfigurowalnym katalogu modeli) — dopuszczamy po komponencie ścieżki.
+    let s = canon.to_string_lossy();
+    s.contains("/ml-training-out/") || s.contains("/exports/") || s.contains("/mlx-model")
+}
+
 /// Węzeł-źródło: pakuje `src_dir` do ZIP i streamuje fragmenty do `target_node_id`
 /// komendą `MlArtifactChunk`. Zwraca ścieżkę katalogu artefaktu NA węźle docelowym.
 pub async fn push_dir_to(
@@ -48,7 +91,13 @@ pub async fn push_dir_to(
     target_node_id: &str,
     src_dir: &str,
 ) -> anyhow::Result<String> {
+    if !Path::new(src_dir).is_dir() {
+        anyhow::bail!("artefakt do transferu nie jest katalogiem: {}", src_dir);
+    }
     let zip = zip_dir(Path::new(src_dir))?;
+    if zip.len() as u64 > MAX_ARTIFACT_BYTES {
+        anyhow::bail!("artefakt przekracza limit transferu ({} B)", zip.len());
+    }
     let transfer_id = blob_content_hash(&zip);
     let name = safe_artifact_name(src_dir);
     let total = zip.len().div_ceil(ARTIFACT_CHUNK_BYTES).max(1) as u32;
@@ -94,35 +143,63 @@ pub async fn push_dir_to(
     Ok(target_path)
 }
 
-/// Węzeł docelowy: przyjmuje jeden fragment. Po komplecie składa ZIP, rozpakowuje
-/// do `<cache>/ml-studio/mesh-artifacts/<name>` i zwraca `(true, ścieżka)`.
-/// Dla fragmentów pośrednich zwraca `(false, "")`.
+/// Węzeł docelowy: przyjmuje jeden fragment od `sender_node_id`. Po komplecie
+/// weryfikuje content-hash, składa ZIP i rozpakowuje do unikalnego katalogu
+/// `<cache>/ml-studio/mesh-artifacts/<name>-<transfer_id>`. Zwraca `(true, ścieżka)`;
+/// dla fragmentów pośrednich `(false, "")`.
 pub fn recv_chunk(
+    sender_node_id: &str,
     transfer_id: &str,
     name: &str,
     seq: u32,
     total: u32,
     data_b64: &str,
 ) -> anyhow::Result<(bool, String)> {
+    if total == 0 || total > MAX_ARTIFACT_CHUNKS || seq >= total {
+        anyhow::bail!("nieprawidłowy fragment artefaktu (seq={}, total={})", seq, total);
+    }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| anyhow::anyhow!("artifact chunk base64: {}", e))?;
 
+    let key = format!("{}:{}", sender_node_id, transfer_id);
     let assembled = {
         let mut map = recv_map().lock().map_err(|_| anyhow::anyhow!("recv lock poisoned"))?;
-        let slot = map.entry(transfer_id.to_string()).or_insert_with(|| vec![None; total as usize]);
-        if slot.len() != total as usize {
-            *slot = vec![None; total as usize];
+        let now = Instant::now();
+        // TTL sweep — porzucone transfery nie rosną w nieskończoność.
+        map.retain(|_, a| now.duration_since(a.last_touch) < RECV_TTL);
+
+        // Globalny limit pamięci wszystkich transferów w toku (poza tym fragmentem).
+        let other: u64 = map.iter().filter(|(k, _)| *k != &key).map(|(_, a)| a.bytes).sum();
+        if other + bytes.len() as u64 > MAX_TOTAL_RECV_BYTES {
+            anyhow::bail!("bufor transferów artefaktów pełny — spróbuj później");
         }
-        if (seq as usize) < slot.len() {
-            slot[seq as usize] = Some(bytes);
+
+        let entry = map.entry(key.clone()).or_insert_with(|| RecvAccum {
+            total,
+            chunks: (0..total).map(|_| None).collect(),
+            bytes: 0,
+            last_touch: now,
+        });
+        if entry.total != total || entry.chunks.len() != total as usize {
+            map.remove(&key);
+            anyhow::bail!("niespójny total dla transferu {}", transfer_id);
         }
-        if slot.iter().all(|c| c.is_some()) {
-            let mut zip = Vec::new();
-            for c in slot.iter() {
+        entry.last_touch = now;
+        if entry.chunks[seq as usize].is_none() {
+            entry.bytes += bytes.len() as u64;
+            if entry.bytes > MAX_ARTIFACT_BYTES {
+                map.remove(&key);
+                anyhow::bail!("artefakt przekracza limit transferu");
+            }
+            entry.chunks[seq as usize] = Some(bytes);
+        }
+        if entry.chunks.iter().all(|c| c.is_some()) {
+            let mut zip = Vec::with_capacity(entry.bytes as usize);
+            for c in entry.chunks.iter() {
                 zip.extend_from_slice(c.as_ref().unwrap());
             }
-            map.remove(transfer_id);
+            map.remove(&key);
             Some(zip)
         } else {
             None
@@ -133,7 +210,13 @@ pub fn recv_chunk(
         return Ok((false, String::new()));
     };
 
-    let dest = artifact_dest_root().join(safe_artifact_name(name));
+    // Integralność: transfer_id JEST content-hashem ZIP-a u nadawcy.
+    if blob_content_hash(&zip) != transfer_id {
+        anyhow::bail!("content-hash artefaktu nie zgadza się — transfer uszkodzony");
+    }
+
+    // Unikalny katalog docelowy (nazwa + transfer_id) — bez wyścigu z innym modelem.
+    let dest = artifact_dest_root().join(format!("{}-{}", safe_artifact_name(name), transfer_id));
     unzip_to_dir(&zip, &dest)?;
     Ok((true, dest.to_string_lossy().to_string()))
 }
