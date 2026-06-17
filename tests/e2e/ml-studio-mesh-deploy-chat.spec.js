@@ -66,70 +66,79 @@ async function shot(page, file) {
       throw e;
     }
 
-    // ---- Step 2: DEPLOY the mesh model from A (routes to B) ----
+    // ---- Step 2: DEPLOY the mesh model from A by clicking the UI "Wdróż" button ----
     try {
-      // The row for the exported-but-not-deployed FT model shows a "Wdróż" action.
-      // Click it via the table's rowActions builder result in the shadow DOM.
-      const deployed = await page.evaluate(async (prefix) => {
+      // Confirm the row exposes the deploy/chat affordance (rebuilt JS).
+      const flags = await page.evaluate((prefix) => {
         const table = document.querySelector('#ml-studio-models-table tf-table');
-        const rows = table?.rows || [];
-        const row = rows.find((r) => String(r._modelId || '').startsWith(prefix));
-        if (!row) return { ok: false, msg: 'brak wiersza modelu' };
-        const alreadyDeployed = Boolean(row._canChat);
-        // Deploy through the exact protocol call the "Wdróż" button issues. The
-        // handler routes the deploy to the model's owner node over mesh.
-        const resp = await window.ApiBinary.one('mlStudioFtDeployRequest', { modelId: row._modelId });
-        const status = String(resp?.status || '');
-        return {
-          ok: status === 'deploying' || alreadyDeployed,
-          msg: resp?.error || status || 'brak statusu',
-          modelName: resp?.modelName,
-          uiHadDeployBtn: Boolean(row._canDeploy),
-          uiHadChatBtn: alreadyDeployed,
-        };
+        const row = (table?.rows || []).find((r) => String(r._modelId || '').startsWith(prefix));
+        return row ? { found: true, canDeploy: !!row._canDeploy, canChat: !!row._canChat } : { found: false };
       }, MODEL_PREFIX);
+      if (!flags.found) throw new Error('brak wiersza modelu w tabeli');
+
+      if (flags.canChat) {
+        step('2. Deploy modelu z mesh (A→B)', true, 'model już wdrożony wcześniej — pomijam Wdróż');
+      } else {
+        if (!flags.canDeploy) throw new Error('model nie pokazuje akcji Wdróż (brak eksportu?)');
+        // tf-button text pierces shadow DOM via Playwright text engine.
+        const deployBtn = page.getByText('Wdróż', { exact: true }).first();
+        await deployBtn.waitFor({ state: 'visible', timeout: 10000 });
+        await deployBtn.click();
+        // deployFtModel → toast + renderModelsTab; the "Zapytaj" action appears
+        // once the model metrics carry inference_model_name. Poll the row flag.
+        await page.waitForFunction((prefix) => {
+          const table = document.querySelector('#ml-studio-models-table tf-table');
+          const row = (table?.rows || []).find((r) => String(r._modelId || '').startsWith(prefix));
+          return row && row._canChat;
+        }, MODEL_PREFIX, { timeout: 30000 });
+        step('2. Deploy modelu z mesh (A→B, klik „Wdróż")', true, 'deploy OK — pojawiła się akcja „Zapytaj"');
+      }
       await shot(page, '02-deploy.png');
-      step('2. Deploy modelu z mesh (A→B, ServiceDeployRemote)', deployed.ok,
-        deployed.ok ? `status=${deployed.msg}${deployed.modelName ? ` alias=${deployed.modelName}` : ''} (UI: Wdróż=${deployed.uiHadDeployBtn}, Zapytaj=${deployed.uiHadChatBtn})` : `nie udało się: ${deployed.msg}`);
-      if (!deployed.ok) throw new Error(deployed.msg);
     } catch (e) {
       await shot(page, '02-FAIL.png');
       step('2. Deploy modelu z mesh', false, `Błąd: ${e.message}`);
       throw e;
     }
 
-    // ---- Step 3: USE the model — chat over mesh (A → MlChat → B → answer) ----
+    // ---- Step 3: USE the model — click "Zapytaj", send a prompt, read the answer ----
     try {
-      // Embedded GGUF load on B can take a while; poll the chat call up to ~150s.
+      // Open the chat modal via the row "Zapytaj" action (before the modal's own send btn exists).
+      const askBtn = page.getByText('Zapytaj', { exact: true }).first();
+      await askBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await askBtn.click();
+      const input = page.locator('#ml-studio-chat-input textarea').first();
+      await input.waitFor({ state: 'visible', timeout: 10000 });
+      await input.fill('Jaka jest stolica Polski? Odpowiedz krótko.');
+
+      // Embedded GGUF load on B can take a while; retry send until an answer renders.
       let answer = '';
       let lastErr = '';
-      const deadline = Date.now() + 150000;
+      const deadline = Date.now() + 160000;
       while (Date.now() < deadline) {
-        const out = await page.evaluate(async (prefix) => {
-          const table = document.querySelector('#ml-studio-models-table tf-table');
-          const rows = table?.rows || [];
-          const row = rows.find((r) => String(r._modelId || '').startsWith(prefix));
-          const modelId = row?._modelId;
-          if (!modelId) return { answer: '', error: 'brak modelu' };
-          try {
-            const resp = await window.ApiBinary.one('mlStudioFtChatRequest', {
-              modelId, message: 'Jaka jest stolica Polski? Odpowiedz krótko.', maxTokens: 40,
-            });
-            return { answer: String(resp?.answer ?? '').trim(), error: resp?.error || '' };
-          } catch (e) { return { answer: '', error: String(e.message || e) }; }
-        }, MODEL_PREFIX);
-        if (out.answer) { answer = out.answer; break; }
-        lastErr = out.error || 'pusta odpowiedź';
-        if (!/not found|nie.*znalez|loading|ładow|503|starting/i.test(lastErr) && lastErr !== 'pusta odpowiedź') {
-          // Hard error unrelated to warmup — stop early.
-          if (/not trusted|peer|mesh/i.test(lastErr)) break;
-        }
+        await page.locator('#ml-studio-chat-send').click();
+        try {
+          await page.waitForFunction(() => {
+            const host = document.querySelector('#ml-studio-chat-answer');
+            if (!host) return false;
+            const pre = host.querySelector('.ml-studio-chat-text');
+            if (pre && pre.textContent.trim()) return true;
+            // error bubble also resolves the wait so we can read it
+            return /nieudane/i.test(host.textContent || '');
+          }, { timeout: 20000 }).catch(() => {});
+          const out = await page.evaluate(() => {
+            const host = document.querySelector('#ml-studio-chat-answer');
+            const pre = host?.querySelector('.ml-studio-chat-text');
+            return { answer: pre ? pre.textContent.trim() : '', html: host ? host.textContent.trim() : '' };
+          });
+          if (out.answer) { answer = out.answer; break; }
+          lastErr = out.html || 'pusta odpowiedź';
+        } catch (e) { lastErr = String(e.message || e); }
         await page.waitForTimeout(5000);
       }
       await shot(page, '03-chat.png');
       const pass = !!answer;
-      step('3. Zapytanie modelu przez mesh (A→MlChat→B)', pass,
-        pass ? `odpowiedź="${answer.slice(0, 160)}"` : `brak odpowiedzi w 150s; ostatnio: ${lastErr}`);
+      step('3. Zapytanie modelu przez mesh (UI „Zapytaj" → A→MlChat→B)', pass,
+        pass ? `odpowiedź="${answer.slice(0, 160)}"` : `brak odpowiedzi w 160s; ostatnio: ${lastErr.slice(0, 160)}`);
     } catch (e) {
       await shot(page, '03-FAIL.png');
       step('3. Zapytanie modelu przez mesh', false, `Błąd: ${e.message}`);

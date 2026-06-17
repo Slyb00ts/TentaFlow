@@ -729,18 +729,50 @@ def _export_worker(req: ExportRequest, export_id: str) -> None:
     # Slot eksportu trzymamy przez całą operację (merge model w RAM) i zwalniamy
     # w finally — niezależnie od wyniku, żeby nie zablokować kolejnych eksportów.
     work: Optional[str] = None
+    # Eksport MLX/safetensors: silnik MLX (Apple) ładuje model w formacie HF
+    # safetensors WPROST — nie potrzeba konwersji GGUF ani narzędzi llama.cpp.
+    # Produkujemy scalony (LoRA→base) model safetensors i zwracamy KATALOG.
+    is_safetensors = req.outtype in ("mlx", "safetensors")
     try:
-        if not os.path.isdir(LLAMA_CPP_DIR):
-            raise RuntimeError(
-                f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
-            )
-        convert_script = os.path.join(LLAMA_CPP_DIR, "convert_hf_to_gguf.py")
-        if not os.path.exists(convert_script):
-            raise RuntimeError(
-                f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
-            )
+        if not is_safetensors:
+            if not os.path.isdir(LLAMA_CPP_DIR):
+                raise RuntimeError(
+                    f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
+                )
+            convert_script = os.path.join(LLAMA_CPP_DIR, "convert_hf_to_gguf.py")
+            if not os.path.exists(convert_script):
+                raise RuntimeError(
+                    f"narzędzia konwersji GGUF niedostępne (LLAMA_CPP_DIR={LLAMA_CPP_DIR})"
+                )
 
         base_path = _resolve_base_path(req.base_model)
+
+        out_dir = os.path.join(ARTIFACTS_ROOT, "exports", export_id)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # MLX/safetensors: scalamy wprost do trwałego katalogu wyjściowego i kończymy.
+        if is_safetensors:
+            base = AutoModelForCausalLM.from_pretrained(
+                base_path, torch_dtype=torch.float16, trust_remote_code=ALLOW_REMOTE_CODE
+            )
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(base, req.adapter_path).merge_and_unload()
+            merged_out = os.path.join(out_dir, "mlx-model")
+            os.makedirs(merged_out, exist_ok=True)
+            model.save_pretrained(merged_out, safe_serialization=True)
+            AutoTokenizer.from_pretrained(
+                base_path, trust_remote_code=ALLOW_REMOTE_CODE
+            ).save_pretrained(merged_out)
+            size = sum(
+                os.path.getsize(os.path.join(dp, f))
+                for dp, _, fs in os.walk(merged_out)
+                for f in fs
+            )
+            _update_export(
+                export_id, status="succeeded", gguf_path=merged_out, size_bytes=size
+            )
+            return
 
         work = tempfile.mkdtemp(prefix="tf-export-")
         base = AutoModelForCausalLM.from_pretrained(
@@ -755,8 +787,6 @@ def _export_worker(req: ExportRequest, export_id: str) -> None:
             base_path, trust_remote_code=ALLOW_REMOTE_CODE
         ).save_pretrained(merged_dir)
 
-        out_dir = os.path.join(ARTIFACTS_ROOT, "exports", export_id)
-        os.makedirs(out_dir, exist_ok=True)
         env = dict(os.environ, PYTHONPATH=os.path.join(LLAMA_CPP_DIR, "gguf-py"))
 
         # K-quant (Q4_K_M itd.) konwerter robi w dwóch krokach: najpierw f16
