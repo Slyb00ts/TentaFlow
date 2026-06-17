@@ -1066,8 +1066,8 @@ pub enum SchedulerPayload {
 
 /// One ML Studio project type with a stable machine slug and a Polish UI label.
 /// The slug is what flows/handlers branch on; the label is what the wizard
-/// shows. Six types are fixed by the product (recognition, ft_llm,
-/// ft_vision_audio, tabular_anomaly, rag, distillation).
+/// shows. The types are fixed by the product (recognition, ft_llm,
+/// ft_vision_audio, tabular_anomaly, distillation).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioProjectTypeInfo {
     pub slug: String,

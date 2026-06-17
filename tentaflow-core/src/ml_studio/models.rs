@@ -11,18 +11,16 @@ pub enum ProjectType {
     FtLlm,
     FtVisionAudio,
     TabularAnomaly,
-    Rag,
     Distillation,
 }
 
 impl ProjectType {
-    /// All six types in wizard display order.
-    pub const ALL: [ProjectType; 6] = [
+    /// All types in wizard display order.
+    pub const ALL: [ProjectType; 5] = [
         ProjectType::Recognition,
         ProjectType::FtLlm,
         ProjectType::FtVisionAudio,
         ProjectType::TabularAnomaly,
-        ProjectType::Rag,
         ProjectType::Distillation,
     ];
 
@@ -33,7 +31,6 @@ impl ProjectType {
             ProjectType::FtLlm => "ft_llm",
             ProjectType::FtVisionAudio => "ft_vision_audio",
             ProjectType::TabularAnomaly => "tabular_anomaly",
-            ProjectType::Rag => "rag",
             ProjectType::Distillation => "distillation",
         }
     }
@@ -45,7 +42,6 @@ impl ProjectType {
             ProjectType::FtLlm => "Fine-tuning LLM",
             ProjectType::FtVisionAudio => "Fine-tuning vision/audio",
             ProjectType::TabularAnomaly => "Dane tabelaryczne i anomalie",
-            ProjectType::Rag => "RAG (wyszukiwanie z kontekstem)",
             ProjectType::Distillation => "Destylacja modelu",
         }
     }
@@ -64,9 +60,6 @@ impl ProjectType {
             }
             ProjectType::TabularAnomaly => {
                 "AutoML dla danych tabelarycznych oraz wykrywanie anomalii."
-            }
-            ProjectType::Rag => {
-                "Budowa korpusu, chunking, embeddingi i indeks wektorowy z playgroundem."
             }
             ProjectType::Distillation => {
                 "Destylacja wiedzy z modelu nauczyciela do mniejszego modelu ucznia."

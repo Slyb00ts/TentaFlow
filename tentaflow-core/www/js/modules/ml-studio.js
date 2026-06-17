@@ -92,7 +92,6 @@ const TYPE_ICON = {
   ft_llm: 'sparkle',
   ft_vision_audio: 'mic',
   tabular_anomaly: 'grid-rows',
-  rag: 'rag-db',
   distillation: 'transform',
 };
 
@@ -101,7 +100,6 @@ const TYPE_TABS = {
   ft_llm: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   ft_vision_audio: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   tabular_anomaly: ['Dane', 'Trenuj', 'Cechy', 'Anomalie', 'Modele'],
-  rag: ['Korpus', 'Indeks', 'Reranker', 'Ewaluacja', 'Zapytania'],
   distillation: ['Nauczyciel', 'Uczeń', 'Dane', 'Trening', 'Modele'],
 };
 
@@ -1221,7 +1219,7 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   if (shortcutsHost) {
     const slug = p.projectType ?? p.project_type ?? '';
     const shortcutIcon = (label) => {
-      if (label === 'Dane' || label === 'Korpus') return 'image';
+      if (label === 'Dane') return 'image';
       if (label === 'Zasoby') return 'host';
       if (label === 'Treningi' || label === 'Trening' || label === 'Trenuj') return 'brain';
       if (label === 'Modele') return 'catalog';
