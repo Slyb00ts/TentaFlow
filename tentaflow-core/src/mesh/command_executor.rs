@@ -445,31 +445,6 @@ impl MeshCommandExecutor {
                 src_path,
                 target_node_id,
             } => self.handle_ml_artifact_push_to(src_path, target_node_id).await,
-            MeshCommandType::MlArtifactChunk {
-                transfer_id,
-                name,
-                seq,
-                total,
-                data_b64,
-            } => match crate::ml_studio::mesh_artifact::recv_chunk(
-                from_node_id,
-                &transfer_id,
-                &name,
-                seq,
-                total,
-                &data_b64,
-            ) {
-                Ok((_, local_path)) => CommandResponse::ok(
-                    MeshCommandResponsePayload::MlArtifactChunkResult {
-                        local_path,
-                        error: None,
-                    },
-                ),
-                Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactChunkResult {
-                    local_path: String::new(),
-                    error: Some(e.to_string()),
-                }),
-            },
         }
     }
 

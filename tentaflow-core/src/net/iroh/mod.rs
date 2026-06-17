@@ -36,3 +36,8 @@ pub const ALPN_BASELINE: &[u8] = b"tentaflow-baseline/v1";
 
 /// ALPN dla API/browser (GUI, SDK). CBOR `MessageBody` bez mesh discriminantow.
 pub const ALPN_API: &[u8] = b"tentaflow-api/v1";
+
+/// ALPN dla bulk-transferu artefaktów modeli (ZIP) między węzłami. Osobny ALPN
+/// bo to jeden duży strumień bajtów (open_bi), nie request/response komend mesh —
+/// unika tysięcy round-tripów przy przenoszeniu modelu (np. MLX z B na C).
+pub const ALPN_ARTIFACT: &[u8] = b"tentaflow-artifact/v1";
