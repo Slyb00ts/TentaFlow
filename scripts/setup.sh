@@ -736,6 +736,31 @@ install_rust() {
     # Upewnij sie ze mamy stable
     rustup default stable
 
+    # rustup shim MUSI byc na PATH przed ewentualnym systemowym cargo (apt/distro
+    # potrafi miec stare 1.75) — inaczej build uzyje starego cargo mimo rustupa.
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    # Wymus minimalna wersje: zaleznosci wymagaja feature `edition2024`, ktora
+    # ustabilizowano dopiero w Rust 1.85. Stary toolchain (np. systemowy 1.75)
+    # wywala build z "feature `edition2024` is required". Fail-loud z instrukcja.
+    local min_rust="1.85.0"
+    local cur_rust
+    cur_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
+    if [[ -z "$cur_rust" ]] || \
+       [[ "$(printf '%s\n%s\n' "$min_rust" "$cur_rust" | sort -V | head -1)" != "$min_rust" ]]; then
+        log_warn "Aktywny rustc=${cur_rust:-brak} < ${min_rust}; probuje rustup update stable..."
+        rustup update stable --no-self-update
+        rustup default stable
+        cur_rust="$(rustc --version 2>/dev/null | awk '{print $2}')"
+    fi
+    if [[ -z "$cur_rust" ]] || \
+       [[ "$(printf '%s\n%s\n' "$min_rust" "$cur_rust" | sort -V | head -1)" != "$min_rust" ]]; then
+        log_error "Rust ${cur_rust:-brak} jest za stary (wymagane >= ${min_rust} dla edition2024)."
+        log_error "Aktywny cargo: $(command -v cargo 2>/dev/null || echo brak)"
+        log_error "Jesli to systemowy Rust (apt/distro): usun go (np. 'apt remove rustc cargo') albo upewnij sie ze ~/.cargo/bin jest PIERWSZE w PATH, i uruchom ponownie."
+        exit 1
+    fi
+
     log_ok "Rust: $(rustc --version)"
     INSTALLED+=("rust-stable")
 }
@@ -1729,10 +1754,14 @@ main() {
     install_base
     install_git_lfs
     ensure_docker
-    install_zvec
+    # Rust + WASM toolchain FIRST: it is foundational (native builds may use cargo)
+    # and must never be skipped by a `set -e` abort in a later fragile native step.
+    # A zvec failure on a fresh rig used to leave the box with an old/system Rust
+    # and no wasm-bindgen -> Rust 1.75 build errors + dashboard wasm_glue 404.
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_zvec
     install_android_rust_tools
     install_android_gstreamer_sdk
     install_android_gradle_runner
