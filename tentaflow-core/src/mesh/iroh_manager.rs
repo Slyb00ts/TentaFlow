@@ -1220,7 +1220,11 @@ impl IrohMeshManager {
         target_node_id: &str,
         name: &str,
         zip: &[u8],
+        progress_key: Option<&str>,
     ) -> Result<String> {
+        use crate::ml_studio::mesh_artifact::{
+            ArtifactTransferProgress, ARTIFACT_CHUNK_BYTES, ARTIFACT_STALL_SECS,
+        };
         let hints = load_trusted_contact_hints(&self.security.db, target_node_id)
             .map_err(|e| anyhow::anyhow!("artifact push: load hints: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("artifact push: brak hintów dla {target_node_id}"))?;
@@ -1250,24 +1254,73 @@ impl IrohMeshManager {
         send.write_all(&(zip.len() as u64).to_be_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("artifact push: write zip_len: {e}"))?;
-        send.write_all(zip)
-            .await
-            .map_err(|e| anyhow::anyhow!("artifact push: write zip: {e}"))?;
+
+        // Strumieniujemy ZIP zapisami CZĄSTKOWYMI (`write`, nie `write_all`) z
+        // watchdogiem STALL: każdy `write` przyjmuje tyle bajtów, ile zmieści okno
+        // flow-control QUIC, i zwraca natychmiast po przyjęciu JAKICHKOLWIEK bajtów.
+        // Świeży limit bezczynności (ARTIFACT_STALL_SECS) na każdy `write` → dopóki
+        // choć bajt zostaje przyjęty w oknie, licznik się resetuje. Timeout = ZERO
+        // przyjętych bajtów przez okno = odbiorca nie czyta (STALL). Aktywny transfer
+        // (nawet bardzo wolny) NIGDY nie pada na sztywny deadline. Postęp → mapa B/s.
+        let total = zip.len() as u64;
+        let stall = std::time::Duration::from_secs(ARTIFACT_STALL_SECS);
+        let mut sent: u64 = 0;
+        let mut window_start = tokio::time::Instant::now();
+        let mut window_bytes: u64 = 0;
+        let mut rate_bps: u64 = 0;
+        let mut off = 0usize;
+        while off < zip.len() {
+            let end = (off + ARTIFACT_CHUNK_BYTES).min(zip.len());
+            let n = match tokio::time::timeout(stall, send.write(&zip[off..end])).await {
+                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("artifact push: write zip: {e}")),
+                Err(_) => {
+                    if let Some(k) = progress_key {
+                        crate::ml_studio::mesh_artifact::clear_artifact_progress(k);
+                    }
+                    anyhow::bail!(
+                        "artifact push: transfer utknął — brak przyjętych bajtów przez {}s ({}/{} B)",
+                        ARTIFACT_STALL_SECS,
+                        sent,
+                        total
+                    );
+                }
+            };
+            sent += n as u64;
+            window_bytes += n as u64;
+            off += n;
+            let win = window_start.elapsed().as_secs_f64();
+            if win >= 1.0 {
+                rate_bps = (window_bytes as f64 / win) as u64;
+                window_start = tokio::time::Instant::now();
+                window_bytes = 0;
+            }
+            if let Some(k) = progress_key {
+                crate::ml_studio::mesh_artifact::set_artifact_progress_pub(
+                    k,
+                    ArtifactTransferProgress {
+                        bytes_sent: sent,
+                        bytes_total: total,
+                        rate_bps,
+                    },
+                );
+            }
+        }
         send.finish()
             .map_err(|e| anyhow::anyhow!("artifact push: finish: {e}"))?;
 
+        // Odpowiedź `[path_len][path]` z odbiorcy — z watchdogiem STALL na każdy
+        // `read` (patrz `read_reply_stall`), żeby zawieszony unzip po stronie
+        // odbiorcy nie zostawił nas w transferze bez końca. Reset na każdy bajt.
         let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("artifact push: read path_len: {e}"))?;
+        read_reply_stall(&mut recv, &mut len_buf, stall).await?;
         let n = u32::from_be_bytes(len_buf) as usize;
         if n == 0 {
             anyhow::bail!("węzeł docelowy nie zapisał artefaktu");
         }
         let mut pbuf = vec![0u8; n];
-        recv.read_exact(&mut pbuf)
-            .await
-            .map_err(|e| anyhow::anyhow!("artifact push: read path: {e}"))?;
+        read_reply_stall(&mut recv, &mut pbuf, stall).await?;
         Ok(String::from_utf8_lossy(&pbuf).to_string())
     }
 
@@ -2593,6 +2646,31 @@ async fn read_forward_payload(
         return Err(IrohStreamError::FrameTooLarge(payload.len()));
     }
     Ok(payload)
+}
+
+/// Czyta dokładnie `buf.len()` bajtów odpowiedzi ze streamu z watchdogiem STALL:
+/// każdy `read` ma świeży limit bezczynności i resetuje go po napłynięciu choć
+/// jednego bajtu. Timeout = ZERO nowych bajtów przez okno (a nie „za wolno").
+async fn read_reply_stall(
+    recv: &mut iroh::endpoint::RecvStream,
+    buf: &mut [u8],
+    stall: std::time::Duration,
+) -> Result<()> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        match tokio::time::timeout(stall, recv.read(&mut buf[got..])).await {
+            Ok(Ok(Some(0))) | Ok(Ok(None)) => {
+                anyhow::bail!("strumień odpowiedzi zamknięty przedwcześnie ({}/{} B)", got, buf.len())
+            }
+            Ok(Ok(Some(k))) => got += k,
+            Ok(Err(e)) => anyhow::bail!("read reply: {e}"),
+            Err(_) => anyhow::bail!(
+                "brak nowych bajtów odpowiedzi przez {}s — peer utknął",
+                stall.as_secs()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Funkcja pomocnicza wywolywana przez accept loop przy pairing ALPN. Separacja
