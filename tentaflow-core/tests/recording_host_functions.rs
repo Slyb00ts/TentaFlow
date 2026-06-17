@@ -107,6 +107,7 @@ fn seed_camera(db: &DbPool, owner: &str, camera_id: &str) {
         "fake_file",
         "/tmp/whatever.mp4",
         30,
+        10,
         Some(64),
         Some(48),
         "C",

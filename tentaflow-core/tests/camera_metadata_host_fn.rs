@@ -89,6 +89,7 @@ fn insert_test_camera(
         "onvif",
         "rtsp://placeholder/stream",
         30,
+        10,
         Some(1920),
         Some(1080),
         "C",
