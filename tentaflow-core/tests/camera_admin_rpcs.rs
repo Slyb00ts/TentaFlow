@@ -498,6 +498,7 @@ fn insert_camera_row(state: &AppState, camera_id: &str, org_id: &str) {
         "onvif",
         "rtsp://example/stream",
         15,
+        10,
         None,
         None,
         "C",
