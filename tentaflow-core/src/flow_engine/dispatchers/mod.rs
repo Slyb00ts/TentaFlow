@@ -19,6 +19,7 @@ pub mod prompts;
 pub mod stt;
 pub mod tts;
 pub mod tts_cleaning;
+pub mod vision;
 
 pub use audit::{AuditEvent, AuditSink};
 pub use clock::Clock;
@@ -35,3 +36,4 @@ pub use prompts::PromptStore;
 pub use stt::{SttDispatcher, SttRequest, SttResponse};
 pub use tts::{TtsDispatcher, TtsRequest, TtsResponse, TtsStreamChunk};
 pub use tts_cleaning::TtsCleaningStore;
+pub use vision::{VisionClassifyRequest, VisionDispatcher, VisionOcrRequest};

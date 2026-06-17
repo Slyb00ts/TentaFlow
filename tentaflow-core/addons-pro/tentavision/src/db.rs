@@ -191,6 +191,8 @@ pub struct CameraRow {
     pub status: String,
     pub fps: i64,
     pub detectors: String,
+    /// Per-camera AI analysis frame rate (`0` = unlimited / native cadence).
+    pub analysis_fps: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -205,10 +207,13 @@ pub struct NewCamera {
     pub status: String,
     pub fps: i64,
     pub detectors: String,
+    /// Per-camera AI analysis frame rate (`0` = unlimited / native cadence).
+    pub analysis_fps: i64,
 }
 
 const CAMERA_COLS: &str =
-    "id, name, location, rtsp_url, onvif_url, status, fps, detectors, created_at, updated_at";
+    "id, name, location, rtsp_url, onvif_url, status, fps, detectors, analysis_fps, \
+     created_at, updated_at";
 
 fn row_to_camera(r: &Row) -> CameraRow {
     let g = |i: usize| r.get(i).cloned().unwrap_or(SqlValue::Null);
@@ -221,8 +226,9 @@ fn row_to_camera(r: &Row) -> CameraRow {
         status: g(5).as_str().into(),
         fps: g(6).as_i64(),
         detectors: g(7).as_str().into(),
-        created_at: g(8).as_i64(),
-        updated_at: g(9).as_i64(),
+        analysis_fps: g(8).as_i64(),
+        created_at: g(9).as_i64(),
+        updated_at: g(10).as_i64(),
     }
 }
 
@@ -255,8 +261,9 @@ pub fn insert_camera_with_id(id: &str, c: &NewCamera) -> Result<(), AbiError> {
     let now = now_secs();
     exec(
         "INSERT INTO cameras \
-         (id, name, location, rtsp_url, onvif_url, status, fps, detectors, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         (id, name, location, rtsp_url, onvif_url, status, fps, detectors, analysis_fps, \
+          created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         &[
             SqlValue::Text(id.into()),
             SqlValue::Text(c.name.clone()),
@@ -266,6 +273,7 @@ pub fn insert_camera_with_id(id: &str, c: &NewCamera) -> Result<(), AbiError> {
             SqlValue::Text(c.status.clone()),
             SqlValue::I64(c.fps),
             SqlValue::Text(c.detectors.clone()),
+            SqlValue::I64(c.analysis_fps),
             SqlValue::I64(now),
         ],
     )?;
@@ -277,7 +285,7 @@ pub fn update_camera(c: &CameraRow) -> Result<u64, AbiError> {
     let now = now_secs();
     exec(
         "UPDATE cameras SET name = ?2, location = ?3, rtsp_url = ?4, onvif_url = ?5, \
-         status = ?6, fps = ?7, detectors = ?8, updated_at = ?9 WHERE id = ?1",
+         status = ?6, fps = ?7, detectors = ?8, analysis_fps = ?9, updated_at = ?10 WHERE id = ?1",
         &[
             SqlValue::Text(c.id.clone()),
             SqlValue::Text(c.name.clone()),
@@ -287,6 +295,21 @@ pub fn update_camera(c: &CameraRow) -> Result<u64, AbiError> {
             SqlValue::Text(c.status.clone()),
             SqlValue::I64(c.fps),
             SqlValue::Text(c.detectors.clone()),
+            SqlValue::I64(c.analysis_fps),
+            SqlValue::I64(now),
+        ],
+    )
+}
+
+/// Updates only the liveness status of a camera (e.g. after a reachability
+/// probe). Returns rows affected (0 if the camera does not exist).
+pub fn set_camera_status(id: &str, status: &str) -> Result<u64, AbiError> {
+    let now = now_secs();
+    exec(
+        "UPDATE cameras SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        &[
+            SqlValue::Text(id.into()),
+            SqlValue::Text(status.into()),
             SqlValue::I64(now),
         ],
     )

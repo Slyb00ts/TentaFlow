@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -247,6 +247,27 @@ impl EventBus {
             delivered_count: self.delivered_count.load(Ordering::Relaxed),
             history_size: self.event_history.read().len(),
         }
+    }
+}
+
+/// Process-global EventBus handle, so non-addon producers (a core flow node such
+/// as `camera_alert`) can publish an event to subscribed addons without
+/// threading the bus through every call site. REBINDABLE (ArcSwap, not OnceLock):
+/// each `AddonManager::new` rebinds it so a shutdown+recreate (or a second
+/// manager in tests) routes to the live bus, never a stale/closed one.
+static GLOBAL_EVENT_BUS: ArcSwapOption<EventBus> = ArcSwapOption::const_empty();
+
+/// Rebinds the process-wide EventBus to the latest `AddonManager`'s bus.
+pub fn set_global_event_bus(bus: Arc<EventBus>) {
+    GLOBAL_EVENT_BUS.store(Some(bus));
+}
+
+/// Publishes an event through the global bus. No-op before the AddonManager is
+/// built (e.g. unit tests / headless paths with no addon runtime), so callers
+/// stay decoupled from addon-runtime presence.
+pub fn publish_global_event(event: Event) {
+    if let Some(bus) = GLOBAL_EVENT_BUS.load_full() {
+        bus.publish(event);
     }
 }
 

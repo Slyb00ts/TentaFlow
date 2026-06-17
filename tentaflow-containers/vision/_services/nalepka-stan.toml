@@ -1,0 +1,30 @@
+# =============================================================================
+# Manifest serwisu Nalepka-Stan — klasyfikacja stanu nalepek ADR.
+# Embedded native: MobileNetV4 ONNX (model_stan.onnx + zewnętrzne wagi
+# model_stan.onnx.data) ładowany przez ONNX Runtime (ort). Wagi pobierane
+# deploy-time z release URL; konfiguracja klas wbudowana w binarkę.
+# =============================================================================
+
+[engine]
+id = "nalepka-stan"
+category = "vision"
+name = "Nalepka Stan"
+description_pl = "Klasyfikator stanu nalepek ADR (5 klas: czysta, brudna, uszkodzona, wyblakła, nieczytelna). MobileNetV4 160px, multi-label."
+description_en = "ADR label condition classifier (5 classes: clean, dirty, damaged, faded, illegible). MobileNetV4 160px, multi-label."
+homepage = "https://github.com/huggingface/pytorch-image-models"
+license = "Apache-2.0"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "mnv4-2026"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-vision-gpu"
+
+[[model_preset]]
+id = "nalepka-stan-mnv4"
+display_name = "Nalepka Stan (MobileNetV4, 5 klas)"
+repo = "https://models.tentaflow.local/orlen/nalepka-stan/v1"
+recommended = true

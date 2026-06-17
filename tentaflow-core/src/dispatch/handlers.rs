@@ -82,6 +82,17 @@ fn flow_write_err(e: anyhow::Error) -> ProtocolError {
     db_err(e)
 }
 
+/// Drops the FlowDispatcher's compiled-flow cache after a flow mutation so the
+/// next dispatch recompiles from the new `flow_json` — covers both the
+/// model-resolution cache and the per-id cache the camera analysis path uses.
+/// Best-effort: `None` before the dispatcher is constructed (early startup)
+/// simply means nothing is cached yet.
+fn invalidate_flow_cache() {
+    if let Some(d) = crate::flow_engine::dispatcher::global_flow_dispatcher() {
+        d.invalidate_cache();
+    }
+}
+
 /// Loguje akcje do DB i jednoczesnie broadcastuje AuditEvent do wszystkich
 /// aktywnych WS klientow (Audit screen otrzymuje live update).
 fn audit(
@@ -797,6 +808,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
     ctx.state.router.rebuild_catalog();
+    invalidate_flow_cache();
 
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -835,6 +847,7 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     // catalog immediately — without this the snapshot keeps it until the
     // next alias mutation or supervisor tick.
     ctx.state.router.rebuild_catalog();
+    invalidate_flow_cache();
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -972,6 +985,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         Err(e) => return Err(flow_write_err(e)),
     }
     ctx.state.router.rebuild_catalog();
+    invalidate_flow_cache();
 
     audit(
         ctx,
@@ -1268,6 +1282,7 @@ pub fn flow_version_restore(
         }
         Err(e) => return Err(db_err(e)),
     }
+    invalidate_flow_cache();
 
     audit(
         ctx,

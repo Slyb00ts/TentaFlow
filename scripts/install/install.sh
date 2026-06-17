@@ -21,7 +21,9 @@
 #   TENTAFLOW_SKIP_DEPS=1            # skip all dep installation (you're on your own)
 #   TENTAFLOW_SKIP_DOCKER=1          # skip Docker install check
 #   TENTAFLOW_SKIP_PYTHON=1          # skip Python install check
+#   TENTAFLOW_SKIP_VISION=1          # skip ONNX Runtime (SuperTonic TTS) install check
 #   TENTAFLOW_NO_GROUP=1             # skip adding user to docker group (Linux)
+#   TENTAFLOW_ORT_VERSION=1.24.0     # ONNX Runtime version for the tarball fallback
 # =============================================================================
 
 set -eu
@@ -33,7 +35,10 @@ NO_AUTOSTART="${TENTAFLOW_NO_AUTOSTART:-0}"
 SKIP_DEPS="${TENTAFLOW_SKIP_DEPS:-0}"
 SKIP_DOCKER="${TENTAFLOW_SKIP_DOCKER:-0}"
 SKIP_PYTHON="${TENTAFLOW_SKIP_PYTHON:-0}"
+SKIP_VISION="${TENTAFLOW_SKIP_VISION:-0}"
 NO_GROUP="${TENTAFLOW_NO_GROUP:-0}"
+ORT_VERSION="${TENTAFLOW_ORT_VERSION:-1.24.0}"
+VISION_NEEDS_TARBALL=0
 
 # ---- Colors (opt-out if not a TTY) ----
 if [ -t 1 ] && [ "${NO_COLOR:-0}" = "0" ]; then
@@ -283,6 +288,86 @@ check_python() {
   fi
 }
 
+# ---- ONNX Runtime (CPU) — SuperTonic TTS + sherpa STT ----
+# Camera-CV now runs on Burn (no onnxruntime). `ort` remains only for SuperTonic
+# TTS (CPU) in load-dynamic mode, so the CPU shared lib must be present. No CUDA
+# / cuDNN needed. Distro package preferred → official CPU prebuilt tarball.
+ort_present() {
+  [ -n "${ORT_DYLIB_PATH:-}" ] && [ -f "${ORT_DYLIB_PATH}" ] && return 0
+  for p in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime.so \
+           /usr/local/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so \
+           /opt/homebrew/lib/libonnxruntime.dylib /usr/local/lib/libonnxruntime.dylib; do
+    [ -f "$p" ] && return 0
+  done
+  return 1
+}
+
+check_vision_runtime() {
+  if [ "$SKIP_VISION" = "1" ]; then
+    warn "ONNX Runtime check skipped. SuperTonic TTS will be disabled until libonnxruntime is present."
+    return 0
+  fi
+
+  if ort_present; then
+    ok "ONNX Runtime present (TTS ready)"
+    return 0
+  fi
+
+  log "Installing ONNX Runtime (CPU) for SuperTonic TTS"
+  case "$PM" in
+    pacman) pm_install onnxruntime ;;
+    zypper) pm_install onnxruntime || VISION_NEEDS_TARBALL=1 ;;
+    brew)   pm_install onnxruntime ;;
+    apt|dnf|*)
+      # No reliable system package — fetch the official CPU prebuilt after extract.
+      VISION_NEEDS_TARBALL=1 ;;
+  esac
+
+  if [ "$VISION_NEEDS_TARBALL" = "0" ] && ort_present; then
+    ok "ONNX Runtime installed (TTS ready)"
+  elif [ "$VISION_NEEDS_TARBALL" = "0" ]; then
+    warn "ONNX Runtime package install did not land a shared lib — will try the prebuilt tarball"
+    VISION_NEEDS_TARBALL=1
+  fi
+}
+
+# Downloads the official onnxruntime prebuilt and drops its shared libs next to
+# the tentaflow binary (the binary probes its own dir). GPU variant when an
+# NVIDIA GPU is present; requires CUDA + cuDNN at runtime for the CUDA EP.
+install_vision_tarball() {
+  [ "$VISION_NEEDS_TARBALL" = "1" ] || return 0
+
+  ort_os=""; ort_arch=""; ort_ext="tgz"
+  case "$TARGET" in
+    x86_64-unknown-linux-gnu)  ort_os="linux";  ort_arch="x64" ;;
+    aarch64-unknown-linux-gnu) ort_os="linux";  ort_arch="aarch64" ;;
+    *) warn "No onnxruntime prebuilt for $TARGET — SuperTonic TTS disabled. Install libonnxruntime manually."; return 0 ;;
+  esac
+
+  # CPU build only — onnxruntime is used solely by SuperTonic TTS (CPU).
+  base="onnxruntime-${ort_os}-${ort_arch}-${ORT_VERSION}"
+  url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${base}.${ort_ext}"
+
+  log "Downloading ONNX Runtime prebuilt: $url"
+  if ! curl -fL --progress-bar "$url" -o "$TMP/ort.tgz"; then
+    warn "ONNX Runtime download failed — SuperTonic TTS disabled. Set TENTAFLOW_ORT_VERSION or install libonnxruntime manually."
+    return 0
+  fi
+  tar -xzf "$TMP/ort.tgz" -C "$TMP"
+  ort_dir="$TMP/$base"
+  if [ ! -d "$ort_dir/lib" ]; then
+    warn "Unexpected onnxruntime archive layout — skipping TTS runtime"
+    return 0
+  fi
+  # Drop every shared lib (core + provider libs) next to the binary.
+  $SUDO sh -c "cp -P '$ort_dir/lib/'*.so* '$PREFIX/' 2>/dev/null" || true
+  if [ -f "$PREFIX/libonnxruntime.so" ]; then
+    ok "ONNX Runtime placed in $PREFIX (camera CV ready)"
+  else
+    warn "Could not place libonnxruntime.so in $PREFIX — camera CV disabled"
+  fi
+}
+
 # =============================================================================
 # Run dependency install
 # =============================================================================
@@ -300,6 +385,7 @@ if [ "$SKIP_DEPS" = "0" ]; then
   check_base_tools
   check_docker
   check_python
+  check_vision_runtime
   echo ""
 fi
 
@@ -349,6 +435,12 @@ if [ ! -f "$PREFIX/config.toml" ] && [ -f "$PREFIX/config.example.toml" ]; then
   $SUDO cp "$PREFIX/config.example.toml" "$PREFIX/config.toml"
 fi
 ok "Installed to $PREFIX"
+
+# Vision runtime tarball fallback (distros without an onnxruntime package) —
+# drops the shared libs next to the binary now that $PREFIX exists.
+if [ "$SKIP_DEPS" = "0" ] && [ "$SKIP_VISION" = "0" ]; then
+  install_vision_tarball
+fi
 
 # =============================================================================
 # systemd / launchd registration

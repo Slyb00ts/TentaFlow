@@ -186,14 +186,23 @@ done
 
 case "$PLATFORM" in
   linux-x86_64|linux-aarch64)
-    # RocksDB 8.1 nie kompiluje sie pod gcc>=13. Preferujemy NATYWNY gcc-11
-    # (bez Dockera, bez root-owned artefaktow); gdy go brak — fallback na
-    # kontener Ubuntu 22.04/gcc-11 (dostarcza gcc-11 + cmake<4 w srodku).
+    # The shared lib statically bundles protobuf/abseil/RocksDB/Arrow AND a
+    # static libstdc++. Without hiding them, those symbols are exported with
+    # global visibility and INTERPOSE the same symbols in any other library the
+    # host loads — notably the system onnxruntime used by the camera-CV engine,
+    # whose protobuf/libstdc++ then bind to zvec's incompatible copies and
+    # segfault. The version script exports only the `zvec_*` C API and localizes
+    # everything else (same isolation we apply to the whisper dylib). Only the
+    # final `zvec_c_api` shared object is built shared here (deps are static
+    # archives), so a global SHARED_LINKER flag is safe.
+    ZVEC_EXPORT_MAP="$SRC_DIR/tentaflow_zvec_exports.map"
+    printf '{ global: zvec_*; local: *; };\n' > "$ZVEC_EXPORT_MAP"
     if linux_native_zvec_ok; then
       echo "  Build natywny: gcc-$(gcc-11 -dumpversion) / cmake $(cmake_major_version).x / ninja (bez Dockera)"
       ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+          "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--version-script=$ZVEC_EXPORT_MAP" \
           -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
         ninja zvec_c_api -j"$(nproc)" )
     else
@@ -237,6 +246,7 @@ case "$PLATFORM" in
         mkdir build_zvec
         cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \
+          "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--version-script=/src/tentaflow_zvec_exports.map" \
           -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
         ninja zvec_c_api -j"$(nproc)"
         chown -R '"$(id -u):$(id -g)"' /src/build_zvec

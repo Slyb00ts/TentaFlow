@@ -23,12 +23,12 @@ use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
     MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
-    SttDispatcher, TtsCleaningStore, TtsDispatcher,
+    SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
     MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
-    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
+    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl, VisionDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -37,13 +37,15 @@ use crate::flow_engine::executor::{execute_blocking, execute_streaming, Streamin
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
-    AwaitSubagentsNodeAdapter, CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
+    AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter,
+    CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
     ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
-    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionNodeAdapter,
+    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionClassifyNodeAdapter,
+    VisionNodeAdapter, VisionOcrNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -129,6 +131,20 @@ impl FlowRequestMeta {
     }
 }
 
+/// Process-global handle to the constructed FlowDispatcher, so non-flow callers
+/// (the camera cold path) can run a camera's assigned analysis flow. Set once by
+/// the router after construction; `None` until then (cold path falls back to the
+/// hardcoded enrichment).
+static GLOBAL_FLOW_DISPATCHER: std::sync::OnceLock<Arc<FlowDispatcher>> =
+    std::sync::OnceLock::new();
+
+pub fn set_global_flow_dispatcher(d: Arc<FlowDispatcher>) {
+    let _ = GLOBAL_FLOW_DISPATCHER.set(d);
+}
+pub fn global_flow_dispatcher() -> Option<Arc<FlowDispatcher>> {
+    GLOBAL_FLOW_DISPATCHER.get().cloned()
+}
+
 pub struct FlowDispatcher {
     db: DbPool,
     cache: FlowCache,
@@ -152,6 +168,12 @@ pub struct FlowDispatcher {
     /// `build_registry`); runner trzyma `Weak<AdapterRegistry>`, więc cykl
     /// registry→adapter→slot→runner→registry jest przerwany.
     subflow_runner: SubflowRunnerSlot,
+    /// Ephemeral in-memory blob layer overlaid in front of the durable store for
+    /// `ctx.blobs`. The camera cold path puts a raw frame here, dispatches the
+    /// analysis flow (whose nodes read it via the composite), then deletes it —
+    /// so per-frame frames never hit disk and a frame delete can never touch a
+    /// durable blob. See [`crate::flow_engine::blob_store::CompositeBlobStore`].
+    frame_blobs: Arc<dyn BlobStore>,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -163,6 +185,7 @@ struct ContextFactory {
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     stt: Arc<dyn SttDispatcher>,
     tts: Arc<dyn TtsDispatcher>,
+    vision: Arc<dyn VisionDispatcher>,
     prompts: Arc<dyn PromptStore>,
     memory: Arc<dyn MemoryStore>,
     history: Arc<dyn ConversationHistoryStore>,
@@ -194,6 +217,7 @@ impl ContextFactory {
             embeddings: self.embeddings.clone(),
             stt: self.stt.clone(),
             tts: self.tts.clone(),
+            vision: self.vision.clone(),
             prompts: self.prompts.clone(),
             memory: self.memory.clone(),
             history: self.history.clone(),
@@ -237,27 +261,45 @@ impl FlowDispatcher {
         // auditing every `llm` node in every flow per call. The node id matches
         // the routing layer's gateway (local hostname; the mesh registry isn't
         // populated yet at FlowDispatcher::new).
+        // Ephemeral frame layer for the camera cold path: nodes read frames via
+        // the composite `ctx.blobs`, but durable node-produced blobs still write
+        // to (and GC from) the original persistent store. Built BEFORE the
+        // capability dispatchers so the LLM/TTS/STT dispatchers (which resolve
+        // image/audio BlobRefs straight from the request, e.g. `vision_llm`
+        // feeding a camera frame to a multimodal model) share the same composite
+        // and can therefore see the ephemeral frame, not just durable blobs.
+        let frame_blobs: Arc<dyn BlobStore> =
+            Arc::new(crate::flow_engine::blob_store::EphemeralBlobStore::new());
+        let ctx_blobs: Arc<dyn BlobStore> = Arc::new(
+            crate::flow_engine::blob_store::CompositeBlobStore::new(
+                frame_blobs.clone(),
+                blobs.clone(),
+            ),
+        );
+
         let audit_node_id = crate::mesh::node_info_collector::local_hostname();
         let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(
             runtime_slot.clone(),
-            blobs.clone(),
+            ctx_blobs.clone(),
             Some(db.clone()),
             audit_node_id,
         ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
-            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), blobs.clone()));
+            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(runtime_slot, blobs.clone()));
+            Arc::new(SttDispatcherImpl::new(runtime_slot, ctx_blobs.clone()));
+        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
 
         let ctx_factory = Arc::new(ContextFactory {
             clock,
-            blobs,
+            blobs: ctx_blobs,
             llm,
             embeddings,
             stt,
             tts,
+            vision,
             prompts,
             memory,
             history,
@@ -290,7 +332,15 @@ impl FlowDispatcher {
             addon_flow_blocks: parking_lot::RwLock::new(None),
             agent_service,
             subflow_runner,
+            frame_blobs,
         }
+    }
+
+    /// Ephemeral frame store for the camera cold path (put/delete a transient RGB
+    /// frame around an analysis-flow dispatch). Distinct from [`Self::blobs`],
+    /// which is the durable store.
+    pub fn frame_blobs(&self) -> Arc<dyn BlobStore> {
+        self.frame_blobs.clone()
     }
 
     pub fn registry(&self) -> &Arc<AdapterRegistry> {
@@ -415,37 +465,61 @@ impl FlowDispatcher {
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
-        let pool = self.db.clone();
-        let lookup_id = flow_id.clone();
-        let flow_opt = tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
-            .await
-            .map_err(|e| DispatchError::Internal(e.to_string()))?
-            .map_err(|e| DispatchError::Internal(e.to_string()))?;
-        let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+        // Compiled-flow cache keyed by id (distinct `byid:` namespace from the
+        // model-resolution path). The camera cold path dispatches the same flow
+        // on every detection event; without this it would re-fetch + re-compile
+        // the flow JSON per event. Flow create/update/delete/version-restore
+        // handlers call `invalidate_cache()`, so a cached compile never serves a
+        // stale edit; the 60 s TTL bounds any other drift.
+        let cache_key = format!("byid:{flow_id}");
+        let cached = match self.cache.get(&cache_key) {
+            Some(slot) => slot,
+            None => {
+                let pool = self.db.clone();
+                let lookup_id = flow_id.clone();
+                let flow_opt =
+                    tokio::task::spawn_blocking(move || repository::get_flow(&pool, &lookup_id))
+                        .await
+                        .map_err(|e| DispatchError::Internal(e.to_string()))?
+                        .map_err(|e| DispatchError::Internal(e.to_string()))?;
+                let flow = flow_opt.ok_or_else(|| DispatchError::CompileFailed {
+                    flow_id: flow_id.clone(),
+                    msg: "flow id nie istnieje w DB".to_string(),
+                })?;
+                match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
+                    Ok(c) => {
+                        let cached = Arc::new(CachedFlow {
+                            flow,
+                            compiled: Arc::new(c),
+                        });
+                        self.cache.set(&cache_key, Some(cached.clone()));
+                        Some(cached)
+                    }
+                    Err(e) => {
+                        warn!(flow_id, "compile failed: {e}");
+                        // Negative cache: a structurally broken flow JSON stays
+                        // broken until an admin edits it (which invalidates).
+                        self.cache.set(&cache_key, None);
+                        None
+                    }
+                }
+            }
+        };
+        let cached = cached.ok_or_else(|| DispatchError::CompileFailed {
             flow_id: flow_id.clone(),
-            msg: "flow id nie istnieje w DB".to_string(),
+            msg: "flow compile failed".to_string(),
         })?;
-        if flow.status != "active" {
-            warn!(flow_id, status = %flow.status, "flow nieaktywny — pomijam");
+        if cached.flow.status != "active" {
+            warn!(flow_id, status = %cached.flow.status, "flow nieaktywny — pomijam");
             return Err(DispatchError::CompileFailed {
                 flow_id,
-                msg: format!("flow status='{}' (nie active)", flow.status),
+                msg: format!("flow status='{}' (nie active)", cached.flow.status),
             });
         }
         if !self.acl_allow(&flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        let compiled = match CompiledFlow::from_json(&flow.id, &flow.flow_json, &self.registry) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!(flow_id, "compile failed: {e}");
-                return Err(DispatchError::CompileFailed {
-                    flow_id,
-                    msg: e.to_string(),
-                });
-            }
-        };
-        self.run_blocking(compiled, initial, meta)
+        self.run_blocking(cached.compiled.clone(), initial, meta)
             .await
             .map_err(DispatchError::from)
     }
@@ -902,6 +976,10 @@ fn build_registry(
         Arc::new(SessionContextNodeAdapter::new()),
         Arc::new(SpeakerContextNodeAdapter::new()),
         Arc::new(VisionNodeAdapter::new()),
+        Arc::new(VisionOcrNodeAdapter::new()),
+        Arc::new(VisionClassifyNodeAdapter::new()),
+        Arc::new(CameraVerdictNodeAdapter::new()),
+        Arc::new(CameraAlertNodeAdapter::new()),
         // ask_user (§3.13 C) — BPMN User Task: no dependency slot, it uses the
         // process-global interaction registry + run manager.
         Arc::new(AskUserNodeAdapter::new()),

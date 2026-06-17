@@ -13318,6 +13318,51 @@ pub fn installed_addon_ids_for_package(
     Ok(ids)
 }
 
+/// Mesh sync targets for an uploaded addon package's bytes: the union of the sync
+/// targets of every installed instance backed by this package. An `addon-package`
+/// blob carries no per-resource ACL of its own (its resource id is a content
+/// hash), so it must replicate to exactly the nodes that receive the
+/// `core.addon_instance` rows referencing it — otherwise a receiver sees the
+/// instance row but never the wasm it names.
+pub fn list_sync_target_nodes_for_addon_package(
+    pool: &DbPool,
+    org_id: &str,
+    package_id: &str,
+    version: &str,
+) -> Result<Vec<String>> {
+    let addon_ids = installed_addon_ids_for_package(pool, package_id, version)?;
+    let mut nodes = std::collections::BTreeSet::new();
+    for addon_id in addon_ids {
+        for target in list_sync_targets_for_resource(
+            pool,
+            org_id,
+            crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+            "core.addon_instance",
+            &addon_id,
+        )? {
+            nodes.insert(target.node_id);
+        }
+    }
+    Ok(nodes.into_iter().collect())
+}
+
+/// Content hash of the most recent capture recorded for a blob id, or None when
+/// no capture exists yet. A package version's bytes are immutable, so any capture
+/// for the id yields the same sha; the caller uses it to locate the blob's chunk
+/// + manifest operations in the ledger.
+pub fn latest_blob_sha_for_blob_id(pool: &DbPool, blob_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    Ok(conn
+        .query_row(
+            "SELECT sha256 FROM __tentaflow_blob_sync_captures \
+             WHERE blob_id = ?1 \
+             ORDER BY created_at_ms DESC, capture_id DESC LIMIT 1",
+            rusqlite::params![blob_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 /// Composite resource id for an `addon_config` row. `addon_id` charset excludes
 /// `:`, so splitting on the first `:` is unambiguous.
 fn addon_config_resource_id(addon_id: &str, key: &str) -> String {
@@ -17032,6 +17077,9 @@ pub struct CameraRow {
     pub url: String,
     pub profile: String,
     pub target_fps: i64,
+    /// Per-camera AI analysis frame rate honored by the always-on analysis
+    /// loop. `0` = unlimited (native cadence); default `10`.
+    pub analysis_fps: i64,
     pub resolution_width: Option<i64>,
     pub resolution_height: Option<i64>,
     pub retention_class: String,
@@ -17049,6 +17097,9 @@ pub struct CameraRow {
     /// any non-ONVIF camera and for ONVIF cameras whose
     /// `GetMetadataConfigurations` returned an empty list.
     pub metadata_supported: bool,
+    /// Per-camera analysis Flow id (the cold path runs it on a detection
+    /// event). `None` = no flow assigned → built-in enrichment.
+    pub analysis_flow_id: Option<String>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -17059,10 +17110,14 @@ pub struct CameraRow {
 pub struct CameraPatch {
     pub display_name: Option<String>,
     pub target_fps: Option<i64>,
+    pub analysis_fps: Option<i64>,
     pub resolution_width: Option<Option<i64>>,
     pub resolution_height: Option<Option<i64>>,
     pub retention_class: Option<String>,
     pub profile: Option<String>,
+    /// Per-camera analysis Flow id. Tri-state: `None` = untouched,
+    /// `Some(None)` = clear (NULL), `Some(Some(id))` = assign.
+    pub analysis_flow_id: Option<Option<String>>,
 }
 
 #[cfg(feature = "camera")]
@@ -17089,6 +17144,8 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         onvif_url: row.get(18)?,
         onvif_profile_token: row.get(19)?,
         metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
+        analysis_fps: row.get(21)?,
+        analysis_flow_id: row.get(22)?,
     })
 }
 
@@ -17097,7 +17154,7 @@ const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
-     onvif_url, onvif_profile_token, metadata_supported";
+     onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -17115,6 +17172,7 @@ pub fn insert_camera(
     vendor: &str,
     url: &str,
     target_fps: i64,
+    analysis_fps: i64,
     resolution_width: Option<i64>,
     resolution_height: Option<i64>,
     retention_class: &str,
@@ -17132,14 +17190,14 @@ pub fn insert_camera(
     conn.execute(
         "INSERT INTO cameras \
          (camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
-          resolution_width, resolution_height, retention_class, status, status_message, \
-          fps_actual, last_frame_at, credentials_encrypted, onvif_url, onvif_profile_token, \
-          created_at, updated_at, org_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'starting', NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?14, ?15)",
+          analysis_fps, resolution_width, resolution_height, retention_class, status, \
+          status_message, fps_actual, last_frame_at, credentials_encrypted, onvif_url, \
+          onvif_profile_token, created_at, updated_at, org_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'starting', NULL, NULL, NULL, ?12, ?13, ?14, ?15, ?15, ?16)",
         rusqlite::params![
             camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps,
-            resolution_width, resolution_height, retention_class, credentials_encrypted,
-            onvif_url, onvif_profile_token, now, resolved_org,
+            analysis_fps, resolution_width, resolution_height, retention_class,
+            credentials_encrypted, onvif_url, onvif_profile_token, now, resolved_org,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -17279,6 +17337,12 @@ pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) 
         "DELETE FROM cameras WHERE camera_id = ?1 AND owner_addon_id = ?2",
         rusqlite::params![camera_id, owner_addon_id],
     )?;
+    // Drop any cross-addon grants so a future camera reusing this id can't
+    // inherit stale access.
+    conn.execute(
+        "DELETE FROM camera_grants WHERE camera_id = ?1",
+        rusqlite::params![camera_id],
+    )?;
     Ok(())
 }
 
@@ -17373,6 +17437,321 @@ pub fn get_camera_for_addon(
     Ok(row)
 }
 
+/// Returns the active row identified by `camera_id` in the supplied org,
+/// regardless of owning addon. Used by read paths that widen access via a grant
+/// (the caller MUST still gate on [`can_read_camera`] before returning the row,
+/// and surface `NotFound` rather than leaking existence when denied).
+#[cfg(feature = "camera")]
+pub fn get_camera_in_org(
+    pool: &DbPool,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<Option<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras \
+         WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL"
+    );
+    let row = conn
+        .query_row(
+            &sql,
+            rusqlite::params![camera_id, resolved_org],
+            row_to_camera,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Central cross-addon camera read authorization. Returns `true` when `addon_id`
+/// may read/view `camera_id` in `org_id`: either it OWNS the active camera, or a
+/// `camera_grants` row grants it (or `'*'`) `level='read'` on that active camera.
+/// This is the ONE predicate every camera read path (get / discovery / stream
+/// subscribe / frame read) must consult — knowing a `camera_id` is never enough.
+#[cfg(feature = "camera")]
+pub fn can_read_camera(
+    pool: &DbPool,
+    addon_id: &str,
+    camera_id: &str,
+    org_id: Option<&str>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let allowed: bool = conn.query_row(
+        "SELECT EXISTS(\
+             SELECT 1 FROM cameras \
+             WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL \
+               AND owner_addon_id = ?3\
+         ) OR EXISTS(\
+             SELECT 1 FROM camera_grants g \
+             JOIN cameras c ON c.camera_id = g.camera_id \
+             WHERE g.camera_id = ?1 AND g.org_id = ?2 AND g.level = 'read' \
+               AND g.grantee_addon_id IN (?3, '*') \
+               AND c.org_id = ?2 AND c.removed_at IS NULL\
+         )",
+        rusqlite::params![camera_id, resolved_org, addon_id],
+        |r| r.get(0),
+    )?;
+    Ok(allowed)
+}
+
+/// Lists every active camera `addon_id` may read in `org_id`: owned cameras
+/// UNION cameras granted to it (or `'*'`). Powers cross-addon discovery
+/// (`camera_list_accessible_v1`) so a consumer addon (e.g. TentaVision) can see a
+/// camera owned by another addon (e.g. go2) once a grant exists.
+#[cfg(feature = "camera")]
+pub fn list_accessible_cameras(
+    pool: &DbPool,
+    addon_id: &str,
+    org_id: Option<&str>,
+) -> Result<Vec<CameraRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let sql = format!(
+        "SELECT {CAMERA_SELECT_COLS} FROM cameras c \
+         WHERE c.org_id = ?2 AND c.removed_at IS NULL AND (\
+             c.owner_addon_id = ?1 \
+             OR EXISTS(\
+                 SELECT 1 FROM camera_grants g \
+                 WHERE g.camera_id = c.camera_id AND g.org_id = ?2 \
+                   AND g.level = 'read' AND g.grantee_addon_id IN (?1, '*')\
+             )\
+         ) ORDER BY c.camera_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id, resolved_org], row_to_camera)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Creates (idempotent) a cross-addon read grant. Authorization to grant
+/// (camera owner or admin) is enforced by the caller (host-fn layer); this only
+/// persists the row. `created_by` is the granting user_id or addon_id.
+#[cfg(feature = "camera")]
+pub fn grant_camera(
+    pool: &DbPool,
+    camera_id: &str,
+    grantee_addon_id: &str,
+    level: &str,
+    org_id: &str,
+    created_by: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO camera_grants (camera_id, grantee_addon_id, level, org_id, created_at, created_by) \
+         VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5) \
+         ON CONFLICT(camera_id, grantee_addon_id, level) DO UPDATE SET \
+             org_id = excluded.org_id, created_at = excluded.created_at, created_by = excluded.created_by",
+        rusqlite::params![camera_id, grantee_addon_id, level, org_id, created_by],
+    )?;
+    Ok(())
+}
+
+/// Revokes a cross-addon grant. Returns the number of rows removed (0 = no such
+/// grant). Owner/admin authorization enforced by the caller.
+#[cfg(feature = "camera")]
+pub fn revoke_camera_grant(
+    pool: &DbPool,
+    camera_id: &str,
+    grantee_addon_id: &str,
+    level: &str,
+    org_id: &str,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM camera_grants \
+         WHERE camera_id = ?1 AND grantee_addon_id = ?2 AND level = ?3 AND org_id = ?4",
+        rusqlite::params![camera_id, grantee_addon_id, level, org_id],
+    )?;
+    Ok(n)
+}
+
+/// Lists the grants on a camera (`(grantee_addon_id, level, created_by)`),
+/// org-scoped, for the owner/admin grants UI.
+#[cfg(feature = "camera")]
+pub fn list_camera_grants(
+    pool: &DbPool,
+    camera_id: &str,
+    org_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT grantee_addon_id, level, created_by FROM camera_grants \
+         WHERE camera_id = ?1 AND org_id = ?2 ORDER BY grantee_addon_id, level",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![camera_id, org_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Removes all grants for a camera (called when the camera is hard-deleted so no
+/// orphan grants linger). Returns rows removed.
+#[cfg(feature = "camera")]
+pub fn delete_camera_grants(pool: &DbPool, camera_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM camera_grants WHERE camera_id = ?1",
+        rusqlite::params![camera_id],
+    )?;
+    Ok(n)
+}
+
+#[cfg(all(test, feature = "camera"))]
+mod camera_grant_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test db")
+    }
+
+    fn org() -> &'static str {
+        crate::services::org::DEFAULT_ORG_ID
+    }
+
+    fn seed_camera(pool: &DbPool, camera_id: &str, owner: &str, org_id: &str) {
+        insert_camera(
+            pool, camera_id, owner, "Cam", "webrtc", "", 30, 10, None, None, "C", "default",
+            None, None, None, Some(org_id),
+        )
+        .expect("seed camera");
+    }
+
+    #[test]
+    fn owner_reads_own_camera() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        assert!(can_read_camera(&db, "go2", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn non_owner_without_grant_is_denied() {
+        // The core IDOR case: an addon that neither owns nor was granted the
+        // camera must not be able to read it, even knowing the id.
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn grant_enables_read_and_revoke_disables_it() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        assert!(can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+        // A different, ungranted addon is still denied.
+        assert!(!can_read_camera(&db, "other", "cam1", Some(org())).unwrap());
+        assert_eq!(revoke_camera_grant(&db, "cam1", "tentavision", "read", org()).unwrap(), 1);
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn wildcard_grant_is_org_wide() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "*", "read", org(), "go2").unwrap();
+        assert!(can_read_camera(&db, "anyone", "cam1", Some(org())).unwrap());
+    }
+
+    #[test]
+    fn cross_org_grant_does_not_authorize() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        // The camera lives in the default org; a caller scoped to another org
+        // must not read it (cross-tenant isolation).
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some("org-other")).unwrap());
+    }
+
+    #[test]
+    fn removed_camera_is_invisible_and_grants_purged() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        assert!(soft_delete_camera(&db, "go2", "cam1", Some(org())).unwrap());
+        assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
+        assert!(list_camera_grants(&db, "cam1", org()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hard_delete_purges_grants() {
+        let db = db();
+        seed_camera(&db, "cam1", "go2", org());
+        grant_camera(&db, "cam1", "tentavision", "read", org(), "go2").unwrap();
+        delete_camera_hard(&db, "go2", "cam1").unwrap();
+        assert!(list_camera_grants(&db, "cam1", org()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_accessible_returns_owned_and_granted_only() {
+        let db = db();
+        seed_camera(&db, "owned", "tentavision", org());
+        seed_camera(&db, "shared", "go2", org());
+        seed_camera(&db, "hidden", "other", org());
+        grant_camera(&db, "shared", "tentavision", "read", org(), "go2").unwrap();
+        let mut ids: Vec<String> = list_accessible_cameras(&db, "tentavision", Some(org()))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.camera_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["owned".to_string(), "shared".to_string()]);
+    }
+}
+
+/// Returns the configured AI analysis frame rate for one camera (`0` =
+/// unlimited / native cadence). Falls back to the default of `10` when the
+/// camera row is missing — the always-on analysis loop uses this to pace
+/// itself without a session context. Process-wide lookup (no org/addon
+/// filter): the loop runs per `camera_id` regardless of tenant.
+#[cfg(feature = "camera")]
+pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
+    let conn = acquire(pool)?;
+    let fps: Option<i64> = conn
+        .query_row(
+            "SELECT analysis_fps FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
+}
+
+/// Per-camera analysis Flow id (the cold path runs it on a detection event).
+/// `None` (NULL or empty) = no flow assigned → default hardcoded enrichment.
+pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT analysis_flow_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(id.filter(|s| !s.is_empty()))
+}
+
+/// Lists active flows assignable as a camera's analysis flow (`(id, name)`),
+/// scoped to `service_type='camera_analysis'`. Powers the per-camera flow
+/// selector; the scope keeps an addon from enumerating unrelated flows.
+pub fn list_camera_analysis_flows(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name FROM flows \
+         WHERE service_type = 'camera_analysis' AND status = 'active' \
+         ORDER BY is_default DESC, name ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Applies a partial update. Returns `Ok(false)` if no row matched
 /// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
 /// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
@@ -17400,6 +17779,10 @@ pub fn update_camera(
         sets.push("target_fps = ?");
         params.push(Box::new(v));
     }
+    if let Some(v) = patch.analysis_fps {
+        sets.push("analysis_fps = ?");
+        params.push(Box::new(v));
+    }
     if let Some(v) = patch.resolution_width {
         sets.push("resolution_width = ?");
         params.push(Box::new(v));
@@ -17414,6 +17797,11 @@ pub fn update_camera(
     }
     if let Some(v) = patch.profile.as_ref() {
         sets.push("profile = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.analysis_flow_id.as_ref() {
+        // Tri-state: `Some(None)` clears (binds NULL), `Some(Some(id))` assigns.
+        sets.push("analysis_flow_id = ?");
         params.push(Box::new(v.clone()));
     }
     sets.push("updated_at = ?");
@@ -17447,6 +17835,14 @@ pub fn soft_delete_camera(
          WHERE owner_addon_id = ?2 AND camera_id = ?3 AND org_id = ?4 AND removed_at IS NULL",
         rusqlite::params![now, addon_id, camera_id, resolved_org],
     )?;
+    // Drop cross-addon grants on removal so a re-registered camera reusing this
+    // id can't inherit stale access.
+    if n > 0 {
+        conn.execute(
+            "DELETE FROM camera_grants WHERE camera_id = ?1",
+            rusqlite::params![camera_id],
+        )?;
+    }
     Ok(n > 0)
 }
 

@@ -368,6 +368,7 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_get_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -410,6 +411,37 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn stream_close_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    /// Generic WebRTC channel API (host feature "webrtc"). CBOR I/O. The addon
+    /// drives signaling + the data channel; the host owns the native peer.
+    fn webrtc_connect_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_set_answer_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_state_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_send_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_drain_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_close_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn webrtc_register_camera_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
@@ -1290,6 +1322,12 @@ const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
 /// payloads without raising the cap for every other call.
 const MAX_OUT_CAP_SNAPSHOT: usize = 8 * 1024 * 1024;
 
+/// Hard cap for webrtc_drain. The host caps the drained batch at MAX_DRAIN_BYTES
+/// (3 MiB raw), which base64-encodes to ~4 MiB plus CBOR overhead — above the
+/// generic `MAX_OUT_CAP`. Match the host's `PayloadKind::ServiceCall` (8 MiB) so
+/// a legal large drain is never rejected (which would strand the staged batch).
+const MAX_OUT_CAP_WEBRTC_DRAIN: usize = 8 * 1024 * 1024;
+
 /// Hard cap dla wyniku resize obrazu (RGB24). Host jest zrodlem prawdy:
 /// `image_resize_rgb_v1` odrzuca > `MAX_PIXELS` (64 MP), wiec maks. wynik to
 /// 64 MP * 3 bajty/px = 192 MiB. Snapshot kamery (`MAX_OUT_CAP_SNAPSHOT`) to
@@ -1583,6 +1621,197 @@ pub fn web_read_search_results(
 // =============================================================================
 
 /// Prelude — importuj wszystkie najczesciej uzywane typy i funkcje
+// =============================================================================
+// Generic WebRTC channel wrappers (robot/device transport; host feature "webrtc")
+// =============================================================================
+
+/// Config for opening a generic WebRTC channel.
+pub struct WebRtcChannelConfig {
+    pub data_channel_label: String,
+    /// Request an inbound video track (so it can be bound to a camera via
+    /// `webrtc_register_camera`).
+    pub want_video: bool,
+    pub disable_mdns: bool,
+    pub gather_timeout_ms: u64,
+    pub inbound_capacity: u32,
+    /// App-level keepalive for precise RTT: ping text + interval + a substring
+    /// identifying the reply. `keepalive_interval_ms = 0` disables it.
+    pub keepalive_text: Option<String>,
+    pub keepalive_interval_ms: u64,
+    pub keepalive_marker: Option<String>,
+}
+
+impl Default for WebRtcChannelConfig {
+    fn default() -> Self {
+        WebRtcChannelConfig {
+            data_channel_label: "data".to_string(),
+            want_video: false,
+            disable_mdns: true,
+            gather_timeout_ms: 8000,
+            inbound_capacity: 2048,
+            keepalive_text: None,
+            keepalive_interval_ms: 0,
+            keepalive_marker: None,
+        }
+    }
+}
+
+/// One inbound data-channel message.
+pub enum WebRtcInbound {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// Channel/peer readiness snapshot.
+pub struct WebRtcChannelState {
+    pub peer_state: String,
+    pub dc_open: bool,
+    pub dropped_count: u64,
+    pub queue_len: u32,
+    /// Transport round-trip latency in ms; None until first measured.
+    pub rtt_ms: Option<f64>,
+}
+
+/// Result of a drain poll.
+pub struct WebRtcDrained {
+    pub messages: Vec<WebRtcInbound>,
+    pub dropped_count: u64,
+    pub queue_len: u32,
+    pub closed: bool,
+}
+
+fn b64_encode(d: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(d)
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, AbiError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|_| AbiError::Operation)
+}
+
+/// Open a channel. Returns `(channel_id, offer_sdp)`. The addon ferries
+/// `offer_sdp` to the peer via its own signaling and feeds the answer back to
+/// `webrtc_set_answer`.
+pub fn webrtc_connect(cfg: &WebRtcChannelConfig) -> Result<(String, String), AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcConnectInput {
+        data_channel_label: cfg.data_channel_label.clone(),
+        want_video: cfg.want_video,
+        disable_mdns: cfg.disable_mdns,
+        gather_timeout_ms: cfg.gather_timeout_ms,
+        inbound_capacity: cfg.inbound_capacity,
+        keepalive_text: cfg.keepalive_text.clone(),
+        keepalive_interval_ms: cfg.keepalive_interval_ms,
+        keepalive_marker: cfg.keepalive_marker.clone(),
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_connect_v1, &payload)?;
+    let out: tentaflow_sdk_spec::WebRtcConnectOutput = decode_cbor(&bytes)?;
+    Ok((out.channel_id, out.offer_sdp))
+}
+
+pub fn webrtc_set_answer(channel_id: &str, answer_sdp: &str) -> Result<(), AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcSetAnswerInput {
+        channel_id: channel_id.to_string(),
+        answer_sdp: answer_sdp.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_set_answer_v1, &payload)?;
+    let _: tentaflow_sdk_spec::WebRtcStatusOutput = decode_cbor(&bytes)?;
+    Ok(())
+}
+
+pub fn webrtc_state(channel_id: &str) -> Result<WebRtcChannelState, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcStateInput {
+        channel_id: channel_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_state_v1, &payload)?;
+    let o: tentaflow_sdk_spec::WebRtcStateOutput = decode_cbor(&bytes)?;
+    Ok(WebRtcChannelState {
+        peer_state: o.peer_state,
+        dc_open: o.dc_open,
+        dropped_count: o.dropped_count,
+        queue_len: o.queue_len,
+        rtt_ms: o.rtt_ms,
+    })
+}
+
+pub fn webrtc_send_text(channel_id: &str, text: &str) -> Result<(), AbiError> {
+    webrtc_send_inner(channel_id, true, text.as_bytes())
+}
+
+pub fn webrtc_send_binary(channel_id: &str, data: &[u8]) -> Result<(), AbiError> {
+    webrtc_send_inner(channel_id, false, data)
+}
+
+fn webrtc_send_inner(channel_id: &str, is_text: bool, data: &[u8]) -> Result<(), AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcSendInput {
+        channel_id: channel_id.to_string(),
+        is_text,
+        data_b64: b64_encode(data),
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_send_v1, &payload)?;
+    let _: tentaflow_sdk_spec::WebRtcStatusOutput = decode_cbor(&bytes)?;
+    Ok(())
+}
+
+/// Poll up to `max_messages` inbound data-channel messages.
+pub fn webrtc_drain(channel_id: &str, max_messages: u32) -> Result<WebRtcDrained, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcDrainInput {
+        channel_id: channel_id.to_string(),
+        max_messages,
+    })?;
+    let bytes =
+        call_sql_with_one_input_capped(webrtc_drain_v1, &payload, MAX_OUT_CAP_WEBRTC_DRAIN)?;
+    let o: tentaflow_sdk_spec::WebRtcDrainOutput = decode_cbor(&bytes)?;
+    let messages = o
+        .messages
+        .into_iter()
+        .map(|m| {
+            let raw = b64_decode(&m.data_b64).unwrap_or_default();
+            if m.is_text {
+                WebRtcInbound::Text(String::from_utf8_lossy(&raw).into_owned())
+            } else {
+                WebRtcInbound::Binary(raw)
+            }
+        })
+        .collect();
+    Ok(WebRtcDrained {
+        messages,
+        dropped_count: o.dropped_count,
+        queue_len: o.queue_len,
+        closed: o.closed,
+    })
+}
+
+pub fn webrtc_close(channel_id: &str) -> Result<(), AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcCloseInput {
+        channel_id: channel_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_close_v1, &payload)?;
+    let _: tentaflow_sdk_spec::WebRtcStatusOutput = decode_cbor(&bytes)?;
+    Ok(())
+}
+
+/// Bind a channel's inbound video track to a camera (consumable by the camera /
+/// streaming host functions). Returns the new camera_id.
+pub fn webrtc_register_camera(
+    channel_id: &str,
+    display_name: &str,
+    target_fps: u32,
+    analysis_fps: u32,
+) -> Result<String, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::WebRtcRegisterCameraInput {
+        channel_id: channel_id.to_string(),
+        display_name: display_name.to_string(),
+        target_fps,
+        analysis_fps,
+    })?;
+    let bytes = call_sql_with_one_input(webrtc_register_camera_v1, &payload)?;
+    let out: tentaflow_sdk_spec::WebRtcRegisterCameraOutput = decode_cbor(&bytes)?;
+    Ok(out.camera_id)
+}
+
 pub mod prelude {
     pub use crate::ui;
     pub use crate::{
@@ -1608,6 +1837,9 @@ pub mod prelude {
         CameraHealthInfo, SnapshotInfo, CameraTestResult,
         stream_subscribe, stream_next, stream_close,
         StreamNextMessage, StreamFrameMeta,
+        webrtc_connect, webrtc_set_answer, webrtc_state, webrtc_send_text, webrtc_send_binary,
+        webrtc_drain, webrtc_close, webrtc_register_camera,
+        WebRtcChannelConfig, WebRtcChannelState, WebRtcDrained, WebRtcInbound,
         camera_metadata_subscribe, camera_metadata_poll, camera_metadata_unsubscribe,
         MetadataItem, MetadataFrame, MetadataPollResult,
         recording_save_snapshot, recording_save_segment, recording_get_url,
@@ -1802,6 +2034,8 @@ pub struct CameraAddSpec {
     pub vendor: String,
     pub url: String,
     pub target_fps: u32,
+    /// Per-camera AI analysis frame rate (`0` = unlimited / native cadence).
+    pub analysis_fps: u32,
     pub resolution: Option<(u32, u32)>,
     pub retention_class: String,
     pub profile: String,
@@ -1821,6 +2055,7 @@ impl Default for CameraAddSpec {
             vendor: "fake_file".to_string(),
             url: String::new(),
             target_fps: 30,
+            analysis_fps: 10,
             resolution: None,
             retention_class: "C".to_string(),
             profile: "default".to_string(),
@@ -1851,6 +2086,8 @@ pub struct CameraInfo {
     pub last_frame_at: Option<i64>,
     pub retention_class: String,
     pub profile: String,
+    /// Per-camera analysis Flow id (None/empty = none assigned).
+    pub analysis_flow_id: Option<String>,
 }
 
 impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
@@ -1869,6 +2106,7 @@ impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
             last_frame_at: o.last_frame_at,
             retention_class: o.retention_class,
             profile: o.profile,
+            analysis_flow_id: o.analysis_flow_id,
         }
     }
 }
@@ -1880,10 +2118,23 @@ pub struct CameraUpdateSpec {
     pub camera_id: String,
     pub display_name: Option<String>,
     pub target_fps: Option<u32>,
+    /// Per-camera AI analysis frame rate (`0` = unlimited); `None` keeps current.
+    pub analysis_fps: Option<u32>,
     pub resolution_width: Option<u32>,
     pub resolution_height: Option<u32>,
     pub retention_class: Option<String>,
     pub profile: Option<String>,
+    /// Per-camera analysis Flow id. `None` keeps current; `Some("")` clears it;
+    /// `Some(id)` assigns (host validates the flow exists and is active).
+    pub analysis_flow_id: Option<String>,
+}
+
+/// One assignable camera-analysis flow (id + display name) from
+/// [`camera_analysis_flows`], for populating the per-camera flow selector.
+#[derive(Debug, Clone)]
+pub struct CameraAnalysisFlow {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1986,6 +2237,7 @@ fn camera_add_payload(spec: &CameraAddSpec) -> tentaflow_sdk_spec::CameraAddInpu
         vendor: spec.vendor.clone(),
         url: spec.url.clone(),
         target_fps: Some(spec.target_fps),
+        analysis_fps: Some(spec.analysis_fps),
         resolution_width,
         resolution_height,
         retention_class: Some(spec.retention_class.clone()),
@@ -2015,6 +2267,21 @@ pub fn camera_list() -> Result<Vec<CameraInfo>, AbiError> {
     Ok(resp.camera.into_iter().map(CameraInfo::from).collect())
 }
 
+/// Lists the flows assignable as a camera's analysis flow (`(id, name)`), for
+/// the per-camera flow selector. Read-only; needs `cameras.read`.
+pub fn camera_analysis_flows() -> Result<Vec<CameraAnalysisFlow>, AbiError> {
+    let bytes = call_host_no_input(camera_analysis_flows_list_v1)?;
+    let resp: tentaflow_sdk_spec::CameraAnalysisFlowsOut = decode_cbor(&bytes)?;
+    Ok(resp
+        .flows
+        .into_iter()
+        .map(|f| CameraAnalysisFlow {
+            id: f.id,
+            name: f.name,
+        })
+        .collect())
+}
+
 /// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
 /// lub nalezy do innego addona (kanalu bocznego nie ma — nie da sie wnioskowac
 /// o istnieniu cudzych camera_id).
@@ -2033,10 +2300,12 @@ pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
         camera_id: spec.camera_id.clone(),
         display_name: spec.display_name.clone(),
         target_fps: spec.target_fps,
+        analysis_fps: spec.analysis_fps,
         resolution_width: spec.resolution_width,
         resolution_height: spec.resolution_height,
         retention_class: spec.retention_class.clone(),
         profile: spec.profile.clone(),
+        analysis_flow_id: spec.analysis_flow_id.clone(),
     })?;
     let bytes = call_sql_with_one_input(camera_update_v1, &payload)?;
     let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
@@ -2194,6 +2463,7 @@ pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
             last_frame_at: None,
             retention_class: String::new(),
             profile: String::new(),
+            analysis_flow_id: None,
         })
         .collect())
 }

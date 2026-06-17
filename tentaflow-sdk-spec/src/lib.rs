@@ -21,9 +21,11 @@ pub mod protocol;
 
 pub use protocol::{
     camera::{
-        CameraAddInput, CameraAddOutput, CameraCredentialsRotateInput, CameraCredentialsRotateOut,
-        CameraDiscoverOut, CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut,
-        CameraRemoveOut, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+        CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
+        CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut,
+        CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
+        CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
+        CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
         CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
     },
     camera_metadata::{
@@ -59,6 +61,13 @@ pub use protocol::{
     streaming::{
         StreamCloseInput, StreamCloseOutput, StreamNextInput, StreamNextOutput,
         StreamSubscribeFilter, StreamSubscribeInput, StreamSubscribeOutput,
+    },
+    webrtc::{
+        WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput,
+        WebRtcDrainOutput, WebRtcDrainOutputRef, WebRtcMessage, WebRtcRegisterCameraInput,
+        WebRtcRegisterCameraOutput,
+        WebRtcSendInput, WebRtcSetAnswerInput, WebRtcStateInput, WebRtcStateOutput,
+        WebRtcStatusOutput,
     },
     ui::{
         a11y::{Accessibility, EventKind, Visibility},

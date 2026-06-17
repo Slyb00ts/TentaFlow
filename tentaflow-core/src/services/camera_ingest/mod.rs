@@ -21,6 +21,10 @@ pub mod rtsp;
 pub mod session;
 pub mod stream_publisher;
 pub mod supervisor;
+pub mod webrtc_source;
+
+#[cfg(feature = "inference-vision-gpu")]
+pub mod vision_analysis;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};

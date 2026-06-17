@@ -29,6 +29,7 @@ use tentaflow_sdk_spec::protocol::camera::{
     CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput,
     CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
     DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CAMERA_DEFAULT_ANALYSIS_FPS,
 };
 use tentaflow_sdk_spec::protocol::ui::{
     bind::BindRef,
@@ -81,6 +82,16 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+    fn camera_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_update_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_list_accessible_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
@@ -102,7 +113,27 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn alias_list_available_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn event_subscribe(
+        event_type_ptr: i32, event_type_len: i32,
+        filter_json_ptr: i32, filter_json_len: i32,
+    ) -> i32;
 }
+
+/// Subscribes the addon to a system event type so its `on_event` is invoked for
+/// each matching event. No filter (pass 0/0). Needs the `events` permission.
+fn subscribe_event(event_type: &str) -> i32 {
+    unsafe {
+        event_subscribe(
+            event_type.as_ptr() as i32,
+            event_type.len() as i32,
+            0,
+            0,
+        )
+    }
+}
+
+/// Event type the camera_alert flow node emits on an alarm verdict.
+const CAMERA_ALARM_EVENT: &str = "camera.alarm";
 
 // =============================================================================
 // Host function wrappers
@@ -253,6 +284,54 @@ where
         out.truncate(out_len as usize);
         return minicbor::decode(&out).map_err(|_| AbiError::Operation);
     }
+}
+
+/// Lists the flows assignable as a camera's analysis flow (`(id, name)`),
+/// scoped host-side to `service_type='camera_analysis'`.
+fn host_camera_analysis_flows() -> Result<Vec<(String, String)>, AbiError> {
+    let out: tentaflow_sdk_spec::CameraAnalysisFlowsOut =
+        call_cbor_out(camera_analysis_flows_list_v1)?;
+    Ok(out.flows.into_iter().map(|f| (f.id, f.name)).collect())
+}
+
+/// Lists every camera this addon can access: cameras it owns UNION cameras
+/// granted to it by another addon (cross-addon share). Each entry carries
+/// `owner_addon_id` + `access_level` ("owner" | "granted"). For granted cameras
+/// the `url` is redacted host-side — live view goes through the dashboard stream
+/// keyed by `camera_id`, so the url is not needed for display or streaming.
+fn host_list_accessible_cameras() -> Result<Vec<tentaflow_sdk_spec::CameraInfoOut>, AbiError> {
+    let out: tentaflow_sdk_spec::CameraListOut =
+        call_cbor_out(camera_list_accessible_v1)?;
+    Ok(out.camera)
+}
+
+/// Reads one camera's authoritative info from core (carries `analysis_flow_id`,
+/// which the addon's own SQLite mirror does not store).
+fn host_camera_get(camera_id: &str) -> Result<tentaflow_sdk_spec::CameraInfoOut, AbiError> {
+    let input = tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.into(),
+    };
+    call_cbor_in_out(&input, camera_get_v1)
+}
+
+/// Sets (or, with `None`, clears) a camera's analysis flow via core. Empty string
+/// on the wire is the documented "clear" signal for `analysis_flow_id`.
+fn host_camera_set_flow(
+    camera_id: &str,
+    flow_id: Option<&str>,
+) -> Result<tentaflow_sdk_spec::CameraInfoOut, AbiError> {
+    let input = tentaflow_sdk_spec::CameraUpdateInput {
+        camera_id: camera_id.into(),
+        display_name: None,
+        target_fps: None,
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: None,
+        profile: None,
+        analysis_fps: None,
+        analysis_flow_id: Some(flow_id.unwrap_or("").into()),
+    };
+    call_cbor_in_out(&input, camera_update_v1)
 }
 
 /// Reads a JSON response from a host function with the read-only
@@ -1463,6 +1542,8 @@ struct PanelState {
     cameras_filter: String,
     // Camera selected via a table row click, pending a delete confirmation.
     camera_pending_remove: Option<String>,
+    // Camera whose analysis-flow selector is open (its "Flow" row action).
+    camera_flow_edit: Option<String>,
     error_message: Option<String>,
     success_message: Option<String>,
     discover: DiscoverState,
@@ -1938,6 +2019,9 @@ struct DiscoverState {
     name: String,
     retention: String,
     fps: String,
+    // AI analysis FPS chosen in step 4 ("1"/"5"/"10"/"15"/"0"=unlimited).
+    // Committed from the analysis-FPS select; default "10" when unset.
+    analysis_fps: String,
     // Analytics profile chosen in step 4. Committed from the profile select so
     // the pick is authoritative on submit instead of a frontend-only value.
     profile: String,
@@ -1954,6 +2038,7 @@ impl DiscoverState {
             cred_user: String::new(), cred_pass: String::new(),
             test_result: None, testing: false,
             name: String::new(), retention: String::new(), fps: String::new(),
+            analysis_fps: String::new(),
             profile: String::new(),
             error_message: None,
         }
@@ -2023,6 +2108,25 @@ impl DiscoverState {
     fn fps_value(&self) -> u32 {
         self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
     }
+    /// AI analysis FPS for the chosen camera. `0` = unlimited (native cadence);
+    /// any out-of-ladder value falls back to the spec default (10).
+    fn analysis_fps_value(&self) -> u32 {
+        self.analysis_fps
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|f| *f <= 30)
+            .unwrap_or(CAMERA_DEFAULT_ANALYSIS_FPS)
+    }
+    /// Committed analysis FPS as a select-bound string, defaulting to "10".
+    fn analysis_fps_or_default(&self) -> String {
+        let v = self.analysis_fps.trim();
+        if v.is_empty() {
+            alloc::format!("{}", CAMERA_DEFAULT_ANALYSIS_FPS)
+        } else {
+            v.into()
+        }
+    }
 }
 
 impl PanelState {
@@ -2031,6 +2135,7 @@ impl PanelState {
             current_panel: String::new(),
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
             camera_pending_remove: None,
+            camera_flow_edit: None,
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -2100,6 +2205,9 @@ pub extern "C" fn on_install() -> i32 { 0 }
 pub extern "C" fn on_start() -> i32 {
     install_panic_hook();
     log::info("TentaVision: on_start (CBOR SDK)");
+    // Receive camera.alarm events emitted by the camera_alert flow node so an
+    // alarm verdict from a camera's analysis flow lands in the alarms table.
+    subscribe_event(CAMERA_ALARM_EVENT);
     send_initial_shell();
     render_panel("overview");
     0
@@ -2112,7 +2220,37 @@ pub extern "C" fn on_stop() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn on_event(_input_ptr: i32, _input_len: i32) -> i32 { 0 }
+pub extern "C" fn on_event(input_ptr: i32, input_len: i32) -> i32 {
+    let bytes = unsafe {
+        core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize)
+    };
+    let event: JsonValue = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if event.get("event_type").and_then(|v| v.as_str()) == Some(CAMERA_ALARM_EVENT) {
+        handle_camera_alarm_event(event.get("payload").unwrap_or(&JsonValue::Null));
+    }
+    0
+}
+
+/// Persists a `camera.alarm` event (emitted by the camera_alert flow node) as a
+/// row in the addon's alarms table. Best-effort: a malformed payload or DB error
+/// is logged, not fatal (the event bus must not be wedged by one bad alarm).
+fn handle_camera_alarm_event(payload: &JsonValue) {
+    let camera_id = payload.get("camera_id").and_then(|v| v.as_str()).unwrap_or("");
+    if camera_id.is_empty() {
+        log::warn("TentaVision: camera.alarm bez camera_id — pomijam");
+        return;
+    }
+    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("Alarm ADR");
+    let severity = payload.get("severity").and_then(|v| v.as_str()).unwrap_or("high");
+    let ts = db::now_secs();
+    match db::insert_alarm(camera_id, severity, "adr", reason, ts) {
+        Ok(id) => log::info(&alloc::format!("TentaVision: alarm {} zapisany dla {}", id, camera_id)),
+        Err(e) => log::error(&alloc::format!("TentaVision: zapis alarmu nieudany: {}", abi_message(e))),
+    }
+}
 
 /// Called by host when user opens a panel on an already-running instance.
 /// Re-emits PanelShell + SlotContent without restarting the addon.
@@ -2300,14 +2438,26 @@ fn render_panel(panel_id: &str) {
     // the Table mounts with rows already in the store snapshot — otherwise its
     // first rebuild sees an empty rows_path and leaves the empty-state visible.
     if panel_id == "cameras" {
-        let overlay = PENDING_CAMERA_ROWS
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-            .map(|rows| vec![StateEntry {
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_CAMERA_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
                 path: StatePath::new(vec![PathSegment::Key("cameras_rows".into())]),
                 value: rows,
-            }]);
+            });
+        }
+        // When the flow selector is open, preselect it with the camera's current
+        // analysis flow (read from core — the addon mirror has no flow id).
+        if let Some(id) = with_state(|s| s.camera_flow_edit.clone()) {
+            let current = host_camera_get(&id)
+                .ok()
+                .and_then(|c| c.analysis_flow_id)
+                .unwrap_or_default();
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("camera_flow_select".into())]),
+                value: Value::Text(current),
+            });
+        }
+        let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "profiles" {
         let mut entries: Vec<StateEntry> = Vec::new();
@@ -2482,6 +2632,9 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
         "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
         "camera-remove" => handle_camera_remove(params),
+        "camera-flow-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-flow-cancel" => { with_state(|s| { s.camera_flow_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-flow-change" => handle_camera_flow_change(params),
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
         "cameras-refresh" => handle_camera_refresh_status(),
@@ -2713,6 +2866,7 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
             "name" => s.discover.name = value,
             "retention" => s.discover.retention = value,
             "fps" => s.discover.fps = value,
+            "analysis_fps" => s.discover.analysis_fps = value,
             "profile" => s.discover.profile = value,
             _ => {}
         }
@@ -2833,10 +2987,11 @@ fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
+    let (target, name, fps, analysis_fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
         s.discover.resolve_target(),
         s.discover.name.trim().to_string(),
         s.discover.fps_value(),
+        s.discover.analysis_fps_value(),
         s.discover.profile_or_default().to_string(),
         s.discover.source_type,
         s.discover.cred_user.trim().to_string(),
@@ -2872,94 +3027,7 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
         profile: Some(profile.clone()),
         credentials_b64,
         onvif_profile_token: profile_token,
-    };
-    let added = match camera_add(input) {
-        Ok(o) => o,
-        Err(e) => return submit_fail(
-            &alloc::format!("Nie udało się uruchomić kamery w rdzeniu: {}", abi_message(e)),
-            &alloc::format!("{}", e),
-        ),
-    };
-
-    // The cameras list reads from the addon DB; persist the row under the core id
-    // so live/zones/overlay resolve the same camera. Status comes from a real
-    // reachability probe (re-probable later via "Odśwież status").
-    let (onvif_url, rtsp_url) = match source_type {
-        Some(SourceType::Onvif) => (url.clone(), String::new()),
-        _ => (String::new(), url.clone()),
-    };
-    let status = match camera_test_connection(&vendor, &url) {
-        Ok(out) if out.ok => "online",
-        _ => "offline",
-    };
-    let new_cam = db::NewCamera {
-        name: name.clone(),
-        location: profile.clone(),
-        rtsp_url,
-        onvif_url,
-        status: status.into(),
-        fps: i64::from(fps),
-        detectors: vendor,
-    };
-    match db::insert_camera_with_id(&added.camera_id, &new_cam) {
-        Ok(()) => {
-            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", added.camera_id)); });
-            render_panel("cameras");
-            json!({"ok":true,"camera_id":added.camera_id})
-        }
-        Err(e) => submit_fail(&alloc::format!("Błąd zapisu: {}", abi_message(e)), &alloc::format!("{}", e)),
-    }
-}
-
-/// Per-row probe target: ONVIF cameras probe their device-service URL, everything
-/// else probes the RTSP(S) URL. Returns (vendor, url) for `camera_test_connection`.
-fn camera_row_probe_target(c: &db::CameraRow) -> (String, String) {
-    if !c.onvif_url.trim().is_empty() {
-        ("onvif".to_string(), c.onvif_url.clone())
-    } else {
-        ("rtsp".to_string(), c.rtsp_url.clone())
-    }
-}
-
-/// Re-probes every camera's reachability and persists the resulting online/offline
-/// status, then re-renders the Cameras tab. This is the truthful source of status
-/// for cameras added before liveness probing existed (and after a camera goes up
-/// or down). Sequential by design — at large fleet sizes this should move to the
-/// core ingest supervisor's health, but for operator-driven refresh it is fine.
-fn handle_camera_refresh_status() -> JsonValue {
-    with_state(|s| s.clear_messages());
-    let cameras = match db::list_cameras() {
-        Ok(c) => c,
-        Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e))); });
-            render_panel("cameras");
-            return json!({"ok":false,"error":alloc::format!("{}",e)});
-        }
-    };
-    let mut online = 0usize;
-    let total = cameras.len();
-    for c in &cameras {
-        let (vendor, url) = camera_row_probe_target(c);
-        if url.trim().is_empty() {
-            let _ = db::set_camera_status(&c.id, "offline");
-            continue;
-        }
-        // Cameras added before core-ingest wiring carry a non-core id and have no
-        // ingest session, so their live tile can never stream. Register them with
-        // the core supervisor now (starts the RTSP→fMP4 pipeline) and rekey the
-        // row to the returned core camera_id so `camera:<id>` has a producer.
-        if !is_valid_camera_id(&c.id) {
-            let input = CameraAddInput {
-                display_name: c.name.clone(),
-                vendor: vendor.clone(),
-                url: url.clone(),
-                target_fps: Some(c.fps as u32),
-                resolution_width: None,
-                resolution_height: None,
-                retention_class: None,
-                profile: Some(c.location.clone()),
-                credentials_b64: None,
-                onvif_profile_token: None,
+                analysis_fps: Some(c.analysis_fps.clamp(0, 30) as u32),
             };
             if let Ok(added) = camera_add(input) {
                 let probed = match camera_test_connection(&vendor, &url) {
@@ -2974,6 +3042,7 @@ fn handle_camera_refresh_status() -> JsonValue {
                     status: probed.into(),
                     fps: c.fps,
                     detectors: c.detectors.clone(),
+                    analysis_fps: c.analysis_fps,
                 };
                 let _ = db::delete_camera(&c.id);
                 let _ = db::insert_camera_with_id(&added.camera_id, &rekeyed);
@@ -3002,6 +3071,39 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     match db::delete_camera(&camera_id) {
         Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+    }
+}
+
+/// Commits the analysis-flow pick for a camera. The Select sends `camera_id`
+/// (handler param) + `value` (chosen flow id; empty = clear). Assignment +
+/// validation (flow exists/active) happen in the core `camera_update_v1` host fn.
+fn handle_camera_flow_change(params: &JsonValue) -> JsonValue {
+    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if camera_id.is_empty() {
+        with_state(|s| { s.error_message = Some("Brak kamery do przypisania flow.".to_string()); });
+        return json!({"ok":false,"error":"empty camera_id"});
+    }
+    let flow = if value.is_empty() { None } else { Some(value.as_str()) };
+    match host_camera_set_flow(&camera_id, flow) {
+        Ok(_) => {
+            with_state(|s| {
+                s.camera_flow_edit = None;
+                s.success_message = Some(if flow.is_some() {
+                    "Przypisano flow analizy do kamery.".to_string()
+                } else {
+                    "Usunięto przypisanie flow (wbudowana analiza).".to_string()
+                });
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać flow: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4171,6 +4273,76 @@ fn live_grid_selector(current: u32) -> Component {
 /// the dashboard renderer plays fMP4 over the binary protocol AND attaches the
 /// detection overlay (also binary) on top. OFFLINE cameras degrade honestly to a
 /// placeholder for THAT tile only — no stream, no fabricated frame, no overlay.
+/// A camera shared into TentaVision by another addon (e.g. the go2 robot). It is
+/// NOT persisted in TentaVision's SQLite mirror — its lifecycle belongs to the
+/// owning addon — so it is merged into read-only surfaces at render time only.
+struct SharedCamera {
+    camera_id: String,
+    display_name: String,
+    /// Owning addon id (e.g. "go2"); shown as the share badge.
+    owner_addon_id: String,
+    status: String,
+}
+
+/// Fetches cameras GRANTED to TentaVision by another addon (cross-addon share),
+/// excluding the cameras TentaVision itself owns (those already come from
+/// `db::list_cameras`). Returns an empty list on any host error so a share
+/// outage never breaks the owned-camera surfaces.
+fn shared_cameras() -> Vec<SharedCamera> {
+    let accessible = match host_list_accessible_cameras() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn(&alloc::format!(
+                "shared camera list unavailable: {}",
+                abi_message(e)
+            ));
+            return Vec::new();
+        }
+    };
+    accessible
+        .into_iter()
+        .filter(|c| c.access_level.as_deref() == Some("granted"))
+        .map(|c| SharedCamera {
+            camera_id: c.camera_id,
+            display_name: c.display_name,
+            owner_addon_id: c.owner_addon_id.unwrap_or_else(|| "shared".into()),
+            status: c.status,
+        })
+        .collect()
+}
+
+/// Live-view tile for a camera shared by another addon. Read-only: it carries a
+/// "shared" badge naming the owner and offers no mutation actions (assignment /
+/// delete / flow config live only on the owned-camera Cameras tab). Live view
+/// works because the dashboard stream subscribe is keyed by `camera_id` and the
+/// core enforces the grant when serving frames.
+fn shared_camera_tile(c: &SharedCamera) -> Component {
+    let online = c.status == "online";
+    let (status_label, status_tone) = if online {
+        ("online", "success")
+    } else if c.status == "offline" {
+        ("offline", "critical")
+    } else {
+        (c.status.as_str(), "warning")
+    };
+    let header = stack_h_gap("sm", vec![
+        chip_with_icon(&c.display_name, "neutral", "video"),
+        chip_toned(status_label, status_tone),
+        chip_toned(&alloc::format!("udostępniona · {}", c.owner_addon_id), "info"),
+    ]);
+
+    let body = if online {
+        live_video_tile(&c.camera_id)
+    } else {
+        empty_state(
+            &c.display_name,
+            Some("Offline — brak podglądu"),
+            Some("alert"),
+        )
+    };
+    card(None, vec![header, body])
+}
+
 fn live_camera_tile(c: &db::CameraRow) -> Component {
     let online = c.status == "online";
     let (status_label, status_tone) = if online {
@@ -4231,7 +4403,11 @@ fn build_live_content() -> Component {
         }
     };
 
-    if cameras.is_empty() {
+    // Cameras shared into TentaVision by another addon (e.g. the go2 robot) are
+    // merged into the live grid read-only — they are viewable but not editable.
+    let shared = shared_cameras();
+
+    if cameras.is_empty() && shared.is_empty() {
         // Empty state with a CTA that navigates to the Cameras tab so the user
         // can add a camera before any tile can appear.
         let cta = button_with_params(
@@ -4262,11 +4438,16 @@ fn build_live_content() -> Component {
         button_with_icon("Odśwież", "live-refresh", "secondary", "refresh"),
         live_grid_selector(size),
     ]);
-    // Only as many tiles as the chosen layout, capped by the real camera count.
-    let tiles: Vec<Component> = cameras.iter()
+    // Owned cameras first, then shared cameras; the whole set is capped by the
+    // chosen layout so the grid never exceeds its tile budget.
+    let mut tiles: Vec<Component> = cameras.iter()
         .take(size as usize)
         .map(live_camera_tile)
         .collect();
+    if tiles.len() < size as usize {
+        let remaining = size as usize - tiles.len();
+        tiles.extend(shared.iter().take(remaining).map(shared_camera_tile));
+    }
     let grid_comp = grid(columns, tiles);
     stack_v(vec![messages, toolbar, grid_comp])
 }
@@ -4366,6 +4547,16 @@ fn build_cameras_content() -> Component {
         }
     }
 
+    // The analysis-flow selector appears above the table for the camera whose
+    // "Flow analizy" row action was clicked.
+    if let Some(edit) = with_state(|s| s.camera_flow_edit.clone()) {
+        if cameras.iter().any(|c| c.id == edit) {
+            children.push(build_camera_flow_config(&edit, &cameras));
+        } else {
+            with_state(|s| s.camera_flow_edit = None);
+        }
+    }
+
     if cameras.is_empty() {
         // No outer Outlined Card: the dashboard pushes its sections straight
         // into the stack, so wrapping these in card(None, ...) would draw a
@@ -4404,6 +4595,16 @@ fn camera_row_fps(c: &db::CameraRow) -> String {
     if c.fps > 0 { alloc::format!("{}", c.fps) } else { "\u{2014}".to_string() }
 }
 
+/// Human-readable AI analysis FPS for the cameras table. `0` reads as
+/// "Bez limitu" (unlimited / native cadence).
+fn camera_row_analysis_fps(c: &db::CameraRow) -> String {
+    if c.analysis_fps <= 0 {
+        "Bez limitu".to_string()
+    } else {
+        alloc::format!("{}", c.analysis_fps)
+    }
+}
+
 /// Builds one Table row as a `Value::Map` keyed by the column field paths.
 /// `camera_id` is the row key the Table uses to scope per-row actions.
 /// Builds a toned chip cell value `{ label, status }`. The data-table renderer
@@ -4437,6 +4638,7 @@ fn camera_table_row_value(c: &db::CameraRow) -> Value {
         (Value::Text("status".into()), camera_status_cell(&c.status)),
         (Value::Text("detectors".into()), Value::Text(detectors)),
         (Value::Text("fps".into()), Value::Text(camera_row_fps(c))),
+        (Value::Text("analysis_fps".into()), Value::Text(camera_row_analysis_fps(c))),
     ];
     Value::Map(entries)
 }
@@ -4464,6 +4666,7 @@ fn build_cameras_table() -> Component {
         camera_table_column("status", "Status", ColumnRender::Chip),
         camera_table_column("detectors", "Detektory", ColumnRender::Text),
         camera_table_column("fps", "FPS", ColumnRender::Text),
+        camera_table_column("analysis_fps", "FPS analizy", ColumnRender::Text),
     ];
 
     // The per-row "⋯" menu carries the deletion action. The Table renderer
@@ -4473,6 +4676,10 @@ fn build_cameras_table() -> Component {
     // `camera-row-select` only arms the pending-remove confirmation bar
     // (`build_camera_remove_confirm`); the real `camera-remove` runs from that
     // bar's explicit Usuń button.
+    // The per-row "⋯" menu also carries the analysis-flow assignment. The Table
+    // injects the clicked camera_id into the action params (as `row_id` /
+    // `camera_id`), so this opens the flow selector for that camera.
+    let flow_action = button("Flow analizy", "camera-flow-edit", "ghost");
     let remove_action = button("Usuń", "camera-row-select", "destructive");
 
     TableComp {
@@ -4489,7 +4696,7 @@ fn build_cameras_table() -> Component {
         sticky_columns: 0,
         pagination: None,
         empty_state: None,
-        row_actions: vec![remove_action],
+        row_actions: vec![flow_action, remove_action],
         bulk_actions: vec![],
         virtualize: false,
         row_expandable: false,
@@ -4516,6 +4723,73 @@ fn build_camera_remove_confirm(camera_id: &str, cameras: &[db::CameraRow]) -> Co
         text_styled(&alloc::format!("Usunąć kamerę \"{}\"?", name), "body_strong"),
         text("Tej operacji nie można cofnąć."),
         stack_h(vec![confirm_btn, cancel_btn]),
+    ])])
+}
+
+/// Analysis-flow selector for the selected camera. The Select lists the active
+/// `camera_analysis` flows (plus a "no flow" clear option) and commits the pick
+/// immediately via `camera-flow-change` (carrying `camera_id`); the cold path
+/// then runs the assigned flow on every detection event. The current value is
+/// preselected by seeding the bound `camera_flow_select` store key in
+/// `render_panel` (read from core, since the addon mirror has no flow id).
+fn build_camera_flow_config(camera_id: &str, cameras: &[db::CameraRow]) -> Component {
+    let name = cameras
+        .iter()
+        .find(|c| c.id == camera_id)
+        .map(|c| c.name.as_str())
+        .unwrap_or(camera_id);
+
+    let mut options = vec![SelectOption {
+        value: SelectValue::Text(String::new()),
+        label: lit("— bez flow (wbudowana analiza) —"),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }];
+    match host_camera_analysis_flows() {
+        Ok(flows) => {
+            for (id, fname) in flows {
+                options.push(SelectOption {
+                    value: SelectValue::Text(id),
+                    label: lit(&fname),
+                    icon: None,
+                    disabled: false,
+                    group_id: None,
+                    description: None,
+                });
+            }
+        }
+        Err(e) => {
+            return card(None, vec![stack_v(vec![
+                text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+                alert(
+                    &alloc::format!("Nie udało się pobrać listy flow: {}", abi_message(e)),
+                    "critical",
+                ),
+                button("Zamknij", "camera-flow-cancel", "ghost"),
+            ])]);
+        }
+    }
+
+    let mut selector = select("Flow analizy", options, "camera_flow_select");
+    let mut params = CborMap::default();
+    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    selector.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "camera-flow-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+        text("Wybrany flow uruchamia się na każdej detekcji z tej kamery."),
+        selector,
+        button("Zamknij", "camera-flow-cancel", "ghost"),
     ])])
 }
 
@@ -4640,6 +4914,9 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
     // Reflect the committed profile (defaulting to "default") so the select
     // shows the authoritative backend value rather than always resetting to it.
     pairs.push(("profile".into(), Value::Text(with_state(|s| s.discover.profile_or_default().to_string()))));
+    // Reflect the committed analysis FPS (defaulting to "10") so the select
+    // shows the authoritative backend value.
+    pairs.push(("analysis_fps".into(), Value::Text(with_state(|s| s.discover.analysis_fps_or_default()))));
     pairs
         .into_iter()
         .map(|(key, value)| StateEntry {
@@ -4978,13 +5255,20 @@ fn build_wizard_step_metadata() -> Component {
         SelectOption { value: SelectValue::Text("Unclassified".into()), label: lit("Niesklasyfikowana"), icon: None, disabled: false, group_id: None, description: None },
     ], "retention");
     let fps_input = wizard_input("Docelowe FPS", "15", "fps", false);
+    let analysis_fps_select = wizard_select("FPS analizy AI", vec![
+        SelectOption { value: SelectValue::Text("1".into()), label: lit("1 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("5".into()), label: lit("5 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("10".into()), label: lit("10 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("15".into()), label: lit("15 / s"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption { value: SelectValue::Text("0".into()), label: lit("Bez limitu"), icon: None, disabled: false, group_id: None, description: None },
+    ], "analysis_fps");
     let profile_select = wizard_select("Profil analityczny", vec![
         SelectOption { value: SelectValue::Text("default".into()), label: lit("default"), icon: None, disabled: false, group_id: None, description: None },
     ], "profile");
 
     stack_v(vec![
         text("Uzupełnij metadane kamery przed jej dodaniem."),
-        grid(2, vec![name_input, retention_select, fps_input, profile_select]),
+        grid(2, vec![name_input, retention_select, fps_input, analysis_fps_select, profile_select]),
     ])
 }
 
@@ -9354,6 +9638,7 @@ fn handle_onboarding_finish() -> JsonValue {
         status: "offline".into(),
         fps: 0,
         detectors: "onboarding".into(),
+        analysis_fps: i64::from(CAMERA_DEFAULT_ANALYSIS_FPS),
     };
     let cam_id = match db::insert_camera(&new_cam) {
         Ok(id) => id,

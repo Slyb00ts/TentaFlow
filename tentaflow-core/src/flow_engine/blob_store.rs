@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -33,10 +33,19 @@ pub trait BlobStore: Send + Sync {
     async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>>;
     /// GC orphan blobs older than `retention`. Returns count removed.
     /// Stub in stage 1 — scheduler + orphan tracking dochodzi w stage 2.
-    /// Per-ref delete jest świadomie pominięty: dedup-by-sha sprawia że dwa
-    /// `BlobRef` mogą wskazywać na ten sam plik i naiwne usunięcie po jednym
-    /// rozsadza drugi. GC z refcount/orphan registry rozwiązuje to w E2.
+    /// Per-ref delete jest świadomie pominięty dla TRWAŁYCH blobów: dedup-by-sha
+    /// sprawia że dwa `BlobRef` mogą wskazywać na ten sam plik i naiwne usunięcie
+    /// po jednym rozsadza drugi. GC z refcount/orphan registry rozwiązuje to w E2.
     async fn gc(&self, retention: Duration) -> Result<u64>;
+    /// Best-effort per-ref delete dla EFEMERYCZNYCH blobów (np. surowa klatka
+    /// kamery podana do flow analizy i niepotrzebna po jego zakończeniu). Bez
+    /// tego ścieżka kamery zapisywałaby unikalną klatkę na każdym zdarzeniu i
+    /// zalała dysk. Default = no-op (trwałe magazyny z dedup-by-sha nie usuwają
+    /// pojedynczo); `FileBlobStore`/`InMemoryBlobStore` nadpisują. „Not found"
+    /// nie jest błędem (delete jest idempotentny).
+    async fn delete(&self, _blob_ref: &BlobRef) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Filesystem-backed blob store with sharded layout to keep directories small:
@@ -317,8 +326,131 @@ impl BlobStore for InMemoryBlobStore {
             .ok_or_else(|| anyhow!("blob not found: {}", blob_ref.sha256))
     }
 
+    async fn delete(&self, blob_ref: &BlobRef) -> Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow!("InMemoryBlobStore poisoned"))?
+            .remove(&blob_ref.sha256);
+        Ok(())
+    }
+
     async fn gc(&self, _retention: Duration) -> Result<u64> {
         Ok(0)
+    }
+}
+
+/// In-memory store keyed by `BlobRef.id` (a fresh uuid per `put`), NOT by
+/// content sha. Used for the camera cold path's transient frames: keying by the
+/// unique id means two concurrent flow runs whose frames happen to be byte
+/// identical get distinct entries, so one run's post-dispatch `delete` can never
+/// remove a frame another run is still reading (the sha-keyed dedup race the
+/// durable store warns about does not apply here).
+pub struct EphemeralBlobStore {
+    inner: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+impl EphemeralBlobStore {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for EphemeralBlobStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl BlobStore for EphemeralBlobStore {
+    async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let sha256 = format!("{:x}", hasher.finalize());
+        let id = uuid::Uuid::new_v4().to_string();
+        let size_bytes = bytes.len() as u64;
+        self.inner
+            .write()
+            .map_err(|_| anyhow!("EphemeralBlobStore poisoned"))?
+            .insert(id.clone(), bytes);
+        Ok(BlobRef {
+            id,
+            size_bytes,
+            mime: mime.to_string(),
+            sha256,
+        })
+    }
+
+    async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
+        self.inner
+            .read()
+            .map_err(|_| anyhow!("EphemeralBlobStore poisoned"))?
+            .get(&blob_ref.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("ephemeral blob not found: {}", blob_ref.id))
+    }
+
+    async fn delete(&self, blob_ref: &BlobRef) -> Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| anyhow!("EphemeralBlobStore poisoned"))?
+            .remove(&blob_ref.id);
+        Ok(())
+    }
+
+    async fn gc(&self, _retention: Duration) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+/// Overlay store: an `ephemeral` (in-memory) layer in front of a `persistent`
+/// durable store. Built so the camera cold path can hand a raw RGB frame to an
+/// analysis flow without writing it to the durable blob store (per-frame writes
+/// would fill disk) and delete it afterwards WITHOUT any risk to durable blobs.
+///
+/// - `get` checks `ephemeral` first, then falls through to `persistent`, so a
+///   flow's nodes resolve both the ephemeral frame and any durable blob via the
+///   single `ctx.blobs` handle.
+/// - `put`/`gc` go to `persistent` (durable is the default for node-produced
+///   blobs — unchanged behavior for every normal flow).
+/// - `delete` goes ONLY to `ephemeral`. Durable blobs are never per-ref deleted
+///   here (that was the dedup-by-sha data-loss hazard); frames are removed from
+///   the in-memory layer alone.
+pub struct CompositeBlobStore {
+    ephemeral: Arc<dyn BlobStore>,
+    persistent: Arc<dyn BlobStore>,
+}
+
+impl CompositeBlobStore {
+    pub fn new(ephemeral: Arc<dyn BlobStore>, persistent: Arc<dyn BlobStore>) -> Self {
+        Self {
+            ephemeral,
+            persistent,
+        }
+    }
+}
+
+#[async_trait]
+impl BlobStore for CompositeBlobStore {
+    async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
+        self.persistent.put(bytes, mime).await
+    }
+
+    async fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>> {
+        match self.ephemeral.get(blob_ref).await {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => self.persistent.get(blob_ref).await,
+        }
+    }
+
+    async fn delete(&self, blob_ref: &BlobRef) -> Result<()> {
+        self.ephemeral.delete(blob_ref).await
+    }
+
+    async fn gc(&self, retention: Duration) -> Result<u64> {
+        self.persistent.gc(retention).await
     }
 }
 
