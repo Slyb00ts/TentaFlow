@@ -441,6 +441,14 @@ pub enum MeshCommandType {
     OauthPoll {
         flow_id: String,
     },
+    /// Cross-node robot control. The receiver owns the robot addon; it decodes
+    /// the opaque `RobotControlRequest` (CBOR), re-checks trust + timing +
+    /// permission, sanitizes the action and dispatches it to the local robot
+    /// addon, returning a `RobotControlResult`. Opaque CBOR keeps this crate free
+    /// of robot types (like `VectorOp`). Appended at END (ciborium index rule).
+    RobotControl {
+        request_cbor: Vec<u8>,
+    },
 }
 
 // =============================================================================
@@ -517,6 +525,13 @@ pub enum MeshCommandResponsePayload {
         status: String,
         account_label: Option<String>,
         error: Option<String>,
+    },
+    /// Opaque CBOR `RobotControlResponse` produced by the receiver running a
+    /// forwarded `RobotControl` against its local robot addon. A rejection
+    /// (timing/permission/unknown-robot) is carried as a successful response with
+    /// the encoded `RobotControlResponse::rejected(...)`. Appended at END.
+    RobotControlResult {
+        result_cbor: Vec<u8>,
     },
 }
 
@@ -662,6 +677,10 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("provider", provider)
                 .finish(),
             Self::OauthPoll { .. } => write!(f, "OauthPoll"),
+            Self::RobotControl { request_cbor } => f
+                .debug_struct("RobotControl")
+                .field("request_len", &request_cbor.len())
+                .finish(),
         }
     }
 }

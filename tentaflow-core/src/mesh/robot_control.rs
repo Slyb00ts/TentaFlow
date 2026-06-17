@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// Hard ceiling on commanded velocity magnitude (normalized protocol range is
 /// -1..1). A receiver further clamps to the robot's own `[robot.safety]`.
@@ -29,6 +30,10 @@ pub const IDEMPOTENCY_TTL_MS: u64 = 30_000;
 /// Allowed clock skew for a command's `issued_at_ms` being ahead of the
 /// receiver's clock (commands further in the future are rejected as bogus).
 pub const MAX_CLOCK_SKEW_MS: u64 = 5_000;
+
+/// Fuel budget for a single robot flow-block invocation on the receiver. Sized
+/// to the go2 `[resources].fuel_limit` so a move/pose block runs to completion.
+pub const ROBOT_BLOCK_FUEL: u64 = 200_000_000;
 
 /// The COMPLETE remote-control surface. Vendor-agnostic; a concrete robot addon
 /// maps these to its own commands (sub-chunk 3). No free-form tool field exists,
@@ -67,6 +72,24 @@ impl RobotAction {
         matches!(self, RobotAction::Status)
     }
 
+    /// Audit-safe label: the action NAME only — never the `Move` velocity values
+    /// (codex: no raw movement payloads in logs).
+    pub fn audit_label(&self) -> &'static str {
+        match self {
+            RobotAction::Move { .. } => "Move",
+            RobotAction::Stop => "Stop",
+            RobotAction::Estop => "Estop",
+            RobotAction::ResetEstop => "ResetEstop",
+            RobotAction::RecoveryStand => "RecoveryStand",
+            RobotAction::StandUp => "StandUp",
+            RobotAction::StandDown => "StandDown",
+            RobotAction::Sit => "Sit",
+            RobotAction::Hello => "Hello",
+            RobotAction::Stretch => "Stretch",
+            RobotAction::Status => "Status",
+        }
+    }
+
     /// Minimum permission the receiver must verify for this action. Split so a
     /// `robot.telemetry` grant can never move hardware.
     pub fn required_permission(&self) -> &'static str {
@@ -93,6 +116,61 @@ impl RobotAction {
             other => other.clone(),
         }
     }
+
+    /// The ONLY action→addon bridge. Maps a (sanitized) `RobotAction` to a
+    /// concrete go2 addon invocation: either a tool call or a flow block. This
+    /// is an explicit allowlist — there is no free-form "call any tool" path, so
+    /// a trusted-peer command can never be turned into arbitrary addon execution.
+    /// Pure: builds the params shape only, performs no I/O.
+    ///
+    /// `Move` becomes the `go2.move` flow block with a FlowEnvelope-shaped
+    /// `variables` map (each axis a `{kind:"json",data:<f64>}` FlowValue) — the
+    /// exact shape the go2 block decoder reads (`block_num` → `variables[key]`).
+    /// Every other action is a stateless tool call with empty params.
+    pub fn to_go2_call(&self) -> Go2Call {
+        let tool = |name: &str| Go2Call::Tool {
+            tool: name.to_string(),
+            params: json!({}),
+        };
+        match self {
+            RobotAction::Move { vx, vy, vyaw } => Go2Call::Block {
+                block_type: "go2.move".to_string(),
+                params: json!({
+                    "variables": {
+                        "vx": { "kind": "json", "data": vx },
+                        "vy": { "kind": "json", "data": vy },
+                        "vyaw": { "kind": "json", "data": vyaw },
+                    }
+                }),
+            },
+            RobotAction::Stop | RobotAction::Estop => tool("go2.estop"),
+            RobotAction::ResetEstop => tool("go2.reset_estop"),
+            RobotAction::RecoveryStand => tool("go2.action_recovery"),
+            RobotAction::StandUp => tool("go2.action_standup"),
+            RobotAction::StandDown => tool("go2.action_standdown"),
+            RobotAction::Sit => tool("go2.action_sit"),
+            RobotAction::Hello => tool("go2.action_hello"),
+            RobotAction::Stretch => tool("go2.action_stretch"),
+            RobotAction::Status => tool("go2.status"),
+        }
+    }
+}
+
+/// How a `RobotAction` is dispatched into the owning robot addon. Either a
+/// stateless tool call (`call_tool`) or a flow block invocation (`invoke_block`,
+/// the path that carries the FlowEnvelope `variables` the go2 block decoder reads).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Go2Call {
+    /// Stateless tool call: `addon_manager.call_tool(addon_id, tool, params, user)`.
+    Tool {
+        tool: String,
+        params: serde_json::Value,
+    },
+    /// Flow block invocation: `addon_manager.invoke_block(addon_id, block_type, params_bytes, ...)`.
+    Block {
+        block_type: String,
+        params: serde_json::Value,
+    },
 }
 
 /// Clamp one velocity component to `[-cap, cap]`; NaN → 0.0.
@@ -113,6 +191,9 @@ pub fn clamp_velocity(v: f64, cap: f64) -> f64 {
 pub struct RobotControlRequest {
     /// Logical robot id (the owning addon's robot), e.g. "go2".
     pub robot_id: String,
+    /// Org the command is issued in — the receiver re-checks `actor_user_id`'s
+    /// permission in THIS org (never trusts the caller's gate).
+    pub org_id: String,
     /// Unique per logical command — drives duplicate suppression.
     pub command_id: String,
     /// The acting user on the originating node (for authz + audit).
@@ -276,6 +357,50 @@ impl IdempotencyCache {
     }
 }
 
+/// What the receiver resolved about the local robot addon for a request: the
+/// concrete addon instance id to invoke and its movement safety ceiling (from
+/// the manifest `[robot.safety].max_linear_mps`, falling back to `MAX_VELOCITY`).
+/// Produced by the I/O side (enumerate installed addons, parse manifests); kept
+/// separate so the decision logic in `plan_execution` is pure and unit-testable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedRobotAddon {
+    pub addon_id: String,
+    pub max_velocity: f64,
+}
+
+/// The decided dispatch for a request that passed resolution + authorization:
+/// the target addon, the actor to run as, and the safety-clamped `Go2Call`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobotExecutionPlan {
+    pub addon_id: String,
+    pub actor_user_id: String,
+    pub call: Go2Call,
+}
+
+/// Pure decision: given a request, the (optionally) resolved local robot addon,
+/// and whether the actor is authorized, produce either an execution plan or the
+/// reason to reject. Deny-by-default: an unresolved addon → `UnknownRobot`, a
+/// failed authz → `PermissionDenied`. Sanitization (velocity clamp to the
+/// addon's safety ceiling) happens HERE so the plan the handler runs is already
+/// safe. No I/O — the handler does resolution + authz lookups and feeds them in,
+/// then just runs the returned plan.
+pub fn plan_execution(
+    req: &RobotControlRequest,
+    resolved: Option<&ResolvedRobotAddon>,
+    authorized: bool,
+) -> Result<RobotExecutionPlan, RejectReason> {
+    let resolved = resolved.ok_or(RejectReason::UnknownRobot)?;
+    if !authorized {
+        return Err(RejectReason::PermissionDenied);
+    }
+    let action = req.action.sanitized(resolved.max_velocity);
+    Ok(RobotExecutionPlan {
+        addon_id: resolved.addon_id.clone(),
+        actor_user_id: req.actor_user_id.clone(),
+        call: action.to_go2_call(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +408,7 @@ mod tests {
     fn move_req(id: &str, vx: f64, issued: u64, expires: u64) -> RobotControlRequest {
         RobotControlRequest {
             robot_id: "go2".into(),
+            org_id: "org-1".into(),
             command_id: id.into(),
             actor_user_id: "u1".into(),
             action: RobotAction::Move { vx, vy: 0.0, vyaw: 0.0 },
@@ -430,6 +556,7 @@ mod tests {
     fn request_cbor_roundtrip() {
         let req = RobotControlRequest {
             robot_id: "go2".into(),
+            org_id: "org-1".into(),
             command_id: "c1".into(),
             actor_user_id: "u1".into(),
             action: RobotAction::Move { vx: 0.3, vy: -0.1, vyaw: 0.2 },
@@ -448,5 +575,103 @@ mod tests {
         let rback: RobotControlResponse =
             ciborium::de::from_reader(&rbuf[..]).expect("decode resp");
         assert_eq!(resp, rback);
+    }
+
+    #[test]
+    fn to_go2_call_move_builds_flow_variables_shape() {
+        let call = RobotAction::Move { vx: 0.4, vy: -0.2, vyaw: 0.1 }.to_go2_call();
+        match call {
+            Go2Call::Block { block_type, params } => {
+                assert_eq!(block_type, "go2.move");
+                let vars = params.get("variables").expect("variables");
+                // Each axis is a FlowValue {kind:"json", data:<f64>} the go2
+                // block_num decoder reads.
+                for (key, want) in [("vx", 0.4), ("vy", -0.2), ("vyaw", 0.1)] {
+                    let fv = vars.get(key).expect(key);
+                    assert_eq!(fv.get("kind").and_then(|k| k.as_str()), Some("json"));
+                    assert_eq!(fv.get("data").and_then(|d| d.as_f64()), Some(want));
+                }
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_go2_call_actions_map_to_allowlisted_tools() {
+        let cases = [
+            (RobotAction::Stop, "go2.estop"),
+            (RobotAction::Estop, "go2.estop"),
+            (RobotAction::ResetEstop, "go2.reset_estop"),
+            (RobotAction::RecoveryStand, "go2.action_recovery"),
+            (RobotAction::StandUp, "go2.action_standup"),
+            (RobotAction::StandDown, "go2.action_standdown"),
+            (RobotAction::Sit, "go2.action_sit"),
+            (RobotAction::Hello, "go2.action_hello"),
+            (RobotAction::Stretch, "go2.action_stretch"),
+            (RobotAction::Status, "go2.status"),
+        ];
+        for (action, want_tool) in cases {
+            match action.to_go2_call() {
+                Go2Call::Tool { tool, params } => {
+                    assert_eq!(tool, want_tool, "action {action:?}");
+                    assert_eq!(params, json!({}), "tool params must be empty");
+                }
+                other => panic!("expected Tool for {action:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_execution_unknown_robot_when_unresolved() {
+        let req = move_req("p1", 0.3, 0, 1_000);
+        assert_eq!(
+            plan_execution(&req, None, true),
+            Err(RejectReason::UnknownRobot)
+        );
+    }
+
+    #[test]
+    fn plan_execution_permission_denied_when_unauthorized() {
+        let req = move_req("p2", 0.3, 0, 1_000);
+        let resolved = ResolvedRobotAddon { addon_id: "go2".into(), max_velocity: 1.0 };
+        assert_eq!(
+            plan_execution(&req, Some(&resolved), false),
+            Err(RejectReason::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn plan_execution_sanitizes_move_to_addon_safety_cap() {
+        // Request asks for vx=5.0; the resolved addon caps at 0.5 → the planned
+        // call must already be clamped (the handler never sees the raw value).
+        let req = move_req("p3", 5.0, 0, 1_000);
+        let resolved = ResolvedRobotAddon { addon_id: "go2-1".into(), max_velocity: 0.5 };
+        let plan = plan_execution(&req, Some(&resolved), true).expect("plan");
+        assert_eq!(plan.addon_id, "go2-1");
+        assert_eq!(plan.actor_user_id, "u1");
+        match plan.call {
+            Go2Call::Block { block_type, params } => {
+                assert_eq!(block_type, "go2.move");
+                let vx = params
+                    .get("variables")
+                    .and_then(|v| v.get("vx"))
+                    .and_then(|v| v.get("data"))
+                    .and_then(|d| d.as_f64());
+                assert_eq!(vx, Some(0.5));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_execution_estop_maps_to_tool() {
+        let mut req = move_req("p4", 0.0, 0, 1_000);
+        req.action = RobotAction::Estop;
+        let resolved = ResolvedRobotAddon { addon_id: "go2".into(), max_velocity: 1.0 };
+        let plan = plan_execution(&req, Some(&resolved), true).expect("plan");
+        assert_eq!(
+            plan.call,
+            Go2Call::Tool { tool: "go2.estop".into(), params: json!({}) }
+        );
     }
 }
