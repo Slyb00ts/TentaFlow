@@ -2616,6 +2616,22 @@ pub async fn ml_studio_ft_deploy(
         .map(str::to_string)
         .unwrap_or_else(|| local_node.clone());
 
+    // Fail-closed dla deployu zdalnego: zanim `service_manifest_deploy` forwarduje
+    // przez mesh, sami weryfikujemy zaufanie. Bez `mesh_security` (None) odmawiamy —
+    // service_manifest_deploy pomija check, gdy security jest None, więc gwarancję
+    // dajemy tutaj, spójnie ze ścieżką czatu/detekcji.
+    if deploy_node != local_node {
+        let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+            ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+        })?;
+        if !security.is_trusted(&deploy_node) {
+            return Err(ProtocolError::bad_request(format!(
+                "peer {} is not trusted",
+                deploy_node
+            )));
+        }
+    }
+
     let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
         engine_id: "llama-cpp".to_string(),
         deploy_method: "native".to_string(),
