@@ -2594,8 +2594,15 @@ pub async fn ml_studio_ft_deploy(
     let short_id = &payload.model_id[..payload.model_id.len().min(8)];
     let model_name = format!("ft-{}", short_id);
 
-    // config_json dla embedded llama.cpp: `model_file` niesie ABSOLUTNĄ ścieżkę
-    // GGUF — embedded.rs rozpozna ją jako lokalny plik i pominie download HF.
+    // Format eksportu decyduje o silniku: katalog safetensors (eksport MLX) →
+    // engine `mlx` (Apple); plik `.gguf` → `llama-cpp`. Detekcja po rozszerzeniu
+    // ścieżki: brak `.gguf` = katalog modelu MLX.
+    let is_mlx = !gguf_path.to_ascii_lowercase().ends_with(".gguf");
+    let engine_id = if is_mlx { "mlx" } else { "llama-cpp" };
+
+    // config_json dla embedded: `model_file` niesie ABSOLUTNĄ ścieżkę — dla
+    // llama.cpp plik GGUF, dla MLX KATALOG safetensors. embedded.rs rozpozna ją
+    // jako lokalny model i pominie download HF.
     let config_json = serde_json::json!({
         "model_repo": model_name,
         "model_file": gguf_path,
@@ -2633,7 +2640,7 @@ pub async fn ml_studio_ft_deploy(
     }
 
     let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
-        engine_id: "llama-cpp".to_string(),
+        engine_id: engine_id.to_string(),
         deploy_method: "native".to_string(),
         node_id: deploy_node,
         config_json,
