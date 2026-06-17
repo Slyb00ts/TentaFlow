@@ -2145,6 +2145,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let uses_models = parse_uses_models(top.get("uses_model"))?;
     let publisher = parse_publisher_section(top.get("publisher"))?;
     let runtime_overrides = parse_runtime_section(top.get("runtime"))?;
+    let robot = parse_robot_section(top.get("robot"));
 
     crate::addon::manifest::validate_manifest_extensions(
         storage.as_ref(),
@@ -2228,6 +2229,32 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         uses_models,
         publisher,
         runtime_overrides,
+        robot,
+    })
+}
+
+/// Parses the optional top-level `[robot]` TOML table. Only the fields the
+/// cross-node robot-control receiver needs are read (`controls_robot`, `kind`,
+/// `[robot.safety]`). Absent section → `None`.
+fn parse_robot_section(value: Option<&toml::Value>) -> Option<crate::addon::RobotManifestSection> {
+    let table = value?.as_table()?;
+    let safety = table.get("safety").and_then(|s| s.as_table()).map(|st| {
+        crate::addon::RobotSafetySection {
+            max_linear_mps: st.get("max_linear_mps").and_then(|v| v.as_float()),
+            max_yaw_rps: st.get("max_yaw_rps").and_then(|v| v.as_float()),
+            require_estop_clear: st.get("require_estop_clear").and_then(|v| v.as_bool()),
+        }
+    });
+    Some(crate::addon::RobotManifestSection {
+        controls_robot: table
+            .get("controls_robot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        kind: table
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        safety,
     })
 }
 

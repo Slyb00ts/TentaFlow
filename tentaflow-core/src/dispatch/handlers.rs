@@ -4171,10 +4171,17 @@ pub async fn deploy_vllm_recommend(
         .map(|g| g.memory_gb)
         .fold(f64::INFINITY, f64::min);
 
-    let kv_dtype = payload
-        .kv_cache_dtype
-        .clone()
-        .unwrap_or_else(|| "auto".to_string());
+    // DeepSeek V4 serwuje uwagę przez kernel FlashMLA w układzie fp8, który
+    // twardo wymaga fp8 kv-cache (vLLM asertuje "FlashMLA fp8 layout only
+    // supports fp8 kv-cache" i ubija engine przy `auto`). Gdy user sam nie
+    // wybrał dtype, domyślamy fp8 dla tej rodziny — inaczej każdy deploy V4 pada.
+    let kv_dtype = payload.kv_cache_dtype.clone().unwrap_or_else(|| {
+        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") {
+            "fp8".to_string()
+        } else {
+            "auto".to_string()
+        }
+    });
     let gpu_mem_util = payload.gpu_memory_utilization.unwrap_or(0.9);
 
     let lock_ctx = payload.lock_max_model_len.unwrap_or(false);
@@ -4233,15 +4240,55 @@ pub async fn deploy_vllm_recommend(
     let max_supported_num_seqs = max_concurrent_seqs_for_budget(&spec, &applied_input);
     // Pole odpowiedzi zostaje `recommended_vllm_args`, ale dla llama.cpp niesie jego
     // argumenty CLI (frontend czyta to pole niezaleznie od silnika).
+    let mut recommended_env: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut recipe_applied: Option<String> = None;
     let recommended_vllm_args = match engine {
         DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
-        DeployEngine::Vllm => build_vllm_args_string(&spec, &applied_input),
+        DeployEngine::Vllm => {
+            let mut base = build_vllm_args_string(&spec, &applied_input);
+            // vLLM deployment recipe (recipes.vllm.ai): expert launch flags
+            // (tool/reasoning parser, expert-parallel, ...) + per-GPU-family env
+            // (Blackwell FP4 MoE / Hopper FP8 MoE). Embedded snapshot first so
+            // offline/HF-only deploys are instant; live fetch only fills models
+            // missing from the snapshot (added upstream after the last vendor).
+            use crate::deploy::vllm_recipes;
+            let entry = match vllm_recipes::resolve_embedded(&payload.model) {
+                Some(e) => Some(e),
+                None => vllm_recipes::fetch_live(&client, &payload.model).await,
+            };
+            if let Some(entry) = entry {
+                let family = payload
+                    .gpus
+                    .first()
+                    .and_then(|g| vllm_recipes::gpu_family(&g.name));
+                let (rargv, renv) = vllm_recipes::build_args(
+                    &entry,
+                    family,
+                    applied_input.tensor_parallel,
+                    applied_input.pipeline_parallel,
+                );
+                if !rargv.is_empty() || !renv.is_empty() {
+                    // Merge our tuned args (gpu-mem, ctx, kv) with the recipe
+                    // expert flags; recipe is appended last so dedup last-wins
+                    // lets it override on overlap.
+                    let mut toks: Vec<String> =
+                        base.split_whitespace().map(String::from).collect();
+                    toks.extend(rargv);
+                    toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                    base = toks.join(" ");
+                    recommended_env = renv;
+                    recipe_applied = Some(entry.hf_id.clone());
+                }
+            }
+            base
+        }
         // MLX (mlx-lm) uruchamiany jest przez wlasny runner, nie przez flagi CLI
         // jednego procesu serwera - kontekst/seqs/KV przekazuje config deployu.
         DeployEngine::Mlx => format!(
             "--max-tokens {} --max-kv-size {}",
             applied_input.max_model_len,
-            applied_input.max_model_len * applied_input.max_num_seqs.max(1)
+            applied_input.max_num_seqs.max(1) * applied_input.max_model_len
         ),
     };
 
@@ -4338,6 +4385,8 @@ pub async fn deploy_vllm_recommend(
             applied,
             auto_adjusted,
             at_limit,
+            recommended_env,
+            recipe_applied,
         },
     ))
 }

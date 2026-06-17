@@ -173,6 +173,43 @@ pub struct AddonManifest {
     /// cap i service_call rate-limit. Pusta sekcja / brak sekcji = defaults.
     #[serde(default)]
     pub runtime_overrides: Option<manifest::RuntimeSection>,
+    /// Sekcja `[robot]` — universal robot capability descriptor. Present only on
+    /// robot-control addons (e.g. go2). The cross-node `RobotControl` receiver
+    /// resolves the owning addon by this block and reads `[robot.safety]`.
+    #[serde(default)]
+    pub robot: Option<RobotManifestSection>,
+}
+
+/// `[robot]` manifest section — marks an addon as a robot controller and carries
+/// the movement safety envelope the cross-node control receiver enforces. Only
+/// the fields the receiver needs are modeled; the Robots-app discovery fields
+/// (capabilities, connection params) are not parsed here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RobotManifestSection {
+    /// `true` when this addon controls a robot. Receiver treats a `[robot]`
+    /// section as authoritative; this is the explicit confirmation flag.
+    #[serde(default)]
+    pub controls_robot: bool,
+    /// Robot kind ("quadruped", "drone", ...). Informational for the receiver.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Movement safety envelope — the receiver clamps commanded velocity to
+    /// `max_linear_mps`. Absent → fall back to the protocol ceiling.
+    #[serde(default)]
+    pub safety: Option<RobotSafetySection>,
+}
+
+/// `[robot.safety]` — the velocity ceiling the controller enforces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RobotSafetySection {
+    /// Max commanded linear velocity (normalized -1..1). The cross-node receiver
+    /// uses this to clamp `Move` before dispatch.
+    #[serde(default)]
+    pub max_linear_mps: Option<f64>,
+    #[serde(default)]
+    pub max_yaw_rps: Option<f64>,
+    #[serde(default)]
+    pub require_estop_clear: Option<bool>,
 }
 
 /// `[application]` manifest section — registers the addon as a user-facing

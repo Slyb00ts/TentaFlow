@@ -1,14 +1,10 @@
-# syntax=docker/dockerfile:1.4
 # =============================================================================
 # Plik: Dockerfile
 # Opis: Obraz kontenera meeting sidecar — Chromium + PulseAudio + Xvfb
 #       do automatycznego dolaczania do spotkan Teams/Meet/Zoom.
 #
-# Wymagania buildera:
-#   - Docker Buildx + BuildKit (dla --mount=type=cache)
-#   - Uzywane jest `cargo fetch` -> cache registry + prebuild dependencies
-#     w osobnej warstwie, zeby edit jednego pliku .rs dawal ~20s rebuild
-#     zamiast peach 3 minut.
+# Buduje sie na klasycznym builderze Dockera (bez BuildKit) — deploy w runtime
+# TentaFlow idzie przez bollard `/build`, ktory BuildKita nie uzywa.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -28,28 +24,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Kopiujemy kod zrodlowy 3 crate'ow (protocol + voice + teams-bot).
-# Workspace z lib dependencies nie pozwala sensownie pre-kompilowac zaleznosci
-# w osobnej warstwie Docker (stub lib.rs musialby replikowac public API),
-# wiec zamiast tego polegamy wylacznie na BuildKit cache mount dla
-# /usr/local/cargo/{registry,git} i /build/target.
-#
-# Dzieki temu:
-#   - pierwszy cold build: ~3-5 min (normalnie)
-#   - kolejne buildy po edit pliku .rs: ~20-40s bo /build/target zachowuje
-#     wszystkie skompilowane deps w BuildKit local cache
-#   - zmiany w Cargo.toml: ~1-2 min (cargo rebudowuje tylko zmienione deps)
-#
-# Binary kopiujemy POZA /build/target (cache mount znika po RUN) do /artifacts.
+# Kopiujemy kod zrodlowy 3 crate'ow (protocol + voice + teams-bot) i budujemy
+# binary w jednej warstwie. Bez cache mountu kazdy build jest cold (~3-5 min),
+# ale klasyczny builder innego nie udzwignie.
 COPY tentaflow-protocol/ tentaflow-protocol/
 COPY tentaflow-transport/ tentaflow-transport/
 COPY tentaflow-voice/ tentaflow-voice/
 COPY tentaflow-containers/agents/native/teams-bot/ tentaflow-containers/agents/native/teams-bot/
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --manifest-path tentaflow-containers/agents/native/teams-bot/Cargo.toml --bin tentaflow-meeting \
+RUN cargo build --release --manifest-path tentaflow-containers/agents/native/teams-bot/Cargo.toml --bin tentaflow-meeting \
     && mkdir -p /artifacts \
     && cp /build/tentaflow-containers/agents/native/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
     && strip /artifacts/tentaflow-meeting
