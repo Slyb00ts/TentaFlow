@@ -1016,6 +1016,13 @@ def train(req: TrainRequest) -> dict[str, Any]:
             if iface:
                 env.setdefault("NCCL_SOCKET_IFNAME", iface)
                 env.setdefault("GLOO_SOCKET_IFNAME", iface)
+            # Cross-machine po zwykłym ethernecie: NCCL musi iść SOCKETAMI, nie
+            # InfiniBand/P2P/shared-mem (te nie istnieją między osobnymi hostami i
+            # powodują twardy crash/hang w init NCCL). Wymuszamy transport socketowy.
+            env.setdefault("NCCL_IB_DISABLE", "1")
+            env.setdefault("NCCL_P2P_DISABLE", "1")
+            env.setdefault("NCCL_SHM_DISABLE", "1")
+            env.setdefault("NCCL_DEBUG", "WARN")
         log_fh = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
         with _JOBS_LOCK:
