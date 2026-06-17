@@ -255,6 +255,11 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
+    /// Periodyczny anti-drift broadcast robotow peera (`MESH_MSG_ROBOTS_ANNOUNCE`).
+    RobotsAnnounceReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
     SyncPushReceived {
         from_node_id: String,
         data: Vec<u8>,
@@ -2423,6 +2428,10 @@ impl IrohMeshManagerRef {
                 data: payload,
             },
             x if x == MESH_MSG_SERVICES_UPDATE => IrohMeshEvent::ServicesUpdateReceived {
+                from_node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_ROBOTS_ANNOUNCE => IrohMeshEvent::RobotsAnnounceReceived {
                 from_node_id: remote_hex,
                 data: payload,
             },

@@ -1422,6 +1422,9 @@ fn spawn_quic_event_handler(
                     // Bez tego GUI aggregate (krok N3b) widzialby duchowe serwisy
                     // niedostepnego nodu az do nastepnego anti-drift broadcastu.
                     mesh_services_registry.remove_node(&node_id);
+                    // Drop the peer's advertised robots too, or the resolver could
+                    // route a robot command to a disconnected owner.
+                    crate::mesh::robot_dispatch::global().remove_node(&node_id);
 
                     // [SCALE] Debounce + reszta przeniesione do spawnowanego
                     // taska z per-peer lockiem (wspolny z PeerConnected).
@@ -1833,6 +1836,9 @@ fn spawn_quic_event_handler(
                                 // F1b P3.B — drop the peer's mirrored HMAC keys
                                 // so their tokens stop verifying immediately.
                                 crate::services::mesh_keys::sync::forget_peer(trusted_id);
+                                // Drop their advertised robots so the resolver stops
+                                // routing to a node we no longer trust.
+                                crate::mesh::robot_dispatch::global().remove_node(trusted_id);
                             }
                             info!(
                                 "Odlaczony z mesh przez {} — usunieto {} kluczy",
@@ -1862,6 +1868,9 @@ fn spawn_quic_event_handler(
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
                             crate::services::mesh_keys::sync::forget_peer(&revoked_node_id);
+                            // Drop the revoked node's advertised robots so the
+                            // resolver stops routing commands to an untrusted owner.
+                            crate::mesh::robot_dispatch::global().remove_node(&revoked_node_id);
                             info!(
                                 "Usunieto {} z mesh (propagacja od {})",
                                 revoked_node_id, node_id
@@ -1896,6 +1905,9 @@ fn spawn_quic_event_handler(
                     }
 
                     info!("Node {} opuszcza mesh (graceful leave)", node_id);
+                    // Drop the leaving node's advertised robots so the resolver
+                    // stops routing commands to an owner that is going offline.
+                    crate::mesh::robot_dispatch::global().remove_node(&node_id);
                     qm_events.disconnect_peer(&node_id).await;
                 }
                 Ok(IrohMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
@@ -2227,6 +2239,57 @@ fn spawn_quic_event_handler(
                         }
                         Err(e) => {
                             warn!(peer = %from_node_id, "MeshServicesUpdate decode error: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::RobotsAnnounceReceived { from_node_id, data }) => {
+                    let is_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !is_trusted {
+                        debug!(peer = %from_node_id, "RobotsAnnounce od niezaufanego — ignoruje");
+                        continue;
+                    }
+                    match crate::mesh::cbor::decode::<
+                        crate::mesh::robot_dispatch::RobotsAnnouncePayload,
+                    >(&data)
+                    {
+                        Ok(payload) => {
+                            // Bind the announce to its transport-authenticated
+                            // sender (and skip our own echo): a trusted node must
+                            // not advertise robots on behalf of another node id.
+                            // Key on `from_node_id` (transport), never the
+                            // self-claimed payload field.
+                            match crate::mesh::robot_dispatch::bind_announce_sender(
+                                &payload.from_node_id,
+                                &from_node_id,
+                                &local_node_id,
+                            ) {
+                                Some(key) => {
+                                    debug!(
+                                        peer = %from_node_id,
+                                        count = payload.robots.len(),
+                                        "RobotsAnnounce: replace_node"
+                                    );
+                                    crate::mesh::robot_dispatch::global()
+                                        .replace_node(key, payload.robots);
+                                }
+                                None => {
+                                    if payload.from_node_id != from_node_id
+                                        && payload.from_node_id != local_node_id
+                                    {
+                                        warn!(
+                                            peer = %from_node_id,
+                                            claimed = %payload.from_node_id,
+                                            "RobotsAnnounce: from_node_id mismatch — dropping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "RobotsAnnounce decode error: {}", e);
                         }
                     }
                 }
@@ -2845,6 +2908,34 @@ fn spawn_heartbeat_sender(
                             }
                             Err(e) => {
                                 warn!(error = %e, "MeshServicesAnnounce: build_local_snapshot failed");
+                            }
+                        }
+                    }
+                }
+
+                // Robots registry — anti-drift snapshot broadcast co 600
+                // heartbeatow (~5 min), tak jak services-announce. Pozwala
+                // zdalnemu nodowi B odkryc, ktory node A posiada dany robot
+                // (resolver `resolve_robot_owner` czyta ten sam globalny rejestr).
+                if heartbeat_count % 600 == 0 {
+                    if let Some(ref pool) = db_pool {
+                        let robots = crate::mesh::robot_dispatch::refresh_local_advertisement(
+                            pool,
+                            &local_node_id,
+                        );
+                        if !robots.is_empty() {
+                            let payload = crate::mesh::robot_dispatch::RobotsAnnouncePayload {
+                                from_node_id: local_node_id.clone(),
+                                robots,
+                            };
+                            if let Ok(bytes) = crate::mesh::cbor::encode(&payload) {
+                                let _ = quic_mesh
+                                    .broadcast_ufp2_to_trusted(
+                                        tentaflow_protocol::mesh::MESH_MSG_ROBOTS_ANNOUNCE,
+                                        &bytes,
+                                        None,
+                                    )
+                                    .await;
                             }
                         }
                     }
