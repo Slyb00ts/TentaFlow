@@ -2719,8 +2719,11 @@ pub async fn ml_studio_ft_deploy(
             serde_json::json!(if error.is_none() { "deploying" } else { "failed" }),
         );
         // Węzeł, na którym model JEST WDROŻONY (może być inny niż węzeł artefaktu
-        // po transferze B→C). Czat routuje zapytania właśnie tam.
-        obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
+        // po transferze B→C). Czat routuje zapytania właśnie tam — ustawiamy TYLKO
+        // przy sukcesie, żeby po nieudanym deployu nie routować w pustkę.
+        if error.is_none() {
+            obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
+        }
     }
     repository::update_model_metrics(&payload.model_id, &merged.to_string()).map_err(db_err)?;
 

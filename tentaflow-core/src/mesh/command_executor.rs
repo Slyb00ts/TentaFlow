@@ -452,6 +452,7 @@ impl MeshCommandExecutor {
                 total,
                 data_b64,
             } => match crate::ml_studio::mesh_artifact::recv_chunk(
+                from_node_id,
                 &transfer_id,
                 &name,
                 seq,
@@ -479,6 +480,17 @@ impl MeshCommandExecutor {
         src_path: String,
         target_node_id: String,
     ) -> CommandResponse {
+        // Fail-closed: węzeł docelowy musi być zaufany lokalnie, a `src_path` musi
+        // być legalnym katalogiem artefaktu ML Studio (nie dowolny katalog na dysku).
+        if !self.security.is_trusted(&target_node_id) {
+            return CommandResponse::fail(format!("target {} nie jest zaufany", target_node_id));
+        }
+        if !crate::ml_studio::mesh_artifact::is_allowed_artifact_dir(&src_path) {
+            return CommandResponse::fail(format!(
+                "src_path nie jest dozwolonym katalogiem artefaktu: {}",
+                src_path
+            ));
+        }
         let Some(ctx) = self.service_action_ctx().await else {
             return CommandResponse::fail("service action context not configured");
         };
