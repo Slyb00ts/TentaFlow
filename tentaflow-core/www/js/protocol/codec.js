@@ -2903,6 +2903,26 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(FtChatRequest). Zapytanie do wdrożonego modelu FT
+   * (test/„użyj"). Gdy model żyje na innym węźle mesh, Core proxuje przez MlChat.
+   * payload: { modelId, message, maxTokens? }
+   */
+  mlStudioFtChatRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioFtChatRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      String(payload.message ?? ''),
+      Number(payload.maxTokens ?? payload.max_tokens ?? 256),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::SkillsBody(ListRequest) — UserSession. Skills registry list
    * with optional tag/source/status filters.
    * payload: { tag?, source?, status? }

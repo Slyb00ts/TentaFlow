@@ -2992,6 +2992,12 @@ function renderModelsTab(panel, p) {
         const modelId = String(m.modelId ?? m.model_id ?? '');
         const baseModel = String(m.baseModel ?? m.base_model ?? '');
         const modelName = String(m.name ?? (modelId || '—'));
+        // Model wdrożony do inferencji → metryki niosą `inference_model_name`.
+        let deployed = false;
+        try {
+          const mj = JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
+          deployed = Boolean(mj.inference_model_name);
+        } catch (_) { deployed = false; }
         return {
           model: modelName,
           framework: String(m.framework ?? '—') || '—',
@@ -3003,9 +3009,10 @@ function renderModelsTab(panel, p) {
           _modelId: modelId,
           _modelName: modelName,
           // Model detekcji (RF-DETR) → akcja „Wykryj"; model FT (adapter, niepuste
-          // baseModel) → „Eksportuj GGUF"; tabularne → brak akcji.
+          // baseModel) → „Eksportuj GGUF"; wdrożony FT → też „Zapytaj".
           _isRecog: String(m.framework ?? '') === 'rfdetr',
           _canExport: Boolean(modelId && baseModel.trim().length > 0 && String(m.framework ?? '') !== 'rfdetr'),
+          _canChat: Boolean(modelId && deployed),
         };
       });
       // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
@@ -3020,6 +3027,28 @@ function renderModelsTab(panel, p) {
           btn.textContent = 'Wykryj na zdjęciu';
           btn.addEventListener('click', () => openRecogDetectPanel(p, row._modelId, row._modelName));
           return btn;
+        }
+        // Model FT: gdy wdrożony → przycisk „Zapytaj"; w przeciwnym razie eksport.
+        if (row._canChat) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+          const ask = document.createElement('tf-button');
+          ask.setAttribute('size', 'sm');
+          ask.setAttribute('variant', 'primary');
+          ask.setAttribute('icon', 'sparkle');
+          ask.textContent = 'Zapytaj';
+          ask.addEventListener('click', () => openFtChatPanel(row._modelId, row._modelName));
+          wrap.appendChild(ask);
+          if (row._canExport) {
+            const exp = document.createElement('tf-button');
+            exp.setAttribute('size', 'sm');
+            exp.setAttribute('variant', 'outline');
+            exp.setAttribute('icon', 'package');
+            exp.textContent = 'Eksportuj GGUF';
+            exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+            wrap.appendChild(exp);
+          }
+          return wrap;
         }
         if (!row._canExport) return null;
         const btn = document.createElement('tf-button');
@@ -3119,6 +3148,64 @@ function renderDetections(host, b64, mime, dets, width, height) {
     <div class="ml-studio-data-head" style="margin-top:10px">${sprite('check')} Wykryto ${dets.length} obiektów</div>
     <ul class="ml-studio-detect-list">${list}</ul>
   `;
+}
+
+// Czat z wdrożonym modelem FT (test/„użyj"). Modal: prompt → mlStudioFtChatRequest
+// → odpowiedź. Gdy model żyje na innym węźle mesh, Core proxuje przez MlChat —
+// dla UI to ta sama akcja. Pierwsze zapytanie może chwilę potrwać (ładowanie GGUF).
+function openFtChatPanel(modelId, modelName) {
+  if (!modelId) return;
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', `Zapytaj model — ${modelName}`);
+  modal.setAttribute('size', 'lg');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Wpisz zapytanie — model odpowie przez lokalny silnik inferencji (a gdy żyje na innym węźle mesh, Core proxuje zapytanie do niego). Pierwsza odpowiedź może chwilę potrwać (ładowanie modelu).</p>
+      <tf-textarea id="ml-studio-chat-input" rows="3" placeholder="np. Czy nalepka ADR jest poprawnie naklejona?"></tf-textarea>
+      <div style="display:flex;gap:8px;align-items:center;margin:10px 0">
+        <tf-input type="number" id="ml-studio-chat-maxtok" label="Maks. tokenów" value="256" min="1" max="2048" step="16" style="width:160px"></tf-input>
+        <tf-button variant="primary" icon="sparkle" id="ml-studio-chat-send" style="align-self:flex-end">Zapytaj</tf-button>
+      </div>
+      <div id="ml-studio-chat-answer"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-chat-close>Zamknij</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-chat-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+
+  const send = async () => {
+    const input = modal.querySelector('#ml-studio-chat-input');
+    const message = String(input?.value ?? '').trim();
+    const answerHost = modal.querySelector('#ml-studio-chat-answer');
+    if (!message) { toast('Wpisz zapytanie', 'info'); return; }
+    const maxTokens = Number(modal.querySelector('#ml-studio-chat-maxtok')?.value ?? 256);
+    const btn = modal.querySelector('#ml-studio-chat-send');
+    btn?.setAttribute('disabled', '');
+    if (answerHost) answerHost.innerHTML = '<div class="ml-studio-export-deploy-progress"><tf-spinner size="sm"></tf-spinner><span>Generowanie odpowiedzi…</span></div>';
+    try {
+      const resp = await ApiBinary.one('mlStudioFtChatRequest', { modelId, message, maxTokens });
+      if (resp?.error) throw new Error(resp.error);
+      const answer = String(resp?.answer ?? '').trim();
+      if (answerHost) {
+        answerHost.innerHTML = answer
+          ? `<div class="ml-studio-data-head" style="margin-top:6px">${sprite('sparkle')} Odpowiedź modelu</div><pre class="ml-studio-chat-text" style="white-space:pre-wrap;word-break:break-word;background:var(--surface-2,#1a1f2b);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;margin:6px 0 0;font-family:inherit"></pre>`
+          : `<div class="ml-studio-ft-done-msg">Model nie zwrócił treści — zwiększ liczbę tokenów lub spróbuj ponownie.</div>`;
+        const pre = answerHost.querySelector('.ml-studio-chat-text');
+        if (pre) pre.textContent = answer;
+      }
+    } catch (err) {
+      if (answerHost) answerHost.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Zapytanie nieudane: ${escapeHtml(err.message || String(err))}</div>`;
+    } finally {
+      btn?.removeAttribute('disabled');
+    }
+  };
+  modal.querySelector('#ml-studio-chat-send')?.addEventListener('click', send);
 }
 
 // =============================================================================
@@ -3248,9 +3335,11 @@ function openFtExportPanel(p, modelId, modelName) {
     const safe = escapeHtml(name || modelName || modelId);
     slot.innerHTML = `
       <div class="ml-studio-export-deploy-ok">
-        ${sprite('check')} <span>Model wdrożony do inferencji jako «<code class="ml-studio-mono">${safe}</code>». Możesz go odpytać przez API <code class="ml-studio-mono">/v1</code> lub w czacie (model: <code class="ml-studio-mono">${safe}</code>).</span>
+        ${sprite('check')} <span>Model wdrożony do inferencji jako «<code class="ml-studio-mono">${safe}</code>». Odpytaj go niżej albo przez API <code class="ml-studio-mono">/v1</code>.</span>
       </div>
+      <tf-button variant="primary" icon="sparkle" id="ml-studio-deploy-chat-btn" style="margin-top:8px">Zapytaj model</tf-button>
     `;
+    byId('ml-studio-deploy-chat-btn')?.addEventListener('click', () => openFtChatPanel(modelId, name || modelName));
   };
 
   // Błąd wdrożenia — komunikat + ponowienie akcji.

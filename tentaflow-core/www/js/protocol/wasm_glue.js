@@ -3382,6 +3382,26 @@ export function encodeMlStudioDatasetsListRequest(project_id) {
 
 /**
  * @param {string} model_id
+ * @param {string} message
+ * @param {number} max_tokens
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtChatRequest(model_id, message, max_tokens) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(message, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtChatRequest(ptr0, len0, ptr1, len1, max_tokens);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} model_id
  * @returns {Uint8Array}
  */
 export function encodeMlStudioFtDeployRequest(model_id) {

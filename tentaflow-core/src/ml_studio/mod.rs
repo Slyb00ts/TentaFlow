@@ -8,6 +8,7 @@
 pub mod coco_annotate;
 pub mod db;
 pub mod export_llm;
+pub mod infer;
 pub mod models;
 pub mod profile;
 pub mod repository;

@@ -2603,10 +2603,23 @@ pub async fn ml_studio_ft_deploy(
     })
     .to_string();
 
+    // Węzeł, na którym żyje GGUF (zapisany przy treningu/eksporcie). Dla modeli
+    // z mesh `gguf_path` jest ścieżką NA tym węźle — deploy musi tam trafić, bo
+    // plik nie istnieje lokalnie. `service_manifest_deploy` sam forwarduje deploy
+    // przez mesh (ServiceDeployRemote), gdy node_id != lokalny.
+    let local_node = ctx.state.local_node_id.to_string();
+    let deploy_node = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| local_node.clone());
+
     let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
         engine_id: "llama-cpp".to_string(),
         deploy_method: "native".to_string(),
-        node_id: ctx.state.local_node_id.to_string(),
+        node_id: deploy_node,
         config_json,
     };
 
@@ -2643,6 +2656,103 @@ pub async fn ml_studio_ft_deploy(
             status,
             error,
         },
+    )))
+}
+
+/// Zapytanie do wdrożonego modelu FT (test/„użyj"). Model lokalny → inferencja
+/// wprost przez Router. Model z mesh (`node_id` w metrykach) → komenda `MlChat`
+/// do węzła-właściciela, który odpala inferencję na swoim silniku i zwraca tekst.
+/// Cała komunikacja A↔B idzie przez mesh — A nigdy nie woła zdalnego serwisu wprost.
+#[handler(variant = "MlStudioFtChatRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_ft_chat(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::FtChatRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioFtChatRequest")),
+    };
+    if payload.message.trim().is_empty() {
+        return Err(ProtocolError::bad_request("puste zapytanie"));
+    }
+    let org = require_org(ctx)?;
+    let model = repository::get_model(&payload.model_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
+    require_project_member(&org.user_id, &model.project_id)?;
+
+    let metrics: serde_json::Value = serde_json::from_str(&model.metrics_json)
+        .map_err(|e| ProtocolError::internal(format!("stored metrics corrupt: {}", e)))?;
+
+    // Model musi być wdrożony — alias inferencji ustawia `ml_studio_ft_deploy`.
+    let model_name = metrics
+        .get("inference_model_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ProtocolError::bad_request("najpierw wdróż model (Deploy)"))?
+        .to_string();
+
+    let max_tokens = payload.max_tokens.clamp(1, 2048);
+
+    let local_node = ctx.state.local_node_id.to_string();
+    let model_node = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+        .map(str::to_string);
+
+    let (answer, error) = match model_node {
+        Some(node) => {
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            // Fail-closed: brak mesh_security = brak weryfikacji zaufania → odmowa.
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&node) {
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
+            }
+            let cmd = tentaflow_protocol::mesh::MeshCommandType::MlChat {
+                model_name: model_name.clone(),
+                message: payload.message.clone(),
+                max_tokens,
+            };
+            match iroh.send_command_and_wait(&node, cmd, 120).await {
+                Ok(resp) => {
+                    if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlChatResult {
+                        answer,
+                        error,
+                    } = resp.payload
+                    {
+                        (answer, error)
+                    } else if !resp.ok {
+                        (String::new(), resp.error.or(Some("remote chat failed".into())))
+                    } else {
+                        (String::new(), Some("unexpected mesh chat response".into()))
+                    }
+                }
+                Err(e) => (String::new(), Some(format!("mesh chat: {}", e))),
+            }
+        }
+        None => match crate::ml_studio::infer::run_local_chat(
+            &ctx.state.router,
+            &model_name,
+            &payload.message,
+            max_tokens,
+        )
+        .await
+        {
+            Ok(answer) => (answer, None),
+            Err(e) => (String::new(), Some(e.to_string())),
+        },
+    };
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtChatResponse(
+        tentaflow_protocol::MlStudioFtChatResponse { answer, error },
     )))
 }
 

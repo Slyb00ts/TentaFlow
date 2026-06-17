@@ -488,6 +488,14 @@ pub enum MeshCommandType {
     MlExportStatus {
         export_id: String,
     },
+    /// ML Studio: zapytanie do modelu FT wdrożonego na odbiorcy (alias `model_name`
+    /// w jego lokalnym routingu). Odbiorca odpala inferencję lokalnie i zwraca
+    /// `MlChatResult`. Pozwala UŻYĆ z Node A modelu żyjącego na Node B. Appended at END.
+    MlChat {
+        model_name: String,
+        message: String,
+        max_tokens: u32,
+    },
 }
 
 // =============================================================================
@@ -582,6 +590,12 @@ pub enum MeshCommandResponsePayload {
     /// ML Studio: status zdalnego eksportu GGUF (JSON: status/gguf_path/error)
     /// produkowany przez odbiorcę. Appended at END (kolejność = wire compat).
     MlExportStatusResult { status_json: String },
+    /// ML Studio: odpowiedź modelu FT z odbiorcy (wygenerowany tekst lub `error`).
+    /// Appended at END (kolejność = wire compat).
+    MlChatResult {
+        answer: String,
+        error: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -757,6 +771,12 @@ impl std::fmt::Debug for MeshCommandType {
             Self::MlExportStatus { export_id } => f
                 .debug_struct("MlExportStatus")
                 .field("export_id", export_id)
+                .finish(),
+            Self::MlChat { model_name, max_tokens, message } => f
+                .debug_struct("MlChat")
+                .field("model_name", model_name)
+                .field("max_tokens", max_tokens)
+                .field("message_len", &message.len())
                 .finish(),
         }
     }

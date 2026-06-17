@@ -502,6 +502,8 @@ pub use message_body::{
     MlStudioFtExportStatusResponse,
     MlStudioFtDeployRequest,
     MlStudioFtDeployResponse,
+    MlStudioFtChatRequest,
+    MlStudioFtChatResponse,
     MlStudioLossPoint,
     MlStudioRecogHyperparams,
     MlStudioRecogTrainStartRequest,

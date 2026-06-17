@@ -25,6 +25,9 @@ pub struct ServiceActionContext {
     pub db: DbPool,
     pub port_allocator: Arc<PortAllocator>,
     pub iroh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    /// Router inferencji tego węzła — używany przez `MlChat`, by odpalić model
+    /// FT wdrożony lokalnie (na tym węźle) na zlecenie innego węzła mesh.
+    pub router: Arc<crate::routing::router::Router>,
 }
 
 /// Odpowiedz na komende mesh — mapowana 1:1 na MeshMessage::MeshCommandResponse
@@ -433,6 +436,37 @@ impl MeshCommandExecutor {
                     Err(e) => CommandResponse::fail(format!("mesh export status: {}", e)),
                 }
             }
+            MeshCommandType::MlChat {
+                model_name,
+                message,
+                max_tokens,
+            } => self.handle_ml_chat(model_name, message, max_tokens).await,
+        }
+    }
+
+    /// Owner side: zapytanie do modelu FT wdrożonego NA TYM węźle (alias w lokalnym
+    /// routingu). Inicjator (Node A) przysyła `model_name` + tekst; odpalamy
+    /// inferencję lokalnym Routerem i zwracamy odpowiedź. Pozwala UŻYĆ z A modelu z B.
+    async fn handle_ml_chat(
+        &self,
+        model_name: String,
+        message: String,
+        max_tokens: u32,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("service action context not configured");
+        };
+        match crate::ml_studio::infer::run_local_chat(&ctx.router, &model_name, &message, max_tokens)
+            .await
+        {
+            Ok(answer) => CommandResponse::ok(MeshCommandResponsePayload::MlChatResult {
+                answer,
+                error: None,
+            }),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlChatResult {
+                answer: String::new(),
+                error: Some(e.to_string()),
+            }),
         }
     }
 
