@@ -50,6 +50,9 @@
   <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
   <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></symbol>
   <symbol id="i-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+  <symbol id="i-mesh" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><line x1="7" y1="6" x2="17" y2="6"/><line x1="6" y1="8" x2="11" y2="16"/><line x1="18" y1="8" x2="13" y2="16"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
 </defs>
 </svg>
 
@@ -87,6 +90,9 @@
         <div class="nav-section">
           <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
           <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
           <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
         </div>
         <div class="nav-section">
@@ -124,11 +130,12 @@
           <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-mic"/></svg></div>
           <div class="d-meta">
             <div class="d-name">Whisper PL · SFT × LoRA <span class="chip warning"><span class="dot"></span>trening trwa</span></div>
-            <div class="d-sub">Whisper-large-v3 · modalność audio · job flow_invoke #c47e · 1× RTX 4090</div>
+            <div class="d-sub">Whisper-large-v3 · modalność audio · job flow_invoke #c47e · 1× RTX 4090 @ warszawa-gpu</div>
             <div class="d-badges">
               <span class="chip accent"><svg class="icon"><use href="#i-clock"/></svg>ETA 11 min</span>
               <span class="chip"><svg class="icon"><use href="#i-flag"/></svg>epoka 3/4</span>
               <span class="chip info">freeze encoder</span>
+              <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>node wykonawczy: warszawa-gpu (z grantu projektu)</span>
             </div>
           </div>
           <div class="d-actions">
@@ -152,6 +159,42 @@
             <span class="text-sm text-2">75% · ~1.1 it/s</span>
           </div>
           <div class="progress"><span style="width:75%"></span></div>
+        </div>
+
+        <!-- Wykonanie: wybór node / trening rozproszony -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-mesh"/></svg>Wykonanie <span class="text-3">— node wykonawczy z zasobów przydzielonych projektowi</span></div>
+            <a class="btn btn-ghost btn-sm" href="przeglad-projektu.html">Zasoby projektu<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+          <div class="flex gap-sm wrap" style="margin-bottom:12px;">
+            <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>ml_studio.db zsynchronizowana z mesh (Sync Ledger)</span>
+            <span class="chip info"><svg class="icon"><use href="#i-server"/></svg>dataset (3 200 nagrań) przeniesiony na node wykonawczy przez mesh</span>
+          </div>
+          <div class="field">
+            <label>Node wykonawczy</label>
+            <select class="select">
+              <option>warszawa-gpu (1× RTX 4090) · node-A</option>
+              <option>dgx-01 (8× B300) · node-B · przez mesh</option>
+            </select>
+            <span class="hint">Lista zawiera wyłącznie zasoby przydzielone temu projektowi przez administratora (granty).</span>
+          </div>
+          <div class="toggle-row" style="margin-top:6px;">
+            <span class="toggle"></span>
+            <span>Trening rozproszony na N nodów <span class="text-3">— część pipeline'u Whisper na node-A, część na node-B (dane przez mesh)</span></span>
+          </div>
+        </div>
+
+        <!-- Wykonanie: alternatywny stan — brak przydzielonych zasobów (trening zablokowany) -->
+        <div class="section-card" style="border-color:rgba(245,158,11,0.35);">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--warning);"><use href="#i-info"/></svg>Wykonanie <span class="text-3">— stan: brak zasobów</span></div>
+            <span class="chip warning"><span class="dot"></span>trening zablokowany</span>
+          </div>
+          <div class="callout" style="display:flex;gap:12px;align-items:flex-start;padding:13px 16px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:var(--radius);">
+            <svg class="icon icon-lg" style="color:var(--warning);flex-shrink:0;"><use href="#i-info"/></svg>
+            <p style="font-size:12px;color:var(--text-2);line-height:1.6;"><strong>Brak przydzielonych zasobów — trening niemożliwy.</strong> Projekt nie ma grantu GPU/CPU na żadnym node mesh, więc lista node'ów wykonawczych jest pusta, a start treningu zablokowany. Poproś administratora o przydział w sekcji <a href="admin-zasoby.html" style="color:var(--accent-2);">Zasoby</a>.</p>
+          </div>
         </div>
 
         <!-- Metryki KPI: WER zamiast accuracy -->

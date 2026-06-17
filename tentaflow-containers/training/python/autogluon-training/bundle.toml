@@ -1,0 +1,50 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle tabularnego serwera treningowego AutoGluon.
+#       server.py uruchamiany przez uvicorn na :8201. CUDA (NVIDIA) gdy dostępna,
+#       w przeciwnym razie CPU jako fallback.
+# Przykład: TentaFlow startuje server.py, a Core wysyła POST /train_tabular.
+# =============================================================================
+
+[bundle]
+engine = "autogluon-training"
+description = "AutoGluon tabular AutoML training server (classification + regression)"
+# AutoGluon wspiera 3.9–3.12; 3.11 to bezpieczny środek z gotowymi wheelami.
+python_version = "3.11"
+# Wszystkie zależności pinowane w requirements.lock. `pypi_package` to
+# identity-package bundla — `autogluon.tabular` (NIE meta `autogluon`, które
+# ciągnie multimodal/torch-heavy) — jest już w locku, więc install idempotentny.
+source = "pypi"
+pypi_package = "autogluon.tabular==1.4.0"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8201}",
+]
+internal_port = 8201
+
+[requires]
+# gpu_memory_gb = 0 — GPU NIE jest wymagane: CUDA jedynie przyspiesza GBM-y, a
+# bez GPU bundle działa na CPU (fallback). disk_gb ~12, bo wariant CUDA ciągnie
+# cięższy wheel torcha z kolami CUDA 12.1.
+gpu_memory_gb = 0
+disk_gb = 12
+platforms = ["linux-x86_64"]
+
+# CUDA jest OPCJONALNA, CPU to fallback. Deploy wybiera `cuda` na nodzie z GPU
+# NVIDIA (extra_index z kolami CUDA 12.1 dla torcha — patrz pin torch BEZ sufixu
+# +cu121 w requirements.lock), a `cpu` tam gdzie GPU nie ma (brak extra_index ->
+# torch CPU z PyPI). AutoGluon sam rozdystrybuuje GPU na GBM-y (LightGBM/
+# CatBoost/XGBoost).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu121"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []

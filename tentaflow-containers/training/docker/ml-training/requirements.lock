@@ -1,0 +1,19 @@
+# Pinowane wheels dla bundla ml-training. Te same wersje co obraz Docker
+# (training/docker/ml-training/Dockerfile).
+#
+# torch BEZ sufixu +cu121 — `--extra-index-url` z bundle.toml install_variants
+# decyduje ktory wheel uv pobierze:
+#   * variant `cuda` + extra_index cu121 -> torch-2.4.1+cu121-...whl
+#   * variant `cpu`  (brak extra_index)  -> torch-2.4.1-...-manylinux (CPU)
+torch==2.4.1
+
+transformers==4.46.3
+peft==0.13.2
+trl==0.12.1
+datasets==3.1.0
+accelerate==1.1.1
+bitsandbytes==0.44.1
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+sentencepiece==0.2.0
+protobuf==5.28.3

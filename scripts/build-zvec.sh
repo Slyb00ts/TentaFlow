@@ -258,8 +258,16 @@ case "$PLATFORM" in
   macos-arm64)
     ensure_cmake_pin_on_path
     ensure_apple_libtool_shim_on_program_path
+    # Izolacja symboli: eksportuj WYŁĄCZNIE C API zvec (`_zvec_*`), schowaj
+    # zbundlowane protobuf/abseil/RocksDB. macOS ld64 nie używa version-scriptów —
+    # odpowiednikiem jest allowlista `-exported_symbols_list` (tylko wymienione
+    # symbole są eksportowane). macOS two-level namespace i tak chroni przed
+    # interpozycją, ale to domyka temat dwóch kopii protobuf „na zawsze".
+    ZVEC_EXPORT_LIST="$SRC_DIR/tentaflow_zvec_exports_macos.txt"
+    printf '_zvec_*\n' > "$ZVEC_EXPORT_LIST"
     ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
-      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON ..
+      cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON_BINDINGS=OFF -DBUILD_TOOLS=OFF -DBUILD_TESTING=OFF -DBUILD_C_BINDINGS=ON \
+        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-exported_symbols_list,$ZVEC_EXPORT_LIST" ..
       ninja zvec_c_api -j"$(sysctl -n hw.ncpu)" )
     cp -f "$SRC_DIR/build_zvec/lib/libzvec_c_api.dylib" "$OUT_LIB_DIR/libzvec_c_api.dylib"
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.dylib"

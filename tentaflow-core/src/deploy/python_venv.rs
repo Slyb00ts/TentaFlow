@@ -207,6 +207,7 @@ fn find_bundle_dir(workspace_root: &Path, engine_id: &str) -> Option<PathBuf> {
         "video-gen",
         "music-gen",
         "model-3d-gen",
+        "training",
         "agents",
         "tools",
     ];
@@ -1887,11 +1888,16 @@ fn spawn_engine(
     let torch = crate::paths::torch_home();
     let vllm_cache = crate::paths::vllm_cache_dir();
     let _ = std::fs::create_dir_all(&vllm_cache);
+    // Artefakty treningu (adaptery, scalone modele, GGUF) — pod cache_dir
+    // (np. /mnt/d), NIE na dysku root. Serwis ml-training czyta ARTIFACTS_ROOT.
+    let artifacts = crate::paths::ml_artifacts_dir();
+    let _ = std::fs::create_dir_all(&artifacts);
     for (k, v) in [
         ("HF_HOME", hf.clone().into_os_string()),
         ("HUGGINGFACE_HUB_CACHE", hf.clone().into_os_string()),
         ("TRANSFORMERS_CACHE", hf.clone().into_os_string()),
         ("TORCH_HOME", torch.clone().into_os_string()),
+        ("ARTIFACTS_ROOT", artifacts.clone().into_os_string()),
         // Shared vLLM kernel cache (host path for native; Docker uses
         // CONTAINER_VLLM_CACHE_PATH from standard_engine_env). Persists
         // Triton/torch.compile/FlashInfer JIT across restarts.

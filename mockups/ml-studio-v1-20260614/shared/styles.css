@@ -919,3 +919,113 @@ button { font-family: inherit; }
 /* ----- Wariant 3-kol grid dla niektórych layoutów ML ----- */
 .grid-ml-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
 .grid-ml-1-2 { display: grid; grid-template-columns: 1fr 2fr; gap: 16px; }
+
+/* =============================================================================
+   Responsywność — jeden plik naprawia wszystkie ekrany (współdzielony shell).
+   Desktop bez zmian; media queries tylko zawężają dla tabletu i telefonu.
+   Selektory grup `.app .*` mają podniesioną specyficzność, bo gridy stron są
+   definiowane w lokalnym <style> ŁADOWANYM PO tym arkuszu (inline wygrywa przy
+   równej specyficzności — `.app` przodek to rozstrzyga).
+   ============================================================================= */
+
+/* ----- Tablet (≤900px): węższy sidebar, gridy 4→2, luźniejsze tabele ----- */
+@media (max-width: 900px) {
+  .app { grid-template-columns: 200px 1fr; }
+  .main { padding: 18px 18px; }
+  .screen { padding: 0 16px; }
+  .intro { padding: 0 16px; }
+
+  .kpi-grid,
+  .grid-4,
+  .app .quant-grid,
+  .app .shortcut-grid { grid-template-columns: repeat(2, 1fr); }
+
+  .engine-grid,
+  .grid-3,
+  .radio-card-grid,
+  .app .type-grid,
+  .app .project-grid,
+  .app .target-grid { grid-template-columns: repeat(2, 1fr); }
+
+  .annotate-layout { grid-template-columns: 180px 1fr 220px; }
+  .form-row { grid-template-columns: 180px 1fr; }
+  .slider-row { grid-template-columns: 120px 1fr 64px; }
+}
+
+/* ----- Telefon (≤640px): shell pionowy, wszystkie gridy 1 kolumna ----- */
+@media (max-width: 640px) {
+  html, body { font-size: 13.5px; }
+
+  /* Shell: sidebar zwija się nad treścią jako poziomy pasek nawigacji,
+     main bierze pełną szerokość — zero poziomego scrolla. */
+  .app { grid-template-columns: 1fr; min-height: 0; }
+  .sidebar {
+    border-right: 0; border-bottom: 1px solid var(--border);
+    padding: 12px 0 8px; flex-direction: column;
+  }
+  .sidebar .logo { padding: 0 16px 12px; }
+  .sidebar .footer { margin-top: 12px; }
+  .nav-section { display: flex; flex-wrap: wrap; gap: 2px; padding: 0 10px; margin-bottom: 6px; }
+  .nav-section .heading { width: 100%; }
+  .nav-item { margin-bottom: 0; }
+  .main { padding: 16px 14px; overflow-y: visible; }
+
+  .screen { margin: 24px auto; padding: 0 12px; }
+  .intro { margin-top: 24px; padding: 0 12px; }
+  .intro .rules { grid-template-columns: 1fr; }
+  .index-page { margin: 36px auto; padding: 0 16px; }
+  .index-grid { grid-template-columns: 1fr; }
+
+  /* Nagłówek ekranu — opis pod tytułem, bez wypychania w bok. */
+  .screen-header { flex-direction: column; align-items: flex-start; gap: 4px; padding: 12px 14px; }
+  .screen-header .desc { margin-left: 0; text-align: left; max-width: 100%; }
+
+  /* Wszystkie gridy → 1 kolumna (pełna szerokość kart/sekcji). */
+  .kpi-grid,
+  .grid-2,
+  .grid-3,
+  .grid-4,
+  .engine-grid,
+  .radio-card-grid,
+  .grid-ml-2-1,
+  .grid-ml-1-2,
+  .app .quant-grid,
+  .app .shortcut-grid,
+  .app .type-grid,
+  .app .project-grid,
+  .app .target-grid,
+  .app .objective-grid,
+  .app .model-card-grid,
+  .app .node-grid,
+  .app .alloc-form-grid { grid-template-columns: 1fr; }
+
+  /* Detail header — ikona nad metą, akcje się zawijają. */
+  .detail-header { flex-direction: column; align-items: flex-start; gap: 12px; padding: 14px 16px; }
+  .detail-header .d-actions { flex-wrap: wrap; }
+
+  /* Taby — zawijają się zamiast wychodzić poza ekran. */
+  .tabs-bar { flex-wrap: wrap; }
+  .tabs-bar .tabs-right { margin-left: 0; width: 100%; flex-wrap: wrap; padding: 6px 0 0; }
+  .stepper { flex-wrap: wrap; gap: 10px; }
+  .stepper .s-line { display: none; }
+
+  /* Formularze — etykieta nad polem. */
+  .form-row { grid-template-columns: 1fr; gap: 6px; }
+  .form-row label { padding-top: 0; }
+  .slider-row { grid-template-columns: 1fr; gap: 8px; }
+  .map-row { grid-template-columns: 1fr; gap: 6px; }
+  .map-row .m-arrow { transform: rotate(90deg); justify-self: start; }
+
+  /* Tabele i widoki o stałej szerokości — przewijanie poziome w obrębie
+     kontenera, żeby nie rozpychały całej strony. */
+  .tf-table,
+  .leaderboard { display: block; overflow-x: auto; white-space: nowrap; }
+  .heatmap-wrap,
+  .app .cm-wrap,
+  .app .lookup-table,
+  .annotate-layout { overflow-x: auto; }
+  .annotate-layout { grid-template-columns: 1fr; }
+
+  .section-card { padding: 14px 14px; }
+  .window { width: 94%; }
+}

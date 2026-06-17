@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<!-- ===== Plik: p02-udostepnianie.html — Udostępnianie projektu: członkowie, role i zaproszenia (uprawnienia per-projekt §11.1) ===== -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — ML Studio · Udostępnianie projektu</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ----- Awatar członka (poza .user-chip — własna reguła na var(--*)) ----- */
+  .member-cell { display: flex; align-items: center; gap: 11px; }
+  .member-avatar {
+    width: 34px; height: 34px; border-radius: 50%; background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: white; font-size: 12px; flex-shrink: 0;
+  }
+  .member-avatar.muted { background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border); }
+  .member-name { font-size: 13px; font-weight: 700; }
+  .member-mail { font-size: 11px; color: var(--text-3); }
+
+  /* ----- Legenda ról ----- */
+  .role-legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .role-item {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .role-item .ri-head { display: flex; align-items: center; gap: 7px; }
+  .role-item .ri-desc { font-size: 11.5px; color: var(--text-2); line-height: 1.55; }
+
+  /* ----- Formularz zaproszenia ----- */
+  .invite-row { display: grid; grid-template-columns: 1fr 180px auto; gap: 12px; align-items: flex-end; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 2a2.5 2.5 0 0 1 2.5 2.5v15a2.5 2.5 0 0 1-2.5 2.5 2.5 2.5 0 0 1-2.5-2.5A2.5 2.5 0 0 1 4.5 17 2.5 2.5 0 0 1 2 14.5a2.5 2.5 0 0 1 1.5-2.3A2.5 2.5 0 0 1 2 9.5 2.5 2.5 0 0 1 4.5 7 2.5 2.5 0 0 1 7 4.5 2.5 2.5 0 0 1 9.5 2z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 2.5 2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-1.5-2.3 2.5 2.5 0 0 0 1.5-2.4A2.5 2.5 0 0 0 19.5 7 2.5 2.5 0 0 0 17 4.5 2.5 2.5 0 0 0 14.5 2z"/></symbol>
+  <symbol id="i-truck" viewBox="0 0 24 24"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></symbol>
+  <symbol id="i-crown" viewBox="0 0 24 24"><path d="M2 18h20l-2-11-5 5-3-7-3 7-5-5z"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="22 6 12 13 2 6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
+  <symbol id="i-chevron-l" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+</defs>
+</svg>
+
+<div class="intro">
+  <h1>ML Studio — Udostępnianie projektu</h1>
+  <p class="lead">
+    Projekt ma <strong>właściciela</strong> (twórcę) i domyślnie jest prywatny — widzi go tylko właściciel.
+    Tutaj właściciel <strong>zaprasza</strong> innych użytkowników (po nazwie lub e-mailu) i nadaje im rolę.
+    Zaproszony zobaczy projekt na swoim koncie (sekcja „Udostępnione mi") i będzie działał wg roli:
+    <strong>Edytor</strong> lub <strong>Przeglądający</strong>.
+  </p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-crown"/></svg>Właściciel zarządza dostępem</h3>
+      <p>Tylko właściciel zaprasza, usuwa członków i zmienia role. Właściciela nie da się usunąć.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-mail"/></svg>Zaproszenie = dostęp</h3>
+      <p>Zaproszenie po użytkowniku lub e-mailu. Projekt pojawia się na koncie zaproszonego z nadaną rolą.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon icon-sm"><use href="#i-eye"/></svg>Role określają zakres</h3>
+      <p>Edytor pracuje na danych/schemacie/treningu. Przeglądający tylko podgląda — bez zmian.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">P2</span>
+    <h2>Udostępnianie projektu — członkowie, role, zaproszenia</h2>
+    <div class="desc">Tabela członków · formularz zaproszenia · legenda ról.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services<span class="badge">13</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-apps"/></svg>Applications</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups<span class="badge">5</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">ML Engineer</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <a class="crumb" href="p00-projekty.html">ML Studio</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="p00-projekty.html">Projekty</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <a class="crumb" href="przeglad-projektu.html">Rozpoznawanie znaków na cysternach</a>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Udostępnianie</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg viewBox="0 0 24 24"><use href="#i-truck"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Udostępnianie — „Rozpoznawanie znaków na cysternach"</div>
+            <div class="d-sub">Zarządzaj członkami projektu i ich rolami. Domyślnie projekt jest prywatny.</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-crown"/></svg>Właściciel: Ty (Piotr Jarocki)</span>
+              <span class="chip"><svg class="icon"><use href="#i-users"/></svg>3 członków</span>
+              <span class="chip info"><svg class="icon"><use href="#i-mail"/></svg>1 zaproszenie oczekuje</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <a class="btn btn-secondary" href="przeglad-projektu.html"><svg class="icon"><use href="#i-chevron-l"/></svg>Wróć do projektu</a>
+          </div>
+        </div>
+
+        <!-- Sekcja: członkowie projektu -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-users"/></svg>Członkowie projektu</div>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Użytkownik</th><th>Rola</th><th>Dodany przez</th><th>Data</th><th style="text-align:right;">Akcja</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>
+                  <div class="member-cell">
+                    <div class="member-avatar">PJ</div>
+                    <div><div class="member-name">Piotr Jarocki <span class="text-3">(Ty)</span></div><div class="member-mail">piotr.jarocki@euvic.pl</div></div>
+                  </div>
+                </td>
+                <td><span class="chip accent"><svg class="icon"><use href="#i-crown"/></svg>Właściciel</span></td>
+                <td class="text-3">— (twórca projektu)</td>
+                <td class="text-3">14 dni temu</td>
+                <td style="text-align:right;"><span class="text-xs text-3">właściciela nie można usunąć</span></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="member-cell">
+                    <div class="member-avatar">AK</div>
+                    <div><div class="member-name">Anna Kowalska</div><div class="member-mail">anna.kowalska@euvic.pl</div></div>
+                  </div>
+                </td>
+                <td>
+                  <select class="select" style="max-width:170px;">
+                    <option>Edytor</option>
+                    <option>Przeglądający</option>
+                  </select>
+                </td>
+                <td class="text-2">Piotr Jarocki</td>
+                <td class="text-3">5 dni temu</td>
+                <td style="text-align:right;"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="member-cell">
+                    <div class="member-avatar">MN</div>
+                    <div><div class="member-name">Marek Nowak</div><div class="member-mail">marek.nowak@euvic.pl</div></div>
+                  </div>
+                </td>
+                <td>
+                  <select class="select" style="max-width:170px;">
+                    <option>Przeglądający</option>
+                    <option>Edytor</option>
+                  </select>
+                </td>
+                <td class="text-2">Piotr Jarocki</td>
+                <td class="text-3">2 dni temu</td>
+                <td style="text-align:right;"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button></td>
+              </tr>
+              <tr>
+                <td>
+                  <div class="member-cell">
+                    <div class="member-avatar muted"><svg class="icon"><use href="#i-mail"/></svg></div>
+                    <div><div class="member-name">tomasz.wis@example.com</div><div class="member-mail">zaproszenie oczekuje na akceptację</div></div>
+                  </div>
+                </td>
+                <td><span class="chip"><svg class="icon"><use href="#i-edit"/></svg>Edytor</span></td>
+                <td class="text-2">Piotr Jarocki</td>
+                <td class="text-3">dziś</td>
+                <td style="text-align:right;">
+                  <span class="chip warning"><span class="dot"></span>oczekuje</span>
+                  <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Cofnij</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Sekcja: zaproś nowego członka -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-mail"/></svg>Zaproś do projektu</div>
+          </div>
+          <div class="invite-row">
+            <div class="field" style="margin-bottom:0;">
+              <label>Użytkownik lub e-mail</label>
+              <input class="input" placeholder="np. anna.kowalska lub osoba@example.com">
+              <span class="hint">Wpisz istniejącego użytkownika TentaFlow albo adres e-mail spoza systemu.</span>
+            </div>
+            <div class="field" style="margin-bottom:0;">
+              <label>Rola</label>
+              <select class="select">
+                <option>Edytor</option>
+                <option>Przeglądający</option>
+              </select>
+            </div>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-send"/></svg>Wyślij zaproszenie</button>
+          </div>
+          <div class="hint mt-md" style="display:flex;align-items:center;gap:7px;">
+            <svg class="icon icon-sm"><use href="#i-info"/></svg>
+            Zaproszony zobaczy projekt na swoim koncie i będzie działał wg roli. Rolę „Właściciel" nadaje się
+            tylko przez przekazanie projektu — nie przez zaproszenie.
+          </div>
+        </div>
+
+        <!-- Legenda ról -->
+        <div class="section-card" style="margin-bottom:0;">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-info"/></svg>Co potrafi każda rola</div>
+          </div>
+          <div class="role-legend">
+            <div class="role-item">
+              <div class="ri-head"><span class="chip accent"><svg class="icon"><use href="#i-crown"/></svg>Właściciel</span></div>
+              <p class="ri-desc">Pełnia uprawnień + zarządzanie dostępem: zaprasza, usuwa członków, zmienia role,
+                usuwa projekt. Jeden na projekt (twórca).</p>
+            </div>
+            <div class="role-item">
+              <div class="ri-head"><span class="chip"><svg class="icon"><use href="#i-edit"/></svg>Edytor</span></div>
+              <p class="ri-desc">Pracuje na projekcie: dane, schemat, anotacja, uruchamianie treningu i eksport.
+                Nie zarządza dostępem.</p>
+            </div>
+            <div class="role-item">
+              <div class="ri-head"><span class="chip"><svg class="icon"><use href="#i-eye"/></svg>Przeglądający</span></div>
+              <p class="ri-desc">Tylko podgląd: dane, schemat, wyniki i modele. Nie zmienia anotacji ani nie
+                uruchamia treningu.</p>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

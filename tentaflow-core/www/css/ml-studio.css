@@ -6,6 +6,16 @@
 
 /* ---------- Lista projektów (p00) ---------- */
 
+/* Wrapper of the whole list: stacks the "Moje"/"Udostępnione" sections
+   vertically. The card grid lives in the inner `.ml-studio-grid` per section,
+   so this MUST NOT be a grid itself (otherwise each inner grid collapses into a
+   single 280px column). */
+.ml-studio-list {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
 .ml-studio-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -43,6 +53,25 @@
   gap: 12px;
 }
 
+/* Status-pill na karcie jak w mockupie p00: WERSALIKI + kolorowa kropka
+   (kolor dziedziczy z tonu badge'a — zielony dla `aktywny`, itd.). */
+.ml-studio-card-top tf-badge .tf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ml-studio-card-top tf-badge .tf-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
 .ml-studio-card-ico {
   display: inline-flex;
   align-items: center;
@@ -68,8 +97,10 @@
 }
 
 .ml-studio-card-type {
-  font-size: 12px;
-  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-2);
+  margin-top: 2px;
 }
 
 .ml-studio-card-desc {
@@ -83,31 +114,36 @@
   overflow: hidden;
 }
 
+/* Lekkie metryki inline (jak `.pc-stats` w mockupie p00): wartości + małe
+   etykiety w jednym rzędzie, oddzielone tylko cienkim border-top — bez ramek
+   i tła per metryka. */
 .ml-studio-card-stats {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
 }
 
 .ml-studio-stat {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-2);
-  text-align: center;
+  min-width: 0;
 }
 
 .ml-studio-stat .v {
-  font-size: 18px;
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 800;
   color: var(--text);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ml-studio-stat .l {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-3);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.05em;
 }
 
 .ml-studio-card-foot {
@@ -205,6 +241,377 @@
   }
 }
 
+/* ---------- Kreator: wizard 4-krokowy (p01) ---------- */
+
+.ml-studio-wizard {
+  display: block;
+}
+
+.ml-studio-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-3);
+}
+.ml-studio-breadcrumb .icon {
+  width: 14px;
+  height: 14px;
+}
+.ml-studio-crumb.current {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.ml-studio-wizard-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  padding: 24px;
+}
+
+/* Stepper — numerowane kółka, etykiety i linie łączące ze stanami done/active. */
+.ml-studio-stepper {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  margin-bottom: 28px;
+}
+
+.ml-studio-step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+.ml-studio-step-num {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  border: 2px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-3);
+}
+.ml-studio-step-num .icon {
+  width: 16px;
+  height: 16px;
+  stroke-width: 3;
+}
+
+.ml-studio-step--active .ml-studio-step-num {
+  border-color: var(--accent-1, var(--accent-2));
+  background: var(--accent-glow);
+  color: var(--accent-2);
+}
+.ml-studio-step--done .ml-studio-step-num {
+  border-color: var(--accent-1, var(--accent-2));
+  background: var(--gradient-accent, var(--accent-1, var(--accent-2)));
+  color: #fff;
+}
+
+.ml-studio-s-label {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+.ml-studio-step--active .ml-studio-s-label,
+.ml-studio-step--done .ml-studio-s-label {
+  color: var(--text);
+}
+.ml-studio-s-desc {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-s-line {
+  flex: 1 1 auto;
+  height: 2px;
+  min-width: 16px;
+  margin: 0 6px;
+  align-self: center;
+  background: var(--border);
+}
+.ml-studio-s-line--done {
+  background: var(--accent-1, var(--accent-2));
+}
+
+.ml-studio-wizard-body {
+  min-height: 180px;
+}
+
+/* Panel "co dalej" — edukacyjna mapa kroków zależna od typu (krok 2). */
+.ml-studio-next-steps {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent-1, var(--border));
+  border-radius: var(--radius);
+  background: linear-gradient(135deg, var(--accent-glow), transparent);
+}
+.ml-studio-ns-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent-2);
+  margin-bottom: 10px;
+}
+.ml-studio-ns-title .icon {
+  width: 15px;
+  height: 15px;
+}
+.ml-studio-ns-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ml-studio-ns-pill {
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 5px 11px;
+  border-radius: 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.ml-studio-ns-arrow {
+  display: inline-flex;
+  color: var(--accent-2);
+}
+.ml-studio-ns-arrow .icon {
+  width: 14px;
+  height: 14px;
+}
+.ml-studio-ns-note {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* Krok 3 — dane i źródła. */
+.ml-studio-wiz-data {
+  display: grid;
+  gap: 14px;
+}
+.ml-studio-wiz-file-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+}
+.ml-studio-wiz-file-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ml-studio-wiz-file-name .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2);
+}
+.ml-studio-wiz-file-size {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ml-studio-wiz-file-info tf-button {
+  margin-left: auto;
+}
+.ml-studio-wiz-sources {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ml-studio-wiz-source-soon {
+  opacity: 0.55;
+}
+.ml-studio-wiz-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ml-studio-wiz-hint .icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+}
+
+/* Krok 4 — podsumowanie. */
+.ml-studio-wiz-summary {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  padding: 18px 20px;
+}
+.ml-studio-wiz-summary-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-2);
+  margin-bottom: 14px;
+}
+.ml-studio-wiz-summary-title .icon {
+  width: 16px;
+  height: 16px;
+}
+.ml-studio-wiz-summary-list {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 10px 18px;
+  margin: 0;
+}
+.ml-studio-wiz-summary-list dt {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ml-studio-wiz-summary-list dd {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.ml-studio-wiz-summary-note,
+.ml-studio-wiz-summary .ml-studio-wiz-hint {
+  margin-top: 14px;
+}
+.ml-studio-wiz-summary-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-1, var(--border));
+  background: var(--accent-glow);
+}
+.ml-studio-wiz-summary-note .icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  color: var(--accent-2);
+}
+
+/* Pasek akcji. */
+.ml-studio-wizard-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.ml-studio-wiz-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+@media (max-width: 767px) {
+  .ml-studio-wizard-card {
+    padding: 16px;
+  }
+  /* Stepper zwija się: mniejsze kółka, ukryte podetykiety, krótkie linie. */
+  .ml-studio-stepper {
+    gap: 2px;
+    margin-bottom: 22px;
+  }
+  .ml-studio-step {
+    gap: 7px;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .ml-studio-step-num {
+    width: 30px;
+    height: 30px;
+    font-size: 13px;
+  }
+  .ml-studio-s-label {
+    font-size: 11.5px;
+    line-height: 1.25;
+  }
+  .ml-studio-s-desc {
+    display: none;
+  }
+  .ml-studio-s-line {
+    min-width: 8px;
+    margin: 0 2px;
+  }
+  .ml-studio-wiz-summary-list {
+    grid-template-columns: 1fr;
+    gap: 4px 0;
+  }
+  .ml-studio-wiz-summary-list dd {
+    margin-bottom: 8px;
+  }
+  .ml-studio-wizard-actions {
+    flex-wrap: wrap;
+  }
+  .ml-studio-wizard-actions tf-button {
+    flex: 1 1 auto;
+  }
+  .ml-studio-wiz-actions-right {
+    flex: 1 1 100%;
+  }
+  .ml-studio-wiz-actions-right tf-button {
+    flex: 1 1 auto;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Stepper w pionie, by etykiety nie ściskały kółek na bardzo wąskich ekranach. */
+  .ml-studio-stepper {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+  }
+  .ml-studio-step {
+    flex: 0 0 auto;
+  }
+  .ml-studio-s-desc {
+    display: block;
+  }
+  .ml-studio-s-line {
+    width: 2px;
+    height: 14px;
+    min-width: 0;
+    margin: 2px 0 2px 17px;
+    align-self: flex-start;
+  }
+  .ml-studio-wizard-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ml-studio-wizard-actions tf-button,
+  .ml-studio-wiz-actions-right {
+    width: 100%;
+  }
+}
+
 /* ---------- Szczegół projektu ---------- */
 
 .ml-studio-detail-top {
@@ -226,4 +633,1468 @@
 
 .ml-studio-tab-panel {
   margin-top: 16px;
+}
+
+/* ---------- Podział listy: Moje / Udostępnione mi ---------- */
+
+.ml-studio-section-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 26px 0 14px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-section-head:first-child {
+  margin-top: 0;
+}
+
+.ml-studio-section-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.ml-studio-section-head h3 .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+/* ---------- Pasek właściciela / roli na karcie + akcja Udostępnij ---------- */
+
+.ml-studio-card {
+  position: relative;
+}
+
+.ml-studio-card-owner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-card-owner .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.ml-studio-card-share {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+}
+
+/* ---------- Ekran udostępniania (p02) ---------- */
+
+.ml-studio-share-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+
+.ml-studio-share-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ml-studio-share-head .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-share-hint {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 0 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.ml-studio-share-hint .icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.ml-studio-member-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ml-studio-member-id {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ml-studio-member-self {
+  color: var(--text-3);
+  font-weight: 400;
+}
+
+.ml-studio-member-note {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ml-studio-role-pick {
+  max-width: 180px;
+}
+
+.ml-studio-invite-row {
+  display: grid;
+  grid-template-columns: 1fr 180px auto;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.ml-studio-role-legend {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.ml-studio-role-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+}
+
+.ml-studio-role-desc {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+/* ---------- Zakładka „Dane” — import + profil kolumn (t-dane) ---------- */
+
+.ml-studio-data {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ml-studio-data-card {
+  background: var(--bg-card, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.ml-studio-data-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 12px;
+}
+
+.ml-studio-data-head .icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-data-hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+.ml-studio-data-origin {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: linear-gradient(135deg, var(--accent-glow, rgba(99, 102, 241, 0.08)), transparent);
+  border: 1px solid var(--accent-1, var(--border));
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.ml-studio-data-origin-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex-shrink: 0;
+  background: var(--gradient-accent, var(--accent-1));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ml-studio-data-origin-ico .icon {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-data-origin-title {
+  font-size: 12.5px;
+  font-weight: 800;
+  margin-bottom: 3px;
+  color: var(--text-1);
+}
+
+.ml-studio-data-origin-text {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.ml-studio-col-name {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.ml-studio-col-classes {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--accent-2, var(--text-2));
+  line-height: 1.5;
+  display: flex;
+  gap: 5px;
+  align-items: flex-start;
+}
+
+.ml-studio-col-classes .icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  margin-top: 1px;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-col-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ml-studio-col-example {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+
+.ml-studio-col-example-empty {
+  background: transparent;
+  color: var(--text-3);
+}
+
+.ml-studio-miss-ok {
+  color: var(--success);
+  font-weight: 700;
+}
+
+.ml-studio-miss-warn {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+/* =============================================================================
+   Mesh resource allocation (§11.3) — admin resources screen + project section.
+   ============================================================================= */
+
+.ml-studio-res-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: var(--spacing-lg, 20px);
+  margin-bottom: var(--spacing-lg, 20px);
+}
+
+.ml-studio-res-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 16px;
+}
+
+.ml-studio-res-pool {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.ml-studio-res-node {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ml-studio-res-node-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ml-studio-res-node-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ml-studio-res-gpus {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ml-studio-res-gpu {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.ml-studio-res-gpu-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ml-studio-res-gpu-empty {
+  color: var(--text-3);
+  font-style: italic;
+}
+
+.ml-studio-res-node-foot {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-res-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  align-items: end;
+}
+
+.ml-studio-res-subject-cell,
+.ml-studio-res-resource-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (max-width: 720px) {
+  .ml-studio-invite-row {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-role-legend {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-res-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ===== "Trenuj" tab — tabular training ===== */
+
+.ml-studio-train {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ml-studio-train-pickers {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.ml-studio-train-callout {
+  margin-top: 14px;
+  background: linear-gradient(135deg, var(--accent-glow, rgba(99, 102, 241, 0.08)), transparent);
+  border: 1px solid var(--accent-1, var(--border));
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.ml-studio-train-callout-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.ml-studio-train-callout-title .icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-train-classes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 10px 0;
+}
+
+.ml-studio-train-class {
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-1);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px 8px;
+}
+
+.ml-studio-train-class-n {
+  font-weight: 500;
+  color: var(--text-3);
+}
+
+.ml-studio-train-callout-note {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.ml-studio-train-engine-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.ml-studio-train-engine-card {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2, var(--surface-1));
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.ml-studio-train-engine-card:hover:not([disabled]) {
+  border-color: var(--accent-1);
+}
+
+.ml-studio-train-engine-card.selected {
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 1px var(--accent-1), 0 0 24px var(--accent-glow, transparent);
+  background: linear-gradient(135deg, var(--accent-glow, transparent), transparent);
+}
+
+.ml-studio-train-engine-card[disabled] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ml-studio-train-engine-body {
+  min-width: 0;
+}
+
+.ml-studio-train-engine-hint {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-3, var(--text-2));
+  line-height: 1.5;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.ml-studio-train-engine-hint .icon {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.ml-studio-train-engine-hint-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-2, var(--accent-1));
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.ml-studio-train-engine-ico-automl {
+  background: linear-gradient(135deg, #60a5fa, #6366f1);
+}
+
+.ml-studio-train-engine-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex-shrink: 0;
+  background: var(--gradient-accent, var(--accent-1));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ml-studio-train-engine-ico .icon {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-train-engine-title {
+  font-size: 12.5px;
+  font-weight: 800;
+  margin-bottom: 3px;
+  color: var(--text-1);
+}
+
+.ml-studio-train-engine-text {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.ml-studio-train-engine-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ml-studio-train-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ml-studio-train-best-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ml-studio-train-best-row .icon {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  color: var(--accent-2, var(--accent-1));
+}
+
+@media (max-width: 720px) {
+  .ml-studio-train-pickers {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* =============================================================================
+   Responsywność ML Studio (≤767px / ≤480px). Cel: zero poziomego scrolla na
+   390px, wszystkie akcje w pełni widoczne i klikalne, treść czytelna.
+   ============================================================================= */
+
+@media (max-width: 767px) {
+  /* Nagłówek listy: wiersz akcji zawija się, primary „Nowy projekt" nigdy nie
+     jest przycinany. Przyciski rozciągają się na całą szerokość wiersza. */
+  .page-header .actions#ml-studio-actions {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .page-header .actions#ml-studio-actions tf-button {
+    flex: 1 1 auto;
+  }
+
+  .page-header .actions#ml-studio-actions tf-button::part(button),
+  .page-header .actions#ml-studio-actions .tf-btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* Karty: jedna kolumna — minmax(280px) potrafi przekroczyć wąski ekran. */
+  .ml-studio-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Karty wyboru silnika: jedna kolumna na wąskim ekranie (auto-fit 280px nie
+     mieści się na 390px → poziomy scroll). */
+  .ml-studio-train-engine-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Zakładka „Dane"/„Trenuj": pickery i statystyki w jednej kolumnie. */
+  .ml-studio-train-pickers,
+  .ml-studio-detail-stats {
+    grid-template-columns: 1fr;
+  }
+
+  /* Hint w nagłówku karty schodzi pod tytuł zamiast rozpychać wiersz. */
+  .ml-studio-data-head {
+    flex-wrap: wrap;
+  }
+
+  .ml-studio-data-hint {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+
+  /* Tabele (tf-table) nie rozpychają strony — poziomy scroll w kontenerze. */
+  .ml-studio-tab-panel tf-table,
+  .ml-studio-share-card tf-table,
+  #ml-studio-datasets tf-table,
+  #ml-studio-profile tf-table,
+  #ml-studio-train-leaderboard tf-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Ekran udostępniania: pasek właściciela i akcja Udostępnij zawsze nad treścią. */
+  .ml-studio-role-pick {
+    max-width: none;
+  }
+}
+
+@media (max-width: 480px) {
+  /* Na bardzo wąskim ekranie przyciski nagłówka idą jeden pod drugim, żeby
+     długa etykieta „Administracja › Zasoby" nie wymuszała poziomego scrolla. */
+  .page-header .actions#ml-studio-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .page-header .actions#ml-studio-actions tf-button {
+    flex: 1 1 100%;
+  }
+
+  /* Stopka karty: metryki i daty w kolumnie, bez przepełnienia. */
+  .ml-studio-card-foot {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+/* ---------- Zakładka „Przegląd" projektu ---------- */
+
+.ml-studio-mono {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+}
+
+/* KPI domenowe: label + value + delta (pochodzenie liczby). */
+.ml-studio-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.ml-studio-kpi {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-input);
+}
+
+.ml-studio-kpi .label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ml-studio-kpi .label .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-kpi .value {
+  margin: 6px 0 4px;
+  font-size: 26px;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.ml-studio-kpi .delta {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* Karta sekcji (członkowie, zasoby, joby, modele, skróty). */
+.ml-studio-section-card {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-2, var(--bg-input));
+}
+
+.ml-studio-section-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-section-card-head .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  flex: 1 1 auto;
+}
+
+.ml-studio-section-card-head .title .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-2, var(--accent));
+}
+
+/* Każda tf-table w karcie przewija się poziomo na wąskim ekranie. */
+.ml-studio-section-card tf-table {
+  display: block;
+  overflow-x: auto;
+}
+
+/* Mini-lista członków: chipy z awatarem (inicjały), nazwą i rolą. */
+.ml-studio-members-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-member-chip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 12px 6px 6px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+}
+
+.ml-studio-member-chip .m-av {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--gradient-accent, var(--accent-2, var(--accent)));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.ml-studio-member-chip .m-nm {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.ml-studio-member-chip .m-rl {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+/* Siatka szybkich skrótów do pozostałych zakładek. */
+.ml-studio-shortcut-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.ml-studio-shortcut-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-input);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.ml-studio-shortcut-card:hover,
+.ml-studio-shortcut-card:focus-visible {
+  border-color: var(--accent-1, var(--accent-2));
+  background: var(--accent-glow);
+  outline: none;
+}
+
+.ml-studio-shortcut-card .sc-ico {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  color: var(--accent-2, var(--accent));
+  flex: 0 0 auto;
+}
+
+.ml-studio-shortcut-card .sc-ico .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.ml-studio-shortcut-card .sc-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+@media (max-width: 767px) {
+  .ml-studio-kpi-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .ml-studio-shortcut-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-members-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 420px) {
+  .ml-studio-kpi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* =============================================================================
+   Fine-tuning LLM (ft_llm) — zakładki „Model bazowy" (f00+f01) i „Trening" (f02).
+   Wzorowane na .ml-studio-train-engine-* (karty wyboru), kpi-grid i inline SVG.
+   ============================================================================= */
+
+.ml-studio-ft {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* ---- Model bazowy: spec + chip pochodzenia ---- */
+.ml-studio-ft-rec {
+  font-size: 9.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--accent-glow, rgba(99, 102, 241, 0.15));
+  color: var(--accent-2, var(--accent-1));
+}
+
+.ml-studio-ft-spec {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.ml-studio-ft-spec .sp {
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.ml-studio-ft-spec .sp b {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-1);
+  font-weight: 800;
+}
+
+.ml-studio-ft-origin-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.ml-studio-ft-origin {
+  font-size: 9.5px;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.ml-studio-ft-origin.serwis {
+  background: rgba(34, 197, 94, 0.13);
+  color: var(--success, #22c55e);
+}
+
+.ml-studio-ft-origin.hf {
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--warning, #f59e0b);
+}
+
+.ml-studio-ft-cap {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+}
+
+/* ---- Metoda: oś celu + oś parametryzacji + iloczyn ---- */
+.ml-studio-ft-axis-label {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3, var(--text-2));
+  margin: 14px 0 8px;
+}
+
+.ml-studio-ft-axis-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.ml-studio-ft-axis-card {
+  text-align: left;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2, var(--surface-1));
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ml-studio-ft-axis-card:hover {
+  border-color: var(--accent-1);
+}
+
+.ml-studio-ft-axis-card.selected {
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 1px var(--accent-1);
+}
+
+.ml-studio-ft-axis-name {
+  font-size: 12.5px;
+  font-weight: 800;
+  color: var(--text-1);
+  margin-bottom: 3px;
+}
+
+.ml-studio-ft-axis-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.ml-studio-ft-method-card {
+  flex-direction: column;
+}
+
+.ml-studio-ft-vram {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 10.5px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(34, 197, 94, 0.13);
+  color: var(--success, #22c55e);
+}
+
+.ml-studio-ft-vram.mid {
+  background: rgba(96, 165, 250, 0.14);
+  color: var(--info, #60a5fa);
+}
+
+.ml-studio-ft-vram.high {
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--warning, #f59e0b);
+}
+
+.ml-studio-ft-vram.max {
+  background: rgba(239, 68, 68, 0.14);
+  color: var(--danger, #ef4444);
+}
+
+.ml-studio-ft-combo {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--bg-input, var(--surface-1));
+  border: 1px solid var(--border);
+}
+
+.ml-studio-ft-combo-eq {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text-1);
+}
+
+.ml-studio-ft-combo-eq .op {
+  color: var(--accent-2, var(--accent-1));
+  margin: 0 4px;
+}
+
+.ml-studio-ft-combo-vram {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-left: auto;
+}
+
+/* ---- Hiperparametry ---- */
+.ml-studio-ft-hp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.ml-studio-ft-hp-field[hidden] {
+  display: none;
+}
+
+/* ---- Trening: podsumowanie ---- */
+.ml-studio-ft-summary {
+  margin-bottom: 14px;
+}
+
+.ml-studio-ft-sum-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.ml-studio-ft-sum-line:last-child {
+  border-bottom: 0;
+}
+
+.ml-studio-ft-sum-line .k {
+  color: var(--text-3, var(--text-2));
+}
+
+.ml-studio-ft-sum-line .v {
+  font-weight: 700;
+  color: var(--text-1);
+  text-align: right;
+}
+
+/* ---- Trening LIVE ---- */
+.ml-studio-ft-status {
+  margin-left: auto;
+}
+
+.ml-studio-ft-progress {
+  margin-bottom: 16px;
+}
+
+.ml-studio-ft-progress-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+
+.ml-studio-ft-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.ml-studio-ft-kpi {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input, var(--surface-1));
+}
+
+.ml-studio-ft-kpi .lbl {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+}
+
+.ml-studio-ft-kpi .val {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Krzywa loss (inline SVG) ---- */
+.ml-studio-ft-chart-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--bg-input, var(--surface-1));
+}
+
+.ml-studio-ft-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.ml-studio-ft-chart-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.ml-studio-ft-chart-legend {
+  display: flex;
+  gap: 14px;
+}
+
+.ml-studio-ft-chart-legend .lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.ml-studio-ft-chart-legend .sw {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.ml-studio-ft-chart-legend .sw.train {
+  background: #a78bfa;
+}
+
+.ml-studio-ft-chart-legend .sw.eval {
+  background: #60a5fa;
+}
+
+.ml-studio-ft-loss-svg {
+  width: 100%;
+  height: 220px;
+  display: block;
+}
+
+.ml-studio-ft-loss-svg .grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  opacity: 0.5;
+}
+
+.ml-studio-ft-loss-svg .line {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.ml-studio-ft-loss-svg .line.train {
+  stroke: #a78bfa;
+}
+
+.ml-studio-ft-loss-svg .line.eval {
+  stroke: #60a5fa;
+  stroke-dasharray: 5 4;
+}
+
+.ml-studio-ft-chart-empty {
+  padding: 40px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-3, var(--text-2));
+}
+
+/* ---- Zakończenie / błąd ---- */
+.ml-studio-ft-done {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.ml-studio-ft-done-msg {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--success, #22c55e);
+}
+
+.ml-studio-ft-done-msg.error {
+  color: var(--danger, #ef4444);
+}
+
+.ml-studio-ft-done-msg .icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+}
+
+@media (max-width: 767px) {
+  /* Wszystkie gridy FT spadają do jednej kolumny — zero poziomego scrolla @390. */
+  .ml-studio-ft-axis-grid,
+  .ml-studio-ft-hp-grid,
+  .ml-studio-ft-model-grid,
+  .ml-studio-ft-method-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-ft-kpi-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-ft-combo-vram {
+    margin-left: 0;
+  }
+}
+
+/* =============================================================================
+   Eksport modelu FT do GGUF (f03) — modal: wybór outtype, postęp, wynik.
+   Mobile-first: jedna kolumna, brak poziomego scrolla.
+   ============================================================================= */
+.ml-studio-muted {
+  color: var(--text-3, #888);
+}
+
+.ml-studio-export-intro {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2, #aaa);
+}
+
+.ml-studio-export-intro code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.ml-studio-export-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.ml-studio-export-progress {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 22px 8px;
+  text-align: center;
+}
+
+.ml-studio-export-progress-text {
+  font-size: 13.5px;
+  color: var(--text-2, #aaa);
+}
+
+.ml-studio-export-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ml-studio-export-result-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.ml-studio-export-result-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ml-studio-export-result-row .lbl {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-3, #888);
+}
+
+.ml-studio-export-result-row .val {
+  font-size: 13.5px;
+}
+
+.ml-studio-export-path {
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.ml-studio-export-note {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--text-3, #888);
+}
+
+.ml-studio-export-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 8px;
+  background: var(--danger-bg, rgba(220, 60, 60, 0.12));
+  color: var(--danger, #e05656);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ml-studio-export-deploy {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-1, rgba(255, 255, 255, 0.08));
+}
+
+.ml-studio-export-deploy-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2, #aaa);
+}
+
+.ml-studio-export-deploy-ok {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 8px;
+  background: var(--success-bg, rgba(60, 180, 90, 0.12));
+  color: var(--text-1, #e8e8e8);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ml-studio-export-deploy-ok code {
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.ml-studio-export-deploy-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 8px;
+  background: var(--danger-bg, rgba(220, 60, 60, 0.12));
+  color: var(--danger, #e05656);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+@media (max-width: 767px) {
+  .ml-studio-export-footer {
+    justify-content: stretch;
+  }
+
+  .ml-studio-export-footer tf-button {
+    flex: 1 1 auto;
+  }
+
+  .ml-studio-export-deploy tf-button {
+    width: 100%;
+  }
+}
+
+/* Edytor anotacji: galeria + płótno obok siebie; na wąskim ekranie 1 kolumna. */
+.ml-studio-annot-body {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 640px) {
+  .ml-studio-annot-body { grid-template-columns: 1fr; }
 }

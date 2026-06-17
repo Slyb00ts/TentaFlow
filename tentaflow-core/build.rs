@@ -668,14 +668,28 @@ fn pack_container_contexts(out_dir: &Path) {
 
     let bundle_path = out_dir.join("container_bundle.tar.gz");
 
-    // Wykluczamy `target/`, `node_modules/`, `.git/`, zeby nie wciskac
-    // kilkudziesieciu MB binarek do binarki.
+    // Bundlujemy DEFINICJE kontenerów, nie zbudowane artefakty. Wykluczamy
+    // build/runtime śmieci, żeby nie wciskać GB do binarki (rmeta!): target/,
+    // node_modules/, .git/, ale TEŻ wirtualne środowiska Pythona (.venv/venv —
+    // deploy tworzy je przez `uv sync` WEWNĄTRZ katalogu bundla; bez tego
+    // wykluczenia trafiały do paczki → rmeta tentaflow-core puchło do 12 GB),
+    // __pycache__/*.pyc, instancje/szablony bundli oraz wagi modeli.
     let status = Command::new("tar")
         .arg("-czf")
         .arg(&bundle_path)
         .arg("--exclude=target")
         .arg("--exclude=node_modules")
         .arg("--exclude=.git")
+        .arg("--exclude=.venv")
+        .arg("--exclude=venv")
+        .arg("--exclude=__pycache__")
+        .arg("--exclude=*.pyc")
+        .arg("--exclude=bundle-instances")
+        .arg("--exclude=bundle-templates")
+        .arg("--exclude=*.pth")
+        .arg("--exclude=*.onnx")
+        .arg("--exclude=*.gguf")
+        .arg("--exclude=*.safetensors")
         .arg("-C")
         .arg(&workspace_root)
         .arg("tentaflow-containers")
@@ -866,6 +880,7 @@ mod services_manifest_build {
         Model3dGen,
         Agents,
         Tools,
+        Training,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

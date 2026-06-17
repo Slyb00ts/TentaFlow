@@ -3,24 +3,31 @@
 use anyhow::{bail, Result};
 use rusqlite::{params, OptionalExtension};
 
-use super::models::{Project, ProjectSummary, ProjectType};
+use super::models::{
+    Dataset, MemberStatus, ModelSummary, Project, ProjectMember, ProjectRole, ProjectSummary,
+    ProjectType, ResourceGrant, TrainingRunSummary, GRANT_RESOURCE_KINDS, GRANT_SUBJECT_KINDS,
+};
 
-/// Lists projects shared across an organization, newest first, each with its
-/// per-project KPIs (dataset count, model count). Scoped by `org_id`; ownership
-/// is not filtered so every member of the org sees the shared project list.
-pub fn list_projects(org_id: &str) -> Result<Vec<ProjectSummary>> {
+/// Lists projects the user is an active member of (owner or invited),
+/// newest first, each with its per-project KPIs (dataset/model count) plus the
+/// user's role and an `is_owner` flag. Membership is the access boundary: a
+/// project the user is not a member of is invisible here.
+pub fn list_projects(user_id: &str) -> Result<Vec<ProjectSummary>> {
     let pool = super::db::pool()?;
     let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
                 (SELECT COUNT(*) FROM models m WHERE m.project_id = p.project_id), \
-                (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id) \
+                (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id), \
+                (SELECT COUNT(*) FROM training_runs t WHERE t.project_id = p.project_id), \
+                pm.role \
          FROM projects p \
-         WHERE p.org_id = ?1 \
+         JOIN project_members pm ON pm.project_id = p.project_id \
+         WHERE pm.user_id = ?1 AND pm.status = 'active' \
          ORDER BY p.updated_at DESC, p.name",
     )?;
-    let rows = stmt.query_map(params![org_id], read_summary)?;
+    let rows = stmt.query_map(params![user_id], read_summary)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -50,7 +57,8 @@ pub fn create_project(
     let project_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
     let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO projects \
              (project_id, name, description, project_type, status, owner_user_id, org_id) \
          VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6)",
@@ -63,28 +71,691 @@ pub fn create_project(
             org_id
         ],
     )?;
+    tx.execute(
+        "INSERT INTO project_members \
+             (project_id, user_id, role, status, invited_by) \
+         VALUES (?1, ?2, 'owner', 'active', ?2)",
+        params![project_id, owner_user_id],
+    )?;
+    tx.commit()?;
     drop(conn);
 
-    get_project(org_id, &project_id)?
+    get_project(owner_user_id, &project_id)?
         .ok_or_else(|| anyhow::anyhow!("project not found after create"))
 }
 
-/// Fetches a single project (with model count) scoped to its organization.
-pub fn get_project(org_id: &str, project_id: &str) -> Result<Option<ProjectSummary>> {
+/// Fetches a single project (with KPIs and the user's role) scoped to the user's
+/// active membership. Returns `None` when the user is not an active member, so a
+/// non-member cannot probe a project's existence by id.
+pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSummary>> {
     let pool = super::db::pool()?;
     let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.query_row(
         "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
                 (SELECT COUNT(*) FROM models m WHERE m.project_id = p.project_id), \
-                (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id) \
+                (SELECT COUNT(*) FROM datasets d WHERE d.project_id = p.project_id), \
+                (SELECT COUNT(*) FROM training_runs t WHERE t.project_id = p.project_id), \
+                pm.role \
          FROM projects p \
-         WHERE p.org_id = ?1 AND p.project_id = ?2",
-        params![org_id, project_id],
+         JOIN project_members pm ON pm.project_id = p.project_id \
+         WHERE pm.user_id = ?1 AND pm.status = 'active' AND p.project_id = ?2",
+        params![user_id, project_id],
         read_summary,
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Returns the membership role slug of `user_id` in `project_id`, or `None` when
+/// the user has no membership row. Used as the authorization primitive for
+/// owner-only project actions. All membership rows are `active`, so a returned
+/// role always grants the access tied to that role.
+pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.query_row(
+        "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        params![project_id, user_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Lists every member of a project, owner first then by creation time. No
+/// authorization is enforced here; callers gate visibility.
+pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT project_id, user_id, role, status, invited_by, created_at \
+         FROM project_members \
+         WHERE project_id = ?1 \
+         ORDER BY (role = 'owner') DESC, created_at, user_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_member)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Rozwiązuje nazwy wyświetlane użytkowników z katalogu CORE (`user_accounts`).
+/// Lookup jest per-id w pętli, bo `project_members` żyje w `ml_studio.db`, a
+/// `user_accounts` w bazie CORE (osobny pool) — to inne pliki SQLite, więc nie da
+/// się zrobić JOIN-a między bazami w jednym zapytaniu. Zwraca mapę id→nazwa tylko
+/// dla znalezionych wierszy; gdy CORE jest niedostępne lub id nie istnieje,
+/// pomija je (frontend ma własny fallback do UUID). Nie panikuje przy błędzie.
+pub fn resolve_display_names(
+    user_ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(core) = crate::db::global_pool() else {
+        return out;
+    };
+    let Ok(conn) = core.lock() else {
+        return out;
+    };
+    for id in user_ids {
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(display_name, ''), NULLIF(username, ''), id) \
+                 FROM user_accounts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(name) = name {
+            out.insert(id.clone(), name);
+        }
+    }
+    out
+}
+
+/// Invites a user to a project with a grantable role (`editor`/`viewer`). Only
+/// the project owner may invite. There is no acceptance step: the new member is
+/// created `active` and gains access immediately.
+pub fn invite_member(
+    project_id: &str,
+    inviter_user_id: &str,
+    invitee_user_id: &str,
+    role: &str,
+) -> Result<ProjectMember> {
+    let role = ProjectRole::from_grantable_slug(role)
+        .ok_or_else(|| anyhow::anyhow!("role must be 'editor' or 'viewer'"))?;
+    let invitee_user_id = invitee_user_id.trim();
+    if invitee_user_id.is_empty() {
+        bail!("invitee user id is required");
+    }
+    if invitee_user_id == inviter_user_id {
+        bail!("cannot invite yourself");
+    }
+
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_owner(&conn, project_id, inviter_user_id)?;
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, invitee_user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        bail!("user is already a member of this project");
+    }
+
+    conn.execute(
+        "INSERT INTO project_members \
+             (project_id, user_id, role, status, invited_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            project_id,
+            invitee_user_id,
+            role.slug(),
+            MemberStatus::Active.slug(),
+            inviter_user_id
+        ],
+    )?;
+
+    conn.query_row(
+        "SELECT project_id, user_id, role, status, invited_by, created_at \
+         FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        params![project_id, invitee_user_id],
+        read_member,
+    )
+    .map_err(Into::into)
+}
+
+/// Removes a member from a project. Only the owner may remove, and the owner
+/// row itself cannot be removed.
+pub fn remove_member(
+    project_id: &str,
+    requester_user_id: &str,
+    target_user_id: &str,
+) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_owner(&conn, project_id, requester_user_id)?;
+
+    let target_role = conn
+        .query_row(
+            "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, target_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("target user is not a member of this project"))?;
+    if target_role == ProjectRole::Owner.slug() {
+        bail!("project owner cannot be removed");
+    }
+
+    conn.execute(
+        "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        params![project_id, target_user_id],
+    )?;
+    Ok(())
+}
+
+/// Changes a member's role. Only the owner may change roles; the role may only
+/// be set to a grantable role (`editor`/`viewer`) and the owner row is immutable.
+pub fn set_member_role(
+    project_id: &str,
+    requester_user_id: &str,
+    target_user_id: &str,
+    role: &str,
+) -> Result<ProjectMember> {
+    let role = ProjectRole::from_grantable_slug(role)
+        .ok_or_else(|| anyhow::anyhow!("role must be 'editor' or 'viewer'"))?;
+
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_owner(&conn, project_id, requester_user_id)?;
+
+    let target_role = conn
+        .query_row(
+            "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, target_user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("target user is not a member of this project"))?;
+    if target_role == ProjectRole::Owner.slug() {
+        bail!("project owner role cannot be changed");
+    }
+
+    conn.execute(
+        "UPDATE project_members SET role = ?3 \
+         WHERE project_id = ?1 AND user_id = ?2",
+        params![project_id, target_user_id, role.slug()],
+    )?;
+
+    conn.query_row(
+        "SELECT project_id, user_id, role, status, invited_by, created_at \
+         FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+        params![project_id, target_user_id],
+        read_member,
+    )
+    .map_err(Into::into)
+}
+
+/// Asserts that `user_id` is the owner of `project_id`, returning an error
+/// otherwise. The single repository-side authorization gate for owner-only
+/// actions (invite/remove/role change).
+fn require_owner(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let role: Option<String> = conn
+        .query_row(
+            "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match role.as_deref() {
+        Some(r) if r == ProjectRole::Owner.slug() => Ok(()),
+        _ => bail!("only the project owner may perform this action"),
+    }
+}
+
+/// Asserts `user_id` is an active member of `project_id`. Membership is the
+/// access boundary for dataset operations, mirroring `get_project`. A non-member
+/// cannot create, list or read datasets in a project they cannot see.
+fn require_member(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let role: Option<String> = conn
+        .query_row(
+            "SELECT role FROM project_members \
+             WHERE project_id = ?1 AND user_id = ?2 AND status = 'active'",
+            params![project_id, user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if role.is_none() {
+        bail!("not a member of this project");
+    }
+    Ok(())
+}
+
+/// Persists a profiled dataset for a project. `profile_json` is the serialized
+/// `profile::TableProfile`. Authorization is by project membership. Returns the
+/// stored row.
+#[allow(clippy::too_many_arguments)]
+pub fn create_dataset(
+    user_id: &str,
+    project_id: &str,
+    name: &str,
+    kind: &str,
+    row_count: u64,
+    column_count: u32,
+    profile_json: &str,
+    raw_data: &[u8],
+) -> Result<Dataset> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("dataset name is required");
+    }
+    if name.chars().count() > 256 {
+        bail!("dataset name must be at most 256 characters");
+    }
+
+    let dataset_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_member(&conn, project_id, user_id)?;
+    conn.execute(
+        "INSERT INTO datasets \
+             (dataset_id, project_id, name, kind, row_count, column_count, profile_json, raw_data) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            dataset_id,
+            project_id,
+            name,
+            kind,
+            row_count as i64,
+            column_count as i64,
+            profile_json,
+            raw_data
+        ],
+    )?;
+    conn.query_row(
+        "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+         FROM datasets WHERE dataset_id = ?1",
+        params![dataset_id],
+        read_dataset,
+    )
+    .map_err(Into::into)
+}
+
+/// Lists datasets of a project, newest first. Authorization by membership.
+pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    require_member(&conn, project_id, user_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+         FROM datasets WHERE project_id = ?1 ORDER BY created_at DESC, name",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_dataset)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Fetches a single dataset by id, scoped to the caller's project membership.
+/// Returns `None` when the dataset does not exist or the user is not a member of
+/// its project, so a non-member cannot probe dataset ids.
+pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let dataset: Option<Dataset> = conn
+        .query_row(
+            "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
+             FROM datasets WHERE dataset_id = ?1",
+            params![dataset_id],
+            read_dataset,
+        )
+        .optional()?;
+    let Some(dataset) = dataset else {
+        return Ok(None);
+    };
+    match require_member(&conn, &dataset.project_id, user_id) {
+        Ok(()) => Ok(Some(dataset)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Returns the raw uploaded bytes of a dataset, scoped to the caller's project
+/// membership. Errors when the dataset does not exist, the user is not a member
+/// of its project, or no raw data was stored (datasets created before the
+/// `raw_data` migration). The bytes feed tabular training.
+pub fn get_dataset_raw(user_id: &str, dataset_id: &str) -> Result<Vec<u8>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row: Option<(String, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT project_id, raw_data FROM datasets WHERE dataset_id = ?1",
+            params![dataset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((project_id, raw)) = row else {
+        bail!("dataset not found");
+    };
+    require_member(&conn, &project_id, user_id)?;
+    match raw {
+        Some(bytes) if !bytes.is_empty() => Ok(bytes),
+        _ => bail!("dataset has no stored raw data (re-upload to enable training)"),
+    }
+}
+
+/// Records a finished tabular training run plus its best model in one
+/// transaction, returning `(run_id, model_id)`. `config_json` carries the
+/// requested target/task; `metrics_json` is the best model's metric blob (the
+/// same JSON stored on the model row). The run is marked `succeeded` with a
+/// `finished_at` timestamp. `metric_history` is an optional list of
+/// `(step, key, value)` rows persisted to `metrics_history` (e.g. per-iteration
+/// training loss) so the leaderboard view can chart convergence.
+pub fn record_training_result(
+    project_id: &str,
+    model_name: &str,
+    framework: &str,
+    config_json: &str,
+    metrics_json: &str,
+    metric_history: &[(i64, String, f64)],
+) -> Result<(String, String)> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let model_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO models \
+             (model_id, project_id, name, framework, base_model, metrics_json, status) \
+         VALUES (?1, ?2, ?3, ?4, '', ?5, 'trained')",
+        params![model_id, project_id, model_name, framework, metrics_json],
+    )?;
+    tx.execute(
+        "INSERT INTO training_runs \
+             (run_id, project_id, model_id, status, config_json, started_at, finished_at) \
+         VALUES (?1, ?2, ?3, 'succeeded', ?4, datetime('now'), datetime('now'))",
+        params![run_id, project_id, model_id, config_json],
+    )?;
+    for (step, key, value) in metric_history {
+        tx.execute(
+            "INSERT INTO metrics_history (run_id, step, metric_key, metric_value) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, step, key, value],
+        )?;
+    }
+    tx.commit()?;
+    Ok((run_id, model_id))
+}
+
+/// Tworzy wiersz `training_runs` w stanie `running` dla asynchronicznego
+/// fine-tuningu LLM. W odróżnieniu od `record_training_result` (który zapisuje
+/// gotowy wynik jednym transactem) ten run jest „żywy" — task w tle aktualizuje
+/// jego status i metryki przez kolejne wywołania. Zwraca wygenerowany `run_id`.
+pub fn create_training_run(project_id: &str, config_json: &str) -> Result<String> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO training_runs (run_id, project_id, status, config_json, started_at) \
+         VALUES (?1, ?2, 'running', ?3, datetime('now'))",
+        params![run_id, project_id, config_json],
+    )?;
+    Ok(run_id)
+}
+
+/// Aktualizuje status runu. Gdy status nie jest już `running` (terminalny:
+/// `succeeded`/`failed`), ustawia także `finished_at`, bo run się zakończył.
+pub fn update_training_run_status(run_id: &str, status: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    if status == "running" {
+        conn.execute(
+            "UPDATE training_runs SET status = ?2 WHERE run_id = ?1",
+            params![run_id, status],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE training_runs SET status = ?2, finished_at = datetime('now') \
+             WHERE run_id = ?1",
+            params![run_id, status],
+        )?;
+    }
+    Ok(())
+}
+
+/// Zapisuje komunikat błędu treningu w `config_json` runu (klucz `$.error`),
+/// żeby status handler mógł go zwrócić do UI. Bez osobnej kolumny — błąd to
+/// metadana runu, a config_json jest jego workiem na metadane.
+pub fn set_training_run_error(run_id: &str, error: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE training_runs SET config_json = json_set(config_json, '$.error', ?2) \
+         WHERE run_id = ?1",
+        params![run_id, error],
+    )?;
+    Ok(())
+}
+
+/// Wiąże run z wytrenowanym modelem (po sukcesie treningu).
+pub fn set_training_run_model(run_id: &str, model_id: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE training_runs SET model_id = ?2 WHERE run_id = ?1",
+        params![run_id, model_id],
+    )?;
+    Ok(())
+}
+
+/// Dopisuje pojedynczą metrykę treningu (np. `train_loss`/`eval_loss`) dla
+/// danego kroku. Wołane na żywo z taska w tle przy każdym statusie z serwisu.
+pub fn record_training_metric(run_id: &str, step: i64, key: &str, value: f64) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO metrics_history (run_id, step, metric_key, metric_value) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![run_id, step, key, value],
+    )?;
+    Ok(())
+}
+
+/// Wstawia model wytrenowany asynchronicznie (poza transactem
+/// `record_training_result`) i zwraca jego `model_id`. Używane po sukcesie
+/// fine-tuningu LLM — run jest już utworzony, więc model dopinamy osobno przez
+/// `set_training_run_model`.
+pub fn insert_model(
+    project_id: &str,
+    name: &str,
+    framework: &str,
+    base_model: &str,
+    metrics_json: &str,
+) -> Result<String> {
+    let model_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO models \
+             (model_id, project_id, name, framework, base_model, metrics_json, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'trained')",
+        params![model_id, project_id, name, framework, base_model, metrics_json],
+    )?;
+    Ok(model_id)
+}
+
+/// Jeden wiersz `models` z polami potrzebnymi do eksportu GGUF i autoryzacji.
+/// `project_id` służy do `require_project_member`, `base_model` + `metrics_json`
+/// (skąd handler wyłuskuje `artifact_path`) zasilają żądanie eksportu.
+pub struct ModelRow {
+    pub model_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub framework: String,
+    pub base_model: String,
+    pub metrics_json: String,
+    pub status: String,
+}
+
+/// Pobiera pojedynczy model po `model_id`. Bez autoryzacji — handler bramkuje
+/// dostęp przez `project_id` (członkostwo w projekcie). Zwraca `None` gdy brak.
+pub fn get_model(model_id: &str) -> Result<Option<ModelRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row = conn
+        .query_row(
+            "SELECT model_id, project_id, name, framework, base_model, metrics_json, status \
+             FROM models WHERE model_id = ?1",
+            params![model_id],
+            |row| {
+                Ok(ModelRow {
+                    model_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    name: row.get(2)?,
+                    framework: row.get(3)?,
+                    base_model: row.get(4)?,
+                    metrics_json: row.get(5)?,
+                    status: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Nadpisuje `metrics_json` modelu. Używane przez task eksportu w tle do zapisu
+/// stanu (`export_status`/`gguf_path`/...) wmergowanego w istniejący JSON metryk.
+pub fn update_model_metrics(model_id: &str, metrics_json: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    conn.execute(
+        "UPDATE models SET metrics_json = ?1 WHERE model_id = ?2",
+        params![metrics_json, model_id],
+    )?;
+    Ok(())
+}
+
+/// Jeden run z `project_id`, do autoryzacji w handlerze statusu (status
+/// odpytuje członek projektu, do którego należy run). Zwraca `None` gdy brak.
+pub struct TrainingRunRow {
+    pub run_id: String,
+    pub project_id: String,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
+pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let row = conn
+        .query_row(
+            "SELECT run_id, project_id, model_id, status, config_json, started_at, finished_at \
+             FROM training_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok(TrainingRunRow {
+                    run_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    status: row.get(3)?,
+                    config_json: row.get(4)?,
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Buduje krzywą straty runu z `metrics_history`: pivotuje wiersze
+/// `metric_key in ('train_loss','eval_loss')` per `step`, zwracając listę
+/// `(step, train_loss, eval_loss)` posortowaną rosnąco po kroku. Brakująca
+/// metryka dla danego kroku zostaje `None`.
+pub fn loss_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 AND metric_key IN ('train_loss', 'eval_loss') \
+         ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    // Pivot: agregujemy per step zachowując kolejność pierwszego wystąpienia
+    // (kroki rosną monotonicznie, więc wystarczy lista + indeks ostatniego kroku).
+    let mut curve: Vec<(i64, Option<f64>, Option<f64>)> = Vec::new();
+    for r in rows {
+        let (step, key, value) = r?;
+        let entry = match curve.last_mut() {
+            Some(last) if last.0 == step => last,
+            _ => {
+                curve.push((step, None, None));
+                curve.last_mut().expect("just pushed")
+            }
+        };
+        match key.as_str() {
+            "train_loss" => entry.1 = Some(value),
+            "eval_loss" => entry.2 = Some(value),
+            _ => {}
+        }
+    }
+    Ok(curve)
+}
+
+/// Krzywa treningu detekcji: pivot metryk per epoka (step=epoka) na
+/// (epoch, train_loss, map50). Analogiczne do `loss_curve_for_run`, ale dla
+/// metryk recognition (`train_loss` + `map50`).
+pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 AND metric_key IN ('train_loss', 'map50') \
+         ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    let mut curve: Vec<(i64, Option<f64>, Option<f64>)> = Vec::new();
+    for r in rows {
+        let (step, key, value) = r?;
+        let entry = match curve.last_mut() {
+            Some(last) if last.0 == step => last,
+            _ => {
+                curve.push((step, None, None));
+                curve.last_mut().expect("just pushed")
+            }
+        };
+        match key.as_str() {
+            "train_loss" => entry.1 = Some(value),
+            "map50" => entry.2 = Some(value),
+            _ => {}
+        }
+    }
+    Ok(curve)
 }
 
 /// Returns the number of registered models for a project.
@@ -97,6 +768,241 @@ pub fn count_models_per_project(project_id: &str) -> Result<u32> {
         |row| row.get(0),
     )?;
     Ok(count.max(0) as u32)
+}
+
+/// Confirms a grant subject actually exists before a grant is stored, so a typo
+/// in `subject_id` can never create an orphaned grant (§11.3). `project`
+/// subjects live in the ML Studio database (reuses the held connection); `user`
+/// and `group` subjects live in the CORE user directory, reached through
+/// `db::global_pool`. Returns a `BadRequest`-style error (anyhow) for unknown
+/// subjects and when the core directory is unavailable.
+fn validate_grant_subject(
+    conn: &rusqlite::Connection,
+    subject_kind: &str,
+    subject_id: &str,
+) -> Result<()> {
+    match subject_kind {
+        "project" => {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM projects WHERE project_id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiego projektu");
+            }
+        }
+        "user" => {
+            let core = crate::db::global_pool()
+                .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
+            let core_conn = core
+                .lock()
+                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+            let exists = core_conn
+                .query_row(
+                    "SELECT 1 FROM user_accounts WHERE id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiego użytkownika");
+            }
+        }
+        "group" => {
+            let core = crate::db::global_pool()
+                .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
+            let core_conn = core
+                .lock()
+                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+            let exists = core_conn
+                .query_row(
+                    "SELECT 1 FROM user_groups WHERE id = ?1",
+                    params![subject_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !exists {
+                bail!("nie ma takiej grupy");
+            }
+        }
+        _ => bail!("subject_kind must be one of user/group/project"),
+    }
+    Ok(())
+}
+
+/// Creates a mesh resource grant (§11.3). Validates `subject_kind` and
+/// `resource_kind` against the fixed catalogues and requires a non-empty
+/// `subject_id` and `node_id`. `resource_ref` (card id) and `quota` are
+/// free-form and may be empty. Returns the stored row.
+#[allow(clippy::too_many_arguments)]
+pub fn create_grant(
+    subject_kind: &str,
+    subject_id: &str,
+    node_id: &str,
+    resource_kind: &str,
+    resource_ref: &str,
+    quota: &str,
+    granted_by: &str,
+) -> Result<ResourceGrant> {
+    if !GRANT_SUBJECT_KINDS.contains(&subject_kind) {
+        bail!("subject_kind must be one of user/group/project");
+    }
+    if !GRANT_RESOURCE_KINDS.contains(&resource_kind) {
+        bail!("resource_kind must be one of gpu/cpu/ram");
+    }
+    let subject_id = subject_id.trim();
+    if subject_id.is_empty() {
+        bail!("subject_id is required");
+    }
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        bail!("node_id is required");
+    }
+
+    let grant_id = uuid::Uuid::new_v4().to_string();
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    validate_grant_subject(&conn, subject_kind, subject_id)?;
+    conn.execute(
+        "INSERT INTO resource_grants \
+             (grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            grant_id,
+            subject_kind,
+            subject_id,
+            node_id,
+            resource_kind,
+            resource_ref,
+            quota,
+            granted_by
+        ],
+    )?;
+    conn.query_row(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants WHERE grant_id = ?1",
+        params![grant_id],
+        read_grant,
+    )
+    .map_err(Into::into)
+}
+
+/// Lists every training run of a project, most recently active first (finished
+/// runs by finish time, otherwise by start time). No authorization here; callers
+/// gate visibility by project membership.
+pub fn list_training_runs(project_id: &str) -> Result<Vec<TrainingRunSummary>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT run_id, model_id, status, config_json, started_at, finished_at \
+         FROM training_runs WHERE project_id = ?1 \
+         ORDER BY COALESCE(finished_at, started_at) DESC, run_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_training_run)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists every model of a project, newest first. No authorization here; callers
+/// gate visibility by project membership.
+pub fn list_models(project_id: &str) -> Result<Vec<ModelSummary>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT model_id, name, framework, base_model, status, metrics_json, created_at \
+         FROM models WHERE project_id = ?1 \
+         ORDER BY created_at DESC, model_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], read_model)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn read_training_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrainingRunSummary> {
+    Ok(TrainingRunSummary {
+        run_id: row.get(0)?,
+        model_id: row.get(1)?,
+        status: row.get(2)?,
+        config_json: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+    })
+}
+
+fn read_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelSummary> {
+    Ok(ModelSummary {
+        model_id: row.get(0)?,
+        name: row.get(1)?,
+        framework: row.get(2)?,
+        base_model: row.get(3)?,
+        status: row.get(4)?,
+        metrics_json: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+/// Lists every resource grant, newest first. Admin-wide view — no subject
+/// scoping. Caller gates visibility (admin-only).
+pub fn list_grants() -> Result<Vec<ResourceGrant>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants ORDER BY created_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map([], read_grant)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists grants targeting one specific subject (`kind`/`id`), newest first.
+pub fn list_grants_for_subject(kind: &str, id: &str) -> Result<Vec<ResourceGrant>> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
+         FROM resource_grants WHERE subject_kind = ?1 AND subject_id = ?2 \
+         ORDER BY created_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map(params![kind, id], read_grant)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Lists grants allocated to one project (`subject_kind = 'project'`).
+pub fn list_grants_for_project(project_id: &str) -> Result<Vec<ResourceGrant>> {
+    list_grants_for_subject("project", project_id)
+}
+
+/// Removes a grant by id. Returns `true` when a row was deleted.
+pub fn revoke_grant(grant_id: &str) -> Result<bool> {
+    let pool = super::db::pool()?;
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let affected = conn.execute(
+        "DELETE FROM resource_grants WHERE grant_id = ?1",
+        params![grant_id],
+    )?;
+    Ok(affected > 0)
+}
+
+fn read_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResourceGrant> {
+    Ok(ResourceGrant {
+        grant_id: row.get(0)?,
+        subject_kind: row.get(1)?,
+        subject_id: row.get(2)?,
+        node_id: row.get(3)?,
+        resource_kind: row.get(4)?,
+        resource_ref: row.get(5)?,
+        quota: row.get(6)?,
+        granted_by: row.get(7)?,
+        created_at: row.get(8)?,
+    })
 }
 
 fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
@@ -113,9 +1019,39 @@ fn read_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSummary> {
     };
     let model_count = row.get::<_, i64>(9)?.max(0) as u32;
     let dataset_count = row.get::<_, i64>(10)?.max(0) as u32;
+    let training_count = row.get::<_, i64>(11)?.max(0) as u32;
+    let role: String = row.get(12)?;
+    let is_owner = role == ProjectRole::Owner.slug();
     Ok(ProjectSummary {
         project,
         model_count,
         dataset_count,
+        training_count,
+        role,
+        is_owner,
+    })
+}
+
+fn read_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dataset> {
+    Ok(Dataset {
+        dataset_id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        row_count: row.get::<_, i64>(4)?.max(0) as u64,
+        column_count: row.get::<_, i64>(5)?.max(0) as u32,
+        profile_json: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn read_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectMember> {
+    Ok(ProjectMember {
+        project_id: row.get(0)?,
+        user_id: row.get(1)?,
+        role: row.get(2)?,
+        status: row.get(3)?,
+        invited_by: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
