@@ -328,23 +328,50 @@ impl EmbeddedDeploy {
             if let Some(local) = local_gguf {
                 if !local.exists() {
                     return Err(DeployError::Other(format!(
-                        "lokalny GGUF nie istnieje: {}",
+                        "lokalny model nie istnieje: {}",
                         local.display()
                     )));
                 }
-                if local
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| !e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(true)
-                {
-                    return Err(DeployError::Other(format!(
-                        "lokalna ścieżka modelu nie jest plikiem .gguf: {}",
-                        local.display()
-                    )));
-                }
-                if let Some(s) = &self.log_sink {
-                    s.info(&format!("[model] using local GGUF: {}", local.display()));
+                // Backend mlx (Apple): `model_file` to KATALOG modelu HF safetensors
+                // (eksport MLX). Backend llamacpp: pojedynczy plik `.gguf`.
+                if preferred_backend == "mlx" {
+                    let is_safetensors_dir = local.is_dir()
+                        && (local.join("config.json").exists()
+                            || std::fs::read_dir(local)
+                                .map(|rd| {
+                                    rd.filter_map(Result::ok).any(|e| {
+                                        e.path()
+                                            .extension()
+                                            .and_then(|x| x.to_str())
+                                            .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false));
+                    if !is_safetensors_dir {
+                        return Err(DeployError::Other(format!(
+                            "lokalna ścieżka modelu MLX nie jest katalogiem safetensors: {}",
+                            local.display()
+                        )));
+                    }
+                    if let Some(s) = &self.log_sink {
+                        s.info(&format!("[model] using local MLX safetensors: {}", local.display()));
+                    }
+                } else {
+                    if local
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| !e.eq_ignore_ascii_case("gguf"))
+                        .unwrap_or(true)
+                    {
+                        return Err(DeployError::Other(format!(
+                            "lokalna ścieżka modelu nie jest plikiem .gguf: {}",
+                            local.display()
+                        )));
+                    }
+                    if let Some(s) = &self.log_sink {
+                        s.info(&format!("[model] using local GGUF: {}", local.display()));
+                    }
                 }
             }
             let model_path = if let Some(local) = local_gguf {
