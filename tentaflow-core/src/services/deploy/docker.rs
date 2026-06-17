@@ -711,6 +711,8 @@ impl DeployStrategy for DockerDeploy {
         for (k, v) in super::vllm_deploy_env(&self.manifest, &self.user_config, hf_token_for_env) {
             env.insert(k, v);
         }
+        // Recipe / user engine env passthrough (e.g. VLLM_USE_FLASHINFER_MOE_FP4).
+        super::apply_engine_env(&self.user_config, &mut env);
         // See python_bundle.rs: the served name must equal the advertised slug
         // (`models_from_manifest` model_name) or dispatch 404s when preset id
         // differs from the repo. entrypoint.sh reads `$SERVED_MODEL_NAME`.
