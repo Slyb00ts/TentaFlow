@@ -689,10 +689,14 @@ fn finalize_dataset_upload(
             let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
                 ProtocolError::bad_request(format!("invalid JSONL at record {}: {}", records + 1, e))
             })?;
+            let obj = value.as_object().ok_or_else(|| {
+                ProtocolError::bad_request(format!(
+                    "JSONL record {} is not an object",
+                    records + 1
+                ))
+            })?;
             if records == 0 {
-                if let Some(obj) = value.as_object() {
-                    keys = obj.keys().cloned().collect();
-                }
+                keys = obj.keys().cloned().collect();
             }
             records += 1;
         }
@@ -728,10 +732,15 @@ fn finalize_dataset_upload(
     .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))
 }
 
-// Akumulator fragmentów uploadu: upload_id → (project_id, fragmenty wg seq,
-// total_chunks, suma bajtów). Wpis żyje tylko między pierwszym a ostatnim
-// fragmentem; po finalizacji jest usuwany. Limit chroni przed zalaniem pamięci.
-const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024;
+// Akumulator fragmentów uploadu: upload_id → metadane + fragmenty wg seq. Wpis
+// żyje tylko między pierwszym a ostatnim fragmentem; po finalizacji jest usuwany.
+// Limity chronią przed zalaniem pamięci (DoS): rozmiar pojedynczego uploadu,
+// łączny rozmiar wszystkich uploadów w toku, maksymalna liczba fragmentów oraz
+// TTL kasujący porzucone (niedokończone) uploady.
+const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_TOTAL_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_UPLOAD_CHUNKS: u32 = 100_000;
+const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct UploadAccum {
     project_id: String,
@@ -740,6 +749,7 @@ struct UploadAccum {
     total_chunks: u32,
     chunks: Vec<Option<Vec<u8>>>,
     received_bytes: u64,
+    last_touch: std::time::Instant,
 }
 
 static UPLOAD_ACCUM: std::sync::OnceLock<
@@ -770,12 +780,31 @@ pub fn ml_studio_dataset_upload_chunk(
     if payload.total_chunks == 0 || payload.seq >= payload.total_chunks {
         return Err(ProtocolError::bad_request("invalid chunk seq/total"));
     }
+    if payload.total_chunks > MAX_UPLOAD_CHUNKS {
+        return Err(ProtocolError::bad_request("too many chunks"));
+    }
     if payload.upload_id.trim().is_empty() || payload.upload_id.len() > 128 {
         return Err(ProtocolError::bad_request("invalid upload_id"));
     }
 
     let (received_chunks, received_bytes, complete_bytes) = {
         let mut map = upload_accum().lock().unwrap();
+
+        // Usuń porzucone uploady (TTL) — zwalnia pamięć po przerwanych transferach.
+        let now = std::time::Instant::now();
+        map.retain(|_, e| now.duration_since(e.last_touch) < UPLOAD_TTL);
+
+        // Globalny limit pamięci na wszystkie uploady w toku (poza tym właśnie
+        // przyjmowanym, którego rozmiar dodajemy poniżej).
+        let other_bytes: u64 = map
+            .iter()
+            .filter(|(k, _)| *k != &payload.upload_id)
+            .map(|(_, e)| e.received_bytes)
+            .sum();
+        if other_bytes + payload.bytes.len() as u64 > MAX_TOTAL_UPLOAD_BYTES {
+            return Err(ProtocolError::bad_request("server upload buffer full, retry later"));
+        }
+
         let entry = map.entry(payload.upload_id.clone()).or_insert_with(|| UploadAccum {
             project_id: payload.project_id.clone(),
             name: payload.name.clone(),
@@ -783,22 +812,38 @@ pub fn ml_studio_dataset_upload_chunk(
             total_chunks: payload.total_chunks,
             chunks: (0..payload.total_chunks).map(|_| None).collect(),
             received_bytes: 0,
+            last_touch: now,
         });
 
-        // Wszystkie fragmenty muszą zgadzać się co do projektu/pliku/liczby części.
-        if entry.project_id != payload.project_id || entry.total_chunks != payload.total_chunks {
+        // Wszystkie fragmenty muszą zgadzać się co do całej niezmiennej metadanej
+        // (projekt, nazwa, plik, liczba części) — inaczej dwa różne uploady o tym
+        // samym upload_id mogłyby się przepleść i zapisać uszkodzony dataset.
+        if entry.project_id != payload.project_id
+            || entry.name != payload.name
+            || entry.filename != payload.filename
+            || entry.total_chunks != payload.total_chunks
+        {
             map.remove(&payload.upload_id);
             return Err(ProtocolError::bad_request("chunk metadata mismatch for upload_id"));
         }
+        entry.last_touch = now;
 
         let idx = payload.seq as usize;
-        if entry.chunks[idx].is_none() {
-            entry.received_bytes += payload.bytes.len() as u64;
-            if entry.received_bytes as usize > MAX_UPLOAD_BYTES {
+        match &entry.chunks[idx] {
+            // Powtórzony fragment z inną treścią = niespójny upload → odrzucamy.
+            Some(existing) if existing.as_slice() != payload.bytes.as_slice() => {
                 map.remove(&payload.upload_id);
-                return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                return Err(ProtocolError::bad_request("conflicting bytes for chunk seq"));
             }
-            entry.chunks[idx] = Some(payload.bytes.clone());
+            Some(_) => {}
+            None => {
+                entry.received_bytes += payload.bytes.len() as u64;
+                if entry.received_bytes > MAX_UPLOAD_BYTES {
+                    map.remove(&payload.upload_id);
+                    return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                }
+                entry.chunks[idx] = Some(payload.bytes.clone());
+            }
         }
 
         let received_chunks = entry.chunks.iter().filter(|c| c.is_some()).count() as u32;
