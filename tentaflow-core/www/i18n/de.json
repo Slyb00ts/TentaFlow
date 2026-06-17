@@ -942,6 +942,7 @@
         "quant_hint": "Leer = dtype aus der Quell-config.json. Override berechnet Gewichte für AWQ/GPTQ/FP8/NVFP4 neu, damit das Modell auf die GPU passt.",
         "trust_remote_code_label": "Remote-Code vertrauen (--trust-remote-code)",
         "trust_remote_code_hint": "Erlaubt dem Modell-Repo, eigenen Ladecode auszuführen. Von manchen Modellen benötigt (Gemma 4, DeepSeek V4). Standardmäßig an — für nicht vertrauenswürdige Repos ausschalten.",
+        "recipe_applied": "Offizielles vLLM-Rezept für {id} angewendet — Expertenflags + Env vorausgefüllt (unten editierbar).",
         "quant_opt_source": "Aus Quelle (config.json)",
         "mlx_title": "Speicherbudget und Kontext (MLX)",
         "mlx_subtitle": "Apple Unified Memory — lege fest, wie viel Speicher das Modell maximal nutzen darf. Die Runtime stoppt mit einem sauberen Fehler statt OOM, wenn der Kontext nicht passt.",

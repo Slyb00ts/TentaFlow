@@ -1095,6 +1095,19 @@ function renderAutoAlert(rec) {
   const r = rec.recommended || {};
   const args = rec.recommended_vllm_args || '';
   const warnings = rec.warnings || [];
+  // Official vLLM recipe (recipes.vllm.ai) badge: signals that expert flags +
+  // per-GPU env were pre-filled from the matched recipe. Args stay editable.
+  const recipeEnv = rec.recommended_env || {};
+  const envList = Object.keys(recipeEnv);
+  const recipeBadge = rec.recipe_applied
+    ? `<div style="margin-top:10px; padding:8px 10px; background:#e8f5e9; border:1px solid #66bb6a; border-radius:6px; font-size:12px; color:#1b5e20;">
+        ✓ ${escapeHtml(tAdv('recipe_applied', { id: rec.recipe_applied }))}${
+          envList.length
+            ? `<br><span style="font-size:11px;">env: ${envList.map((k) => `<code>${escapeHtml(k)}=${escapeHtml(String(recipeEnv[k]))}</code>`).join(' ')}</span>`
+            : ''
+        }
+      </div>`
+    : '';
   // GPU compatibility: when the chosen GPU count doesn't fit the model
   // architecture (TP must divide num_attention_heads, PP must divide
   // num_hidden_layers), surface a warning chip with better-fitting counts.
@@ -1130,6 +1143,7 @@ function renderAutoAlert(rec) {
           seqs: r.max_num_seqs || 0,
           mu: (r.gpu_memory_utilization || 0.9).toFixed(2),
         }))}
+        ${recipeBadge}
         ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
         ${compatChip}
         ${warnings.length > 0 ? `<ul class="adv-alert-warn">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
@@ -2576,6 +2590,14 @@ async function startDeploy() {
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,
+    // Engine env from the matched vLLM recipe (e.g. VLLM_USE_FLASHINFER_MOE_FP4
+    // on Blackwell). Backend (`apply_engine_env`) injects these into the engine
+    // process env on both native and docker paths. Empty/missing = nothing extra.
+    engine_env: (advActive && advancedRecommendation
+      && advancedRecommendation.recommended_env
+      && Object.keys(advancedRecommendation.recommended_env).length)
+      ? advancedRecommendation.recommended_env
+      : undefined,
     // External cloud provider credentials. `api_key` is encrypted server-side
     // (never persisted in clear). `base_url`/`api_version` override the
     // manifest endpoint for generic openai-compatible / Azure engines.
