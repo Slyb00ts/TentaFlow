@@ -60,6 +60,34 @@ pub enum RobotAction {
 }
 
 impl RobotAction {
+    /// The SINGLE source of the `kind`→action allowlist, keyed on primitives so
+    /// both wire shapes (the minicbor SDK/host ABI `RobotActionWire` and the
+    /// ciborium/serde protocol `RobotActionWire`) map through the SAME closed set.
+    /// An unknown `kind` returns `None` so every caller refuses it identically;
+    /// there is no duplicated tool→action mapping anywhere.
+    pub fn from_kind_axes(kind: &str, vx: f64, vy: f64, vyaw: f64) -> Option<RobotAction> {
+        Some(match kind {
+            "move" => RobotAction::Move { vx, vy, vyaw },
+            "stop" => RobotAction::Stop,
+            "estop" => RobotAction::Estop,
+            "reset_estop" => RobotAction::ResetEstop,
+            "recovery_stand" => RobotAction::RecoveryStand,
+            "stand_up" => RobotAction::StandUp,
+            "stand_down" => RobotAction::StandDown,
+            "sit" => RobotAction::Sit,
+            "hello" => RobotAction::Hello,
+            "stretch" => RobotAction::Stretch,
+            "status" => RobotAction::Status,
+            _ => return None,
+        })
+    }
+
+    /// Map a flat `RobotActionWire` (SDK + host ABI minicbor shape) onto the core
+    /// allowlist via the shared `from_kind_axes`.
+    pub fn from_wire(wire: &tentaflow_sdk_spec::RobotActionWire) -> Option<RobotAction> {
+        Self::from_kind_axes(&wire.kind, wire.vx, wire.vy, wire.vyaw)
+    }
+
     /// E-stop-class actions are never blocked by an active e-stop latch and are
     /// never suppressed as "already failed" by the idempotency cache (repeating a
     /// stop is always safe and desirable).
@@ -469,6 +497,32 @@ mod tests {
             issued_at_ms: issued,
             expires_at_ms: expires,
         }
+    }
+
+    #[test]
+    fn from_kind_axes_maps_allowlist_and_rejects_unknown() {
+        assert_eq!(
+            RobotAction::from_kind_axes("move", 0.3, -0.1, 0.2),
+            Some(RobotAction::Move { vx: 0.3, vy: -0.1, vyaw: 0.2 })
+        );
+        let cases = [
+            ("stop", RobotAction::Stop),
+            ("estop", RobotAction::Estop),
+            ("reset_estop", RobotAction::ResetEstop),
+            ("recovery_stand", RobotAction::RecoveryStand),
+            ("stand_up", RobotAction::StandUp),
+            ("stand_down", RobotAction::StandDown),
+            ("sit", RobotAction::Sit),
+            ("hello", RobotAction::Hello),
+            ("stretch", RobotAction::Stretch),
+            ("status", RobotAction::Status),
+        ];
+        for (kind, want) in cases {
+            assert_eq!(RobotAction::from_kind_axes(kind, 0.0, 0.0, 0.0), Some(want));
+        }
+        // Closed allowlist: an unknown kind is refused.
+        assert_eq!(RobotAction::from_kind_axes("explode", 0.0, 0.0, 0.0), None);
+        assert_eq!(RobotAction::from_kind_axes("", 0.0, 0.0, 0.0), None);
     }
 
     #[test]

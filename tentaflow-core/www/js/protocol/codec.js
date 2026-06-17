@@ -981,6 +981,65 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Robots core app (MessageBody::RobotsBody)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::RobotsBody(ListRequest) — org-scoped robot list (unit). */
+  robotsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action
+   * to a robot (local or over the mesh). `kind` is one of the closed allowlist
+   * (move/stop/estop/reset_estop/recovery_stand/stand_up/stand_down/sit/hello/
+   * stretch/status); vx/vy/vyaw are normalized -1..1 and only used for "move".
+   * payload: { robotId, kind, vx, vy, vyaw }
+   */
+  robotControlRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotControlRequest(
+      payload.robotId,
+      payload.kind,
+      Number(payload.vx ?? 0),
+      Number(payload.vy ?? 0),
+      Number(payload.vyaw ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
+   * TentaVision (local: persists a cross-addon read grant; remote: view-only).
+   * payload: { robotId, cameraId }
+   */
+  robotCameraShareRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotCameraShareRequest(
+      payload.robotId,
+      payload.cameraId,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
 

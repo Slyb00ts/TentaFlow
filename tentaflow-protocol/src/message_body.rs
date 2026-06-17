@@ -1156,6 +1156,91 @@ pub enum MlStudioPayload {
     ProjectTypesListResponse(MlStudioProjectTypesListResponse),
 }
 
+// ----- Robots screen (UserSession) -----
+
+/// Typed, allowlisted robot control action carried over the binary protocol. A
+/// flat `kind` discriminant plus the optional `Move` axes mirrors the addon SDK
+/// `RobotActionWire`, so the Robots app, the addon SDK and the host all share ONE
+/// action wire shape and the same closed allowlist (Core rejects unknown kinds).
+/// `kind` is one of: "move", "stop", "estop", "reset_estop", "recovery_stand",
+/// "stand_up", "stand_down", "sit", "hello", "stretch", "status".
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotActionWire {
+    pub kind: String,
+    /// `Move` body velocity (normalized -1..1). Ignored for non-move kinds; the
+    /// owner clamps again to its safety cap.
+    pub vx: f64,
+    pub vy: f64,
+    pub vyaw: f64,
+}
+
+/// One robot row for the Robots list screen: a projection of the mesh registry's
+/// `AdvertisedRobot`, scoped to the caller's org. `is_local` lets the UI label a
+/// robot this node physically owns vs one controlled over the mesh.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotEntry {
+    pub robot_id: String,
+    /// Endpoint-id hex of the node that owns (physically controls) this robot.
+    pub owner_node_id: String,
+    pub is_local: bool,
+    pub kind: Option<String>,
+    pub status: String,
+    pub battery_percent: Option<f32>,
+    pub rtt_ms: Option<u32>,
+    pub camera_id: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotsListRequest;
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotsListResponse {
+    pub robots: Vec<RobotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotControlRequest {
+    pub robot_id: String,
+    pub action: RobotActionWire,
+}
+
+/// Result of a control action. A robot-level refusal is still a successful call
+/// carrying `rejected` (a stable tag, e.g. "permission_denied", "unknown_robot");
+/// `error` holds an execution failure message.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotControlResponse {
+    pub ok: bool,
+    pub rejected: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotCameraShareRequest {
+    pub robot_id: String,
+    pub camera_id: String,
+}
+
+/// Result of exposing a robot's camera to TentaVision. For a LOCAL robot this
+/// persists a cross-addon read grant; for a REMOTE robot no local grant exists
+/// (camera rows are node-local) so `note` explains the remote-view path.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotCameraShareResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum RobotsPayload {
+    ListRequest(RobotsListRequest),
+    ListResponse(RobotsListResponse),
+    ControlRequest(RobotControlRequest),
+    ControlResponse(RobotControlResponse),
+    CameraShareRequest(RobotCameraShareRequest),
+    CameraShareResponse(RobotCameraShareResponse),
+}
+
 // ----- Skills registry (Harness plan §3.2) -----
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -5530,6 +5615,8 @@ pub enum MessageBody {
     AddonStorageBody(AddonStoragePayload),
     // Vector backend picker addona (zvec / Milvus config + discovery).
     AddonVectorBody(AddonVectorPayload),
+    // Robots core app: list (org-scoped) + control routing + camera share.
+    RobotsBody(RobotsPayload),
 }
 
 // =============================================================================
