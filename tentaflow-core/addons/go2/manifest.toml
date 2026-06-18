@@ -80,9 +80,17 @@ required = false
 # What the robot can do — lets the Robots app / Flow Builder expose controls,
 # status tiles and sensor previews uniformly across robot types.
 [robot.capabilities]
-locomotion = true                 # Move(vx, vy, vyaw)
-poses = true                      # StandUp/StandDown/RecoveryStand/Sit/Pose(euler,height)
-actions = ["hello", "stretch", "sit", "stand_up", "stand_down", "recovery_stand", "dance1", "dance2"]
+locomotion = true                 # Move(vx, vy, vyaw) + SpeedLevel
+poses = true                      # StandUp/StandDown/RecoveryStand/BalanceStand/Sit/Euler/BodyHeight/FootRaiseHeight/Pose
+# Full implemented action surface. Acrobatics (dance1/dance2/scrape/front_flip/
+# front_jump/front_pounce) are high-risk and may be firmware/Air-locked — the
+# rich `actions_meta` from go2.status tags each with a risk tier so the UI gates them.
+actions = [
+    "hello", "stretch", "sit", "stand_up", "stand_down", "recovery_stand",
+    "balance_stand", "wiggle_hips", "heart", "dance1", "dance2",
+    "scrape", "front_flip", "front_jump", "front_pounce",
+    "euler", "body_height", "foot_raise_height", "speed_level", "pose",
+]
 estop = true
 telemetry = ["battery", "imu", "pose", "mode"]
 camera = true                     # provides a video source (consumable by TentaVision)

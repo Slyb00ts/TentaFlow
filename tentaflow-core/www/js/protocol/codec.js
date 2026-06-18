@@ -1026,7 +1026,10 @@ export const encode = {
    * to a robot (local or over the mesh). `kind` is one of the closed allowlist
    * (move/stop/estop/reset_estop/recovery_stand/stand_up/stand_down/sit/hello/
    * stretch/status); vx/vy/vyaw are normalized -1..1 and only used for "move".
-   * payload: { robotId, kind, vx, vy, vyaw }
+   * payload: { robotId, kind, vx, vy, vyaw, p1, p2, p3, p4 }
+   * p1..p4 are generic params keyed by kind (euler → roll/pitch/yaw;
+   * body_height/foot_raise_height → p1=height; speed_level → p1=level;
+   * pose → roll/pitch/yaw/height). The owner clamps every numeric param.
    */
   robotControlRequest(correlationId, payload, sequence = 1) {
     assertReady();
@@ -1036,6 +1039,10 @@ export const encode = {
       Number(payload.vx ?? 0),
       Number(payload.vy ?? 0),
       Number(payload.vyaw ?? 0),
+      Number(payload.p1 ?? 0),
+      Number(payload.p2 ?? 0),
+      Number(payload.p3 ?? 0),
+      Number(payload.p4 ?? 0),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

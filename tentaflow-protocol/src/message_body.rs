@@ -1892,6 +1892,18 @@ pub struct RobotActionWire {
     pub vx: f64,
     pub vy: f64,
     pub vyaw: f64,
+    /// Generic numeric params for parametered poses/levels, keyed by `kind` (see
+    /// the SDK `RobotActionWire` and core `RobotAction::from_kind_params`).
+    /// Defaulted to 0 for parameterless kinds and older senders. The owner clamps
+    /// each to the documented Go2 range.
+    #[serde(default)]
+    pub p1: f64,
+    #[serde(default)]
+    pub p2: f64,
+    #[serde(default)]
+    pub p3: f64,
+    #[serde(default)]
+    pub p4: f64,
 }
 
 /// One robot row for the Robots list screen: a projection of the mesh registry's

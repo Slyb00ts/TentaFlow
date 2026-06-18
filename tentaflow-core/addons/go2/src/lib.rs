@@ -59,17 +59,47 @@ const ONLINE_STALE_SECS: i64 = 12;
 static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
-// Sport command api_ids (normal mode) — only safe motions exposed (no Air-locked
-// flips / handstand).
+// Sport command api_ids (Go2 normal mode). This addon drives the robot over the
+// WebRTC firmware channel, so the authoritative id source is the WebRTC SPORT_CMD
+// table, NOT the DDS `unitree_sdk2` header. Cross-checked on 2026-06-18 against:
+//   - DDS:    https://raw.githubusercontent.com/unitreerobotics/unitree_sdk2/main/include/unitree/robot/go2/sport/sport_api.hpp
+//   - WebRTC: https://raw.githubusercontent.com/legion1581/unitree_webrtc_connect/master/unitree_webrtc_connect/constants.py (SPORT_CMD)
+// 19 of the 22 ids appear in BOTH tables identically. The remaining three —
+// BODY_HEIGHT (1013), FOOT_RAISE_HEIGHT (1014) and WIGGLE_HIPS (1033) — are NOT in
+// the DDS sport_api.hpp but ARE in the WebRTC SPORT_CMD table, which is the table
+// this transport uses. 1036 is `FingerHeart`/HEART in both, mapped to `heart`.
+// These IDs move a REAL robot, so they are not invented.
 const SPORT_DAMP: u32 = 1001;
+const SPORT_BALANCE_STAND: u32 = 1002;
 const SPORT_STOP_MOVE: u32 = 1003;
 const SPORT_STAND_UP: u32 = 1004;
 const SPORT_STAND_DOWN: u32 = 1005;
 const SPORT_RECOVERY_STAND: u32 = 1006;
+const SPORT_EULER: u32 = 1007;
 const SPORT_MOVE: u32 = 1008;
 const SPORT_SIT: u32 = 1009;
-const SPORT_STRETCH: u32 = 1017;
+const SPORT_BODY_HEIGHT: u32 = 1013;
+const SPORT_FOOT_RAISE_HEIGHT: u32 = 1014;
+const SPORT_SPEED_LEVEL: u32 = 1015;
 const SPORT_HELLO: u32 = 1016;
+const SPORT_STRETCH: u32 = 1017;
+const SPORT_DANCE1: u32 = 1022;
+const SPORT_DANCE2: u32 = 1023;
+const SPORT_SCRAPE: u32 = 1029;
+const SPORT_FRONT_FLIP: u32 = 1030;
+const SPORT_FRONT_JUMP: u32 = 1031;
+const SPORT_FRONT_POUNCE: u32 = 1032;
+const SPORT_WIGGLE_HIPS: u32 = 1033;
+const SPORT_FINGER_HEART: u32 = 1036;
+
+// Safe parameter clamps (mirrors core robot_control limits) — applied here too so
+// a LOCAL tool/block call (which does not pass through the mesh sanitizer) can
+// never send an out-of-range pose to the robot.
+const EULER_LIMIT: f64 = 0.75;
+const BODY_HEIGHT_MIN: f64 = -0.18;
+const BODY_HEIGHT_MAX: f64 = 0.03;
+const FOOT_RAISE_MIN: f64 = -0.06;
+const FOOT_RAISE_MAX: f64 = 0.10;
 
 // =============================================================================
 // Host imports
@@ -363,24 +393,58 @@ fn subscribe_msg(topic: &str) -> String {
     json!({ "type": "subscribe", "topic": topic }).to_string()
 }
 
+/// Clamp a value into `[lo, hi]`; reject NaN/inf (caller surfaces an error).
+fn clamp_finite(v: f64, lo: f64, hi: f64) -> Option<f64> {
+    if !v.is_finite() {
+        return None;
+    }
+    Some(v.clamp(lo, hi))
+}
+
+/// Read a JSON number param from the tool/block input (supports a raw number or a
+/// FlowValue `{kind,data}`). Returns None when absent/unparseable so the caller
+/// can reject rather than silently default a motion command.
+fn param_num(params: &JsonValue, key: &str) -> Option<f64> {
+    let v = params.get(key)?;
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    flow_value_num(v)
+}
+
 /// Map a local sport command `(api_id, parameter)` to the vendor-agnostic
 /// `RobotActionWire` used for cross-node dispatch. `parameter` is the go2 move
 /// JSON (`{"x","y","z"}`) for SPORT_MOVE; ignored otherwise. Returns `None` for
 /// an api_id with no remote-control equivalent (so the caller keeps it local).
 fn sport_to_action(api_id: u32, parameter: &str) -> Option<RobotActionWire> {
+    let p: JsonValue = serde_json::from_str(parameter).unwrap_or(JsonValue::Null);
+    let num = |k: &str| p.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0);
     Some(match api_id {
-        SPORT_MOVE => {
-            let p: JsonValue = serde_json::from_str(parameter).unwrap_or(JsonValue::Null);
-            let axis = |k: &str| p.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0);
-            RobotActionWire::move_to(axis("x"), axis("y"), axis("z"))
-        }
+        SPORT_MOVE => RobotActionWire::move_to(num("x"), num("y"), num("z")),
         SPORT_STOP_MOVE | SPORT_DAMP => RobotActionWire::simple("stop"),
         SPORT_STAND_UP => RobotActionWire::simple("stand_up"),
         SPORT_STAND_DOWN => RobotActionWire::simple("stand_down"),
         SPORT_RECOVERY_STAND => RobotActionWire::simple("recovery_stand"),
+        SPORT_BALANCE_STAND => RobotActionWire::simple("balance_stand"),
         SPORT_SIT => RobotActionWire::simple("sit"),
         SPORT_HELLO => RobotActionWire::simple("hello"),
         SPORT_STRETCH => RobotActionWire::simple("stretch"),
+        SPORT_WIGGLE_HIPS => RobotActionWire::simple("wiggle_hips"),
+        SPORT_FINGER_HEART => RobotActionWire::simple("heart"),
+        SPORT_DANCE1 => RobotActionWire::simple("dance1"),
+        SPORT_DANCE2 => RobotActionWire::simple("dance2"),
+        SPORT_SCRAPE => RobotActionWire::simple("scrape"),
+        SPORT_FRONT_FLIP => RobotActionWire::simple("front_flip"),
+        SPORT_FRONT_JUMP => RobotActionWire::simple("front_jump"),
+        SPORT_FRONT_POUNCE => RobotActionWire::simple("front_pounce"),
+        // The Go2 sport `parameter` for Euler is a JSON object with x/y/z (the
+        // roll/pitch/yaw radians); map it back onto the generic params shape.
+        SPORT_EULER => RobotActionWire::params("euler", num("x"), num("y"), num("z"), 0.0),
+        SPORT_BODY_HEIGHT => RobotActionWire::params("body_height", num("data"), 0.0, 0.0, 0.0),
+        SPORT_FOOT_RAISE_HEIGHT => {
+            RobotActionWire::params("foot_raise_height", num("data"), 0.0, 0.0, 0.0)
+        }
+        SPORT_SPEED_LEVEL => RobotActionWire::params("speed_level", num("data"), 0.0, 0.0, 0.0),
         _ => return None,
     })
 }
@@ -444,6 +508,117 @@ fn send_sport_gated(api_id: u32, parameter: &str) -> JsonValue {
         Ok(()) => json!({ "status": "sent" }),
         Err(e) => json!({ "error": alloc::format!("send: {e}") }),
     }
+}
+
+/// Euler tool: clamp roll/pitch/yaw to ±EULER_LIMIT, reject NaN/inf, send 1007.
+/// The Go2 sport `parameter` for Euler is `{"x":roll,"y":pitch,"z":yaw}`.
+fn send_euler(params: &JsonValue) -> JsonValue {
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        param_num(params, "roll"),
+        param_num(params, "pitch"),
+        param_num(params, "yaw"),
+    ) else {
+        return json!({ "error": "euler requires numeric roll/pitch/yaw" });
+    };
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        clamp_finite(roll, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(pitch, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(yaw, -EULER_LIMIT, EULER_LIMIT),
+    ) else {
+        return json!({ "error": "euler params must be finite" });
+    };
+    let p = json!({ "x": roll, "y": pitch, "z": yaw }).to_string();
+    send_sport_gated(SPORT_EULER, &p)
+}
+
+/// BodyHeight tool: clamp delta to [BODY_HEIGHT_MIN, BODY_HEIGHT_MAX], send 1013.
+fn send_body_height(params: &JsonValue) -> JsonValue {
+    let Some(h) = param_num(params, "height") else {
+        return json!({ "error": "body_height requires numeric height" });
+    };
+    let Some(h) = clamp_finite(h, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) else {
+        return json!({ "error": "body_height must be finite" });
+    };
+    send_sport_gated(SPORT_BODY_HEIGHT, &json!({ "data": h }).to_string())
+}
+
+/// FootRaiseHeight tool: clamp to [FOOT_RAISE_MIN, FOOT_RAISE_MAX], send 1014.
+fn send_foot_raise(params: &JsonValue) -> JsonValue {
+    let Some(h) = param_num(params, "height") else {
+        return json!({ "error": "foot_raise_height requires numeric height" });
+    };
+    let Some(h) = clamp_finite(h, FOOT_RAISE_MIN, FOOT_RAISE_MAX) else {
+        return json!({ "error": "foot_raise_height must be finite" });
+    };
+    send_sport_gated(SPORT_FOOT_RAISE_HEIGHT, &json!({ "data": h }).to_string())
+}
+
+/// SpeedLevel tool: discrete -1/0/1, NaN/out-of-range rejected, send 1015.
+fn send_speed_level(params: &JsonValue) -> JsonValue {
+    let Some(l) = param_num(params, "level") else {
+        return json!({ "error": "speed_level requires numeric level" });
+    };
+    if !l.is_finite() {
+        return json!({ "error": "speed_level must be finite" });
+    }
+    let l = l.round();
+    if !(-1.0..=1.0).contains(&l) {
+        return json!({ "error": "speed_level must be -1, 0 or 1" });
+    }
+    send_sport_gated(SPORT_SPEED_LEVEL, &json!({ "data": l as i64 }).to_string())
+}
+
+/// Composite body pose: Euler orientation (1007) + optional BodyHeight delta (1013).
+/// This is deliberately NOT the canonical `Pose` (1028) toggle — 1028 is a mode
+/// switch whose bool-flag semantics vary across Go2 firmware variants, so it can
+/// leave the robot in an unexpected state. The composite gives a deterministic
+/// body-orientation+height pose on every firmware; 1028 is intentionally omitted.
+///
+/// SAFETY: validate and clamp ALL params {roll,pitch,yaw,height} up front and send
+/// nothing until every value is known-safe. A bad height must NOT move the robot
+/// via the Euler leg first. NaN/inf are rejected (never coerced); finite-but-out-of
+/// -range values are clamped to the documented envelope.
+fn send_pose(params: &JsonValue) -> JsonValue {
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        param_num(params, "roll"),
+        param_num(params, "pitch"),
+        param_num(params, "yaw"),
+    ) else {
+        return json!({ "error": "pose requires numeric roll/pitch/yaw" });
+    };
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        clamp_finite(roll, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(pitch, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(yaw, -EULER_LIMIT, EULER_LIMIT),
+    ) else {
+        return json!({ "error": "pose orientation params must be finite" });
+    };
+
+    // `height` is optional for a pure-orientation pose; default to no height change.
+    let height = match params.get("height") {
+        Some(_) => match param_num(params, "height") {
+            Some(h) => match clamp_finite(h, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) {
+                Some(h) => Some(h),
+                None => return json!({ "error": "pose height must be finite" }),
+            },
+            None => return json!({ "error": "pose height must be numeric" }),
+        },
+        None => None,
+    };
+
+    // Everything is validated and clamped: now (and only now) emit motion commands.
+    let euler_param = json!({ "x": roll, "y": pitch, "z": yaw }).to_string();
+    let euler = send_sport_gated(SPORT_EULER, &euler_param);
+    if euler.get("error").is_some() {
+        return euler;
+    }
+    if let Some(h) = height {
+        let body = send_sport_gated(SPORT_BODY_HEIGHT, &json!({ "data": h }).to_string());
+        if body.get("error").is_some() {
+            return body;
+        }
+    }
+    json!({ "status": "sent" })
 }
 
 /// Find `needle` in `hay` starting at `from` (plain substring scan).
@@ -1004,7 +1179,7 @@ fn render_panel() {
 // Request dispatch
 // =============================================================================
 
-fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
+fn handle(tool: &str, params: &JsonValue) -> JsonValue {
     let mv = |vx: f64, vy: f64, vyaw: f64| -> JsonValue {
         let p = json!({ "x": vx, "y": vy, "z": vyaw }).to_string();
         send_sport_gated(SPORT_MOVE, &p)
@@ -1019,7 +1194,21 @@ fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
         "go2.action_sit" => send_sport_gated(SPORT_SIT, ""),
         "go2.action_standup" => send_sport_gated(SPORT_STAND_UP, ""),
         "go2.action_standdown" => send_sport_gated(SPORT_STAND_DOWN, ""),
+        "go2.action_balance_stand" => send_sport_gated(SPORT_BALANCE_STAND, ""),
         "go2.action_stretch" => send_sport_gated(SPORT_STRETCH, ""),
+        "go2.action_wiggle_hips" => send_sport_gated(SPORT_WIGGLE_HIPS, ""),
+        "go2.action_heart" => send_sport_gated(SPORT_FINGER_HEART, ""),
+        "go2.action_dance1" => send_sport_gated(SPORT_DANCE1, ""),
+        "go2.action_dance2" => send_sport_gated(SPORT_DANCE2, ""),
+        "go2.action_scrape" => send_sport_gated(SPORT_SCRAPE, ""),
+        "go2.action_front_flip" => send_sport_gated(SPORT_FRONT_FLIP, ""),
+        "go2.action_front_jump" => send_sport_gated(SPORT_FRONT_JUMP, ""),
+        "go2.action_front_pounce" => send_sport_gated(SPORT_FRONT_POUNCE, ""),
+        "go2.euler" => send_euler(params),
+        "go2.body_height" => send_body_height(params),
+        "go2.foot_raise_height" => send_foot_raise(params),
+        "go2.speed_level" => send_speed_level(params),
+        "go2.pose" => send_pose(params),
         "go2.move_fwd" => mv(0.3, 0.0, 0.0),
         "go2.move_back" => mv(-0.3, 0.0, 0.0),
         "go2.move_left" => mv(0.0, 0.3, 0.0),
@@ -1028,18 +1217,76 @@ fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
             Ok(r) => json!({
                 "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
                 "estop_active": r.estop_active, "camera_id": r.camera_id,
-                // Capabilities the go2 driver exposes. Advertised on the mesh so a
-                // controller node can present available actions without owning the
-                // addon. Keep in sync with the `go2.action_*` / `go2.move_*` tools.
-                "capabilities": [
-                    "move", "sit", "stand_up", "stand_down", "recovery_stand",
-                    "hello", "stretch", "stop", "camera",
-                ],
+                // Flat capability tags (kept for backward compatibility with any
+                // consumer that reads a string array). Keep in sync with `actions_meta`.
+                "capabilities": capability_kinds(),
+                // Rich, capability-driven descriptor: every implemented control with
+                // a human label, risk tier and param schema, so a capability-driven
+                // UI can render labels / gate high-risk acrobatics without hardcoding.
+                "actions_meta": actions_meta(),
             }),
             Err(e) => json!({ "error": alloc::format!("{e}") }),
         },
         other => json!({ "error": alloc::format!("unknown tool: {other}") }),
     }
+}
+
+/// Flat list of control `kind` strings this driver exposes (matches the core
+/// `RobotAction` allowlist kinds + the non-motion `camera`/`status` tags).
+fn capability_kinds() -> Vec<&'static str> {
+    vec![
+        "move", "stop", "estop", "reset_estop", "recovery_stand", "stand_up",
+        "stand_down", "balance_stand", "sit", "hello", "stretch", "euler",
+        "body_height", "foot_raise_height", "speed_level", "pose", "wiggle_hips",
+        "heart", "dance1", "dance2", "scrape", "front_flip", "front_jump",
+        "front_pounce", "status", "camera",
+    ]
+}
+
+/// Rich capability descriptor for a capability-driven UI: each entry carries the
+/// control `kind`, a human label, a risk tier ("low"/"medium"/"high") and the
+/// numeric param schema (name + min/max). High-risk acrobatics are tagged so the
+/// UI can require an explicit confirmation before sending them.
+fn actions_meta() -> JsonValue {
+    let p = |name: &str, min: f64, max: f64| json!({ "name": name, "min": min, "max": max });
+    json!([
+        { "kind": "move", "label": "Ruch", "risk": "medium", "params": [
+            p("vx", -1.0, 1.0), p("vy", -1.0, 1.0), p("vyaw", -1.0, 1.0) ] },
+        { "kind": "stop", "label": "Stop", "risk": "low", "params": [] },
+        { "kind": "estop", "label": "E-STOP", "risk": "low", "params": [] },
+        { "kind": "reset_estop", "label": "Reset e-stop", "risk": "low", "params": [] },
+        { "kind": "recovery_stand", "label": "RecoveryStand", "risk": "medium", "params": [] },
+        { "kind": "stand_up", "label": "Wstań", "risk": "medium", "params": [] },
+        { "kind": "stand_down", "label": "Połóż się", "risk": "low", "params": [] },
+        { "kind": "balance_stand", "label": "BalanceStand", "risk": "medium", "params": [] },
+        { "kind": "sit", "label": "Siad", "risk": "low", "params": [] },
+        { "kind": "hello", "label": "Przywitanie", "risk": "low", "params": [] },
+        { "kind": "stretch", "label": "Przeciąganie", "risk": "low", "params": [] },
+        { "kind": "euler", "label": "Orientacja (Euler)", "risk": "medium", "params": [
+            p("roll", -EULER_LIMIT, EULER_LIMIT),
+            p("pitch", -EULER_LIMIT, EULER_LIMIT),
+            p("yaw", -EULER_LIMIT, EULER_LIMIT) ] },
+        { "kind": "body_height", "label": "Wysokość ciała", "risk": "medium", "params": [
+            p("height", BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) ] },
+        { "kind": "foot_raise_height", "label": "Wysokość kroku", "risk": "medium", "params": [
+            p("height", FOOT_RAISE_MIN, FOOT_RAISE_MAX) ] },
+        { "kind": "speed_level", "label": "Poziom prędkości", "risk": "medium", "params": [
+            p("level", -1.0, 1.0) ] },
+        { "kind": "pose", "label": "Poza ciała", "risk": "medium", "params": [
+            p("roll", -EULER_LIMIT, EULER_LIMIT),
+            p("pitch", -EULER_LIMIT, EULER_LIMIT),
+            p("yaw", -EULER_LIMIT, EULER_LIMIT),
+            p("height", BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) ] },
+        { "kind": "wiggle_hips", "label": "Wiggle Hips", "risk": "medium", "params": [] },
+        { "kind": "heart", "label": "Serduszko", "risk": "medium", "params": [] },
+        { "kind": "dance1", "label": "Taniec 1", "risk": "high", "params": [] },
+        { "kind": "dance2", "label": "Taniec 2", "risk": "high", "params": [] },
+        { "kind": "scrape", "label": "Scrape", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_flip", "label": "Front Flip", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_jump", "label": "Front Jump", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_pounce", "label": "Front Pounce", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "status", "label": "Status", "risk": "low", "read_only": true, "params": [] },
+    ])
 }
 
 /// Decode a `FlowValue` (`{"kind":"json"|"text","data":...}`) into a number.
@@ -1066,6 +1313,17 @@ fn block_num(params: &JsonValue, key: &str) -> f64 {
     0.0
 }
 
+/// Extract the flow block's `variables` map (the contract for typed block params,
+/// each a FlowValue `{kind,data}`). `param_num` reads FlowValues directly, so a
+/// parametered block (euler/body_height/…) feeds this sub-object to the same
+/// param parser the tool path uses. Missing → empty object (param parser rejects).
+fn block_vars(params: &JsonValue) -> JsonValue {
+    params
+        .get("variables")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
 /// Flow-block dispatch. Executes the robot action, then returns the INPUT
 /// envelope (a valid FlowEnvelope) with the result recorded in `meta.go2` so the
 /// flow continues. `params` IS the FlowEnvelope the host sent.
@@ -1078,6 +1336,20 @@ fn handle_block(block_type: &str, params: &JsonValue) -> JsonValue {
         "go2.sit" => send_sport_gated(SPORT_SIT, ""),
         "go2.hello" => send_sport_gated(SPORT_HELLO, ""),
         "go2.stretch" => send_sport_gated(SPORT_STRETCH, ""),
+        "go2.balance_stand" => send_sport_gated(SPORT_BALANCE_STAND, ""),
+        "go2.wiggle_hips" => send_sport_gated(SPORT_WIGGLE_HIPS, ""),
+        "go2.heart" => send_sport_gated(SPORT_FINGER_HEART, ""),
+        "go2.dance1" => send_sport_gated(SPORT_DANCE1, ""),
+        "go2.dance2" => send_sport_gated(SPORT_DANCE2, ""),
+        "go2.scrape" => send_sport_gated(SPORT_SCRAPE, ""),
+        "go2.front_flip" => send_sport_gated(SPORT_FRONT_FLIP, ""),
+        "go2.front_jump" => send_sport_gated(SPORT_FRONT_JUMP, ""),
+        "go2.front_pounce" => send_sport_gated(SPORT_FRONT_POUNCE, ""),
+        "go2.euler" => send_euler(&block_vars(params)),
+        "go2.body_height" => send_body_height(&block_vars(params)),
+        "go2.foot_raise_height" => send_foot_raise(&block_vars(params)),
+        "go2.speed_level" => send_speed_level(&block_vars(params)),
+        "go2.pose" => send_pose(&block_vars(params)),
         "go2.move" => {
             let p = json!({
                 "x": block_num(params, "vx"),
