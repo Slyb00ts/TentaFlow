@@ -685,6 +685,240 @@ fn parse_soc(bytes: &[u8]) -> Option<i64> {
 }
 
 // =============================================================================
+// Latest-telemetry snapshot (rt/sportmodestate + rt/lf/lowstate)
+// =============================================================================
+
+/// Most-recent values parsed from the high-rate telemetry streams. Every field is
+/// optional so an absent value is NEVER fabricated — a stream that omits a field
+/// (or a whole sub-block) simply leaves it `None`/empty. This lives in process
+/// memory (single-threaded WASM) and is overwritten with the latest values on
+/// every tick; `go2.status` reads it at the existing status cadence (it is NOT
+/// advertised at the raw stream rate).
+#[derive(Clone, Default)]
+struct Telemetry {
+    mode: Option<i64>,
+    gait_type: Option<i64>,
+    body_height: Option<f64>,
+    vx: Option<f64>,
+    vy: Option<f64>,
+    vyaw: Option<f64>,
+    position: Vec<f64>,
+    foot_force: Vec<f64>,
+    imu_roll: Option<f64>,
+    imu_pitch: Option<f64>,
+    imu_yaw: Option<f64>,
+    imu_quaternion: Vec<f64>,
+    imu_temperature: Option<f64>,
+    bat_soc: Option<f64>,
+    bat_voltage: Option<f64>,
+    bat_current: Option<f64>,
+    bat_temperature: Option<f64>,
+}
+
+std::thread_local! {
+    static TELEMETRY: core::cell::RefCell<Telemetry> = core::cell::RefCell::new(Telemetry::default());
+}
+
+/// Read a fixed-layout `[a, b, c, ...]` JSON sensor array of numbers into a
+/// `Vec<f64>`. All-or-nothing: these arrays carry positional identity (e.g.
+/// `foot_force[0]` is one specific foot), so if ANY element is missing/null/
+/// non-numeric the WHOLE vector is dropped rather than compacted — a compacted
+/// partial would silently shift indices and corrupt the per-position mapping.
+/// Empty when the value is absent, not an array, or any element is non-numeric
+/// (no invented entries, no shifted entries).
+fn json_f64_array(v: Option<&JsonValue>) -> Vec<f64> {
+    let Some(arr) = v.and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        match elem.as_f64() {
+            Some(n) => out.push(n),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// Parse a `rt/sportmodestate` message body into the latest-telemetry snapshot,
+/// overwriting ONLY the fields actually present (an absent field keeps the prior
+/// value rather than clobbering it to None — the stream sometimes omits sub-blocks
+/// between frames). The documented go2_webrtc_connect shape carries the sport
+/// fields under `data`.
+fn ingest_sportmodestate(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        if let Some(n) = data.get("mode").and_then(JsonValue::as_i64) {
+            t.mode = Some(n);
+        }
+        if let Some(n) = data.get("gait_type").and_then(JsonValue::as_i64) {
+            t.gait_type = Some(n);
+        }
+        if let Some(n) = data.get("body_height").and_then(JsonValue::as_f64) {
+            t.body_height = Some(n);
+        }
+        if let Some(vel) = data.get("velocity").and_then(JsonValue::as_array) {
+            if let Some(x) = vel.first().and_then(JsonValue::as_f64) {
+                t.vx = Some(x);
+            }
+            if let Some(y) = vel.get(1).and_then(JsonValue::as_f64) {
+                t.vy = Some(y);
+            }
+        }
+        if let Some(n) = data.get("yaw_speed").and_then(JsonValue::as_f64) {
+            t.vyaw = Some(n);
+        }
+        let pos = json_f64_array(data.get("position"));
+        if !pos.is_empty() {
+            t.position = pos;
+        }
+        let ff = json_f64_array(data.get("foot_force"));
+        if !ff.is_empty() {
+            t.foot_force = ff;
+        }
+        if let Some(imu) = data.get("imu_state") {
+            if let Some(rpy) = imu.get("rpy").and_then(JsonValue::as_array) {
+                if let Some(r) = rpy.first().and_then(JsonValue::as_f64) {
+                    t.imu_roll = Some(r);
+                }
+                if let Some(p) = rpy.get(1).and_then(JsonValue::as_f64) {
+                    t.imu_pitch = Some(p);
+                }
+                if let Some(y) = rpy.get(2).and_then(JsonValue::as_f64) {
+                    t.imu_yaw = Some(y);
+                }
+            }
+            let quat = json_f64_array(imu.get("quaternion"));
+            if !quat.is_empty() {
+                t.imu_quaternion = quat;
+            }
+            if let Some(n) = imu.get("temperature").and_then(JsonValue::as_f64) {
+                t.imu_temperature = Some(n);
+            }
+        }
+    });
+}
+
+/// Parse the extra battery detail (voltage / current / bms temperature) out of a
+/// `rt/lf/lowstate` body, updating the snapshot. SOC is handled separately by the
+/// zero-alloc `parse_soc` byte scan on the hot path; this richer parse runs only
+/// when a lowstate frame is the throttled snapshot carrier. Tolerant of the two
+/// documented shapes: a top-level `bms_state` object or a flat layout.
+fn ingest_lowstate_battery(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    let bms = data.get("bms_state").or_else(|| data.get("bms"));
+    TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        if let Some(soc) = bms
+            .and_then(|b| b.get("soc"))
+            .or_else(|| data.get("soc"))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_soc = Some(soc);
+        }
+        // Pack voltage/current can be reported at the lowstate root (`power_v`,
+        // `power_a`) or inside the bms block (`voltage`, `current`).
+        if let Some(volt) = data
+            .get("power_v")
+            .or_else(|| bms.and_then(|b| b.get("voltage")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_voltage = Some(volt);
+        }
+        if let Some(curr) = data
+            .get("power_a")
+            .or_else(|| bms.and_then(|b| b.get("current")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_current = Some(curr);
+        }
+        if let Some(temp) = bms
+            .and_then(|b| b.get("temperature"))
+            .or_else(|| bms.and_then(|b| b.get("bms_temperature")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_temperature = Some(temp);
+        }
+    });
+}
+
+/// Build the structured `telemetry` JSON object from the latest snapshot, INCLUDING
+/// only the fields actually received (absent → omitted, never a fabricated value).
+/// Returns `JsonValue::Null` when nothing has been received yet so `go2.status`
+/// omits the key entirely.
+fn telemetry_json() -> JsonValue {
+    TELEMETRY.with(|cell| {
+        let t = cell.borrow();
+        let mut obj = serde_json::Map::new();
+        let put_num = |obj: &mut serde_json::Map<String, JsonValue>, k: &str, v: Option<f64>| {
+            if let Some(n) = v {
+                obj.insert(k.into(), json!(n));
+            }
+        };
+        if let Some(n) = t.mode {
+            obj.insert("mode".into(), json!(n));
+        }
+        if let Some(n) = t.gait_type {
+            obj.insert("gait_type".into(), json!(n));
+        }
+        put_num(&mut obj, "body_height", t.body_height);
+        let mut vel = serde_json::Map::new();
+        if let Some(n) = t.vx {
+            vel.insert("vx".into(), json!(n));
+        }
+        if let Some(n) = t.vy {
+            vel.insert("vy".into(), json!(n));
+        }
+        if let Some(n) = t.vyaw {
+            vel.insert("vyaw".into(), json!(n));
+        }
+        if !vel.is_empty() {
+            obj.insert("velocity".into(), JsonValue::Object(vel));
+        }
+        if !t.position.is_empty() {
+            obj.insert("position".into(), json!(t.position));
+        }
+        if !t.foot_force.is_empty() {
+            obj.insert("foot_force".into(), json!(t.foot_force));
+        }
+
+        let mut imu = serde_json::Map::new();
+        put_num(&mut imu, "roll", t.imu_roll);
+        put_num(&mut imu, "pitch", t.imu_pitch);
+        put_num(&mut imu, "yaw", t.imu_yaw);
+        if !t.imu_quaternion.is_empty() {
+            imu.insert("quaternion".into(), json!(t.imu_quaternion));
+        }
+        put_num(&mut imu, "temperature", t.imu_temperature);
+        if !imu.is_empty() {
+            obj.insert("imu".into(), JsonValue::Object(imu));
+        }
+
+        let mut bat = serde_json::Map::new();
+        put_num(&mut bat, "soc", t.bat_soc);
+        put_num(&mut bat, "voltage", t.bat_voltage);
+        put_num(&mut bat, "current", t.bat_current);
+        put_num(&mut bat, "temperature", t.bat_temperature);
+        if !bat.is_empty() {
+            obj.insert("battery".into(), JsonValue::Object(bat));
+        }
+
+        if obj.is_empty() {
+            JsonValue::Null
+        } else {
+            JsonValue::Object(obj)
+        }
+    })
+}
+
+// =============================================================================
 // Connection state machine
 // =============================================================================
 
@@ -989,12 +1223,19 @@ fn tick() {
                     };
                     let raw = &dec[..n];
                     // Only lowstate carries battery; gate on the topic substring,
-                    // then pull the integer soc with a zero-alloc byte scan.
+                    // then pull the integer soc with a zero-alloc byte scan. The
+                    // richer battery detail (voltage/current/temp) is parsed into
+                    // the latest-telemetry snapshot read at the status cadence.
                     if find_sub(raw, b"lowstate", 0).is_some() {
                         if let Some(soc) = parse_soc(raw) {
                             battery = soc;
                             got_telemetry = true;
                         }
+                        ingest_lowstate_battery(raw);
+                    } else if find_sub(raw, b"sportmodestate", 0).is_some() {
+                        // High-rate motion/IMU stream: keep only the latest values
+                        // in memory; never advertise at this raw rate.
+                        ingest_sportmodestate(raw);
                     }
                 }
             });
@@ -1214,17 +1455,29 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
         "go2.move_left" => mv(0.0, 0.3, 0.0),
         "go2.move_right" => mv(0.0, -0.3, 0.0),
         "go2.status" => match db::get_robot() {
-            Ok(r) => json!({
-                "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
-                "estop_active": r.estop_active, "camera_id": r.camera_id,
-                // Flat capability tags (kept for backward compatibility with any
-                // consumer that reads a string array). Keep in sync with `actions_meta`.
-                "capabilities": capability_kinds(),
-                // Rich, capability-driven descriptor: every implemented control with
-                // a human label, risk tier and param schema, so a capability-driven
-                // UI can render labels / gate high-risk acrobatics without hardcoding.
-                "actions_meta": actions_meta(),
-            }),
+            Ok(r) => {
+                let mut out = json!({
+                    "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
+                    "estop_active": r.estop_active, "camera_id": r.camera_id,
+                    // Flat capability tags (kept for backward compatibility with any
+                    // consumer that reads a string array). Keep in sync with `actions_meta`.
+                    "capabilities": capability_kinds(),
+                    // Rich, capability-driven descriptor: every implemented control with
+                    // a human label, risk tier and param schema, so a capability-driven
+                    // UI can render labels / gate high-risk acrobatics without hardcoding.
+                    "actions_meta": actions_meta(),
+                });
+                // Structured telemetry snapshot (latest values from
+                // rt/sportmodestate + rt/lf/lowstate). Only emitted when something
+                // has been received — an empty stream omits the key entirely.
+                let telemetry = telemetry_json();
+                if !telemetry.is_null() {
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("telemetry".into(), telemetry);
+                    }
+                }
+                out
+            }
             Err(e) => json!({ "error": alloc::format!("{e}") }),
         },
         other => json!({ "error": alloc::format!("unknown tool: {other}") }),

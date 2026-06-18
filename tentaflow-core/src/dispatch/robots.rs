@@ -19,8 +19,9 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotCameraShareResponse,
-    RobotControlResponse, RobotEntry, RobotsListResponse, RobotsPayload,
+    MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
+    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot,
+    RobotTelemetrySnapshot, RobotsListResponse, RobotsPayload,
 };
 
 use super::HandlerContext;
@@ -74,6 +75,38 @@ fn to_entry(r: AdvertisedRobot, local_node_id: &str) -> RobotEntry {
                     .collect(),
             })
             .collect(),
+        telemetry: r.telemetry.map(to_telemetry),
+    }
+}
+
+/// Project the mesh-layer `RobotTelemetrySnapshot` onto the protocol wire type
+/// (two distinct types over the same shape — the mesh struct is the registry's
+/// own, the protocol struct is the wire contract).
+fn to_telemetry(
+    t: crate::mesh::robot_dispatch::RobotTelemetrySnapshot,
+) -> RobotTelemetrySnapshot {
+    RobotTelemetrySnapshot {
+        mode: t.mode,
+        gait_type: t.gait_type,
+        body_height: t.body_height,
+        vx: t.vx,
+        vy: t.vy,
+        vyaw: t.vyaw,
+        position: t.position,
+        foot_force: t.foot_force,
+        imu: t.imu.map(|i| RobotImuSnapshot {
+            roll: i.roll,
+            pitch: i.pitch,
+            yaw: i.yaw,
+            quaternion: i.quaternion,
+            temperature: i.temperature,
+        }),
+        battery: t.battery.map(|b| RobotBatterySnapshot {
+            soc: b.soc,
+            voltage: b.voltage,
+            current: b.current,
+            temperature: b.temperature,
+        }),
     }
 }
 

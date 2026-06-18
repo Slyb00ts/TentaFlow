@@ -148,6 +148,22 @@ function actionsMeta(r) {
   return Array.isArray(m) ? m : [];
 }
 
+// Structured runtime telemetry snapshot (gait / velocity / IMU / battery detail).
+// camel/snake tolerant; null when the robot reports none.
+function telemetry(r) {
+  return field(r, 'telemetry', 'telemetry') || null;
+}
+
+function telNum(t, camel, snake) {
+  const v = t[camel] ?? t[snake];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// Radians → degrees for the IMU orientation display.
+function radToDeg(v) {
+  return v == null ? null : (v * 180) / Math.PI;
+}
+
 function actionRisk(a) { return String(a.risk || 'medium').toLowerCase(); }
 function actionAcrobatic(a) { return !!a.acrobatic; }
 function actionReadOnly(a) { return !!(a.readOnly ?? a.read_only); }
@@ -608,6 +624,10 @@ function updateCard(el, r) {
     ownerEl.textContent = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
   }
 
+  // Refresh the telemetry panel in place (its own container, never the video
+  // node above it). Only present fields render; an absent snapshot hides it.
+  updateTelemetry(el, r);
+
   // Rebuild the capability-driven controls only when the advertised action set
   // actually changed (signature compare inside buildControls). This never touches
   // the video node above it.
@@ -640,6 +660,93 @@ function setMetric(el, fieldName, raw, format) {
   row.hidden = false;
   const valueEl = row.querySelector('.robots-metric-value');
   if (valueEl) valueEl.textContent = format(raw);
+}
+
+// Rebuilds the telemetry panel from the latest snapshot, IN PLACE inside the
+// [data-field="telemetry"] container. The container sits below the video node and
+// is never the video node itself, so the live <tf-video-stream> is untouched. Only
+// fields actually present render; an absent snapshot hides the whole panel.
+function updateTelemetry(el, r) {
+  const host = el.querySelector('[data-field="telemetry"]');
+  if (!host) return;
+  const t = telemetry(r);
+  if (!t) {
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+
+  const rows = [];
+  const mode = telNum(t, 'mode', 'mode');
+  const gait = telNum(t, 'gaitType', 'gait_type');
+  if (mode != null) rows.push(telRow('Tryb', String(Math.round(mode))));
+  if (gait != null) rows.push(telRow('Chód', String(Math.round(gait))));
+  const bh = telNum(t, 'bodyHeight', 'body_height');
+  if (bh != null) rows.push(telRow('Wys. ciała', `${bh.toFixed(2)} m`));
+
+  const vx = telNum(t, 'vx', 'vx');
+  const vy = telNum(t, 'vy', 'vy');
+  const vyaw = telNum(t, 'vyaw', 'vyaw');
+  if (vx != null || vy != null || vyaw != null) {
+    const parts = [];
+    if (vx != null) parts.push(`vx ${vx.toFixed(2)}`);
+    if (vy != null) parts.push(`vy ${vy.toFixed(2)}`);
+    if (vyaw != null) parts.push(`yaw ${vyaw.toFixed(2)}`);
+    rows.push(telRow('Prędkość', parts.join('  ·  ')));
+  }
+
+  const imu = t.imu || null;
+  if (imu) {
+    const roll = radToDeg(telNum(imu, 'roll', 'roll'));
+    const pitch = radToDeg(telNum(imu, 'pitch', 'pitch'));
+    const yaw = radToDeg(telNum(imu, 'yaw', 'yaw'));
+    if (roll != null || pitch != null || yaw != null) {
+      const parts = [];
+      if (roll != null) parts.push(`R ${roll.toFixed(1)}°`);
+      if (pitch != null) parts.push(`P ${pitch.toFixed(1)}°`);
+      if (yaw != null) parts.push(`Y ${yaw.toFixed(1)}°`);
+      rows.push(telRow('Orientacja', parts.join('  ·  ')));
+    }
+    const imuTemp = telNum(imu, 'temperature', 'temperature');
+    if (imuTemp != null) rows.push(telRow('Temp. IMU', `${imuTemp.toFixed(0)} °C`));
+  }
+
+  const foot = Array.isArray(t.footForce ?? t.foot_force) ? t.footForce ?? t.foot_force : [];
+  if (foot.length) {
+    const vals = foot.map((f) => (Number.isFinite(Number(f)) ? Math.round(Number(f)) : '—'));
+    rows.push(telRow('Siły stóp', vals.join('  ·  ')));
+  }
+
+  const bat = t.battery || null;
+  if (bat) {
+    const soc = telNum(bat, 'soc', 'soc');
+    const volt = telNum(bat, 'voltage', 'voltage');
+    const curr = telNum(bat, 'current', 'current');
+    const temp = telNum(bat, 'temperature', 'temperature');
+    if (soc != null) rows.push(telRow('Bateria SOC', `${Math.round(soc)} %`));
+    if (volt != null) rows.push(telRow('Napięcie', `${volt.toFixed(1)} V`));
+    if (curr != null) rows.push(telRow('Prąd', `${curr.toFixed(1)} A`));
+    if (temp != null) rows.push(telRow('Temp. baterii', `${temp.toFixed(0)} °C`));
+  }
+
+  if (!rows.length) {
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  host.hidden = false;
+  host.innerHTML = `
+    <div class="robots-telemetry-title">Telemetria</div>
+    <div class="robots-telemetry-rows">${rows.join('')}</div>`;
+}
+
+// One compact telemetry row (label + value), mirroring the metricRow pattern.
+function telRow(label, value) {
+  return `
+    <div class="robots-telemetry-row">
+      <span class="robots-telemetry-label">${escapeHtml(label)}</span>
+      <span class="robots-telemetry-value">${escapeHtml(value)}</span>
+    </div>`;
 }
 
 // A robot is controllable unless its status reads as offline/lost/error.
@@ -691,6 +798,8 @@ function robotCard(r) {
 
       <div class="robots-metrics">${metrics.join('')}</div>
       ${cameraHtml}
+
+      <div class="robots-telemetry" data-field="telemetry" hidden></div>
 
       <div class="robots-controls" data-field="controls"></div>
 
