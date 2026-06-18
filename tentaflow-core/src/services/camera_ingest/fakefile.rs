@@ -195,6 +195,21 @@ pub(crate) fn build_pipeline_from_description(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| CameraIngestError::PipelineBuild("'sink' is not AppSink".into()))?;
 
+    install_frame_callback(&appsink, camera_id, mailbox, counters);
+
+    Ok(FakeFilePipeline { pipeline, appsink })
+}
+
+/// Wire the new-sample callback onto an RGB24 appsink so decoded frames flow
+/// into the shared `FrameMailbox`, `FrameStorage` and `StreamingBus`. Shared by
+/// the parse-launch path (fakefile/local) and the element-built webrtc pipeline
+/// so the frame contract (Branch A) is byte-for-byte identical across sources.
+pub(crate) fn install_frame_callback(
+    appsink: &gst_app::AppSink,
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) {
     let mailbox_cb = mailbox.clone();
     let counters_cb = counters.clone();
     let camera_id_cb = camera_id;
@@ -246,8 +261,6 @@ pub(crate) fn build_pipeline_from_description(
             })
             .build(),
     );
-
-    Ok(FakeFilePipeline { pipeline, appsink })
 }
 
 /// Seek the pipeline back to position 0. Used on EOS to implement the replay

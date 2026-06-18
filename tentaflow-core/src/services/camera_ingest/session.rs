@@ -335,6 +335,11 @@ async fn run_session(
         SessionSource::WebRtc(_) => SourceKind::WebRtc,
     };
     let mut webrtc_pump: Option<tokio::task::JoinHandle<()>> = None;
+    // WebRTC fMP4 fan-out: the tee that Branch B (mp4mux → appsink) attaches to,
+    // and the live branch state while a consumer is subscribed. `None` for
+    // File/Local sources, which do not support fMP4 streaming.
+    let mut webrtc_tee: Option<gst::Element> = None;
+    let mut webrtc_mp4_branch: Option<super::rtsp::Mp4BranchState> = None;
     let pipeline = match source {
         SessionSource::File(ref path) => {
             build_pipeline(path, cam_id.clone(), mailbox.clone(), counters.clone())
@@ -346,8 +351,9 @@ async fn run_session(
                 mailbox.clone(),
                 counters.clone(),
             ) {
-                Ok((p, appsrc)) => {
+                Ok((p, appsrc, tee)) => {
                     webrtc_pump = Some(tokio::spawn(super::webrtc_source::webrtc_pump(rx, appsrc)));
+                    webrtc_tee = Some(tee);
                     Ok(p)
                 }
                 Err(e) => Err(e),
@@ -419,6 +425,7 @@ async fn run_session(
                 match cmd {
                     Some(SessionCommand::Stop) | None => {
                         publish(&health_tx, &cam_id, CameraStatus::Stopping, None, &counters, fps_window.back().copied());
+                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
@@ -440,15 +447,47 @@ async fn run_session(
                         // not crash the task.
                     }
                     Some(SessionCommand::AttachMp4Branch(pub_)) => {
-                        // fake_file is a synthetic looped source — H.264 mux
-                        // branching is meaningful only for live RTSP streams.
-                        // Mark the publisher unsupported so the hub-side
-                        // `init_segment()` returns None immediately instead
-                        // of stalling for the full 3 s timeout window.
-                        pub_.mark_unsupported();
+                        // Only the live webrtc (robot camera) pipeline carries a
+                        // tee for fMP4 fan-out. File/Local are synthetic or raw
+                        // capture sources without an H.264 ES on the wire, so
+                        // mark the publisher unsupported — the hub-side
+                        // `init_segment()` returns None immediately instead of
+                        // stalling for the full 3 s timeout window.
+                        match webrtc_tee.as_ref() {
+                            Some(tee) if webrtc_mp4_branch.is_none() => {
+                                match super::webrtc_source::attach_mp4_branch_webrtc(
+                                    &pipeline.pipeline,
+                                    tee,
+                                    &pub_,
+                                ) {
+                                    Ok(state) => {
+                                        webrtc_mp4_branch = Some(state);
+                                        tracing::info!(camera_id = %cam_id, "webrtc: fMP4 branch attached");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(camera_id = %cam_id, error = %e, "webrtc: fMP4 branch attach failed");
+                                        pub_.mark_unsupported();
+                                    }
+                                }
+                            }
+                            // Already attached (a second subscriber) or no tee
+                            // (File/Local): refuse cleanly. A live branch already
+                            // feeds the hub's broadcast for the first publisher.
+                            _ => pub_.mark_unsupported(),
+                        }
                     }
                     Some(SessionCommand::DetachMp4Branch) => {
-                        // No branch ever attached for fake_file — nothing to
+                        if let (Some(tee), Some(state)) =
+                            (webrtc_tee.as_ref(), webrtc_mp4_branch.take())
+                        {
+                            super::webrtc_source::detach_mp4_branch_webrtc(
+                                &pipeline.pipeline,
+                                tee,
+                                state,
+                            );
+                            tracing::info!(camera_id = %cam_id, "webrtc: fMP4 branch detached");
+                        }
+                        // No branch ever attached for File/Local — nothing to
                         // tear down. Drop arrives here on publisher destruct.
                     }
                     Some(SessionCommand::GetHealth(reply)) => {
@@ -517,6 +556,7 @@ async fn run_session(
                                 SourceKind::WebRtc => {
                                     let reason = "webrtc video stream ended";
                                     publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, fps_window.back().copied());
+                                    teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                                     let _ = pipeline.pipeline.set_state(gst::State::Null);
                                     if let Some(h) = webrtc_pump.take() {
                                         h.abort();
@@ -530,6 +570,7 @@ async fn run_session(
                         MessageView::Error(err) => {
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
                             publish(&health_tx, &cam_id, CameraStatus::Error, Some(text.clone()), &counters, fps_window.back().copied());
+                            teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                             let _ = pipeline.pipeline.set_state(gst::State::Null);
                             if let Some(h) = webrtc_pump.take() {
                                 h.abort();
@@ -564,6 +605,7 @@ async fn run_session(
                     } else if tokio::time::Instant::now() >= warmup_deadline {
                         let reason = "no frames within warmup window";
                         publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, None);
+                        teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
                         if let Some(h) = webrtc_pump.take() {
                             h.abort();
@@ -607,6 +649,22 @@ fn publish(
         frames_total: total,
         frames_dropped: dropped,
     });
+}
+
+/// Detach a live webrtc Branch B before a terminal pipeline teardown. Takes the
+/// branch state out of `branch` and runs the full unlink → NULL → remove →
+/// release-request-pad sequence (same as a normal `DetachMp4Branch`), so a
+/// terminal path (Stop / EOS / error / warmup-fail) never just drops the state
+/// and leaks the tee request pad and mux elements. No-op when no branch is
+/// attached or the tee is absent (File/Local sources).
+fn teardown_webrtc_branch(
+    pipeline: &gst::Pipeline,
+    tee: Option<&gst::Element>,
+    branch: &mut Option<super::rtsp::Mp4BranchState>,
+) {
+    if let (Some(tee), Some(state)) = (tee, branch.take()) {
+        super::webrtc_source::detach_mp4_branch_webrtc(pipeline, tee, state);
+    }
 }
 
 /// After a terminal error we keep the task alive so the supervisor can

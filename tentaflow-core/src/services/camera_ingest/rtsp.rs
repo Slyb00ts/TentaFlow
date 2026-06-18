@@ -867,9 +867,42 @@ fn install_frame_callback(
 /// these in `Option<Mp4BranchState>` while a consumer is subscribed; on
 /// detach we walk these elements back to NULL and remove them from the
 /// pipeline so the mux state machine resets cleanly for the next attach.
-struct Mp4BranchState {
-    tee_src_pad: gst::Pad,
-    elements: Vec<gst::Element>,
+pub(super) struct Mp4BranchState {
+    pub(super) tee_src_pad: gst::Pad,
+    pub(super) elements: Vec<gst::Element>,
+}
+
+/// Wire an `mp4mux` appsink so every fragment buffer is forwarded into the
+/// publisher through a `Weak` ref. Shared by the RTSP and webrtc Branch B
+/// builders so the publisher contract (init-segment sealing + chunk fan-out)
+/// is identical regardless of source. The `Weak` ref keeps the pipeline from
+/// pinning the hub-side `Arc` alive past the last subscriber.
+pub(super) fn wire_mp4_appsink(
+    sink: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+) -> std::result::Result<(), String> {
+    let appsink_b = sink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "appsink_b downcast failed".to_string())?;
+    let pub_weak = std::sync::Arc::downgrade(publisher);
+    appsink_b.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                let bytes = map.as_slice().to_vec();
+                if let Some(pub_arc) = pub_weak.upgrade() {
+                    pub_arc.push_chunk(bytes);
+                }
+                // No-op when publisher has been dropped — the session will
+                // soon receive DetachMp4Branch and tear this appsink down.
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    Ok(())
 }
 
 /// Build and link Branch B (RTP → rtph264depay → h264parse → mp4mux → appsink)
@@ -962,27 +995,7 @@ fn attach_mp4_branch(
     gst::Element::link_many([&queue_b, &depay, &parse, &mux, &sink])
         .map_err(|e| format!("link branch B: {e}"))?;
 
-    let appsink_b = sink
-        .clone()
-        .downcast::<gst_app::AppSink>()
-        .map_err(|_| "appsink_b downcast failed".to_string())?;
-    let pub_weak = std::sync::Arc::downgrade(publisher);
-    appsink_b.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let bytes = map.as_slice().to_vec();
-                if let Some(pub_arc) = pub_weak.upgrade() {
-                    pub_arc.push_chunk(bytes);
-                }
-                // No-op when publisher has been dropped — the session will
-                // soon receive DetachMp4Branch and tear this appsink down.
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
+    wire_mp4_appsink(&sink, publisher)?;
 
     // Bring every new element up to the pipeline's current state so the
     // mux branch starts producing without needing a full pipeline restart.
@@ -999,7 +1012,7 @@ fn attach_mp4_branch(
 
 /// Walk Branch B's elements back to NULL and remove them from the pipeline.
 /// Idempotent: the caller is expected to `.take()` the state once.
-fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, state: Mp4BranchState) {
+pub(super) fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, state: Mp4BranchState) {
     // Unlink the request pad first so the upstream tee stops pushing into
     // a half-disposed branch. `unlink` on an already-unlinked pad is a no-op.
     if let Some(peer) = state.tee_src_pad.peer() {
