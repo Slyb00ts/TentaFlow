@@ -92,18 +92,23 @@ impl StreamHub {
     ) -> Result<SubscriptionHandle, StreamHubError> {
         // Fast path: source already active — just bump the counter.
         if let Some(entry) = self.active.read().get(stream_id).cloned() {
-            entry.subscribers.fetch_add(1, Ordering::AcqRel);
-            let receiver = entry.source.chunk_broadcaster().subscribe();
-            let mime = entry.source.mime_type().to_string();
-            let init = entry.init_segment.clone();
-            let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
-            return Ok(SubscriptionHandle::new(
-                stream_id.to_string(),
-                mime,
-                init,
-                receiver,
-                token,
-            ));
+            // A terminally-failed source (no broadcaster) must not hand out a
+            // hung receiver: drop it so the next cold subscribe rebuilds it.
+            if let Some(broadcaster) = entry.source.chunk_broadcaster() {
+                entry.subscribers.fetch_add(1, Ordering::AcqRel);
+                let receiver = broadcaster.subscribe();
+                let mime = entry.source.mime_type().to_string();
+                let init = entry.init_segment.clone();
+                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
+                return Ok(SubscriptionHandle::new(
+                    stream_id.to_string(),
+                    mime,
+                    init,
+                    receiver,
+                    token,
+                ));
+            }
+            self.active.write().remove(stream_id);
         }
 
         // Cold path: serialize per stream so exactly ONE source is created.
@@ -115,18 +120,21 @@ impl StreamHub {
 
         // Re-check under the creation lock — a racer may have just published it.
         if let Some(entry) = self.active.read().get(stream_id).cloned() {
-            entry.subscribers.fetch_add(1, Ordering::AcqRel);
-            let receiver = entry.source.chunk_broadcaster().subscribe();
-            let mime = entry.source.mime_type().to_string();
-            let init = entry.init_segment.clone();
-            let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
-            return Ok(SubscriptionHandle::new(
-                stream_id.to_string(),
-                mime,
-                init,
-                receiver,
-                token,
-            ));
+            if let Some(broadcaster) = entry.source.chunk_broadcaster() {
+                entry.subscribers.fetch_add(1, Ordering::AcqRel);
+                let receiver = broadcaster.subscribe();
+                let mime = entry.source.mime_type().to_string();
+                let init = entry.init_segment.clone();
+                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
+                return Ok(SubscriptionHandle::new(
+                    stream_id.to_string(),
+                    mime,
+                    init,
+                    receiver,
+                    token,
+                ));
+            }
+            self.active.write().remove(stream_id);
         }
 
         let factory_result = {
@@ -138,6 +146,14 @@ impl StreamHub {
         };
         let source = factory_result?;
         let init_segment = source.init_segment().await;
+
+        // A source that terminally failed during creation (relay open refused,
+        // owner closed before init, init timed out) reports no broadcaster. Do
+        // not cache it — surface a clean failure so the subscriber resubscribes
+        // instead of hanging on an empty registered stream.
+        let Some(broadcaster) = source.chunk_broadcaster() else {
+            return Err(StreamHubError::NotRegistered(stream_id.to_string()));
+        };
 
         let entry = {
             let mut active = self.active.write();
@@ -155,8 +171,16 @@ impl StreamHub {
             }
         };
 
+        // Re-fetch the broadcaster from the cached entry: if we lost the race
+        // the winner's source is the one we subscribe to. A racing winner that
+        // is itself terminal collapses to the same clean failure.
+        let Some(broadcaster) = entry.source.chunk_broadcaster() else {
+            // Drop the freshly created (unused) broadcaster handle.
+            drop(broadcaster);
+            return Err(StreamHubError::NotRegistered(stream_id.to_string()));
+        };
         entry.subscribers.fetch_add(1, Ordering::AcqRel);
-        let receiver = entry.source.chunk_broadcaster().subscribe();
+        let receiver = broadcaster.subscribe();
         let mime = entry.source.mime_type().to_string();
         let init = entry.init_segment.clone();
         let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());

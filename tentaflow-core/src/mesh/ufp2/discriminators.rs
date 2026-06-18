@@ -223,6 +223,8 @@ mod tests {
         // the UFP/2 path MUST be rejected.
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_REQ as u16)).is_none());
         assert!(legacy_from_kind(Kind(legacy::MESH_MSG_FORWARD_STREAM_REQ as u16)).is_none());
+        // Camera live relay subscribe is also a bi-stream-only discriminator.
+        assert!(legacy_from_kind(Kind(legacy::MESH_MSG_CAMERA_STREAM_SUBSCRIBE as u16)).is_none());
         // Holes in the 0x10..=0x4C range — not even legacy.
         assert!(legacy_from_kind(Kind(0x0017)).is_none());
         assert!(legacy_from_kind(Kind(0x0036)).is_none());
@@ -287,6 +289,9 @@ mod tests {
         ));
         assert!(!is_migrated_to_ufp2_discriminator(
             legacy::MESH_MSG_FORWARD_STREAM_REQ
+        ));
+        assert!(!is_migrated_to_ufp2_discriminator(
+            legacy::MESH_MSG_CAMERA_STREAM_SUBSCRIBE
         ));
     }
 

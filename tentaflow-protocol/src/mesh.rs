@@ -785,10 +785,39 @@ pub const MESH_MSG_ROBOTS_GET_RESPONSE: u8 = 0x50;
 /// aplikuje `change` na swoim widoku noda przez `apply_change`. Trusted-peer
 /// only.
 pub const MESH_MSG_ROBOTS_UPDATE: u8 = 0x51;
+/// Live camera relay subscribe — raw bi-stream discriminator (like
+/// `MESH_MSG_FORWARD_STREAM_REQ`), trusted-peer only. The observer (B) opens a
+/// QUIC bi-stream to the owner (A), writes
+/// `[0x52][u32 id_len][req_id][CBOR CameraStreamSubscribePayload]`, then reads a
+/// `[u32 len][CBOR CameraStreamFrame]` loop until the stream closes. This is
+/// NOT a UFP/2 channel kind — it never travels as a UFP/2 unicast envelope, so
+/// the channel-kind range is untouched (see `ufp2/discriminators.rs`).
+pub const MESH_MSG_CAMERA_STREAM_SUBSCRIBE: u8 = 0x52;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
 // =============================================================================
+
+/// Observer→owner subscribe request body for the live camera relay bi-stream.
+/// `camera_id` is the owner-local camera (e.g. `cam_xxx`, without the
+/// `camera:` StreamHub prefix); `org_id` is the caller's tenant. Both ends
+/// enforce org scope: the observer resolves the owner via `remote_camera_owner`
+/// (org match) and the owner re-verifies the robot is advertised by itself in
+/// this org before serving.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct CameraStreamSubscribePayload {
+    pub camera_id: String,
+    pub org_id: String,
+}
+
+/// One frame on the camera relay bi-stream. `is_init=true` carries the fMP4
+/// init segment (ftyp+moov) delivered once at the start; `is_init=false` frames
+/// are rolling media segments (moof+mdat) ready for `SourceBuffer.appendBuffer`.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct CameraStreamFrame {
+    pub is_init: bool,
+    pub data: Vec<u8>,
+}
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct TrustRevokedPayload {

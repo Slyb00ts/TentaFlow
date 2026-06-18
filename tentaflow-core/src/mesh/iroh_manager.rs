@@ -48,6 +48,36 @@ pub type ForwardStreamHandler = Arc<
         + Sync,
 >;
 
+/// Owner-side camera relay handler. Unlike `ForwardStreamHandler` it writes into
+/// a BOUNDED channel (`send().await`) so a slow observer back-pressures the
+/// StreamHub broadcast drain instead of growing memory without limit. The QUIC
+/// writer reads the bounded receiver and applies flow-control on the wire.
+pub type CameraStreamHandler = Arc<
+    dyn Fn(
+            Vec<u8>,
+            mpsc::Sender<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Bounded capacity for the owner-side camera relay channel between the
+/// StreamHub broadcast drain and the QUIC writer. Matches the StreamHub
+/// broadcast capacity so the relay never queues more than one broadcast window
+/// before either the wire drains it or the slow observer is cut.
+const CAMERA_RELAY_CHANNEL_CAPACITY: usize = 32;
+
+/// Aborts the wrapped task when dropped. Used so an early return on the
+/// owner-side camera bi-stream cancels the spawned relay handler immediately
+/// instead of leaving it parked in `recv().await` holding a StreamHub handle.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Odpowiedz komendy mesh — typed payload zamiast string output.
 #[derive(Debug, Clone)]
 pub struct CommandWaitResponse {
@@ -354,6 +384,10 @@ pub struct IrohMeshManager {
     next_connection_id: AtomicU64,
     forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
     forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
+    /// Owner-side handler for live camera relay bi-streams. Same shape as
+    /// `forward_stream_handler` (payload → frames via `tx`) but a different
+    /// payload (camera subscribe) — kept separate so the two never alias.
+    camera_stream_handler: Arc<AsyncRwLock<Option<CameraStreamHandler>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -441,6 +475,7 @@ impl IrohMeshManager {
             next_connection_id: AtomicU64::new(1),
             forward_handler: Arc::new(AsyncRwLock::new(None)),
             forward_stream_handler: Arc::new(AsyncRwLock::new(None)),
+            camera_stream_handler: Arc::new(AsyncRwLock::new(None)),
             command_waiters: DashMap::new(),
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
@@ -716,6 +751,7 @@ impl IrohMeshManager {
             security: Arc::clone(&self.security),
             forward_handler: Arc::clone(&self.forward_handler),
             forward_stream_handler: Arc::clone(&self.forward_stream_handler),
+            camera_stream_handler: Arc::clone(&self.camera_stream_handler),
         }
     }
 
@@ -1698,6 +1734,79 @@ impl IrohMeshManager {
         Ok(Box::pin(stream))
     }
 
+    /// Observer side of the live camera relay. Opens a bi-stream to the owner
+    /// node, sends a `CameraStreamSubscribePayload`, and returns a stream of raw
+    /// frame bytes (each item is one CBOR `CameraStreamFrame` body — the caller
+    /// decodes it). Mirrors `forward_stream_request` but with the camera relay
+    /// discriminator. Trust-gated like every outbound bi-stream.
+    pub async fn camera_stream_request(
+        &self,
+        owner_node_id: &str,
+        camera_id: &str,
+        org_id: &str,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>>> + Send>>> {
+        if !self.security.is_trusted(owner_node_id) {
+            return Err(anyhow::anyhow!(
+                "camera stream relay refused: peer '{}' is not trusted",
+                owner_node_id
+            ));
+        }
+        let payload = tentaflow_protocol::cbor::encode(
+            &tentaflow_protocol::mesh::CameraStreamSubscribePayload {
+                camera_id: camera_id.to_string(),
+                org_id: org_id.to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("encode camera subscribe: {e}"))?;
+
+        let connection = self
+            .connections
+            .get(owner_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", owner_node_id))?
+            .connection
+            .clone();
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        send.write_all(&[tentaflow_protocol::mesh::MESH_MSG_CAMERA_STREAM_SUBSCRIBE])
+            .await
+            .map_err(|e| anyhow::anyhow!("write disc: {e}"))?;
+        // Request id is informational here (no per-request correlation on the
+        // relay); use the camera id so owner-side logs are diagnosable.
+        let id_bytes = camera_id.as_bytes();
+        send.write_all(&(id_bytes.len() as u32).to_be_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("write id_len: {e}"))?;
+        send.write_all(id_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write id: {e}"))?;
+        send.write_all(&payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
+        send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+        let stream = async_stream::try_stream! {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                if len > MAX_MSG_BYTES {
+                    Err(anyhow::anyhow!("camera relay frame too large: {}", len))?;
+                }
+                let mut frame = vec![0u8; len];
+                recv.read_exact(&mut frame)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read relay frame: {e}"))?;
+                yield frame;
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
     /// Zwraca snapshot EndpointId wszystkich znanych polaczonych peerow.
     pub async fn connected_peer_ids(&self) -> Vec<String> {
         self.connected_peers().await
@@ -1710,6 +1819,14 @@ impl IrohMeshManager {
 
     pub async fn set_forward_stream_handler(&self, handler: ForwardStreamHandler) {
         *self.forward_stream_handler.write().await = Some(handler);
+    }
+
+    /// Installs the owner-side handler for live camera relay bi-streams. Carries
+    /// a camera subscribe payload and writes frames into a BOUNDED channel so a
+    /// slow observer back-pressures the StreamHub drain instead of buffering
+    /// without limit (`CameraStreamHandler`).
+    pub async fn set_camera_stream_handler(&self, handler: CameraStreamHandler) {
+        *self.camera_stream_handler.write().await = Some(handler);
     }
 
     /// Pobiera RTT do peera w mikrosekundach. iroh udostepnia `remote_info`
@@ -1970,6 +2087,7 @@ struct IrohMeshManagerRef {
     security: Arc<MeshSecurity>,
     forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
     forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
+    camera_stream_handler: Arc<AsyncRwLock<Option<CameraStreamHandler>>>,
 }
 
 impl IrohMeshManagerRef {
@@ -2026,6 +2144,42 @@ impl IrohMeshManagerRef {
                         .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
                 }
                 let _ = task.await;
+                send.finish()
+                    .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+            }
+            x if x == tentaflow_protocol::mesh::MESH_MSG_CAMERA_STREAM_SUBSCRIBE => {
+                let handler = self.camera_stream_handler.read().await.clone();
+                let Some(handler) = handler else {
+                    return Ok(());
+                };
+                // Owner side: the handler subscribes to the local StreamHub and
+                // emits already-CBOR-encoded `CameraStreamFrame` blobs on a
+                // BOUNDED channel. A slow observer back-pressures the handler's
+                // broadcast drain (which then drops the subscription rather than
+                // buffering forever) instead of growing this process's memory.
+                // QUIC flow-control on `write_all` provides the on-wire bound.
+                //
+                // The handler task is wrapped in an abort-on-drop guard: any
+                // early return below (write error, frame too large, observer
+                // close) drops the guard, aborts the task, and drops `rx` — so
+                // the handler can never sit in `recv().await` holding a dead
+                // StreamHub subscription after the QUIC write half is gone.
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CAMERA_RELAY_CHANNEL_CAPACITY);
+                let task = AbortOnDrop(tokio::spawn(handler(payload, tx)));
+                while let Some(frame) = rx.recv().await {
+                    if frame.len() > MAX_MSG_BYTES {
+                        return Err(IrohStreamError::FrameTooLarge(frame.len()));
+                    }
+                    send.write_all(&(frame.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                    send.write_all(&frame)
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                }
+                // Channel closed: the handler finished (source closed / observer
+                // gone). The guard's Drop aborts the (already-finished) task.
+                drop(task);
                 send.finish()
                     .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
             }

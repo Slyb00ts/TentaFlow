@@ -45,8 +45,8 @@ impl BinaryStreamSource for FakeSource {
     async fn init_segment(&self) -> Option<Bytes> {
         self.init.clone()
     }
-    fn chunk_broadcaster(&self) -> &broadcast::Sender<Bytes> {
-        &self.tx
+    fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+        Some(self.tx.clone())
     }
 }
 
@@ -181,8 +181,8 @@ async fn lagged_subscriber_handles_gracefully() {
         async fn init_segment(&self) -> Option<Bytes> {
             None
         }
-        fn chunk_broadcaster(&self) -> &broadcast::Sender<Bytes> {
-            &self.tx
+        fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+            Some(self.tx.clone())
         }
     }
 
@@ -214,5 +214,54 @@ async fn lagged_subscriber_handles_gracefully() {
     }
 
     drop(handle);
+    hub.unregister_factory(id);
+}
+
+/// A source that reports `None` from `chunk_broadcaster` models a relay that
+/// terminally failed during creation (no init, no media). The hub must NOT
+/// cache it and must surface a clean `NotRegistered` failure so the subscriber
+/// resubscribes instead of hanging on an empty registered stream.
+#[tokio::test]
+async fn terminal_source_fails_subscribe_cleanly() {
+    struct TerminalSource {
+        id: String,
+        mime: String,
+    }
+    #[async_trait::async_trait]
+    impl BinaryStreamSource for TerminalSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn mime_type(&self) -> &str {
+            &self.mime
+        }
+        async fn init_segment(&self) -> Option<Bytes> {
+            None
+        }
+        fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+            None
+        }
+    }
+
+    let hub = hub();
+    let id = "camera:terminal-relay-test";
+    hub.register_factory(
+        id.to_string(),
+        Box::new(|| {
+            Ok(Arc::new(TerminalSource {
+                id: "camera:terminal-relay-test".to_string(),
+                mime: "video/mp4".to_string(),
+            }) as Arc<dyn BinaryStreamSource>)
+        }),
+    )
+    .unwrap();
+
+    match hub.subscribe(id).await {
+        Err(StreamHubError::NotRegistered(got)) => assert_eq!(got, id),
+        other => panic!("expected NotRegistered, got {other:?}"),
+    }
+    // The terminal source must not have been cached.
+    assert!(!hub.is_active(id), "terminal source must not be cached");
+
     hub.unregister_factory(id);
 }

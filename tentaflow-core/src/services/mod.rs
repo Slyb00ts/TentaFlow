@@ -20,6 +20,8 @@ pub mod auto_detect;
 pub mod backend;
 #[cfg(feature = "camera")]
 pub mod camera_ingest;
+#[cfg(feature = "camera")]
+pub mod camera_relay;
 pub mod catalog;
 pub mod deploy;
 pub mod detection_bus;
