@@ -33,6 +33,8 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SharedSettingSecret
             | CoreSyncResourceKind::AddonInstance
             | CoreSyncResourceKind::AddonConfig
+            | CoreSyncResourceKind::ApiKey
+            | CoreSyncResourceKind::ResourcePermission
     )
 }
 
@@ -110,6 +112,8 @@ pub fn apply_core_operation(
         }
         CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
         CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
+        CoreSyncResourceKind::ApiKey => apply_api_key(&tx, operation)?,
+        CoreSyncResourceKind::ResourcePermission => apply_resource_permission(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -367,6 +371,109 @@ fn apply_addon_config(
             .execute(
                 "DELETE FROM addon_config WHERE addon_id = ?1 AND key = ?2",
                 rusqlite::params![addon_id, key],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated external-app API key. Insert/Update are full-row upserts
+/// keyed on `uid`; the replicated set carries the verifier (NEVER the raw key),
+/// prefix, name, type, subject, rate limit and active flag. `last_used_at` is
+/// node-local and intentionally absent from the synced fields, so the UPSERT must
+/// preserve the existing local value rather than reset it to NULL (mirrors the
+/// skills use_count/last_used_at preservation).
+fn apply_api_key(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let uid = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO api_keys \
+                 (uid, key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps, is_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(uid) DO UPDATE SET \
+                 key_verifier = excluded.key_verifier, key_prefix = excluded.key_prefix, \
+                 name = excluded.name, key_type = excluded.key_type, \
+                 subject_id = excluded.subject_id, rate_limit_rps = excluded.rate_limit_rps, \
+                 is_active = excluded.is_active",
+                rusqlite::params![
+                    uid,
+                    field_string(operation, "key_verifier")?,
+                    field_string(operation, "key_prefix")?,
+                    field_string(operation, "name")?,
+                    field_string(operation, "key_type")?,
+                    field_optional_string(operation, "subject_id")?,
+                    field_i64_or(operation, "rate_limit_rps", 0)?,
+                    field_bool_or(operation, "is_active", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM api_keys WHERE uid = ?1",
+                rusqlite::params![uid],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated resource ACL rule. The four key components travel in the
+/// fields (`resource_type`, `resource_id`, `subject_type`, `subject_id`); the
+/// resource_id is the length-prefixed composite for per-rule LWW. A `clear` on
+/// the origin replicates as Delete (tombstone): the LWW gate in
+/// `apply_core_operation` records the clear's HLC in `core_resource_versions`, so
+/// a later-arriving but OLDER `allow` for the same rule loses the comparison and
+/// is dropped — the cleared rule is never resurrected.
+fn apply_resource_permission(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let resource_type = field_string(operation, "resource_type")?;
+    let resource_id = field_string(operation, "resource_id")?;
+    let subject_type = field_string(operation, "subject_type")?;
+    let subject_id = field_string(operation, "subject_id")?;
+    // Bind the LWW slot to the rule we actually write: the gate in
+    // `apply_core_operation` keys on `operation.body.resource_id`, so a stale op
+    // whose composite id points at rule C but whose fields encode rule B would
+    // pass C's freshness check and then resurrect B. Reject any op whose fields
+    // do not recompute to the composite id it claims.
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &resource_type,
+        &resource_id,
+        &subject_type,
+        &subject_id,
+    ]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "resource_permission composite id mismatch: body={}, fields={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO resource_permissions \
+                 (resource_type, resource_id, subject_type, subject_id, access_level) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(resource_type, resource_id, subject_type, subject_id) \
+                 DO UPDATE SET access_level = excluded.access_level",
+                rusqlite::params![
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    field_string(operation, "access_level")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM resource_permissions \
+                 WHERE resource_type = ?1 AND resource_id = ?2 \
+                   AND subject_type = ?3 AND subject_id = ?4",
+                rusqlite::params![resource_type, resource_id, subject_type, subject_id],
             )
             .map_err(sql_error),
     }

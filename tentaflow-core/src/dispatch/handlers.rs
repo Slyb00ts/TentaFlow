@@ -363,7 +363,7 @@ pub fn api_key_list_request(
     let summaries: Vec<ApiKeySummary> = keys
         .into_iter()
         .map(|k| ApiKeySummary {
-            key_id: k.key_prefix,
+            key_id: k.uid,
             name: k.name,
             created_at_epoch: parse_ts(&k.created_at),
             last_used_at_epoch: parse_ts_opt(&k.last_used_at),
@@ -393,14 +393,34 @@ pub fn api_key_create(
         return Err(ProtocolError::bad_request("name must be 1-200 chars"));
     }
 
-    let raw_key = format!("sk-{}", uuid::Uuid::new_v4().simple());
-    let key_hash = auth::hash_api_key(&raw_key);
+    // Token = "sk-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC verifier is
+    // persisted; the raw token is returned once and never stored.
+    let mut token_bytes = [0u8; 32];
+    getrandom::fill(&mut token_bytes).expect("OS RNG fill_bytes");
+    let mut token_hex = String::with_capacity(token_bytes.len() * 2);
+    for b in token_bytes.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(token_hex, "{:02x}", b);
+    }
+    let raw_key = format!("sk-{}", token_hex);
+    let pepper = repository::get_or_create_api_key_pepper(&ctx.state.db, &ctx.state.settings_cipher)
+        .map_err(db_err)?;
+    let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
 
-    let id = repository::create_api_key(&ctx.state.db, &key_hash, &key_prefix, &payload.name, 60)
-        .map_err(db_err)?;
+    let subject_uid = user_id_to_uuid(&require_user_id(ctx)?);
+    let (id, uid) = repository::create_api_key(
+        &ctx.state.db,
+        &key_verifier,
+        &key_prefix,
+        &payload.name,
+        "user",
+        Some(&subject_uid),
+        60,
+    )
+    .map_err(db_err)?;
 
-    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    let user_id = Some(subject_uid);
     let _ = repository::log_audit(
         &ctx.state.db,
         user_id.as_deref(),
@@ -414,7 +434,7 @@ pub fn api_key_create(
 
     Ok(MessageBody::ApiKeyCreateResponseBody(
         ApiKeyCreateResponse {
-            key_id: key_prefix,
+            key_id: uid,
             token: raw_key,
         },
     ))
@@ -436,14 +456,12 @@ pub fn api_key_revoke(
         }
     };
 
-    // key_id z protocolu to key_prefix (np. "sk-...abc123") — query po prefix.
-    let keys = repository::list_api_keys(&ctx.state.db).map_err(db_err)?;
-    let target = keys
-        .iter()
-        .find(|k| k.key_prefix == *key_id)
-        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
-
-    let affected = repository::delete_api_key(&ctx.state.db, target.id).map_err(db_err)?;
+    // key_id z protocolu to stabilny uid klucza (NIE key_prefix — ten jest
+    // wylacznie do wyswietlania i moze kolidowac miedzy kluczami).
+    let affected = repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
+    if affected == 0 {
+        return Err(ProtocolError::not_found("api key not found"));
+    }
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -451,7 +469,7 @@ pub fn api_key_revoke(
         user_id.as_deref(),
         None,
         "apikey.delete",
-        Some(&format!("apikey:{}", target.id)),
+        Some(&format!("apikey:{}", key_id)),
         None,
         None,
         Some(&ctx.state.local_node_id),
@@ -1108,8 +1126,7 @@ pub fn flow_node_templates_list(
         )
         .unwrap_or_default();
         for a in agents {
-            let default_config =
-                serde_json::json!({ "agent_id": a.id }).to_string();
+            let default_config = serde_json::json!({ "agent_id": a.id }).to_string();
             let label = a.display_name.clone().unwrap_or_else(|| a.name.clone());
             templates.push(tentaflow_protocol::FlowNodeTemplate {
                 id: 0,
@@ -3721,8 +3738,10 @@ pub async fn service_manifest_deploy(
     // settings cipher before it flows into the placeholder/deployment/service
     // config_json. The key stays node-local; remote deploys are forwarded with
     // the plaintext key over the encrypted mesh and re-encrypted by the receiver.
-    let user_config =
-        crate::services::deploy::encrypt_api_key_in_config(&user_config, &ctx.state.settings_cipher);
+    let user_config = crate::services::deploy::encrypt_api_key_in_config(
+        &user_config,
+        &ctx.state.settings_cipher,
+    );
 
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
@@ -4065,9 +4084,9 @@ pub async fn deploy_vllm_recommend(
     use crate::deploy::vram_calculator::{
         analyze_gpu_compatibility, analyze_gpu_compatibility_llamacpp, auto_fit_config,
         build_llamacpp_args_string, build_vllm_args_string, estimate_vram, fetch_gguf_spec,
-        fetch_hf_config, fetch_safetensors_total_size,
-        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
-        AutoFitOutcome, AutoFitRequest, DeployEngine,
+        fetch_hf_config, fetch_safetensors_total_size, max_concurrent_seqs_for_budget,
+        max_context_for_budget, parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+        DeployEngine,
     };
 
     let payload = match req {
@@ -4272,8 +4291,7 @@ pub async fn deploy_vllm_recommend(
                     // Merge our tuned args (gpu-mem, ctx, kv) with the recipe
                     // expert flags; recipe is appended last so dedup last-wins
                     // lets it override on overlap.
-                    let mut toks: Vec<String> =
-                        base.split_whitespace().map(String::from).collect();
+                    let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
                     toks.extend(rargv);
                     toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
                     base = toks.join(" ");
@@ -4404,11 +4422,13 @@ fn to_access_transitions(
 ) -> Vec<tentaflow_protocol::AccessTransition> {
     transitions
         .into_iter()
-        .map(|(addon_id, before, after)| tentaflow_protocol::AccessTransition {
-            addon_id,
-            before,
-            after,
-        })
+        .map(
+            |(addon_id, before, after)| tentaflow_protocol::AccessTransition {
+                addon_id,
+                before,
+                after,
+            },
+        )
         .collect()
 }
 
@@ -4421,7 +4441,11 @@ pub fn alias_consumer_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerListRequest",
+            ))
+        }
     };
     let rows = repository::list_alias_consumers(&ctx.state.db, payload.alias_id).map_err(db_err)?;
     let consumers = rows
@@ -4450,11 +4474,19 @@ pub fn alias_consumer_grant(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerGrantRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerGrantRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerGrantRequest",
+            ))
+        }
     };
-    let transitions =
-        repository::grant_alias_consumer_audited(&ctx.state.db, payload.alias_id, &payload.addon_id, None)
-            .map_err(db_err)?;
+    let transitions = repository::grant_alias_consumer_audited(
+        &ctx.state.db,
+        payload.alias_id,
+        &payload.addon_id,
+        None,
+    )
+    .map_err(db_err)?;
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
@@ -4480,7 +4512,11 @@ pub fn alias_consumer_revoke(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerRevokeRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerRevokeRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerRevokeRequest",
+            ))
+        }
     };
     let transitions = repository::revoke_alias_consumer_audited(
         &ctx.state.db,
@@ -4514,9 +4550,16 @@ pub fn alias_visibility_set(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasVisibilitySetRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasVisibilitySetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasVisibilitySetRequest",
+            ))
+        }
     };
-    if !matches!(payload.visibility.as_str(), "private" | "restricted" | "public") {
+    if !matches!(
+        payload.visibility.as_str(),
+        "private" | "restricted" | "public"
+    ) {
         return Err(ProtocolError::bad_request(
             "visibility must be private/restricted/public",
         ));
@@ -4573,7 +4616,11 @@ pub fn model_visibility_set(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelVisibilitySetRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelVisibilitySetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelVisibilitySetRequest",
+            ))
+        }
     };
     if !matches!(payload.visibility.as_str(), "restricted" | "public") {
         return Err(ProtocolError::bad_request(
@@ -4612,7 +4659,11 @@ pub fn model_consumer_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerListRequest",
+            ))
+        }
     };
     let rows =
         repository::list_model_consumers(&ctx.state.db, &payload.model_id).map_err(db_err)?;
@@ -4642,7 +4693,11 @@ pub fn model_consumer_grant(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerGrantRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerGrantRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerGrantRequest",
+            ))
+        }
     };
     let transitions = repository::grant_model_consumer_audited(
         &ctx.state.db,
@@ -4676,7 +4731,11 @@ pub fn model_consumer_revoke(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerRevokeRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerRevokeRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerRevokeRequest",
+            ))
+        }
     };
     let transitions = repository::revoke_model_consumer_audited(
         &ctx.state.db,
@@ -4710,7 +4769,11 @@ pub fn addon_access_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AddonAccessListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AddonAccessListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonAccessListRequest",
+            ))
+        }
     };
     let alias_rows =
         repository::list_addon_uses_alias(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
@@ -4774,7 +4837,11 @@ pub fn addon_access_decision(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AddonAccessDecisionRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AddonAccessDecisionRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonAccessDecisionRequest",
+            ))
+        }
     };
     let approve = match payload.decision.as_str() {
         "approve" => true,
@@ -4818,24 +4885,22 @@ pub fn addon_access_decision(
             }
             .map_err(db_err)?
         }
-        "model" => {
-            if approve {
-                repository::grant_model_consumer_audited(
-                    &ctx.state.db,
-                    &payload.target,
-                    &payload.addon_id,
-                    None,
-                )
-            } else {
-                repository::revoke_model_consumer_audited(
-                    &ctx.state.db,
-                    &payload.target,
-                    &payload.addon_id,
-                    None,
-                )
-            }
-            .map_err(db_err)?
+        "model" => if approve {
+            repository::grant_model_consumer_audited(
+                &ctx.state.db,
+                &payload.target,
+                &payload.addon_id,
+                None,
+            )
+        } else {
+            repository::revoke_model_consumer_audited(
+                &ctx.state.db,
+                &payload.target,
+                &payload.addon_id,
+                None,
+            )
         }
+        .map_err(db_err)?,
         _ => return Err(ProtocolError::bad_request("kind must be alias/model")),
     };
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
@@ -5291,10 +5356,13 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 .map(|latest| latest != &a.package_version)
                 .unwrap_or(false);
             let content_changed = {
-                let catalog_hash =
-                    repository::get_package_bundle_hash(&ctx.state.db, &a.package_id, &a.package_version)
-                        .map_err(db_err)?
-                        .unwrap_or_default();
+                let catalog_hash = repository::get_package_bundle_hash(
+                    &ctx.state.db,
+                    &a.package_id,
+                    &a.package_version,
+                )
+                .map_err(db_err)?
+                .unwrap_or_default();
                 let installed_hash =
                     repository::get_instance_installed_bundle_hash(&ctx.state.db, &a.addon_id)
                         .map_err(db_err)?;
@@ -6008,8 +6076,8 @@ pub async fn skills_hub_search(
             ));
         }
     };
-    let taps_setting = repository::get_setting(&ctx.state.db, SKILLS_HUB_TAPS_SETTING)
-        .map_err(db_err)?;
+    let taps_setting =
+        repository::get_setting(&ctx.state.db, SKILLS_HUB_TAPS_SETTING).map_err(db_err)?;
     // A `source` override scopes to one tap; otherwise enumerate configured taps.
     let taps: Vec<String> = match payload.source.as_deref().filter(|s| !s.is_empty()) {
         Some(src) => vec![src.to_string()],
@@ -6017,12 +6085,11 @@ pub async fn skills_hub_search(
     };
     let query = payload.query.trim().to_lowercase();
 
-    let results = tokio::task::spawn_blocking(move || {
-        crate::skills_hub::search_taps(&taps, &query)
-    })
-    .await
-    .map_err(|e| ProtocolError::internal(format!("hub search task failed: {e}")))?
-    .map_err(|e| ProtocolError::internal(format!("hub search failed: {e}")))?;
+    let results =
+        tokio::task::spawn_blocking(move || crate::skills_hub::search_taps(&taps, &query))
+            .await
+            .map_err(|e| ProtocolError::internal(format!("hub search task failed: {e}")))?
+            .map_err(|e| ProtocolError::internal(format!("hub search failed: {e}")))?;
 
     let results_json = serde_json::to_string(&results)
         .map_err(|e| ProtocolError::internal(format!("hub search encode failed: {e}")))?;
@@ -6079,23 +6146,20 @@ pub async fn skills_hub_import(
 
     let verdict = crate::skills_hub::scan_skill(&parsed.body, &fetched.files);
 
-    let preferred = parsed
-        .name
-        .clone()
-        .unwrap_or_else(|| match &source {
-            crate::skills_hub::HubSource::Github { repo, path, .. } => {
-                if path.is_empty() {
-                    repo.clone()
-                } else {
-                    path.rsplit('/').next().unwrap_or(repo).to_string()
-                }
+    let preferred = parsed.name.clone().unwrap_or_else(|| match &source {
+        crate::skills_hub::HubSource::Github { repo, path, .. } => {
+            if path.is_empty() {
+                repo.clone()
+            } else {
+                path.rsplit('/').next().unwrap_or(repo).to_string()
             }
-            crate::skills_hub::HubSource::Url(url) => url
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .unwrap_or("hub-skill")
-                .to_string(),
-        });
+        }
+        crate::skills_hub::HubSource::Url(url) => url
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or("hub-skill")
+            .to_string(),
+    });
     let name = hub_resolve_name(&ctx.state.db, &preferred)?;
     let description = parsed
         .description
@@ -6288,25 +6352,33 @@ pub async fn skills_curator_run(
     match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRunRequest(_)) => {}
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorRunRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorRunRequest",
+            ));
         }
     }
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
     let model = crate::skills::resolve_model(&ctx.state.db);
     let router = ctx.state.router.clone();
     let call_model = model.clone();
-    let outcome = crate::skills::run_curator_review(&ctx.state.db, Some(&user_id), &model, move |prompt| {
-        Box::pin(async move { crate::skills::router_complete(&router, &call_model, prompt).await })
-    })
-    .await
-    .map_err(|e| ProtocolError::internal(format!("curator review failed: {e}")))?;
+    let outcome =
+        crate::skills::run_curator_review(&ctx.state.db, Some(&user_id), &model, move |prompt| {
+            Box::pin(
+                async move { crate::skills::router_complete(&router, &call_model, prompt).await },
+            )
+        })
+        .await
+        .map_err(|e| ProtocolError::internal(format!("curator review failed: {e}")))?;
 
     audit(
         ctx,
         Some(&user_id),
         "skill.curator_run",
         Some(&format!("snapshot:{}", outcome.snapshot_id)),
-        Some(&format!("{} proposed action(s)", outcome.proposal.actions.len())),
+        Some(&format!(
+            "{} proposed action(s)",
+            outcome.proposal.actions.len()
+        )),
     );
 
     let proposal_json = serde_json::to_string(&outcome.proposal)
@@ -6331,7 +6403,9 @@ pub fn skills_curator_apply(
     let payload = match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorApplyRequest(p)) => p,
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorApplyRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorApplyRequest",
+            ));
         }
     };
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
@@ -6371,16 +6445,22 @@ pub fn skills_curator_rollback(
     let payload = match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(p)) => p,
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorRollbackRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorRollbackRequest",
+            ));
         }
     };
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
     let audit_fn = |event_kind: &str, resource: Option<&str>, message: Option<&str>| {
         audit(ctx, Some(&user_id), event_kind, resource, message);
     };
-    let restored =
-        crate::skills::rollback_snapshot(&ctx.state.db, &payload.snapshot_id, Some(&user_id), &audit_fn)
-            .map_err(|e| ProtocolError::bad_request(format!("curator rollback failed: {e}")))?;
+    let restored = crate::skills::rollback_snapshot(
+        &ctx.state.db,
+        &payload.snapshot_id,
+        Some(&user_id),
+        &audit_fn,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("curator rollback failed: {e}")))?;
 
     Ok(MessageBody::SkillsBody(
         tentaflow_protocol::SkillsPayload::CuratorRollbackResponse(
@@ -6796,7 +6876,9 @@ pub fn agent_run_detail(
     let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
     let run = repository::get_agent_run(&ctx.state.db, &payload.run_id)
         .map_err(db_err)?
-        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {}", payload.run_id)))?;
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("agent run not found: {}", payload.run_id))
+        })?;
     // ACL: a non-admin can only read a run whose principal is themselves. A run
     // with no principal (unattended) is admin-only.
     if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
@@ -6874,7 +6956,11 @@ pub fn agent_permission_reply(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::PermissionReplyRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected AgentPermissionReplyRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AgentPermissionReplyRequest",
+            ))
+        }
     };
     assert_run_reply_access(ctx, &payload.run_id)?;
 
@@ -9084,7 +9170,15 @@ pub async fn service_update(
 fn resolve_external_request_ctx(
     ctx: &HandlerContext,
     row: &crate::services_repo::services::ServiceRow,
-) -> Result<(crate::services::manifest::ApiKind, String, String, Option<String>), String> {
+) -> Result<
+    (
+        crate::services::manifest::ApiKind,
+        String,
+        String,
+        Option<String>,
+    ),
+    String,
+> {
     if row.deploy_method != crate::services_repo::services::DeployMethod::External {
         return Err("service is not an external provider".to_string());
     }
@@ -9240,7 +9334,9 @@ pub async fn service_model_selection(
     if forward_target_node(ctx, &payload.node_id).is_some() {
         return resp(
             false,
-            Some("model selection must be performed on the node that owns the provider".to_string()),
+            Some(
+                "model selection must be performed on the node that owns the provider".to_string(),
+            ),
         );
     }
 
@@ -9276,7 +9372,10 @@ pub async fn service_model_selection(
 
     audit(
         ctx,
-        require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b)).as_deref(),
+        require_user_id(ctx)
+            .ok()
+            .map(|b| user_id_to_uuid(&b))
+            .as_deref(),
         "service.model.selection",
         Some(&row.engine_id),
         Some(&format!("{} models", selected.len())),
@@ -9301,18 +9400,19 @@ pub async fn service_oauth_start(
         }
     };
 
-    let resp = |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
-        Ok(MessageBody::ServiceBody(
-            tentaflow_protocol::ServicePayload::ResOauthStart(
-                tentaflow_protocol::ServiceOauthStartResponse {
-                    flow_id,
-                    authorize_url,
-                    user_code,
-                    error,
-                },
-            ),
-        ))
-    };
+    let resp =
+        |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
+            Ok(MessageBody::ServiceBody(
+                tentaflow_protocol::ServicePayload::ResOauthStart(
+                    tentaflow_protocol::ServiceOauthStartResponse {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                        error,
+                    },
+                ),
+            ))
+        };
 
     // The OAuth flow must run on the node that will own the service + tokens.
     // When deploying to a mesh peer, forward the login there (the peer holds the
@@ -9394,7 +9494,11 @@ pub async fn service_oauth_poll(
                     account_label,
                     error,
                 } => poll_resp(status, account_label, error),
-                _ => poll_resp("error".to_string(), None, Some("unexpected mesh response".to_string())),
+                _ => poll_resp(
+                    "error".to_string(),
+                    None,
+                    Some("unexpected mesh response".to_string()),
+                ),
             },
             Err(e) => poll_resp("error".to_string(), None, Some(e)),
         };
