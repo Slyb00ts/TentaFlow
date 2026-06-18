@@ -4091,6 +4091,24 @@ pub struct AddonPackageInfo {
     pub source: String,
     /// Ile instancji tego pakietu jest aktualnie zainstalowanych.
     pub installed_instances: i32,
+    /// Connection parameters the package declares via `[[robot.connection_param]]`.
+    /// Empty for non-robot packages. The install UI renders one input per entry
+    /// and passes the collected values back in `AddonInstanceInstallRequest.config`.
+    /// `#[serde(default)]` keeps CBOR compatibility with older peers.
+    #[serde(default)]
+    pub connection_params: Vec<AddonConnectionParam>,
+}
+
+/// One declared connection parameter (`[[robot.connection_param]]`). Drives the
+/// per-install form so each robot instance carries its own concrete values
+/// (e.g. the robot IP) instead of a hardcoded default.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonConnectionParam {
+    pub key: String,
+    pub label: String,
+    pub param_type: String,
+    pub required: bool,
+    pub placeholder: String,
 }
 
 /// Instalacja nowej instancji pakietu z katalogu pod nadana nazwa.
@@ -4099,6 +4117,12 @@ pub struct AddonInstanceInstallRequest {
     pub package_id: String,
     pub version: String,
     pub display_name: String,
+    /// Connection-param values entered at install time (key → value). For robot
+    /// packages this carries the per-instance IP/serial; substituted into
+    /// `${key}` placeholders in network rules and persisted to `addon_config`.
+    /// `#[serde(default)]` keeps CBOR compatibility with older peers.
+    #[serde(default)]
+    pub config: Vec<(String, String)>,
 }
 
 /// Wspolna odpowiedz dla install/duplicate — zwraca addon_id nowej instancji.

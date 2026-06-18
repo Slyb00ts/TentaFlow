@@ -542,6 +542,23 @@ function openInstallInstanceModal(pkg) {
   const pkgId = pkg.packageId ?? pkg.package_id;
   const versions = Array.isArray(pkg.versions) ? pkg.versions : [];
   const opts = versions.map((v) => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`).join('');
+  // Connection params declared by the package ([[robot.connection_param]]).
+  // Each renders a tf-input collected into the install request's config map, so
+  // robot packages get a per-instance IP/serial instead of a hardcoded default.
+  const params = Array.isArray(pkg.connectionParams ?? pkg.connection_params)
+    ? (pkg.connectionParams ?? pkg.connection_params)
+    : [];
+  const paramType = (p) => (p.paramType ?? p.param_type ?? '').toLowerCase();
+  const paramFields = params.map((p) => {
+    const key = p.key;
+    const label = p.label || key;
+    const required = !!p.required;
+    const placeholder = p.placeholder || '';
+    const reqMark = required ? ' <span style="color:var(--danger);">*</span>' : '';
+    return `<label style="display:flex;flex-direction:column;gap:4px;">${escapeHtml(label)}${reqMark}
+          <tf-input data-param-key="${escapeAttr(key)}" data-param-type="${escapeAttr(paramType(p))}" placeholder="${escapeAttr(placeholder)}"></tf-input>
+        </label>`;
+  }).join('');
   openModal({
     title: `Zainstaluj: ${pkg.name || pkgId}`,
     icon: 'download',
@@ -555,15 +572,37 @@ function openInstallInstanceModal(pkg) {
         <label style="display:flex;flex-direction:column;gap:4px;">Wersja
           <tf-select id="inst-version">${opts}</tf-select>
         </label>
+        ${paramFields}
       </div>`,
     onConfirm: async (win) => {
       const name = (win.querySelector('#inst-name')?.value || '').trim();
       const version = win.querySelector('#inst-version')?.value || versions[0];
       if (!name) { toast('Podaj nazwe instancji', 'error'); return false; }
+      const config = [];
+      for (const p of params) {
+        const el = win.querySelector(`tf-input[data-param-key="${CSS.escape(p.key)}"]`);
+        // Trim regardless of type — leading/trailing whitespace is never a valid
+        // connection-param value and the server trims too.
+        const value = (el?.value || '').trim();
+        if (p.required && !value) {
+          toast(`Pole "${p.label || p.key}" jest wymagane`, 'error');
+          return false;
+        }
+        // Operator-feedback gate mirroring the server host rule (the server is the
+        // real gate). A host-type param must be a bare host: no spaces or scheme.
+        if (value && paramType(p) === 'host') {
+          if (/\s/.test(value) || /:\/\//.test(value)) {
+            toast(`Pole "${p.label || p.key}": podaj sam adres IP lub nazwe hosta (bez schematu i spacji)`, 'error');
+            return false;
+          }
+        }
+        if (value) config.push([p.key, value]);
+      }
       const res = await ApiBinary.action('addonInstanceInstallRequest', {
         packageId: pkgId,
         version,
         displayName: name,
+        config,
       });
       if (!res.ok) { toast(res.error || 'Instalacja nieudana', 'error'); return false; }
       toast(`Zainstalowano instancje "${name}"`, 'success');

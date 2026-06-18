@@ -58,6 +58,7 @@ pub use message_body::{
     AddonAdminOnlySetResponse,
     AddonApplicationInfo,
     AddonConfigField,
+    AddonConnectionParam,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
     AddonConfigSetRequest,
