@@ -101,15 +101,23 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
             return;
         }
     };
+    // `stream_id` is the PUBLIC id the client sent (and the one we echo back in
+    // every frame). `hub_key` is the INTERNAL StreamHub key we subscribe under:
+    // identical to `stream_id` for local cameras, but org/owner-scoped for
+    // remote relays so two tenants (or two owner nodes) can never collide or
+    // reuse the same `camera:<id>` source. The client never sees `hub_key`.
     let stream_id = payload.stream_id;
 
     // Per-stream-prefix permission gate. Camera streams require
     // `camera.read`; any other prefix is rejected pending a dedicated
     // permission wiring (no implicit allow — fail closed).
-    if let Err(err) = enforce_subscribe_permission(&ctx, &stream_id) {
-        let _ = push_end(&sub, Some(MessageBody::Error(err)));
-        return;
-    }
+    let hub_key = match enforce_subscribe_permission(&ctx, &stream_id) {
+        Ok(key) => key,
+        Err(err) => {
+            let _ = push_end(&sub, Some(MessageBody::Error(err)));
+            return;
+        }
+    };
 
     // Per-user concurrency cap. Acquired before touching the hub so a
     // rejected request never instantiates a hub source. The guard moves
@@ -140,14 +148,16 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         // per-user slot back to the pool.
         let _slot = slot_guard;
 
-        let handle = match StreamHub::global().subscribe(&stream_id).await {
+        let handle = match StreamHub::global().subscribe(&hub_key).await {
             Ok(h) => h,
-            Err(StreamHubError::NotRegistered(id)) => {
+            Err(StreamHubError::NotRegistered(_)) => {
+                // Echo the PUBLIC stream id, never the internal (org/owner
+                // scoped) hub key, which would leak tenant/topology detail.
                 let _ = push_end_async(
                     &sub,
                     Some(MessageBody::Error(ProtocolError::not_found(format!(
                         "stream_not_registered: {}",
-                        id
+                        stream_id
                     )))),
                 )
                 .await;
@@ -339,10 +349,69 @@ fn audit_stream_denied(
     );
 }
 
+/// Build the INTERNAL StreamHub key for a remote relay. Scoped by owner node +
+/// org so a remote relay can never collide with a local `camera:<id>` source or
+/// with another tenant's / another owner's relay for the same camera id. The
+/// client never sees this key — it only ever sends/receives the public
+/// `camera:<id>` stream id.
+#[cfg(feature = "camera")]
+fn remote_relay_hub_key(camera_id: &str, owner_node: &str, org_id: &str) -> String {
+    format!("{}{}@{}#{}", CAMERA_PREFIX, camera_id, owner_node, org_id)
+}
+
+/// Resolve a trusted remote owner for `camera_id` (a camera not local to this
+/// node) and, if found, idempotently register a `RemoteCameraStreamSource`
+/// factory under the org/owner-scoped internal hub key. Returns `Some(hub_key)`
+/// when a relay is available (owner resolved + mesh present), so the caller may
+/// subscribe under that key; `None` means deny (unknown camera, no mesh,
+/// cross-tenant).
+///
+/// The org-scope gate lives in `remote_camera_owner`: it only returns an owner
+/// when the advertised robot's org equals the caller's org. The owner node
+/// independently re-verifies this before serving (defence in depth).
+#[cfg(feature = "camera")]
+fn register_remote_camera_relay(
+    ctx: &HandlerContext,
+    org: &crate::services::rbac::OrgContext,
+    camera_id: &str,
+) -> Option<String> {
+    let iroh = ctx.state.quic_mesh.as_ref()?;
+    let owner = crate::dispatch::camera_admin::remote_camera_owner(
+        &ctx.state.local_node_id,
+        &org.org_id,
+        camera_id,
+    )?;
+
+    // Register a factory under the scoped key; re-registering the same key is
+    // idempotent (latest wins) and does not tear down an already-active relay.
+    // The factory captures what it needs to open a fresh relay on the next cold
+    // subscribe.
+    let hub_key = remote_relay_hub_key(camera_id, &owner, &org.org_id);
+    let iroh = Arc::clone(iroh);
+    let owner = owner.clone();
+    let camera_id = camera_id.to_string();
+    let org_id = org.org_id.clone();
+    let factory = Box::new(move || {
+        let source = crate::services::camera_relay::source::RemoteCameraStreamSource::new(
+            Arc::clone(&iroh),
+            owner.clone(),
+            camera_id.clone(),
+            org_id.clone(),
+        );
+        Ok(source as Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
+    });
+    let _ = StreamHub::global().register_factory(hub_key.clone(), factory);
+    Some(hub_key)
+}
+
+/// Authorize a subscribe and resolve the INTERNAL StreamHub key to subscribe
+/// under. For local cameras (and the no-camera build) this is the bare public
+/// `stream_id`; for a remote relay it is the org/owner-scoped key returned by
+/// `register_remote_camera_relay`.
 fn enforce_subscribe_permission(
     ctx: &HandlerContext,
     stream_id: &str,
-) -> Result<(), ProtocolError> {
+) -> Result<String, ProtocolError> {
     if let Some(rest) = stream_id.strip_prefix(CAMERA_PREFIX) {
         if rest.is_empty() {
             return Err(ProtocolError::bad_request("stream_id missing camera id"));
@@ -367,15 +436,27 @@ fn enforce_subscribe_permission(
                 rest,
                 &org.org_id,
             ) {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    // Audit the cross-tenant probe; never echo the camera_id.
-                    audit_stream_denied(ctx, org, "camera_not_in_org");
-                    Err(ProtocolError::not_found(format!(
-                        "stream_not_registered: {}{}",
-                        CAMERA_PREFIX, rest
-                    )))
-                }
+                // Local camera in this org: the hub key is the bare public id
+                // (already org-checked via camera_exists_in_org).
+                Ok(true) => Ok(stream_id.to_string()),
+                // Not a local camera in this org. Before denying, check whether a
+                // trusted mesh node in THIS org owns it (a robot camera physically
+                // on another node). If so, lazily register a remote relay source
+                // under the org/owner-scoped hub key and subscribe under THAT key.
+                // Org scope is enforced here (remote_camera_owner requires the
+                // advertised robot's org == caller org) AND on the owner side (it
+                // re-verifies it advertises the camera in this org).
+                Ok(false) => match register_remote_camera_relay(ctx, org, rest) {
+                    Some(hub_key) => Ok(hub_key),
+                    None => {
+                        // Audit the cross-tenant probe; never echo the camera_id.
+                        audit_stream_denied(ctx, org, "camera_not_in_org");
+                        Err(ProtocolError::not_found(format!(
+                            "stream_not_registered: {}{}",
+                            CAMERA_PREFIX, rest
+                        )))
+                    }
+                },
                 Err(_) => Err(ProtocolError::new(
                     ProtocolErrorCode::Internal,
                     "camera org lookup failed",
@@ -383,7 +464,7 @@ fn enforce_subscribe_permission(
             };
         }
         #[cfg(not(feature = "camera"))]
-        return Ok(());
+        return Ok(stream_id.to_string());
     }
     Err(ProtocolError::new(
         ProtocolErrorCode::PolicyDenied,
@@ -426,8 +507,8 @@ mod tests {
         async fn init_segment(&self) -> Option<Bytes> {
             self.init.clone()
         }
-        fn chunk_broadcaster(&self) -> &broadcast::Sender<Bytes> {
-            &self.tx
+        fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+            Some(self.tx.clone())
         }
     }
 
@@ -471,6 +552,33 @@ mod tests {
         }
     }
 
+    /// Seed a local camera row in `ctx`'s DB under the ctx's org so the local
+    /// `camera_exists_in_org` gate passes and the subscribe takes the LOCAL hub
+    /// key path (bare `camera:<id>`), matching what these tests exercise.
+    #[cfg(feature = "camera")]
+    fn seed_local_camera(ctx: &HandlerContext, camera_id: &str) {
+        let org_id = ctx.org_context.as_ref().unwrap().org_id.clone();
+        crate::db::repository::insert_camera(
+            &ctx.state.db,
+            camera_id,
+            "test-owner",
+            "Cam",
+            "webrtc",
+            "",
+            30,
+            10,
+            None,
+            None,
+            "C",
+            "default",
+            None,
+            None,
+            None,
+            Some(&org_id),
+        )
+        .expect("seed local camera");
+    }
+
     #[tokio::test]
     async fn subscribe_emits_response_then_init_then_frame_then_end() {
         let stream_id = "camera:test-cam-emit";
@@ -484,7 +592,9 @@ mod tests {
                 stream_id: stream_id.to_string(),
             }));
         let h = find_stream_handler("StreamSubscribeRequest").expect("registered");
-        (h.handler_fn)(req, ctx_with_camera_read(101), sub);
+        let ctx = ctx_with_camera_read(101);
+        seed_local_camera(&ctx, "test-cam-emit");
+        (h.handler_fn)(req, ctx, sub);
 
         // 1) SubscribeResponse.
         match rx.recv().await.unwrap() {
@@ -540,6 +650,7 @@ mod tests {
             }));
         let mut ctx = ctx_with_camera_read(606);
         ctx.org_context = Some(test_org_context("lag-user", PERM_CAMERA_READ));
+        seed_local_camera(&ctx, "test-cam-lag");
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx, sub);
 
@@ -658,6 +769,21 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "camera")]
+    #[test]
+    fn remote_relay_hub_key_is_owner_and_org_scoped() {
+        // The internal hub key for a remote relay must encode camera id + owner
+        // node + org so it can never collide with a local `camera:<id>` source
+        // or with another tenant's / owner's relay for the same camera id.
+        let key = remote_relay_hub_key("cam-x", "node-A", "org-1");
+        assert_eq!(key, "camera:cam-x@node-A#org-1");
+        // Distinct owner or org yields a distinct key.
+        assert_ne!(key, remote_relay_hub_key("cam-x", "node-B", "org-1"));
+        assert_ne!(key, remote_relay_hub_key("cam-x", "node-A", "org-2"));
+        // The bare local key (what a local camera uses) never collides.
+        assert_ne!(key, format!("{}{}", CAMERA_PREFIX, "cam-x"));
+    }
+
     #[tokio::test]
     async fn per_user_subscription_cap_enforced() {
         let stream_id = "camera:cap-test-cam";
@@ -672,6 +798,7 @@ mod tests {
             let (sub, rx) = reg.create(900 + i as u64, None);
             let mut ctx = ctx_with_camera_read(900 + i as u64);
             ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
+            seed_local_camera(&ctx, "cap-test-cam");
             let req =
                 MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                     stream_id: stream_id.to_string(),
@@ -693,6 +820,7 @@ mod tests {
         let (sub, mut rx_over) = reg.create(999, None);
         let mut ctx = ctx_with_camera_read(999);
         ctx.org_context = Some(test_org_context(user_key, PERM_CAMERA_READ));
+        seed_local_camera(&ctx, "cap-test-cam");
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),

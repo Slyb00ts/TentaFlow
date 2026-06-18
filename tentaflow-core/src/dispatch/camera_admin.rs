@@ -846,7 +846,7 @@ async fn camera_frame_url(
 /// stop a node in org-A reading an org-B robot's camera on the same mesh.
 /// `None` also covers our own camera (handled by the local path) and the
 /// ambiguous case (2+ nodes claim the same camera id), which is logged.
-fn remote_camera_owner(
+pub(crate) fn remote_camera_owner(
     local_node_id: &str,
     caller_org_id: &str,
     camera_id: &str,

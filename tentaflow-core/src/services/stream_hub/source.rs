@@ -43,7 +43,12 @@ pub trait BinaryStreamSource: Send + Sync {
 
     /// Broadcast sender the source pushes media chunks into. The hub hands
     /// out fresh receivers via `Sender::subscribe()` on every subscribe call.
-    fn chunk_broadcaster(&self) -> &broadcast::Sender<Bytes>;
+    ///
+    /// Returns `None` when the source has terminally failed (e.g. a remote
+    /// relay that never received an init segment): the hub then treats the
+    /// subscribe as a clean failure instead of registering a hung empty stream.
+    /// Live sources always return `Some`.
+    fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>>;
 }
 
 /// Factory invoked the first time a stream is subscribed to. The hub caches

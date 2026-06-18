@@ -15,14 +15,11 @@ import '/js/components/tf-badge.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
-import '/js/components/tf-live-camera-tile.js';
+import '/js/components/tf-video-stream.js';
 
 // Mesh discovery refreshes the registry periodically; re-poll so status, battery
 // and online/offline transitions appear without a manual reload.
 const REFRESH_INTERVAL_MS = 4000;
-
-// Live camera tile TTL — half of it drives the per-frame refresh cadence.
-const CAMERA_TTL_SECS = 30;
 
 // Closed control allowlist mirrored from RobotActionWire (message_body.rs:1166).
 // Non-move actions ignore vx/vy/vyaw; the owner clamps again to its safety cap.
@@ -221,7 +218,7 @@ function robotCard(r) {
   const cameraHtml = cam
     ? `
       <div class="robots-camera">
-        <tf-live-camera-tile camera-id="${escapeAttr(cam)}" ttl-secs="${CAMERA_TTL_SECS}" label="${escapeAttr(id)}"></tf-live-camera-tile>
+        <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" height-px="240"></tf-video-stream>
         <tf-button variant="outline" size="sm" icon="image" full-width
           data-robot="${escapeAttr(id)}" data-share-camera="${escapeAttr(cam)}">
           Dodaj kamerę do TentaVision
