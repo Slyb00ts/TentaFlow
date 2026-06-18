@@ -73,6 +73,11 @@ pub struct EngineConfig {
     pub n_batch: u32,
     pub n_ubatch: u32,
     pub n_gpu_layers: u32,
+    // Indeks karty głównej i wagi rozkładu warstw — przekazywane do
+    // LlamaLoadConfig przy ładowaniu modelu. Wybór kart embedded idzie wyłącznie
+    // tędy (jeden proces core, CUDA_VISIBLE_DEVICES nie działa po starcie).
+    pub main_gpu: i32,
+    pub tensor_split: Vec<f32>,
     pub threads: Option<u32>,
     pub flash_attn: FlashAttentionMode,
     pub kv_unified: bool,
@@ -98,6 +103,8 @@ impl Default for EngineConfig {
             n_batch: 2048,
             n_ubatch: 512,
             n_gpu_layers: crate::llama::DEFAULT_GPU_LAYERS,
+            main_gpu: 0,
+            tensor_split: Vec::new(),
             threads: None,
             flash_attn: FlashAttentionMode::Auto,
             kv_unified: false,
@@ -784,6 +791,8 @@ fn scheduler_main(
             batch_size: config.n_batch.max(config.n_seq_max),
             threads: config.threads,
             flash_attn: config.flash_attn,
+            main_gpu: config.main_gpu,
+            tensor_split: config.tensor_split.clone(),
         },
     ) {
         Ok(rt) => Arc::new(rt),
