@@ -256,7 +256,7 @@ pub(super) fn attach_mp4_branch_webrtc(
     // streamable=true → ftyp+moov init segment on the first fragment, then
     // moof+mdat media fragments with no finalize. fragment-duration in ms.
     let mux = gst::ElementFactory::make("mp4mux")
-        .property("fragment-duration", 200u32)
+        .property("fragment-duration", 100u32)
         .property("streamable", true)
         .build()
         .map_err(|e| format!("mp4mux build: {e}"))?;
