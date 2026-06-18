@@ -111,6 +111,9 @@ pub struct WhisperDeployParams {
     pub default_beam_size: Option<i32>,
     pub default_language: Option<String>,
     pub default_translate: Option<bool>,
+    // Indeks karty GPU dla whisper.cpp (single-device). Wybor kart z kreatora
+    // bierze pierwsza wybrana karte — embedded nie reaguje na CUDA_VISIBLE_DEVICES.
+    pub gpu_device: i32,
 }
 
 impl WhisperDeployParams {

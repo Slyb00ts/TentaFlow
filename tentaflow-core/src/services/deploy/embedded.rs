@@ -161,6 +161,20 @@ impl EmbeddedDeploy {
             .acquire()
             .await
             .expect("EMBEDDED_LOAD_GATE never closed");
+        // whisper.cpp jest single-device: bierzemy pierwsza wybrana karte z
+        // kreatora. Embedded nie reaguje na CUDA_VISIBLE_DEVICES, wiec indeks
+        // karty trafia do silnika przez WhisperDeployParams -> WhisperLoadConfig.
+        let mut deploy_params = crate::stt::WhisperDeployParams::default();
+        let gpu_mode = self
+            .user_config
+            .get("gpu_select_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
+        if gpu_mode == "specific" {
+            if let Some(&first) = parse_gpu_ids(&self.user_config).first() {
+                deploy_params.gpu_device = first as i32;
+            }
+        }
         let shared = crate::stt::shared_stt_manager();
         let info = {
             let mut mgr = shared.write().await;
@@ -169,7 +183,7 @@ impl EmbeddedDeploy {
                 Some(&model_repo),
                 None,
                 self.log_sink.as_ref(),
-                crate::stt::WhisperDeployParams::default(),
+                deploy_params,
             )
             .await
         }
@@ -504,7 +518,7 @@ impl EmbeddedDeploy {
             // jak ctx_size/n_gpu_layers/threads/batch_size dla llama-cpp;
             // request-time defaults dla mlx). DeployTarget::NativeEmbedded
             // dla wszystkich embedded LLM/STT.
-            let (app, _req_time) = super::apply_parameters_deploy(
+            let (mut app, _req_time) = super::apply_parameters_deploy(
                 &self.manifest,
                 &self.user_config,
                 super::DeployTarget::NativeEmbedded,
@@ -514,6 +528,13 @@ impl EmbeddedDeploy {
             // apply_parameters_deploy gdy serializuje config_json zeby
             // request_time_parameters byly persystowane (snapshot_builder
             // potem czyta z config_json).
+
+            // Wybór kart z kreatora (`gpu_select_mode`/`gpu_ids`) tlumaczymy na
+            // `tensor_split`/`main_gpu`/`n_gpu_layers` w `app.llamacpp`. Embedded
+            // llama.cpp dziala w jednym procesie core (CUDA init raz), wiec
+            // CUDA_VISIBLE_DEVICES ustawiane po starcie nie dziala — zawezenie do
+            // wybranych kart idzie tylko tymi parametrami ladowania do FFI.
+            apply_gpu_selection_llamacpp(&self.user_config, &mut app.llamacpp);
 
             let deploy_params = crate::inference::DeployParamsSnapshot {
                 llamacpp: app.llamacpp.clone(),
@@ -679,6 +700,55 @@ impl DeployStrategy for EmbeddedDeploy {
             crate::vision::unregister_engine(key);
         }
         Ok(())
+    }
+}
+
+/// Odczytuje wybrane indeksy kart z `gpu_ids` (akceptuje liczby i stringi).
+fn parse_gpu_ids(user_config: &serde_json::Value) -> Vec<usize> {
+    user_config
+        .get("gpu_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_u64()
+                        .map(|n| n as usize)
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<usize>().ok()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Tlumaczy wybor kart z kreatora (`gpu_select_mode`/`gpu_ids`) na parametry
+/// ladowania embedded llama.cpp. `none` => `n_gpu_layers=0` (tylko CPU);
+/// `specific` z niepusta lista => `tensor_split` z waga 1.0 na wybranych kartach
+/// (0.0 wyklucza pozostale) + `main_gpu` = pierwsza wybrana karta. `all` oraz
+/// pusta lista nie zmieniaja niczego (domyslny rozklad na wszystkie karty).
+fn apply_gpu_selection_llamacpp(
+    user_config: &serde_json::Value,
+    llamacpp: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let mode = user_config
+        .get("gpu_select_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+    match mode {
+        "none" => {
+            llamacpp.insert("n_gpu_layers".to_string(), serde_json::json!(0));
+        }
+        "specific" => {
+            let ids = parse_gpu_ids(user_config);
+            if let Some(&max_index) = ids.iter().max() {
+                let mut split = vec![0.0_f32; max_index + 1];
+                for &idx in &ids {
+                    split[idx] = 1.0;
+                }
+                llamacpp.insert("tensor_split".to_string(), serde_json::json!(split));
+                llamacpp.insert("main_gpu".to_string(), serde_json::json!(ids[0]));
+            }
+        }
+        _ => {}
     }
 }
 
