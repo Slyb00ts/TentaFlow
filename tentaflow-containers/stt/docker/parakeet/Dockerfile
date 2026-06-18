@@ -18,7 +18,7 @@ WORKDIR /build/tentaflow-containers/sidecar
 RUN cargo build --release --bin tentaflow-sidecar \
     && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.3-devel-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv git ffmpeg curl ca-certificates \
       build-essential libsndfile1 \
@@ -26,12 +26,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# torch cu130 instalowany jawnie PRZED NeMo, bo NeMo ciagnie torch posrednio
+# (NGC <=25.03 z torch cu128 crashuje na B300/sm_103 — wymuszamy cu130)
 RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir \
-      torch==2.4.* torchaudio \
+      torch>=2.11 torchaudio \
+      --index-url https://download.pytorch.org/whl/cu130 \
+ && pip install --no-cache-dir \
       "nemo_toolkit[asr]" \
-      fastapi uvicorn python-multipart soundfile \
-      --extra-index-url https://download.pytorch.org/whl/cu124
+      fastapi uvicorn python-multipart soundfile
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/stt/docker/parakeet/server.py /app/server.py

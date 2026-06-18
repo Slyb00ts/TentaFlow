@@ -1,0 +1,32 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle dla Nemotron-OCR (nvidia/nemotron-ocr-v1).
+#       Model jest CUDA-only, wiec jedyny wariant instalacji to cuda (torch z
+#       wheelami CUDA). Uruchamia server.py (FastAPI) z endpointem /ocr.
+# =============================================================================
+
+[bundle]
+engine = "nemotron-ocr"
+description = "NVIDIA Nemotron-OCR document OCR server (CUDA only)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "transformers==4.49.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8093}"]
+internal_port = 8093
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 8
+platforms = ["linux-x86_64", "windows-x86_64"]
+
+# Tylko CUDA — model nie ma sciezki CPU. torch z wheelami CUDA, reszta
+# zaleznosci serwera (pillow, accelerate, fastapi, uvicorn) jako extras.
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+install_hint = "CUDA_VISIBLE_DEVICES=0"

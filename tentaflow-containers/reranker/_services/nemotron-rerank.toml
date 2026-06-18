@@ -1,0 +1,39 @@
+# =============================================================================
+# Plik: reranker/_services/nemotron-rerank.toml
+# Opis: Manifest silnika NVIDIA Llama-Nemotron Rerank (tekstowy cross-encoder)
+#       serwowanego przez vLLM w trybie score/rerank. Wystawia OpenAI-compatible
+#       /v1/rerank i /v1/score; sidecar QUIC proxuje /v1 do mesh.
+# =============================================================================
+
+[engine]
+id = "nemotron-rerank"
+provider = "tentaflow"
+category = "reranker"
+name = "NVIDIA Llama-Nemotron Rerank"
+description_pl = "Cross-encoder rerankingu NVIDIA (Llama 3.2 1B) serwowany przez vLLM (--task score). Ranguje pasaże względem zapytania."
+description_en = "NVIDIA cross-encoder reranker (Llama 3.2 1B) served via vLLM (--task score). Ranks passages against a query."
+homepage = "https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2"
+license = "nvidia-open-model-license"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "0.23.0"
+service_surfaces = ["rerank"]
+input_modalities = ["text"]
+dgx_spark = false
+
+[deploy.docker]
+context_path = "reranker/docker/nemotron-rerank"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "reranker/python/nemotron-rerank"
+
+[[model_preset]]
+id = "llama-nemotron-rerank-1b-v2"
+display_name = "Llama-Nemotron Rerank 1B v2"
+repo = "nvidia/llama-nemotron-rerank-1b-v2"
+recommended = true

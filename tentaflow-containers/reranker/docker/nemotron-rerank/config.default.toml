@@ -1,9 +1,10 @@
 # =============================================================================
 # Plik: config.default.toml
-# Opis: Fallback configu sidecara - nadpisany przez /data/config.toml
-#       generowany przez tentaflow-core/src/deploy/runner.rs przy deployu.
+# Opis: Fallback dla sidecara w obrazie Nemotron Rerank - nadpisany przez
+#       /data/config.toml wygenerowany przez tentaflow-core/src/deploy/runner.rs
+#       przy deployu. Proxuje /v1 (w tym /v1/rerank i /v1/score) z vLLM.
 # =============================================================================
-service_name = "llm-tensorrt-llm"
+service_name = "reranker-nemotron"
 model_aliases = []
 
 [transport]
@@ -15,4 +16,4 @@ enable_dht_discovery = false
 kind = "reverse_proxy"
 upstream_url = "http://127.0.0.1:8000/v1"
 api = "open_ai"
-timeout_ms = 900000
+timeout_ms = 600000

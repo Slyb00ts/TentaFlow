@@ -83,3 +83,9 @@ id = "qwen3-5-9b-mlx-4bit"
 display_name = "Qwen 3.5 9B (MLX 4-bit)"
 repo = "mlx-community/Qwen3.5-9B-MLX-4bit"
 quantization = "int4"
+
+[[model_preset]]
+id = "nemotron-3-super-120b-a12b-mlx-6bit"
+display_name = "Nemotron 3 Super 120B (MLX 6bit)"
+repo = "mlx-community/Nemotron-3-Super-120B-A12B-MLX-6bit"
+quantization = "int6"

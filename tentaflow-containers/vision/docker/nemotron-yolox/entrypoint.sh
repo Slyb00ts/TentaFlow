@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: Sidecar QUIC + trtllm startuja rownolegle. Sidecar nasluchuje
-#       iroh natychmiast (klient widzi peera od razu); engine laduje model w
-#       tle. Logi obu na stdout kontenera. PID1 czeka na pierwszego upadku
-#       i grzecznie konczy drugiego.
+# Opis: Sidecar QUIC + serwer detekcji YOLOX startuja rownolegle. Sidecar
+#       nasluchuje iroh natychmiast, serwer pobiera wagi .pth dla MODEL_REPO,
+#       buduje siec YOLOX i laduje ja na GPU (inferencja w PyTorch, bez
+#       onnxruntime). Logi obu na stdout. PID1 czeka na pierwszego upadku i
+#       grzecznie konczy drugiego.
 # =============================================================================
 
 set -uo pipefail
@@ -12,15 +13,7 @@ set -uo pipefail
 CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 [[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
 
-MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
-TRTLLM_PORT="${TRTLLM_PORT:-8000}"
-
-# Argi silnika jako "$@" (bollard Cmd array z Rust). JSON-owe argi nietkniete,
-# bez re-tokenizacji. Pusto → bezpieczny baseline.
-ENGINE_ARGS=("$@")
-if [[ "${#ENGINE_ARGS[@]}" -eq 0 ]]; then
-  ENGINE_ARGS=(--max_batch_size 8 --max_num_tokens 8192)
-fi
+PORT="${NEMOTRON_YOLOX_PORT:-8086}"
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
@@ -28,14 +21,11 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] start trtllm (${#ENGINE_ARGS[@]} args)"
-trtllm-serve "$MODEL" \
-  --host 127.0.0.1 \
-  --port "$TRTLLM_PORT" \
-  "${ENGINE_ARGS[@]}" 2>&1 \
-  | sed -u 's/^/[trtllm] /' &
+echo "[entrypoint] start nemotron-yolox (model=${MODEL_REPO:-?})"
+PORT="$PORT" python /app/server.py 2>&1 \
+  | sed -u 's/^/[nemotron-yolox] /' &
 ENGINE_PID=$!
-echo "[entrypoint] trtllm PID=$ENGINE_PID"
+echo "[entrypoint] nemotron-yolox PID=$ENGINE_PID"
 
 cleanup() {
   echo "[entrypoint] shutdown sidecar=$SIDECAR_PID engine=$ENGINE_PID"

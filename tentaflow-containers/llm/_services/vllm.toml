@@ -55,3 +55,21 @@ speculator_repo = "TentaFlow/Bielik-1.5B-NVFP4"
 speculator_method = "draft_model"
 speculator_num_tokens = 3
 featured = true
+
+[[model_preset]]
+id = "nemotron-3-super-120b-a12b"
+display_name = "Nemotron 3 Super 120B A12B"
+repo = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+quantization = "fp8"
+
+[[model_preset]]
+id = "nemotron-3-nano-omni-30b-a3b-reasoning"
+display_name = "Nemotron 3 Nano Omni 30B A3B (VLM reasoning)"
+repo = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"
+quantization = "fp8"
+
+[[model_preset]]
+id = "nemotron-nano-12b-v2-vl"
+display_name = "Nemotron Nano 12B v2 VL (captioning)"
+repo = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8"
+quantization = "fp8"

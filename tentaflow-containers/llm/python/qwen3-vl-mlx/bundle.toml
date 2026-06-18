@@ -1,0 +1,36 @@
+# =============================================================================
+# Plik: llm/python/qwen3-vl-mlx/bundle.toml
+# Opis: Zamiennik VLM Qwen3-VL dla Apple Silicon (macOS) jako natywny
+#       python-bundle — mlx-vlm z wbudowanym serwerem OpenAI-compatible
+#       (python -m mlx_vlm.server). Model przyjmuje tekst i obrazy, generuje
+#       tekst; serwuje /v1/chat/completions. Wariant instalacji metal (MLX).
+# =============================================================================
+
+[bundle]
+engine = "qwen3-vl-mlx"
+description = "Qwen3-VL (VLM chat) via mlx-vlm OpenAI server (Apple Silicon)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "mlx-vlm"
+
+[launch]
+command = "python"
+# mlx-vlm dostarcza wlasny serwer OpenAI-compatible. Model wskazuje preset/repo,
+# port z deploy configu (domyslnie 8000). Serwer sam laduje multimodalny
+# procesor modelu Qwen3-VL — bez dodatkowych flag obrazow.
+args = [
+    "-m", "mlx_vlm.server",
+    "--model", "${MODEL}",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["macos-aarch64"]
+
+[[install_variants]]
+backend = "metal"
+extras = []

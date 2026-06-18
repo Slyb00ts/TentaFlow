@@ -16,7 +16,7 @@ WORKDIR /build/tentaflow-containers/sidecar
 RUN cargo build --release --bin tentaflow-sidecar \
     && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev git ffmpeg curl ca-certificates \
       libsndfile1 gcc g++ \
@@ -24,12 +24,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# torch cu130 instalowany jawnie PRZED TTS, bo coqui-TTS ciagnie torch posrednio
+# (TT>=0.22 pinuje torch>=2.2 bez gornej granicy — wymuszamy cu130 dla B300/sm_103)
 RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir \
-      torch==2.4.* torchaudio \
+      torch>=2.11 torchaudio \
+      --index-url https://download.pytorch.org/whl/cu130 \
+ && pip install --no-cache-dir \
       "TTS>=0.22" \
-      fastapi uvicorn \
-      --extra-index-url https://download.pytorch.org/whl/cu124
+      fastapi uvicorn
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/tts/docker/xtts/server.py /app/server.py

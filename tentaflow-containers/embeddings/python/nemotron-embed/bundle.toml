@@ -1,0 +1,54 @@
+# =============================================================================
+# Plik: embeddings/python/nemotron-embed/bundle.toml
+# Opis: NVIDIA Llama-Nemotron Embed jako natywny python-bundle — vLLM (PyPI
+#       pinned 0.23.0) serwowany w trybie embeddings (--task embed). CUDA (cu130)
+#       oraz ROCm (rocm7.0). Eksponuje OpenAI-compatible /v1/embeddings.
+# =============================================================================
+
+[bundle]
+engine = "nemotron-embed"
+description = "NVIDIA Llama-Nemotron Embed via vLLM (PyPI, pinned 0.23.0, --task embed)"
+python_version = "3.12"
+# Pinned na 0.23.0 dla reproducibility — git main moze rozjechac sie z deps.
+source = "pypi"
+pypi_package = "vllm==0.23.0"
+
+[launch]
+command = "python"
+# Bundle dostarcza identity flags (model + transport) i baseline defaults.
+# `--task embed` przelacza vLLM na sciezke embeddingow (/v1/embeddings) zamiast
+# generacji. `--gpu-memory-utilization` celowo NIE jest tu — backend
+# (`python_bundle.rs::prepare`) zarzadza ta flaga (auto-clamp wzgledem free
+# VRAM / user explicit z wizarda).
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--task", "embed",
+    # Serwuj pod slugiem ktory core routuje (`models_from_manifest` model_name
+    # = preset id), nie pod sciezka repo `${MODEL}`. Bez tego dispatch 404.
+    "--served-model-name", "${SERVED_MODEL_NAME}",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 4
+disk_gb = 12
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+# vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny PyPI to cu129
+# i nie ma optymalizacji Blackwell. extra_index wskazuje nightly cu130 vLLM;
+# torch tez idzie z cu130 (Dockerfile pobiera go z download.pytorch.org/whl/cu130).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://wheels.vllm.ai/nightly/cu130"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "VLLM_TARGET_DEVICE=rocm"
