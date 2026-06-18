@@ -452,6 +452,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "api_keys_access_v2",
             MigrationStep::RustSelfManaged(api_keys_access_v2),
         ),
+        (
+            83,
+            "roles_add_robot_permissions",
+            MigrationStep::Rust(roles_add_robot_permissions),
+        ),
     ]
 }
 
@@ -2576,6 +2581,21 @@ fn roles_add_camera_metadata_permission(conn: &Connection) -> Result<()> {
     roles_add_permissions(conn, &["org_admin", "org_operator"], &["camera.metadata"])
 }
 
+// Grant robot control permissions to the operational roles. The robot
+// dispatch path (`PermissionMatrix::has_permission`) enforces
+// `robot.command` / `robot.estop` / `robot.telemetry` on the acting user;
+// without this, even an org admin gets `permission_denied` when driving a
+// robot. Viewer stays read-only (no robot control). Idempotent via
+// `roles_add_permissions` — safe on fresh DBs (the v32 seed already carries
+// these) and on existing DBs created before robots existed.
+fn roles_add_robot_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator"],
+        &["robot.command", "robot.estop", "robot.telemetry"],
+    )
+}
+
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
 // gains a boolean flag indicating whether the device exposes a metadata
 // configuration that produces analytics events. Filled by the wizard when
@@ -3074,6 +3094,9 @@ fn setup_multi_tenant(conn: &Connection) -> Result<()> {
                 "legal.read",
                 "legal.write",
                 "rbac.elevate",
+                "robot.command",
+                "robot.estop",
+                "robot.telemetry",
             ],
         ),
         (
@@ -3092,6 +3115,9 @@ fn setup_multi_tenant(conn: &Connection) -> Result<()> {
                 "gate.check",
                 "flow.invoke",
                 "legal.read",
+                "robot.command",
+                "robot.estop",
+                "robot.telemetry",
             ],
         ),
         (
