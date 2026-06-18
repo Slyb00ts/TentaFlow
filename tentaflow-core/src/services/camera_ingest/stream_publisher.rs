@@ -40,7 +40,12 @@ const FMP4_H264_MIME: &str = "video/mp4; codecs=\"avc1.42E01E\"";
 /// Maximum time `init_segment()` waits for the appsink to observe the first
 /// fMP4 chunk after `AttachMp4Branch`. Beyond this we assume the publisher
 /// will never produce (e.g. H.265 camera, branch refused) and return `None`.
-const INIT_SEGMENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Must comfortably exceed the camera's IDR interval: a mid-stream Branch-B
+/// attach can land just after a keyframe, and h264parse cannot emit the avcC
+/// init segment until the NEXT SPS/PPS+IDR arrives. The robot's IDR interval is
+/// ~2 s, so 10 s leaves room for the attach + state-sync plus several keyframe
+/// chances before we give up.
+const INIT_SEGMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Publishes fragmented MP4 chunks produced by a camera session's Branch B
 /// mux to any number of WS subscribers.
@@ -75,6 +80,7 @@ pub struct Mp4StreamPublisher {
     parser_buf: Mutex<Vec<u8>>,
     pending_init: Mutex<Vec<u8>>,
     media_buf: Mutex<Vec<u8>>,
+    first_chunk_seen: AtomicBool,
 }
 
 impl std::fmt::Debug for Mp4StreamPublisher {
@@ -112,6 +118,7 @@ impl Mp4StreamPublisher {
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
             chunks_tx: Mutex::new(Some(chunks_tx)),
+            first_chunk_seen: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             cmd_tx,
         }
@@ -131,6 +138,12 @@ impl Mp4StreamPublisher {
     ///   - once init is sealed: each `moof+mdat` pair becomes one broadcast
     ///     chunk (browser appends them as one media segment).
     pub fn push_chunk(&self, bytes: Vec<u8>) {
+        if !self.first_chunk_seen.swap(true, Ordering::AcqRel) {
+            tracing::info!(
+                len = bytes.len(),
+                "fMP4 publisher: first mp4mux chunk received from Branch B"
+            );
+        }
         let mut buf = self.parser_buf.lock();
         buf.extend_from_slice(&bytes);
 
@@ -160,6 +173,10 @@ impl Mp4StreamPublisher {
                     // first media segment with this `moof`.
                     let pending = std::mem::take(&mut *self.pending_init.lock());
                     if !pending.is_empty() {
+                        tracing::info!(
+                            init_len = pending.len(),
+                            "fMP4 publisher: init segment (ftyp+moov) sealed"
+                        );
                         *init_guard = Some(Bytes::from(pending));
                         drop(init_guard);
                         self.init_ready.notify_waiters();
@@ -250,6 +267,10 @@ impl BinaryStreamSource for Mp4StreamPublisher {
         match tokio::time::timeout(INIT_SEGMENT_TIMEOUT, notified).await {
             Ok(()) => self.init_segment.lock().clone(),
             Err(_) => {
+                tracing::warn!(
+                    timeout_s = INIT_SEGMENT_TIMEOUT.as_secs(),
+                    "fMP4 publisher: init segment timed out, marking unsupported"
+                );
                 // Init never arrived in time: make the publisher terminal so
                 // `chunk_broadcaster()` returns None and subscribe fails cleanly
                 // (live receivers get Closed) instead of caching a hung empty
@@ -273,6 +294,10 @@ impl Drop for Mp4StreamPublisher {
         // whole pipeline down anyway). The session is the only entity that
         // can untangle the mux elements from the running pipeline, so this
         // is the canonical teardown path.
+        tracing::debug!(
+            stream_id = %self.stream_id,
+            "fMP4 publisher dropped, posting DetachMp4Branch"
+        );
         let _ = self.cmd_tx.try_send(SessionCommand::DetachMp4Branch);
     }
 }
@@ -336,23 +361,18 @@ mod tests {
         assert_eq!(&init[..], &expected[..]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn init_segment_timeout_returns_none_for_dormant() {
         let (pub_, _cmd_rx) = make_publisher();
-        // Pause is the only knob to keep the test fast; otherwise we wait
-        // the full 3 s timeout.
+        // Paused clock: tokio auto-advances when the only pending work is the
+        // timeout sleep, so the full window elapses instantly in test time.
         let start = tokio::time::Instant::now();
         let result = pub_.init_segment().await;
         let elapsed = start.elapsed();
         assert!(result.is_none(), "dormant publisher must yield None");
-        // We do not pin the upper bound tightly — 3 s ± scheduler jitter.
         assert!(
             elapsed >= INIT_SEGMENT_TIMEOUT,
             "must wait at least the timeout window, got {elapsed:?}"
-        );
-        assert!(
-            elapsed < INIT_SEGMENT_TIMEOUT + Duration::from_secs(2),
-            "must not overshoot the timeout by more than 2 s, got {elapsed:?}"
         );
     }
 
@@ -440,7 +460,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn init_timeout_makes_broadcaster_terminal() {
         let (pub_, _cmd_rx) = make_publisher();
         // No chunk ever pushed: init_segment waits out the timeout, then must
