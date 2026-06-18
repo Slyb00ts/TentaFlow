@@ -273,17 +273,76 @@ pub fn encode_api_key_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ApiKeyListRequest).map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ApiKeyCreateRequest { name, scopes }.
+/// MessageBody::ApiKeyCreateRequest { name, key_type, subject_id, scope_resources }.
+/// `scope_resources` travels as two parallel arrays (types[i] + ids[i]) so the
+/// wasm-bindgen boundary stays on simple `Vec<String>` values.
 #[wasm_bindgen(js_name = encodeApiKeyCreateRequest)]
 pub fn encode_api_key_create_request(
     name: String,
-    scopes: Vec<String>,
+    key_type: String,
+    subject_id: Option<String>,
+    scope_types: Vec<String>,
+    scope_ids: Vec<String>,
 ) -> Result<Vec<u8>, JsError> {
+    let scope_resources = scope_types
+        .into_iter()
+        .zip(scope_ids)
+        .map(|(resource_type, resource_id)| tentaflow_protocol::ResourceRef {
+            resource_type,
+            resource_id,
+        })
+        .collect();
     encode_body_inner(&MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
         name,
-        scopes,
+        key_type,
+        subject_id,
+        scope_resources,
     }))
     .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ApiKeyScopeListRequest { key_uid }.
+#[wasm_bindgen(js_name = encodeApiKeyScopeListRequest)]
+pub fn encode_api_key_scope_list_request(key_uid: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ApiKeyScopeListRequest { key_uid }).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level }.
+#[wasm_bindgen(js_name = encodeApiKeyScopeSetRequest)]
+pub fn encode_api_key_scope_set_request(
+    key_uid: String,
+    resource_type: String,
+    resource_id: String,
+    access_level: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ApiKeyScopeSetRequest {
+        key_uid,
+        resource_type,
+        resource_id,
+        access_level,
+    })
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ApiKeyScopeClearRequest { key_uid, resource_type, resource_id }.
+#[wasm_bindgen(js_name = encodeApiKeyScopeClearRequest)]
+pub fn encode_api_key_scope_clear_request(
+    key_uid: String,
+    resource_type: String,
+    resource_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ApiKeyScopeClearRequest {
+        key_uid,
+        resource_type,
+        resource_id,
+    })
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ApiKeyRotateRequest { key_uid }.
+#[wasm_bindgen(js_name = encodeApiKeyRotateRequest)]
+pub fn encode_api_key_rotate_request(key_uid: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ApiKeyRotateRequest { key_uid }).map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ApiKeyRevokeRequest { key_id }.
@@ -3882,6 +3941,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(used) = k.last_used_at_epoch {
                     set(&item, "lastUsedAtEpoch", used.into());
                 }
+                set(&item, "keyType", k.key_type.into());
+                if let Some(sid) = k.subject_id {
+                    set(&item, "subjectId", sid.into());
+                }
+                if let Some(lbl) = k.subject_label {
+                    set(&item, "subjectLabel", lbl.into());
+                }
+                set(&item, "scopeCount", k.scope_count.into());
+                set(&item, "isActive", k.is_active.into());
                 arr.push(&item.into());
             }
             set(&obj, "keys", arr.into());
@@ -3889,11 +3957,18 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ApiKeyCreateRequestBody(req) => {
             set(&obj, "variant", "ApiKeyCreateRequest".into());
             set(&obj, "name", req.name.into());
-            let scopes_arr = js_sys::Array::new();
-            for s in req.scopes {
-                scopes_arr.push(&JsValue::from_str(&s));
+            set(&obj, "keyType", req.key_type.into());
+            if let Some(sid) = req.subject_id {
+                set(&obj, "subjectId", sid.into());
             }
-            set(&obj, "scopes", scopes_arr.into());
+            let scopes_arr = js_sys::Array::new();
+            for r in req.scope_resources {
+                let item = js_sys::Object::new();
+                set(&item, "resourceType", r.resource_type.into());
+                set(&item, "resourceId", r.resource_id.into());
+                scopes_arr.push(&item.into());
+            }
+            set(&obj, "scopeResources", scopes_arr.into());
         }
         MessageBody::ApiKeyCreateResponseBody(resp) => {
             set(&obj, "variant", "ApiKeyCreateResponse".into());
@@ -3907,6 +3982,54 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ApiKeyRevokeResponse { deleted } => {
             set(&obj, "variant", "ApiKeyRevokeResponse".into());
             set(&obj, "deleted", deleted.into());
+        }
+        MessageBody::ApiKeyScopeListResponse { entries } => {
+            set(&obj, "variant", "ApiKeyScopeListResponse".into());
+            let arr = js_sys::Array::new();
+            for e in entries {
+                let item = js_sys::Object::new();
+                set(&item, "resourceType", e.resource_type.into());
+                set(&item, "resourceId", e.resource_id.into());
+                set(&item, "subjectType", e.subject_type.into());
+                set(&item, "subjectId", e.subject_id.into());
+                set(&item, "accessLevel", e.access_level.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "entries", arr.into());
+        }
+        MessageBody::ApiKeyRotateResponse { token } => {
+            set(&obj, "variant", "ApiKeyRotateResponse".into());
+            set(&obj, "token", token.into());
+        }
+        MessageBody::ApiKeyScopeListRequest { key_uid } => {
+            set(&obj, "variant", "ApiKeyScopeListRequest".into());
+            set(&obj, "keyUid", key_uid.into());
+        }
+        MessageBody::ApiKeyScopeSetRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+            access_level,
+        } => {
+            set(&obj, "variant", "ApiKeyScopeSetRequest".into());
+            set(&obj, "keyUid", key_uid.into());
+            set(&obj, "resourceType", resource_type.into());
+            set(&obj, "resourceId", resource_id.into());
+            set(&obj, "accessLevel", access_level.into());
+        }
+        MessageBody::ApiKeyScopeClearRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+        } => {
+            set(&obj, "variant", "ApiKeyScopeClearRequest".into());
+            set(&obj, "keyUid", key_uid.into());
+            set(&obj, "resourceType", resource_type.into());
+            set(&obj, "resourceId", resource_id.into());
+        }
+        MessageBody::ApiKeyRotateRequest { key_uid } => {
+            set(&obj, "variant", "ApiKeyRotateRequest".into());
+            set(&obj, "keyUid", key_uid.into());
         }
         MessageBody::AuthLoginRequestBody(req) => {
             set(&obj, "variant", "AuthLoginRequest".into());

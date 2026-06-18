@@ -32,6 +32,7 @@
     "logout": "Logout",
     "addons": "Addons",
     "users": "Users",
+    "access_keys": "Access & API keys",
     "roles_catalog": "Role catalog",
     "audit": "Audit Log",
     "legal": "Legal Documents",

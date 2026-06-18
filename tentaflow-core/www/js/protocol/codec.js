@@ -116,16 +116,41 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ApiKeyCreateRequest { name, scopes: string[] } */
-  apiKeyCreateRequest(correlationId, { name, scopes = [] }, sequence = 1) {
+  /** MessageBody::ApiKeyCreateRequest { name, keyType, subjectId?, scopeResources: {resourceType,resourceId}[] } */
+  apiKeyCreateRequest(correlationId, { name, keyType = 'user', subjectId = null, scopeResources = [] }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyCreateRequest(name, scopes);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
+    const types = scopeResources.map((r) => r.resourceType);
+    const ids = scopeResources.map((r) => r.resourceId);
+    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ApiKeyScopeListRequest { keyUid } */
+  apiKeyScopeListRequest(correlationId, { keyUid }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeApiKeyScopeListRequest(keyUid);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel } */
+  apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId } */
+  apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::ApiKeyRotateRequest { keyUid } */
+  apiKeyRotateRequest(correlationId, { keyUid }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeApiKeyRotateRequest(keyUid);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /**

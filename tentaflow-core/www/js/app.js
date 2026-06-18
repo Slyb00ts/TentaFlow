@@ -35,6 +35,7 @@ import ChatScreen from '/js/modules/chat.js';
 import PromptsScreen from '/js/modules/prompts.js';
 import RulesScreen from '/js/modules/rules.js';
 import UsersScreen from '/js/modules/users.js';
+import AccessKeysScreen from '/js/modules/access-keys.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
 import AddonsScreen from '/js/modules/addons.js';
@@ -146,6 +147,7 @@ const ADMIN_NAV = [
     items: [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
+      { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
@@ -517,6 +519,7 @@ async function renderApp() {
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('users', UsersScreen);
+  Router.register('access-keys', AccessKeysScreen);
   Router.register('roles-catalog', RolesCatalogScreen);
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);
