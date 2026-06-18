@@ -24,17 +24,26 @@ use super::rtsp::{detach_mp4_branch, wire_mp4_appsink, Mp4BranchState};
 use super::session::CameraConfig;
 use super::stream_publisher::Mp4StreamPublisher;
 
-/// Build the appsrc → h264parse → tee pipeline. Branch A (`tee → queue →
-/// decodebin → videoconvert → RGB → appsink`) is always present and drives the
-/// existing frame_storage / streaming_bus path. The returned `tee` lets the
-/// session attach an on-demand fMP4 mux branch (Branch B) without rebuilding.
-/// We also return the appsrc so the pump can feed it.
+/// Build the appsrc → tee pipeline. Branch A (`tee → queue → decodebin →
+/// videoconvert → RGB → appsink`) is always present and drives the existing
+/// frame_storage / streaming_bus path. The returned `tee` lets the session
+/// attach an on-demand fMP4 mux branch (Branch B) without rebuilding. We also
+/// return the appsrc so the pump can feed it.
+///
+/// We tee the RAW Annex-B byte stream (no parse before the tee) and give each
+/// branch its OWN h264parse. A single shared parse before the tee broke Branch
+/// B on the real robot stream: the front parse consumed the SPS/PPS into its
+/// caps (codec_data) and forwarded bare slice NALUs, so Branch B's downstream
+/// parse saw "broken/invalid nal" for every frame, dropped them all, and
+/// mp4mux never produced an init segment (3 s timeout → detach loop). Branch
+/// A's decodebin carries its own parser, so the raw tee feeds both consumers
+/// the unmodified byte stream where each IDR re-announces SPS/PPS in-band.
 ///
 /// Pipeline graph:
 ///
-///   appsrc(byte-stream,au) → h264parse → tee(allow-not-linked)
-///       ├─ src_0 → queue → decodebin → videoconvert → RGB → appsink   (Branch A, always on)
-///       └─ src_N → queue → h264parse(AVC) → mp4mux(fMP4) → appsink     (Branch B, on demand)
+///   appsrc(byte-stream,au) → tee(allow-not-linked)
+///       ├─ src_0 → queue → decodebin → videoconvert → RGB → appsink           (Branch A, always on)
+///       └─ src_N → queue → h264parse(AVC) → mp4mux(fMP4) → appsink            (Branch B, on demand)
 pub fn build_webrtc_pipeline(
     config: &CameraConfig,
     mailbox: Arc<FrameMailbox>,
@@ -51,15 +60,6 @@ pub fn build_webrtc_pipeline(
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsrc: {e}")))?;
     appsrc.set_property_from_str("format", "time");
-
-    // Parse the Annex-B byte stream once, BEFORE the tee, so both branches get
-    // properly framed access units. Branch B re-runs h264parse only to switch
-    // the sample format to AVC for mp4mux — the parse here keeps Branch A's
-    // decodebin happy and gives the tee stable H.264 caps.
-    let h264parse = gst::ElementFactory::make("h264parse")
-        .property("name", "parse_front")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("h264parse: {e}")))?;
 
     // `allow-not-linked=true` lets the pipeline run with Branch B absent (before
     // first attach and after detach) without tripping `not-linked (-1)` when the
@@ -104,7 +104,6 @@ pub fn build_webrtc_pipeline(
     pipeline
         .add_many([
             &appsrc,
-            &h264parse,
             &tee,
             &queue_a,
             &decodebin,
@@ -114,10 +113,10 @@ pub fn build_webrtc_pipeline(
         ])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
 
-    // Static segments: appsrc → h264parse → tee, and convert → capsfilter →
-    // appsink. tee.src_0 → queue_a → decodebin and decodebin → convert are
-    // wired by request pad / dynamic pad below.
-    gst::Element::link_many([&appsrc, &h264parse, &tee])
+    // Static segments: appsrc → tee, and convert → capsfilter → appsink.
+    // tee.src_0 → queue_a → decodebin and decodebin → convert are wired by
+    // request pad / dynamic pad below.
+    gst::Element::link(&appsrc, &tee)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("appsrc → tee: {e}")))?;
     let tee_src_a = tee
         .request_pad_simple("src_%u")
@@ -201,11 +200,15 @@ pub fn build_webrtc_pipeline(
 
 /// Attach Branch B (`tee → queue → h264parse(AVC) → mp4mux → appsink`) to the
 /// running webrtc pipeline and route the mux output into `publisher`. Unlike
-/// the RTSP Branch B there is no rtph264depay — the appsrc already carries
-/// Annex-B access units that the front h264parse framed, so Branch B only needs
-/// to re-parse into AVC sample format (length-prefixed NALUs with in-band SPS/
-/// PPS) which mp4mux requires. mp4mux/h264parse properties mirror RTSP exactly
-/// so the browser MSE init segment + fragment layout is identical.
+/// the RTSP Branch B there is no rtph264depay — the appsrc feeds the tee a raw
+/// Annex-B byte stream, so Branch B's own h264parse frames it and switches to
+/// AVC sample format (length-prefixed NALUs with in-band SPS/PPS) which mp4mux
+/// requires. This is the ONLY parse on the Branch B path: parsing the raw byte
+/// stream here (rather than re-parsing an already-parsed stream) lets h264parse
+/// see the SPS/PPS the robot re-announces at every IDR and build the avcC
+/// codec_data mp4mux needs for the init segment. mp4mux/h264parse properties
+/// mirror RTSP exactly so the browser MSE init segment + fragment layout is
+/// identical.
 pub(super) fn attach_mp4_branch_webrtc(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
