@@ -1165,12 +1165,14 @@ impl AddonManager {
         package_id: &str,
         version: &str,
         display_name: &str,
+        config: &std::collections::BTreeMap<String, String>,
     ) -> Result<String> {
         info!(
             "Instalacja instancji pakietu '{}' v{} jako '{}'",
             package_id, version, display_name
         );
-        let instance_id = lifecycle::install_instance(&self.db, package_id, version, display_name)?;
+        let instance_id =
+            lifecycle::install_instance(&self.db, package_id, version, display_name, config)?;
         let manifest = self.load_addon_manifest(&instance_id)?;
         let pkg_dir = bundled::package_dir(package_id, version);
         self.register_addon_runtime(&manifest, &pkg_dir)?;
@@ -1191,7 +1193,15 @@ impl AddonManager {
         let (package_id, version) =
             crate::db::repository::get_addon_instance_package_ref(&self.db, source_addon_id)?
                 .ok_or_else(|| anyhow::anyhow!("instancja '{source_addon_id}' nie istnieje"))?;
-        self.install_instance(&package_id, &version, new_display_name)
+        // Carry the source instance's connection-param values so the duplicate
+        // passes required-param validation and points at the same robot.
+        let config: std::collections::BTreeMap<String, String> =
+            crate::db::repository::list_addon_config_rows(&self.db, source_addon_id)?
+                .into_iter()
+                .filter(|row| !row.is_secret)
+                .map(|row| (row.key, row.value))
+                .collect();
+        self.install_instance(&package_id, &version, new_display_name, &config)
     }
 
     /// Hot-update instancji do innej (juz skatalogowanej) wersji jej pakietu,

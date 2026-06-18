@@ -45,7 +45,9 @@ const VISION_ADDON_ID: &str = "tentavision";
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const ADDON_ID: &str = "go2";
 const PANEL_ID: &str = "overview";
-const DEFAULT_IP: &str = "192.168.0.190";
+// The robot IP is provided per-install via the `ip` connection_param and read
+// from addon_config at runtime — there is intentionally NO hardcoded default.
+const IP_CONFIG_KEY: &str = "ip";
 const LATENCY_ALERT_MS: i64 = 500;
 const BATTERY_ALERT_PCT: i64 = 20;
 // Watchdogs (seconds). Validation must complete promptly; an online connection
@@ -89,6 +91,43 @@ extern "C" {
     fn webrtc_register_camera_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+}
+
+/// Reads an install-time connection param from `addon_config` (scoped to this
+/// instance). Returns None when the key is absent/empty — there is NO default.
+fn config_get(key: &str) -> Option<String> {
+    let mut cap = 256usize;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            config_get_v1(
+                key.as_ptr() as i32,
+                key.len() as i32,
+                buf.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == 6 {
+            let want = if out_len > 0 { out_len as usize } else { 0 };
+            cap = want.max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return None;
+        }
+        if out_len <= 0 || out_len as usize > cap {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&buf[..out_len as usize]).into_owned();
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
 }
 
 // =============================================================================
@@ -477,7 +516,16 @@ fn parse_soc(bytes: &[u8]) -> Option<i64> {
 fn do_connect() -> JsonValue {
     log::info("go2: do_connect entered");
     let robot = db::get_robot().unwrap_or_default();
-    let ip = if robot.ip.is_empty() { DEFAULT_IP.to_string() } else { robot.ip.clone() };
+    // The configured IP (install-time `ip` connection_param) is the single source
+    // of truth. No default — an unconfigured instance refuses to connect.
+    let ip = match config_get(IP_CONFIG_KEY) {
+        Some(ip) => ip,
+        None => {
+            log::warn("go2: no IP configured — cannot connect");
+            let _ = db::set_offline("error", "no IP configured");
+            return json!({ "error": "no IP configured" });
+        }
+    };
     log::info(&alloc::format!("go2: do_connect ip={ip} status={}", robot.status));
     if db::ensure_robot(&ip).is_err() {
         log::warn("go2: ensure_robot failed");
@@ -906,7 +954,11 @@ fn render_panel() {
     } else {
         "—".into()
     };
-    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, if robot.ip.is_empty() { DEFAULT_IP } else { &robot.ip });
+    // IP pochodzi WYLACZNIE z konfiguracji instalacji (connection-param). Brak
+    // fallbacku do starej kolumny robot.ip — niesakonfigurowana instancja pokazuje
+    // marker, zeby UI nie sugerowal polaczenia z nieaktualnym/legacy adresem.
+    let ip_display = config_get(IP_CONFIG_KEY).unwrap_or_else(|| "(brak konfiguracji)".to_string());
+    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, ip_display);
     let estop_line = if robot.estop_active { "E-STOP AKTYWNY".into() } else { "e-stop: wyłączony".to_string() };
 
     let layout = card(
@@ -1070,15 +1122,23 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
     }
 }
 
+/// Seeds the singleton robot row from the install-time `ip` config. Passing an
+/// empty ip when no config exists creates the row in offline state WITHOUT
+/// inventing a default (ensure_robot keeps the existing ip on empty input).
+fn ensure_robot_from_config() {
+    let ip = config_get(IP_CONFIG_KEY).unwrap_or_default();
+    let _ = db::ensure_robot(&ip);
+}
+
 #[no_mangle]
 pub extern "C" fn on_install() -> i32 {
-    let _ = db::ensure_robot(DEFAULT_IP);
+    ensure_robot_from_config();
     0
 }
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
-    let _ = db::ensure_robot(DEFAULT_IP);
+    ensure_robot_from_config();
     0
 }
 

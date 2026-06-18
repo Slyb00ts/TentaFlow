@@ -482,19 +482,22 @@ export function encodeAddonInstanceDuplicateRequest(source_addon_id, new_display
 
 /**
  * MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+ * `config` is a JS `Array<[key, value]>` of install-time connection-param
+ * values (e.g. the robot IP). Empty for non-robot packages.
  * @param {string} package_id
  * @param {string} version
  * @param {string} display_name
+ * @param {any} config
  * @returns {Uint8Array}
  */
-export function encodeAddonInstanceInstallRequest(package_id, version, display_name) {
+export function encodeAddonInstanceInstallRequest(package_id, version, display_name, config) {
     const ptr0 = passStringToWasm0(package_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(version, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonInstanceInstallRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    const ret = wasm.encodeAddonInstanceInstallRequest(ptr0, len0, ptr1, len1, ptr2, len2, config);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

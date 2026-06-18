@@ -33,11 +33,14 @@ sort_order = 60
 enabled = true
 tick_interval_ms = 200
 
-# LAN signaling to the robot (con_notify / con_ing). Exact host — admin approves
-# the private address in the Network tab. Update host when the robot IP changes.
+# LAN signaling to the robot (con_notify / con_ing). `${ip}` is a per-install
+# placeholder: at install time the entered `ip` connection_param is substituted
+# into the persisted per-instance manifest, so the admin approves THAT concrete
+# robot address in the Network tab. Installing this package twice yields two
+# instances each pinned to its own robot IP.
 [[network_rule]]
 id = "go2-webrtc-signaling"
-host = "192.168.0.190"
+host = "${ip}"
 port = 9991
 protocol = "tcp"
 description = "Unitree Go2 WebRTC LAN signaling (con_notify / con_ing over HTTP/TCP)."
@@ -62,7 +65,9 @@ transports = ["webrtc-lan"]  # how the controller reaches the robot
 [[robot.connection_param]]
 key = "ip"
 label = "Adres IP robota"
-type = "string"
+# `host`: this value is substituted into the addon's network_rule host, so the
+# install form and the server both validate it as a bare IP/hostname token.
+type = "host"
 required = true
 placeholder = "192.168.0.190"
 

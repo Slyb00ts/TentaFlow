@@ -111,6 +111,7 @@ pub fn install_instance(
     package_id: &str,
     package_version: &str,
     display_name: &str,
+    config: &std::collections::BTreeMap<String, String>,
 ) -> Result<String> {
     let name = display_name.trim();
     if name.is_empty() {
@@ -128,13 +129,34 @@ pub fn install_instance(
         );
     }
 
+    // Validate every declared connection_param against the provided config:
+    // a required param must be present and non-empty. No silent defaults.
+    let declared = parse_connection_params(&pkg.manifest_json)?;
+    for param in &declared {
+        if param.required {
+            let present = config
+                .get(&param.key)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if !present {
+                bail!(
+                    "wymagany parametr polaczenia '{}' ({}) jest pusty",
+                    param.key,
+                    param.label
+                );
+            }
+        }
+    }
+
     // Syntetyczny, unikalny addon_id instancji. Czytelny prefix pakietu jest
     // uzytkowy w flow blokach (addon.{id}.{block}) i toolach LLM ({id}.{tool}).
     let instance_id = unique_instance_id(db, package_id)?;
 
-    // Manifest instancji = manifest pakietu z przepisanym [addon] id/name, zeby
-    // sync_manifest_metadata, flow bloki i storage scope'owaly sie po instancji.
-    let instance_manifest = rewrite_manifest_identity(&pkg.manifest_json, &instance_id, name)?;
+    // Manifest instancji = manifest pakietu z przepisanym [addon] id/name ORAZ
+    // podstawionymi ${key} placeholderami w hostach regul sieciowych, zeby
+    // persistowany manifest niosl konkretny adres robota (Network tab approval).
+    let instance_manifest =
+        rewrite_manifest_for_instance(&pkg.manifest_json, &instance_id, name, config)?;
     let manifest = parse_manifest_toml(&instance_manifest)
         .map_err(|e| anyhow::anyhow!("manifest instancji niepoprawny: {e}"))?;
 
@@ -148,6 +170,25 @@ pub fn install_instance(
         false,
         true,
     )?;
+
+    // Persist the entered connection-param values into `addon_config` (scoped to
+    // the new instance_id) so the addon can read its own IP/serial at runtime.
+    for param in &declared {
+        if let Some(value) = config.get(&param.key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                crate::db::repository::upsert_addon_config_value(
+                    db,
+                    &instance_id,
+                    &param.key,
+                    value,
+                    false,
+                    None,
+                )?;
+            }
+        }
+    }
+
     Ok(instance_id)
 }
 
@@ -184,13 +225,166 @@ fn unique_instance_id(db: &DbPool, package_id: &str) -> Result<String> {
     bail!("nie udalo sie wygenerowac unikalnego id instancji dla '{package_id}'")
 }
 
-/// Przepisuje tozsamosc manifestu pakietu na instancje: ustawia [addon].id =
-/// instance_id oraz [addon].name = display_name (manifest.display_name mapuje
-/// sie z pola `name`), zostawiajac reszte bez zmian. Zwraca manifest jako TOML.
-fn rewrite_manifest_identity(
+/// One declared `[[robot.connection_param]]` entry, parsed from the package
+/// manifest. Drives install-time validation, the GUI form and (via `required`)
+/// the "must be provided" check.
+#[derive(Debug, Clone)]
+pub struct DeclaredConnectionParam {
+    pub key: String,
+    pub label: String,
+    pub param_type: String,
+    pub required: bool,
+    pub placeholder: String,
+}
+
+/// Parses the `[[robot.connection_param]]` list from a package manifest TOML.
+/// Returns an empty vec for non-robot packages (no `[robot]` section).
+pub fn parse_connection_params(manifest_toml: &str) -> Result<Vec<DeclaredConnectionParam>> {
+    let value: toml::Value = toml::from_str(manifest_toml)
+        .map_err(|e| anyhow::anyhow!("manifest pakietu niepoprawny: {e}"))?;
+    let Some(params) = value
+        .get("robot")
+        .and_then(|r| r.get("connection_param"))
+        .and_then(|p| p.as_array())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(params.len());
+    for entry in params {
+        let key = entry
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("connection_param bez 'key'"))?
+            .to_string();
+        let label = entry
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&key)
+            .to_string();
+        let param_type = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("string")
+            .to_string();
+        let required = entry
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let placeholder = entry
+            .get("placeholder")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(DeclaredConnectionParam {
+            key,
+            label,
+            param_type,
+            required,
+            placeholder,
+        });
+    }
+    Ok(out)
+}
+
+/// Substitutes `${key}` placeholders in `input` using `config`. Every `${...}`
+/// must resolve — an unresolved placeholder bails so no half-resolved host
+/// (e.g. a literal `${ip}`) is ever persisted. When `validate_host` is set, each
+/// substituted value is checked as a clean host token (see `validate_host_token`)
+/// BEFORE it lands in the output, so an operator-supplied connection-param can
+/// never inject a scheme/port/path/userinfo into a network_rule host.
+fn substitute_placeholders(
+    input: &str,
+    config: &std::collections::BTreeMap<String, String>,
+    validate_host: bool,
+) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow::anyhow!("niezamkniety placeholder ${{ w manifescie"))?;
+        let key = &after[..end];
+        let value = config.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
+        let value = value
+            .ok_or_else(|| anyhow::anyhow!("brak wartosci dla placeholdera '${{{key}}}'"))?;
+        if validate_host {
+            validate_host_token(key, value)?;
+        }
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Validates that a connection-param `value` substituted into a network_rule
+/// `host` is a clean host token: a bare IP literal (IPv4/IPv6) or a DNS
+/// hostname. This is the security gate for operator-supplied robot addresses —
+/// the substituted host later becomes an admin-approvable exact host and is used
+/// to build `http://{host}:{port}/...`, so anything carrying a scheme, port,
+/// path, userinfo, whitespace or control characters must be rejected here.
+fn validate_host_token(key: &str, value: &str) -> Result<()> {
+    let reject = |reason: &str| -> anyhow::Error {
+        anyhow::anyhow!("connection-param '{key}' nie jest poprawnym hostem: {reason}")
+    };
+    if value.is_empty() {
+        return Err(reject("pusta wartosc"));
+    }
+    if value.contains("://") {
+        return Err(reject("zawiera schemat URL"));
+    }
+    // Whitespace/control + path/userinfo/query separators are never legal in a
+    // bare host. ':' is checked separately below so a bare IPv6 literal (which
+    // legitimately contains ':') is still accepted, while `host:port` is not.
+    if let Some(bad) = value
+        .chars()
+        .find(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '@' | '?' | '#' | '\\'))
+    {
+        return Err(reject(&format!("niedozwolony znak '{bad}'")));
+    }
+    // A bare IP literal is always a valid host (IPv4 has no ':'; IPv6 does, so
+    // it is matched here BEFORE the ':' rejection that guards against host:port).
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    // Beyond an IP literal, ':' can only mean an attached port — reject it.
+    if value.contains(':') {
+        return Err(reject("niedozwolony znak ':'"));
+    }
+    if is_valid_dns_hostname(value) {
+        return Ok(());
+    }
+    Err(reject("nie jest adresem IP ani nazwa DNS"))
+}
+
+/// True when `host` is a syntactically valid DNS hostname: 1+ dot-separated
+/// labels of `[A-Za-z0-9-]`, each 1..=63 chars, no leading/trailing hyphen.
+fn is_valid_dns_hostname(host: &str) -> bool {
+    if host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Przepisuje manifest pakietu na instancje: ustawia [addon].id = instance_id,
+/// [addon].name = display_name (manifest.display_name mapuje sie z pola `name`)
+/// ORAZ podstawia ${key} placeholdery w `host`/`port` kazdej reguly sieciowej
+/// uzywajac wartosci connection-param. Dzieki temu persistowany manifest oraz
+/// sparsowane `manifest.network_rules` niosa konkretny adres (Network tab pinuje
+/// realny host robota). Zwraca manifest jako TOML.
+fn rewrite_manifest_for_instance(
     manifest_toml: &str,
     instance_id: &str,
     display_name: &str,
+    config: &std::collections::BTreeMap<String, String>,
 ) -> Result<String> {
     let mut value: toml::Value = toml::from_str(manifest_toml)
         .map_err(|e| anyhow::anyhow!("manifest pakietu niepoprawny: {e}"))?;
@@ -206,6 +400,23 @@ fn rewrite_manifest_identity(
         "name".to_string(),
         toml::Value::String(display_name.to_string()),
     );
+
+    if let Some(rules) = value.get_mut("network_rule").and_then(|v| v.as_array_mut()) {
+        for rule in rules.iter_mut() {
+            let Some(table) = rule.as_table_mut() else {
+                continue;
+            };
+            if let Some(toml::Value::String(host)) = table.get("host") {
+                let resolved = substitute_placeholders(host, config, true)?;
+                table.insert("host".to_string(), toml::Value::String(resolved));
+            }
+            if let Some(toml::Value::String(port)) = table.get("port") {
+                let resolved = substitute_placeholders(port, config, false)?;
+                table.insert("port".to_string(), toml::Value::String(resolved));
+            }
+        }
+    }
+
     toml::to_string(&value).map_err(|e| anyhow::anyhow!("serializacja manifestu instancji: {e}"))
 }
 
@@ -1578,8 +1789,17 @@ pub fn update_instance(db: &DbPool, addon_id: &str, target_version: &str) -> Res
         .map(|a| a.name)
         .unwrap_or_else(|| addon_id.to_string());
 
-    // Manifest docelowy = manifest wersji pakietu z tozsamoscia instancji.
-    let instance_manifest = rewrite_manifest_identity(&pkg.manifest_json, addon_id, &display_name)?;
+    // Manifest docelowy = manifest wersji pakietu z tozsamoscia instancji ORAZ
+    // podstawionymi ${key} z istniejacej konfiguracji instancji (np. IP robota),
+    // zeby update nie zostawil niepodstawionego placeholdera w hostach regul.
+    let config: std::collections::BTreeMap<String, String> =
+        crate::db::repository::list_addon_config_rows(db, addon_id)?
+            .into_iter()
+            .filter(|row| !row.is_secret)
+            .map(|row| (row.key, row.value))
+            .collect();
+    let instance_manifest =
+        rewrite_manifest_for_instance(&pkg.manifest_json, addon_id, &display_name, &config)?;
     let new_manifest = parse_manifest_toml(&instance_manifest)
         .map_err(|e| anyhow::anyhow!("manifest docelowej wersji niepoprawny: {e}"))?;
 
@@ -3019,19 +3239,89 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// rewrite_manifest_identity nadpisuje [addon].id i [addon].name, a manifest
+    /// rewrite_manifest_for_instance nadpisuje [addon].id i [addon].name, a manifest
     /// dalej parsuje sie poprawnie z nowym addon_id == id instancji.
     #[test]
     fn rewrite_manifest_identity_sets_instance_id_and_name() {
         let pkg = "[addon]\nid = \"company-lookup\"\nname = \"Company Lookup\"\nversion = \"1.2.0\"\nwasm_file = \"addon.wasm\"\n";
-        let rewritten =
-            rewrite_manifest_identity(pkg, "company-lookup-ab12cd34", "Prod Lookup").unwrap();
+        let rewritten = rewrite_manifest_for_instance(
+            pkg,
+            "company-lookup-ab12cd34",
+            "Prod Lookup",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         let manifest = parse_manifest_toml(&rewritten).unwrap();
         assert_eq!(manifest.addon_id, "company-lookup-ab12cd34");
         assert_eq!(manifest.display_name, "Prod Lookup");
         // Wersja i wasm_file pakietu zostaja nietkniete.
         assert_eq!(manifest.version, "1.2.0");
         assert_eq!(manifest.wasm_file, "addon.wasm");
+    }
+
+    /// ${ip} w hoscie reguly sieciowej jest podstawiany konkretnym adresem z
+    /// connection-paramow przy tworzeniu manifestu instancji.
+    #[test]
+    fn rewrite_substitutes_ip_placeholder_in_network_rule_host() {
+        let pkg = "[addon]\nid = \"go2\"\nname = \"Go2\"\nversion = \"0.0.1\"\nwasm_file = \"addon.wasm\"\n\
+                   [[network_rule]]\nid = \"sig\"\nhost = \"${ip}\"\nport = 9991\nprotocol = \"tcp\"\ndescription = \"sig\"\n";
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("ip".to_string(), "10.0.0.5".to_string());
+        let rewritten =
+            rewrite_manifest_for_instance(pkg, "go2-ab12cd34", "Robot A", &config).unwrap();
+        let manifest = parse_manifest_toml(&rewritten).unwrap();
+        assert_eq!(manifest.network_rules.len(), 1);
+        assert_eq!(manifest.network_rules[0].host, "10.0.0.5");
+    }
+
+    /// Brak wartosci dla ${ip} jest bledem — zaden niepodstawiony placeholder
+    /// nie moze trafic do persistowanego manifestu.
+    #[test]
+    fn rewrite_fails_on_missing_placeholder_value() {
+        let pkg = "[addon]\nid = \"go2\"\nname = \"Go2\"\nversion = \"0.0.1\"\nwasm_file = \"addon.wasm\"\n\
+                   [[network_rule]]\nid = \"sig\"\nhost = \"${ip}\"\nport = 9991\nprotocol = \"tcp\"\ndescription = \"sig\"\n";
+        let config = std::collections::BTreeMap::new();
+        let err = rewrite_manifest_for_instance(pkg, "go2-ab12cd34", "Robot A", &config)
+            .expect_err("missing ip must error");
+        assert!(err.to_string().contains("ip"), "blad wskazuje na ${{ip}}");
+    }
+
+    /// Connection-param wartosci podstawiane do hosta reguly sieciowej musza byc
+    /// czystym tokenem hosta — bare IP/DNS przechodzi, wszystko z portem/schematem/
+    /// sciezka/userinfo/spacja jest odrzucane (gate bezpieczenstwa SSRF/injection).
+    #[test]
+    fn host_token_validation_accepts_ip_and_hostname_rejects_dirty() {
+        // Akceptowane: czysta nazwa DNS oraz literal IP (v4 i v6).
+        assert!(validate_host_token("ip", "evil.com").is_ok());
+        assert!(validate_host_token("ip", "10.0.0.5").is_ok());
+        assert!(validate_host_token("ip", "robot-1.lan").is_ok());
+        assert!(validate_host_token("ip", "fe80::1").is_ok());
+
+        // Odrzucane: schemat, port, sciezka, spacja, userinfo, znak kontrolny.
+        assert!(validate_host_token("ip", "http://x").is_err());
+        assert!(validate_host_token("ip", "1.2.3.4:80").is_err());
+        assert!(validate_host_token("ip", "a/b").is_err());
+        assert!(validate_host_token("ip", "a b").is_err());
+        assert!(validate_host_token("ip", "a@b").is_err());
+        assert!(validate_host_token("ip", "").is_err());
+        assert!(validate_host_token("ip", "-bad.com").is_err());
+
+        // Blad nazywa klucz parametru, zeby operator wiedzial co poprawic.
+        let err = validate_host_token("robot_ip", "http://x").unwrap_err();
+        assert!(err.to_string().contains("robot_ip"));
+    }
+
+    /// Brudna wartosc connection-param w hoscie reguly jest odrzucana podczas
+    /// przepisywania manifestu instancji (pelna sciezka, nie tylko helper).
+    #[test]
+    fn rewrite_rejects_dirty_host_value() {
+        let pkg = "[addon]\nid = \"go2\"\nname = \"Go2\"\nversion = \"0.0.1\"\nwasm_file = \"addon.wasm\"\n\
+                   [[network_rule]]\nid = \"sig\"\nhost = \"${ip}\"\nport = 9991\nprotocol = \"tcp\"\ndescription = \"sig\"\n";
+        let mut config = std::collections::BTreeMap::new();
+        config.insert("ip".to_string(), "1.2.3.4:80".to_string());
+        let err = rewrite_manifest_for_instance(pkg, "go2-ab12cd34", "Robot A", &config)
+            .expect_err("dirty host must error");
+        assert!(err.to_string().contains("ip"));
     }
 
     fn minimal_wasm_bytes() -> Vec<u8> {

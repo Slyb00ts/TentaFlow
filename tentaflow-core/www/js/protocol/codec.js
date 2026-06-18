@@ -2187,11 +2187,11 @@ export const encode = {
   /** MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu. */
   addonInstanceInstallRequest(
     correlationId,
-    { packageId, version, displayName },
+    { packageId, version, displayName, config = [] },
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceInstallRequest(packageId, version, displayName);
+    const body = _wasm.encodeAddonInstanceInstallRequest(packageId, version, displayName, config);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

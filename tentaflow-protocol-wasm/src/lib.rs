@@ -1080,16 +1080,41 @@ pub fn encode_addon_catalog_list_request() -> Result<Vec<u8>, JsError> {
 }
 
 /// MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+/// `config` is a JS `Array<[key, value]>` of install-time connection-param
+/// values (e.g. the robot IP). Empty for non-robot packages.
 #[wasm_bindgen(js_name = encodeAddonInstanceInstallRequest)]
 pub fn encode_addon_instance_install_request(
     package_id: String,
     version: String,
     display_name: String,
+    config: JsValue,
 ) -> Result<Vec<u8>, JsError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if !config.is_undefined() && !config.is_null() {
+        let arr: js_sys::Array = config
+            .dyn_into()
+            .map_err(|_| JsError::new("config musi byc Array<[key, value]>"))?;
+        for i in 0..arr.length() {
+            let pair: js_sys::Array = arr
+                .get(i)
+                .dyn_into()
+                .map_err(|_| JsError::new("config element musi byc [key, value]"))?;
+            let key = pair
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsError::new("config key musi byc string"))?;
+            let value = pair
+                .get(1)
+                .as_string()
+                .ok_or_else(|| JsError::new("config value musi byc string"))?;
+            pairs.push((key, value));
+        }
+    }
     encode_addon_instance(AddonInstancePayload::ReqInstall(AddonInstanceInstallRequest {
         package_id,
         version,
         display_name,
+        config: pairs,
     }))
 }
 
@@ -4810,6 +4835,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "source", pkg.source.into());
                         set(&item, "installedInstances", pkg.installed_instances.into());
                         set(&item, "installed_instances", pkg.installed_instances.into());
+                        let params = js_sys::Array::new();
+                        for p in pkg.connection_params {
+                            let pv = js_sys::Object::new();
+                            set(&pv, "key", p.key.into());
+                            set(&pv, "label", p.label.into());
+                            set(&pv, "paramType", p.param_type.clone().into());
+                            set(&pv, "param_type", p.param_type.into());
+                            set(&pv, "required", p.required.into());
+                            set(&pv, "placeholder", p.placeholder.into());
+                            params.push(&pv.into());
+                        }
+                        set(&item, "connectionParams", params.clone().into());
+                        set(&item, "connection_params", params.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());

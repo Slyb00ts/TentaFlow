@@ -1189,6 +1189,34 @@ pub fn addon_instance_dispatch(
                 }
                 let installed_instances =
                     repository::count_addon_instances(db, &row.package_id).map_err(db_err)? as i32;
+                // Surface the package's declared connection params so the install
+                // UI can render a per-instance form (e.g. robot IP). A malformed
+                // manifest must NOT be silently emptied — that would drop a
+                // required IP field and let install proceed then fail late. Skip
+                // the offending package (one bad third-party manifest cannot break
+                // the whole catalog list) and log loudly so it is not hidden.
+                let connection_params = match crate::addon::lifecycle::parse_connection_params(
+                    &row.manifest_json,
+                ) {
+                    Ok(params) => params
+                        .into_iter()
+                        .map(|p| tentaflow_protocol::AddonConnectionParam {
+                            key: p.key,
+                            label: p.label,
+                            param_type: p.param_type,
+                            required: p.required,
+                            placeholder: p.placeholder,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            package_id = %row.package_id,
+                            error = %e,
+                            "skipping package from catalog: connection_params parse failed",
+                        );
+                        continue;
+                    }
+                };
                 packages.push(AddonPackageInfo {
                     package_id: row.package_id,
                     name: row.name,
@@ -1196,6 +1224,7 @@ pub fn addon_instance_dispatch(
                     versions: vec![row.version],
                     source: row.source,
                     installed_instances,
+                    connection_params,
                 });
             }
             P::ResCatalogList { packages }
@@ -1207,7 +1236,9 @@ pub fn addon_instance_dispatch(
                 return Err(ProtocolError::bad_request("nazwa instancji 1..=120 znakow"));
             }
             let mgr = addon_manager(ctx)?;
-            let res = match mgr.install_instance(&r.package_id, &r.version, name) {
+            let config: std::collections::BTreeMap<String, String> =
+                r.config.iter().cloned().collect();
+            let res = match mgr.install_instance(&r.package_id, &r.version, name, &config) {
                 Ok(addon_id) => {
                     capture_addon_instance_sync(db, &addon_id);
                     AddonInstanceInstallResponse {
