@@ -27,6 +27,7 @@ let host = null;
 let activeTab = 'keys';
 let matrixSubtab = 'group';
 let resourceView = 'model';
+let highlightKeyUid = null;
 let keys = [];
 let groups = [];
 let users = [];
@@ -406,6 +407,7 @@ function showToken(token) {
 async function renderMatrixTab(body) {
   body.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(t('common.loading', 'Ładowanie...'))}</div>`;
   await loadSubjectsAndResources();
+  if (activeTab !== 'matrix') return; // user switched tabs during the async load
   body.innerHTML = `
     <div class="tf-section-card">
       <div class="subtabs" id="ak-msub">
@@ -490,6 +492,11 @@ async function renderMatrixGrid(grid) {
   }).join('');
   grid.innerHTML = `<table class="perm-matrix"><thead>${head}</thead><tbody>${rowsHtml}</tbody></table>`;
   grid.querySelectorAll('.perm-btn[data-subject-id]').forEach((btn) => btn.addEventListener('click', () => cycleCell(btn, grid)));
+  if (highlightKeyUid) {
+    const target = grid.querySelector(`.perm-btn[data-subject-id="${CSS.escape(highlightKeyUid)}"]`)?.closest('tr');
+    if (target) { target.classList.add('ak-row-hl'); target.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+    highlightKeyUid = null;
+  }
 }
 
 function cellBtn(mode, subject, col) {
@@ -525,10 +532,12 @@ async function cycleCell(btn, grid) {
   }
 }
 
-// Scope editor reuses the matrix logic for a single api-key (general).
+// Scope editor reuses the matrix logic for a single api-key (general): jump to
+// the Per-klucz matrix and highlight + scroll to that key's row.
 function openScopeEditor(keyUid) {
   activeTab = 'matrix';
   matrixSubtab = 'api_key';
+  highlightKeyUid = keyUid;
   renderActiveTab();
 }
 
@@ -538,6 +547,7 @@ function openScopeEditor(keyUid) {
 async function renderByResourceTab(body) {
   body.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(t('common.loading', 'Ładowanie...'))}</div>`;
   await loadSubjectsAndResources();
+  if (activeTab !== 'byresource') return; // user switched tabs during the async load
   const cols = resources[resourceView] || [];
   const opts = cols.map((r) => `<option value="${escapeAttr(r.id)}">${escapeHtml(r.name)}</option>`).join('');
   body.innerHTML = `
