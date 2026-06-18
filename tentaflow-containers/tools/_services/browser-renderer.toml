@@ -17,6 +17,7 @@ gpu_supported = false
 context_path = "tools/docker/browser-renderer"
 platforms = ["linux", "windows"]
 transport = "direct-http"
+gpus = "none"
 download_size_mb = 1600
 
 [deploy.native]

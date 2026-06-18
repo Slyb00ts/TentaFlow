@@ -245,7 +245,9 @@ impl Category {
             Self::Vision => &["chat"],
             Self::ImageGen => &["image_gen"],
             Self::Agents => &["agents"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => {
+                &[]
+            }
         }
     }
 
@@ -257,7 +259,9 @@ impl Category {
             Self::Stt => &["audio"],
             Self::Vision => &["text", "image"],
             Self::Agents => &["text"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => {
+                &[]
+            }
         }
     }
 
@@ -269,7 +273,9 @@ impl Category {
             Self::Tts => &["audio"],
             Self::Embeddings => &["embedding"],
             Self::ImageGen => &["image"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => {
+                &[]
+            }
         }
     }
 }
@@ -411,6 +417,14 @@ pub struct DockerDeploy {
     /// error rather than a serde "missing field" message.
     #[serde(default)]
     pub transport: Option<DockerTransport>,
+    /// GPU passthrough for the container, equivalent to `docker run --gpus`.
+    /// `"all"` exposes every GPU, a number exposes that many, `"none"`/`"0"`
+    /// forces CPU-only. When the field is absent the deploy defaults to all GPUs
+    /// iff the host has an NVIDIA GPU (so AI engines get the GPU without per-image
+    /// flags, while CPU-only hosts and the searxng/browser-renderer containers
+    /// just run without it).
+    #[serde(default)]
+    pub gpus: Option<String>,
 }
 
 /// Transport variant declared by `[deploy.docker].transport`. The build-time

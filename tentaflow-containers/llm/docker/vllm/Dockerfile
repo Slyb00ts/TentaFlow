@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir \
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
 # do pobierania zrodel safetensors. hf_transfer = szybsze rownolegle pobieranie.
-RUN pip install --no-cache-dir llm-compressor "huggingface_hub[cli,hf_transfer]"
+RUN pip install --no-cache-dir llmcompressor "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
     QUANT_SCRIPT=/app/quantize_nvfp4.py
 

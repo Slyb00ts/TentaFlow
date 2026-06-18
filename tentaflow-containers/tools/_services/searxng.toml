@@ -17,6 +17,7 @@ gpu_supported = false
 context_path = "tools/docker/searxng"
 platforms = ["linux", "windows"]
 transport = "direct-http"
+gpus = "none"
 download_image = "searxng/searxng:2026.5.17-d7e8b7cd1"
 download_size_mb = 240
 

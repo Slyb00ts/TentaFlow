@@ -344,10 +344,49 @@ fn is_port_conflict(stderr: &str) -> bool {
         || s.contains("already in use by container")
 }
 
+/// True when the host exposes at least one NVIDIA GPU (probed once via
+/// `nvidia-smi -L`). Cached so repeated deploys don't re-spawn the probe.
+#[cfg(feature = "docker")]
+fn host_has_nvidia_gpu() -> bool {
+    use std::sync::OnceLock;
+    static HAS_GPU: OnceLock<bool> = OnceLock::new();
+    *HAS_GPU.get_or_init(|| {
+        std::process::Command::new("nvidia-smi")
+            .arg("-L")
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// Resolves how many GPUs to attach to a container (Docker `--gpus`), from the
+/// manifest's `[deploy.docker].gpus` field. `Some(-1)` = all, `Some(n)` = n,
+/// `None` = no GPU. When the field is absent we default to all GPUs iff the host
+/// has an NVIDIA GPU, so AI engines get the device without per-image flags while
+/// CPU-only hosts (and CPU services like searxng) simply run without it.
+#[cfg(feature = "docker")]
+fn resolve_gpu_count(manifest_gpus: Option<&str>) -> Option<i64> {
+    match manifest_gpus.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if v == "all" => Some(-1),
+        Some(v) if v.is_empty() || v == "none" || v == "0" || v == "false" => None,
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => None,
+        },
+        None => {
+            if host_has_nvidia_gpu() {
+                Some(-1)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[cfg(feature = "docker")]
 mod backend {
     use super::*;
-    use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+    use bollard::models::{ContainerCreateBody, DeviceRequest, HostConfig, PortBinding};
     use bollard::query_parameters::{
         BuildImageOptions, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
     };
@@ -473,27 +512,94 @@ mod backend {
         use hyper::body::Bytes;
         let body = body_full(Bytes::from(tar_bytes));
         let mut stream = docker.build_image(opts, None, Some(body));
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(info) => {
-                    if let Some(line) = info.stream {
-                        let trimmed = line.trim_end();
-                        if !trimmed.is_empty() {
-                            if let Some(s) = log {
-                                s.info(&format!("[docker build] {}", trimmed));
-                            } else {
-                                tracing::info!(target: "docker_build", "{}", trimmed);
+
+        let emit = |msg: &str| {
+            if let Some(s) = log {
+                s.info(msg);
+            } else {
+                tracing::info!(target: "docker_build", "{}", msg);
+            }
+        };
+
+        // Heartbeat: the classic builder relays a long RUN step's stdout, but
+        // tools that draw progress with `\r` (pip, cmake/ninja, nvcc, git clone)
+        // emit no newline for minutes, so the stream goes silent mid-step. Park
+        // on `stream.next()` AND a timer so we can surface a liveness line during
+        // those silent stretches — otherwise CUDA kernel compiles look frozen.
+        let start = std::time::Instant::now();
+        let mut last_output = std::time::Instant::now();
+        let mut current_step = String::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.tick().await; // first tick fires immediately — drop it
+
+        loop {
+            tokio::select! {
+                item = stream.next() => {
+                    let Some(item) = item else { break };
+                    match item {
+                        Ok(info) => {
+                            let mut emitted = false;
+                            if let Some(line) = info.stream {
+                                let trimmed = line.trim_end();
+                                if !trimmed.is_empty() {
+                                    if trimmed.starts_with("Step ") {
+                                        current_step = trimmed.to_string();
+                                    }
+                                    emit(&format!("[docker build] {}", trimmed));
+                                    emitted = true;
+                                }
+                            }
+                            // Pull/extract phases arrive as status+progress, not
+                            // stream — forward them so downloads aren't invisible.
+                            if !emitted {
+                                if let Some(status) = info.status {
+                                    let status = status.trim();
+                                    if !status.is_empty() {
+                                        let detail = info.progress_detail.and_then(|p| {
+                                            match (p.current, p.total) {
+                                                (Some(c), Some(t)) if t > 0 => {
+                                                    Some(format!(" {}/{}", c, t))
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                        match detail {
+                                            Some(d) => emit(&format!("[docker build] {}{}", status, d)),
+                                            None => emit(&format!("[docker build] {}", status)),
+                                        }
+                                        emitted = true;
+                                    }
+                                }
+                            }
+                            if emitted {
+                                last_output = std::time::Instant::now();
+                            }
+                            if let Some(err_detail) = info.error_detail {
+                                return Err(DeployError::Docker(format!(
+                                    "build error: {}",
+                                    err_detail.message.unwrap_or_default()
+                                )));
                             }
                         }
-                    }
-                    if let Some(err_detail) = info.error_detail {
-                        return Err(DeployError::Docker(format!(
-                            "build error: {}",
-                            err_detail.message.unwrap_or_default()
-                        )));
+                        Err(e) => return Err(DeployError::Docker(format!("build stream: {}", e))),
                     }
                 }
-                Err(e) => return Err(DeployError::Docker(format!("build stream: {}", e))),
+                _ = ticker.tick() => {
+                    if last_output.elapsed().as_secs() >= 15 {
+                        let step = if current_step.is_empty() {
+                            "build w toku".to_string()
+                        } else {
+                            current_step.clone()
+                        };
+                        emit(&format!(
+                            "[docker build] … {} — pracuje ({}s ciszy, {}s łącznie)",
+                            step,
+                            last_output.elapsed().as_secs(),
+                            start.elapsed().as_secs()
+                        ));
+                        last_output = std::time::Instant::now();
+                    }
+                }
             }
         }
         Ok(())
@@ -510,6 +616,7 @@ mod backend {
         cmd: &[String], // dolaczane do ENTRYPOINT jako "$@" (argv silnika)
         binds: &[(PathBuf, String, bool)],
         labels: &HashMap<String, String>,
+        gpu_count: Option<i64>, // Some(-1)=all GPUs, Some(n)=n GPUs, None=no GPU
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed: Vec<String> = Vec::new();
@@ -537,6 +644,20 @@ mod backend {
             })
             .collect();
 
+        // GPU passthrough — equivalent of `docker run --gpus`. Empty driver +
+        // `["gpu"]` capability is what the CLI sends for `--gpus`, letting Docker
+        // pick the NVIDIA device-request driver (named `nvidia` runtime is not
+        // registered on this host, but the device-request path works).
+        let device_requests = gpu_count.map(|count| {
+            vec![DeviceRequest {
+                driver: None,
+                count: Some(count),
+                device_ids: None,
+                capabilities: Some(vec![vec!["gpu".to_string()]]),
+                options: None,
+            }]
+        });
+
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             binds: if binds_vec.is_empty() {
@@ -544,6 +665,7 @@ mod backend {
             } else {
                 Some(binds_vec)
             },
+            device_requests,
             ..Default::default()
         };
         let body = ContainerCreateBody {
@@ -655,7 +777,9 @@ impl DeployStrategy for DockerDeploy {
             .parent()
             .map(|p| p.to_path_buf())
             .ok_or_else(|| {
-                DeployError::Manifest("cannot resolve bundle root (containers_root has no parent)".into())
+                DeployError::Manifest(
+                    "cannot resolve bundle root (containers_root has no parent)".into(),
+                )
             })?;
         let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
         let image_tag = format!(
@@ -852,6 +976,27 @@ impl DeployStrategy for DockerDeploy {
             ),
         ];
 
+        let gpu_count = resolve_gpu_count(
+            self.manifest
+                .deploy
+                .docker
+                .as_ref()
+                .and_then(|d| d.gpus.as_deref()),
+        );
+        if let Some(s) = &self.log_sink {
+            match gpu_count {
+                Some(c) => s.info(&format!(
+                    "[docker] GPU passthrough: {}",
+                    if c < 0 {
+                        "all".to_string()
+                    } else {
+                        c.to_string()
+                    }
+                )),
+                None => s.info("[docker] GPU passthrough: none (CPU)"),
+            }
+        }
+
         let id = backend::run(
             &docker,
             &image_tag,
@@ -861,6 +1006,7 @@ impl DeployStrategy for DockerDeploy {
             &engine_args,
             &binds,
             &labels,
+            gpu_count,
         )
         .await?;
 
@@ -1127,6 +1273,7 @@ mod tests {
                     download_image: None,
                     download_size_mb: None,
                     transport: Some(DockerTransport::SidecarQuic),
+                    gpus: None,
                 }),
                 native: None,
                 external: None,
