@@ -19,7 +19,7 @@
 // produces bytes) — `init_segment()` returns `None` so the hub surfaces a
 // clean `FactoryFailed` instead of hanging the WS consumer indefinitely.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -60,7 +60,14 @@ pub struct Mp4StreamPublisher {
     stream_id: String,
     init_segment: Mutex<Option<Bytes>>,
     init_ready: Notify,
-    chunks_tx: broadcast::Sender<Bytes>,
+    /// `None` once the publisher has terminally failed — `chunk_broadcaster`
+    /// reports that to the hub so the subscribe collapses to a clean failure
+    /// (no init segment, no hung empty stream) instead of being cached as an
+    /// active source. Mirrors `RemoteCameraStreamSource`.
+    chunks_tx: Mutex<Option<broadcast::Sender<Bytes>>>,
+    /// Set true on any terminal outcome (attach refused / init timeout); gates
+    /// duplicate teardown and makes `chunk_broadcaster()` return `None`.
+    terminal: AtomicBool,
     cmd_tx: mpsc::Sender<SessionCommand>,
     // mp4mux emits raw fMP4 boxes split across arbitrary `GstBuffer`s. We
     // accumulate them here, parse 8-byte box headers, and forward to MSE
@@ -78,7 +85,15 @@ impl std::fmt::Debug for Mp4StreamPublisher {
                 "init_segment_len",
                 &self.init_segment.lock().as_ref().map(|b| b.len()),
             )
-            .field("subscribers", &self.chunks_tx.receiver_count())
+            .field(
+                "subscribers",
+                &self
+                    .chunks_tx
+                    .lock()
+                    .as_ref()
+                    .map(|tx| tx.receiver_count()),
+            )
+            .field("terminal", &self.terminal.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -96,7 +111,8 @@ impl Mp4StreamPublisher {
             stream_id: format!("camera:{}", camera_id),
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
-            chunks_tx,
+            chunks_tx: Mutex::new(Some(chunks_tx)),
+            terminal: AtomicBool::new(false),
             cmd_tx,
         }
     }
@@ -177,21 +193,31 @@ impl Mp4StreamPublisher {
                     media.extend_from_slice(&box_bytes);
                     let segment = std::mem::take(&mut *media);
                     drop(media);
-                    let _ = self.chunks_tx.send(Bytes::from(segment));
+                    if let Some(tx) = self.chunks_tx.lock().as_ref() {
+                        let _ = tx.send(Bytes::from(segment));
+                    }
                 }
                 _ => {
-                    let _ = self.chunks_tx.send(Bytes::from(box_bytes));
+                    if let Some(tx) = self.chunks_tx.lock().as_ref() {
+                        let _ = tx.send(Bytes::from(box_bytes));
+                    }
                 }
             }
         }
     }
 
     /// Mark the publisher as permanently undeliverable. Called by the session
-    /// when the attach refuses (non-H.264 codec, mux build failure) so that
-    /// `init_segment()` does not block waiters for the full timeout. Idempotent.
+    /// when the attach refuses (non-H.264 codec, mux build failure, File/Local
+    /// source with no tee) or on an init-segment timeout. Drops the broadcast
+    /// sender so live receivers observe `Closed`, makes `chunk_broadcaster()`
+    /// return `None` so the hub rejects/cache-busts the failed source, and wakes
+    /// init waiters so `init_segment()` returns `None` immediately instead of
+    /// blocking for the full timeout. Idempotent.
     pub fn mark_unsupported(&self) {
-        // Wake every waiter — they will observe `init_segment` still None and
-        // return `None`. Equivalent to the timeout path but immediate.
+        self.terminal.store(true, Ordering::Release);
+        // Dropping the only Sender closes every outstanding Receiver and makes
+        // `chunk_broadcaster()` report the source as terminal to the hub.
+        *self.chunks_tx.lock() = None;
         self.init_ready.notify_waiters();
     }
 }
@@ -217,14 +243,25 @@ impl BinaryStreamSource for Mp4StreamPublisher {
         if let Some(b) = self.init_segment.lock().clone() {
             return Some(b);
         }
+        // A publisher that already failed before we started waiting: bail now.
+        if self.terminal.load(Ordering::Acquire) {
+            return None;
+        }
         match tokio::time::timeout(INIT_SEGMENT_TIMEOUT, notified).await {
             Ok(()) => self.init_segment.lock().clone(),
-            Err(_) => None,
+            Err(_) => {
+                // Init never arrived in time: make the publisher terminal so
+                // `chunk_broadcaster()` returns None and subscribe fails cleanly
+                // (live receivers get Closed) instead of caching a hung empty
+                // stream that never delivers an init segment.
+                self.mark_unsupported();
+                None
+            }
         }
     }
 
-    fn chunk_broadcaster(&self) -> &broadcast::Sender<Bytes> {
-        &self.chunks_tx
+    fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+        self.chunks_tx.lock().clone()
     }
 }
 
@@ -243,6 +280,7 @@ impl Drop for Mp4StreamPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn make_publisher() -> (Arc<Mp4StreamPublisher>, mpsc::Receiver<SessionCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -325,7 +363,7 @@ mod tests {
         // segment travel through the broadcast channel.
         seed_init(&pub_);
         let _ = pub_.init_segment().await.expect("init seeded");
-        let mut rx = pub_.chunk_broadcaster().subscribe();
+        let mut rx = pub_.chunk_broadcaster().expect("broadcaster").subscribe();
         // A media segment is the `moof`+`mdat` pair, broadcast concatenated.
         let moof1 = mp4_box(b"moof", &[1]);
         let mdat1 = mp4_box(b"mdat", &[2]);
@@ -350,8 +388,8 @@ mod tests {
         let (pub_, _cmd_rx) = make_publisher();
         seed_init(&pub_);
         let _ = pub_.init_segment().await.expect("init seeded");
-        let mut rx1 = pub_.chunk_broadcaster().subscribe();
-        let mut rx2 = pub_.chunk_broadcaster().subscribe();
+        let mut rx1 = pub_.chunk_broadcaster().expect("broadcaster").subscribe();
+        let mut rx2 = pub_.chunk_broadcaster().expect("broadcaster").subscribe();
         let moof = mp4_box(b"moof", &[9]);
         let mdat = mp4_box(b"mdat", &[9]);
         pub_.push_chunk(moof.clone());
@@ -384,5 +422,34 @@ mod tests {
         });
         let init = pub_.init_segment().await;
         assert!(init.is_none(), "unsupported publisher must yield None");
+    }
+
+    #[tokio::test]
+    async fn mark_unsupported_makes_broadcaster_terminal() {
+        let (pub_, _cmd_rx) = make_publisher();
+        // A live receiver before the terminal transition observes Closed.
+        let mut rx = pub_.chunk_broadcaster().expect("broadcaster live").subscribe();
+        pub_.mark_unsupported();
+        assert!(
+            pub_.chunk_broadcaster().is_none(),
+            "terminal publisher must report no broadcaster so the hub cache-busts it"
+        );
+        assert!(
+            rx.recv().await.is_err(),
+            "dropping the sender closes outstanding receivers"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_timeout_makes_broadcaster_terminal() {
+        let (pub_, _cmd_rx) = make_publisher();
+        // No chunk ever pushed: init_segment waits out the timeout, then must
+        // mark the publisher terminal so the hub does not cache it active.
+        let result = pub_.init_segment().await;
+        assert!(result.is_none(), "dormant publisher must yield None");
+        assert!(
+            pub_.chunk_broadcaster().is_none(),
+            "init timeout must make the broadcaster terminal"
+        );
     }
 }
