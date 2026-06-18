@@ -30,20 +30,26 @@ use super::stream_publisher::Mp4StreamPublisher;
 /// attach an on-demand fMP4 mux branch (Branch B) without rebuilding. We also
 /// return the appsrc so the pump can feed it.
 ///
-/// We tee the RAW Annex-B byte stream (no parse before the tee) and give each
-/// branch its OWN h264parse. A single shared parse before the tee broke Branch
-/// B on the real robot stream: the front parse consumed the SPS/PPS into its
-/// caps (codec_data) and forwarded bare slice NALUs, so Branch B's downstream
-/// parse saw "broken/invalid nal" for every frame, dropped them all, and
-/// mp4mux never produced an init segment (3 s timeout → detach loop). Branch
-/// A's decodebin carries its own parser, so the raw tee feeds both consumers
-/// the unmodified byte stream where each IDR re-announces SPS/PPS in-band.
+/// We tee the RAW Annex-B byte stream (no parse before the tee) and give Branch
+/// B its OWN h264parse. A shared parse before the tee re-frames the stream into
+/// access units that split the parameter sets away from the IDR (the front parse
+/// emitted SPS as its own AU separate from PPS+IDR), so Branch B's AVC parse
+/// could not build avcC codec_data (num_pps=0) and posted a FATAL
+/// `No caps set ... GstH264Parse` bus error that tore down the WHOLE shared
+/// pipeline (Branch A included). The upstream H264Gate coalesces SPS+PPS+IDR
+/// into a single keyframe access unit, so the raw tee delivers Branch B a clean,
+/// self-contained keyframe from which codec_data is always constructible.
+///
+/// Branch B's h264parse uses config-interval=-1 (in-band SPS/PPS) and an
+/// SPS-sync pad probe drops mid-GOP slices until the next keyframe AU so the
+/// parse never pushes before negotiating caps. Branch A's decodebin carries its
+/// own parser and consumes the raw byte stream directly.
 ///
 /// Pipeline graph:
 ///
 ///   appsrc(byte-stream,au) → tee(allow-not-linked)
-///       ├─ src_0 → queue → decodebin → videoconvert → RGB → appsink           (Branch A, always on)
-///       └─ src_N → queue → h264parse(AVC) → mp4mux(fMP4) → appsink            (Branch B, on demand)
+///       ├─ src_0 → queue → decodebin → videoconvert → RGB → appsink                       (Branch A, always on)
+///       └─ src_N → queue → [SPS-gate] → h264parse(AVC) → mp4mux(fMP4) → appsink           (Branch B, on demand)
 pub fn build_webrtc_pipeline(
     config: &CameraConfig,
     mailbox: Arc<FrameMailbox>,
@@ -199,14 +205,14 @@ pub fn build_webrtc_pipeline(
 }
 
 /// Attach Branch B (`tee → queue → h264parse(AVC) → mp4mux → appsink`) to the
-/// running webrtc pipeline and route the mux output into `publisher`. Unlike
-/// the RTSP Branch B there is no rtph264depay — the appsrc feeds the tee a raw
-/// Annex-B byte stream, so Branch B's own h264parse frames it and switches to
-/// AVC sample format (length-prefixed NALUs with in-band SPS/PPS) which mp4mux
-/// requires. This is the ONLY parse on the Branch B path: parsing the raw byte
-/// stream here (rather than re-parsing an already-parsed stream) lets h264parse
-/// see the SPS/PPS the robot re-announces at every IDR and build the avcC
-/// codec_data mp4mux needs for the init segment. mp4mux/h264parse properties
+/// running webrtc pipeline and route the mux output into `publisher`. The tee
+/// carries the raw Annex-B byte stream; this branch's h264parse frames it and
+/// converts to AVC sample format (codec_data) which mp4mux requires. The
+/// upstream gate coalesces SPS+PPS+IDR into one keyframe access unit so the
+/// parse can always build avcC codec_data. An SPS-sync pad probe on the parse
+/// sink drops mid-GOP buffers until the next keyframe AU so the parse never
+/// pushes before negotiating caps — that pre-sync push is what posted the fatal
+/// "No caps set" bus error and tore down the whole pipeline. mp4mux properties
 /// mirror RTSP exactly so the browser MSE init segment + fragment layout is
 /// identical.
 pub(super) fn attach_mp4_branch_webrtc(
@@ -214,15 +220,21 @@ pub(super) fn attach_mp4_branch_webrtc(
     tee: &gst::Element,
     publisher: &Arc<Mp4StreamPublisher>,
 ) -> std::result::Result<Mp4BranchState, String> {
+    // NON-leaky: Branch B feeds a mux, not a live-display sink, so it must never
+    // drop the keyframe that seeds the init segment. Bound by time so a bursty
+    // GOP cannot trip a buffer-count limit and start dropping.
     let queue_b = gst::ElementFactory::make("queue")
         .property("name", "queue_branch_b")
-        .property("max-size-buffers", 60u32)
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 5_000_000_000u64)
         .build()
         .map_err(|e| format!("queue_b build: {e}"))?;
-    queue_b.set_property_from_str("leaky", "downstream");
-    // config-interval=-1 makes h264parse repeat SPS/PPS in-band and emit AVC
-    // sample format — mp4mux refuses byte-stream input with `not-negotiated`.
+    queue_b.set_property_from_str("leaky", "no");
+    // config-interval=-1 keeps SPS/PPS attached so the AVC caps carry codec_data
+    // for mp4mux's avcC; output stream-format negotiates to avc against mp4mux.
     let parse = gst::ElementFactory::make("h264parse")
+        .property("name", "parse_branch_b")
         .property_from_str("config-interval", "-1")
         .build()
         .map_err(|e| format!("h264parse build: {e}"))?;
@@ -252,7 +264,8 @@ pub(super) fn attach_mp4_branch_webrtc(
             // No request pad yet, but the elements ARE in the pipeline — remove
             // them so a failed attach never leaves dangling elements that a
             // later attach would trip over.
-            let refs: Vec<&gst::Element> = [&queue_b, &parse, &mux, &sink].into_iter().collect();
+            let refs: Vec<&gst::Element> =
+                [&queue_b, &parse, &mux, &sink].into_iter().collect();
             let _ = pipeline.remove_many(refs);
             "tee src_%u request for branch B failed".to_string()
         })?;
@@ -287,7 +300,37 @@ fn wire_and_link_webrtc_branch(
     publisher: &Arc<Mp4StreamPublisher>,
 ) -> std::result::Result<(), String> {
     let queue_b = &state.elements[0];
+    let parse = &state.elements[1];
     let sink = &state.elements[3];
+
+    // Keyframe-sync gate on the parse SINK pad. Branch B attaches mid-GOP, so
+    // the first buffers off the tee are bare P-slices (NAL type 1). A standalone
+    // h264parse cannot frame those: it would push before negotiating src caps,
+    // and gstbaseparse posts a FATAL bus error ("No caps set ... GstH264Parse")
+    // that tears down the WHOLE shared pipeline (Branch A included). The upstream
+    // gate coalesces SPS+PPS+IDR into the single keyframe buffer (NAL type 5), so
+    // we drop every buffer reaching this parse until that self-contained keyframe
+    // AU arrives, then remove the probe. Gating on the IDR (not a standalone SPS)
+    // is essential: mid-stream the gate also re-emits standalone SPS and PPS in
+    // their OWN buffers just before the IDR; matching the first SPS would pass an
+    // SPS-only AU (num_pps=0), the parse could not build avcC codec_data, and it
+    // would die exactly as before. The IDR buffer carries SPS+PPS+IDR together.
+    let parse_sink = parse
+        .static_pad("sink")
+        .ok_or_else(|| "branch B h264parse sink pad missing".to_string())?;
+    parse_sink.add_probe(gst::PadProbeType::BUFFER, |_pad, info| {
+        let Some(buffer) = info.buffer() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Ok(map) = buffer.map_readable() else {
+            return gst::PadProbeReturn::Drop;
+        };
+        if annexb_contains_idr(map.as_slice()) {
+            gst::PadProbeReturn::Remove
+        } else {
+            gst::PadProbeReturn::Drop
+        }
+    });
 
     let queue_b_sink = queue_b
         .static_pad("sink")
@@ -308,6 +351,27 @@ fn wire_and_link_webrtc_branch(
             .map_err(|e| format!("sync_state branch B element: {e}"))?;
     }
     Ok(())
+}
+
+/// Return true if an Annex-B byte-stream buffer contains an IDR slice (NAL type
+/// 5). The upstream gate coalesces SPS+PPS+IDR into the keyframe buffer, so an
+/// IDR-bearing buffer is a self-contained access unit from which h264parse can
+/// build avcC codec_data. We scan for `00 00 01` start codes (the 4-byte
+/// `00 00 00 01` prefix shares this 3-byte suffix) and read the NAL header's low
+/// 5 bits.
+fn annexb_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if data[i + 3] & 0x1F == 5 {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Detach Branch B from the webrtc pipeline. Delegates to the shared RTSP
@@ -331,4 +395,39 @@ pub async fn webrtc_pump(mut rx: mpsc::Receiver<bytes::Bytes>, appsrc: gst_app::
         }
     }
     let _ = appsrc.end_of_stream();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::annexb_contains_idr;
+
+    fn nal(ty: u8) -> Vec<u8> {
+        vec![0, 0, 0, 1, ty & 0x1F, 0xAA, 0xBB]
+    }
+
+    #[test]
+    fn idr_detected_in_coalesced_keyframe() {
+        // A coalesced SPS(7)+PPS(8)+IDR(5) keyframe buffer must report an IDR.
+        let mut buf = nal(7);
+        buf.extend_from_slice(&nal(8));
+        buf.extend_from_slice(&nal(5));
+        assert!(annexb_contains_idr(&buf));
+    }
+
+    #[test]
+    fn idr_absent_in_param_only_and_pslice_buffers() {
+        // Standalone SPS+PPS (no IDR) must NOT pass the gate.
+        let mut params = nal(7);
+        params.extend_from_slice(&nal(8));
+        assert!(!annexb_contains_idr(&params));
+        // A lone P-slice (type 1) must NOT pass.
+        assert!(!annexb_contains_idr(&nal(1)));
+    }
+
+    #[test]
+    fn idr_detected_with_3byte_start_code() {
+        // 3-byte start code variant: 00 00 01 <nal-header>.
+        let buf = vec![0, 0, 1, 5, 0x11];
+        assert!(annexb_contains_idr(&buf));
+    }
 }
