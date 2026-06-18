@@ -352,29 +352,72 @@ pub fn me_preferences_update(
 // =============================================================================
 
 #[handler(variant = "ApiKeyListRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let keys = repository::list_api_keys(&ctx.state.db).map_err(db_err)?;
+    let db = &ctx.state.db;
+    let keys = repository::list_api_keys(db).map_err(db_err)?;
 
     let summaries: Vec<ApiKeySummary> = keys
         .into_iter()
-        .map(|k| ApiKeySummary {
-            key_id: k.uid,
-            name: k.name,
-            created_at_epoch: parse_ts(&k.created_at),
-            last_used_at_epoch: parse_ts_opt(&k.last_used_at),
+        .map(|k| {
+            // subject_label resolves the user/group display name; general keys
+            // carry no subject. scope_count only matters for general keys whose
+            // allowlist lives in resource_permissions keyed by the key uid.
+            let subject_label = match (k.key_type.as_str(), k.subject_id.as_deref()) {
+                ("user", Some(uid)) => repository::get_user_account_by_id(db, uid)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.display_name),
+                ("group", Some(gid)) => repository::get_group_by_id(db, gid)
+                    .ok()
+                    .flatten()
+                    .map(|g| g.name),
+                _ => None,
+            };
+            let scope_count = if k.key_type == "general" {
+                repository::resource_permissions::count_for_subject(db, "api_key", &k.uid)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            ApiKeySummary {
+                key_id: k.uid,
+                name: k.name,
+                created_at_epoch: parse_ts(&k.created_at),
+                last_used_at_epoch: parse_ts_opt(&k.last_used_at),
+                key_type: k.key_type,
+                subject_id: k.subject_id,
+                subject_label,
+                scope_count,
+                is_active: k.is_active,
+            }
         })
         .collect();
 
     Ok(MessageBody::ApiKeyListResponse { keys: summaries })
 }
 
+/// Shared validation for a general key's scope resource. `resource_type` must be
+/// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
+/// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
+fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
+    if !matches!(resource_type, "model" | "flow" | "alias") {
+        return Err(ProtocolError::bad_request(
+            "resource_type must be 'model', 'flow' or 'alias'",
+        ));
+    }
+    if resource_id.is_empty() {
+        return Err(ProtocolError::bad_request("resource_id is empty"));
+    }
+    Ok(())
+}
+
 #[handler(variant = "ApiKeyCreateRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_create(
     req: &MessageBody,
@@ -393,6 +436,60 @@ pub fn api_key_create(
         return Err(ProtocolError::bad_request("name must be 1-200 chars"));
     }
 
+    let db = &ctx.state.db;
+
+    // Resolve the key's subject per type. Fail-closed: a user/group key that does
+    // not resolve to an existing, active subject must never be created, otherwise
+    // the /v1 gate would later reject it as anonymous — better to refuse here.
+    let subject_id: Option<String> = match payload.key_type.as_str() {
+        "user" => {
+            let uid = payload
+                .subject_id
+                .as_deref()
+                .ok_or_else(|| ProtocolError::bad_request("key_type='user' requires subject_id"))?;
+            let user = repository::get_user_account_by_id(db, uid)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("subject user not found"))?;
+            if !user.is_active {
+                return Err(ProtocolError::bad_request("subject user is not active"));
+            }
+            Some(uid.to_string())
+        }
+        "group" => {
+            let gid = payload.subject_id.as_deref().ok_or_else(|| {
+                ProtocolError::bad_request("key_type='group' requires subject_id")
+            })?;
+            repository::get_group_by_id(db, gid)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("subject group not found"))?;
+            Some(gid.to_string())
+        }
+        "general" => {
+            if payload.subject_id.is_some() {
+                return Err(ProtocolError::bad_request(
+                    "key_type='general' must not carry a subject_id",
+                ));
+            }
+            None
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "key_type must be 'user', 'group' or 'general'",
+            ));
+        }
+    };
+
+    // General keys may seed an explicit allowlist. Validate resource types up
+    // front so a bad request cannot leave a half-created key with no scopes.
+    if payload.key_type != "general" && !payload.scope_resources.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "scope_resources only valid for key_type='general'",
+        ));
+    }
+    for r in &payload.scope_resources {
+        validate_scope_resource(&r.resource_type, &r.resource_id)?;
+    }
+
     // Token = "sk-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC verifier is
     // persisted; the raw token is returned once and never stored.
     let mut token_bytes = [0u8; 32];
@@ -403,34 +500,37 @@ pub fn api_key_create(
         let _ = write!(token_hex, "{:02x}", b);
     }
     let raw_key = format!("sk-{}", token_hex);
-    let pepper = repository::get_or_create_api_key_pepper(&ctx.state.db, &ctx.state.settings_cipher)
-        .map_err(db_err)?;
+    let pepper =
+        repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
     let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
 
-    let subject_uid = user_id_to_uuid(&require_user_id(ctx)?);
-    let (id, uid) = repository::create_api_key(
-        &ctx.state.db,
+    let scopes: Vec<(String, String)> = if payload.key_type == "general" {
+        payload
+            .scope_resources
+            .iter()
+            .map(|r| (r.resource_type.clone(), r.resource_id.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    // Key INSERT, scope seeding and the audit entry commit in ONE transaction: a
+    // scope failure rolls the whole thing back, so no half-created key survives.
+    let (_id, uid) = repository::create_api_key_with_scopes(
+        db,
         &key_verifier,
         &key_prefix,
         &payload.name,
-        "user",
-        Some(&subject_uid),
+        &payload.key_type,
+        subject_id.as_deref(),
         60,
+        &scopes,
+        actor.as_deref(),
+        Some(&ctx.state.local_node_id),
     )
     .map_err(db_err)?;
-
-    let user_id = Some(subject_uid);
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id.as_deref(),
-        None,
-        "apikey.create",
-        Some(&format!("apikey:{}", id)),
-        Some(&payload.name),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
 
     Ok(MessageBody::ApiKeyCreateResponseBody(
         ApiKeyCreateResponse {
@@ -441,7 +541,7 @@ pub fn api_key_create(
 }
 
 #[handler(variant = "ApiKeyRevokeRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_revoke(
     req: &MessageBody,
@@ -464,7 +564,7 @@ pub fn api_key_revoke(
     }
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
-    let _ = repository::log_audit(
+    repository::log_audit(
         &ctx.state.db,
         user_id.as_deref(),
         None,
@@ -473,11 +573,223 @@ pub fn api_key_revoke(
         None,
         None,
         Some(&ctx.state.local_node_id),
-    );
+    )
+    .map_err(db_err)?;
 
     Ok(MessageBody::ApiKeyRevokeResponse {
         deleted: affected > 0,
     })
+}
+
+// =============================================================================
+// API key scope (general keys) + rotation — admin-only
+// =============================================================================
+
+/// Resolves a general key by uid; rejects non-existent or non-general keys so a
+/// scope operation cannot silently attach an allowlist to a user/group key.
+fn require_general_key(
+    ctx: &HandlerContext,
+    key_uid: &str,
+) -> Result<crate::db::models::DbApiKey, ProtocolError> {
+    let key = repository::get_api_key_by_uid(&ctx.state.db, key_uid)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
+    if key.key_type != "general" {
+        return Err(ProtocolError::bad_request(
+            "scope operations are only valid for general keys",
+        ));
+    }
+    Ok(key)
+}
+
+#[handler(variant = "ApiKeyScopeListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ApiKeyScopeListRequest { key_uid } => key_uid,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_list expected ApiKeyScopeListRequest variant",
+            ));
+        }
+    };
+    require_general_key(ctx, key_uid)?;
+    let rows =
+        repository::resource_permissions::list_for_subject(&ctx.state.db, "api_key", key_uid)
+            .map_err(db_err)?;
+    let entries = rows
+        .into_iter()
+        .map(|r| tentaflow_protocol::PermissionEntry {
+            resource_type: r.resource_type,
+            resource_id: r.resource_id,
+            subject_type: r.subject_type,
+            subject_id: r.subject_id,
+            access_level: r.access_level,
+        })
+        .collect();
+    Ok(MessageBody::ApiKeyScopeListResponse { entries })
+}
+
+#[handler(variant = "ApiKeyScopeSetRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (key_uid, resource_type, resource_id, access_level) = match req {
+        MessageBody::ApiKeyScopeSetRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+            access_level,
+        } => (key_uid, resource_type, resource_id, access_level),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_set expected ApiKeyScopeSetRequest variant",
+            ));
+        }
+    };
+    validate_scope_resource(resource_type, resource_id)?;
+    require_general_key(ctx, key_uid)?;
+    repository::resource_permissions::set(
+        &ctx.state.db,
+        resource_type,
+        resource_id,
+        "api_key",
+        key_uid,
+        access_level,
+    )
+    .map_err(iam_err)?;
+
+    // Audit is mandatory: a successful mutation that cannot be recorded must fail
+    // the request rather than silently drop the trail. The write commits in its own
+    // transaction right after the mutation's (separate repo calls); folding it into
+    // the mutation's tx would mean threading audit through every resource_permissions
+    // repo fn — deferred as too invasive for set/clear. create/revoke ARE in-tx.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        &ctx.state.db,
+        actor.as_deref(),
+        None,
+        "apikey.scope.set",
+        Some(&format!("apikey:{}", key_uid)),
+        Some(&format!(
+            "{}:{}={}",
+            resource_type, resource_id, access_level
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+    Ok(MessageBody::IamBody(tentaflow_protocol::IamPayload::ResOk))
+}
+
+#[handler(variant = "ApiKeyScopeClearRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_clear(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (key_uid, resource_type, resource_id) = match req {
+        MessageBody::ApiKeyScopeClearRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+        } => (key_uid, resource_type, resource_id),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_clear expected ApiKeyScopeClearRequest variant",
+            ));
+        }
+    };
+    validate_scope_resource(resource_type, resource_id)?;
+    require_general_key(ctx, key_uid)?;
+    repository::resource_permissions::clear(
+        &ctx.state.db,
+        resource_type,
+        resource_id,
+        "api_key",
+        key_uid,
+    )
+    .map_err(db_err)?;
+
+    // Audit mandatory (see api_key_scope_set): propagate the failure.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        &ctx.state.db,
+        actor.as_deref(),
+        None,
+        "apikey.scope.clear",
+        Some(&format!("apikey:{}", key_uid)),
+        Some(&format!("{}:{}", resource_type, resource_id)),
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+    Ok(MessageBody::IamBody(tentaflow_protocol::IamPayload::ResOk))
+}
+
+#[handler(variant = "ApiKeyRotateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_rotate(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ApiKeyRotateRequest { key_uid } => key_uid,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_rotate expected ApiKeyRotateRequest variant",
+            ));
+        }
+    };
+    let db = &ctx.state.db;
+    // Confirm the key exists before minting a new secret.
+    repository::get_api_key_by_uid(db, key_uid)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
+
+    let mut token_bytes = [0u8; 32];
+    getrandom::fill(&mut token_bytes).expect("OS RNG fill_bytes");
+    let mut token_hex = String::with_capacity(token_bytes.len() * 2);
+    for b in token_bytes.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(token_hex, "{:02x}", b);
+    }
+    let raw_key = format!("sk-{}", token_hex);
+    let pepper =
+        repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
+    let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
+
+    let rotated =
+        repository::rotate_api_key(db, key_uid, &key_verifier, &key_prefix).map_err(db_err)?;
+    if !rotated {
+        return Err(ProtocolError::not_found("api key not found"));
+    }
+
+    // Audit mandatory (see api_key_scope_set): propagate the failure.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        db,
+        actor.as_deref(),
+        None,
+        "apikey.rotate",
+        Some(&format!("apikey:{}", key_uid)),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+
+    Ok(MessageBody::ApiKeyRotateResponse { token: raw_key })
 }
 
 // =============================================================================

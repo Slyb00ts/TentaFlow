@@ -372,6 +372,10 @@ pub fn start_unified_server_with_permissions(
                                 let mut owner_user_ctx: Option<crate::auth::acl::UserContext> =
                                     None;
                                 let mut principal: Option<crate::auth::acl::Principal> = None;
+                                // (uid, rate_limit_rps) of the authenticated key,
+                                // captured for every key type so the per-key limiter
+                                // can be enforced after auth (NOT keyed by IP).
+                                let mut key_rate_limit: Option<(String, i64)> = None;
                                 // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
                                 if path != "/health" && path != "/ready" {
                                     let api_key = req
@@ -404,6 +408,13 @@ pub fn start_unified_server_with_permissions(
                                                 &db, &verifier,
                                             ) {
                                                 Ok(Some(api_key_row)) => {
+                                                    // Capture the per-key budget regardless of type;
+                                                    // it is only enforced once the key resolves to a
+                                                    // valid principal below.
+                                                    key_rate_limit = Some((
+                                                        api_key_row.uid.clone(),
+                                                        api_key_row.rate_limit_rps,
+                                                    ));
                                                     match api_key_row.key_type.as_str() {
                                                         "user" => {
                                                             // A 'user' key MUST resolve to an
@@ -504,6 +515,32 @@ pub fn start_unified_server_with_permissions(
                                             )))
                                             .unwrap();
                                         return Ok(resp);
+                                    }
+
+                                    // Per-key rate limit (token bucket keyed by key uid, not IP).
+                                    // Enforced only after the key authenticated successfully.
+                                    if let Some((ref uid, rps)) = key_rate_limit {
+                                        if let Some(retry) =
+                                            crate::api::rate_limit::per_key_rate_limiter()
+                                                .check(uid, rps)
+                                        {
+                                            let retry_secs = retry.ceil().max(1.0) as u64;
+                                            let body = r#"{"error":{"type":"rate_limit_error","message":"Przekroczono limit zadan dla tego klucza API","code":"rate_limit_exceeded"}}"#;
+                                            let full = http_body_util::Full::new(
+                                                hyper::body::Bytes::from(body),
+                                            );
+                                            let resp = hyper::Response::builder()
+                                                .status(429)
+                                                .header("Content-Type", "application/json")
+                                                .header("Retry-After", retry_secs.to_string())
+                                                .body(UnsyncBoxBody::new(full.map_err(
+                                                    |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                                        match e {}
+                                                    },
+                                                )))
+                                                .unwrap();
+                                            return Ok(resp);
+                                        }
                                     }
                                 }
 

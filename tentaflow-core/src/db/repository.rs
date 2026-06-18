@@ -639,6 +639,83 @@ pub fn create_api_key(
     Ok((row_id, uid))
 }
 
+/// Atomically creates an API key and (for `general` keys) seeds its explicit
+/// `resource_permissions` allowlist in ONE transaction. Either the key and all of
+/// its scopes commit together, or nothing does — a scope failure rolls back the
+/// key, so callers can never observe a half-created key with a partial allowlist.
+///
+/// `scopes` are `(resource_type, resource_id)` pairs, each written as an `allow`
+/// rule with `subject_type='api_key'`, `subject_id=<new key uid>`. The audit entry
+/// is written in the same transaction so it can never be orphaned from the key.
+#[allow(clippy::too_many_arguments)]
+pub fn create_api_key_with_scopes(
+    pool: &DbPool,
+    key_verifier: &str,
+    key_prefix: &str,
+    name: &str,
+    key_type: &str,
+    subject_id: Option<&str>,
+    rate_limit_rps: i64,
+    scopes: &[(String, String)],
+    actor_user_id: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<(i64, String)> {
+    if key_type == "user" && subject_id.is_none() {
+        anyhow::bail!("api key with key_type='user' requires a subject_id");
+    }
+    if key_type != "general" && !scopes.is_empty() {
+        anyhow::bail!("scopes are only valid for key_type='general'");
+    }
+    let uid = uuid::Uuid::new_v4().to_string();
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO api_keys (uid, key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            uid,
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps
+        ],
+    )?;
+    let row_id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+        uid.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        api_key_changed_fields(
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps,
+            true,
+        ),
+        None,
+    )?;
+    for (resource_type, resource_id) in scopes {
+        resource_permissions::set_tx(&tx, resource_type, resource_id, "api_key", &uid, "allow")?;
+    }
+    log_audit_tx(
+        &tx,
+        actor_user_id,
+        None,
+        "apikey.create",
+        Some(&format!("apikey:{}", row_id)),
+        Some(&format!("{} ({})", name, key_type)),
+        None,
+        node_id,
+    )?;
+    tx.commit()?;
+    Ok((row_id, uid))
+}
+
 /// Deletes a key by its stable `uid`. Revocation is keyed by `uid` because the
 /// 24-bit `key_prefix` is display-only and can collide across keys.
 pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
@@ -8418,6 +8495,41 @@ pub fn log_audit(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    log_audit_conn(
+        &conn, user_id, addon_id, action, resource, details, ip_address, node_id,
+    )
+}
+
+/// Transactional audit write — same hash-chained INSERT as `log_audit`, joined to
+/// a caller's transaction so the audit entry commits atomically with the mutation
+/// it records (a rolled-back mutation leaves no orphan audit row, and vice versa).
+#[allow(clippy::too_many_arguments)]
+pub fn log_audit_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: Option<&str>,
+    addon_id: Option<&str>,
+    action: &str,
+    resource: Option<&str>,
+    details: Option<&str>,
+    ip_address: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
+    log_audit_conn(
+        tx, user_id, addon_id, action, resource, details, ip_address, node_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_audit_conn(
+    conn: &rusqlite::Connection,
+    user_id: Option<&str>,
+    addon_id: Option<&str>,
+    action: &str,
+    resource: Option<&str>,
+    details: Option<&str>,
+    ip_address: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let hash_input = crate::audit::chain::AuditRowHashInput {
         user_id,
@@ -8438,7 +8550,7 @@ pub fn log_audit(
         request_id: None,
         timestamp: &timestamp,
     };
-    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -16453,16 +16565,38 @@ pub mod resource_permissions {
         subject_id: &str,
         access_level: &str,
     ) -> Result<()> {
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let tx = conn.unchecked_transaction()?;
+        set_tx(
+            &tx,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            access_level,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transactional upsert — same logic + capture as `set`, but joins a caller's
+    /// transaction so seeding multiple scopes (key creation) commits atomically.
+    pub(crate) fn set_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        access_level: &str,
+    ) -> Result<()> {
         if !matches!(access_level, "allow" | "deny") {
             anyhow::bail!("access_level must be 'allow' or 'deny'");
         }
         if !matches!(subject_type, "user" | "group" | "api_key") {
             anyhow::bail!("subject_type must be 'user', 'group' or 'api_key'");
         }
-        let conn = pool
-            .lock()
-            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
-        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO resource_permissions
                 (resource_type, resource_id, subject_type, subject_id, access_level)
@@ -16478,7 +16612,7 @@ pub mod resource_permissions {
             ],
         )?;
         super::record_core_capture_tx(
-            &tx,
+            tx,
             crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
             super::resource_permission_resource_id(
                 resource_type,
@@ -16496,7 +16630,6 @@ pub mod resource_permissions {
             ),
             None,
         )?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -16514,6 +16647,20 @@ pub mod resource_permissions {
             .lock()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
         let tx = conn.unchecked_transaction()?;
+        clear_tx(&tx, resource_type, resource_id, subject_type, subject_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transactional clear — same delete + tombstone capture as `clear`, joined to
+    /// a caller's transaction.
+    pub(crate) fn clear_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<()> {
         let affected = tx.execute(
             "DELETE FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
@@ -16524,7 +16671,7 @@ pub mod resource_permissions {
         // exist only on a peer, and the clear's HLC must still fence a stale allow.
         let _ = affected;
         super::record_core_capture_tx(
-            &tx,
+            tx,
             crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
             super::resource_permission_resource_id(
                 resource_type,
@@ -16542,7 +16689,6 @@ pub mod resource_permissions {
             ),
             None,
         )?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -16573,6 +16719,20 @@ pub mod resource_permissions {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Count of permission rows scoped to a subject — used by the key list UI to
+    /// show how many resources a general key explicitly allows/denies.
+    pub fn count_for_subject(pool: &DbPool, subject_type: &str, subject_id: &str) -> Result<u32> {
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM resource_permissions WHERE subject_type = ?1 AND subject_id = ?2",
+            rusqlite::params![subject_type, subject_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
     }
 
     /// Lista wszystkich wpisow dla user/group — dla UI "co user X ma zabronione".
@@ -20787,6 +20947,110 @@ mod api_key_access_v2_tests {
     }
 
     #[test]
+    fn create_with_scopes_is_atomic_seeds_all_scopes_and_audits() {
+        let db = fresh_db();
+        let scopes = vec![
+            ("model".to_string(), "gpt-4o".to_string()),
+            ("flow".to_string(), "flow-1".to_string()),
+        ];
+        let (_, uid) = create_api_key_with_scopes(
+            &db,
+            "verifier-seed",
+            "sk-...s",
+            "seeded",
+            "general",
+            None,
+            60,
+            &scopes,
+            Some("actor-uid"),
+            Some("node-1"),
+        )
+        .unwrap();
+
+        // All scopes landed atomically as allow rules for the key.
+        let rows = resource_permissions::list_for_subject(&db, "api_key", &uid).unwrap();
+        assert_eq!(rows.len(), 2, "both seeded scopes persisted");
+        assert!(rows.iter().all(|r| r.access_level == "allow"));
+        // The in-tx audit entry exists.
+        let logs = list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("apikey.create".to_string()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(!logs.is_empty(), "create must be audited in the same tx");
+    }
+
+    #[test]
+    fn create_with_scopes_rolls_back_key_when_a_scope_write_fails() {
+        // A second create reusing the SAME key_verifier fails the api_keys INSERT
+        // (UNIQUE) inside the transaction. The whole call must roll back: no second
+        // key, and not a single scope from the failed call may leak into
+        // resource_permissions — proving the key + scope seeding are atomic.
+        let db = fresh_db();
+        let (_, first_uid) = create_api_key_with_scopes(
+            &db,
+            "dup-verifier",
+            "sk-...a",
+            "first",
+            "general",
+            None,
+            60,
+            &[("model".to_string(), "m-a".to_string())],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let before_keys = list_api_keys(&db).unwrap().len();
+        let before_scopes =
+            resource_permissions::count_for_subject(&db, "api_key", &first_uid).unwrap();
+
+        let res = create_api_key_with_scopes(
+            &db,
+            "dup-verifier",
+            "sk-...b",
+            "second",
+            "general",
+            None,
+            60,
+            &[
+                ("model".to_string(), "m-b".to_string()),
+                ("flow".to_string(), "f-b".to_string()),
+            ],
+            None,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "duplicate verifier must fail the second create"
+        );
+
+        // No new key, and none of the second call's scopes survived the rollback.
+        assert_eq!(
+            list_api_keys(&db).unwrap().len(),
+            before_keys,
+            "failed create must not leave a partial key"
+        );
+        assert_eq!(
+            resource_permissions::count_for_subject(&db, "api_key", &first_uid).unwrap(),
+            before_scopes,
+            "first key's scopes are untouched"
+        );
+        // The second call's resources must have zero rows anywhere.
+        let mb = resource_permissions::list_for_resource(&db, "model", "m-b").unwrap();
+        let fb = resource_permissions::list_for_resource(&db, "flow", "f-b").unwrap();
+        assert!(
+            mb.is_empty() && fb.is_empty(),
+            "no scope from the rolled-back create may persist"
+        );
+    }
+
+    #[test]
     fn rotate_and_set_active_and_delete_record_full_row_captures() {
         let db = fresh_db();
         let (_, uid) =
@@ -20805,7 +21069,8 @@ mod api_key_access_v2_tests {
         assert!(!fields.contains_key("last_used_at"));
 
         set_api_key_active(&db, &uid, false).unwrap();
-        let (action, fields) = latest_capture(&db, "core.api_key", &uid).expect("set_active capture");
+        let (action, fields) =
+            latest_capture(&db, "core.api_key", &uid).expect("set_active capture");
         assert_eq!(action, "update");
         assert_eq!(
             fields.get("is_active"),
