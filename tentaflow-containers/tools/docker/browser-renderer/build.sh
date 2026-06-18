@@ -11,5 +11,10 @@ REGISTRY="${1:-ghcr.io/slyb00ts}"
 TAG="${2:-latest}"
 IMAGE="${REGISTRY}/tentaflow-browser-renderer:${TAG}"
 
-docker build -t "${IMAGE}" "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
+
+# Kontekstem jest root projektu — Dockerfile COPY-uje pliki przez pelna sciezke
+# tentaflow-containers/... (spojnie z deployem przez core).
+docker build -t "${IMAGE}" -f "$SCRIPT_DIR/Dockerfile" "$PROJECT_ROOT"
 echo "Zbudowano ${IMAGE}"
