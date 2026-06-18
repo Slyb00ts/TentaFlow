@@ -9,6 +9,9 @@
 //   Static: TfModal.open({title, body, actions}) → Promise.
 // =============================================================================
 
+// Footer action buttons in the static .open() API are tf-button elements.
+import './tf-button.js';
+
 const MODAL_SIZE_CLASSES = [
   'tf-modal--size-xs', 'tf-modal--size-sm', 'tf-modal--size-md',
   'tf-modal--size-lg', 'tf-modal--size-xl', 'tf-modal--size-fullscreen',
@@ -190,9 +193,8 @@ class TfModal extends HTMLElement {
         const footerSlot = document.createElement('div');
         footerSlot.setAttribute('slot', 'footer');
         for (const action of actions) {
-          const btn = document.createElement('button');
-          btn.type = 'button';
-          btn.className = action.primary ? 'tf-btn tf-btn-primary' : 'tf-btn tf-btn-secondary';
+          const btn = document.createElement('tf-button');
+          btn.setAttribute('variant', action.primary ? 'primary' : 'secondary');
           btn.textContent = action.label || '';
           btn.addEventListener('click', () => {
             resolve(action.value ?? action.label);

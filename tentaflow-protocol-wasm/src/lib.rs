@@ -7877,7 +7877,33 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
         caps.push(&JsValue::from(c.clone()));
     }
     set(&obj, "capabilities", caps.into());
+    let actions = js_sys::Array::new();
+    for a in &r.actions_meta {
+        actions.push(&robot_action_meta_to_js(a));
+    }
+    set(&obj, "actionsMeta", actions.clone().into());
+    set(&obj, "actions_meta", actions.into());
     obj
+}
+
+fn robot_action_meta_to_js(a: &tentaflow_protocol::RobotActionMeta) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "kind", a.kind.clone().into());
+    set(&obj, "label", a.label.clone().into());
+    set(&obj, "risk", a.risk.clone().into());
+    set(&obj, "acrobatic", a.acrobatic.into());
+    set(&obj, "readOnly", a.read_only.into());
+    set(&obj, "read_only", a.read_only.into());
+    let params = js_sys::Array::new();
+    for p in &a.params {
+        let pobj = js_sys::Object::new();
+        set(&pobj, "name", p.name.clone().into());
+        set(&pobj, "min", p.min.into());
+        set(&pobj, "max", p.max.into());
+        params.push(&pobj.into());
+    }
+    set(&obj, "params", params.into());
+    obj.into()
 }
 
 fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::RobotsPayload) {

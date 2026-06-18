@@ -1906,6 +1906,35 @@ pub struct RobotActionWire {
     pub p4: f64,
 }
 
+/// One numeric parameter of a parametered robot action, with the inclusive range
+/// the UI must bound its input to (the owner re-clamps on receipt regardless).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotActionParam {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Rich descriptor of ONE advertised robot control: enough for a capability-driven
+/// UI to render the right widget (button / bounded inputs / dpad), gate high-risk
+/// acrobatics behind a confirmation, and label it — without hardcoding any action
+/// list. Projected verbatim from the owning addon's `actions_meta`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotActionMeta {
+    pub kind: String,
+    pub label: String,
+    /// Risk tier: "low" / "medium" / "high". "high" (or `acrobatic`) requires the
+    /// UI to confirm before sending.
+    pub risk: String,
+    #[serde(default)]
+    pub acrobatic: bool,
+    /// A read-only action (e.g. status) the UI must NOT render as a control.
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub params: Vec<RobotActionParam>,
+}
+
 /// One robot row for the Robots list screen: a projection of the mesh registry's
 /// `AdvertisedRobot`, scoped to the caller's org. `is_local` lets the UI label a
 /// robot this node physically owns vs one controlled over the mesh.
@@ -1921,6 +1950,12 @@ pub struct RobotEntry {
     pub rtt_ms: Option<u32>,
     pub camera_id: Option<String>,
     pub capabilities: Vec<String>,
+    /// Rich capability descriptors driving the capability-based control UI.
+    /// Appended last for CBOR back-compat: an older owner that advertises no
+    /// `actions_meta` decodes with an empty vec (`#[serde(default)]`,
+    /// ciborium APPEND-AT-END rule) — the UI then falls back to plain chips.
+    #[serde(default)]
+    pub actions_meta: Vec<RobotActionMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -7444,6 +7479,72 @@ mod tests {
             }
             other => panic!("expected BaselineAdoptClearResponseBody, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn robot_entry_legacy_decode_without_actions_meta_defaults_empty() {
+        // Mirror of a pre-actions_meta RobotEntry sender: the field simply did not
+        // exist on the wire. ciborium APPEND-AT-END + #[serde(default)] must decode
+        // it to an empty vec so the UI degrades to plain chips instead of failing.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotEntry {
+            robot_id: String,
+            owner_node_id: String,
+            is_local: bool,
+            kind: Option<String>,
+            status: String,
+            battery_percent: Option<f32>,
+            rtt_ms: Option<u32>,
+            camera_id: Option<String>,
+            capabilities: Vec<String>,
+        }
+
+        let legacy = LegacyRobotEntry {
+            robot_id: "go2-001".to_string(),
+            owner_node_id: "abcdef0123".to_string(),
+            is_local: true,
+            kind: Some("quadruped".to_string()),
+            status: "online".to_string(),
+            battery_percent: Some(87.5),
+            rtt_ms: Some(12),
+            camera_id: Some("front".to_string()),
+            capabilities: vec!["move".to_string(), "stop".to_string()],
+        };
+
+        let bytes = crate::cbor::encode(&legacy).expect("encode legacy");
+        let decoded: RobotEntry = crate::cbor::decode(&bytes).expect("decode legacy");
+
+        assert_eq!(decoded.robot_id, "go2-001");
+        assert_eq!(decoded.status, "online");
+        assert_eq!(decoded.capabilities, vec!["move", "stop"]);
+        assert!(
+            decoded.actions_meta.is_empty(),
+            "missing actions_meta must default to an empty vec"
+        );
+
+        // Same guarantee through the list wrapper the UI actually consumes.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotsListResponse {
+            robots: Vec<LegacyRobotEntry>,
+        }
+        let list = LegacyRobotsListResponse {
+            robots: vec![LegacyRobotEntry {
+                robot_id: "go2-002".to_string(),
+                owner_node_id: "0011223344".to_string(),
+                is_local: false,
+                kind: None,
+                status: "offline".to_string(),
+                battery_percent: None,
+                rtt_ms: None,
+                camera_id: None,
+                capabilities: vec![],
+            }],
+        };
+        let list_bytes = crate::cbor::encode(&list).expect("encode legacy list");
+        let decoded_list: RobotsListResponse =
+            crate::cbor::decode(&list_bytes).expect("decode legacy list");
+        assert_eq!(decoded_list.robots.len(), 1);
+        assert!(decoded_list.robots[0].actions_meta.is_empty());
     }
 
     #[test]

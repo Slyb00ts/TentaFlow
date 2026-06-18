@@ -19,8 +19,8 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    MessageBody, ProtocolError, RobotCameraShareResponse, RobotControlResponse, RobotEntry,
-    RobotsListResponse, RobotsPayload,
+    MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotCameraShareResponse,
+    RobotControlResponse, RobotEntry, RobotsListResponse, RobotsPayload,
 };
 
 use super::HandlerContext;
@@ -54,6 +54,26 @@ fn to_entry(r: AdvertisedRobot, local_node_id: &str) -> RobotEntry {
         rtt_ms: r.rtt_ms,
         camera_id: r.camera_id,
         capabilities: r.capabilities,
+        actions_meta: r
+            .actions_meta
+            .into_iter()
+            .map(|a| RobotActionMeta {
+                kind: a.kind,
+                label: a.label,
+                risk: a.risk,
+                acrobatic: a.acrobatic,
+                read_only: a.read_only,
+                params: a
+                    .params
+                    .into_iter()
+                    .map(|p| RobotActionParam {
+                        name: p.name,
+                        min: p.min,
+                        max: p.max,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

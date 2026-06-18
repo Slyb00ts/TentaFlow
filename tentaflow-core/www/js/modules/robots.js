@@ -2,9 +2,17 @@
 // Talks to Core over the binary protocol via MessageBody::RobotsBody:
 //   RobotsListRequest / RobotControlRequest / RobotCameraShareRequest.
 // Renders one card per robot advertised in the mesh (org-scoped): status badge,
-// owner node, battery / RTT, capability chips, an optional live camera tile and
-// the closed-allowlist control buttons (Hello, Sit, Stand Up, Recovery Stand,
-// Stop, E-stop). The list auto-refreshes so mesh discovery state stays visible.
+// owner node, battery / RTT, an optional live camera tile and a CAPABILITY-DRIVEN
+// control surface generated from each robot's advertised `actions_meta` (label /
+// risk / param schema) — no hardcoded action list. High-risk / acrobatic actions
+// are gated behind a confirm dialog using the UNION of advertised risk and an
+// authoritative client-side known-dangerous set (a hostile descriptor can't
+// downgrade a flip to a one-click button). Parametered actions write values into
+// FIXED p1..p4 slots BY NAME and refuse to send if a required param is missing
+// (no slot shifting). An always-present E-stop is independent of the advertised
+// metadata and stays clickable even when the robot reads offline — safety must
+// never depend on status metadata. The server remains the real safety gate.
+// The list auto-refreshes so mesh discovery state stays visible.
 // tf-* components only; control results surface through tf-toast.
 // =============================================================================
 
@@ -13,6 +21,9 @@ import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-badge.js';
 import '/js/components/tf-chip.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-select.js';
+import '/js/components/tf-modal.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
 import '/js/components/tf-video-stream.js';
@@ -21,14 +32,50 @@ import '/js/components/tf-video-stream.js';
 // and online/offline transitions appear without a manual reload.
 const REFRESH_INTERVAL_MS = 4000;
 
-// Closed control allowlist mirrored from RobotActionWire (message_body.rs:1166).
-// Non-move actions ignore vx/vy/vyaw; the owner clamps again to its safety cap.
-const CONTROL_ACTIONS = [
-  { kind: 'hello', label: 'Przywitaj', icon: 'sparkle', variant: 'outline' },
-  { kind: 'sit', label: 'Usiądź', icon: 'pause', variant: 'outline' },
-  { kind: 'stand_up', label: 'Wstań', icon: 'arrow', variant: 'outline' },
-  { kind: 'recovery_stand', label: 'Podnieś się', icon: 'rotate', variant: 'outline' },
-];
+// Locomotion magnitude (m/s) for the directional pad, matching the go2 driver's
+// own move buttons. The owner re-clamps to its safety cap regardless.
+const MOVE_SPEED = 0.3;
+
+// Kinds the control surface must NOT render as a button: read-only telemetry, the
+// camera tag, and the e-stop family (a dedicated, always-present STOP button owns
+// safety so it can't depend on advertised metadata).
+const NON_CONTROL_KINDS = new Set(['status', 'camera', 'estop', 'stop', 'reset_estop']);
+
+// Authoritative client-side set of known dangerous kinds. Defense-in-depth: the
+// confirm dialog is required if a kind is in this set REGARDLESS of advertised
+// risk, so a malformed/hostile descriptor that advertises e.g. `front_flip` as
+// low-risk can NEVER bypass confirmation into a one-click flip. The server stays
+// the real safety gate; this just makes the UI un-trickable.
+const KNOWN_HIGH_RISK_KINDS = new Set([
+  'front_flip',
+  'front_jump',
+  'front_pounce',
+  'scrape',
+  'dance1',
+  'dance2',
+]);
+
+// Documented wire slot order per known parametered kind: param NAME → fixed
+// p1..p4 slot. Values are placed BY NAME (never compacted by index), so a missing
+// param leaves its slot empty rather than shifting a later param into it (which
+// the owner would misread as a different axis). REQUIRED_PARAMS lists the params
+// that MUST be present for the kind to be sendable; a missing required param
+// refuses the send instead of guessing.
+const PARAM_SLOTS = {
+  euler: { roll: 'p1', pitch: 'p2', yaw: 'p3' },
+  pose: { roll: 'p1', pitch: 'p2', yaw: 'p3', height: 'p4' },
+  body_height: { height: 'p1' },
+  foot_raise_height: { height: 'p1' },
+  speed_level: { level: 'p1' },
+};
+
+const REQUIRED_PARAMS = {
+  euler: ['roll', 'pitch', 'yaw'],
+  pose: ['roll', 'pitch', 'yaw', 'height'],
+  body_height: ['height'],
+  foot_raise_height: ['height'],
+  speed_level: ['level'],
+};
 
 let robots = [];
 let refreshTimer = null;
@@ -93,9 +140,28 @@ function isLocal(r) { return !!field(r, 'isLocal', 'is_local'); }
 function batteryPercent(r) { return field(r, 'batteryPercent', 'battery_percent'); }
 function rttMs(r) { return field(r, 'rttMs', 'rtt_ms'); }
 function cameraId(r) { return field(r, 'cameraId', 'camera_id'); }
-function capabilities(r) {
-  const caps = r.capabilities;
-  return Array.isArray(caps) ? caps : [];
+
+// Rich capability descriptors driving the control surface. camel/snake tolerant.
+// Each entry: {kind, label, risk, acrobatic, readOnly|read_only, params:[{name,min,max}]}.
+function actionsMeta(r) {
+  const m = field(r, 'actionsMeta', 'actions_meta');
+  return Array.isArray(m) ? m : [];
+}
+
+function actionRisk(a) { return String(a.risk || 'medium').toLowerCase(); }
+function actionAcrobatic(a) { return !!a.acrobatic; }
+function actionReadOnly(a) { return !!(a.readOnly ?? a.read_only); }
+function actionParams(a) { return Array.isArray(a.params) ? a.params : []; }
+// Union of the advertised risk and the authoritative known-dangerous set: an
+// advertised-low kind that is in KNOWN_HIGH_RISK_KINDS is STILL high-risk. Never
+// trust advertised-low to bypass the known set.
+function isHighRisk(a) {
+  return (
+    KNOWN_HIGH_RISK_KINDS.has(a.kind) ||
+    actionRisk(a) === 'high' ||
+    actionRisk(a) === 'acrobatic' ||
+    actionAcrobatic(a)
+  );
 }
 
 // Maps the free-form status string onto a tf-badge tone. tf-badge accepts
@@ -228,24 +294,300 @@ function renderList() {
   }
 }
 
-// Creates a card element from robotCard() markup and binds its action handlers
-// once. Listeners live on the persistent element, so update polls never rebind.
+// Creates a card element from robotCard() markup, then builds the capability-
+// driven control surface and binds the e-stop / share handlers once. Listeners
+// live on the persistent element, so update polls never rebind.
 function buildCard(r) {
   const tmp = document.createElement('div');
   tmp.innerHTML = robotCard(r);
   const el = tmp.firstElementChild;
 
-  el.querySelectorAll('[data-control]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      handleControl(btn.dataset.robot, btn.dataset.control, btn);
-    });
+  const id = robotId(r);
+  // E-stop is rendered as static markup (always present) — bind it once.
+  el.querySelectorAll('[data-control="estop"]').forEach((btn) => {
+    btn.addEventListener('click', () => handleControl(id, 'estop', btn));
   });
   el.querySelectorAll('[data-share-camera]').forEach((btn) => {
     btn.addEventListener('click', () => {
       handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
     });
   });
+
+  // Capability-driven controls live in their own sub-container so they can be
+  // rebuilt independently of the video node when the advertised action set
+  // changes — the <tf-video-stream> is NEVER touched.
+  buildControls(el, r);
   return el;
+}
+
+// Renders the capability-driven controls into [data-field="controls"], grouped by
+// kind/risk. Rebuilt only when the advertised action signature actually changed,
+// so a steady action set survives every poll untouched (and the video node above
+// it stays stable). The e-stop button is separate static markup, never rebuilt.
+function buildControls(el, r) {
+  const host = el.querySelector('[data-field="controls"]');
+  if (!host) return;
+
+  const meta = actionsMeta(r);
+  const sig = controlsSignature(meta);
+  if (host.dataset.controlsSig === sig) return;
+  host.dataset.controlsSig = sig;
+  host.innerHTML = '';
+
+  const id = robotId(r);
+  const controllable = meta.filter((a) => !NON_CONTROL_KINDS.has(a.kind) && !actionReadOnly(a));
+
+  // Locomotion dpad (only when "move" is advertised).
+  const move = controllable.find((a) => a.kind === 'move');
+  if (move) host.appendChild(buildMoveGroup(id, move));
+
+  // Parametered poses/levels (euler/pose/body_height/foot_raise_height/speed_level
+  // and any other action that advertises params).
+  const parametered = controllable.filter((a) => a.kind !== 'move' && actionParams(a).length > 0);
+  if (parametered.length) {
+    host.appendChild(buildGroup('Pozy', parametered.map((a) => buildParameteredControl(id, a))));
+  }
+
+  // Simple parameterless actions, split by risk so acrobatics are visually and
+  // behaviourally distinct.
+  const simple = controllable.filter(
+    (a) => a.kind !== 'move' && actionParams(a).length === 0 && !isHighRisk(a),
+  );
+  if (simple.length) {
+    host.appendChild(buildGroup('Akcje', simple.map((a) => buildSimpleButton(id, a))));
+  }
+
+  const acrobatic = controllable.filter(
+    (a) => a.kind !== 'move' && actionParams(a).length === 0 && isHighRisk(a),
+  );
+  if (acrobatic.length) {
+    host.appendChild(buildGroup('Akrobacje', acrobatic.map((a) => buildSimpleButton(id, a))));
+  }
+}
+
+// Stable signature of the action set: any change in the set/order/risk/params of
+// advertised actions triggers a controls rebuild; rtt/battery churn does not.
+function controlsSignature(meta) {
+  return meta
+    .map((a) => {
+      const params = actionParams(a)
+        .map((p) => `${p.name}:${p.min}:${p.max}`)
+        .join(',');
+      return `${a.kind}|${a.label}|${actionRisk(a)}|${actionAcrobatic(a) ? 1 : 0}|${actionReadOnly(a) ? 1 : 0}|${params}`;
+    })
+    .join(';');
+}
+
+// A labelled group wrapper holding one or more control nodes.
+function buildGroup(title, nodes) {
+  const group = document.createElement('div');
+  group.className = 'robots-control-group';
+  const heading = document.createElement('div');
+  heading.className = 'robots-control-group-title';
+  heading.textContent = title;
+  group.appendChild(heading);
+  const body = document.createElement('div');
+  body.className = 'robots-controls-row';
+  nodes.forEach((n) => body.appendChild(n));
+  group.appendChild(body);
+  return group;
+}
+
+// Directional pad (forward/back/left/right + rotate) sending "move" with clamped
+// vx/vy/vyaw. Reuses the driver's own ±MOVE_SPEED magnitudes.
+function buildMoveGroup(id, move) {
+  const dirs = [
+    { label: 'Przód', icon: 'arrow', vx: MOVE_SPEED, vy: 0, vyaw: 0 },
+    { label: 'Tył', icon: 'arrow', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
+    { label: 'Lewo', icon: 'arrow', vx: 0, vy: MOVE_SPEED, vyaw: 0 },
+    { label: 'Prawo', icon: 'arrow', vx: 0, vy: -MOVE_SPEED, vyaw: 0 },
+    { label: 'Obrót L', icon: 'rotate', vx: 0, vy: 0, vyaw: MOVE_SPEED },
+    { label: 'Obrót P', icon: 'rotate', vx: 0, vy: 0, vyaw: -MOVE_SPEED },
+  ];
+  const nodes = dirs.map((d) => {
+    const btn = document.createElement('tf-button');
+    btn.setAttribute('variant', 'outline');
+    btn.setAttribute('size', 'sm');
+    btn.setAttribute('icon', d.icon);
+    btn.dataset.control = 'move';
+    btn.textContent = d.label;
+    btn.addEventListener('click', () =>
+      handleControl(id, 'move', btn, { vx: d.vx, vy: d.vy, vyaw: d.vyaw }, move.label || 'Ruch'),
+    );
+    return btn;
+  });
+  return buildGroup(move.label || 'Ruch', nodes);
+}
+
+// Simple parameterless action button. High-risk / acrobatic actions get the danger
+// variant and a confirm dialog before sending; low/medium use the outline variant.
+function buildSimpleButton(id, a) {
+  const high = isHighRisk(a);
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', high ? 'danger' : 'outline');
+  btn.setAttribute('size', 'sm');
+  btn.setAttribute('icon', high ? 'alert' : 'sparkle');
+  btn.dataset.control = a.kind;
+  btn.textContent = a.label || a.kind;
+  btn.addEventListener('click', () => handleControl(id, a.kind, btn, null, a.label, high));
+  return btn;
+}
+
+// Parametered control: one bounded input per param plus a send button. speed_level
+// renders a tf-select (-1/0/1). Values are written into FIXED p1..p4 slots BY NAME
+// (slotsForKind), never compacted by index, so a missing param can't shift a later
+// one into the wrong axis. If a REQUIRED documented param is missing from the
+// advertised meta, the control refuses to send (disabled + inline error).
+function buildParameteredControl(id, a) {
+  const wrap = document.createElement('div');
+  wrap.className = 'robots-param-control';
+
+  const title = document.createElement('div');
+  title.className = 'robots-param-title';
+  title.textContent = a.label || a.kind;
+  wrap.appendChild(title);
+
+  const params = actionParams(a);
+  const high = isHighRisk(a);
+  const slots = slotsForKind(a.kind, params);
+
+  // For a KNOWN kind, every required documented param must be advertised; missing
+  // one means the descriptor is malformed for this kind, so we refuse rather than
+  // guess which slot each value belongs to.
+  const required = REQUIRED_PARAMS[a.kind];
+  const advertisedNames = new Set(params.map((p) => p.name));
+  const missingRequired = required
+    ? required.filter((name) => !advertisedNames.has(name))
+    : [];
+
+  // speed_level is a discrete level, not a continuous range: a select is clearer.
+  if (a.kind === 'speed_level') {
+    const sel = document.createElement('tf-select');
+    sel.setAttribute('label', 'Poziom');
+    sel.setOptions(
+      [
+        { value: '-1', label: 'Wolno' },
+        { value: '0', label: 'Normalnie' },
+        { value: '1', label: 'Szybko' },
+      ],
+      '0',
+    );
+    wrap.appendChild(sel);
+    const send = makeSendButton(a.label || a.kind);
+    if (missingRequired.length) {
+      refuseControl(wrap, send, a.kind, missingRequired);
+    } else {
+      send.addEventListener('click', () =>
+        handleControl(id, a.kind, send, { p1: Number(sel.value) }, a.label, high),
+      );
+    }
+    wrap.appendChild(send);
+    return wrap;
+  }
+
+  // Build one input per param that has a FIXED slot. For unknown kinds slotsForKind
+  // assigns slots by the meta's declared order (no compaction); a param it can't
+  // place at all (more than 4 on an unknown kind) is reported as ambiguous below.
+  const fields = [];
+  let ambiguous = false;
+  for (const p of params) {
+    const slot = slots.get(p.name);
+    if (!slot) {
+      ambiguous = true;
+      continue;
+    }
+    const input = document.createElement('tf-input');
+    input.setAttribute('type', 'number');
+    input.setAttribute('label', paramLabel(p.name));
+    if (Number.isFinite(p.min)) input.setAttribute('min', String(p.min));
+    if (Number.isFinite(p.max)) input.setAttribute('max', String(p.max));
+    input.setAttribute('step', '0.01');
+    input.setAttribute('value', '0');
+    wrap.appendChild(input);
+    fields.push({ input, slot, min: p.min, max: p.max });
+  }
+
+  const send = makeSendButton(a.label || a.kind);
+
+  // Refuse on a malformed/ambiguous descriptor — prefer refusing over guessing for
+  // anything that moves the robot.
+  if (missingRequired.length) {
+    refuseControl(wrap, send, a.kind, missingRequired);
+  } else if (ambiguous) {
+    refuseControl(wrap, send, a.kind, null, 'Niejednoznaczne parametry akcji');
+  } else {
+    send.addEventListener('click', () => {
+      const payload = {};
+      for (const f of fields) {
+        let v = Number(f.input.value);
+        if (!Number.isFinite(v)) v = 0;
+        if (Number.isFinite(f.min)) v = Math.max(v, f.min);
+        if (Number.isFinite(f.max)) v = Math.min(v, f.max);
+        payload[f.slot] = v;
+      }
+      handleControl(id, a.kind, send, payload, a.label, high);
+    });
+  }
+  wrap.appendChild(send);
+  return wrap;
+}
+
+// Disables the send button and surfaces an inline error so a malformed descriptor
+// can't be sent with shifted/guessed slots.
+function refuseControl(wrap, send, kind, missing, customMsg) {
+  send.setAttribute('disabled', '');
+  const err = document.createElement('div');
+  err.className = 'robots-param-error';
+  err.textContent =
+    customMsg ||
+    `Brak wymaganych parametrów (${(missing || []).join(', ')}) — akcji „${kind}" nie można wysłać`;
+  wrap.appendChild(err);
+}
+
+function makeSendButton(label) {
+  const send = document.createElement('tf-button');
+  send.setAttribute('variant', 'primary');
+  send.setAttribute('size', 'sm');
+  send.setAttribute('icon', 'check');
+  send.textContent = `Wyślij (${label})`;
+  return send;
+}
+
+// Maps each advertised param name to its FIXED wire slot. For a KNOWN kind the slot
+// comes from the documented PARAM_SLOTS map (by name, never by index) so a missing
+// param leaves its slot empty instead of shifting later params. For an unknown kind
+// (no documented map) slots are assigned in the meta's declared param order WITHOUT
+// compaction gaps — beyond p4 the param is left unmapped so the caller refuses as
+// ambiguous rather than dropping it silently. Returns a Map<name, "pN">.
+function slotsForKind(kind, params) {
+  const known = PARAM_SLOTS[kind];
+  if (known) {
+    const out = new Map();
+    for (const p of params) {
+      if (known[p.name]) out.set(p.name, known[p.name]);
+    }
+    return out;
+  }
+  const out = new Map();
+  const generic = ['p1', 'p2', 'p3', 'p4'];
+  params.forEach((p, idx) => {
+    if (idx < generic.length) out.set(p.name, generic[idx]);
+  });
+  return out;
+}
+
+function paramLabel(name) {
+  const map = {
+    roll: 'Roll',
+    pitch: 'Pitch',
+    yaw: 'Yaw',
+    height: 'Wysokość',
+    vx: 'vx',
+    vy: 'vy',
+    vyaw: 'vyaw',
+    level: 'Poziom',
+  };
+  return map[name] || name;
 }
 
 // Updates only the mutable fields of an existing card. Never touches the
@@ -266,22 +608,21 @@ function updateCard(el, r) {
     ownerEl.textContent = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
   }
 
-  // Capability chips: only rebuild when the set actually changed.
-  const capsBox = el.querySelector('[data-field="caps"]');
-  if (capsBox) {
-    const caps = capabilities(r);
-    const key = caps.join('');
-    if (capsBox.dataset.capsKey !== key) {
-      capsBox.dataset.capsKey = key;
-      capsBox.innerHTML = caps
-        .map((c) => `<tf-chip variant="tag" tone="muted" size="sm" label="${escapeAttr(c)}"></tf-chip>`)
-        .join('');
-    }
-  }
+  // Rebuild the capability-driven controls only when the advertised action set
+  // actually changed (signature compare inside buildControls). This never touches
+  // the video node above it.
+  buildControls(el, r);
 
-  // Offline robots can't take commands: disable control + share buttons.
+  // Offline robots can't take commands: disable every control + share button —
+  // EXCEPT the e-stop family. STOP must stay clickable regardless of advertised
+  // status so safety never depends on status metadata (the server still validates).
   const offline = !isControllable(status);
   el.querySelectorAll('[data-control], [data-share-camera]').forEach((btn) => {
+    const ctrl = btn.dataset.control;
+    if (ctrl === 'estop' || ctrl === 'stop' || ctrl === 'reset_estop') {
+      btn.removeAttribute('disabled');
+      return;
+    }
     if (offline) btn.setAttribute('disabled', '');
     else btn.removeAttribute('disabled');
   });
@@ -314,7 +655,6 @@ function robotCard(r) {
   const owner = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
   const battery = batteryPercent(r);
   const rtt = rttMs(r);
-  const caps = capabilities(r);
   const cam = cameraId(r);
 
   // Battery/RTT rows always render so updateCard() has a stable slot to fill;
@@ -324,10 +664,6 @@ function robotCard(r) {
     metricRow('bolt', 'RTT', rtt != null ? `${Math.round(Number(rtt))} ms` : '', 'rtt', rtt == null),
     metricRow('host', 'Węzeł', '', 'owner', false, owner),
   ];
-
-  const capsHtml = `<div class="robots-caps" data-field="caps" data-caps-key="${escapeAttr(caps.join(''))}">${caps
-    .map((c) => `<tf-chip variant="tag" tone="muted" size="sm" label="${escapeAttr(c)}"></tf-chip>`)
-    .join('')}</div>`;
 
   const cameraHtml = cam
     ? `
@@ -340,6 +676,8 @@ function robotCard(r) {
       </div>`
     : '';
 
+  // Controls sub-container is populated by buildControls() AFTER the card mounts,
+  // so the action set can be rebuilt independently of the video node above it.
   return `
     <article class="robots-card" data-robot-card="${escapeAttr(id)}" data-camera-id="${escapeAttr(cam ?? '')}">
       <div class="robots-card-top">
@@ -352,17 +690,12 @@ function robotCard(r) {
       </div>
 
       <div class="robots-metrics">${metrics.join('')}</div>
-      ${capsHtml}
       ${cameraHtml}
 
-      <div class="robots-controls">
-        ${CONTROL_ACTIONS.map((a) => `
-          <tf-button variant="${a.variant}" size="sm" icon="${a.icon}"
-            data-robot="${escapeAttr(id)}" data-control="${escapeAttr(a.kind)}">
-            ${escapeHtml(a.label)}
-          </tf-button>
-        `).join('')}
-        <tf-button variant="danger-solid" size="sm" icon="stop"
+      <div class="robots-controls" data-field="controls"></div>
+
+      <div class="robots-estop">
+        <tf-button variant="danger-solid" icon="stop" full-width
           data-robot="${escapeAttr(id)}" data-control="estop">
           STOP awaryjny
         </tf-button>
@@ -393,23 +726,37 @@ function shortNode(nodeId) {
   return s.length > 12 ? `${s.slice(0, 12)}…` : (s || '—');
 }
 
-async function handleControl(id, kind, btn) {
+// Sends a control action. `params` carries optional vx/vy/vyaw (move) and p1..p4
+// (parametered kinds). `requireConfirm` gates high-risk / acrobatic actions behind
+// a modal — they are NEVER sent on a single click.
+async function handleControl(id, kind, btn, params, label, requireConfirm = false) {
   if (!id || !kind) return;
+
+  if (requireConfirm) {
+    const ok = await tfConfirmAcrobatic(label || kind);
+    if (!ok) return;
+  }
+
   btn.setAttribute('loading', '');
   try {
     const resp = await ApiBinary.action('robotControlRequest', {
       robotId: id,
       kind,
-      vx: 0,
-      vy: 0,
-      vyaw: 0,
+      vx: Number(params?.vx ?? 0),
+      vy: Number(params?.vy ?? 0),
+      vyaw: Number(params?.vyaw ?? 0),
+      p1: Number(params?.p1 ?? 0),
+      p2: Number(params?.p2 ?? 0),
+      p3: Number(params?.p3 ?? 0),
+      p4: Number(params?.p4 ?? 0),
     });
     // A robot-level refusal is still a successful call carrying `rejected`;
     // `error` is an execution failure (RobotControlResponse, message_body.rs).
     const rejected = resp.rejected;
     const error = resp.error;
+    const name = label || kind;
     if (resp.ok) {
-      toast(`Robot ${shortNode(id)}: ${actionLabel(kind)} ✓`, 'success');
+      toast(`Robot ${shortNode(id)}: ${name} ✓`, 'success');
     } else if (rejected) {
       toast(`Robot ${shortNode(id)}: odrzucono — ${rejected}`, 'error');
     } else {
@@ -420,6 +767,22 @@ async function handleControl(id, kind, btn) {
   } finally {
     btn.removeAttribute('loading');
   }
+}
+
+// Confirmation gate for acrobatic / high-risk actions. Returns true only when the
+// operator explicitly confirms; ESC / backdrop / cancel resolve to false.
+async function tfConfirmAcrobatic(label) {
+  const choice = await window.customElements
+    .get('tf-modal')
+    .open({
+      title: 'Potwierdź akcję wysokiego ryzyka',
+      body: `„${label}" to akcja akrobatyczna / wysokiego ryzyka. Upewnij się, że robot ma wolną przestrzeń. Potwierdzić wykonanie?`,
+      actions: [
+        { label: 'Anuluj', value: false },
+        { label: 'Wykonaj', value: true, primary: true },
+      ],
+    });
+  return choice === true;
 }
 
 async function handleShareCamera(id, cam, btn) {
@@ -441,13 +804,6 @@ async function handleShareCamera(id, cam, btn) {
   } finally {
     btn.removeAttribute('loading');
   }
-}
-
-function actionLabel(kind) {
-  const a = CONTROL_ACTIONS.find((x) => x.kind === kind);
-  if (a) return a.label;
-  if (kind === 'estop') return 'STOP awaryjny';
-  return kind;
 }
 
 function plural(n, one, few, many) {
