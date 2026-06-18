@@ -64,9 +64,7 @@ pub struct ModelSummary {
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceModelEntry {
     pub model_name: String,
     pub display_name: Option<String>,
@@ -81,9 +79,7 @@ pub struct ServiceModelEntry {
 /// — typed mape wartosci ktore BackendClient materializuje przy kazdym
 /// requestcie (Ollama options, python wrapper extra fields, whisper/mlx
 /// deploy defaults z opcjonalnym per-request override).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInfo {
     pub id: i64,
     /// Owning mesh node — endpoint-id hex. Same as the local node when the row
@@ -143,15 +139,7 @@ pub struct ServiceInfo {
 ///     `request_override = true`; backend uzywa jako baseline, klient API
 ///     moze nadpisac per request.
 ///   * `mlx_overridable` → analogicznie dla MLX engine.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Default,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestTimeParameters {
     pub ollama_options: Vec<KeyValue>,
     pub python_request: Vec<KeyValue>,
@@ -162,9 +150,7 @@ pub struct RequestTimeParameters {
 /// Generic key-value pair dla typed parametrow propagowanych przez wire.
 /// Wartosc jako serialized JSON string (CBOR nie obsluguje natywnie
 /// `serde_json::Value`).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct KeyValue {
     pub key: String,
     /// JSON-serialized value. Konsument deserializuje przez `serde_json::from_str`.
@@ -174,9 +160,7 @@ pub struct KeyValue {
 /// Incremental change applied to one entry in the mesh services registry. Used
 /// by `MeshServicesUpdate` push messages so peers do not have to re-broadcast
 /// the full snapshot on every deploy / stop / pin / pause / rename / delete.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ServiceChange {
     Added(ServiceInfo),
     Updated(ServiceInfo),
@@ -260,9 +244,7 @@ pub struct ServicePauseResponse {
 /// są materializowane do `services.config_json` jako manifest schema
 /// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
 /// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ServiceUpdateRequest {
     pub service_id: i64,
     /// See `ServiceDeleteRequest::node_id` — None = local node.
@@ -567,12 +549,34 @@ pub struct ApiKeySummary {
     pub name: String,
     pub created_at_epoch: u64,
     pub last_used_at_epoch: Option<u64>,
+    /// 'user' | 'group' | 'general'.
+    pub key_type: String,
+    /// user_id (user) / group_id (group) / None (general).
+    pub subject_id: Option<String>,
+    /// Human label for the subject (user display name / group name), if any.
+    pub subject_label: Option<String>,
+    /// Count of `resource_permissions` rows scoped to this key (general keys).
+    pub scope_count: u32,
+    pub is_active: bool,
+}
+
+/// One resource entry on a general key's explicit allowlist at creation time.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ResourceRef {
+    /// 'model' | 'flow' | 'alias'.
+    pub resource_type: String,
+    pub resource_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ApiKeyCreateRequest {
     pub name: String,
-    pub scopes: Vec<String>,
+    /// 'user' | 'group' | 'general'.
+    pub key_type: String,
+    /// Required for 'user'/'group' (the user/group id); None for 'general'.
+    pub subject_id: Option<String>,
+    /// Explicit allowlist seeded for 'general' keys; ignored for user/group.
+    pub scope_resources: Vec<ResourceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3607,18 +3611,14 @@ pub struct NimCatalogListResponse {
 // f64 fields drop Eq; PartialEq only.
 // =============================================================================
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmGpuInfo {
     pub index: u32,
     pub name: String,
     pub memory_gb: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmRecommendRequest {
     pub model: String,
     pub gpus: Vec<DeployVllmGpuInfo>,
@@ -3653,9 +3653,7 @@ pub struct DeployVllmRecommendRequest {
     pub max_num_batched_tokens: Option<u64>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmConfig {
     pub tensor_parallel: u32,
     pub pipeline_parallel: u32,
@@ -3665,9 +3663,7 @@ pub struct DeployVllmConfig {
     pub gpu_memory_utilization: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmModelSpecSummary {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -3684,9 +3680,7 @@ pub struct DeployVllmModelSpecSummary {
     pub bytes_per_param: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmVramEstimate {
     pub model_weights_gb: f64,
     pub kv_cache_gb: f64,
@@ -3710,9 +3704,7 @@ pub struct DeployVllmVramEstimate {
     pub concurrent_full_len_seqs: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmGpuCompatibility {
     pub used_tp: u32,
     pub used_pp: u32,
@@ -3722,9 +3714,7 @@ pub struct DeployVllmGpuCompatibility {
     pub warning: Option<String>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmRecommendResponse {
     pub model_spec: DeployVllmModelSpecSummary,
     pub vram_estimate: DeployVllmVramEstimate,
@@ -3897,9 +3887,7 @@ pub struct AddonAccessDecisionRequest {
 /// Ask the server which host port a fresh deploy would be assigned (the first
 /// free port in the services range, skipping leased / OS-bound / docker-bound
 /// ports). The deploy wizard pre-fills the editable port field with it.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct SuggestServicePortRequest {
     /// Deploy method the wizard is targeting ("docker", "native", …) — purely
     /// informational for now; the suggestion comes from the shared allocator.
@@ -3909,9 +3897,7 @@ pub struct SuggestServicePortRequest {
 /// Response to [`SuggestServicePortRequest`]. `available = false` (port 0) when
 /// the whole range is exhausted. Advisory: the deploy re-allocates at commit, so
 /// the value can change if another deploy grabs it first.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct SuggestServicePortResponse {
     pub port: u32,
     pub available: bool,
@@ -3922,9 +3908,7 @@ pub struct SuggestServicePortResponse {
 /// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
 /// silniki maja proste defaulty per kategoria). Zwraca typed mape
 /// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct EngineRecommendRequest {
     pub engine_id: String,
     pub model_repo: String,
@@ -3932,9 +3916,7 @@ pub struct EngineRecommendRequest {
     pub hf_token: Option<String>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct EngineRecommendResponse {
     /// JSON-serialized values per parameter key. Wizard JS deserializuje
     /// zgodnie z `parameter.kind` z manifestu.
@@ -6246,6 +6228,37 @@ pub enum MessageBody {
     AddonStorageBody(AddonStoragePayload),
     // Vector backend picker addona (zvec / Milvus config + discovery).
     AddonVectorBody(AddonVectorPayload),
+
+    // ---- API key scope + rotation (admin-only) ----
+    // Appended at the END of the enum: ciborium 0.8 encodes variants by index
+    // (256-variant cap), so new discriminants must never be inserted mid-list.
+    /// Lists the explicit allowlist of a general key (subject_type='api_key').
+    ApiKeyScopeListRequest {
+        key_uid: String,
+    },
+    ApiKeyScopeListResponse {
+        entries: Vec<PermissionEntry>,
+    },
+    /// Sets one allow/deny scope entry for a general key.
+    ApiKeyScopeSetRequest {
+        key_uid: String,
+        resource_type: String,
+        resource_id: String,
+        access_level: String,
+    },
+    /// Removes one scope entry for a general key.
+    ApiKeyScopeClearRequest {
+        key_uid: String,
+        resource_type: String,
+        resource_id: String,
+    },
+    /// Rotates a key's secret: new token, same uid + scope, old token invalid.
+    ApiKeyRotateRequest {
+        key_uid: String,
+    },
+    ApiKeyRotateResponse {
+        token: String,
+    },
 }
 
 // =============================================================================
@@ -6456,13 +6469,23 @@ mod tests {
                 name: "primary".to_string(),
                 created_at_epoch: 1_700_000_000,
                 last_used_at_epoch: Some(1_700_100_000),
+                key_type: "general".to_string(),
+                subject_id: None,
+                subject_label: None,
+                scope_count: 2,
+                is_active: true,
             }],
         };
         assert_eq!(round_trip(list.clone()), list);
 
         let create = MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
             name: "svc".to_string(),
-            scopes: vec!["read".to_string(), "write".to_string()],
+            key_type: "general".to_string(),
+            subject_id: None,
+            scope_resources: vec![ResourceRef {
+                resource_type: "model".to_string(),
+                resource_id: "gpt-4o".to_string(),
+            }],
         });
         assert_eq!(round_trip(create.clone()), create);
 
@@ -6661,9 +6684,9 @@ mod tests {
             MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
                 skill_id: "s3".to_string(),
             })),
-            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(SkillsHubApproveResponse {
-                approved: true,
-            })),
+            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(
+                SkillsHubApproveResponse { approved: true },
+            )),
             MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
                 skill_id: "s3".to_string(),
             })),
@@ -7208,10 +7231,7 @@ mod tests {
             MessageBody::BaselineDonorListResponseBody(r) => {
                 assert_eq!(r.candidates.len(), 2);
                 assert_eq!(r.candidates[0].node_id, "aabbccdd");
-                assert_eq!(
-                    r.candidates[0].summary.as_ref().map(|s| s.users),
-                    Some(12)
-                );
+                assert_eq!(r.candidates[0].summary.as_ref().map(|s| s.users), Some(12));
                 assert!(r.candidates[1].summary.is_none());
             }
             other => panic!("expected BaselineDonorListResponseBody, got {other:?}"),
@@ -7305,15 +7325,13 @@ mod tests {
     fn body_nests_inside_envelope() {
         use crate::envelope::{message_kind, Envelope};
         let body = MessageBody::ModelListRequest;
-        let body_bytes = crate::cbor::encode(&body).expect("encode body")
-            .to_vec();
+        let body_bytes = crate::cbor::encode(&body).expect("encode body").to_vec();
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, body_bytes);
         let env_bytes = crate::cbor::encode(&env).expect("encode env");
         let decoded_env: Envelope =
             crate::cbor::decode::<Envelope>(&env_bytes).expect("decode env");
         let decoded_body: MessageBody =
-            crate::cbor::decode::<MessageBody>(&decoded_env.body)
-                .expect("decode body");
+            crate::cbor::decode::<MessageBody>(&decoded_env.body).expect("decode body");
         assert_eq!(decoded_body, body);
     }
 }
