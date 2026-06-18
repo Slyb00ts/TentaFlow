@@ -33,6 +33,11 @@ const CONTROL_ACTIONS = [
 let robots = [];
 let refreshTimer = null;
 let inFlightRefresh = false;
+// robotId -> card element currently in the DOM. Lets renderList() do a keyed
+// diff (append new, remove gone, update-in-place existing) instead of rebuilding
+// innerHTML each poll — rebuilding tears down the live <tf-video-stream> (MSE)
+// every REFRESH_INTERVAL_MS and the video never stabilizes.
+let cardEls = new Map();
 
 const RobotsScreen = {
   get title() { return 'Roboty'; },
@@ -68,6 +73,7 @@ const RobotsScreen = {
     }
     robots = [];
     inFlightRefresh = false;
+    cardEls = new Map();
   },
 };
 
@@ -148,6 +154,9 @@ async function loadRobots({ showSpinner }) {
 
 function renderError(list, err) {
   if (!list) return;
+  // The error empty-state replaces the grid contents; drop stale card refs so a
+  // later successful poll rebuilds every card from scratch.
+  cardEls = new Map();
   list.innerHTML = '';
   const empty = document.createElement('tf-empty-state');
   empty.setAttribute('icon', 'alert');
@@ -161,12 +170,16 @@ function renderError(list, err) {
   list.appendChild(empty);
 }
 
+// Keyed reconcile by robot id. Cards (and their <tf-video-stream>) are created
+// once and kept across polls; only mutable fields update in place. A card is
+// recreated only when its robot appears, disappears, or its camera_id changes.
 function renderList() {
   const host = byId('robots-list');
   if (!host) return;
 
   if (!robots.length) {
     host.innerHTML = '';
+    cardEls = new Map();
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'cpu');
     empty.setAttribute('title', 'Brak robotów w sieci mesh');
@@ -175,19 +188,123 @@ function renderList() {
     return;
   }
 
-  host.innerHTML = robots.map((r) => robotCard(r)).join('');
+  // The previous poll may have left a non-card child (spinner/empty-state) as
+  // the sole content; clear it so card append order stays clean.
+  if (cardEls.size === 0 && host.firstChild) {
+    host.innerHTML = '';
+  }
 
-  // Wire control + camera-share buttons after the markup is in the DOM.
-  host.querySelectorAll('[data-control]').forEach((btn) => {
+  const present = new Set();
+  for (const r of robots) {
+    const id = robotId(r);
+    if (!id) continue;
+    present.add(id);
+
+    let el = cardEls.get(id);
+    // Recreate the card when the camera tile identity changes (camera_id flip,
+    // or camera appearing/disappearing) — otherwise the stream-id would be stale.
+    if (el && el.dataset.cameraId !== String(cameraId(r) ?? '')) {
+      el.remove();
+      cardEls.delete(id);
+      el = null;
+    }
+
+    if (!el) {
+      el = buildCard(r);
+      cardEls.set(id, el);
+      host.appendChild(el);
+    }
+    // Apply mutable state on both new and existing cards (a freshly built card
+    // still needs its offline-disable applied for a robot that appears offline).
+    updateCard(el, r);
+  }
+
+  // Remove cards for robots no longer in the list.
+  for (const [id, el] of cardEls) {
+    if (!present.has(id)) {
+      el.remove();
+      cardEls.delete(id);
+    }
+  }
+}
+
+// Creates a card element from robotCard() markup and binds its action handlers
+// once. Listeners live on the persistent element, so update polls never rebind.
+function buildCard(r) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = robotCard(r);
+  const el = tmp.firstElementChild;
+
+  el.querySelectorAll('[data-control]').forEach((btn) => {
     btn.addEventListener('click', () => {
       handleControl(btn.dataset.robot, btn.dataset.control, btn);
     });
   });
-  host.querySelectorAll('[data-share-camera]').forEach((btn) => {
+  el.querySelectorAll('[data-share-camera]').forEach((btn) => {
     btn.addEventListener('click', () => {
       handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
     });
   });
+  return el;
+}
+
+// Updates only the mutable fields of an existing card. Never touches the
+// <tf-video-stream> node, so the live MSE stream keeps playing across polls.
+function updateCard(el, r) {
+  const status = r.status || '';
+  const badge = el.querySelector('[data-field="status"]');
+  if (badge) {
+    badge.setAttribute('tone', statusTone(status));
+    badge.setAttribute('value', statusLabel(status));
+  }
+
+  setMetric(el, 'battery', batteryPercent(r), (v) => `${Math.round(Number(v))}%`);
+  setMetric(el, 'rtt', rttMs(r), (v) => `${Math.round(Number(v))} ms`);
+
+  const ownerEl = el.querySelector('[data-field="owner"]');
+  if (ownerEl) {
+    ownerEl.textContent = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
+  }
+
+  // Capability chips: only rebuild when the set actually changed.
+  const capsBox = el.querySelector('[data-field="caps"]');
+  if (capsBox) {
+    const caps = capabilities(r);
+    const key = caps.join('');
+    if (capsBox.dataset.capsKey !== key) {
+      capsBox.dataset.capsKey = key;
+      capsBox.innerHTML = caps
+        .map((c) => `<tf-chip variant="tag" tone="muted" size="sm" label="${escapeAttr(c)}"></tf-chip>`)
+        .join('');
+    }
+  }
+
+  // Offline robots can't take commands: disable control + share buttons.
+  const offline = !isControllable(status);
+  el.querySelectorAll('[data-control], [data-share-camera]').forEach((btn) => {
+    if (offline) btn.setAttribute('disabled', '');
+    else btn.removeAttribute('disabled');
+  });
+}
+
+// Updates a metric row in place, inserting/removing the row's value text. Rows
+// that are optional (battery/RTT) keep a stable slot rendered by robotCard().
+function setMetric(el, fieldName, raw, format) {
+  const row = el.querySelector(`[data-metric="${fieldName}"]`);
+  if (!row) return;
+  if (raw == null) {
+    row.hidden = true;
+    return;
+  }
+  row.hidden = false;
+  const valueEl = row.querySelector('.robots-metric-value');
+  if (valueEl) valueEl.textContent = format(raw);
+}
+
+// A robot is controllable unless its status reads as offline/lost/error.
+function isControllable(status) {
+  const s = String(status || '').toLowerCase();
+  return s !== 'offline' && s !== 'lost' && s !== 'error';
 }
 
 function robotCard(r) {
@@ -200,20 +317,17 @@ function robotCard(r) {
   const caps = capabilities(r);
   const cam = cameraId(r);
 
-  const metrics = [];
-  if (battery != null) {
-    metrics.push(metricRow('zap', 'Bateria', `${Math.round(Number(battery))}%`));
-  }
-  if (rtt != null) {
-    metrics.push(metricRow('bolt', 'RTT', `${Math.round(Number(rtt))} ms`));
-  }
-  metrics.push(metricRow('host', 'Węzeł', owner));
+  // Battery/RTT rows always render so updateCard() has a stable slot to fill;
+  // they're hidden via [hidden] when the value is absent (mirrors null checks).
+  const metrics = [
+    metricRow('zap', 'Bateria', battery != null ? `${Math.round(Number(battery))}%` : '', 'battery', battery == null),
+    metricRow('bolt', 'RTT', rtt != null ? `${Math.round(Number(rtt))} ms` : '', 'rtt', rtt == null),
+    metricRow('host', 'Węzeł', '', 'owner', false, owner),
+  ];
 
-  const capsHtml = caps.length
-    ? `<div class="robots-caps">${caps
-        .map((c) => `<tf-chip variant="tag" tone="muted" size="sm" label="${escapeAttr(c)}"></tf-chip>`)
-        .join('')}</div>`
-    : '';
+  const capsHtml = `<div class="robots-caps" data-field="caps" data-caps-key="${escapeAttr(caps.join(''))}">${caps
+    .map((c) => `<tf-chip variant="tag" tone="muted" size="sm" label="${escapeAttr(c)}"></tf-chip>`)
+    .join('')}</div>`;
 
   const cameraHtml = cam
     ? `
@@ -227,14 +341,14 @@ function robotCard(r) {
     : '';
 
   return `
-    <article class="robots-card">
+    <article class="robots-card" data-robot-card="${escapeAttr(id)}" data-camera-id="${escapeAttr(cam ?? '')}">
       <div class="robots-card-top">
         <div class="robots-card-ico">${sprite('cpu')}</div>
         <div class="robots-card-id">
           <div class="robots-card-name">${escapeHtml(id || '(bez identyfikatora)')}</div>
           <div class="robots-card-kind">${escapeHtml(kind)}</div>
         </div>
-        <tf-badge tone="${statusTone(status)}" value="${escapeAttr(statusLabel(status))}"></tf-badge>
+        <tf-badge data-field="status" tone="${statusTone(status)}" value="${escapeAttr(statusLabel(status))}"></tf-badge>
       </div>
 
       <div class="robots-metrics">${metrics.join('')}</div>
@@ -257,12 +371,19 @@ function robotCard(r) {
   `;
 }
 
-function metricRow(icon, label, value) {
+// `metricName` is the stable update key (battery/rtt/owner) used by updateCard().
+// The owner row carries its value in a [data-field="owner"] span (updated by id),
+// the numeric rows in `.robots-metric-value` (updated by formatted value).
+function metricRow(icon, label, value, metricName, hidden, ownerValue) {
+  const isOwner = metricName === 'owner';
+  const valueSpan = isOwner
+    ? `<span class="robots-metric-value" data-field="owner">${escapeHtml(ownerValue ?? '')}</span>`
+    : `<span class="robots-metric-value">${escapeHtml(value)}</span>`;
   return `
-    <div class="robots-metric">
+    <div class="robots-metric" data-metric="${escapeAttr(metricName)}"${hidden ? ' hidden' : ''}>
       <span class="robots-metric-ico">${sprite(icon)}</span>
       <span class="robots-metric-label">${escapeHtml(label)}</span>
-      <span class="robots-metric-value">${escapeHtml(value)}</span>
+      ${valueSpan}
     </div>`;
 }
 
