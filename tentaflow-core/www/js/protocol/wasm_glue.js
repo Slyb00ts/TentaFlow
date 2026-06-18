@@ -1384,23 +1384,34 @@ export function encodeAliasVisibilitySetRequest(alias_id, visibility) {
 }
 
 /**
- * MessageBody::ApiKeyCreateRequest { name, scopes }.
+ * MessageBody::ApiKeyCreateRequest { name, key_type, subject_id, scope_resources }.
+ * `scope_resources` travels as two parallel arrays (types[i] + ids[i]) so the
+ * wasm-bindgen boundary stays on simple `Vec<String>` values.
  * @param {string} name
- * @param {string[]} scopes
+ * @param {string} key_type
+ * @param {string | null | undefined} subject_id
+ * @param {string[]} scope_types
+ * @param {string[]} scope_ids
  * @returns {Uint8Array}
  */
-export function encodeApiKeyCreateRequest(name, scopes) {
+export function encodeApiKeyCreateRequest(name, key_type, subject_id, scope_types, scope_ids) {
     const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passArrayJsValueToWasm0(scopes, wasm.__wbindgen_malloc);
+    const ptr1 = passStringToWasm0(key_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeApiKeyCreateRequest(ptr0, len0, ptr1, len1);
+    var ptr2 = isLikeNone(subject_id) ? 0 : passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArrayJsValueToWasm0(scope_types, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArrayJsValueToWasm0(scope_ids, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
+    return v6;
 }
 
 /**
@@ -1432,6 +1443,89 @@ export function encodeApiKeyRevokeRequest(key_id) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * MessageBody::ApiKeyRotateRequest { key_uid }.
+ * @param {string} key_uid
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyRotateRequest(key_uid) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyRotateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ApiKeyScopeClearRequest { key_uid, resource_type, resource_id }.
+ * @param {string} key_uid
+ * @param {string} resource_type
+ * @param {string} resource_id
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeClearRequest(key_uid, resource_type, resource_id) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(resource_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(resource_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeClearRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::ApiKeyScopeListRequest { key_uid }.
+ * @param {string} key_uid
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeListRequest(key_uid) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level }.
+ * @param {string} key_uid
+ * @param {string} resource_type
+ * @param {string} resource_id
+ * @param {string} access_level
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeSetRequest(key_uid, resource_type, resource_id, access_level) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(resource_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(resource_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(access_level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeSetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
 }
 
 /**
