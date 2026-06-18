@@ -238,6 +238,21 @@ pub(super) fn attach_mp4_branch_webrtc(
         .property_from_str("config-interval", "-1")
         .build()
         .map_err(|e| format!("h264parse build: {e}"))?;
+    // The appsrc stamps buffers with `do-timestamp=true` (arrival wall-clock),
+    // so whenever the upstream H264Gate re-waits for an IDR after a WiFi RTP
+    // sequence gap, the clock keeps advancing while no AU is pushed. The stream
+    // resumes with a forward DTS jump equal to the stall, which mp4mux writes as
+    // a baseMediaDecodeTime discontinuity. MSE's decoder rejects that gap, sets
+    // HTMLMediaElement.error, and the next appendBuffer throws — the ~4s black
+    // cycle. h264timestamper rebuilds a clean, monotonic, gap-free DTS/PTS
+    // timeline from the H.264 SPS framerate and picture-order count, so the
+    // muxed fragments stay continuous regardless of arrival jitter or gate
+    // re-primes. RTSP doesn't need this (rtspsrc carries the camera's own
+    // continuous RTP timeline); this appsrc path is the only jittery source.
+    let timestamper = gst::ElementFactory::make("h264timestamper")
+        .property("name", "timestamper_branch_b")
+        .build()
+        .map_err(|e| format!("h264timestamper build: {e}"))?;
     // streamable=true → ftyp+moov init segment on the first fragment, then
     // moof+mdat media fragments with no finalize. fragment-duration in ms.
     let mux = gst::ElementFactory::make("mp4mux")
@@ -255,7 +270,7 @@ pub(super) fn attach_mp4_branch_webrtc(
         .map_err(|e| format!("appsink_b build: {e}"))?;
 
     pipeline
-        .add_many([&queue_b, &parse, &mux, &sink])
+        .add_many([&queue_b, &parse, &timestamper, &mux, &sink])
         .map_err(|e| format!("add_many branch B: {e}"))?;
 
     let tee_src_pad = tee
@@ -265,7 +280,7 @@ pub(super) fn attach_mp4_branch_webrtc(
             // them so a failed attach never leaves dangling elements that a
             // later attach would trip over.
             let refs: Vec<&gst::Element> =
-                [&queue_b, &parse, &mux, &sink].into_iter().collect();
+                [&queue_b, &parse, &timestamper, &mux, &sink].into_iter().collect();
             let _ = pipeline.remove_many(refs);
             "tee src_%u request for branch B failed".to_string()
         })?;
@@ -277,7 +292,7 @@ pub(super) fn attach_mp4_branch_webrtc(
     // state is returned to the session unchanged.
     let state = Mp4BranchState {
         tee_src_pad,
-        elements: vec![queue_b, parse, mux, sink],
+        elements: vec![queue_b, parse, timestamper, mux, sink],
     };
 
     // `wire_and_link` performs every fallible step that follows pad acquisition;
@@ -294,39 +309,61 @@ pub(super) fn attach_mp4_branch_webrtc(
 /// the branch up to the pipeline's current state. Split out from
 /// `attach_mp4_branch_webrtc` so a single error path can drive the shared
 /// detach/cleanup on any failure after the tee request pad exists. The element
-/// order in `state.elements` is `[queue_b, parse, mux, sink]`.
+/// order in `state.elements` is `[queue_b, parse, timestamper, mux, sink]`.
 fn wire_and_link_webrtc_branch(
     state: &Mp4BranchState,
     publisher: &Arc<Mp4StreamPublisher>,
 ) -> std::result::Result<(), String> {
     let queue_b = &state.elements[0];
     let parse = &state.elements[1];
-    let sink = &state.elements[3];
+    let sink = &state.elements[4];
 
-    // Keyframe-sync gate on the parse SINK pad. Branch B attaches mid-GOP, so
-    // the first buffers off the tee are bare P-slices (NAL type 1). A standalone
-    // h264parse cannot frame those: it would push before negotiating src caps,
-    // and gstbaseparse posts a FATAL bus error ("No caps set ... GstH264Parse")
-    // that tears down the WHOLE shared pipeline (Branch A included). The upstream
-    // gate coalesces SPS+PPS+IDR into the single keyframe buffer (NAL type 5), so
-    // we drop every buffer reaching this parse until that self-contained keyframe
-    // AU arrives, then remove the probe. Gating on the IDR (not a standalone SPS)
-    // is essential: mid-stream the gate also re-emits standalone SPS and PPS in
-    // their OWN buffers just before the IDR; matching the first SPS would pass an
-    // SPS-only AU (num_pps=0), the parse could not build avcC codec_data, and it
-    // would die exactly as before. The IDR buffer carries SPS+PPS+IDR together.
+    // Permanent buffer gate on the parse SINK pad. Two jobs:
+    //
+    // 1. Keyframe-sync at attach. Branch B attaches mid-GOP, so the first buffers
+    //    off the tee are bare P-slices (NAL type 1). A standalone h264parse cannot
+    //    frame those before an IDR: it would push before negotiating src caps and
+    //    gstbaseparse posts a FATAL "No caps set ... GstH264Parse" bus error that
+    //    tears down the WHOLE shared pipeline (Branch A included). We drop every
+    //    buffer until the upstream gate's coalesced SPS+PPS+IDR keyframe AU (NAL
+    //    type 5) arrives. Gating on the IDR (not a standalone SPS) is essential:
+    //    an SPS-only AU has num_pps=0, the parse could not build avcC codec_data,
+    //    and it would die exactly as before.
+    //
+    // 2. Drop param-only access units forever after. Mid-stream the upstream gate
+    //    re-emits standalone SPS and PPS in their OWN au-aligned buffers (so
+    //    Branch A's decodebin can re-sync after a drop). Those have no coded
+    //    slice. If they reach mp4mux they become samples with no picture, and
+    //    the browser/ffmpeg decoder reports "missing picture in access unit" /
+    //    "no frame" → MEDIA_ERR_DECODE, which set HTMLMediaElement.error and
+    //    triggered the client's ~4s reset cycle. The keyframe AU already carries
+    //    SPS+PPS inline (coalesced) and h264parse config-interval=-1 re-inserts
+    //    them before every keyframe, so dropping the standalone param-only AUs
+    //    loses nothing the muxed stream needs. We keep only AUs that contain a
+    //    VCL slice (NAL types 1..=5).
     let parse_sink = parse
         .static_pad("sink")
         .ok_or_else(|| "branch B h264parse sink pad missing".to_string())?;
-    parse_sink.add_probe(gst::PadProbeType::BUFFER, |_pad, info| {
+    let synced = std::sync::atomic::AtomicBool::new(false);
+    parse_sink.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         let Some(buffer) = info.buffer() else {
             return gst::PadProbeReturn::Ok;
         };
         let Ok(map) = buffer.map_readable() else {
             return gst::PadProbeReturn::Drop;
         };
-        if annexb_contains_idr(map.as_slice()) {
-            gst::PadProbeReturn::Remove
+        let data = map.as_slice();
+        if !synced.load(std::sync::atomic::Ordering::Relaxed) {
+            if annexb_contains_idr(data) {
+                synced.store(true, std::sync::atomic::Ordering::Relaxed);
+                return gst::PadProbeReturn::Ok;
+            }
+            return gst::PadProbeReturn::Drop;
+        }
+        // Post-sync: forward only slice-bearing access units; drop param-only
+        // (SPS/PPS/SEI/AUD) buffers that would mux as picture-less samples.
+        if annexb_contains_vcl_slice(data) {
+            gst::PadProbeReturn::Ok
         } else {
             gst::PadProbeReturn::Drop
         }
@@ -374,6 +411,29 @@ fn annexb_contains_idr(data: &[u8]) -> bool {
     false
 }
 
+/// Return true if an Annex-B byte-stream buffer contains a coded VCL slice (NAL
+/// types 1..=5: non-IDR/partition/IDR slices). A buffer with only parameter sets
+/// (SPS=7/PPS=8), SEI (6) or AUD (9) carries no picture, so muxing it as its own
+/// access unit yields a sample the decoder rejects ("missing picture in access
+/// unit"). Dropping such param-only AUs from the mux branch keeps every muxed
+/// sample a real frame. Scans `00 00 01` start codes (the 4-byte prefix shares
+/// the 3-byte suffix) and reads the NAL header's low 5 bits.
+fn annexb_contains_vcl_slice(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let t = data[i + 3] & 0x1F;
+            if (1..=5).contains(&t) {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Detach Branch B from the webrtc pipeline. Delegates to the shared RTSP
 /// teardown — the unlink/NULL/remove/release-pad sequence is source-agnostic.
 pub(super) fn detach_mp4_branch_webrtc(
@@ -399,7 +459,7 @@ pub async fn webrtc_pump(mut rx: mpsc::Receiver<bytes::Bytes>, appsrc: gst_app::
 
 #[cfg(test)]
 mod tests {
-    use super::annexb_contains_idr;
+    use super::{annexb_contains_idr, annexb_contains_vcl_slice};
 
     fn nal(ty: u8) -> Vec<u8> {
         vec![0, 0, 0, 1, ty & 0x1F, 0xAA, 0xBB]
@@ -429,5 +489,23 @@ mod tests {
         // 3-byte start code variant: 00 00 01 <nal-header>.
         let buf = vec![0, 0, 1, 5, 0x11];
         assert!(annexb_contains_idr(&buf));
+    }
+
+    #[test]
+    fn vcl_slice_present_in_frames_absent_in_param_only() {
+        // Coalesced SPS+PPS+IDR keyframe → has a VCL slice (IDR=5).
+        let mut key = nal(7);
+        key.extend_from_slice(&nal(8));
+        key.extend_from_slice(&nal(5));
+        assert!(annexb_contains_vcl_slice(&key));
+        // A lone P-slice (type 1) → VCL present.
+        assert!(annexb_contains_vcl_slice(&nal(1)));
+        // Standalone SPS+PPS (the mid-stream param-only AU) → NO VCL slice.
+        let mut params = nal(7);
+        params.extend_from_slice(&nal(8));
+        assert!(!annexb_contains_vcl_slice(&params));
+        // SEI(6) and AUD(9) only → NO VCL slice.
+        assert!(!annexb_contains_vcl_slice(&nal(6)));
+        assert!(!annexb_contains_vcl_slice(&nal(9)));
     }
 }

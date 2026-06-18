@@ -348,7 +348,17 @@ class TfVideoStream extends HTMLElement {
     if (!ranges || ranges.length === 0) return;
     const start = ranges.start(0);
     const end = ranges.end(ranges.length - 1);
-    const TARGET_LATENCY_SECS = 0.5;
+    // Hold a cushion behind the live edge instead of riding it. Seeking to
+    // `end - tiny` left the playhead with ~0.07s buffered ahead, so any network
+    // hiccup underran the decoder and stalled. A ~1s cushion keeps a few
+    // fragments queued ahead of the playhead; the camera's wall-clock latency
+    // stays low while the player no longer starves on jitter.
+    const TARGET_LATENCY_SECS = 1.0;
+    // Only build the initial cushion before first play: wait until enough is
+    // buffered so playback starts with room ahead rather than at the edge.
+    if (v.paused && end - start < TARGET_LATENCY_SECS && v.currentTime <= start) {
+      return;
+    }
     if (v.currentTime < start || end - v.currentTime > KEEP_WINDOW_SECS) {
       try {
         v.currentTime = Math.max(start, end - TARGET_LATENCY_SECS);
