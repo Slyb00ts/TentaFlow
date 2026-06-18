@@ -455,10 +455,23 @@ async function loadSubjectLevels(subjectType, subjectId) {
   return map;
 }
 
+// Two-row header: top row groups columns under Modele / Flow / Aliasy
+// (spanning), bottom row carries the resource names — 1:1 with mockup 03.
+function matrixHead(firstLabel) {
+  const groups = [
+    { label: t('access_keys.models', 'Modele'), icon: 'model', items: resources.model.map((r) => ({ ...r, type: 'model' })) },
+    { label: 'Flow', icon: 'flow', items: resources.flow.map((r) => ({ ...r, type: 'flow' })) },
+    { label: t('access_keys.aliases', 'Aliasy'), icon: 'link', items: resources.alias.map((r) => ({ ...r, type: 'alias' })) },
+  ].filter((g) => g.items.length > 0);
+  const top = groups.map((g) => `<th class="grp" colspan="${g.items.length}"><svg class="icon"><use href="#i-${g.icon}"/></svg> ${escapeHtml(g.label)}</th>`).join('');
+  const names = groups.flatMap((g) => g.items).map((c) => `<th class="func" title="${escapeAttr(c.type + ':' + c.id)}">${escapeHtml(c.name)}</th>`).join('');
+  return `<tr><th rowspan="2" style="min-width:220px;vertical-align:bottom;">${escapeHtml(firstLabel)}</th>${top}</tr><tr>${names}</tr>`;
+}
+
 async function renderMatrixGrid(grid) {
   const cols = allResourceColumns();
   if (matrixSubtab === 'default') {
-    grid.innerHTML = `<table class="perm-matrix"><thead><tr><th style="min-width:220px;">${escapeHtml(t('access_keys.defaults', 'Domyślne'))}</th>${cols.map((c) => `<th class="func" title="${escapeAttr(c.id)}">${escapeHtml(c.name)}</th>`).join('')}</tr></thead>
+    grid.innerHTML = `<table class="perm-matrix"><thead>${matrixHead(t('access_keys.defaults', 'Domyślne'))}</thead>
       <tbody><tr class="row-default"><td><div class="group-name">${escapeHtml(t('access_keys.default_v1', 'Domyślne (/v1)'))}</div><div class="group-meta">${escapeHtml(t('access_keys.default_meta', 'fallback = DENY'))}</div></td>
       ${cols.map(() => `<td class="func"><button class="perm-btn deny" disabled><svg class="icon"><use href="#i-x"/></svg></button></td>`).join('')}</tr></tbody></table>`;
     return;
@@ -466,7 +479,7 @@ async function renderMatrixGrid(grid) {
   const subjects = await subjectRows();
   if (subjects.length === 0) { grid.innerHTML = `<div class="empty-big">${escapeHtml(t('access_keys.no_subjects', 'Brak podmiotów'))}</div>`; return; }
   const levels = await Promise.all(subjects.map((s) => loadSubjectLevels(s.subjectType, s.subjectId)));
-  const head = `<tr><th style="min-width:220px;">${escapeHtml(t('access_keys.subject', 'Podmiot'))}</th>${cols.map((c) => `<th class="func" title="${escapeAttr(c.type + ':' + c.id)}">${escapeHtml(c.name)}<br><span style="opacity:.6">${escapeHtml(c.type)}</span></th>`).join('')}</tr>`;
+  const head = matrixHead(t('access_keys.subject', 'Podmiot'));
   const rowsHtml = subjects.map((s, i) => {
     const lv = levels[i];
     const cells = cols.map((c) => {

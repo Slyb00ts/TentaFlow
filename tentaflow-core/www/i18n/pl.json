@@ -3118,6 +3118,7 @@
     "perm_hint": "Zmień uprawnienia tej grupy do poszczególnych zasobów. Auto = domyślny dostęp (zezwolono), Zezwól = explicit allow, Odmów = explicit deny. Priorytet: User > Grupa > Default.",
     "perm_models": "Modele",
     "perm_flows": "Flowy",
+    "perm_aliases": "Aliasy",
     "perm_addons": "Addony",
     "perm_auto": "Auto",
     "perm_allow": "Zezwól",
@@ -3158,7 +3159,7 @@
     "delete_account": "Usuń konto",
     "delete_group": "Usuń grupę",
     "group_label": "Grupa",
-    "perms_user_todo": "Uprawnienia użytkownika (override nad grupami) — w kolejnej wersji."
+    "perms_user_effective": "Efektywne uprawnienia = override usera na uprawnieniach jego grup. — = dziedziczy z grupy."
   },
   "groups": {
     "title": "Grupy",
