@@ -1,0 +1,41 @@
+# =============================================================================
+# Plik: nemotron-page-elements.toml
+# Opis: Manifest detektora elementow strony (YOLOX, NVIDIA NeMo Retriever).
+#       Wykrywa bloki ukladu dokumentu (tekst, naglowki, tabele, obrazy itp.)
+#       do ekstrakcji. Wagi PyTorch .pth z HF; deploy eksportuje je do ONNX i
+#       serwuje detekcje przez onnxruntime (CPU/CUDA/ROCm) - wspolny
+#       python-bundle vision/python/nemotron-yolox. Custom API /detect.
+# =============================================================================
+
+[engine]
+id = "nemotron-page-elements"
+category = "vision"
+name = "Nemotron Page Elements"
+description_pl = "Detektor elementow strony dokumentu (YOLOX, NeMo Retriever). Wykrywa bloki ukladu do ekstrakcji. Wagi .pth -> ONNX przy deployu."
+description_en = "Document page-element detector (YOLOX, NeMo Retriever). Detects layout blocks for extraction. .pth -> ONNX export at deploy."
+homepage = "https://huggingface.co/nvidia/nemotron-page-elements-v3"
+license = "Apache-2.0"
+icon = "yolo"
+resource_kind = "ai"
+default_port = 5086
+api = "custom"
+version = "v3"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
+output_modalities = ["text"]
+
+[deploy.docker]
+context_path = "vision/docker/nemotron-yolox"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "vision/python/nemotron-yolox"
+
+[[model_preset]]
+id = "nemotron-page-elements-v3"
+display_name = "Nemotron Page Elements v3"
+repo = "nvidia/nemotron-page-elements-v3"
+recommended = true

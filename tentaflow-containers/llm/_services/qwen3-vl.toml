@@ -1,0 +1,44 @@
+# Manifest serwisu Qwen3-VL — zamiennik VLM dla platform nie-NVIDIA (GPU AMD/CPU).
+# Model wizualno-jezykowy (tekst + obraz na wejsciu, tekst na wyjsciu) serwowany
+# przez vLLM w trybie generacyjnym chat. Docker (sidecar QUIC) oraz natywny
+# python-bundle (CUDA/ROCm/CPU). Apple Silicon ma osobny silnik `qwen3-vl-mlx`
+# (mlx-vlm) w qwen3-vl-mlx.toml. Na sciezce NVIDIA/CUDA uzywamy oryginalnych
+# Nemotron VLM (presety w vllm.toml) — tu zamiennik dla pozostalych platform.
+
+[engine]
+id = "qwen3-vl"
+category = "llm"
+name = "Qwen3-VL"
+description_pl = "Model wizualno-jezykowy Qwen3-VL (tekst i obraz) serwowany przez vLLM. Zamiennik VLM dla GPU AMD/CPU. Wybierz wariant w kreatorze."
+description_en = "Qwen3-VL vision-language model (text and image) served via vLLM. VLM replacement for AMD GPU/CPU. Pick a variant in the wizard."
+homepage = "https://huggingface.co/Qwen"
+license = "apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "v3"
+dgx_spark = false
+service_surfaces = ["chat"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+
+[deploy.docker]
+context_path = "llm/docker/qwen3-vl"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "llm/python/qwen3-vl"
+
+[[model_preset]]
+id = "qwen3-vl-30b-a3b-instruct"
+display_name = "Qwen3-VL 30B A3B Instruct (VLM reasoning)"
+repo = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+recommended = true
+
+[[model_preset]]
+id = "qwen3-vl-4b-instruct"
+display_name = "Qwen3-VL 4B Instruct (captioning)"
+repo = "Qwen/Qwen3-VL-4B-Instruct"

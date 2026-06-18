@@ -1,0 +1,39 @@
+# =============================================================================
+# Plik: paddle-ocr-mlx.toml
+# Opis: Manifest serwisu PaddleOCR-MLX — wariant PaddleOCR-VL na Apple Silicon
+#       (port MLX). Wbudowany engine (embedded) dla macOS/iOS, bez kontenera
+#       docker i bez bundla python. Surface "documents", wejscie obraz,
+#       wyjscie tekst + layout.
+# =============================================================================
+
+[engine]
+id = "paddle-ocr-mlx"
+category = "vision"
+name = "PaddleOCR (MLX)"
+description_pl = "PaddleOCR-VL na Apple Silicon (MLX). Wbudowany OCR/parsing dokumentow dla macOS/iOS. Zwraca tekst z ukladem strony."
+description_en = "PaddleOCR-VL on Apple Silicon (MLX). Embedded document OCR/parsing for macOS/iOS. Returns text with page layout."
+homepage = "https://huggingface.co/mlx-community/paddleocr-vl.swift"
+license = "Apache-2.0"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "vl-mlx"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx-ocr"
+
+[[model_preset]]
+id = "paddleocr-vl-mlx"
+display_name = "PaddleOCR-VL (MLX)"
+repo = "mlx-community/paddleocr-vl.swift"
+recommended = true
+
+[[model_preset]]
+id = "paddleocr-vl-mlx-gamhtoi"
+display_name = "PaddleOCR-VL-MLX"
+repo = "gamhtoi/PaddleOCR-VL-MLX"

@@ -1,0 +1,46 @@
+# =============================================================================
+# Plik: paddle-ocr.toml
+# Opis: Manifest serwisu PaddleOCR-VL przez transformers, GPU (CUDA/ROCm),
+#       zgodny z B300; Apple przez paddle-ocr-mlx. Uniwersalny silnik OCR i
+#       parsingu dokumentow (model VLM ~0.9B ladowany przez transformers, bo
+#       framework paddlepaddle nie ma kerneli pod sm_103). Sluzy jako zamiennik
+#       dla nemotron-ocr / nemotron-parse. Deploy native python-bundle (warianty
+#       cuda + rocm) oraz docker z sidecarem QUIC.
+# =============================================================================
+
+[engine]
+id = "paddle-ocr"
+category = "vision"
+name = "PaddleOCR"
+description_pl = "PaddleOCR-VL przez transformers, GPU (CUDA/ROCm), zgodny z B300; Apple przez paddle-ocr-mlx. Uniwersalny OCR/parsing dokumentow (VLM ~0.9B) — zamiennik dla nemotron-ocr/nemotron-parse. Zwraca tekst z ukladem strony."
+description_en = "PaddleOCR-VL via transformers, GPU (CUDA/ROCm), B300-compatible; Apple via paddle-ocr-mlx. Universal document OCR/parsing (VLM ~0.9B) — a replacement for nemotron-ocr/nemotron-parse. Returns text with page layout."
+homepage = "https://github.com/PaddlePaddle/PaddleOCR"
+license = "Apache-2.0"
+icon = "vision"
+default_port = 8095
+api = "custom"
+version = "pp-ocrv5"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "vision/python/paddle-ocr"
+
+[deploy.docker]
+context_path = "vision/docker/paddle-ocr"
+platforms = ["linux", "windows"]
+transport = "sidecar-quic"
+
+[[model_preset]]
+id = "pp-ocrv5-server"
+display_name = "PP-OCRv5 (det server + rec mobile)"
+repo = "PaddlePaddle/PP-OCRv5_server_det"
+recommended = true
+
+[[model_preset]]
+id = "paddleocr-vl"
+display_name = "PaddleOCR-VL"
+repo = "PaddlePaddle/PaddleOCR-VL"

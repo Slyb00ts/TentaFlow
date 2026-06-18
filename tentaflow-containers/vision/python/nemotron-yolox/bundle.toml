@@ -1,0 +1,44 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Wspolny python-bundle dla trzech detektorow YOLOX z NVIDIA NeMo
+#       Retriever (page-elements, graphic-elements, table-structure). Bundle
+#       serwuje detekcje BEZPOSREDNIO w PyTorch na GPU (server.py): laduje wagi
+#       .pth do sieci YOLOX i liczy inferencje na CUDA/ROCm. Wybor modelu
+#       nastepuje przez zmienne MODEL/MODEL_REPO ustawiane per silnik.
+#       onnxruntime NIE jest uzywany na sciezce serwowania — B300 (sm_103) nie
+#       ma kerneli onnxruntime-gpu, a torch cu130 wspiera sm_103.
+# Przykład: MODEL_REPO=nvidia/nemotron-page-elements-v3 python ${BUNDLE_DIR}/server.py
+# =============================================================================
+
+[bundle]
+engine = "nemotron-yolox"
+description = "NVIDIA NeMo Retriever YOLOX document-element detectors served directly in PyTorch (GPU)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "torch"
+
+[launch]
+command = "python"
+# server.py laduje wagi .pth do sieci YOLOX na GPU i startuje FastAPI/uvicorn
+# na porcie uslugi. Brak GPU => RuntimeError (bez fallbacku CPU).
+args = ["${BUNDLE_DIR}/server.py"]
+internal_port = 8086
+
+[requires]
+gpu_memory_gb = 4
+disk_gb = 6
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+# Wariant CUDA: torch z wheelami cu130 (wspiera sm_103/B300), reszta z PyPI.
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+install_hint = "TORCH_DEVICE=cuda"
+
+# Wariant ROCm: torch z wheelami rocm7.0 dla GPU AMD (torch raportuje cuda API).
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+install_hint = "TORCH_DEVICE=cuda"

@@ -74,3 +74,9 @@ display_name = "Qwen 3.5 0.8B Q4_K_M"
 repo = "Qwen/Qwen3.5-0.8B-GGUF"
 quantization = "Q4_K_M"
 recommended = true
+
+[[model_preset]]
+id = "nemotron-3-super-120b-a12b-gguf"
+display_name = "Nemotron 3 Super 120B (GGUF Q4_K_M)"
+repo = "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF"
+quantization = "Q4_K_M"

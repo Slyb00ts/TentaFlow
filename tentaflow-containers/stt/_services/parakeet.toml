@@ -27,3 +27,8 @@ id = "parakeet-tdt-0.6b-v3"
 display_name = "Parakeet TDT 0.6B v3 (multilingual)"
 repo = "nvidia/parakeet-tdt-0.6b-v3"
 recommended = true
+
+[[model_preset]]
+id = "parakeet-tdt-0.6b-v2"
+display_name = "Parakeet TDT 0.6B v2 (EN)"
+repo = "nvidia/parakeet-tdt-0.6b-v2"
