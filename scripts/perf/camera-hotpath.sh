@@ -28,9 +28,8 @@ mkdir -p "${OUT_DIR}"
 
 # sccache is broken repo-wide — force it off for every cargo call here.
 export RUSTC_WRAPPER=
-# The core lib references api::dashboard unconditionally from dispatch/{handlers,
-# state}.rs, so any bench build needs this feature to link the lib.
-FEATURES="dashboard-api"
+# Camera benches need the camera feature for the video pipeline types.
+FEATURES="camera"
 # Profiling needs frame pointers + symbols in the release bench binary.
 export CARGO_PROFILE_BENCH_DEBUG=1
 export CARGO_PROFILE_RELEASE_DEBUG=1

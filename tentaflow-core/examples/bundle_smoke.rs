@@ -6,7 +6,7 @@
 //       (chat completion / health), zapisuje raport do pliku, ubija proces.
 //
 //       Uzycie:
-//         cargo run --example bundle_smoke --features dashboard-api -- \
+//         cargo run --example bundle_smoke -- \
 //             <engine_id> [<MODEL_REPO>]
 //
 //       MODEL_REPO przekazywany jako env `MODEL` do bundla; dla TTS/STT moze

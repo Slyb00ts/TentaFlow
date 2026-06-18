@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["dashboard-api", "camera"] }
+tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["camera"] }
 chrono = "0.4"
 rand = "0.10.1"
 

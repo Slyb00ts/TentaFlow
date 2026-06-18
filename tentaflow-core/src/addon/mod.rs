@@ -2061,18 +2061,29 @@ impl AddonManager {
             }
         }
 
-        // K4: Wez instancje z mapy pod lockiem (krotko)
-        let mut addon_instance = {
-            let mut instances = self.instances.lock();
-            let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
-                anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id)
-            })?;
-
-            if addon_instances.is_empty() {
-                bail!("Brak dostepnych instancji addonu '{}'", addon_id);
+        // K4: Wez instancje z mapy pod lockiem (krotko). Single-instance addons
+        // share the one instance with the service-tick loop (call_tick_static),
+        // which removes it from the pool for the duration of on_tick. A tool call
+        // that lands mid-tick would otherwise see an empty pool and fail; wait
+        // briefly for the tick to return the instance instead. Bounded so a
+        // genuinely dead/never-started addon still surfaces an error promptly.
+        let acquire_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut addon_instance = loop {
+            {
+                let mut instances = self.instances.lock();
+                let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
+                    anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id)
+                })?;
+                if !addon_instances.is_empty() {
+                    // Wyjmij pierwsza instancje — lock jest zwalniany natychmiast
+                    break addon_instances.remove(0);
+                }
             }
-            // Wyjmij pierwsza instancje — lock jest zwalniany natychmiast
-            addon_instances.remove(0)
+            if std::time::Instant::now() >= acquire_deadline {
+                bail!("Brak dostepnych instancji addonu '{}' (zajety)", addon_id);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         };
         // Write lock zwolniony — inne watki moga operowac na mapie
 

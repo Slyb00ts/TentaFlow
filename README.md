@@ -250,7 +250,7 @@ cd tentaflow && cargo build --release --features gpu-cuda
 
 Open the dashboard at **https://localhost:8090**.
 
-Useful `tentaflow-core` features: `dashboard-api` (web UI + API), `inference-llamacpp`,
+Useful `tentaflow-core` features: `inference-llamacpp`,
 `inference-whisper` (default), `inference-sherpa`, `inference-mlx*` (Apple), `inference-diarization`,
 `gpu-cuda`, `docker`.
 

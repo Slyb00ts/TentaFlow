@@ -387,6 +387,16 @@ mod backend {
     /// BuildKit) does not support `COPY --chmod` and takes file modes from the
     /// tar headers — but the exec bit is unreliable on disk: the containers
     /// bundle ships scripts as 0644 and Windows has no exec bit at all.
+    /// Zwraca true dla wpisow ktore nie powinny trafic do tar kontekstu:
+    /// ciezkie katalogi cache (`target`, `node_modules`, `.git`, `.build*`),
+    /// nigdy nie kopiowane przez Dockerfile'e.
+    fn should_skip_context_entry(name: &std::ffi::OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        matches!(name, "target" | "node_modules" | ".git") || name.starts_with(".build")
+    }
+
     fn append_context_dir(
         builder: &mut tar::Builder<Vec<u8>>,
         dir: &Path,
@@ -395,7 +405,15 @@ mod backend {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            let rel = prefix.join(entry.file_name());
+            let name = entry.file_name();
+            // Pakujemy korzen bundla jako kontekst, wiec pomijamy ciezkie
+            // katalogi ktorych zaden Dockerfile nie kopiuje (cache buildow),
+            // zeby nie wysylac ich do daemona. Wykluczenia dotycza nazw, wiec
+            // nie ruszaja tentaflow-protocol/transport/voice, vendor, sidecar.
+            if should_skip_context_entry(&name) {
+                continue;
+            }
+            let rel = prefix.join(&name);
             if path.is_dir() {
                 builder.append_dir(&rel, &path)?;
                 append_context_dir(builder, &path, &rel)?;
@@ -414,14 +432,15 @@ mod backend {
         Ok(())
     }
 
-    /// Builds an image from `<containers_root>/<context_path>/`. Streams build
-    /// log lines into `log` (when present). The Dockerfile is expected at
-    /// `<context>/Dockerfile`; bollard reads it relative to the tar root, so
-    /// we pack the context directory itself (not its parent) and point at
-    /// `Dockerfile`.
+    /// Builds an image from `context` jako KORZENIA bundla (tar root). Dockerfile'e
+    /// kopiuja sciezki wzgledem korzenia bundla (`tentaflow-protocol`, `vendor`,
+    /// `tentaflow-containers/...`), wiec kontekstem jest korzen bundla, a `dockerfile_rel`
+    /// wskazuje plik Dockerfile pod podscieszka (`tentaflow-containers/<cat>/docker/<eng>/Dockerfile`).
+    /// Streams build log lines into `log` (when present).
     pub(super) async fn build_image_from_context(
         docker: &Docker,
         context: &Path,
+        dockerfile_rel: &str,
         tag: &str,
         log: Option<&LogSink>,
     ) -> DeployResult<()> {
@@ -434,8 +453,8 @@ mod backend {
             )));
         }
 
-        // Pack the context root as the tar root so the Dockerfile is at the
-        // top level. Bollard streams this body as the build context.
+        // Pack the bundle root as the tar root so Dockerfile COPY paths resolve
+        // against it. Bollard streams this body as the build context.
         let mut tar_builder = tar::Builder::new(Vec::new());
         append_context_dir(&mut tar_builder, context, Path::new(""))
             .map_err(|e| DeployError::Docker(format!("tar context: {}", e)))?;
@@ -444,7 +463,7 @@ mod backend {
             .map_err(|e| DeployError::Docker(format!("tar finalize: {}", e)))?;
 
         let opts = BuildImageOptions {
-            dockerfile: "Dockerfile".to_string(),
+            dockerfile: dockerfile_rel.to_string(),
             t: Some(tag.to_string()),
             rm: true,
             ..Default::default()
@@ -621,7 +640,7 @@ impl DeployStrategy for DockerDeploy {
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;
 
-        // Resolve build context against the extracted containers tree.
+        // Walidacja: podkatalog silnika musi istniec (czytelny blad gdy context_path zly).
         let context_dir = crate::paths::containers_root().join(context_path);
         if !context_dir.exists() {
             return Err(DeployError::Manifest(format!(
@@ -629,6 +648,16 @@ impl DeployStrategy for DockerDeploy {
                 context_dir.display()
             )));
         }
+        // Kontekstem budowania jest KORZEN bundla (rodzic `tentaflow-containers/`),
+        // bo Dockerfile'e kopiuja sciezki wzgledem korzenia bundla. Dockerfile
+        // lezy pod podscieszka silnika.
+        let bundle_root = crate::paths::containers_root()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                DeployError::Manifest("cannot resolve bundle root (containers_root has no parent)".into())
+            })?;
+        let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
         let image_tag = format!(
             "tentaflow/{}:{}",
             self.manifest.engine.id, self.manifest.engine.version
@@ -638,14 +667,16 @@ impl DeployStrategy for DockerDeploy {
         if !backend::image_exists(&docker, &image_tag).await? {
             if let Some(s) = &self.log_sink {
                 s.info(&format!(
-                    "[docker] building image {} from {}",
+                    "[docker] building image {} from {} (dockerfile {})",
                     image_tag,
-                    context_dir.display()
+                    bundle_root.display(),
+                    dockerfile_rel
                 ));
             }
             backend::build_image_from_context(
                 &docker,
-                &context_dir,
+                &bundle_root,
+                &dockerfile_rel,
                 &image_tag,
                 self.log_sink.as_ref(),
             )

@@ -1,6 +1,6 @@
 // ===== File: examples/dump_flows.rs — diagnostic: run migrations+seed on a DB
 // path and print the resulting flow list (id tail, name, node/edge counts).
-// Usage: cargo run --example dump_flows --features dashboard-api -- <db_path> =====
+// Usage: cargo run --example dump_flows -- <db_path> =====
 
 use std::path::Path;
 

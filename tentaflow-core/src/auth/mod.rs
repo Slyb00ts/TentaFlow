@@ -5,7 +5,6 @@
 
 pub mod acl;
 pub mod rate_limit;
-#[cfg(feature = "dashboard-api")]
 pub mod sso;
 
 pub use acl::UserContext;

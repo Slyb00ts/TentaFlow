@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: examples/system_check.rs
 // Opis: Uruchamia detekcje srodowiska i wypisuje co maszyna potrafi uruchomic.
-//       Uzycie: cargo run --example system_check --features inference-diarization,docker,dashboard-api
+//       Uzycie: cargo run --example system_check --features inference-diarization,docker
 // =============================================================================
 
 fn main() {

@@ -11,7 +11,7 @@
 //   * frame_url_issue                                              < 1 ms p99
 //   * frame_url_verify                                             < 1 ms p99
 //
-// Run: `cargo bench --features camera,dashboard-api --bench recording_perf
+// Run: `cargo bench --features camera --bench recording_perf
 //      -- --quick --noplot`
 
 #![cfg(feature = "camera")]

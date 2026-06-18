@@ -7,11 +7,11 @@
 //
 // Uzycie:
 //   cargo run --example embedded_smoke --no-default-features \
-//     --features inference-llamacpp,gpu-cuda,dashboard-api \
+//     --features inference-llamacpp,gpu-cuda \
 //     -- /mnt/d/models/Qwen3.5-0.8B-Q4_0.gguf
 //
 //   cargo run --example embedded_smoke --no-default-features \
-//     --features inference-whisper,gpu-cuda-whisper,dashboard-api \
+//     --features inference-whisper,gpu-cuda-whisper \
 //     -- whisper /path/to/sample.wav
 // =============================================================================
 

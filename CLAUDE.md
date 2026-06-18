@@ -8,7 +8,7 @@ No workspace Cargo.toml — each crate builds independently. Main binary: `tenta
 
 ```bash
 cd tentaflow && cargo build                                   # main binary
-cd tentaflow-core && cargo build --features dashboard-api     # core lib + dashboard
+cd tentaflow-core && cargo build                              # core lib + dashboard
 
 # Browser protocol glue (tentaflow-protocol-wasm). Without these two, build.rs
 # skips www/js/protocol/wasm_glue.{js,wasm} and the dashboard won't load.
@@ -33,7 +33,6 @@ if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
 
 | Flag | Purpose |
 |------|---------|
-| `dashboard-api` | Axum HTTP dashboard + API (opt-in; headless deploys skip it) |
 | `docker` | Docker management (bollard) |
 | `inference-llamacpp` / `inference-whisper` / `inference-sherpa` | llama.cpp / Whisper / sherpa-onnx backends |
 | `inference-mlx*` | Apple MLX (macOS/iOS) |

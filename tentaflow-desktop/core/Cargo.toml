@@ -19,7 +19,7 @@ path = "src/main.rs"
 mlx-swift-bridge = ["tentaflow-core/inference-mlx"]
 
 [dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "dashboard-api", "vector-milvus"] }
+tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "vector-milvus"] }
 tentaflow-ui = { path = "../../tentaflow-ui" }
 
 tokio = { version = "1.35", features = ["full"] }
@@ -37,4 +37,4 @@ uuid = { version = "1.0", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx"] }
