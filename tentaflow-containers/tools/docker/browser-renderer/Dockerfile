@@ -1,18 +1,19 @@
 # =============================================================================
 # Plik: Dockerfile
 # Opis: Obraz Playwright Chromium renderera dla stron JS-heavy w web research.
-# Przykład: docker build -t tentaflow-browser-renderer .
+# Przykład (kontekst = root projektu):
+#   docker build -f tentaflow-containers/tools/docker/browser-renderer/Dockerfile -t tentaflow-browser-renderer .
 # =============================================================================
 
 FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 
 WORKDIR /app
 
-COPY requirements.lock /app/requirements.lock
+COPY tentaflow-containers/tools/docker/browser-renderer/requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /app/requirements.lock
 
-COPY server.py /app/server.py
+COPY tentaflow-containers/tools/docker/browser-renderer/server.py /app/server.py
 
 ENV PORT=8092 \
     BROWSER_RENDERER_SKIP_BROWSER_INSTALL=1 \
