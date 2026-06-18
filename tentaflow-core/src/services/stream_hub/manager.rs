@@ -175,8 +175,18 @@ impl StreamHub {
         // the winner's source is the one we subscribe to. A racing winner that
         // is itself terminal collapses to the same clean failure.
         let Some(broadcaster) = entry.source.chunk_broadcaster() else {
-            // Drop the freshly created (unused) broadcaster handle.
-            drop(broadcaster);
+            // The (possibly race-winning) cached source is terminal — evict it so
+            // the next subscribe rebuilds a fresh source instead of reusing this
+            // dead zero-subscriber entry, then surface a clean failure. Guard on
+            // identity so we never evict a different entry that already replaced it.
+            {
+                let mut active = self.active.write();
+                if let Some(cur) = active.get(stream_id) {
+                    if Arc::ptr_eq(cur, &entry) {
+                        active.remove(stream_id);
+                    }
+                }
+            }
             return Err(StreamHubError::NotRegistered(stream_id.to_string()));
         };
         entry.subscribers.fetch_add(1, Ordering::AcqRel);
