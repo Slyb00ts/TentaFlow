@@ -228,7 +228,7 @@ function renderUserRow(u) {
     .map((g) => `<span class="group-tag">${escapeHtml(g.name)}</span>`)
     .join('');
   return `
-    <tr data-user-id="${u.id}">
+    <tr data-user-id="${escapeAttr(u.id)}">
       <td>
         <div class="tf-account-cell">
           <div class="tf-account-avatar">${escapeHtml(initials(u))}</div>
@@ -275,7 +275,7 @@ function renderGroupsTable() {
 function renderGroupRow(g) {
   const gIcon = `<svg viewBox="0 0 24 24"><use href="#i-users"/></svg>`;
   return `
-    <tr data-group-id="${g.id}">
+    <tr data-group-id="${escapeAttr(g.id)}">
       <td>
         <div class="tf-account-cell">
           <div class="tf-account-avatar">${gIcon}</div>
@@ -452,7 +452,8 @@ function renderUserDetailPanel(u) {
   return `
     <div class="tf-section-card">
       <h3>${escapeHtml(I18n.t('users.tab_perms'))}</h3>
-      <div class="users-empty">${escapeHtml(I18n.t('users.perms_user_todo'))}</div>
+      <div class="perm-header-hint">${escapeHtml(I18n.t('users.perms_user_effective'))}</div>
+      <div id="ud-perms-body"><div class="users-empty">${escapeHtml(I18n.t('common.loading'))}</div></div>
     </div>
   `;
 }
@@ -467,7 +468,14 @@ function wireUserDetail(host, u) {
     if (main) main.innerHTML = renderUserDetailPanel(u);
     const pickerHost = host.querySelector('#u-groups-picker');
     if (pickerHost) wireGroupPicker(pickerHost, selectedGroupIds);
+    if (detailTab === 'perms') {
+      loadSubjectPermissions('user', u.id, host.querySelector('#ud-perms-body'));
+    }
   });
+  // Initial mount may already be on the perms tab (preserved across refresh).
+  if (detailTab === 'perms') {
+    loadSubjectPermissions('user', u.id, host.querySelector('#ud-perms-body'));
+  }
 
   host.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-action]');
@@ -608,7 +616,7 @@ function wireGroupDetail(host, g) {
     if (detailTab === 'members') {
       await loadGroupMembers(g.id, main.querySelector('#gd-members-list'));
     } else if (detailTab === 'perms') {
-      await loadGroupPermissions(g.id, main.querySelector('#gd-perms-body'));
+      await loadSubjectPermissions('group', g.id, main.querySelector('#gd-perms-body'));
     }
   };
   tabsEl?.addEventListener('change', async (e) => {
@@ -783,7 +791,7 @@ function renderGroupPicker(selected) {
   const tags = Array.from(selected)
     .map((gid) => groups.find((g) => g.id === gid))
     .filter(Boolean)
-    .map((g) => `<span class="group-tag removable" data-group-id="${g.id}">${escapeHtml(g.name)} <button type="button" class="remove-x" data-remove="${g.id}">×</button></span>`)
+    .map((g) => `<span class="group-tag removable" data-group-id="${escapeAttr(g.id)}">${escapeHtml(g.name)} <button type="button" class="remove-x" data-remove="${escapeAttr(g.id)}">×</button></span>`)
     .join('');
   return `
     <div class="group-picker" data-picker>
@@ -810,7 +818,7 @@ function wireGroupPicker(host, selectedSet) {
     const avail = groups.filter((g) => !selectedSet.has(g.id) && (!q || g.name.toLowerCase().includes(q)));
     if (avail.length === 0) { menu.hidden = true; return; }
     menu.innerHTML = avail.map((g) => `
-      <div class="group-option" data-add="${g.id}">
+      <div class="group-option" data-add="${escapeAttr(g.id)}">
         <div>${escapeHtml(g.name)}</div>
         ${g.description ? `<div class="descr">${escapeHtml(g.description)}</div>` : ''}
       </div>
@@ -907,12 +915,18 @@ function renderMemberRow(u) {
   `;
 }
 
-async function loadGroupPermissions(groupId, host) {
+// Per-subject resource permissions (model / flow / alias / addon). Shared by
+// the group detail and the user detail "Uprawnienia" tab — `subjectType` is
+// 'group' or 'user'; the effective ACL resolution (admin > user > group >
+// default) lives server-side. Adding/removing rows here writes
+// `resource_permissions` and is what the user/group-bound API keys inherit.
+async function loadSubjectPermissions(subjectType, subjectId, host) {
   try {
-    const [permsResp, modelsResp, flowsResp, addonsResp] = await Promise.all([
-      ApiBinary.action('iamListPermsForSubjectRequest', { subjectType: 'group', subjectId: groupId }),
+    const [permsResp, modelsResp, flowsResp, aliasesResp, addonsResp] = await Promise.all([
+      ApiBinary.action('iamListPermsForSubjectRequest', { subjectType, subjectId }),
       ApiBinary.list('modelListRequest').catch(() => []),
       ApiBinary.list('flowListRequest').catch(() => []),
+      ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => []),
     ]);
     const entries = permsResp?.entries || [];
@@ -932,6 +946,11 @@ async function loadGroupPermissions(groupId, host) {
       name: String(f.name || f.id || ''),
       descr: String(f.description || ''),
     }));
+    const aliasItems = (aliasesResp || []).map((a) => ({
+      id: String(a.alias || a.id || ''),
+      name: String(a.alias || a.id || ''),
+      descr: String(a.targetModel || a.target_model || a.target || ''),
+    }));
     const addonItems = (addonsResp || []).map((a) => ({
       id: String(a.id || a.addonId || ''),
       name: String(a.name || a.displayName || a.id || ''),
@@ -942,7 +961,7 @@ async function loadGroupPermissions(groupId, host) {
       if (items.length === 0) return '';
       const rows = items.map((item) => {
         const current = byResource[type]?.[item.id] || 'auto';
-        return renderPermRow(type, item, current, groupId);
+        return renderPermRow(type, item, current, subjectId);
       }).join('');
       return `
         <div class="perm-section">
@@ -955,6 +974,7 @@ async function loadGroupPermissions(groupId, host) {
       <div class="perm-header-hint">${escapeHtml(I18n.t('users.perm_hint'))}</div>
       ${renderSection(I18n.t('users.perm_models'), 'model', modelItems)}
       ${renderSection(I18n.t('users.perm_flows'), 'flow', flowItems)}
+      ${renderSection(I18n.t('users.perm_aliases'), 'alias', aliasItems)}
       ${renderSection(I18n.t('users.perm_addons'), 'addon', addonItems)}
     `;
 
@@ -964,21 +984,29 @@ async function loadGroupPermissions(groupId, host) {
       const resourceType = seg.dataset.resourceType;
       const resourceId = seg.dataset.resourceId;
       const level = e.detail?.value;
+      const prev = seg.dataset.committed ?? 'auto';
       try {
         if (level === 'auto') {
           await ApiBinary.action('iamClearPermissionRequest', {
-            resourceType, resourceId, subjectType: 'group', subjectId: groupId,
+            resourceType, resourceId, subjectType, subjectId,
           });
         } else {
           await ApiBinary.action('iamSetPermissionRequest', {
-            resourceType, resourceId, subjectType: 'group', subjectId: groupId,
+            resourceType, resourceId, subjectType, subjectId,
             accessLevel: level,
           });
         }
+        seg.dataset.committed = level;
         const row = seg.closest('.perm-row');
         if (row) row.classList.toggle('denied', level === 'deny');
         toast(I18n.t('users.perm_saved'), 'success');
       } catch (err) {
+        // Roll the control back to the last committed value so the UI never
+        // shows an unsaved permission as if it persisted.
+        seg.value = prev;
+        seg.setAttribute('value', prev);
+        const row = seg.closest('.perm-row');
+        if (row) row.classList.toggle('denied', prev === 'deny');
         toast(err.message || I18n.t('users.perm_save_failed'), 'error');
       }
     });
@@ -995,7 +1023,7 @@ function renderPermRow(resourceType, item, current, _groupId) {
         <div class="name">${escapeHtml(item.name)}</div>
         ${item.descr ? `<div class="descr">${escapeHtml(item.descr)}</div>` : ''}
       </div>
-      <tf-segmented size="sm" value="${escapeAttr(current)}" data-resource-type="${escapeAttr(resourceType)}" data-resource-id="${escapeAttr(item.id)}">
+      <tf-segmented size="sm" value="${escapeAttr(current)}" data-committed="${escapeAttr(current)}" data-resource-type="${escapeAttr(resourceType)}" data-resource-id="${escapeAttr(item.id)}">
         <option value="auto" variant="neutral">${escapeHtml(I18n.t('users.perm_auto'))}</option>
         <option value="allow" variant="ok">${escapeHtml(I18n.t('users.perm_allow'))}</option>
         <option value="deny" variant="err">${escapeHtml(I18n.t('users.perm_deny'))}</option>

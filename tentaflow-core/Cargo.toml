@@ -110,6 +110,10 @@ pin-project-lite = "0.2"
 
 # HTTP
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
+# Klient HTTP czysto synchroniczny (bez własnego runtime tokio) dla handlerów
+# treningu działających na workerze tokio — `reqwest::blocking` panikuje tam
+# ("Cannot drop a runtime in a context where blocking is not allowed").
+ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 readability = { version = "0.3.0", default-features = false }
 hyper = { version = "1.9.0", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
@@ -136,6 +140,18 @@ fjall = "3.1.4"
 # konfigurowane w addon/storage_sql.rs.
 r2d2 = "0.8"
 r2d2_sqlite = "0.34.0"
+
+# Tabular dataset parsing for ML Studio data profiling (CSV + XLSX). Calamine
+# reads the first worksheet without spawning a process; csv streams rows.
+csv = "1.3"
+calamine = "0.26"
+
+# Klasyczny ML on-device — smartcore to czysty Rust (drzewa cargo: num/rand,
+# zero C/Python/sys), wiec kompiluje sie tak samo na Androidzie jak na desktopie.
+# default-features = [] (puste): wyłącza ndarray-bindings/serde/datasets/js, ktorych
+# tabularny trener nie potrzebuje. Drzewo decyzyjne + las losowy z jawnym seedem
+# (with_seed) dla deterministycznych wynikow — RNG nie zalezy od std thread_rng.
+smartcore = { version = "0.5.0", default-features = false }
 
 # Crypto
 argon2 = "0.5.3"

@@ -441,6 +441,68 @@ pub enum MeshCommandType {
     OauthPoll {
         flow_id: String,
     },
+    /// ML Studio: uruchom trening NA TYM nodzie (odbiorca). `spec_json` niesie
+    /// pełną specyfikację (kind, dataset_dir, class_names, variant, hyperparams,
+    /// output_dir). Odbiorca startuje swój lokalny serwis treningowy i śledzi
+    /// job pod `run_id`. Odpowiedź: Empty (ok/error). Appended at END.
+    MlTrainStart {
+        run_id: String,
+        spec_json: String,
+    },
+    /// ML Studio: status zdalnego treningu o `run_id` (odbiorca odpytuje swój
+    /// lokalny serwis). Odpowiedź: `MlTrainStatusResult { status_json }`.
+    MlTrainStatus {
+        run_id: String,
+    },
+    /// ML Studio: transfer datasetu COCO przez mesh (chunk zip-a, content-addr
+    /// po `dataset_hash`). Odbiorca składa zip i rozpakowuje do cache pod hashem.
+    /// Dedup: gdy odbiorca MA już ten hash, zwraca `have_already=true` (nadawca
+    /// przerywa). Odpowiedź: `MlDatasetChunkResult { have_already }`.
+    MlDatasetChunk {
+        dataset_hash: String,
+        seq: u32,
+        total: u32,
+        data_b64: String,
+    },
+    /// ML Studio: detekcja NA TYM nodzie wytrenowanym tu modelem (checkpoint
+    /// lokalny na odbiorcy). Inicjator (Node A) wysyła checkpoint_path + klasy +
+    /// wariant + próg + obraz (base64); odbiorca woła swój lokalny serwis i
+    /// zwraca `MlDetectResult`. Pozwala testować z A model żyjący na B.
+    MlDetect {
+        checkpoint_path: String,
+        class_names_json: String,
+        variant: String,
+        threshold: f64,
+        image_b64: String,
+    },
+    /// ML Studio: eksport GGUF NA TYM nodzie modelu, którego adapter żyje tutaj
+    /// (wytrenowany lokalnie/przez mesh). `spec_json` niesie adapter_path/base_model/
+    /// outtype/export_id. Odbiorca startuje eksport na swoim ml-training; inicjator
+    /// odpytuje przez `MlExportStatus`. Odpowiedź: Empty (ok/error).
+    MlExport {
+        export_id: String,
+        spec_json: String,
+    },
+    /// ML Studio: status zdalnego eksportu GGUF o `export_id`. Odpowiedź:
+    /// `MlExportStatusResult { status_json }`.
+    MlExportStatus {
+        export_id: String,
+    },
+    /// ML Studio: zapytanie do modelu FT wdrożonego na odbiorcy (alias `model_name`
+    /// w jego lokalnym routingu). Odbiorca odpala inferencję lokalnie i zwraca
+    /// `MlChatResult`. Pozwala UŻYĆ z Node A modelu żyjącego na Node B. Appended at END.
+    MlChat {
+        model_name: String,
+        message: String,
+        max_tokens: u32,
+    },
+    /// ML Studio: zlecenie węzłowi-źródłu spakowania katalogu artefaktu `src_path`
+    /// i wypchnięcia go (komendą `MlArtifactChunk`) do `target_node_id`. Odpowiedź:
+    /// `MlArtifactPushResult { target_path }`. Appended at END.
+    MlArtifactPushTo {
+        src_path: String,
+        target_node_id: String,
+    },
     /// Cross-node robot control. The receiver owns the robot addon; it decodes
     /// the opaque `RobotControlRequest` (CBOR), re-checks trust + timing +
     /// permission, sanitizes the action and dispatches it to the local robot
@@ -510,6 +572,20 @@ pub enum MeshCommandResponsePayload {
     },
     /// Serialized WebResearchResponse JSON produced by the receiver.
     WebResearchResult { response_json: String },
+    /// ML Studio: status zdalnego treningu (JSON: status/epoch/total_epochs/
+    /// train_loss/map50/map50_95/artifact_path/error) produkowany przez odbiorcę.
+    MlTrainStatusResult { status_json: String },
+    /// ML Studio: ack chunku datasetu. `have_already` = odbiorca ma już ten
+    /// dataset (hash) → nadawca może przerwać transfer.
+    MlDatasetChunkResult { have_already: bool },
+    /// ML Studio: wynik detekcji na odbiorcy (detekcje JSON + wymiary obrazu;
+    /// `error` gdy serwis zawiódł).
+    MlDetectResult {
+        detections_json: String,
+        width: u32,
+        height: u32,
+        error: Option<String>,
+    },
     /// Opaque minicbor `VectorOpResponse` produced by the receiver running a
     /// forwarded `VectorOp` against its local Milvus. Appended at END.
     VectorOpResult { result_cbor: Vec<u8> },
@@ -524,6 +600,21 @@ pub enum MeshCommandResponsePayload {
     OauthPollResult {
         status: String,
         account_label: Option<String>,
+        error: Option<String>,
+    },
+    /// ML Studio: status zdalnego eksportu GGUF (JSON: status/gguf_path/error)
+    /// produkowany przez odbiorcę. Appended at END (kolejność = wire compat).
+    MlExportStatusResult { status_json: String },
+    /// ML Studio: odpowiedź modelu FT z odbiorcy (wygenerowany tekst lub `error`).
+    /// Appended at END (kolejność = wire compat).
+    MlChatResult {
+        answer: String,
+        error: Option<String>,
+    },
+    /// ML Studio: wynik wypchnięcia artefaktu do węzła docelowego — ścieżka
+    /// katalogu artefaktu NA węźle docelowym. Appended at END.
+    MlArtifactPushResult {
+        target_path: String,
         error: Option<String>,
     },
     /// Opaque CBOR `RobotControlResponse` produced by the receiver running a
@@ -677,6 +768,49 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("provider", provider)
                 .finish(),
             Self::OauthPoll { .. } => write!(f, "OauthPoll"),
+            Self::MlTrainStart { run_id, spec_json } => f
+                .debug_struct("MlTrainStart")
+                .field("run_id", run_id)
+                .field("spec_len", &spec_json.len())
+                .finish(),
+            Self::MlTrainStatus { run_id } => f
+                .debug_struct("MlTrainStatus")
+                .field("run_id", run_id)
+                .finish(),
+            Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
+                .debug_struct("MlDatasetChunk")
+                .field("hash", &&dataset_hash[..dataset_hash.len().min(12)])
+                .field("seq", seq)
+                .field("total", total)
+                .field("chunk_len", &data_b64.len())
+                .finish(),
+            Self::MlDetect { checkpoint_path, variant, threshold, image_b64, .. } => f
+                .debug_struct("MlDetect")
+                .field("checkpoint", checkpoint_path)
+                .field("variant", variant)
+                .field("threshold", threshold)
+                .field("image_len", &image_b64.len())
+                .finish(),
+            Self::MlExport { export_id, spec_json } => f
+                .debug_struct("MlExport")
+                .field("export_id", export_id)
+                .field("spec_len", &spec_json.len())
+                .finish(),
+            Self::MlExportStatus { export_id } => f
+                .debug_struct("MlExportStatus")
+                .field("export_id", export_id)
+                .finish(),
+            Self::MlChat { model_name, max_tokens, message } => f
+                .debug_struct("MlChat")
+                .field("model_name", model_name)
+                .field("max_tokens", max_tokens)
+                .field("message_len", &message.len())
+                .finish(),
+            Self::MlArtifactPushTo { src_path, target_node_id } => f
+                .debug_struct("MlArtifactPushTo")
+                .field("src_path", src_path)
+                .field("target_node_id", target_node_id)
+                .finish(),
             Self::RobotControl { request_cbor } => f
                 .debug_struct("RobotControl")
                 .field("request_len", &request_cbor.len())

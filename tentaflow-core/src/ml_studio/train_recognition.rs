@@ -1,0 +1,917 @@
+// ===== File: ml_studio/train_recognition.rs — async RF-DETR detection training =====
+//
+// Asynchroniczny silnik treningu detekcji obiektów (RF-DETR) ML Studio. Trening
+// detekcji trwa MINUTY/GODZINY, więc — jak fine-tuning LLM (`train_llm.rs`) — NIE
+// może blokować RPC. Handler tworzy run `running`, woła `spawn_recog_training` i
+// wraca natychmiast; cała robota (rozpakowanie datasetu COCO, start jobu w
+// serwisie rfdetr-training, polling, zapis metryk i modelu) dzieje się w tle.
+//
+// Dataset recognition to ZIP COCO (obrazy + `_annotations.coco.json` w
+// podkatalogach train/valid/test). Rozpakowujemy go do katalogu cache na tym
+// samym węźle co serwis treningowy i przekazujemy `dataset_dir` w POST /train.
+// Nazwy klas wyciągamy z `categories` w COCO json (kolejność po id rosnąco).
+
+use std::io::Read;
+use std::path::Path;
+use std::time::Duration;
+
+use base64::Engine;
+use serde_json::json;
+
+use crate::ml_studio::repository;
+use crate::services_repo;
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const JOB_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Startuje trening detekcji w tle. Run o `run_id` musi już istnieć (`running`).
+/// Błędy lądują w statusie runu (`failed`), nie są propagowane.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_recog_training(
+    run_id: String,
+    project_id: String,
+    owner_user_id: String,
+    dataset_id: String,
+    variant: String,
+    hyperparams: tentaflow_protocol::MlStudioRecogHyperparams,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = run_training(
+            &run_id,
+            &project_id,
+            &owner_user_id,
+            &dataset_id,
+            &variant,
+            &hyperparams,
+        )
+        .await
+        {
+            tracing::warn!(run_id = %run_id, error = %err, "RF-DETR training failed");
+            let _ = repository::update_training_run_status(&run_id, "failed");
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_training(
+    run_id: &str,
+    project_id: &str,
+    owner_user_id: &str,
+    dataset_id: &str,
+    variant: &str,
+    hyperparams: &tentaflow_protocol::MlStudioRecogHyperparams,
+) -> anyhow::Result<()> {
+    let endpoint = resolve_endpoint()?;
+
+    let dataset = repository::get_dataset(owner_user_id, dataset_id)?
+        .ok_or_else(|| anyhow::anyhow!("dataset not found"))?;
+    let raw = repository::get_dataset_raw(owner_user_id, dataset_id)?;
+
+    // Dwa źródła datasetu COCO:
+    //  - "coco_path": raw to ŚCIEŻKA do katalogu COCO na dysku (duże zbiory),
+    //  - "coco" (zip): rozpakowujemy bajty do katalogu cache.
+    let (dataset_dir, class_names) = if dataset.kind == "coco_path" {
+        let dir = std::path::PathBuf::from(String::from_utf8_lossy(&raw).trim().to_string());
+        if !dir.is_dir() {
+            anyhow::bail!("katalog datasetu COCO nie istnieje: {}", dir.display());
+        }
+        let classes = coco_class_names_from_dir(&dir);
+        (dir, classes)
+    } else {
+        let dir = crate::paths::cache_dir()
+            .join("ml-recog-datasets")
+            .join(dataset_id);
+        let classes = unpack_coco(&raw, &dir)?;
+        (dir, classes)
+    };
+    if class_names.is_empty() {
+        anyhow::bail!("dataset COCO bez kategorii (class_names puste)");
+    }
+
+    let output_dir = format!("recog/{}/{}", project_id, run_id);
+    let train_body = json!({
+        "dataset_dir": dataset_dir.to_string_lossy(),
+        "class_names": class_names,
+        "variant": variant,
+        "output_dir": output_dir,
+        "hyperparams": {
+            "epochs": hyperparams.epochs,
+            "batch_size": hyperparams.batch_size,
+            "grad_accum": hyperparams.grad_accum,
+            "lr": hyperparams.learning_rate,
+            "resolution": hyperparams.resolution,
+            "early_stopping": hyperparams.early_stopping,
+        },
+    });
+
+    let base = endpoint.trim_end_matches('/').to_string();
+    let job_id = {
+        let url = format!("{}/train", base);
+        tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??
+    };
+
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let status_url = format!("{}/status/{}", base, job_id);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("RF-DETR training timed out after {}s", JOB_TIMEOUT.as_secs());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let url = status_url.clone();
+        let st = tokio::task::spawn_blocking(move || get_status(&url)).await??;
+
+        // Metryki per epoka: train_loss + mAP@50 → krzywa w UI.
+        if let Some(loss) = st.train_loss {
+            repository::record_training_metric(run_id, st.epoch, "train_loss", loss)?;
+        }
+        if let Some(map50) = st.map50 {
+            repository::record_training_metric(run_id, st.epoch, "map50", map50)?;
+        }
+
+        match st.status.as_str() {
+            "running" => continue,
+            "succeeded" => {
+                let metrics_json = json!({
+                    "train_loss": st.train_loss,
+                    "map50": st.map50,
+                    "map50_95": st.map50_95,
+                    "epoch": st.epoch,
+                    "total_epochs": st.total_epochs,
+                    "checkpoint_path": st.artifact_path,
+                    "variant": variant,
+                    "class_names": class_names,
+                })
+                .to_string();
+                let model_name = format!("rfdetr-{}", variant);
+                let model_id = repository::insert_model(
+                    project_id,
+                    &model_name,
+                    "rfdetr",
+                    &format!("RF-DETR {}", variant),
+                    &metrics_json,
+                )?;
+                repository::set_training_run_model(run_id, &model_id)?;
+                repository::update_training_run_status(run_id, "succeeded")?;
+                return Ok(());
+            }
+            "failed" => {
+                let msg = st
+                    .error
+                    .unwrap_or_else(|| "rfdetr-training reported failure".to_string());
+                anyhow::bail!("RF-DETR training failed: {}", msg);
+            }
+            other => anyhow::bail!("rfdetr-training unknown status '{}'", other),
+        }
+    }
+}
+
+/// Rozpakowuje zip COCO do `dest` (czyści wcześniejszą zawartość) i zwraca
+/// nazwy klas wyciągnięte z pierwszego napotkanego `_annotations.coco.json`.
+fn unpack_coco(zip_bytes: &[u8], dest: &Path) -> anyhow::Result<Vec<String>> {
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .map_err(|e| anyhow::anyhow!("dataset nie jest poprawnym zip COCO: {}", e))?;
+
+    let mut class_names: Vec<String> = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue; // odcięcie path traversal (zip slip)
+        };
+        let out_path = dest.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        // Z pierwszego annotations.coco.json wyciągamy klasy (kolejność po id).
+        if class_names.is_empty()
+            && rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with("_annotations.coco.json"))
+                .unwrap_or(false)
+        {
+            class_names = coco_class_names(&buf);
+        }
+        std::fs::write(&out_path, &buf)?;
+    }
+    Ok(class_names)
+}
+
+/// Czyta nazwy klas z pierwszego `*/_annotations.coco.json` w katalogu COCO.
+fn coco_class_names_from_dir(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let annot = entry.path().join("_annotations.coco.json");
+        if annot.is_file() {
+            if let Ok(buf) = std::fs::read(&annot) {
+                let names = coco_class_names(&buf);
+                if !names.is_empty() {
+                    return names;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Wyciąga nazwy klas z COCO json: `categories` posortowane po `id` rosnąco,
+/// pomijając ewentualną kategorię tła o `id==0` (Roboflow/RF-DETR konwencja).
+fn coco_class_names(json_bytes: &[u8]) -> Vec<String> {
+    let Ok(value): Result<serde_json::Value, _> = serde_json::from_slice(json_bytes) else {
+        return Vec::new();
+    };
+    let Some(cats) = value.get("categories").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    let mut cats: Vec<(i64, String)> = cats
+        .iter()
+        .filter_map(|c| {
+            let id = c.get("id")?.as_i64()?;
+            let name = c.get("name")?.as_str()?.to_string();
+            Some((id, name))
+        })
+        .collect();
+    cats.sort_by_key(|(id, _)| *id);
+    let has_zero = cats.iter().any(|(id, _)| *id == 0);
+    cats.into_iter()
+        .filter(|(id, _)| !(has_zero && *id == 0))
+        .map(|(_, name)| name)
+        .collect()
+}
+
+// Rejestr jobów treningowych uruchomionych PRZEZ MESH na tym nodzie (odbiorca).
+// Mapuje `run_id` (klucz inicjatora Node A) na lokalny job serwisu (base+job_id).
+// In-memory — joby to byty runtime; artefakty żyją na dysku tego noda.
+static MESH_JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>> =
+    std::sync::OnceLock::new();
+
+fn mesh_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>> {
+    MESH_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// Akumulacja chunków datasetu przyjmowanych przez mesh (B-side), per hash.
+// Vec<Option<bytes>> indeksowany seq; po komplecie składamy zip i rozpakowujemy.
+static MESH_DS_ACCUM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<Option<Vec<u8>>>>>,
+> = std::sync::OnceLock::new();
+
+fn ds_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Option<Vec<u8>>>>> {
+    MESH_DS_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Katalog cache dla datasetu przyniesionego przez mesh (content-addr po hash).
+/// Wspólny dla recognition (COCO dir) i LLM (blob JSONL) — adresowanie po hashu.
+pub fn mesh_dataset_cache(hash: &str) -> std::path::PathBuf {
+    crate::paths::cache_dir().join("ml-recog-mesh").join(hash)
+}
+
+/// Marker kompletnego rozpakowania (pisany dopiero PO udanym unzip). Dedup
+/// sprawdza JEGO obecność, nie „jakikolwiek plik" — częściowe/zerwane
+/// rozpakowanie nie zostanie uznane za gotowe i transfer się powtórzy.
+fn cache_complete_marker(dir: &Path) -> std::path::PathBuf {
+    dir.join(".complete")
+}
+
+/// Czy dataset pod hashem jest KOMPLETNIE zmaterializowany (marker `.complete`).
+fn cache_complete(dir: &Path) -> bool {
+    cache_complete_marker(dir).is_file()
+}
+
+/// sha256 surowych bajtów (content-hash blobu, np. datasetu JSONL dla LLM).
+pub fn blob_content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// Pakuje pojedynczy blob do zip-a (jedna pozycja `name`) — do transferu mesh
+/// blobów nie-katalogowych (dataset LLM). Współdzieli format z `zip_dir`.
+pub fn zip_single_file(name: &str, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut cursor);
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file(name, opts)?;
+    zip.write_all(bytes)?;
+    zip.finish()?;
+    Ok(cursor.into_inner())
+}
+
+// Stała: brak postępu transferu przez tyle = błąd. NIE liczymy sztywnego deadline
+// na cały transfer — duży dataset może iść długo; błędem jest dopiero STALL
+// (prędkość spada do zera i nie rośnie).
+const SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const SYNC_CHUNK_BYTES: usize = 600 * 1024;
+const SYNC_CHUNK_TIMEOUT_SECS: u64 = 25;
+
+/// Postęp transferu datasetu A→B przez mesh (faza poprzedzająca trening zdalny).
+/// Trzymane in-memory na A, odpytywane przez status handler dla paska postępu.
+#[derive(Clone, Debug, Default)]
+pub struct DatasetSyncProgress {
+    pub phase: String, // "zipping" | "syncing" | "starting" | "training" | "error"
+    pub bytes_sent: u64,
+    pub bytes_total: u64,
+    pub rate_bps: u64,
+    pub error: Option<String>,
+}
+
+static RECOG_SYNC: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, DatasetSyncProgress>>,
+> = std::sync::OnceLock::new();
+
+fn recog_sync_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, DatasetSyncProgress>>
+{
+    RECOG_SYNC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn set_recog_sync(run_id: &str, p: DatasetSyncProgress) {
+    if let Ok(mut m) = recog_sync_map().lock() {
+        m.insert(run_id.to_string(), p);
+    }
+}
+
+/// A-side: bieżący postęp transferu datasetu dla runu (None gdy brak/zakończony).
+pub fn recog_sync_progress(run_id: &str) -> Option<DatasetSyncProgress> {
+    recog_sync_map().lock().ok()?.get(run_id).cloned()
+}
+
+/// A-side: usuwa wpis postępu (po przejściu w fazę treningu na B).
+pub fn clear_recog_sync(run_id: &str) {
+    if let Ok(mut m) = recog_sync_map().lock() {
+        m.remove(run_id);
+    }
+}
+
+// Licznik kolejnych nieudanych pollingów statusu zdalnego runu (Node B nieosiągalny
+// / zgubił job po restarcie). Po przekroczeniu progu run domykamy jako failed,
+// zamiast trzymać go w „running" w nieskończoność.
+static REMOTE_POLL_FAILS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+    std::sync::OnceLock::new();
+const REMOTE_POLL_FAIL_LIMIT: u32 = 15;
+
+fn remote_poll_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    REMOTE_POLL_FAILS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Rejestruje wynik pollingu zdalnego statusu. `ok=true` zeruje licznik; `false`
+/// inkrementuje i zwraca true gdy próg przekroczony (czas domknąć run jako failed).
+pub fn note_remote_poll(run_id: &str, ok: bool) -> bool {
+    let Ok(mut m) = remote_poll_map().lock() else { return false };
+    if ok {
+        m.remove(run_id);
+        false
+    } else {
+        let n = m.entry(run_id.to_string()).or_insert(0);
+        *n += 1;
+        if *n >= REMOTE_POLL_FAIL_LIMIT {
+            m.remove(run_id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A-side: transfer datasetu COCO przez mesh do węzła B, a po zmaterializowaniu
+/// — start treningu (`MlTrainStart`). Biegnie w tle (task), żeby NIE blokować RPC
+/// `train_start` na czas transferu. Postęp (bytes/total/rate) ląduje w
+/// `RECOG_SYNC` i jest serwowany do UI jako pasek B/s. Błąd wykrywany przez STALL:
+/// gdy przez `SYNC_STALL_TIMEOUT` nie przybędzie ani bajt (chunk wciąż nie-ACK),
+/// transfer jest uznawany za zerwany. Pojedynczy chunk ma własny timeout i przy
+/// błędzie jest ponawiany — to watchdog stallu (a nie pojedynczy timeout) decyduje
+/// o porażce.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_mesh_dataset_push_and_train(
+    iroh: std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    target: String,
+    run_id: String,
+    dataset_dir: String,
+    dataset_hash: String,
+    spec_json: String,
+) {
+    tokio::spawn(async move {
+        let zipped = {
+            set_recog_sync(
+                &run_id,
+                DatasetSyncProgress { phase: "zipping".into(), ..Default::default() },
+            );
+            let dir = std::path::PathBuf::from(&dataset_dir);
+            tokio::task::spawn_blocking(move || zip_dir(&dir)).await
+        };
+        let result = match zipped {
+            Ok(Ok(zip_bytes)) => {
+                mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json)
+                    .await
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(anyhow::anyhow!("zip join: {}", e)),
+        };
+        if let Err(err) = result {
+            tracing::warn!(run_id = %run_id, error = %err, "mesh dataset push/train failed");
+            set_recog_sync(
+                &run_id,
+                DatasetSyncProgress {
+                    phase: "error".into(),
+                    error: Some(err.to_string()),
+                    ..Default::default()
+                },
+            );
+            let _ = repository::update_training_run_status(&run_id, "failed");
+        }
+    });
+}
+
+/// Wariant generyczny: transfer GOTOWEGO zip-a (np. spakowany blob JSONL dla LLM)
+/// + start treningu na B. Współdzieli pasek postępu/stall i `MlTrainStart`.
+pub fn spawn_mesh_push_and_train(
+    iroh: std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>,
+    target: String,
+    run_id: String,
+    zip_bytes: Vec<u8>,
+    dataset_hash: String,
+    spec_json: String,
+) {
+    tokio::spawn(async move {
+        if let Err(err) =
+            mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json).await
+        {
+            tracing::warn!(run_id = %run_id, error = %err, "mesh blob push/train failed");
+            set_recog_sync(
+                &run_id,
+                DatasetSyncProgress {
+                    phase: "error".into(),
+                    error: Some(err.to_string()),
+                    ..Default::default()
+                },
+            );
+            let _ = repository::update_training_run_status(&run_id, "failed");
+        }
+    });
+}
+
+async fn mesh_push_and_train(
+    iroh: &crate::mesh::iroh_manager::IrohMeshManager,
+    target: &str,
+    run_id: &str,
+    zip_bytes: Vec<u8>,
+    dataset_hash: &str,
+    spec_json: &str,
+) -> anyhow::Result<()> {
+    use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
+    use tokio::time::Instant;
+
+    let total_bytes = zip_bytes.len() as u64;
+    let total_chunks = zip_bytes.len().div_ceil(SYNC_CHUNK_BYTES).max(1) as u32;
+    set_recog_sync(
+        run_id,
+        DatasetSyncProgress {
+            phase: "syncing".into(),
+            bytes_total: total_bytes,
+            ..Default::default()
+        },
+    );
+
+    let mut bytes_sent: u64 = 0;
+    let mut last_advance = Instant::now();
+    let mut window_start = Instant::now();
+    let mut window_bytes: u64 = 0;
+    let mut rate_bps: u64 = 0;
+    let mut seq: u32 = 0;
+    while seq < total_chunks {
+        if last_advance.elapsed() > SYNC_STALL_TIMEOUT {
+            anyhow::bail!(
+                "transfer datasetu utknął — brak postępu przez {}s",
+                SYNC_STALL_TIMEOUT.as_secs()
+            );
+        }
+        let start = seq as usize * SYNC_CHUNK_BYTES;
+        let end = (start + SYNC_CHUNK_BYTES).min(zip_bytes.len());
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&zip_bytes[start..end]);
+        let chunk_cmd = MeshCommandType::MlDatasetChunk {
+            dataset_hash: dataset_hash.to_string(),
+            seq,
+            total: total_chunks,
+            data_b64,
+        };
+        match iroh
+            .send_command_and_wait(target, chunk_cmd, SYNC_CHUNK_TIMEOUT_SECS)
+            .await
+        {
+            Ok(cr) => {
+                if let MeshCommandResponsePayload::MlDatasetChunkResult { have_already } =
+                    cr.payload
+                {
+                    if have_already {
+                        // Wspólny zasób / wcześniejszy transfer — B już ma dataset.
+                        set_recog_sync(
+                            run_id,
+                            DatasetSyncProgress {
+                                phase: "syncing".into(),
+                                bytes_sent: total_bytes,
+                                bytes_total: total_bytes,
+                                rate_bps: 0,
+                                error: None,
+                            },
+                        );
+                        break;
+                    }
+                }
+                let chunk_len = (end - start) as u64;
+                bytes_sent += chunk_len;
+                window_bytes += chunk_len;
+                last_advance = Instant::now();
+                let win = window_start.elapsed().as_secs_f64();
+                if win >= 1.0 {
+                    rate_bps = (window_bytes as f64 / win) as u64;
+                    window_start = Instant::now();
+                    window_bytes = 0;
+                }
+                set_recog_sync(
+                    run_id,
+                    DatasetSyncProgress {
+                        phase: "syncing".into(),
+                        bytes_sent,
+                        bytes_total: total_bytes,
+                        rate_bps,
+                        error: None,
+                    },
+                );
+                seq += 1;
+            }
+            Err(e) => {
+                // Brak postępu — nie zwiększamy seq ani bytes_sent. Watchdog STALL
+                // ubije transfer po SYNC_STALL_TIMEOUT, jeśli to się nie odblokuje.
+                tracing::warn!(run_id = %run_id, seq, error = %e, "mesh chunk send failed, retry");
+                set_recog_sync(
+                    run_id,
+                    DatasetSyncProgress {
+                        phase: "syncing".into(),
+                        bytes_sent,
+                        bytes_total: total_bytes,
+                        rate_bps: 0,
+                        error: None,
+                    },
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    set_recog_sync(
+        run_id,
+        DatasetSyncProgress {
+            phase: "starting".into(),
+            bytes_sent: total_bytes,
+            bytes_total: total_bytes,
+            rate_bps: 0,
+            error: None,
+        },
+    );
+    let cmd = MeshCommandType::MlTrainStart {
+        run_id: run_id.to_string(),
+        spec_json: spec_json.to_string(),
+    };
+    let resp = iroh.send_command_and_wait(target, cmd, 30).await?;
+    if !resp.ok {
+        anyhow::bail!(resp
+            .error
+            .unwrap_or_else(|| "remote train start failed".to_string()));
+    }
+    set_recog_sync(
+        run_id,
+        DatasetSyncProgress {
+            phase: "training".into(),
+            bytes_sent: total_bytes,
+            bytes_total: total_bytes,
+            rate_bps: 0,
+            error: None,
+        },
+    );
+    Ok(())
+}
+
+/// B-side (odbiorca `MlDatasetChunk`): składa zip datasetu z chunków pod hashem;
+/// po ostatnim chunku rozpakowuje do cache. Dedup: gdy cache hash już istnieje,
+/// zwraca true (have_already) — nadawca przerywa transfer.
+pub fn mesh_dataset_chunk(
+    hash: &str,
+    seq: u32,
+    total: u32,
+    data_b64: &str,
+) -> anyhow::Result<bool> {
+    let cache = mesh_dataset_cache(hash);
+    // Dedup: dataset (po content-hashu) KOMPLETNIE zmaterializowany na tym węźle
+    // (marker .complete) — wspólny zasób / wcześniejszy transfer. Częściowe
+    // rozpakowanie nie ma markera → transfer się powtórzy (brak treningu na ułomku).
+    if cache_complete(&cache) {
+        return Ok(true);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| anyhow::anyhow!("chunk base64: {}", e))?;
+    let mut map = ds_accum().lock().map_err(|_| anyhow::anyhow!("accum lock poisoned"))?;
+    let slot = map.entry(hash.to_string()).or_insert_with(|| vec![None; total as usize]);
+    if slot.len() != total as usize {
+        *slot = vec![None; total as usize];
+    }
+    if (seq as usize) < slot.len() {
+        slot[seq as usize] = Some(bytes);
+    }
+    // Komplet? — złóż zip i rozpakuj.
+    if slot.iter().all(|c| c.is_some()) {
+        let mut zip_bytes = Vec::new();
+        for c in slot.iter() {
+            zip_bytes.extend_from_slice(c.as_ref().unwrap());
+        }
+        map.remove(hash);
+        drop(map);
+        unpack_coco(&zip_bytes, &cache)?;
+        // Marker kompletności PO udanym rozpakowaniu — dopiero teraz dedup
+        // (cache_complete) uzna dataset za gotowy. Brak markera = niekompletny.
+        let _ = std::fs::write(cache_complete_marker(&cache), b"ok");
+    }
+    Ok(false)
+}
+
+/// A-side: pakuje katalog datasetu COCO do zip-a w pamięci (do transferu mesh).
+pub fn zip_dir(dir: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut cursor);
+    let opts: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    fn add(
+        zip: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+        opts: &zip::write::FileOptions<()>,
+        base: &Path,
+        cur: &Path,
+    ) -> anyhow::Result<()> {
+        for e in std::fs::read_dir(cur)? {
+            let p = e?.path();
+            let rel = p.strip_prefix(base)?.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                add(zip, opts, base, &p)?;
+            } else {
+                zip.start_file(rel, *opts)?;
+                zip.write_all(&std::fs::read(&p)?)?;
+            }
+        }
+        Ok(())
+    }
+    add(&mut zip, &opts, dir, dir)?;
+    zip.finish()?;
+    Ok(cursor.into_inner())
+}
+
+/// Fingerprint zawartości datasetu COCO: sha256 po posortowanych parach
+/// (nazwa_splitu, bajty `_annotations.coco.json`). Służy do wykrycia WSPÓLNEGO
+/// zasobu między nodami — gdy A i B widzą te same pliki (np. wspólny NAS), hash
+/// się zgadza i transfer jest zbędny. Obrazów nie hashujemy (drogie) — adnotacje
+/// COCO niosą file_name+rozmiary, więc jednoznacznie identyfikują zbiór.
+pub fn coco_content_hash(dir: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let split = e?.path();
+        let annot = split.join("_annotations.coco.json");
+        if annot.is_file() {
+            let name = split
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            entries.push((name, std::fs::read(&annot)?));
+        }
+    }
+    if entries.is_empty() {
+        anyhow::bail!("brak _annotations.coco.json w {}", dir.display());
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (name, bytes) in &entries {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// B-side (odbiorca komendy mesh `MlTrainStart`): startuje trening na LOKALNYM
+/// serwisie tego noda wg `spec_json` (dataset_dir/class_names/variant/output_dir/
+/// hyperparams) i zapamiętuje job pod `run_id`. Inicjator (A) odpytuje przez
+/// `mesh_train_status`. Weryfikuje content-hash: dataset_dir na B musi być TYM
+/// SAMYM zasobem co u A (te same pliki) — inaczej odmawia (transfer blobów przez
+/// mesh dla NIE-wspólnego zasobu jest osobnym, jeszcze niezaimplementowanym
+/// krokiem; NIE wolno trenować na cudzych/nie-tych danych).
+pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<()> {
+    let spec: serde_json::Value = serde_json::from_str(spec_json)
+        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let dataset_dir_raw = spec
+        .get("dataset_dir")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("spec bez dataset_dir"))?;
+    // "mesh:<hash>" → dataset przyniesiony przez mesh, w cache content-addr.
+    let resolved;
+    let dataset_dir: &str = if let Some(hash) = dataset_dir_raw.strip_prefix("mesh:") {
+        let c = mesh_dataset_cache(hash);
+        if !c.is_dir() {
+            anyhow::bail!("dataset mesh nie zmaterializowany na tym nodzie (hash {})", hash);
+        }
+        resolved = c.to_string_lossy().to_string();
+        &resolved
+    } else {
+        dataset_dir_raw
+    };
+    if !std::path::Path::new(dataset_dir).is_dir() {
+        anyhow::bail!(
+            "dataset niedostępny na tym nodzie ({}). Transfer datasetu przez mesh \
+             (blob) dla nie-wspólnego zasobu nie jest jeszcze zaimplementowany — \
+             użyj wspólnego zasobu (NAS) widocznego na obu nodach.",
+            dataset_dir
+        );
+    }
+    // Wykrycie wspólnego zasobu: hash zawartości MUSI zgadzać się z oczekiwanym
+    // (policzonym przez A). Brak hasha w spec → starsza ścieżka, pomijamy.
+    if let Some(expected) = spec.get("dataset_hash").and_then(|v| v.as_str()) {
+        let actual = coco_content_hash(std::path::Path::new(dataset_dir))?;
+        if actual != expected {
+            anyhow::bail!(
+                "dataset na tym nodzie to NIE ten sam zasób (hash mismatch: oczekiwano {}, jest {}). \
+                 Transfer przez mesh dla nie-wspólnego zasobu niezaimplementowany.",
+                &expected[..expected.len().min(12)],
+                &actual[..actual.len().min(12)]
+            );
+        }
+    }
+    let class_names = spec.get("class_names").cloned().unwrap_or(json!([]));
+    let variant = spec.get("variant").and_then(|v| v.as_str()).unwrap_or("base");
+    let output_dir = spec
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("spec bez output_dir"))?;
+    let hyperparams = spec.get("hyperparams").cloned().unwrap_or(json!({}));
+
+    let endpoint = resolve_endpoint()?;
+    let base = endpoint.trim_end_matches('/').to_string();
+    let train_body = json!({
+        "dataset_dir": dataset_dir,
+        "class_names": class_names,
+        "variant": variant,
+        "output_dir": output_dir,
+        "hyperparams": hyperparams,
+    });
+    let url = format!("{}/train", base);
+    let job_id =
+        tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??;
+    mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .insert(run_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlTrainStatus`): odpytuje lokalny serwis o status joba
+/// zmapowanego z `run_id` i zwraca surowy JSON statusu do inicjatora.
+pub async fn mesh_train_status(run_id: &str) -> anyhow::Result<String> {
+    let (base, job_id) = mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany run_id na tym nodzie: {}", run_id))?;
+    let url = format!("{}/status/{}", base, job_id);
+    let value: serde_json::Value = tokio::task::spawn_blocking(move || {
+        let http = http_agent();
+        let mut resp = http
+            .get(&url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("GET {} failed: {}", url, e))?;
+        resp.body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|e| anyhow::anyhow!("decode status: {}", e))
+    })
+    .await??;
+    Ok(value.to_string())
+}
+
+/// Detekcja na obrazie przez serwis rfdetr-training (`POST /detect`). Zwraca
+/// (detections_json, width, height). `image_b64` to zakodowane base64 zdjęcie.
+pub async fn run_detect(
+    checkpoint_path: String,
+    class_names: Vec<String>,
+    variant: String,
+    threshold: f64,
+    image_b64: String,
+) -> anyhow::Result<(String, u32, u32)> {
+    let endpoint = resolve_endpoint()?;
+    let url = format!("{}/detect", endpoint.trim_end_matches('/'));
+    let body = json!({
+        "checkpoint_path": checkpoint_path,
+        "class_names": class_names,
+        "variant": variant,
+        "threshold": threshold,
+        "image_b64": image_b64,
+    });
+    let value: serde_json::Value = tokio::task::spawn_blocking(move || {
+        let http = http_agent();
+        let mut resp = http
+            .post(&url)
+            .send_json(&body)
+            .map_err(|e| anyhow::anyhow!("POST {} failed: {}", url, e))?;
+        resp.body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|e| anyhow::anyhow!("decode /detect response: {}", e))
+    })
+    .await??;
+
+    let detections = value.get("detections").cloned().unwrap_or(json!([]));
+    let width = value.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let height = value.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok((detections.to_string(), width, height))
+}
+
+fn resolve_endpoint() -> anyhow::Result<String> {
+    let pool = crate::db::global_pool()
+        .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
+    let conn = pool
+        .lock()
+        .map_err(|_| anyhow::anyhow!("core db pool poisoned"))?;
+    let svcs =
+        services_repo::services::list_by_category(&conn, "training", Some("rfdetr-training"))?;
+    let svc = svcs.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!("Serwis rfdetr-training niedostępny — wdróż go w Serwisach")
+    })?;
+    svc.endpoint_url
+        .ok_or_else(|| anyhow::anyhow!("serwis rfdetr-training bez endpointu"))
+}
+
+#[derive(serde::Deserialize)]
+struct TrainResponse {
+    job_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StatusResponse {
+    status: String,
+    #[serde(default)]
+    epoch: i64,
+    #[serde(default)]
+    total_epochs: i64,
+    #[serde(default)]
+    train_loss: Option<f64>,
+    #[serde(default)]
+    map50: Option<f64>,
+    #[serde(default)]
+    map50_95: Option<f64>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    artifact_path: Option<String>,
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .build()
+        .into()
+}
+
+fn post_train(url: &str, body: serde_json::Value) -> anyhow::Result<String> {
+    let http = http_agent();
+    let mut resp = http
+        .post(url)
+        .send_json(&body)
+        .map_err(|e| anyhow::anyhow!("POST {} failed: {}", url, e))?;
+    let parsed: TrainResponse = resp
+        .body_mut()
+        .read_json()
+        .map_err(|e| anyhow::anyhow!("decode /train response: {}", e))?;
+    Ok(parsed.job_id)
+}
+
+fn get_status(url: &str) -> anyhow::Result<StatusResponse> {
+    let http = http_agent();
+    let mut resp = http
+        .get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET {} failed: {}", url, e))?;
+    resp.body_mut()
+        .read_json()
+        .map_err(|e| anyhow::anyhow!("decode /status response: {}", e))
+}

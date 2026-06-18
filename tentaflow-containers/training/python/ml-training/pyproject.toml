@@ -1,0 +1,44 @@
+# =============================================================================
+# Plik: pyproject.toml
+# Opis: Definicja środowiska `uv` dla natywnego serwera treningowego LLM.
+#       Te same zależności co obraz Docker; torch z CUDA 12.1 z indeksu PyTorch.
+# =============================================================================
+
+[project]
+name = "tentaflow-ml-training"
+version = "1.0.0"
+description = "TentaFlow LLM training server (Hugging Face SFT/LoRA/QLoRA/DPO)"
+# Host CI bywa na Pythonie 3.14 bez kół torcha — uv zainstaluje izolowany 3.12.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.4.1",
+    "transformers==4.46.3",
+    "peft==0.13.2",
+    "trl==0.12.1",
+    "datasets==3.1.0",
+    "accelerate==1.1.1",
+    "bitsandbytes==0.44.1",
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "sentencepiece==0.2.0",
+    "protobuf==5.28.3",
+]
+
+# Flash Attention 2 — opcjonalny przyspieszacz uwagi (Ampere+). Serwis używa go
+# automatycznie gdy `flash_attn` jest zaimportowalny, inaczej spada na `sdpa`
+# (wbudowany fused attention PyTorcha). NIE jest deklarowany jako zależność
+# projektu, bo flash-attn nie deklaruje torcha jako build-dep i `uv sync`
+# próbowałby budować go ze źródeł (długo / wymaga torcha) → wywala cały sync.
+# Instalacja PO `uv sync` (torch już obecny), prebuilt wheel bez build-isolation:
+#   uv pip install --no-build-isolation \
+#     https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+
+# torch z kołami CUDA 12.1 (PyPI domyślnie serwuje wariant CPU). uv bierze torch
+# wyłącznie z tego indeksu, resztę pakietów z PyPI.
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

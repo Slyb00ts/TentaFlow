@@ -15,10 +15,57 @@ fn main() {
     set_linux_rpath();
     copy_native_dynamic_libs();
     copy_isolated_whisper_dylib();
+    copy_zvec_dylib();
     copy_versioned_shared_libs_linux();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
+}
+
+// Kopiuje aktualny vendored libzvec_c_api (.so/.dylib) PLASKO do target/<profile>,
+// nadpisując poprzednią kopię. Powód: deploy uruchamia binarkę z
+// `LD_LIBRARY_PATH=target/<profile>`, który MA pierwszeństwo nad rpath do vendora.
+// Gdy `build-zvec.sh` przebuduje vendored .so (np. po dodaniu izolacji symboli
+// protobuf), stara kopia w target shadow'owała świeży vendored → binarka ładowała
+// nieaktualną bibliotekę (crash `corrupted size` na Linuxie z dwiema kopiami protobuf).
+// Pełna kopia bajtów (nie hardlink) + rerun-if-changed gwarantuje świeżość.
+fn copy_zvec_dylib() {
+    let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let (platform, libname) = match target.as_str() {
+        "linux" => ("linux-x86_64", "libzvec_c_api.so"),
+        "macos" => ("macos-arm64", "libzvec_c_api.dylib"),
+        _ => return,
+    };
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let src = manifest
+        .join("..")
+        .join("tentaflow-zvec-sys")
+        .join("vendor")
+        .join("lib")
+        .join(platform)
+        .join(libname);
+    if !src.exists() {
+        return;
+    }
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => return,
+    };
+    let Some(target_dir) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    let dst = target_dir.join(libname);
+    let _ = std::fs::remove_file(&dst);
+    if let Err(e) = std::fs::copy(&src, &dst) {
+        println!(
+            "cargo:warning=tentaflow: kopia zvec {} -> {} nieudana: {}",
+            src.display(),
+            dst.display(),
+            e
+        );
+    }
 }
 
 // ----- Linux linker flags ----------------------------------------------------

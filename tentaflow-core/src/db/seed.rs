@@ -96,20 +96,26 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     // Seed user_accounts — domyslny admin z hashem argon2
     seed_user_accounts(&tx)?;
 
-    // Kazdy admin w `user_accounts` musi miec wiersz `org_memberships` w
-    // `org-default` z rola `role-org-admin` — inaczej binary-WS rozwiazuje
-    // sesje do `org_context=None` i kazda sciezka filtrowana po org (kamery,
-    // nagrania, frame_url, compliance) odrzuca request. Login dashboardu idzie
-    // wylacznie przez `user_accounts`, wiec to jedyna tabela istotna dla
-    // membership. Musi byc PO `seed_user_accounts`, bo dopiero ono tworzy
-    // wiersz admina. Idempotentne przez PK (org_id, user_id) — naprawia tez
-    // bazy zaseedowane zanim ten krok istnial (seed leci przy kazdym starcie).
+    // KAZDY aktywny user w `user_accounts` musi miec wiersz `org_memberships` w
+    // `org-default` — inaczej binary-WS rozwiazuje sesje do `org_context=None`
+    // i kazda sciezka filtrowana po org (kamery, nagrania, frame_url,
+    // compliance, ML Studio) odrzuca request. Rola org mapuje sie z roli konta:
+    // admin → org_admin, power_user → org_operator, reszta → org_viewer.
+    // Login dashboardu idzie wylacznie przez `user_accounts`, wiec to jedyna
+    // tabela istotna dla membership. Musi byc PO `seed_user_accounts`.
+    // Idempotentne przez PK (org_id, user_id) — backfilluje tez konta zalozone
+    // zanim ten krok obejmowal nie-adminow (seed leci przy kazdym starcie).
     tx.execute(
         "INSERT OR IGNORE INTO org_memberships \
             (org_id, user_id, role_id, granted_at, granted_by) \
-         SELECT 'org-default', CAST(u.id AS TEXT), 'role-org-admin', \
+         SELECT 'org-default', CAST(u.id AS TEXT), \
+                CASE \
+                    WHEN u.is_admin = 1 OR u.role = 'admin' THEN 'role-org-admin' \
+                    WHEN u.role = 'power_user' THEN 'role-org-operator' \
+                    ELSE 'role-org-viewer' \
+                END, \
                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'system' \
-         FROM user_accounts u WHERE u.is_admin = 1 OR u.role = 'admin'",
+         FROM user_accounts u WHERE u.is_active = 1",
         [],
     )?;
 

@@ -186,6 +186,7 @@ impl DashboardServer {
                             db: db.clone(),
                             port_allocator: pa,
                             iroh: qm.clone(),
+                            router: router.clone(),
                             addon_manager: am.clone(),
                         },
                     )
@@ -1876,8 +1877,12 @@ fn extract_ws_user_session(
     if !account.is_active {
         return None;
     }
-    let role = if account.is_admin {
+    // is_admin wymusza "admin"; poza tym honorujemy kolumnę `role`
+    // (np. "power_user" przypisany w UI), z fallbackiem do "user".
+    let role = if account.is_admin || account.role == "admin" {
         "admin".to_string()
+    } else if account.role == "power_user" {
+        "power_user".to_string()
     } else {
         "user".to_string()
     };

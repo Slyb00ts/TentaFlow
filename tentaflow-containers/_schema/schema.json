@@ -21,7 +21,7 @@
       "enum": [
         "llm", "stt", "tts", "embeddings", "reranker",
         "vision", "image-gen", "video-gen", "music-gen",
-        "model-3d-gen", "agents", "tools"
+        "model-3d-gen", "agents", "tools", "training"
       ]
     },
     "api": {

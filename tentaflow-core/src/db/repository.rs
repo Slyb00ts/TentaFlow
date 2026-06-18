@@ -451,76 +451,411 @@ pub fn set_wake_word_enabled(pool: &DbPool, id: i64, enabled: bool) -> Result<()
 
 // --- API Keys ---
 
-const API_KEY_COLS: &str =
-    "id, key_hash, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at, owner_user_id";
+const API_KEY_COLS: &str = "id, uid, key_verifier, key_prefix, name, key_type, subject_id, \
+     rate_limit_rps, is_active, created_at, last_used_at";
 
 fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
     Ok(DbApiKey {
         id: row.get(0)?,
-        key_hash: row.get(1)?,
-        key_prefix: row.get(2)?,
-        name: row.get(3)?,
-        rate_limit_rps: row.get(4)?,
-        is_active: row.get(5)?,
-        created_at: row.get(6)?,
-        last_used_at: row.get(7)?,
-        owner_user_id: row.get::<_, Option<String>>(8).ok().flatten(),
+        uid: row.get(1)?,
+        key_verifier: row.get(2)?,
+        key_prefix: row.get(3)?,
+        name: row.get(4)?,
+        key_type: row.get(5)?,
+        subject_id: row.get(6)?,
+        rate_limit_rps: row.get(7)?,
+        is_active: row.get(8)?,
+        created_at: row.get(9)?,
+        last_used_at: row.get(10)?,
     })
 }
 
+/// Settings key holding the API key pepper (hex, stored encrypted). Replicated as
+/// a shared secret (`SHARED_SECRET_SETTING_KEYS`) so it is ORG-WIDE: a key issued
+/// on one node verifies on every node because all nodes derive the verifier under
+/// the same pepper.
+const API_KEY_PEPPER_KEY: &str = "api_key_pepper";
+
+/// Returns the org-wide API key pepper, decrypting the stored value, and only
+/// generating + persisting 32 CSPRNG bytes when none exists yet.
+///
+/// INVARIANT: the pepper is org-wide. A fresh joiner adopts the org's pepper from
+/// the baseline snapshot (it travels as a shared secret, re-encrypted per node)
+/// BEFORE it ever creates or verifies a key, so this function finds the synced
+/// pepper and never mints a divergent one. Generation here is the genesis path:
+/// the very first node of an org, or a unit test with an isolated DB.
+///
+/// RESIDUAL RISK: a full node compromise leaks the org's pepper (not just one
+/// node's). RACE: two nodes that each generate a pepper before they sync would
+/// derive verifiers under different peppers; convergence then follows the shared-
+/// secret LWW (one pepper wins) and keys issued under the loser stop verifying.
+/// Mesh E2E (slice 8) validates that the baseline delivers the pepper before any
+/// key write, which keeps a freshly joined node out of this race in practice.
+pub fn get_or_create_api_key_pepper(
+    pool: &DbPool,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<Vec<u8>> {
+    fn read_valid_pepper(
+        pool: &DbPool,
+        cipher: &crate::crypto::SettingsCipher,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(hex) = get_setting_secure(pool, API_KEY_PEPPER_KEY, cipher)? else {
+            return Ok(None);
+        };
+        // Fail-closed: a stored pepper that does not decode to EXACTLY 32 bytes
+        // is corrupt. Silently accepting it (or auto-rotating it) would either
+        // weaken the HMAC key or invalidate every previously issued key without
+        // an operator decision, so we refuse instead.
+        let bytes = decode_hex(&hex)
+            .map_err(|e| anyhow::anyhow!("stored api_key_pepper is not valid hex: {}", e))?;
+        if bytes.len() != 32 {
+            anyhow::bail!(
+                "stored api_key_pepper must decode to exactly 32 bytes, got {}",
+                bytes.len()
+            );
+        }
+        Ok(Some(bytes))
+    }
+
+    // Fast path: pepper already present.
+    if let Some(bytes) = read_valid_pepper(pool, cipher)? {
+        return Ok(bytes);
+    }
+    // Genesis path is serialized in-process so two concurrent callers cannot each
+    // generate and persist a different pepper (the loser's keys would stop
+    // verifying). Re-check under the lock — another thread may have just created
+    // it. Cross-node divergence is a separate, documented case resolved by the
+    // shared-secret LWW.
+    static PEPPER_GENESIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _genesis = PEPPER_GENESIS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(bytes) = read_valid_pepper(pool, cipher)? {
+        return Ok(bytes);
+    }
+    let mut pepper = [0u8; 32];
+    getrandom::fill(&mut pepper).expect("OS RNG fill_bytes");
+    let mut hex = String::with_capacity(pepper.len() * 2);
+    for b in pepper.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{:02x}", b);
+    }
+    // Persist through the shared-secret path: encrypts with the local cipher AND
+    // emits a `core.shared_setting_secret` capture, so a genesis-node pepper also
+    // replicates to already-joined peers (joiners get it from the baseline).
+    set_shared_secret_setting_secure(pool, API_KEY_PEPPER_KEY, &hex, cipher, None)?;
+    Ok(pepper.to_vec())
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        anyhow::bail!("odd-length hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!("invalid hex: {}", e))
+        })
+        .collect()
+}
+
+/// Lists keys for the dashboard. The verifier is never returned on lists.
 pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT id, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at, owner_user_id FROM api_keys ORDER BY name",
+        "SELECT id, uid, key_prefix, name, key_type, subject_id, rate_limit_rps, \
+                is_active, created_at, last_used_at \
+         FROM api_keys ORDER BY name",
     )?;
     let keys = stmt
         .query_map([], |row| {
             Ok(DbApiKey {
                 id: row.get(0)?,
-                key_hash: String::new(),
-                key_prefix: row.get(1)?,
-                name: row.get(2)?,
-                rate_limit_rps: row.get(3)?,
-                is_active: row.get(4)?,
-                created_at: row.get(5)?,
-                last_used_at: row.get(6)?,
-                owner_user_id: row.get::<_, Option<String>>(7).ok().flatten(),
+                uid: row.get(1)?,
+                key_verifier: String::new(),
+                key_prefix: row.get(2)?,
+                name: row.get(3)?,
+                key_type: row.get(4)?,
+                subject_id: row.get(5)?,
+                rate_limit_rps: row.get(6)?,
+                is_active: row.get(7)?,
+                created_at: row.get(8)?,
+                last_used_at: row.get(9)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(keys)
 }
 
+/// Inserts a key with a freshly generated stable `uid`. Returns `(id, uid)`.
 pub fn create_api_key(
     pool: &DbPool,
-    key_hash: &str,
+    key_verifier: &str,
     key_prefix: &str,
     name: &str,
+    key_type: &str,
+    subject_id: Option<&str>,
     rate_limit_rps: i64,
-) -> Result<i64> {
+) -> Result<(i64, String)> {
+    // Fail-closed: a 'user' key without a subject is anonymous and would bypass
+    // per-user ACL on the /v1 surface (None subject is treated as internal).
+    if key_type == "user" && subject_id.is_none() {
+        anyhow::bail!("api key with key_type='user' requires a subject_id");
+    }
+    let uid = uuid::Uuid::new_v4().to_string();
     let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO api_keys (key_hash, key_prefix, name, rate_limit_rps) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![key_hash, key_prefix, name, rate_limit_rps],
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO api_keys (uid, key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            uid,
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps
+        ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let row_id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+        uid.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        api_key_changed_fields(
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps,
+            true,
+        ),
+        None,
+    )?;
+    tx.commit()?;
+    Ok((row_id, uid))
 }
 
-pub fn delete_api_key(pool: &DbPool, id: i64) -> Result<usize> {
+/// Atomically creates an API key and (for `general` keys) seeds its explicit
+/// `resource_permissions` allowlist in ONE transaction. Either the key and all of
+/// its scopes commit together, or nothing does — a scope failure rolls back the
+/// key, so callers can never observe a half-created key with a partial allowlist.
+///
+/// `scopes` are `(resource_type, resource_id)` pairs, each written as an `allow`
+/// rule with `subject_type='api_key'`, `subject_id=<new key uid>`. The audit entry
+/// is written in the same transaction so it can never be orphaned from the key.
+#[allow(clippy::too_many_arguments)]
+pub fn create_api_key_with_scopes(
+    pool: &DbPool,
+    key_verifier: &str,
+    key_prefix: &str,
+    name: &str,
+    key_type: &str,
+    subject_id: Option<&str>,
+    rate_limit_rps: i64,
+    scopes: &[(String, String)],
+    actor_user_id: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<(i64, String)> {
+    if key_type == "user" && subject_id.is_none() {
+        anyhow::bail!("api key with key_type='user' requires a subject_id");
+    }
+    if key_type != "general" && !scopes.is_empty() {
+        anyhow::bail!("scopes are only valid for key_type='general'");
+    }
+    let uid = uuid::Uuid::new_v4().to_string();
     let conn = acquire(pool)?;
-    let affected = conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id])?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO api_keys (uid, key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            uid,
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps
+        ],
+    )?;
+    let row_id = tx.last_insert_rowid();
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+        uid.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        api_key_changed_fields(
+            key_verifier,
+            key_prefix,
+            name,
+            key_type,
+            subject_id,
+            rate_limit_rps,
+            true,
+        ),
+        None,
+    )?;
+    for (resource_type, resource_id) in scopes {
+        resource_permissions::set_tx(&tx, resource_type, resource_id, "api_key", &uid, "allow")?;
+    }
+    log_audit_tx(
+        &tx,
+        actor_user_id,
+        None,
+        "apikey.create",
+        Some(&format!("apikey:{}", row_id)),
+        Some(&format!("{} ({})", name, key_type)),
+        None,
+        node_id,
+    )?;
+    tx.commit()?;
+    Ok((row_id, uid))
+}
+
+/// Deletes a key by its stable `uid`. Revocation is keyed by `uid` because the
+/// 24-bit `key_prefix` is display-only and can collide across keys.
+pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let affected = tx.execute(
+        "DELETE FROM api_keys WHERE uid = ?1",
+        rusqlite::params![uid],
+    )?;
+    if affected > 0 {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+            uid.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            BTreeMap::new(),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(affected)
 }
 
-pub fn verify_api_key(pool: &DbPool, key_hash: &str) -> Result<Option<DbApiKey>> {
+pub fn get_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<Option<DbApiKey>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM api_keys WHERE key_hash = ?1 AND is_active = 1",
+        "SELECT {} FROM api_keys WHERE uid = ?1",
         API_KEY_COLS
     ))?;
     let result = stmt
-        .query_row(rusqlite::params![key_hash], row_to_api_key)
+        .query_row(rusqlite::params![uid], row_to_api_key)
         .optional()?;
+    Ok(result)
+}
+
+/// Replaces the verifier and prefix for a key identified by `uid` (rotation).
+pub fn rotate_api_key(
+    pool: &DbPool,
+    uid: &str,
+    new_verifier: &str,
+    new_prefix: &str,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let affected = tx.execute(
+        "UPDATE api_keys SET key_verifier = ?2, key_prefix = ?3 WHERE uid = ?1",
+        rusqlite::params![uid, new_verifier, new_prefix],
+    )?;
+    if affected > 0 {
+        // Replicate as a full-row Update: the materializer applies it as an
+        // upsert (it needs every synced column), and `last_used_at` stays local.
+        record_api_key_full_row_capture_tx(&tx, uid)?;
+    }
+    tx.commit()?;
+    Ok(affected > 0)
+}
+
+pub fn set_api_key_active(pool: &DbPool, uid: &str, active: bool) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let affected = tx.execute(
+        "UPDATE api_keys SET is_active = ?2 WHERE uid = ?1",
+        rusqlite::params![uid, active as i64],
+    )?;
+    if affected > 0 {
+        record_api_key_full_row_capture_tx(&tx, uid)?;
+    }
+    tx.commit()?;
+    Ok(affected > 0)
+}
+
+/// Records a full-row `core.api_key` Update capture by reading the post-write row
+/// inside the same transaction. Partial captures cannot be used: the materializer
+/// upserts the whole replicated column set, so every synced field must be present.
+fn record_api_key_full_row_capture_tx(tx: &rusqlite::Transaction<'_>, uid: &str) -> Result<()> {
+    let row = tx
+        .query_row(
+            "SELECT key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps, is_active \
+             FROM api_keys WHERE uid = ?1",
+            rusqlite::params![uid],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, bool>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((key_verifier, key_prefix, name, key_type, subject_id, rate_limit_rps, is_active)) =
+        row
+    else {
+        return Ok(());
+    };
+    record_core_capture_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+        uid.to_string(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        api_key_changed_fields(
+            &key_verifier,
+            &key_prefix,
+            &name,
+            &key_type,
+            subject_id.as_deref(),
+            rate_limit_rps,
+            is_active,
+        ),
+        None,
+    )
+}
+
+/// Verifies an API key by its precomputed verifier and stamps `last_used_at` on
+/// a hit. Inactive keys are never returned.
+pub fn verify_api_key(pool: &DbPool, key_verifier: &str) -> Result<Option<DbApiKey>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM api_keys WHERE key_verifier = ?1 AND is_active = 1",
+        API_KEY_COLS
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![key_verifier], row_to_api_key)
+        .optional()?;
+    if let Some(ref key) = result {
+        // Throttle the write-on-read: under a shared Arc<Mutex<Connection>> a
+        // stamp on every request would serialize verification. Only refresh
+        // when the row was never used or last used more than 60s ago, keyed by
+        // the indexed primary key.
+        conn.execute(
+            "UPDATE api_keys SET last_used_at = datetime('now') \
+             WHERE id = ?1 \
+               AND (last_used_at IS NULL \
+                    OR last_used_at < datetime('now','-60 seconds'))",
+            rusqlite::params![key.id],
+        )?;
+    }
     Ok(result)
 }
 
@@ -539,7 +874,7 @@ pub fn get_setting(pool: &DbPool, key: &str) -> Result<Option<String>> {
 }
 
 pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
-    let mut conn = acquire(pool)?;
+    let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
@@ -650,7 +985,7 @@ pub fn set_setting_secure(
 /// Allowlist of `settings` keys that replicate as `core.shared_setting_secret`
 /// (re-encrypted per node). Single source of truth for the secret capture path,
 /// the upgrade-time enqueue, and the baseline-reset reseed.
-pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &["hf_token", "ngc_api_key"];
+pub const SHARED_SECRET_SETTING_KEYS: &[&str] = &["hf_token", "ngc_api_key", "api_key_pepper"];
 
 pub fn is_shared_secret_setting_key(key: &str) -> bool {
     SHARED_SECRET_SETTING_KEYS.contains(&key)
@@ -2194,8 +2529,8 @@ pub fn grant_model_consumer_audited(
     for (addon, b, a) in &transitions {
         audit_reconcile_uses_model_within_tx(&tx, addon, model_id, b, a)?;
     }
-    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" })
-        .to_string();
+    let after_snap =
+        serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" }).to_string();
     record_model_visibility_change_within_tx(
         &tx,
         model_id,
@@ -2225,8 +2560,8 @@ pub fn revoke_model_consumer_audited(
     for (addon, b, a) in &transitions {
         audit_reconcile_uses_model_within_tx(&tx, addon, model_id, b, a)?;
     }
-    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" })
-        .to_string();
+    let after_snap =
+        serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" }).to_string();
     record_model_visibility_change_within_tx(
         &tx,
         model_id,
@@ -2312,8 +2647,8 @@ pub fn grant_alias_consumer_audited(
     for (addon, b, a) in &transitions {
         audit_reconcile_uses_alias_within_tx(&tx, addon, &alias_name, b, a)?;
     }
-    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" })
-        .to_string();
+    let after_snap =
+        serde_json::json!({ "consumer": consumer_addon_id, "state": "granted" }).to_string();
     tx.execute(
         "INSERT INTO model_alias_changes \
             (alias_id, alias_name, changed_by_user_id, after_snapshot, change_type, ts) \
@@ -2352,8 +2687,8 @@ pub fn revoke_alias_consumer_audited(
     for (addon, b, a) in &transitions {
         audit_reconcile_uses_alias_within_tx(&tx, addon, &alias_name, b, a)?;
     }
-    let after_snap = serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" })
-        .to_string();
+    let after_snap =
+        serde_json::json!({ "consumer": consumer_addon_id, "state": "revoked" }).to_string();
     tx.execute(
         "INSERT INTO model_alias_changes \
             (alias_id, alias_name, changed_by_user_id, after_snapshot, change_type, ts) \
@@ -4318,6 +4653,85 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::ApiKey => {
+                // last_used_at is node-local and stays out of the synced set.
+                let mut stmt = tx.prepare(
+                    "SELECT uid, key_verifier, key_prefix, name, key_type, subject_id, \
+                            rate_limit_rps, is_active FROM api_keys",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, bool>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (uid, verifier, prefix, name, key_type, subject_id, rate, active) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        uid,
+                        Insert,
+                        api_key_changed_fields(
+                            &verifier,
+                            &prefix,
+                            &name,
+                            &key_type,
+                            subject_id.as_deref(),
+                            rate,
+                            active,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ResourcePermission => {
+                let mut stmt = tx.prepare(
+                    "SELECT resource_type, resource_id, subject_type, subject_id, access_level \
+                     FROM resource_permissions",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (resource_type, resource_id, subject_type, subject_id, access_level) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        resource_permission_resource_id(
+                            &resource_type,
+                            &resource_id,
+                            &subject_type,
+                            &subject_id,
+                        ),
+                        Insert,
+                        resource_permission_changed_fields(
+                            &resource_type,
+                            &resource_id,
+                            &subject_type,
+                            &subject_id,
+                            Some(&access_level),
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
@@ -4578,6 +4992,78 @@ fn group_changed_fields(
 
 fn group_member_resource_id(group_id: &str, user_id: &str) -> String {
     format!("{}:{}", group_id, user_id)
+}
+
+/// Replicated field set for an `api_keys` row. `last_used_at` is deliberately
+/// omitted — it is node-local usage state (mirrors skills' use_count/last_used_at)
+/// and the materializer preserves the local value on UPSERT.
+fn api_key_changed_fields(
+    key_verifier: &str,
+    key_prefix: &str,
+    name: &str,
+    key_type: &str,
+    subject_id: Option<&str>,
+    rate_limit_rps: i64,
+    is_active: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("key_verifier".to_string(), field_string(key_verifier));
+    fields.insert("key_prefix".to_string(), field_string(key_prefix));
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("key_type".to_string(), field_string(key_type));
+    fields.insert(
+        "subject_id".to_string(),
+        match subject_id {
+            Some(value) => field_string(value),
+            None => FieldValue::Null,
+        },
+    );
+    fields.insert(
+        "rate_limit_rps".to_string(),
+        FieldValue::I64(rate_limit_rps),
+    );
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+    fields
+}
+
+/// Composite resource_id for a `resource_permissions` row. The four key columns
+/// (resource_type, resource_id, subject_type, subject_id) map to one length-
+/// prefixed key so distinct rules never collide and each gets its own LWW slot.
+fn resource_permission_resource_id(
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+) -> String {
+    crate::sync::resource_id::composite_resource_id(&[
+        resource_type,
+        resource_id,
+        subject_type,
+        subject_id,
+    ])
+}
+
+/// Replicated field set for a `resource_permissions` upsert. Carries the four key
+/// components (the materializer reconstructs the row from these, not from the
+/// composite resource_id) plus the `access_level`. A `clear` replicates as a
+/// Delete that needs only the key components, so it does not set `access_level`.
+fn resource_permission_changed_fields(
+    resource_type: &str,
+    resource_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    access_level: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("resource_type".to_string(), field_string(resource_type));
+    fields.insert("resource_id".to_string(), field_string(resource_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    if let Some(level) = access_level {
+        fields.insert("access_level".to_string(), field_string(level));
+    }
+    fields
 }
 
 fn group_member_changed_fields(
@@ -5420,10 +5906,7 @@ pub fn create_curator_snapshot(
     Ok(())
 }
 
-pub fn get_curator_snapshot(
-    pool: &DbPool,
-    snapshot_id: &str,
-) -> Result<Option<DbCuratorSnapshot>> {
+pub fn get_curator_snapshot(pool: &DbPool, snapshot_id: &str) -> Result<Option<DbCuratorSnapshot>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, proposal_json, status, created_by, created_at, applied_at, rolled_back_at \
@@ -5478,16 +5961,16 @@ pub fn list_curator_snapshot_rows(
 
 /// Marks a snapshot's lifecycle status (`applied` | `rolled_back`), stamping the
 /// matching timestamp column. Returns true when a row moved.
-pub fn set_curator_snapshot_status(
-    pool: &DbPool,
-    snapshot_id: &str,
-    status: &str,
-) -> Result<bool> {
+pub fn set_curator_snapshot_status(pool: &DbPool, snapshot_id: &str, status: &str) -> Result<bool> {
     let stamp_col = match status {
         "applied" => "applied_at",
         "rolled_back" => "rolled_back_at",
         "open" => "created_at",
-        other => return Err(anyhow::anyhow!("invalid curator snapshot status: '{other}'")),
+        other => {
+            return Err(anyhow::anyhow!(
+                "invalid curator snapshot status: '{other}'"
+            ))
+        }
     };
     let conn = acquire(pool)?;
     let rows = conn.execute(
@@ -5986,10 +6469,7 @@ fn agent_changed_fields(
         "max_spawn_depth".to_string(),
         crate::sync::ledger::FieldValue::I64(params.max_spawn_depth),
     );
-    fields.insert(
-        "flow_id".to_string(),
-        field_optional_string(params.flow_id),
-    );
+    fields.insert("flow_id".to_string(), field_optional_string(params.flow_id));
     fields.insert(
         "routable".to_string(),
         crate::sync::ledger::FieldValue::Bool(params.routable),
@@ -6152,8 +6632,9 @@ pub fn create_agent_run(pool: &DbPool, run: &NewAgentRun<'_>) -> Result<()> {
 
 pub fn get_agent_run(pool: &DbPool, id: &str) -> Result<Option<DbAgentRun>> {
     let conn = acquire(pool)?;
-    let mut stmt =
-        conn.prepare_cached(&format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE id = ?1"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE id = ?1"
+    ))?;
     let result = stmt
         .query_row(rusqlite::params![id], row_to_agent_run)
         .optional()?;
@@ -6231,10 +6712,7 @@ pub fn append_agent_run_log(pool: &DbPool, id: &str, step_json: &str) -> Result<
     Ok(rows > 0)
 }
 
-pub fn list_agent_runs(
-    pool: &DbPool,
-    filter: &AgentRunListFilter<'_>,
-) -> Result<Vec<DbAgentRun>> {
+pub fn list_agent_runs(pool: &DbPool, filter: &AgentRunListFilter<'_>) -> Result<Vec<DbAgentRun>> {
     let conn = acquire(pool)?;
     let mut sql = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE 1=1");
     let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
@@ -6608,11 +7086,17 @@ mod agents_repository_tests {
 
         bad = agent_params(&id, "ok-name");
         bad.skills_json = "[]";
-        assert!(upsert_agent(&db, &bad).is_err(), "skills_json not an object");
+        assert!(
+            upsert_agent(&db, &bad).is_err(),
+            "skills_json not an object"
+        );
 
         bad = agent_params(&id, "ok-name");
         bad.params_json = "5";
-        assert!(upsert_agent(&db, &bad).is_err(), "params_json not an object");
+        assert!(
+            upsert_agent(&db, &bad).is_err(),
+            "params_json not an object"
+        );
 
         bad = agent_params(&id, "ok-name");
         bad.max_spawn_depth = 0;
@@ -6804,7 +7288,9 @@ mod agents_repository_tests {
 
         let children = list_agent_runs_by_parent(&db, &parent).expect("children");
         assert_eq!(children.len(), 2);
-        assert!(children.iter().all(|r| r.parent_run_id.as_deref() == Some(parent.as_str())));
+        assert!(children
+            .iter()
+            .all(|r| r.parent_run_id.as_deref() == Some(parent.as_str())));
 
         let by_user = list_agent_runs(
             &db,
@@ -7502,6 +7988,24 @@ pub fn set_user_role(pool: &DbPool, user_id: &str, role: &str) -> Result<()> {
     Ok(())
 }
 
+/// Zwraca `(role, is_admin)` uzytkownika z `user_accounts` lub `None` gdy nie istnieje.
+/// Zrodlo prawdy o rolach userow to baza CORE — ML Studio nie trzyma wlasnej kopii rol.
+pub fn get_user_role(pool: &DbPool, user_id: &str) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT role, is_admin FROM user_accounts WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| {
+                let role: String = row.get(0)?;
+                let is_admin: bool = row.get(1)?;
+                Ok((role, is_admin))
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
 /// Tworzy nowego uzytkownika w tabeli user_accounts.
 /// Zwraca ID nowo utworzonego wiersza.
 pub fn create_user_account(
@@ -7991,6 +8495,41 @@ pub fn log_audit(
     node_id: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    log_audit_conn(
+        &conn, user_id, addon_id, action, resource, details, ip_address, node_id,
+    )
+}
+
+/// Transactional audit write — same hash-chained INSERT as `log_audit`, joined to
+/// a caller's transaction so the audit entry commits atomically with the mutation
+/// it records (a rolled-back mutation leaves no orphan audit row, and vice versa).
+#[allow(clippy::too_many_arguments)]
+pub fn log_audit_tx(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: Option<&str>,
+    addon_id: Option<&str>,
+    action: &str,
+    resource: Option<&str>,
+    details: Option<&str>,
+    ip_address: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
+    log_audit_conn(
+        tx, user_id, addon_id, action, resource, details, ip_address, node_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_audit_conn(
+    conn: &rusqlite::Connection,
+    user_id: Option<&str>,
+    addon_id: Option<&str>,
+    action: &str,
+    resource: Option<&str>,
+    details: Option<&str>,
+    ip_address: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let hash_input = crate::audit::chain::AuditRowHashInput {
         user_id,
@@ -8011,7 +8550,7 @@ pub fn log_audit(
         request_id: None,
         timestamp: &timestamp,
     };
-    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(&conn, &hash_input)?;
+    let (prev_hash, hash) = crate::audit::chain::compute_chain_for_insert(conn, &hash_input)?;
     conn.execute(
         "INSERT INTO audit_log (timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, prev_hash, hash) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -13096,7 +13635,7 @@ pub fn get_addon_enabled(pool: &DbPool, addon_id: &str) -> Result<Option<bool>> 
 
 /// Ustawia flage is_enabled dla addona. Zwraca false jesli addon nie istnieje.
 pub fn set_addon_enabled(pool: &DbPool, addon_id: &str, enabled: bool) -> Result<bool> {
-    let mut conn = acquire(pool)?;
+    let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     let rows = tx.execute(
         "UPDATE addons SET is_enabled = ?2, updated_at = datetime('now') WHERE addon_id = ?1",
@@ -13161,7 +13700,7 @@ pub fn addon_is_syncable(pool: &DbPool, addon_id: &str) -> Result<bool> {
 /// the receiver rebuilds the row + loads the wasm on reconcile (the package is in
 /// its store — bundled in the binary, or arrived as a synced blob).
 pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()> {
-    let mut conn = acquire(pool)?;
+    let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     let row = tx
         .query_row(
@@ -13193,7 +13732,7 @@ pub fn capture_addon_instance_insert(pool: &DbPool, addon_id: &str) -> Result<()
 /// instances do not emit a tombstone, and the bundled check is possible while
 /// the row still exists).
 pub fn capture_addon_instance_delete(pool: &DbPool, addon_id: &str) -> Result<()> {
-    let mut conn = acquire(pool)?;
+    let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     record_core_capture_tx(
         &tx,
@@ -13241,7 +13780,7 @@ pub fn upsert_addon_config_value(
     is_secret: bool,
     updated_by: Option<&str>,
 ) -> Result<()> {
-    let mut conn = acquire(pool)?;
+    let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO addon_config (addon_id, key, value, is_secret, updated_by, updated_at) \
@@ -16005,13 +16544,14 @@ pub mod resource_permissions {
 
     use crate::db::DbPool;
     use anyhow::Result;
+    use rusqlite::OptionalExtension;
 
     #[derive(Debug, Clone)]
     pub struct ResourcePermission {
         pub id: i64,
         pub resource_type: String,
         pub resource_id: String,
-        pub subject_type: String, // "user" | "group"
+        pub subject_type: String, // "user" | "group" | "api_key"
         pub subject_id: String,
         pub access_level: String, // "allow" | "deny"
     }
@@ -16025,14 +16565,39 @@ pub mod resource_permissions {
         subject_id: &str,
         access_level: &str,
     ) -> Result<()> {
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let tx = conn.unchecked_transaction()?;
+        set_tx(
+            &tx,
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            access_level,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transactional upsert — same logic + capture as `set`, but joins a caller's
+    /// transaction so seeding multiple scopes (key creation) commits atomically.
+    pub(crate) fn set_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        access_level: &str,
+    ) -> Result<()> {
         if !matches!(access_level, "allow" | "deny") {
             anyhow::bail!("access_level must be 'allow' or 'deny'");
         }
-        if !matches!(subject_type, "user" | "group") {
-            anyhow::bail!("subject_type must be 'user' or 'group'");
+        if !matches!(subject_type, "user" | "group" | "api_key") {
+            anyhow::bail!("subject_type must be 'user', 'group' or 'api_key'");
         }
-        let conn = pool.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "INSERT INTO resource_permissions
                 (resource_type, resource_id, subject_type, subject_id, access_level)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -16046,10 +16611,31 @@ pub mod resource_permissions {
                 access_level
             ],
         )?;
+        super::record_core_capture_tx(
+            tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+            super::resource_permission_resource_id(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+            ),
+            crate::sync::runtime::SqlWriteAction::Update,
+            super::resource_permission_changed_fields(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+                Some(access_level),
+            ),
+            None,
+        )?;
         Ok(())
     }
 
-    /// Usun wpis (reset do default-allow).
+    /// Usun wpis (reset do default-allow). Replikuje sie jako Delete (tombstone),
+    /// dzieki czemu starszy `allow` z innego wezla nie wskrzesi skasowanej reguly
+    /// (LWW po HLC: nowszy clear wygrywa nad starszym allow).
     pub fn clear(
         pool: &DbPool,
         resource_type: &str,
@@ -16057,12 +16643,51 @@ pub mod resource_permissions {
         subject_type: &str,
         subject_id: &str,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
-        conn.execute(
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let tx = conn.unchecked_transaction()?;
+        clear_tx(&tx, resource_type, resource_id, subject_type, subject_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transactional clear — same delete + tombstone capture as `clear`, joined to
+    /// a caller's transaction.
+    pub(crate) fn clear_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<()> {
+        let affected = tx.execute(
             "DELETE FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
                AND subject_type = ?3 AND subject_id = ?4",
             rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+        )?;
+        // Always emit the tombstone, even when no local row matched: the rule may
+        // exist only on a peer, and the clear's HLC must still fence a stale allow.
+        let _ = affected;
+        super::record_core_capture_tx(
+            tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+            super::resource_permission_resource_id(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+            ),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            super::resource_permission_changed_fields(
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+                None,
+            ),
+            None,
         )?;
         Ok(())
     }
@@ -16096,6 +16721,20 @@ pub mod resource_permissions {
         Ok(rows)
     }
 
+    /// Count of permission rows scoped to a subject — used by the key list UI to
+    /// show how many resources a general key explicitly allows/denies.
+    pub fn count_for_subject(pool: &DbPool, subject_type: &str, subject_id: &str) -> Result<u32> {
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM resource_permissions WHERE subject_type = ?1 AND subject_id = ?2",
+            rusqlite::params![subject_type, subject_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
     /// Lista wszystkich wpisow dla user/group — dla UI "co user X ma zabronione".
     pub fn list_for_subject(
         pool: &DbPool,
@@ -16124,28 +16763,34 @@ pub mod resource_permissions {
         Ok(rows)
     }
 
-    /// Sprawdza czy user ma dostep do zasobu. Priorytet:
+    /// Wspolna logika sprawdzania dostepu uzytkownika z priorytetem:
     /// 1. Admin rola → zawsze allow.
     /// 2. Explicit user-level deny → deny.
     /// 3. Explicit user-level allow → allow.
     /// 4. Any group-level deny dla grup usera → deny.
     /// 5. Any group-level allow → allow.
-    /// 6. Default: allow (public by default).
-    pub fn check(
+    /// 6. DEFAULT = `default_allow`.
+    fn check_inner(
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
         user_id: &str,
         user_role: &str,
+        default_allow: bool,
     ) -> Result<bool> {
         // 1. Admin zawsze moze.
         if user_role == "admin" {
             return Ok(true);
         }
 
-        let conn = pool.lock().unwrap();
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
-        // 2. + 3. User-level override.
+        // 2. + 3. User-level override. Only "no matching row" collapses to
+        // None; any real DB error must propagate so the /v1 fail-closed
+        // wrapper (`check_v1_access`) denies instead of falling through to
+        // the group/default path.
         let user_level: Option<String> = conn
             .query_row(
                 "SELECT access_level FROM resource_permissions
@@ -16154,7 +16799,7 @@ pub mod resource_permissions {
                 rusqlite::params![resource_type, resource_id, user_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         if let Some(level) = user_level {
             return Ok(level == "allow");
         }
@@ -16179,8 +16824,81 @@ pub mod resource_permissions {
             return Ok(true);
         }
 
-        // 6. Default = allow (public by default).
-        Ok(true)
+        // 6. DEFAULT.
+        Ok(default_allow)
+    }
+
+    /// Sprawdza dostep uzytkownika — wariant Tier1 z default ALLOW
+    /// (public by default) i admin-bypass.
+    pub fn check_default_allow(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        user_id: &str,
+        user_role: &str,
+    ) -> Result<bool> {
+        check_inner(pool, resource_type, resource_id, user_id, user_role, true)
+    }
+
+    /// Sprawdza dostep podmiotu — wariant /v1 (Tier 2) z default DENY.
+    ///
+    /// - `User`: admin→allow; potem user_deny/user_allow; group_deny/group_allow
+    ///   (z grup usera); else DENY.
+    /// - `Group`: wylacznie reguly `subject_type='group'`, `subject_id=gid`
+    ///   (deny>allow); brak admin-bypass; else DENY.
+    /// - `ApiKey`: wylacznie reguly `subject_type='api_key'`, `subject_id=uid`
+    ///   (deny>allow); brak admin-bypass; else DENY.
+    pub fn check_subject_default_deny(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject: &crate::auth::acl::Principal,
+    ) -> Result<bool> {
+        use crate::auth::acl::Principal;
+        match subject {
+            Principal::User { user_id, role } => {
+                check_inner(pool, resource_type, resource_id, user_id, role, false)
+            }
+            Principal::Group { group_id } => {
+                check_single_subject(pool, resource_type, resource_id, "group", group_id)
+            }
+            Principal::ApiKey { uid } => {
+                check_single_subject(pool, resource_type, resource_id, "api_key", uid)
+            }
+        }
+    }
+
+    /// Sprawdza wylacznie wpisy dla pojedynczego podmiotu
+    /// `(subject_type, subject_id)`. deny>allow; brak wpisu → DENY.
+    /// Bez admin-bypass, bez rozwijania grup.
+    fn check_single_subject(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<bool> {
+        let conn = pool
+            .lock()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT access_level FROM resource_permissions
+             WHERE resource_type = ?1 AND resource_id = ?2
+               AND subject_type = ?3 AND subject_id = ?4",
+        )?;
+        let levels: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if levels.iter().any(|l| l == "deny") {
+            return Ok(false);
+        }
+        if levels.iter().any(|l| l == "allow") {
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -17564,7 +18282,11 @@ pub fn list_camera_grants(
     )?;
     let rows = stmt
         .query_map(rusqlite::params![camera_id, org_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
@@ -17597,8 +18319,22 @@ mod camera_grant_tests {
 
     fn seed_camera(pool: &DbPool, camera_id: &str, owner: &str, org_id: &str) {
         insert_camera(
-            pool, camera_id, owner, "Cam", "webrtc", "", 30, 10, None, None, "C", "default",
-            None, None, None, Some(org_id),
+            pool,
+            camera_id,
+            owner,
+            "Cam",
+            "webrtc",
+            "",
+            30,
+            10,
+            None,
+            None,
+            "C",
+            "default",
+            None,
+            None,
+            None,
+            Some(org_id),
         )
         .expect("seed camera");
     }
@@ -17627,7 +18363,10 @@ mod camera_grant_tests {
         assert!(can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
         // A different, ungranted addon is still denied.
         assert!(!can_read_camera(&db, "other", "cam1", Some(org())).unwrap());
-        assert_eq!(revoke_camera_grant(&db, "cam1", "tentavision", "read", org()).unwrap(), 1);
+        assert_eq!(
+            revoke_camera_grant(&db, "cam1", "tentavision", "read", org()).unwrap(),
+            1
+        );
         assert!(!can_read_camera(&db, "tentavision", "cam1", Some(org())).unwrap());
     }
 
@@ -18162,9 +18901,7 @@ pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool> {
 
 // --- Conversation messages (durable history) ---
 
-fn row_to_conversation_message(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<DbConversationMessage> {
+fn row_to_conversation_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbConversationMessage> {
     Ok(DbConversationMessage {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -19396,7 +20133,10 @@ mod model_access_tests {
         {
             let conn = acquire(&db).unwrap();
             let tx = conn.unchecked_transaction().unwrap();
-            assert_eq!(lookup_model_visibility_within_tx(&tx, "m1").unwrap(), "restricted");
+            assert_eq!(
+                lookup_model_visibility_within_tx(&tx, "m1").unwrap(),
+                "restricted"
+            );
             tx.commit().unwrap();
         }
         set_model_visibility_audited(&db, "m1", "public", None).unwrap();
@@ -19485,17 +20225,32 @@ mod model_access_tests {
             tx.commit().unwrap();
             assert_eq!(status, "pending");
         }
-        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("pending"));
+        assert_eq!(
+            uses_model_status(&db, "addon-a", "m1").as_deref(),
+            Some("pending")
+        );
 
         // Granting a consumer reconciles pending → granted with audit rows.
         let transitions = grant_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
-        assert_eq!(transitions, vec![("addon-a".into(), "pending".into(), "granted".into())]);
-        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("granted"));
+        assert_eq!(
+            transitions,
+            vec![("addon-a".into(), "pending".into(), "granted".into())]
+        );
+        assert_eq!(
+            uses_model_status(&db, "addon-a", "m1").as_deref(),
+            Some("granted")
+        );
 
         // Revoking flips it back to pending.
         let transitions = revoke_model_consumer_audited(&db, "m1", "addon-a", None).unwrap();
-        assert_eq!(transitions, vec![("addon-a".into(), "granted".into(), "pending".into())]);
-        assert_eq!(uses_model_status(&db, "addon-a", "m1").as_deref(), Some("pending"));
+        assert_eq!(
+            transitions,
+            vec![("addon-a".into(), "granted".into(), "pending".into())]
+        );
+        assert_eq!(
+            uses_model_status(&db, "addon-a", "m1").as_deref(),
+            Some("pending")
+        );
 
         // Going public auto-grants without a consumer row.
         let transitions = set_model_visibility_audited(&db, "m1", "public", None).unwrap();
@@ -19560,3 +20315,813 @@ mod model_access_tests {
     }
 }
 
+#[cfg(all(test, feature = "dashboard-api"))]
+mod api_key_access_v2_tests {
+    use super::*;
+    use crate::api::dashboard::auth::api_key_verifier;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    fn test_cipher() -> crate::crypto::SettingsCipher {
+        crate::crypto::SettingsCipher::new(&[7u8; 32])
+    }
+
+    #[test]
+    fn migration_rebuilds_api_keys_schema() {
+        let db = fresh_db();
+        let conn = acquire(&db).unwrap();
+        let cols: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(api_keys)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        for expected in [
+            "uid",
+            "key_verifier",
+            "key_prefix",
+            "name",
+            "key_type",
+            "subject_id",
+            "rate_limit_rps",
+            "is_active",
+            "created_at",
+            "last_used_at",
+        ] {
+            assert!(cols.contains(expected), "missing column {expected}");
+        }
+        assert!(
+            !cols.contains("owner_user_id"),
+            "owner_user_id must be gone"
+        );
+        assert!(!cols.contains("key_hash"), "key_hash must be gone");
+    }
+
+    #[test]
+    fn resource_permissions_check_allows_api_key_subject() {
+        let db = fresh_db();
+        let conn = acquire(&db).unwrap();
+        // 'api_key' is now within the CHECK and must INSERT.
+        conn.execute(
+            "INSERT INTO resource_permissions \
+                (resource_type, resource_id, subject_type, subject_id, access_level) \
+             VALUES ('model', 'gpt-4o', 'api_key', 'key-uid-1', 'allow')",
+            [],
+        )
+        .expect("api_key subject_type must be accepted");
+
+        // A value outside the CHECK must be rejected.
+        let bad = conn.execute(
+            "INSERT INTO resource_permissions \
+                (resource_type, resource_id, subject_type, subject_id, access_level) \
+             VALUES ('model', 'gpt-4o', 'service', 'x', 'allow')",
+            [],
+        );
+        assert!(bad.is_err(), "subject_type outside CHECK must fail");
+    }
+
+    #[test]
+    fn resource_permissions_set_accepts_api_key() {
+        let db = fresh_db();
+        resource_permissions::set(&db, "model", "gpt-4o", "api_key", "key-uid-1", "allow")
+            .expect("set with api_key subject must succeed");
+        let rows = resource_permissions::list_for_subject(&db, "api_key", "key-uid-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].access_level, "allow");
+    }
+
+    fn seed_user(db: &DbPool, id: &str, role: &str) {
+        let conn = acquire(db).unwrap();
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, role) \
+             VALUES (?1, ?1, 'x', ?2)",
+            rusqlite::params![id, role],
+        )
+        .unwrap();
+    }
+
+    fn seed_group_member(db: &DbPool, group_id: &str, user_id: &str) {
+        let conn = acquire(db).unwrap();
+        conn.execute(
+            "INSERT INTO user_groups (id, name) VALUES (?1, ?1)",
+            rusqlite::params![group_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+            rusqlite::params![group_id, user_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_default_allow_no_rules_allows() {
+        let db = fresh_db();
+        assert!(
+            resource_permissions::check_default_allow(&db, "model", "gpt-4o", "u1", "user")
+                .unwrap(),
+            "Tier1 default must be ALLOW with no rules"
+        );
+    }
+
+    #[test]
+    fn check_default_allow_explicit_deny_denies() {
+        let db = fresh_db();
+        seed_user(&db, "u1", "user");
+        resource_permissions::set(&db, "model", "gpt-4o", "user", "u1", "deny").unwrap();
+        assert!(
+            !resource_permissions::check_default_allow(&db, "model", "gpt-4o", "u1", "user")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_user_no_rules_denies() {
+        let db = fresh_db();
+        let p = crate::auth::acl::Principal::User {
+            user_id: "u1".into(),
+            role: "user".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "/v1 default must be DENY"
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_user_allow_allows() {
+        let db = fresh_db();
+        seed_user(&db, "u1", "user");
+        resource_permissions::set(&db, "model", "gpt-4o", "user", "u1", "allow").unwrap();
+        let p = crate::auth::acl::Principal::User {
+            user_id: "u1".into(),
+            role: "user".into(),
+        };
+        assert!(
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_user_deny_overrides() {
+        let db = fresh_db();
+        seed_user(&db, "u1", "user");
+        resource_permissions::set(&db, "model", "gpt-4o", "user", "u1", "deny").unwrap();
+        let p = crate::auth::acl::Principal::User {
+            user_id: "u1".into(),
+            role: "user".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_admin_user_bypass() {
+        let db = fresh_db();
+        let p = crate::auth::acl::Principal::User {
+            user_id: "u1".into(),
+            role: "admin".into(),
+        };
+        assert!(
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "admin User must bypass even under default-deny"
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_user_group_rules() {
+        let db = fresh_db();
+        seed_user(&db, "u1", "user");
+        seed_group_member(&db, "g1", "u1");
+
+        let p = crate::auth::acl::Principal::User {
+            user_id: "u1".into(),
+            role: "user".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "no group rule → DENY"
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "allow").unwrap();
+        assert!(
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "group allow → allow"
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "deny").unwrap();
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "group deny wins over allow"
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_group_principal() {
+        let db = fresh_db();
+        let p = crate::auth::acl::Principal::Group {
+            group_id: "g1".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "no rule → DENY"
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "allow").unwrap();
+        assert!(
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "group", "g1", "deny").unwrap();
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "deny wins"
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_api_key_principal() {
+        let db = fresh_db();
+        let p = crate::auth::acl::Principal::ApiKey {
+            uid: "key-uid-1".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "no rule → DENY"
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "api_key", "key-uid-1", "allow").unwrap();
+        assert!(
+            resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap()
+        );
+
+        resource_permissions::set(&db, "model", "gpt-4o", "api_key", "key-uid-1", "deny").unwrap();
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "deny wins"
+        );
+    }
+
+    #[test]
+    fn subject_default_deny_api_key_no_admin_bypass() {
+        let db = fresh_db();
+        // An 'admin' user row + the same id present elsewhere must NOT grant the
+        // api_key principal any bypass: api_key only sees api_key rows.
+        seed_user(&db, "key-uid-1", "admin");
+        let p = crate::auth::acl::Principal::ApiKey {
+            uid: "key-uid-1".into(),
+        };
+        assert!(
+            !resource_permissions::check_subject_default_deny(&db, "model", "gpt-4o", &p).unwrap(),
+            "api_key must never get admin-bypass"
+        );
+    }
+
+    #[test]
+    fn check_v1_access_fail_closed_no_rules() {
+        let db = fresh_db();
+        for p in [
+            crate::auth::acl::Principal::User {
+                user_id: "u1".into(),
+                role: "user".into(),
+            },
+            crate::auth::acl::Principal::Group {
+                group_id: "g1".into(),
+            },
+            crate::auth::acl::Principal::ApiKey {
+                uid: "key-uid-1".into(),
+            },
+        ] {
+            assert!(
+                !crate::auth::acl::check_v1_access(&db, "model", "gpt-4o", &p),
+                "no rules → deny for every principal variant"
+            );
+        }
+    }
+
+    #[test]
+    fn create_verify_roundtrip() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let token = "sk-roundtriptoken";
+        let verifier = api_key_verifier(token, &pepper);
+
+        let (id, uid) = create_api_key(
+            &db,
+            &verifier,
+            "sk-...token",
+            "test-key",
+            "user",
+            Some("user-uid-1"),
+            60,
+        )
+        .unwrap();
+        assert!(id > 0);
+        assert!(!uid.is_empty());
+
+        let found = verify_api_key(&db, &verifier)
+            .unwrap()
+            .expect("key must verify");
+        assert_eq!(found.uid, uid);
+        assert_eq!(found.key_type, "user");
+        assert_eq!(found.subject_id.as_deref(), Some("user-uid-1"));
+        // verify_api_key stamps last_used_at in the DB on a hit; re-read to confirm
+        // the persisted value (the returned struct reflects the row pre-stamp).
+        let after = get_api_key_by_uid(&db, &uid).unwrap().unwrap();
+        assert!(after.last_used_at.is_some(), "last_used_at must be stamped");
+
+        // Wrong verifier never matches.
+        let wrong = api_key_verifier("sk-not-the-token", &pepper);
+        assert!(verify_api_key(&db, &wrong).unwrap().is_none());
+    }
+
+    #[test]
+    fn rotate_invalidates_old_verifier() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let old_verifier = api_key_verifier("sk-old", &pepper);
+        let (_, uid) = create_api_key(
+            &db,
+            &old_verifier,
+            "sk-...old",
+            "rotate-key",
+            "user",
+            Some("user-uid-rotate"),
+            60,
+        )
+        .unwrap();
+
+        let new_verifier = api_key_verifier("sk-new", &pepper);
+        assert!(rotate_api_key(&db, &uid, &new_verifier, "sk-...new").unwrap());
+
+        assert!(verify_api_key(&db, &old_verifier).unwrap().is_none());
+        let found = verify_api_key(&db, &new_verifier)
+            .unwrap()
+            .expect("new verifier");
+        assert_eq!(found.uid, uid);
+        assert_eq!(found.key_prefix, "sk-...new");
+    }
+
+    #[test]
+    fn deactivate_blocks_verification() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let verifier = api_key_verifier("sk-deactivate", &pepper);
+        let (_, uid) = create_api_key(
+            &db,
+            &verifier,
+            "sk-...d",
+            "k",
+            "user",
+            Some("user-uid-deact"),
+            60,
+        )
+        .unwrap();
+
+        assert!(verify_api_key(&db, &verifier).unwrap().is_some());
+        assert!(set_api_key_active(&db, &uid, false).unwrap());
+        assert!(
+            verify_api_key(&db, &verifier).unwrap().is_none(),
+            "inactive key must not verify"
+        );
+
+        let by_uid = get_api_key_by_uid(&db, &uid).unwrap().unwrap();
+        assert!(!by_uid.is_active);
+    }
+
+    #[test]
+    fn list_does_not_expose_verifier() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let verifier = api_key_verifier("sk-list", &pepper);
+        create_api_key(
+            &db,
+            &verifier,
+            "sk-...l",
+            "listed",
+            "user",
+            Some("user-uid-list"),
+            60,
+        )
+        .unwrap();
+        let keys = list_api_keys(&db).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].key_verifier.is_empty(),
+            "verifier must not leak on lists"
+        );
+    }
+
+    #[test]
+    fn verifier_is_deterministic_and_pepper_sensitive() {
+        let pepper_a = b"pepper-aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pepper_b = b"pepper-bbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let token = "sk-deterministic";
+        assert_eq!(
+            api_key_verifier(token, pepper_a),
+            api_key_verifier(token, pepper_a)
+        );
+        assert_ne!(
+            api_key_verifier(token, pepper_a),
+            api_key_verifier(token, pepper_b)
+        );
+    }
+
+    #[test]
+    fn pepper_is_idempotent() {
+        let db = fresh_db();
+        let first = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let second = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+    }
+
+    #[test]
+    fn user_key_without_subject_is_rejected() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let verifier = api_key_verifier("sk-nosub", &pepper);
+        let res = create_api_key(&db, &verifier, "sk-...n", "no-subject", "user", None, 60);
+        assert!(
+            res.is_err(),
+            "a 'user' key without subject_id must be rejected"
+        );
+    }
+
+    #[test]
+    fn pepper_with_wrong_length_fails_closed() {
+        let db = fresh_db();
+        let cipher = test_cipher();
+        // A 1-byte pepper (the "00" corruption case) must be refused, never
+        // silently used as a 1-byte HMAC key nor auto-rotated. Stored encrypted
+        // because the pepper is now read through the secure (decrypting) path.
+        set_setting_secure(&db, API_KEY_PEPPER_KEY, "00", &cipher).unwrap();
+        let res = get_or_create_api_key_pepper(&db, &cipher);
+        assert!(res.is_err(), "non-32-byte pepper must fail closed");
+
+        // Non-hex is equally refused.
+        set_setting_secure(&db, API_KEY_PEPPER_KEY, "zz", &cipher).unwrap();
+        assert!(get_or_create_api_key_pepper(&db, &cipher).is_err());
+    }
+
+    #[test]
+    fn last_used_at_is_throttled_to_60s() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let verifier = api_key_verifier("sk-throttle", &pepper);
+        let (_, uid) = create_api_key(
+            &db,
+            &verifier,
+            "sk-...t",
+            "throttled",
+            "user",
+            Some("user-uid-throttle"),
+            60,
+        )
+        .unwrap();
+
+        // First verify stamps (was NULL).
+        verify_api_key(&db, &verifier).unwrap().unwrap();
+        let after_first = get_api_key_by_uid(&db, &uid)
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .expect("first verify must stamp");
+
+        // Force the stamp far enough into the past that a second verify is NOT
+        // within the throttle window, then prove the throttle SQL only updates
+        // when the row is stale.
+        let conn = acquire(&db).unwrap();
+        conn.execute(
+            "UPDATE api_keys SET last_used_at = datetime('now','-120 seconds') WHERE uid = ?1",
+            rusqlite::params![uid],
+        )
+        .unwrap();
+        drop(conn);
+        verify_api_key(&db, &verifier).unwrap().unwrap();
+        let after_stale = get_api_key_by_uid(&db, &uid)
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .unwrap();
+        assert!(
+            after_stale > "2000".to_string(),
+            "stale row must be refreshed"
+        );
+
+        // A fresh stamp (now) must NOT be overwritten on the very next verify:
+        // set a sentinel in the future window and confirm it survives.
+        let conn = acquire(&db).unwrap();
+        conn.execute(
+            "UPDATE api_keys SET last_used_at = datetime('now') WHERE uid = ?1",
+            rusqlite::params![uid],
+        )
+        .unwrap();
+        let sentinel: String = conn
+            .query_row(
+                "SELECT last_used_at FROM api_keys WHERE uid = ?1",
+                rusqlite::params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        verify_api_key(&db, &verifier).unwrap().unwrap();
+        let after_fresh = get_api_key_by_uid(&db, &uid)
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .unwrap();
+        assert_eq!(
+            after_fresh, sentinel,
+            "a fresh last_used_at must not be overwritten within the throttle window"
+        );
+        let _ = after_first;
+    }
+
+    #[test]
+    fn revoke_by_uid_targets_the_right_key() {
+        let db = fresh_db();
+        let pepper = get_or_create_api_key_pepper(&db, &test_cipher()).unwrap();
+        let v1 = api_key_verifier("sk-key-one", &pepper);
+        let v2 = api_key_verifier("sk-key-two", &pepper);
+        let (_, uid1) = create_api_key(
+            &db,
+            &v1,
+            "sk-...one",
+            "key-one",
+            "user",
+            Some("user-uid-1"),
+            60,
+        )
+        .unwrap();
+        let (_, uid2) = create_api_key(
+            &db,
+            &v2,
+            "sk-...two",
+            "key-two",
+            "user",
+            Some("user-uid-2"),
+            60,
+        )
+        .unwrap();
+
+        let affected = delete_api_key_by_uid(&db, &uid1).unwrap();
+        assert_eq!(affected, 1, "exactly the targeted key is deleted");
+        assert!(
+            get_api_key_by_uid(&db, &uid1).unwrap().is_none(),
+            "revoked key is gone"
+        );
+        assert!(
+            get_api_key_by_uid(&db, &uid2).unwrap().is_some(),
+            "the other key survives"
+        );
+        assert!(
+            verify_api_key(&db, &v2).unwrap().is_some(),
+            "the other key still verifies"
+        );
+
+        // Revoking an unknown uid affects nothing.
+        assert_eq!(delete_api_key_by_uid(&db, "no-such-uid").unwrap(), 0);
+    }
+
+    // =========================================================================
+    // Slice-4: capture emission for api_keys + resource_permissions
+    // =========================================================================
+
+    /// Loads the most-recent capture row for a `(resource_type, resource_id)` and
+    /// returns its `(action, changed_fields)`. The capture journal stores the
+    /// fields as a binary blob; decode it through the canonical codec.
+    fn latest_capture(
+        db: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<(
+        String,
+        std::collections::BTreeMap<String, crate::sync::ledger::FieldValue>,
+    )> {
+        let conn = acquire(db).unwrap();
+        conn.query_row(
+            "SELECT action, changed_fields_blob FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 \
+             ORDER BY hlc_wall DESC, hlc_logical DESC LIMIT 1",
+            rusqlite::params![resource_type, resource_id],
+            |row| {
+                let action: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((action, blob))
+            },
+        )
+        .optional()
+        .unwrap()
+        .map(|(action, blob)| (action, crate::sync::ledger::decode(&blob).unwrap()))
+    }
+
+    #[test]
+    fn create_api_key_records_capture_without_last_used_at() {
+        let db = fresh_db();
+        let (_, uid) = create_api_key(
+            &db,
+            "verifier-x",
+            "sk-...x",
+            "captured",
+            "user",
+            Some("user-uid-cap"),
+            42,
+        )
+        .unwrap();
+        let (action, fields) = latest_capture(&db, "core.api_key", &uid).expect("capture exists");
+        assert_eq!(action, "insert");
+        // The verifier travels; last_used_at never does (node-local).
+        assert!(fields.contains_key("key_verifier"));
+        assert!(!fields.contains_key("last_used_at"));
+        assert_eq!(
+            fields.get("rate_limit_rps"),
+            Some(&crate::sync::ledger::FieldValue::I64(42))
+        );
+    }
+
+    #[test]
+    fn create_with_scopes_is_atomic_seeds_all_scopes_and_audits() {
+        let db = fresh_db();
+        let scopes = vec![
+            ("model".to_string(), "gpt-4o".to_string()),
+            ("flow".to_string(), "flow-1".to_string()),
+        ];
+        let (_, uid) = create_api_key_with_scopes(
+            &db,
+            "verifier-seed",
+            "sk-...s",
+            "seeded",
+            "general",
+            None,
+            60,
+            &scopes,
+            Some("actor-uid"),
+            Some("node-1"),
+        )
+        .unwrap();
+
+        // All scopes landed atomically as allow rules for the key.
+        let rows = resource_permissions::list_for_subject(&db, "api_key", &uid).unwrap();
+        assert_eq!(rows.len(), 2, "both seeded scopes persisted");
+        assert!(rows.iter().all(|r| r.access_level == "allow"));
+        // The in-tx audit entry exists.
+        let logs = list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("apikey.create".to_string()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .unwrap();
+        assert!(!logs.is_empty(), "create must be audited in the same tx");
+    }
+
+    #[test]
+    fn create_with_scopes_rolls_back_key_when_a_scope_write_fails() {
+        // A second create reusing the SAME key_verifier fails the api_keys INSERT
+        // (UNIQUE) inside the transaction. The whole call must roll back: no second
+        // key, and not a single scope from the failed call may leak into
+        // resource_permissions — proving the key + scope seeding are atomic.
+        let db = fresh_db();
+        let (_, first_uid) = create_api_key_with_scopes(
+            &db,
+            "dup-verifier",
+            "sk-...a",
+            "first",
+            "general",
+            None,
+            60,
+            &[("model".to_string(), "m-a".to_string())],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let before_keys = list_api_keys(&db).unwrap().len();
+        let before_scopes =
+            resource_permissions::count_for_subject(&db, "api_key", &first_uid).unwrap();
+
+        let res = create_api_key_with_scopes(
+            &db,
+            "dup-verifier",
+            "sk-...b",
+            "second",
+            "general",
+            None,
+            60,
+            &[
+                ("model".to_string(), "m-b".to_string()),
+                ("flow".to_string(), "f-b".to_string()),
+            ],
+            None,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "duplicate verifier must fail the second create"
+        );
+
+        // No new key, and none of the second call's scopes survived the rollback.
+        assert_eq!(
+            list_api_keys(&db).unwrap().len(),
+            before_keys,
+            "failed create must not leave a partial key"
+        );
+        assert_eq!(
+            resource_permissions::count_for_subject(&db, "api_key", &first_uid).unwrap(),
+            before_scopes,
+            "first key's scopes are untouched"
+        );
+        // The second call's resources must have zero rows anywhere.
+        let mb = resource_permissions::list_for_resource(&db, "model", "m-b").unwrap();
+        let fb = resource_permissions::list_for_resource(&db, "flow", "f-b").unwrap();
+        assert!(
+            mb.is_empty() && fb.is_empty(),
+            "no scope from the rolled-back create may persist"
+        );
+    }
+
+    #[test]
+    fn rotate_and_set_active_and_delete_record_full_row_captures() {
+        let db = fresh_db();
+        let (_, uid) =
+            create_api_key(&db, "v0", "sk-...0", "k", "user", Some("user-uid-r"), 10).unwrap();
+
+        rotate_api_key(&db, &uid, "v1", "sk-...1").unwrap();
+        let (action, fields) = latest_capture(&db, "core.api_key", &uid).expect("rotate capture");
+        assert_eq!(action, "update");
+        // Full-row capture: rotation carries the NEW verifier and every column the
+        // materializer upserts (it cannot apply a partial row).
+        assert_eq!(
+            fields.get("key_verifier"),
+            Some(&crate::sync::ledger::FieldValue::String("v1".to_string()))
+        );
+        assert!(fields.contains_key("name"));
+        assert!(!fields.contains_key("last_used_at"));
+
+        set_api_key_active(&db, &uid, false).unwrap();
+        let (action, fields) =
+            latest_capture(&db, "core.api_key", &uid).expect("set_active capture");
+        assert_eq!(action, "update");
+        assert_eq!(
+            fields.get("is_active"),
+            Some(&crate::sync::ledger::FieldValue::Bool(false))
+        );
+
+        delete_api_key_by_uid(&db, &uid).unwrap();
+        let (action, _) = latest_capture(&db, "core.api_key", &uid).expect("delete capture");
+        assert_eq!(action, "delete");
+    }
+
+    #[test]
+    fn resource_permission_set_and_clear_record_captures() {
+        let db = fresh_db();
+        let rid = resource_permission_resource_id("model", "gpt-4o", "user", "u1");
+
+        resource_permissions::set(&db, "model", "gpt-4o", "user", "u1", "deny").unwrap();
+        let (action, fields) =
+            latest_capture(&db, "core.resource_permission", &rid).expect("set capture");
+        assert_eq!(action, "update");
+        assert_eq!(
+            fields.get("access_level"),
+            Some(&crate::sync::ledger::FieldValue::String("deny".to_string()))
+        );
+        // The four key components ride in the fields so the materializer can
+        // reconstruct the row without parsing the composite resource_id.
+        for key in ["resource_type", "resource_id", "subject_type", "subject_id"] {
+            assert!(fields.contains_key(key), "missing key component {key}");
+        }
+
+        resource_permissions::clear(&db, "model", "gpt-4o", "user", "u1").unwrap();
+        let (action, _) =
+            latest_capture(&db, "core.resource_permission", &rid).expect("clear capture");
+        assert_eq!(action, "delete", "clear replicates as a delete tombstone");
+    }
+
+    #[test]
+    fn default_policies_cover_new_security_resources() {
+        let db = fresh_db();
+        ensure_default_core_sync_policies(&db).unwrap();
+        let conn = acquire(&db).unwrap();
+        for resource_type in ["core.api_key", "core.resource_permission"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_policies \
+                     WHERE resource_type = ?1 AND mode = 'replicated_by_permission'",
+                    rusqlite::params![resource_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing default policy for {resource_type}");
+        }
+    }
+}

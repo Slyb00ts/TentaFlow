@@ -1,0 +1,44 @@
+# Manifest serwisu RF-DETR Training — serwer treningowy detekcji obiektów
+# (RF-DETR). Realne fine-tuningi na zbiorach COCO sterowane przez REST API
+# (POST /train). Wariant modelu (nano/small/medium/base/large) i dane (dataset
+# COCO) są parametrem JOBA, nie wybierane przy deployu — requires_model = false.
+
+[engine]
+id = "rfdetr-training"
+category = "training"
+name = "RF-DETR Training"
+description_pl = "Serwer treningowy detekcji obiektów (RF-DETR): fine-tuning na COCO, eksport do ONNX. Wariant modelu i dane podajesz per job przez REST API."
+description_en = "Object detection training server (RF-DETR): COCO fine-tuning, ONNX export. Model variant and data are supplied per job over a REST API."
+homepage = "https://github.com/roboflow/rf-detr"
+license = "Apache-2.0"
+icon = "image"
+default_port = 8202
+api = "custom"
+version = "1.0.0"
+requires_model = false
+
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "training/python/rfdetr-training"
+
+[[model_preset]]
+id = "rfdetr-base"
+display_name = "RF-DETR Base (560px)"
+repo = "base"
+recommended = true
+
+[[model_preset]]
+id = "rfdetr-nano"
+display_name = "RF-DETR Nano (szybki)"
+repo = "nano"
+
+[[model_preset]]
+id = "rfdetr-medium"
+display_name = "RF-DETR Medium"
+repo = "medium"
+
+[[model_preset]]
+id = "rfdetr-large"
+display_name = "RF-DETR Large (najlepszy)"
+repo = "large"

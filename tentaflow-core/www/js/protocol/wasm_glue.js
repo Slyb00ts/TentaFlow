@@ -1384,23 +1384,34 @@ export function encodeAliasVisibilitySetRequest(alias_id, visibility) {
 }
 
 /**
- * MessageBody::ApiKeyCreateRequest { name, scopes }.
+ * MessageBody::ApiKeyCreateRequest { name, key_type, subject_id, scope_resources }.
+ * `scope_resources` travels as two parallel arrays (types[i] + ids[i]) so the
+ * wasm-bindgen boundary stays on simple `Vec<String>` values.
  * @param {string} name
- * @param {string[]} scopes
+ * @param {string} key_type
+ * @param {string | null | undefined} subject_id
+ * @param {string[]} scope_types
+ * @param {string[]} scope_ids
  * @returns {Uint8Array}
  */
-export function encodeApiKeyCreateRequest(name, scopes) {
+export function encodeApiKeyCreateRequest(name, key_type, subject_id, scope_types, scope_ids) {
     const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passArrayJsValueToWasm0(scopes, wasm.__wbindgen_malloc);
+    const ptr1 = passStringToWasm0(key_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeApiKeyCreateRequest(ptr0, len0, ptr1, len1);
+    var ptr2 = isLikeNone(subject_id) ? 0 : passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArrayJsValueToWasm0(scope_types, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArrayJsValueToWasm0(scope_ids, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
+    return v6;
 }
 
 /**
@@ -1432,6 +1443,89 @@ export function encodeApiKeyRevokeRequest(key_id) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * MessageBody::ApiKeyRotateRequest { key_uid }.
+ * @param {string} key_uid
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyRotateRequest(key_uid) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyRotateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ApiKeyScopeClearRequest { key_uid, resource_type, resource_id }.
+ * @param {string} key_uid
+ * @param {string} resource_type
+ * @param {string} resource_id
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeClearRequest(key_uid, resource_type, resource_id) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(resource_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(resource_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeClearRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::ApiKeyScopeListRequest { key_uid }.
+ * @param {string} key_uid
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeListRequest(key_uid) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level }.
+ * @param {string} key_uid
+ * @param {string} resource_type
+ * @param {string} resource_id
+ * @param {string} access_level
+ * @returns {Uint8Array}
+ */
+export function encodeApiKeyScopeSetRequest(key_uid, resource_type, resource_id, access_level) {
+    const ptr0 = passStringToWasm0(key_uid, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(resource_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(resource_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(access_level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeApiKeyScopeSetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
 }
 
 /**
@@ -3291,6 +3385,252 @@ export function encodeMetaSchemaVersionCheck(client_version) {
 }
 
 /**
+ * @param {string} dataset_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioDatasetProfileRequest(dataset_id) {
+    const ptr0 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioDatasetProfileRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} name
+ * @param {string} filename
+ * @param {string} upload_id
+ * @param {number} seq
+ * @param {number} total_chunks
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioDatasetUploadChunkRequest(project_id, name, filename, upload_id, seq, total_chunks, bytes) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(filename, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(upload_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioDatasetUploadChunkRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, seq, total_chunks, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * Upload a tabular file for profiling. `bytes` arrives from JS as a Uint8Array
+ * and wasm-bindgen materializes it directly into `Vec<u8>` — no base64 or copy
+ * step on the JS side.
+ * @param {string} project_id
+ * @param {string} name
+ * @param {string} filename
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioDatasetUploadRequest(project_id, name, filename, bytes) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(filename, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioDatasetUploadRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioDatasetsListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioDatasetsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} model_id
+ * @param {string} message
+ * @param {number} max_tokens
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtChatRequest(model_id, message, max_tokens) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(message, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtChatRequest(ptr0, len0, ptr1, len1, max_tokens);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} model_id
+ * @param {string} target_node_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtDeployRequest(model_id, target_node_id) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtDeployRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} model_id
+ * @param {string} outtype
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtExportRequest(model_id, outtype) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(outtype, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtExportRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} model_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtExportStatusRequest(model_id) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtExportStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} dataset_id
+ * @param {string} base_model
+ * @param {string} method
+ * @param {string} objective
+ * @param {string | null | undefined} teacher_model
+ * @param {number} learning_rate
+ * @param {number} batch_size
+ * @param {number} grad_accum_steps
+ * @param {number} epochs
+ * @param {number} lora_r
+ * @param {number} lora_alpha
+ * @param {number} lora_dropout
+ * @param {number} max_seq_len
+ * @param {boolean} merge_adapter
+ * @param {string | null | undefined} target_node_id
+ * @param {number} num_gpus
+ * @param {number} dist_nnodes
+ * @param {number} dist_node_rank
+ * @param {string} dist_master_addr
+ * @param {number} dist_master_port
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtTrainStartRequest(project_id, dataset_id, base_model, method, objective, teacher_model, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter, target_node_id, num_gpus, dist_nnodes, dist_node_rank, dist_master_addr, dist_master_port) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(base_model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(method, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(objective, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(teacher_model) ? 0 : passStringToWasm0(teacher_model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    var ptr6 = isLikeNone(target_node_id) ? 0 : passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    const ptr7 = passStringToWasm0(dist_master_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len7 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtTrainStartRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, learning_rate, batch_size, grad_accum_steps, epochs, lora_r, lora_alpha, lora_dropout, max_seq_len, merge_adapter, ptr6, len6, num_gpus, dist_nnodes, dist_node_rank, ptr7, len7, dist_master_port);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v9 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v9;
+}
+
+/**
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioFtTrainStatusRequest(run_id) {
+    const ptr0 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioFtTrainStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioModelsListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioModelsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @param {string} name
  * @param {string} description
  * @param {string} project_type
@@ -3329,6 +3669,117 @@ export function encodeMlStudioProjectDetailRequest(project_id) {
 }
 
 /**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectGrantsListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectGrantsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} invitee_user_id
+ * @param {string} role
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectInviteRequest(project_id, invitee_user_id, role) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(invitee_user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectInviteRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} user_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectMemberRemoveRequest(project_id, user_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectMemberRemoveRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} user_id
+ * @param {string} role
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectMemberRoleSetRequest(project_id, user_id, role) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectMemberRoleSetRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectMembersListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectMembersListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioProjectResourcesRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioProjectResourcesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @returns {Uint8Array}
  */
 export function encodeMlStudioProjectTypesListRequest() {
@@ -3352,6 +3803,256 @@ export function encodeMlStudioProjectsListRequest() {
     var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} name
+ * @param {string} path
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogDatasetRegisterRequest(project_id, name, path) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogDatasetRegisterRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} model_id
+ * @param {number} threshold
+ * @param {string} image_b64
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogDetectRequest(model_id, threshold, image_b64) {
+    const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(image_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogDetectRequest(ptr0, len0, threshold, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} dataset_id
+ * @param {string} image_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogImageRequest(dataset_id, image_id) {
+    const ptr0 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(image_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogImageRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} dataset_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogImagesListRequest(dataset_id) {
+    const ptr0 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogImagesListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} dataset_id
+ * @param {string} image_id
+ * @param {string} annotations_json
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogSaveAnnotationsRequest(dataset_id, image_id, annotations_json) {
+    const ptr0 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(image_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(annotations_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogSaveAnnotationsRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} dataset_id
+ * @param {string} variant
+ * @param {number} epochs
+ * @param {number} batch_size
+ * @param {number} grad_accum
+ * @param {number} learning_rate
+ * @param {number} resolution
+ * @param {boolean} early_stopping
+ * @param {string | null} [target_node_id]
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogTrainStartRequest(project_id, dataset_id, variant, epochs, batch_size, grad_accum, learning_rate, resolution, early_stopping, target_node_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(variant, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(target_node_id) ? 0 : passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogTrainStartRequest(ptr0, len0, ptr1, len1, ptr2, len2, epochs, batch_size, grad_accum, learning_rate, resolution, early_stopping, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * @param {string} run_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioRecogTrainStatusRequest(run_id) {
+    const ptr0 = passStringToWasm0(run_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogTrainStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} subject_kind
+ * @param {string} subject_id
+ * @param {string} node_id
+ * @param {string} resource_kind
+ * @param {string} resource_ref
+ * @param {string} quota
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantCreateRequest(subject_kind, subject_id, node_id, resource_kind, resource_ref, quota) {
+    const ptr0 = passStringToWasm0(subject_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(resource_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(resource_ref, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passStringToWasm0(quota, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioResourceGrantCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * @param {string} grant_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantRevokeRequest(grant_id) {
+    const ptr0 = passStringToWasm0(grant_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioResourceGrantRevokeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioResourceGrantsListRequest() {
+    const ret = wasm.encodeMlStudioResourceGrantsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} project_id
+ * @param {string} dataset_id
+ * @param {string} target_column
+ * @param {string} task
+ * @param {string | null} [engine]
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioTabularTrainRequest(project_id, dataset_id, target_column, task, engine) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(target_column, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(task, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(engine) ? 0 : passStringToWasm0(engine, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioTabularTrainRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * @param {string} project_id
+ * @returns {Uint8Array}
+ */
+export function encodeMlStudioTrainingRunsListRequest(project_id) {
+    const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioTrainingRunsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**

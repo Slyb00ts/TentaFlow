@@ -182,6 +182,26 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
+    // Wczytaj konfigurowalne lokalizacje instalacji (models/containers/cache) z
+    // ustawien i zastosuj jako runtime override w `paths`. Wolane PO `db::init`
+    // (pool dostepny), wiec ponawiamy `ensure_app_dirs()` — jest idempotentne —
+    // zeby katalogi powstaly w nowej lokalizacji. data_dir/baza ZOSTAJA pod
+    // tentaflow_home. Te 3 klucze sa node-local (nie syncowane).
+    {
+        let models = db::repository::get_setting(&db, "models_dir")
+            .ok()
+            .flatten();
+        let containers = db::repository::get_setting(&db, "containers_dir")
+            .ok()
+            .flatten();
+        let cache = db::repository::get_setting(&db, "cache_dir").ok().flatten();
+        paths::set_path_overrides(models, containers, cache);
+        if let Err(e) = paths::ensure_app_dirs() {
+            error!("ensure_app_dirs po wczytaniu override nieudany: {}", e);
+            return Err(anyhow::anyhow!("ensure_app_dirs (override): {}", e));
+        }
+    }
+
     // ML Studio uses its OWN dedicated SQLite file (`data/ml_studio.db`) with a
     // separate pool and migration runner; open it right after the core DB.
     if let Err(e) = tentaflow_core::ml_studio::init(paths::tentaflow_home()) {
@@ -731,6 +751,7 @@ async fn run_server(args: Args) -> Result<()> {
                                             db: db.clone(),
                                             port_allocator,
                                             iroh: mesh_mgr.clone(),
+                                            router: router.clone(),
                                             addon_manager: addon_manager.clone(),
                                         },
                                     )

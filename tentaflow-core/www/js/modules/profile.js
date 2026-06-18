@@ -27,7 +27,13 @@ const ProfileScreen = {
       const me = await ApiBinary.one('authMeRequest');
       const card = byId('profile-card');
       const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
-      const roleKey = (me?.role ?? 'user').toLowerCase() === 'admin' ? 'role.administrator' : 'role.user';
+      const roleValue = (me?.role ?? 'user').toLowerCase();
+      const roleKey =
+        roleValue === 'admin'
+          ? 'role.administrator'
+          : roleValue === 'power_user'
+            ? 'users.role_power'
+            : 'role.user';
       card.innerHTML = `
         <div class="profile-header">
           <div class="profile-avatar">${escapeHtml(initials)}</div>

@@ -447,6 +447,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "camera_grants_table",
             MigrationStep::Sql(CAMERA_GRANTS_TABLE),
         ),
+        (
+            82,
+            "api_keys_access_v2",
+            MigrationStep::RustSelfManaged(api_keys_access_v2),
+        ),
     ]
 }
 
@@ -1430,6 +1435,139 @@ fn widen_retention_scope_for_agent_runs(conn: &Connection, version: i64, name: &
         if !fk_violations.is_empty() {
             anyhow::bail!(
                 "widen_retention_scope_for_agent_runs: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+// =============================================================================
+// v82 — rebuild api_keys (HMAC verifier + key_type/subject + stable uid) and
+// widen resource_permissions.subject_type to allow 'api_key'. Self-managed
+// because the table rebuild needs `PRAGMA foreign_keys=OFF` outside a
+// transaction. All legacy api_keys rows are dropped (decision: never used).
+// =============================================================================
+fn api_keys_access_v2(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    // Defensive idempotency: detect the new schema by the presence of the
+    // `key_verifier` column on api_keys; if it is already there this DB ran the
+    // migration (version guard in `run` normally prevents a re-run anyway).
+    let already_done: bool = conn
+        .query_row(
+            "SELECT instr(sql, 'key_verifier') > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'api_keys'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if already_done {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        // api_keys: drop every legacy row (never used in production) and rebuild
+        // with the new column set. `key_hash` and `owner_user_id` are gone;
+        // `key_verifier` (HMAC-SHA256), `uid`, `key_type` and `subject_id`
+        // replace them.
+        tx.execute_batch(
+            "
+            DELETE FROM api_keys;
+            DROP INDEX IF EXISTS idx_api_keys_prefix;
+            DROP INDEX IF EXISTS idx_apikeys_owner;
+            CREATE TABLE api_keys_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL UNIQUE,
+                key_verifier TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                name TEXT NOT NULL,
+                key_type TEXT NOT NULL DEFAULT 'user'
+                    CHECK(key_type IN ('user','group','general')),
+                subject_id TEXT NULL,
+                rate_limit_rps INTEGER NOT NULL DEFAULT 100,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT
+            );
+            DROP TABLE api_keys;
+            ALTER TABLE api_keys_new RENAME TO api_keys;
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix);
+            CREATE INDEX idx_api_keys_subject ON api_keys(key_type, subject_id);
+            ",
+        )?;
+
+        // resource_permissions: widen subject_type CHECK to include 'api_key',
+        // preserving existing rows and all other columns/constraints/indexes.
+        // The base schema had no CHECK on subject_type, so a row with a value
+        // outside the new allowlist would fail the INSERT...SELECT rebuild and
+        // lose data silently. Preflight first and bail with a readable error.
+        let bad_subject_types: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT subject_type FROM resource_permissions \
+                 WHERE subject_type NOT IN ('user','group','api_key')",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if !bad_subject_types.is_empty() {
+            anyhow::bail!(
+                "api_keys_access_v2: resource_permissions has rows with subject_type \
+                 outside ('user','group','api_key'): {}. Resolve these rows before \
+                 migrating; refusing to drop them.",
+                bad_subject_types.join(", ")
+            );
+        }
+
+        tx.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_resperm_subject;
+            DROP INDEX IF EXISTS idx_resperm_resource;
+            CREATE TABLE resource_permissions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL
+                    CHECK(subject_type IN ('user','group','api_key')),
+                subject_id TEXT NOT NULL,
+                access_level TEXT NOT NULL CHECK(access_level IN ('allow','deny')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(resource_type, resource_id, subject_type, subject_id)
+            );
+            INSERT INTO resource_permissions_new
+                SELECT id, resource_type, resource_id, subject_type, subject_id, \
+                       access_level, created_at
+                FROM resource_permissions;
+            DROP TABLE resource_permissions;
+            ALTER TABLE resource_permissions_new RENAME TO resource_permissions;
+            CREATE INDEX idx_resperm_subject ON resource_permissions(subject_type, subject_id);
+            CREATE INDEX idx_resperm_resource ON resource_permissions(resource_type, resource_id);
+            ",
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "api_keys_access_v2: foreign_key_check found {} violation(s): {}",
                 fk_violations.len(),
                 fk_violations.join("; ")
             );

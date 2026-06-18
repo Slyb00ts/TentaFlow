@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 03-macierz-dostepu.html
+     Opis: Macierz dostępu do zasobów (model/flow/alias) — 1:1 ze stylem
+           uprawnień funkcji addonów: subtabs Per grupa / Per user / Per klucz /
+           Domyślne, kolumny = zasoby, komórki tri-state allow/deny/inherit.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Dostęp i klucze API — Macierz dostępu</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/><path d="m14 9 2 1"/><path d="m18 7 2 1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5 11 16.5"/><path d="M16.5 7.5 13 16.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><path d="M6.4 7.1 10.6 10.9"/><path d="M17.6 7.1 13.4 10.9"/><path d="M6.4 16.9 10.6 13.1"/><path d="M17.6 16.9 13.4 13.1"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">03</span>
+    <h2>Macierz dostępu (jak uprawnienia funkcji addonów)</h2>
+    <div class="desc">Wiersze = podmioty (grupy / userzy / klucze ogólne) + wiersz „Domyślne”. Kolumny = zasoby pogrupowane (Modele / Flow / Aliasy). Komórka tri-state: ✓ allow · ✗ deny · — dziedzicz.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Katalog usług</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-network"/></svg>Mesh</div>
+        </div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy i grupy<span class="badge">5</span></div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-key"/></svg>Dostęp i klucze API</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addony</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr J.</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="page-header">
+          <div>
+            <h1><svg class="icon icon-xl"><use href="#i-shield"/></svg>Macierz dostępu</h1>
+            <div class="sub">Kto może używać których zasobów przez /v1 · zapis trafia do <span class="mono">resource_permissions</span> i sync na cały mesh</div>
+          </div>
+          <div class="actions">
+            <div class="view-toggle"><span class="vt active">Wg podmiotu</span><a class="vt" href="04-zasob-dostep.html">Wg zasobu</a></div>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-key"/></svg>Klucze</div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Macierz dostępu</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-model"/></svg>Wg zasobu</div>
+        </div>
+
+        <div class="subtabs" role="tablist">
+          <div class="subtab active">Per grupa</div>
+          <div class="subtab">Per user</div>
+          <div class="subtab">Per klucz</div>
+          <div class="subtab">Domyślne</div>
+        </div>
+
+        <div class="alert info">
+          <svg class="icon"><use href="#i-info"/></svg>
+          <div><strong>Kolejność rozwiązywania:</strong> admin → deny usera → allow usera → deny grupy → allow grupy → <strong>Domyślne</strong>.
+            Na <strong>/v1 Domyślne = DENY</strong> (nic bez jawnego nadania). Klucz dodatkowo zawęża: efektywny dostęp = <code>scope_klucza ∩ wynik_macierzy</code>.</div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Macierz: grupy × zasoby <span class="muted">· kliknij komórkę aby cyklicznie zmieniać allow → deny → dziedzicz</span></h3>
+          <div class="section-sub">Kolumny pogrupowane: Modele (usługi lokalne + mesh), Flow (opublikowane), Aliasy (z fallbackami). Tabela przewija się w poziomie przy wielu zasobach.</div>
+
+          <div style="overflow:auto;">
+            <table class="perm-matrix">
+              <thead>
+                <tr>
+                  <th rowspan="2" style="min-width:230px;vertical-align:bottom;">Grupa</th>
+                  <th class="grp" colspan="3"><svg class="icon icon-sm"><use href="#i-model"/></svg> Modele</th>
+                  <th class="grp" colspan="2"><svg class="icon icon-sm"><use href="#i-flow"/></svg> Flow</th>
+                  <th class="grp" colspan="2"><svg class="icon icon-sm"><use href="#i-link"/></svg> Aliasy</th>
+                </tr>
+                <tr>
+                  <th class="func" title="guard-pl (LLM, lokalny + B)">guard<br>pl</th>
+                  <th class="func" title="embeddings-gemma">emb<br>gemma</th>
+                  <th class="func" title="whisper-base (STT)">whisper<br>base</th>
+                  <th class="func" title="chat-orlen (flow)">chat<br>orlen</th>
+                  <th class="func" title="rag-korpus (flow)">rag<br>korpus</th>
+                  <th class="func" title="chat-prod → guard-pl + fallback">chat<br>prod</th>
+                  <th class="func" title="emb-prod → embeddings-gemma">emb<br>prod</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><div class="group-name">data-science</div><div class="group-meta">8 członków</div></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                </tr>
+                <tr>
+                  <td><div class="group-name">orlen-poc</div><div class="group-meta">4 członków</div></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn allow"><svg class="icon"><use href="#i-check"/></svg></button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                </tr>
+                <tr>
+                  <td><div class="group-name">goście</div><div class="group-meta">12 członków</div></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                  <td class="func"><button class="perm-btn inherit">—</button></td>
+                </tr>
+                <tr class="row-default">
+                  <td><div class="group-name">Domyślne (/v1)</div><div class="group-meta">fallback gdy brak reguły — DENY</div></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                  <td class="func"><button class="perm-btn deny"><svg class="icon"><use href="#i-x"/></svg></button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="legend">
+            <div class="li"><span class="dot allow"></span>allow — jawnie dozwolone</div>
+            <div class="li"><span class="dot deny"></span>deny — jawnie zablokowane (wygrywa nad allow grupy)</div>
+            <div class="li"><span class="dot inherit"></span>dziedzicz — spada do reguły grupy / Domyślnych</div>
+            <div class="li" style="margin-left:auto;">Ostatnia zmiana: Piotr J. · dziś 14:21 · zsync. 3/3 węzły</div>
+          </div>
+        </div>
+
+        <div class="alert success">
+          <svg class="icon"><use href="#i-check"/></svg>
+          <div><strong>Każda zmiana komórki</strong> zapisuje wpis <span class="mono">resource_permissions(resource_type, resource_id, subject_type, subject_id, access_level)</span>,
+            audytuje operację i emituje do ledgera sync → po chwili identyczna reguła obowiązuje na węzłach A, B i C.</div>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

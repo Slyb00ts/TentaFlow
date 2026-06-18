@@ -8,9 +8,10 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::Argon2;
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 /// Dane zawarte w tokenie JWT
 /// VULN-004: is_admin USUNIETY z JWT — zawsze sprawdzaj w DB (Zero Trust).
@@ -44,11 +45,22 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-/// SHA256 hex hash dla kluczy API (szybki, deterministyczny)
-pub fn hash_api_key(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+/// API key verifier = hex(HMAC-SHA256(pepper, token)). The pepper is an org-wide
+/// secret (see `get_or_create_api_key_pepper`), stored encrypted and replicated
+/// only as a sync shared secret (re-encrypted per node); a plain DB dump without
+/// the master key cannot forge keys. INVARIANT: the pepper is identical across
+/// all nodes within an org so a replicated key verifies everywhere — a joiner
+/// adopts the org pepper from the baseline before issuing or verifying keys.
+pub fn api_key_verifier(token: &str, pepper: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).expect("HMAC accepts keys of any length");
+    mac.update(token.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
 }
 
 /// Generuje token JWT dla uzytkownika.

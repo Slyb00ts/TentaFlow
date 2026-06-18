@@ -1,0 +1,29 @@
+# Manifest serwisu AutoGluon Training — tabularny silnik AutoML (Python).
+# Realny trening tabularny przez REST API (POST /train_tabular): ensemble drzew
+# (LightGBM/CatBoost/XGBoost) + leaderboard, klasyfikacja i regresja. Dane (CSV/
+# XLSX) podajesz per job jako base64 — nie ma modelu bazowego, wiec
+# requires_model = false. To „silnik best" tabularny obok rust-owego trenera.
+
+[engine]
+id = "autogluon-training"
+category = "training"
+name = "AutoGluon (Tabular AutoML)"
+description_pl = "Tabularny AutoML: ensemble drzew, leaderboard, klasyfikacja i regresja. Dane (CSV/XLSX) podajesz per job przez REST API."
+description_en = "Tabular AutoML: tree ensembles, leaderboard, classification and regression. Data (CSV/XLSX) is supplied per job over a REST API."
+homepage = "https://github.com/autogluon/autogluon"
+license = "Apache-2.0"
+icon = "grid-rows"
+default_port = 8201
+api = "custom"
+version = "1.0.0"
+requires_model = false
+
+[deploy.docker]
+context_path = "training/docker/autogluon-training"
+platforms = ["linux"]
+transport = "sidecar-quic"
+
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "training/python/autogluon-training"

@@ -1,0 +1,44 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle natywnego serwera treningowego LLM (Hugging Face
+#       SFT/LoRA/QLoRA/DPO). server.py uruchamiany przez uvicorn na :8200.
+# Przykład: TentaFlow startuje server.py, a Core wysyła POST /train.
+# =============================================================================
+
+[bundle]
+engine = "ml-training"
+description = "Hugging Face LLM training server (SFT/LoRA/QLoRA/DPO)"
+python_version = "3.12"
+# Wszystkie zaleznosci sa pinowane w requirements.lock (torch bez sufixu
+# +cu121, zeby install_variants.extra_index zadecydowal ktory wheel torcha uv
+# pobierze). `pypi_package` to identity-package bundla (transformers) — jest
+# juz w locku, wiec install jest idempotentny.
+source = "pypi"
+pypi_package = "transformers==4.46.3"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8200}",
+]
+internal_port = 8200
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 30
+platforms = ["linux-x86_64"]
+
+# torch z kolami CUDA 12.1 (PyPI domyslnie serwuje wariant CPU). requirements.lock
+# pinuje torch BEZ lokalnego sufixu +cu121, zeby ten extra_index wybral wheel
+# CUDA. Brak GPU -> wariant `cpu` (bez extra_index) zaciaga torcha CPU.
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu121"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []

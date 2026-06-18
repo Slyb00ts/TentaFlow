@@ -31,6 +31,8 @@ pub enum CoreSyncResourceKind {
     SharedSettingSecret,
     AddonInstance,
     AddonConfig,
+    ApiKey,
+    ResourcePermission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +286,35 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "addons",
+    },
+    // External-app API keys (Tier-2 /v1 surface). Replicated so a key issued on
+    // one node verifies on every node — the verifier travels, NEVER the raw key.
+    // Node-local `last_used_at` is deliberately excluded from the synced field
+    // set (same scheme as skills usage stats); the materializer preserves it on
+    // UPSERT so a synced edit cannot reset a node's local usage timestamp.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ApiKey,
+        table_name: "api_keys",
+        resource_type: "core.api_key",
+        primary_key_column: "uid",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "security",
+    },
+    // Generic resource ACL (model/flow/addon allow|deny per subject). Composite
+    // key (resource_type, resource_id, subject_type, subject_id) travels as a
+    // length-prefixed composite resource_id; the materializer reads the four
+    // components from the fields. `clear` replicates as a Delete tombstone so a
+    // stale `allow` from another node cannot resurrect a cleared rule (LWW: the
+    // newer clear wins over an older allow via core_resource_versions).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ResourcePermission,
+        table_name: "resource_permissions",
+        resource_type: "core.resource_permission",
+        primary_key_column: "resource_type,resource_id,subject_type,subject_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "permissions",
     },
 ];
 

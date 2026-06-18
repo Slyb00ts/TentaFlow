@@ -188,6 +188,116 @@ pub fn rate_limiter() -> &'static Arc<RateLimiter> {
     RATE_LIMITER.get_or_init(|| Arc::new(RateLimiter::new(RateLimitConfig::default())))
 }
 
+// =============================================================================
+// Per-key rate limiter — keyed by API key uid (NOT IP)
+// =============================================================================
+//
+// The HMAC `RateLimiter` above guards the unauthenticated signed-URL surfaces by
+// IP. The /v1 surface is authenticated, so the meaningful budget is per API key:
+// each `api_keys.rate_limit_rps` is enforced as a token bucket keyed by the key
+// uid. The same key shares one budget across every IP it calls from; distinct
+// keys are isolated. `rate_limit_rps <= 0` disables the limit for that key.
+
+/// Hard ceiling on the per-key map. Unlike the per-IP surface (forged tokens) the
+/// keys here are valid uids, but a deployment with very high key cardinality (or a
+/// key-enumeration probe against `rate_limit_rps>0` keys) would otherwise grow the
+/// map without bound — idle eviction never fires for keys that keep firing.
+const MAX_PER_KEY_ENTRIES: usize = 10_000;
+
+struct KeyEntry {
+    bucket: TokenBucket,
+    rps: u32,
+    last_seen: Instant,
+}
+
+pub struct PerKeyRateLimiter {
+    keys: DashMap<String, KeyEntry>,
+}
+
+impl PerKeyRateLimiter {
+    fn new() -> Self {
+        Self {
+            keys: DashMap::new(),
+        }
+    }
+
+    /// Charge one token against `key_uid`'s bucket sized for `rate_limit_rps`.
+    /// Returns `None` when allowed, or `Some(retry_after_secs)` when throttled.
+    /// A non-positive `rate_limit_rps` means "no limit" and always allows.
+    pub fn check(&self, key_uid: &str, rate_limit_rps: i64) -> Option<f64> {
+        if rate_limit_rps <= 0 {
+            return None;
+        }
+        let rps = rate_limit_rps as u32;
+        let now = Instant::now();
+        self.sweep_if_needed(now);
+
+        let mut entry = self
+            .keys
+            .entry(key_uid.to_string())
+            .or_insert_with(|| KeyEntry {
+                // Burst depth = sustained rps; refill = rps tokens/sec.
+                bucket: TokenBucket::new(rps),
+                rps,
+                last_seen: now,
+            });
+        // If the stored capacity is stale (key's rps changed via sync), rebuild.
+        if entry.rps != rps {
+            entry.bucket = TokenBucket::new(rps);
+            entry.rps = rps;
+        }
+        entry.last_seen = now;
+        match entry.bucket.refill_and_peek(rps, rps as f64, now) {
+            Ok(()) => {
+                entry.bucket.commit_one();
+                None
+            }
+            Err(retry) => Some(retry),
+        }
+    }
+
+    fn sweep_if_needed(&self, now: Instant) {
+        let over_cap = self.keys.len() >= MAX_PER_KEY_ENTRIES;
+        let limit = if over_cap { usize::MAX } else { 64 };
+        let mut scanned = 0;
+        self.keys.retain(|_k, v| {
+            scanned += 1;
+            if scanned > limit {
+                return true;
+            }
+            now.saturating_duration_since(v.last_seen) < IDLE_EVICT_AFTER
+        });
+
+        // Idle eviction alone is unbounded under high cardinality of ACTIVELY
+        // firing keys (none idle yet). Enforce a hard ceiling: when still at/above
+        // the cap, drop the oldest 25 % by `last_seen` (approximate LRU) so the map
+        // can never grow past the cap regardless of traffic pattern.
+        if self.keys.len() >= MAX_PER_KEY_ENTRIES {
+            let target = MAX_PER_KEY_ENTRIES * 3 / 4;
+            let mut snapshot: Vec<(String, Instant)> = self
+                .keys
+                .iter()
+                .map(|e| (e.key().clone(), e.value().last_seen))
+                .collect();
+            snapshot.sort_by_key(|(_, ts)| *ts);
+            let drop_count = snapshot.len().saturating_sub(target);
+            for (key, _) in snapshot.into_iter().take(drop_count) {
+                self.keys.remove(&key);
+            }
+        }
+    }
+
+    pub fn key_entry_count(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+static PER_KEY_LIMITER: OnceLock<Arc<PerKeyRateLimiter>> = OnceLock::new();
+
+pub fn per_key_rate_limiter() -> &'static Arc<PerKeyRateLimiter> {
+    PER_KEY_LIMITER.get_or_init(|| Arc::new(PerKeyRateLimiter::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +406,49 @@ mod tests {
             rl.ip_entry_count(),
             MAX_PER_IP_ENTRIES
         );
+    }
+
+    #[test]
+    fn per_key_burst_then_throttled_and_isolated() {
+        let rl = PerKeyRateLimiter::new();
+        // rps=2 → burst of 2 allowed, third throttled.
+        assert!(rl.check("key-a", 2).is_none());
+        assert!(rl.check("key-a", 2).is_none());
+        let retry = rl.check("key-a", 2).expect("third request throttled");
+        assert!(retry > 0.0);
+        // A different key has its own independent budget.
+        assert!(rl.check("key-b", 2).is_none());
+        // rate_limit_rps <= 0 disables the limit entirely.
+        for _ in 0..100 {
+            assert!(rl.check("key-unlimited", 0).is_none());
+        }
+    }
+
+    #[test]
+    fn per_key_eviction_at_hard_cap() {
+        // Pump > MAX_PER_KEY_ENTRIES distinct, actively-firing keys. Idle eviction
+        // never fires (all fresh), so only the hard-cap LRU pass keeps the map
+        // bounded — it must never exceed the cap.
+        let rl = PerKeyRateLimiter::new();
+        for n in 0..(MAX_PER_KEY_ENTRIES + 2_000) {
+            let _ = rl.check(&format!("key-{n}"), 1);
+        }
+        assert!(
+            rl.key_entry_count() <= MAX_PER_KEY_ENTRIES,
+            "per-key map size {} exceeded hard cap {}",
+            rl.key_entry_count(),
+            MAX_PER_KEY_ENTRIES
+        );
+    }
+
+    #[test]
+    fn per_key_refills_after_window() {
+        let rl = PerKeyRateLimiter::new();
+        assert!(rl.check("k", 1).is_none());
+        assert!(rl.check("k", 1).is_some());
+        std::thread::sleep(Duration::from_millis(1_100));
+        // After 1.1 s with refill 1/s at least one token is back.
+        assert!(rl.check("k", 1).is_none());
     }
 
     #[test]

@@ -29,7 +29,8 @@ use crate::net::iroh::{
         endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
         merge_contact_hints, PairingContactHints, PairingHandler,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_BASELINE, ALPN_MESH, ALPN_PAIRING,
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_MESH,
+    ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -837,6 +838,47 @@ impl IrohMeshManager {
                     }
                 });
             }
+            a if a == ALPN_ARTIFACT => {
+                // Odbiorca bulk-transferu artefaktu modelu. Nadawca (zaufany peer)
+                // otwiera bi-stream i pcha [name_len u32][name][zip_len u64][zip];
+                // my składamy, rozpakowujemy do lokalnego katalogu i odsyłamy
+                // [path_len u32][path]. remote_id z połączenia = autorytatywny peer.
+                if !self.security.is_trusted(&remote_hex) {
+                    warn!(peer = %remote_hex, "artifact: nieufny peer — odrzucam");
+                    connection.close(0u32.into(), b"untrusted");
+                    return Ok(());
+                }
+                tokio::spawn(async move {
+                    let (mut send, mut recv) = match connection.accept_bi().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(peer = %remote_hex, "artifact: accept_bi nieudane: {}", e);
+                            return;
+                        }
+                    };
+                    match crate::ml_studio::mesh_artifact::recv_artifact_stream(&mut recv).await {
+                        Ok((name, zip)) => {
+                            match crate::ml_studio::mesh_artifact::store_artifact_zip(&name, &zip) {
+                                Ok(path) => {
+                                    let pb = path.as_bytes();
+                                    let _ = send.write_all(&(pb.len() as u32).to_be_bytes()).await;
+                                    let _ = send.write_all(pb).await;
+                                    let _ = send.finish();
+                                    info!(peer = %remote_hex, "artifact: odebrano i rozpakowano do {}", path);
+                                }
+                                Err(e) => {
+                                    warn!(peer = %remote_hex, "artifact: rozpakowanie nieudane: {}", e);
+                                    let _ = send.write_all(&0u32.to_be_bytes()).await;
+                                    let _ = send.finish();
+                                }
+                            }
+                        }
+                        Err(e) => warn!(peer = %remote_hex, "artifact: odbiór streamu nieudany: {}", e),
+                    }
+                    // Daj czas na flush odpowiedzi zanim połączenie zniknie.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                });
+            }
             a if a == ALPN_API => {
                 debug!(
                     "iroh_mesh: ALPN_API otrzymane — delegacja do dashboard layer (zadanie #56)"
@@ -1224,6 +1266,119 @@ impl IrohMeshManager {
         .await
         .map_err(|e| anyhow::anyhow!("baseline pull: joiner session: {e}"))?;
         Ok(())
+    }
+
+    /// Bulk-push artefaktu modelu (ZIP) do `target_node_id` jednym bi-streamem na
+    /// ALPN_ARTIFACT — zamiast tysięcy round-tripów komend mesh. Wysyła
+    /// `[name_len u32][name][zip_len u64][zip]`, odbiera `[path_len u32][path]`
+    /// (ścieżka katalogu artefaktu na węźle docelowym). Zwraca tę ścieżkę.
+    pub async fn push_artifact_stream(
+        &self,
+        target_node_id: &str,
+        name: &str,
+        zip: &[u8],
+        progress_key: Option<&str>,
+    ) -> Result<String> {
+        use crate::ml_studio::mesh_artifact::{
+            ArtifactTransferProgress, ARTIFACT_CHUNK_BYTES, ARTIFACT_STALL_SECS,
+        };
+        let hints = load_trusted_contact_hints(&self.security.db, target_node_id)
+            .map_err(|e| anyhow::anyhow!("artifact push: load hints: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("artifact push: brak hintów dla {target_node_id}"))?;
+        let hints_resolved = hints_with_relay_fallback(
+            self.endpoint.inner(),
+            &hints,
+            self.config.relay_url.as_ref().map(|u| u.as_str()),
+        );
+        let addr = endpoint_addr_from_hints(&hints_resolved)
+            .map_err(|e| anyhow::anyhow!("artifact push: addr: {e}"))?;
+        let connection = self
+            .endpoint
+            .connect(addr, ALPN_ARTIFACT)
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: connect ALPN_ARTIFACT: {e:?}"))?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: open_bi: {e}"))?;
+
+        send.write_all(&(name.len() as u32).to_be_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: write name_len: {e}"))?;
+        send.write_all(name.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: write name: {e}"))?;
+        send.write_all(&(zip.len() as u64).to_be_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: write zip_len: {e}"))?;
+
+        // Strumieniujemy ZIP zapisami CZĄSTKOWYMI (`write`, nie `write_all`) z
+        // watchdogiem STALL: każdy `write` przyjmuje tyle bajtów, ile zmieści okno
+        // flow-control QUIC, i zwraca natychmiast po przyjęciu JAKICHKOLWIEK bajtów.
+        // Świeży limit bezczynności (ARTIFACT_STALL_SECS) na każdy `write` → dopóki
+        // choć bajt zostaje przyjęty w oknie, licznik się resetuje. Timeout = ZERO
+        // przyjętych bajtów przez okno = odbiorca nie czyta (STALL). Aktywny transfer
+        // (nawet bardzo wolny) NIGDY nie pada na sztywny deadline. Postęp → mapa B/s.
+        let total = zip.len() as u64;
+        let stall = std::time::Duration::from_secs(ARTIFACT_STALL_SECS);
+        let mut sent: u64 = 0;
+        let mut window_start = tokio::time::Instant::now();
+        let mut window_bytes: u64 = 0;
+        let mut rate_bps: u64 = 0;
+        let mut off = 0usize;
+        while off < zip.len() {
+            let end = (off + ARTIFACT_CHUNK_BYTES).min(zip.len());
+            let n = match tokio::time::timeout(stall, send.write(&zip[off..end])).await {
+                Ok(Ok(n)) if n > 0 => n,
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("artifact push: write zip: {e}")),
+                Err(_) => {
+                    if let Some(k) = progress_key {
+                        crate::ml_studio::mesh_artifact::clear_artifact_progress(k);
+                    }
+                    anyhow::bail!(
+                        "artifact push: transfer utknął — brak przyjętych bajtów przez {}s ({}/{} B)",
+                        ARTIFACT_STALL_SECS,
+                        sent,
+                        total
+                    );
+                }
+            };
+            sent += n as u64;
+            window_bytes += n as u64;
+            off += n;
+            let win = window_start.elapsed().as_secs_f64();
+            if win >= 1.0 {
+                rate_bps = (window_bytes as f64 / win) as u64;
+                window_start = tokio::time::Instant::now();
+                window_bytes = 0;
+            }
+            if let Some(k) = progress_key {
+                crate::ml_studio::mesh_artifact::set_artifact_progress_pub(
+                    k,
+                    ArtifactTransferProgress {
+                        bytes_sent: sent,
+                        bytes_total: total,
+                        rate_bps,
+                    },
+                );
+            }
+        }
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("artifact push: finish: {e}"))?;
+
+        // Odpowiedź `[path_len][path]` z odbiorcy — z watchdogiem STALL na każdy
+        // `read` (patrz `read_reply_stall`), żeby zawieszony unzip po stronie
+        // odbiorcy nie zostawił nas w transferze bez końca. Reset na każdy bajt.
+        let mut len_buf = [0u8; 4];
+        read_reply_stall(&mut recv, &mut len_buf, stall).await?;
+        let n = u32::from_be_bytes(len_buf) as usize;
+        if n == 0 {
+            anyhow::bail!("węzeł docelowy nie zapisał artefaktu");
+        }
+        let mut pbuf = vec![0u8; n];
+        read_reply_stall(&mut recv, &mut pbuf, stall).await?;
+        Ok(String::from_utf8_lossy(&pbuf).to_string())
     }
 
     /// Wysyla ramke `[disc][data]` na uni streamie do peera.
@@ -2682,6 +2837,31 @@ async fn read_forward_payload(
         return Err(IrohStreamError::FrameTooLarge(payload.len()));
     }
     Ok(payload)
+}
+
+/// Czyta dokładnie `buf.len()` bajtów odpowiedzi ze streamu z watchdogiem STALL:
+/// każdy `read` ma świeży limit bezczynności i resetuje go po napłynięciu choć
+/// jednego bajtu. Timeout = ZERO nowych bajtów przez okno (a nie „za wolno").
+async fn read_reply_stall(
+    recv: &mut iroh::endpoint::RecvStream,
+    buf: &mut [u8],
+    stall: std::time::Duration,
+) -> Result<()> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        match tokio::time::timeout(stall, recv.read(&mut buf[got..])).await {
+            Ok(Ok(Some(0))) | Ok(Ok(None)) => {
+                anyhow::bail!("strumień odpowiedzi zamknięty przedwcześnie ({}/{} B)", got, buf.len())
+            }
+            Ok(Ok(Some(k))) => got += k,
+            Ok(Err(e)) => anyhow::bail!("read reply: {e}"),
+            Err(_) => anyhow::bail!(
+                "brak nowych bajtów odpowiedzi przez {}s — peer utknął",
+                stall.as_secs()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Funkcja pomocnicza wywolywana przez accept loop przy pairing ALPN. Separacja
