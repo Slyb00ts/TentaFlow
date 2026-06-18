@@ -424,6 +424,7 @@ async fn run_session(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SessionCommand::Stop) | None => {
+                        tracing::debug!(camera_id = %cam_id, "webrtc session stopping (Stop/None)");
                         publish(&health_tx, &cam_id, CameraStatus::Stopping, None, &counters, fps_window.back().copied());
                         teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
@@ -555,6 +556,7 @@ async fn run_session(
                                 }
                                 SourceKind::WebRtc => {
                                     let reason = "webrtc video stream ended";
+                                    tracing::warn!(camera_id = %cam_id, "webrtc session terminal: EOS on bus");
                                     publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, fps_window.back().copied());
                                     teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                                     let _ = pipeline.pipeline.set_state(gst::State::Null);
@@ -569,6 +571,7 @@ async fn run_session(
                         }
                         MessageView::Error(err) => {
                             let text = format!("{} ({})", err.error(), err.debug().unwrap_or_default());
+                            tracing::warn!(camera_id = %cam_id, error = %text, "webrtc session terminal: GST bus Error");
                             publish(&health_tx, &cam_id, CameraStatus::Error, Some(text.clone()), &counters, fps_window.back().copied());
                             teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                             let _ = pipeline.pipeline.set_state(gst::State::Null);
@@ -604,6 +607,7 @@ async fn run_session(
                         online = true;
                     } else if tokio::time::Instant::now() >= warmup_deadline {
                         let reason = "no frames within warmup window";
+                        tracing::warn!(camera_id = %cam_id, "webrtc session terminal: warmup window elapsed with no frames");
                         publish(&health_tx, &cam_id, CameraStatus::Error, Some(reason.into()), &counters, None);
                         teardown_webrtc_branch(&pipeline.pipeline, webrtc_tee.as_ref(), &mut webrtc_mp4_branch);
                         let _ = pipeline.pipeline.set_state(gst::State::Null);
@@ -663,6 +667,7 @@ fn teardown_webrtc_branch(
     branch: &mut Option<super::rtsp::Mp4BranchState>,
 ) {
     if let (Some(tee), Some(state)) = (tee, branch.take()) {
+        tracing::debug!("webrtc: terminal teardown detaching Branch B");
         super::webrtc_source::detach_mp4_branch_webrtc(pipeline, tee, state);
     }
 }
