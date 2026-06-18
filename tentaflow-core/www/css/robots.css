@@ -123,3 +123,11 @@
   margin-top: auto;
   padding-top: 4px;
 }
+
+/* Inline refusal shown when a parametered action's descriptor is missing a
+   required param or is ambiguous — the send button stays disabled. */
+.robots-param-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--danger, #dc3545);
+}

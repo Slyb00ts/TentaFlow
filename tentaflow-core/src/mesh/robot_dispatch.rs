@@ -88,6 +88,39 @@ pub struct AdvertisedRobot {
     /// controller node can present available actions without owning the addon.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Rich capability descriptors (label / risk / param schema) driving a
+    /// capability-based control UI. Appended last for wire compat: an old peer's
+    /// announce decodes with an empty vec (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule), and a robot addon that emits no `actions_meta` simply
+    /// advertises none — the UI then falls back to the flat capability chips.
+    #[serde(default)]
+    pub actions_meta: Vec<AdvertisedAction>,
+}
+
+/// One numeric parameter of a parametered robot action, with the inclusive range
+/// the UI bounds its input to (the owner re-clamps on receipt regardless).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisedActionParam {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Rich descriptor of ONE advertised robot control, mirrored from the owning
+/// addon's `<pkg>.status` `actions_meta`. Carries the human label, risk tier and
+/// param schema so a controller node can render a capability-driven UI and gate
+/// high-risk acrobatics without hardcoding any per-robot action list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisedAction {
+    pub kind: String,
+    pub label: String,
+    pub risk: String,
+    #[serde(default)]
+    pub acrobatic: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub params: Vec<AdvertisedActionParam>,
 }
 
 /// CBOR wire payload for the robot advertisement broadcast: one node's complete
@@ -288,6 +321,7 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             battery_percent: telemetry.battery_percent,
             rtt_ms: telemetry.rtt_ms,
             capabilities: telemetry.capabilities,
+            actions_meta: telemetry.actions_meta,
         });
     }
     global().replace_local(local_node_id, robots.clone());
@@ -305,6 +339,7 @@ pub struct RobotStatusTelemetry {
     pub battery_percent: Option<f32>,
     pub rtt_ms: Option<u32>,
     pub capabilities: Vec<String>,
+    pub actions_meta: Vec<AdvertisedAction>,
 }
 
 impl RobotStatusTelemetry {
@@ -317,6 +352,7 @@ impl RobotStatusTelemetry {
             battery_percent: None,
             rtt_ms: None,
             capabilities: Vec::new(),
+            actions_meta: Vec::new(),
         }
     }
 }
@@ -410,6 +446,7 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
                 .collect()
         })
         .unwrap_or_default();
+    let actions_meta = parse_actions_meta(status);
     RobotStatusTelemetry {
         is_online,
         status: raw_status,
@@ -417,7 +454,64 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
         battery_percent,
         rtt_ms,
         capabilities,
+        actions_meta,
     }
+}
+
+/// PURE extraction of the rich `actions_meta` descriptor from a `status` result.
+/// Absence is a first-class capability-absent case (an older/other robot addon
+/// that emits no rich descriptor) → empty vec, NOT an error. Each entry must have
+/// a non-empty `kind` and `label`; malformed entries are skipped individually so
+/// one bad entry can't drop the whole set. `risk` defaults to "medium" (the safer
+/// "needs care" tier) when absent.
+fn parse_actions_meta(status: &serde_json::Value) -> Vec<AdvertisedAction> {
+    let Some(arr) = status.get("actions_meta").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let kind = entry.get("kind").and_then(|v| v.as_str())?.trim();
+            let label = entry.get("label").and_then(|v| v.as_str()).unwrap_or(kind);
+            if kind.is_empty() {
+                return None;
+            }
+            let risk = entry
+                .get("risk")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("medium")
+                .to_string();
+            let acrobatic = entry.get("acrobatic").and_then(|v| v.as_bool()).unwrap_or(false);
+            let read_only = entry.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let params = entry
+                .get("params")
+                .and_then(|v| v.as_array())
+                .map(|ps| {
+                    ps.iter()
+                        .filter_map(|p| {
+                            let name = p.get("name").and_then(|v| v.as_str())?.trim();
+                            if name.is_empty() {
+                                return None;
+                            }
+                            Some(AdvertisedActionParam {
+                                name: name.to_string(),
+                                min: p.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY),
+                                max: p.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AdvertisedAction {
+                kind: kind.to_string(),
+                label: label.to_string(),
+                risk,
+                acrobatic,
+                read_only,
+                params,
+            })
+        })
+        .collect()
 }
 
 /// Last camera_id THIS node advertised for `addon_id` (its robot_id), read from
@@ -469,6 +563,7 @@ fn robots_structurally_equal(a: &AdvertisedRobot, b: &AdvertisedRobot) -> bool {
         && a.status == b.status
         && a.battery_percent == b.battery_percent
         && a.capabilities == b.capabilities
+        && a.actions_meta == b.actions_meta
 }
 
 /// PURE diff of two advertised-robot snapshots keyed by `robot_id`. Produces the
@@ -912,6 +1007,7 @@ mod tests {
             battery_percent: Some(80.0),
             rtt_ms: Some(12),
             capabilities: vec!["move".to_string(), "sit".to_string()],
+            actions_meta: Vec::new(),
         }
     }
 
@@ -1309,6 +1405,125 @@ mod tests {
         assert_eq!(t.battery_percent, Some(73.0));
         assert_eq!(t.rtt_ms, Some(18));
         assert_eq!(t.capabilities, vec!["move", "sit", "stand_up"]);
+    }
+
+    #[test]
+    fn parse_status_telemetry_parses_actions_meta() {
+        let status = serde_json::json!({
+            "status": "online",
+            "capabilities": ["move", "sit", "front_flip"],
+            "actions_meta": [
+                { "kind": "sit", "label": "Siad", "risk": "low", "params": [] },
+                { "kind": "move", "label": "Ruch", "risk": "medium", "params": [
+                    { "name": "vx", "min": -1.0, "max": 1.0 },
+                    { "name": "vyaw", "min": -1.0, "max": 1.0 } ] },
+                { "kind": "front_flip", "label": "Front Flip", "risk": "high",
+                  "acrobatic": true, "params": [] },
+                { "kind": "status", "label": "Status", "risk": "low",
+                  "read_only": true, "params": [] },
+            ],
+        });
+        let t = parse_status_telemetry(&status);
+        assert_eq!(t.actions_meta.len(), 4);
+
+        let sit = &t.actions_meta[0];
+        assert_eq!(sit.kind, "sit");
+        assert_eq!(sit.label, "Siad");
+        assert_eq!(sit.risk, "low");
+        assert!(!sit.acrobatic);
+        assert!(!sit.read_only);
+        assert!(sit.params.is_empty());
+
+        let mv = &t.actions_meta[1];
+        assert_eq!(mv.kind, "move");
+        assert_eq!(mv.params.len(), 2);
+        assert_eq!(mv.params[0].name, "vx");
+        assert_eq!(mv.params[0].min, -1.0);
+        assert_eq!(mv.params[0].max, 1.0);
+
+        let flip = &t.actions_meta[2];
+        assert_eq!(flip.risk, "high");
+        assert!(flip.acrobatic);
+
+        assert!(t.actions_meta[3].read_only);
+    }
+
+    #[test]
+    fn parse_status_telemetry_absent_actions_meta_is_empty() {
+        // An older/other robot addon that emits no rich descriptor: capability-
+        // absent, not an error. The UI falls back to flat capability chips.
+        let status = serde_json::json!({
+            "status": "online", "capabilities": ["move", "sit"],
+        });
+        let t = parse_status_telemetry(&status);
+        assert!(t.actions_meta.is_empty());
+        assert_eq!(t.capabilities, vec!["move", "sit"]);
+    }
+
+    #[test]
+    fn parse_actions_meta_skips_malformed_entries_and_defaults_risk() {
+        let status = serde_json::json!({
+            "actions_meta": [
+                { "label": "no kind here", "risk": "low" },
+                { "kind": "", "label": "empty kind" },
+                { "kind": "hello" },
+                { "kind": "euler", "params": [
+                    { "min": 0.0, "max": 1.0 },
+                    { "name": "roll", "min": -0.5, "max": 0.5 } ] },
+            ],
+        });
+        let metas = parse_actions_meta(&status);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].kind, "hello");
+        assert_eq!(metas[0].label, "hello", "label defaults to kind when absent");
+        assert_eq!(metas[0].risk, "medium", "risk defaults to medium when absent");
+        assert_eq!(metas[1].kind, "euler");
+        assert_eq!(metas[1].params.len(), 1, "param without name is skipped");
+        assert_eq!(metas[1].params[0].name, "roll");
+    }
+
+    #[test]
+    fn parse_actions_meta_roundtrips_through_advertised_robot() {
+        let mut robot = ad("go2", "go2", "node-b");
+        robot.actions_meta = vec![
+            AdvertisedAction {
+                kind: "sit".to_string(),
+                label: "Siad".to_string(),
+                risk: "low".to_string(),
+                acrobatic: false,
+                read_only: false,
+                params: vec![],
+            },
+            AdvertisedAction {
+                kind: "front_flip".to_string(),
+                label: "Front Flip".to_string(),
+                risk: "high".to_string(),
+                acrobatic: true,
+                read_only: false,
+                params: vec![],
+            },
+        ];
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, robot);
+        assert_eq!(back.actions_meta.len(), 2);
+        assert!(back.actions_meta[1].acrobatic);
+    }
+
+    #[test]
+    fn diff_advertised_actions_meta_change_emits_updated() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.actions_meta = vec![AdvertisedAction {
+            kind: "sit".to_string(),
+            label: "Siad".to_string(),
+            risk: "low".to_string(),
+            acrobatic: false,
+            read_only: false,
+            params: vec![],
+        }];
+        let new = vec![changed.clone()];
+        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
     }
 
     #[test]
@@ -1753,6 +1968,7 @@ mod tests {
             battery_percent: None,
             rtt_ms: None,
             capabilities: Vec::new(),
+            actions_meta: Vec::new(),
         };
 
         // A remote node advertises the SAME robot_id with its own camera id.

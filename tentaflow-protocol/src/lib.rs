@@ -517,6 +517,8 @@ pub use message_body::{
     SchedulerPayload,
     SchedulerRunsListRequest,
     SchedulerRunsListResponse,
+    RobotActionMeta,
+    RobotActionParam,
     RobotActionWire,
     RobotCameraShareRequest,
     RobotCameraShareResponse,
