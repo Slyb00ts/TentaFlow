@@ -1935,6 +1935,76 @@ pub struct RobotActionMeta {
     pub params: Vec<RobotActionParam>,
 }
 
+/// Inertial-measurement snapshot the robot reports (orientation + temperature).
+/// Every field is optional so a robot that omits one (or a whole IMU block) is
+/// representable without inventing a reading.
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotImuSnapshot {
+    #[serde(default)]
+    pub roll: Option<f64>,
+    #[serde(default)]
+    pub pitch: Option<f64>,
+    #[serde(default)]
+    pub yaw: Option<f64>,
+    /// Orientation quaternion [w, x, y, z] (empty when the robot omits it).
+    #[serde(default)]
+    pub quaternion: Vec<f64>,
+    /// IMU board temperature in °C.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Battery detail beyond the flat percentage: voltage / current / cell SOC /
+/// pack temperature. All optional (capability-absent → `None`).
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotBatterySnapshot {
+    #[serde(default)]
+    pub soc: Option<f64>,
+    #[serde(default)]
+    pub voltage: Option<f64>,
+    #[serde(default)]
+    pub current: Option<f64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Structured runtime telemetry snapshot of a robot, projected from the owning
+/// addon's `status.telemetry` object. This is a SNAPSHOT read at the existing
+/// advertisement cadence, NOT a high-rate stream. Every field is optional / a
+/// possibly-empty vector so a robot that does not report a value simply omits it
+/// (capability-absent, never a fabricated reading).
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotTelemetrySnapshot {
+    /// Sport/gait mode integer the robot reports (firmware-specific).
+    #[serde(default)]
+    pub mode: Option<i64>,
+    /// Gait type integer (trot / run / climb …).
+    #[serde(default)]
+    pub gait_type: Option<i64>,
+    /// Current body height in metres.
+    #[serde(default)]
+    pub body_height: Option<f64>,
+    /// Forward velocity (m/s).
+    #[serde(default)]
+    pub vx: Option<f64>,
+    /// Lateral velocity (m/s).
+    #[serde(default)]
+    pub vy: Option<f64>,
+    /// Yaw rate (rad/s).
+    #[serde(default)]
+    pub vyaw: Option<f64>,
+    /// Odometry position [x, y, z] (empty when absent).
+    #[serde(default)]
+    pub position: Vec<f64>,
+    /// Per-foot contact force (empty when absent).
+    #[serde(default)]
+    pub foot_force: Vec<f64>,
+    #[serde(default)]
+    pub imu: Option<RobotImuSnapshot>,
+    #[serde(default)]
+    pub battery: Option<RobotBatterySnapshot>,
+}
+
 /// One robot row for the Robots list screen: a projection of the mesh registry's
 /// `AdvertisedRobot`, scoped to the caller's org. `is_local` lets the UI label a
 /// robot this node physically owns vs one controlled over the mesh.
@@ -1956,6 +2026,12 @@ pub struct RobotEntry {
     /// ciborium APPEND-AT-END rule) — the UI then falls back to plain chips.
     #[serde(default)]
     pub actions_meta: Vec<RobotActionMeta>,
+    /// Structured runtime telemetry snapshot (gait / velocity / IMU / battery
+    /// detail). Appended last for CBOR back-compat: an older owner that reports
+    /// no telemetry decodes with `None` (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule) — the UI then renders no telemetry panel.
+    #[serde(default)]
+    pub telemetry: Option<RobotTelemetrySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -7521,6 +7597,10 @@ mod tests {
             decoded.actions_meta.is_empty(),
             "missing actions_meta must default to an empty vec"
         );
+        assert!(
+            decoded.telemetry.is_none(),
+            "missing telemetry must default to None"
+        );
 
         // Same guarantee through the list wrapper the UI actually consumes.
         #[derive(SerdeSerialize)]
@@ -7545,6 +7625,55 @@ mod tests {
             crate::cbor::decode(&list_bytes).expect("decode legacy list");
         assert_eq!(decoded_list.robots.len(), 1);
         assert!(decoded_list.robots[0].actions_meta.is_empty());
+        assert!(decoded_list.robots[0].telemetry.is_none());
+    }
+
+    #[test]
+    fn robot_entry_telemetry_snapshot_roundtrips() {
+        // A full telemetry snapshot must survive CBOR encode/decode, including the
+        // nested IMU + battery sub-snapshots and the variable-length vectors.
+        let entry = RobotEntry {
+            robot_id: "go2-001".to_string(),
+            owner_node_id: "abcdef0123".to_string(),
+            is_local: true,
+            kind: Some("quadruped".to_string()),
+            status: "online".to_string(),
+            battery_percent: Some(73.0),
+            rtt_ms: Some(12),
+            camera_id: Some("front".to_string()),
+            capabilities: vec!["move".to_string()],
+            actions_meta: vec![],
+            telemetry: Some(RobotTelemetrySnapshot {
+                mode: Some(1),
+                gait_type: Some(3),
+                body_height: Some(0.32),
+                vx: Some(0.4),
+                vy: Some(-0.1),
+                vyaw: Some(0.05),
+                position: vec![1.0, 2.0, 0.3],
+                foot_force: vec![120.0, 118.0, 121.0, 119.0],
+                imu: Some(RobotImuSnapshot {
+                    roll: Some(0.01),
+                    pitch: Some(-0.02),
+                    yaw: Some(1.57),
+                    quaternion: vec![0.707, 0.0, 0.0, 0.707],
+                    temperature: Some(41.0),
+                }),
+                battery: Some(RobotBatterySnapshot {
+                    soc: Some(73.0),
+                    voltage: Some(28.4),
+                    current: Some(-2.1),
+                    temperature: Some(36.0),
+                }),
+            }),
+        };
+        let bytes = crate::cbor::encode(&entry).expect("encode");
+        let back: RobotEntry = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, entry);
+        let t = back.telemetry.expect("telemetry present");
+        assert_eq!(t.foot_force.len(), 4);
+        assert_eq!(t.imu.unwrap().yaw, Some(1.57));
+        assert_eq!(t.battery.unwrap().voltage, Some(28.4));
     }
 
     #[test]

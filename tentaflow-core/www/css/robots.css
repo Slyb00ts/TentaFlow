@@ -103,6 +103,52 @@
   gap: 6px;
 }
 
+/* Structured runtime telemetry panel (gait / velocity / IMU / battery detail).
+   Compact label+value rows mirroring the metric rows; hidden when the robot
+   reports no telemetry. */
+.robots-telemetry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+}
+
+.robots-telemetry-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+
+.robots-telemetry-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.robots-telemetry-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.robots-telemetry-label {
+  color: var(--text-2);
+}
+
+.robots-telemetry-value {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .robots-camera {
   display: flex;
   flex-direction: column;
