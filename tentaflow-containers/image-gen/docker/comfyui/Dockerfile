@@ -16,7 +16,8 @@ WORKDIR /build/tentaflow-containers/sidecar
 RUN cargo build --release --bin tentaflow-sidecar \
     && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
-FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+# Baza CUDA 13 wymagana przez Blackwell B300 (sm_103); torch cu130 dziala wstecz na starszych GPU.
+FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev git curl ca-certificates \
       libgl1 libglib2.0-0 gcc g++ \
@@ -28,9 +29,11 @@ WORKDIR /opt/ComfyUI
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# torch z cu130 (jedyne kola dzialajace na sm_103). NIE instalujemy xFormers/SageAttention/
+# flash-attn - pinuja stary torch i psuja Blackwell; uruchamiamy z SDPA (--use-pytorch-cross-attention).
 RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir torch torchvision torchaudio \
-      --extra-index-url https://download.pytorch.org/whl/cu124 \
+      --index-url https://download.pytorch.org/whl/cu130 \
  && pip install --no-cache-dir -r requirements.txt
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar

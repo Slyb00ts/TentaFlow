@@ -1,0 +1,38 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle dla PaddleOCR-VL — model VLM ~0.9B ladowany przez
+#       transformers + torch (cu130), bo framework paddlepaddle nie ma kerneli
+#       pod B300 (sm_103). Warianty instalacji: cuda (torch cu130) oraz rocm
+#       (torch rocm7.0). Apple obslugiwane przez osobny bundle paddle-ocr-mlx.
+#       Uruchamia server.py (FastAPI) z endpointem /ocr.
+# =============================================================================
+
+[bundle]
+engine = "paddle-ocr"
+description = "PaddleOCR-VL przez transformers (GPU CUDA/ROCm, zgodny z B300)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "transformers==4.49.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8095}"]
+internal_port = 8095
+
+[requires]
+gpu_memory_gb = 4
+disk_gb = 6
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+# Wariant CUDA: torch z kanalu cu130 (kernele sm_103 dla B300).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+
+# Wariant ROCm: torch z kanalu rocm7.0 dla GPU AMD.
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]

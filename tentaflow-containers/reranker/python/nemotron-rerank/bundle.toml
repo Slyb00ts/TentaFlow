@@ -1,0 +1,51 @@
+# =============================================================================
+# Plik: reranker/python/nemotron-rerank/bundle.toml
+# Opis: NVIDIA Llama-Nemotron Rerank jako natywny bundle vLLM (PyPI, pinned
+#       0.23.0). vLLM serwuje cross-encoder w trybie score/rerank i wystawia
+#       OpenAI-compatible /v1/rerank + /v1/score. CUDA (cu130) i ROCm (rocm7.0).
+# =============================================================================
+
+[bundle]
+engine = "nemotron-rerank"
+description = "NVIDIA Llama-Nemotron Rerank cross-encoder via vLLM (PyPI, pinned 0.23.0)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "vllm==0.23.0"
+
+[launch]
+command = "python"
+# Bundle dostarcza identity flags (model + transport) i baseline defaults.
+# --task score wlacza tryb cross-encoder vLLM (endpointy /v1/rerank + /v1/score).
+# --trust-remote-code bo repo rerankera NVIDIA dostarcza wlasny kod architektury.
+# --served-model-name = preset id (slug po ktorym core routuje), nie repo path.
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--served-model-name", "${SERVED_MODEL_NAME}",
+    "--task", "score",
+    "--trust-remote-code",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 6
+disk_gb = 12
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+# vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny PyPI to cu129
+# i nie ma optymalizacji Blackwell. extra_index wskazuje nightly cu130 vLLM;
+# torch tez idzie z cu130 (Dockerfile pobiera go z download.pytorch.org/whl/cu130).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://wheels.vllm.ai/nightly/cu130"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "VLLM_TARGET_DEVICE=rocm"

@@ -1,0 +1,20 @@
+# =============================================================================
+# Plik: config.default.toml
+# Opis: Fallback configu sidecara dla detektorow YOLOX (NeMo Retriever).
+#       Nadpisywany przez /data/config.toml generowany przez deploy runner.
+#       Sidecar forwarduje surowo do custom API serwera (/detect) - rola
+#       reverse_proxy z api = raw_http.
+# =============================================================================
+service_name = "vision-nemotron-yolox"
+model_aliases = []
+
+[transport]
+port = 5000
+enable_lan_discovery = false
+enable_dht_discovery = false
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8086"
+api = "raw_http"
+timeout_ms = 120000

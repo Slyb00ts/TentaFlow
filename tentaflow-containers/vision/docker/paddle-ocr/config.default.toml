@@ -1,0 +1,19 @@
+# =============================================================================
+# Plik: config.default.toml
+# Opis: Fallback configu sidecara dla obrazu PaddleOCR — nadpisywany przez
+#       /data/config.toml generowany przy deployu. Sidecar forwarduje surowo
+#       (raw_http) do lokalnego serwera FastAPI z endpointem /ocr.
+# =============================================================================
+service_name = "vision-paddle-ocr"
+model_aliases = []
+
+[transport]
+port = 5000
+enable_lan_discovery = false
+enable_dht_discovery = false
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8095"
+api = "raw_http"
+timeout_ms = 600000

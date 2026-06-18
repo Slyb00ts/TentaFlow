@@ -1,0 +1,62 @@
+# =============================================================================
+# Plik: llm/python/qwen3-vl/bundle.toml
+# Opis: Zamiennik VLM Qwen3-VL dla GPU nie-NVIDIA (AMD/ROCm) jako natywny
+#       python-bundle — vLLM (PyPI pinned 0.23.0) serwowany w trybie
+#       generacyjnym chat z obsluga obrazow. CUDA (cu130) oraz ROCm (rocm7.0).
+#       Eksponuje OpenAI-compatible /v1/chat/completions z modalnoscia
+#       tekst + obraz.
+# =============================================================================
+
+[bundle]
+engine = "qwen3-vl"
+description = "Qwen3-VL (VLM chat) via vLLM (PyPI, pinned 0.23.0)"
+python_version = "3.12"
+# Pinned na 0.23.0 dla reproducibility — git main moze rozjechac sie z deps.
+source = "pypi"
+pypi_package = "vllm==0.23.0"
+
+[launch]
+command = "python"
+# Bundle dostarcza identity flags (model + transport) i baseline defaults.
+# Brak `--task embed` — silnik dziala generacyjnie (chat). `--trust-remote-code`
+# laduje wlasny procesor multimodalny modelu Qwen3-VL, a `--limit-mm-per-prompt`
+# wlacza sciezke obrazow. `--gpu-memory-utilization` celowo NIE jest tu —
+# backend (`python_bundle.rs::prepare`) zarzadza ta flaga (auto-clamp wzgledem
+# free VRAM / user explicit z wizarda).
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--trust-remote-code",
+    "--limit-mm-per-prompt", "{\"image\": ${MM_IMAGE_LIMIT:-1}}",
+    # Serwuj pod slugiem ktory core routuje (preset id), nie pod sciezka repo.
+    "--served-model-name", "${SERVED_MODEL_NAME}",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+    "--max-num-batched-tokens", "${MAX_NUM_BATCHED_TOKENS:-8192}",
+    # Prefix-caching obniza TTFT przy powtarzalnych promptach; chunked-prefill
+    # vLLM sam wylacza dla VL modeli (no-op tam, bez szkody).
+    "--enable-prefix-caching",
+    "--enable-chunked-prefill",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+# vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny PyPI to cu129
+# i nie ma optymalizacji Blackwell. extra_index wskazuje nightly cu130 vLLM;
+# torch tez idzie z cu130 (Dockerfile pobiera go z download.pytorch.org/whl/cu130).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://wheels.vllm.ai/nightly/cu130"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "VLLM_TARGET_DEVICE=rocm"
