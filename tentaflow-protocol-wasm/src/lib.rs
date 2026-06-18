@@ -13829,22 +13829,29 @@ pub fn encode_robots_list_request() -> Result<Vec<u8>, JsError> {
 }
 
 /// MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action to
-/// the robot's owning node. `kind` is one of: "move", "stop", "estop",
-/// "reset_estop", "recovery_stand", "stand_up", "stand_down", "sit", "hello",
-/// "stretch", "status". The `vx`/`vy`/`vyaw` axes apply to "move" only.
+/// the robot's owning node. The `vx`/`vy`/`vyaw` axes apply to "move" only; the
+/// `p1..p4` generic params carry parametered poses/levels keyed by `kind` (euler
+/// → roll/pitch/yaw; body_height/foot_raise_height → p1=height; speed_level →
+/// p1=level; pose → roll/pitch/yaw/height). The owner clamps every numeric param
+/// to the documented Go2 range.
 #[wasm_bindgen(js_name = encodeRobotControlRequest)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_robot_control_request(
     robot_id: String,
     kind: String,
     vx: f64,
     vy: f64,
     vyaw: f64,
+    p1: f64,
+    p2: f64,
+    p3: f64,
+    p4: f64,
 ) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{RobotActionWire, RobotControlRequest, RobotsPayload};
     encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::ControlRequest(
         RobotControlRequest {
             robot_id,
-            action: RobotActionWire { kind, vx, vy, vyaw },
+            action: RobotActionWire { kind, vx, vy, vyaw, p1, p2, p3, p4 },
         },
     )))
     .map_err(|e| JsError::new(&e))

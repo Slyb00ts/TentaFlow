@@ -62,5 +62,117 @@
     "description": "Ruch robota. Prędkości vx/vy/vyaw (zakres -1..1) odczytywane ze zmiennych flow; brak = 0.",
     "inputs": [{ "name": "in", "type": "any", "required": false }],
     "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.balance_stand",
+    "title": "Go2: BalanceStand",
+    "category": "Robot · Go2",
+    "description": "Postawa stojąca z aktywną balansacją (BalanceStand).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.euler",
+    "title": "Go2: Orientacja ciała (Euler)",
+    "category": "Robot · Go2",
+    "description": "Ustaw orientację ciała w radianach: roll/pitch/yaw (zakres -0.75..0.75) ze zmiennych flow.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.body_height",
+    "title": "Go2: Wysokość ciała",
+    "category": "Robot · Go2",
+    "description": "Zmiana wysokości ciała w metrach: height (zakres -0.18..0.03) ze zmiennej flow.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.foot_raise_height",
+    "title": "Go2: Wysokość kroku",
+    "category": "Robot · Go2",
+    "description": "Wysokość unoszenia łap w metrach: height (zakres -0.06..0.10) ze zmiennej flow.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.speed_level",
+    "title": "Go2: Poziom prędkości",
+    "category": "Robot · Go2",
+    "description": "Poziom prędkości chodu: level -1 (wolno), 0 (normalnie), 1 (szybko) ze zmiennej flow.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.pose",
+    "title": "Go2: Poza ciała",
+    "category": "Robot · Go2",
+    "description": "Statyczna poza: orientacja roll/pitch/yaw + wysokość height ze zmiennych flow (Euler + BodyHeight).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.wiggle_hips",
+    "title": "Go2: Wiggle Hips",
+    "category": "Robot · Go2",
+    "description": "Robot kręci biodrami (WiggleHips).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.heart",
+    "title": "Go2: Serduszko",
+    "category": "Robot · Go2",
+    "description": "Gest serduszka (FingerHeart).",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.dance1",
+    "title": "Go2: Taniec 1",
+    "category": "Robot · Go2",
+    "description": "Sekwencja tańca 1 (Dance1). Ruch o podwyższonym ryzyku — upewnij się, że jest miejsce.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.dance2",
+    "title": "Go2: Taniec 2",
+    "category": "Robot · Go2",
+    "description": "Sekwencja tańca 2 (Dance2). Ruch o podwyższonym ryzyku — upewnij się, że jest miejsce.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.scrape",
+    "title": "Go2: Scrape (akrobacja)",
+    "category": "Robot · Go2",
+    "description": "Akrobacja o WYSOKIM ryzyku (Scrape). Może być zablokowana w firmware Air.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.front_flip",
+    "title": "Go2: Front Flip (akrobacja)",
+    "category": "Robot · Go2",
+    "description": "Akrobacja o WYSOKIM ryzyku (FrontFlip — salto w przód). Może być zablokowana w firmware Air.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.front_jump",
+    "title": "Go2: Front Jump (akrobacja)",
+    "category": "Robot · Go2",
+    "description": "Akrobacja o WYSOKIM ryzyku (FrontJump — skok w przód). Może być zablokowana w firmware Air.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
+  },
+  {
+    "type": "go2.front_pounce",
+    "title": "Go2: Front Pounce (akrobacja)",
+    "category": "Robot · Go2",
+    "description": "Akrobacja o WYSOKIM ryzyku (FrontPounce — wyskok w przód). Może być zablokowana w firmware Air.",
+    "inputs": [{ "name": "in", "type": "any", "required": false }],
+    "outputs": [{ "name": "out", "type": "any" }]
   }
 ]

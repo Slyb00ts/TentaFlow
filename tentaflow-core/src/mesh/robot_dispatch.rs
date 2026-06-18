@@ -679,27 +679,29 @@ fn now_ms() -> u64 {
 /// = now, an expiry window sized to the action (`Move` ≤ `MAX_MOVE_DURATION_MS`,
 /// others `DEFAULT_COMMAND_WINDOW_MS`), and the SENDER-side velocity clamp
 /// (`action.sanitized(MAX_VELOCITY)`) as defense-in-depth — the receiver clamps
-/// again to its own `[robot.safety]`. Pure (apart from uuid/clock).
+/// again to its own `[robot.safety]`. Returns `Err(RejectReason::Malformed)` if the
+/// action carries a non-finite numeric param (NaN/inf is rejected, never coerced),
+/// so a bad command is stopped at the sender too. Pure (apart from uuid/clock).
 pub fn build_request(
     action: RobotAction,
     robot_id: &str,
     actor_user_id: &str,
     org_id: &str,
-) -> RobotControlRequest {
+) -> Result<RobotControlRequest, RejectReason> {
     let issued_at_ms = now_ms();
     let window = match action {
         RobotAction::Move { .. } => MAX_MOVE_DURATION_MS,
         _ => DEFAULT_COMMAND_WINDOW_MS,
     };
-    RobotControlRequest {
+    Ok(RobotControlRequest {
         robot_id: robot_id.to_string(),
         org_id: org_id.to_string(),
         command_id: uuid::Uuid::new_v4().to_string(),
         actor_user_id: actor_user_id.to_string(),
-        action: action.sanitized(MAX_VELOCITY),
+        action: action.sanitized(MAX_VELOCITY)?,
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(window),
-    }
+    })
 }
 
 /// Force every advertised robot's `node_id` to the transport-authenticated
@@ -839,7 +841,10 @@ pub async fn dispatch_robot_action(
     local_node_id: &str,
     sender: &dyn RobotCommandSender,
 ) -> RobotControlResponse {
-    let request = build_request(action, robot_id, actor_user_id, org_id);
+    let request = match build_request(action, robot_id, actor_user_id, org_id) {
+        Ok(req) => req,
+        Err(reason) => return RobotControlResponse::rejected(reason),
+    };
 
     match resolve_robot_owner(db, local_node_id, robot_id) {
         RobotOwner::Local => {
@@ -1065,7 +1070,8 @@ mod tests {
             "go2",
             "u1",
             "org-1",
-        );
+        )
+        .unwrap();
         assert!(!req.command_id.is_empty());
         // Move window is bounded by MAX_MOVE_DURATION_MS.
         assert_eq!(req.expires_at_ms - req.issued_at_ms, MAX_MOVE_DURATION_MS);
@@ -1076,7 +1082,7 @@ mod tests {
 
     #[test]
     fn build_request_non_move_uses_default_window() {
-        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1");
+        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1").unwrap();
         assert_eq!(req.expires_at_ms - req.issued_at_ms, DEFAULT_COMMAND_WINDOW_MS);
     }
 
@@ -1089,7 +1095,8 @@ mod tests {
             "go2",
             "u1",
             "org-1",
-        );
+        )
+        .unwrap();
         assert_eq!(
             req.action,
             RobotAction::Move {
@@ -1102,8 +1109,8 @@ mod tests {
 
     #[test]
     fn build_request_unique_command_ids() {
-        let a = build_request(RobotAction::Stop, "go2", "u1", "org-1");
-        let b = build_request(RobotAction::Stop, "go2", "u1", "org-1");
+        let a = build_request(RobotAction::Stop, "go2", "u1", "org-1").unwrap();
+        let b = build_request(RobotAction::Stop, "go2", "u1", "org-1").unwrap();
         assert_ne!(a.command_id, b.command_id);
     }
 
@@ -1150,7 +1157,7 @@ mod tests {
         assert_eq!(owner, RobotOwner::Remote("node-b".to_string()));
 
         let fake = FakeSender::new(RobotControlResponse::ok());
-        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1");
+        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1").unwrap();
         let resp = futures::executor::block_on(async {
             if let RobotOwner::Remote(node) = owner {
                 fake.send_remote(&node, &req).await.unwrap()

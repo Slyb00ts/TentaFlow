@@ -113,11 +113,15 @@ pub async fn robots_control(
     // The protocol `RobotActionWire` is one of two wire encodings (ciborium here,
     // minicbor for the host ABI) over the SAME flat shape; run the SINGLE shared
     // `kind`→action allowlist directly. Closed allowlist: an unknown kind is refused.
-    let action = RobotAction::from_kind_axes(
+    let action = RobotAction::from_kind_params(
         &payload.action.kind,
         payload.action.vx,
         payload.action.vy,
         payload.action.vyaw,
+        payload.action.p1,
+        payload.action.p2,
+        payload.action.p3,
+        payload.action.p4,
     )
     .ok_or_else(|| ProtocolError::bad_request("unknown robot action kind"))?;
 
