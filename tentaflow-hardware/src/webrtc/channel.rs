@@ -573,14 +573,32 @@ impl H264Gate {
                 }
             }
             5 => {
-                // IDR — always prepend the cached parameter sets.
-                if let Some(s) = &self.sps {
-                    out.push(s.clone());
+                // IDR — prepend the cached parameter sets, coalesced with the
+                // IDR into a SINGLE buffer. The robot delimits NALs with AUDs and
+                // delivers SPS/PPS in their own access units, so emitting SPS,
+                // PPS and IDR as three separate buffers makes a downstream
+                // h264parse frame them as separate AUs. When that parse must
+                // output AVC (the fMP4 mux branch), it cannot build avcC
+                // codec_data from an SPS-only AU (num_pps=0) and posts a FATAL
+                // "No caps set" bus error. Concatenating SPS+PPS+IDR guarantees
+                // one self-contained keyframe access unit so codec_data is always
+                // constructible. Decoders accept the concatenation unchanged.
+                let sps = self.sps.as_ref();
+                let pps = self.pps.as_ref();
+                if sps.is_some() || pps.is_some() {
+                    let extra = sps.map_or(0, |s| s.len()) + pps.map_or(0, |p| p.len());
+                    let mut au = Vec::with_capacity(extra + nal.len());
+                    if let Some(s) = sps {
+                        au.extend_from_slice(s);
+                    }
+                    if let Some(p) = pps {
+                        au.extend_from_slice(p);
+                    }
+                    au.extend_from_slice(&nal);
+                    out.push(Bytes::from(au));
+                } else {
+                    out.push(nal);
                 }
-                if let Some(p) = &self.pps {
-                    out.push(p.clone());
-                }
-                out.push(nal);
                 self.seen_idr = true;
             }
             _ => {
@@ -769,12 +787,15 @@ mod tests {
         // SPS/PPS cached, not emitted yet.
         assert!(admit(&mut g, nal(7, b"s")).is_empty());
         assert!(admit(&mut g, nal(8, b"p")).is_empty());
-        // IDR → emits SPS, PPS, IDR.
+        // IDR → emits ONE coalesced buffer: SPS|PPS|IDR concatenated so a
+        // downstream parser frames it as a single self-contained keyframe AU.
         let out = admit(&mut g, nal(5, b"i"));
-        assert_eq!(out.len(), 3);
-        assert_eq!(nal_type(&out[0]), 7);
-        assert_eq!(nal_type(&out[1]), 8);
-        assert_eq!(nal_type(&out[2]), 5);
+        assert_eq!(out.len(), 1);
+        let parts = split_annexb(&out[0]);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(nal_type(&parts[0]), 7);
+        assert_eq!(nal_type(&parts[1]), 8);
+        assert_eq!(nal_type(&parts[2]), 5);
         // After start, everything passes through.
         let out2 = admit(&mut g, nal(1, b"p"));
         assert_eq!(out2.len(), 1);
@@ -787,11 +808,14 @@ mod tests {
         admit(&mut g, nal(7, b"s"));
         admit(&mut g, nal(8, b"p"));
         let _ = admit(&mut g, nal(5, b"i")); // first IDR primes
-        // A later IDR still gets SPS+PPS prepended (self-healing stream).
+        // A later IDR still carries SPS+PPS in its coalesced keyframe buffer
+        // (self-healing stream).
         let out = admit(&mut g, nal(5, b"i2"));
-        assert_eq!(out.len(), 3);
-        assert_eq!(nal_type(&out[0]), 7);
-        assert_eq!(nal_type(&out[2]), 5);
+        assert_eq!(out.len(), 1);
+        let parts = split_annexb(&out[0]);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(nal_type(&parts[0]), 7);
+        assert_eq!(nal_type(&parts[2]), 5);
     }
 
     #[test]
@@ -804,7 +828,8 @@ mod tests {
         // After reset, P-frames are dropped again until the next IDR.
         assert!(admit(&mut g, nal(1, b"p")).is_empty());
         let out = admit(&mut g, nal(5, b"i"));
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(split_annexb(&out[0]).len(), 3);
     }
 }
 
