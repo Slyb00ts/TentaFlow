@@ -19,8 +19,9 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 
 [[install_variants]]
 backend = "cuda"
-extra_index = "https://download.pytorch.org/whl/cu124"
-extras = []
+# B300/sm_103 wymaga torch cu130 (cu124 nie ma kerneli sm_103); spojne z Dockerfile.
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch==2.11.0", "torchaudio==2.11.0"]
 
 [[install_variants]]
 backend = "rocm"

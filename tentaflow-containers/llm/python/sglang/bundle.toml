@@ -1,11 +1,12 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.10)"
+description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.13)"
 python_version = "3.12"
-# Pinned na najnowsza stabilna wersje sglang (2026-04). Update wymaga
-# regeneracji requirements.lock + bumpa pakietu.
+# Pinned na najnowsza stabilna wersje sglang (2026-06, pierwsza z sgl-kernel
+# pod cu130 wspierajaca sm_103 / B300). Update wymaga regeneracji
+# requirements.lock + bumpa pakietu.
 source = "pypi"
-pypi_package = "sglang[all]==0.5.10.post1"
+pypi_package = "sglang[all]==0.5.13"
 
 [launch]
 command = "python"
@@ -31,6 +32,10 @@ internal_port = 30000
 [launch.env]
 TVM_FFI_GPU_BACKEND = "cuda"
 TVM_FFI_CUDA_ARCH_LIST = "8.0 8.9 9.0"
+# Obejscie buga "ptxas fatal: sm_103a not defined": Triton dolaczony do torch
+# ma stary ptxas. Wymuszamy ptxas z toolkitu CUDA 13 (wymagany w PATH hosta dla
+# B300 / sm_103). Sciezka domyslna instalacji CUDA 13 na Linuksie.
+TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"
 
 [requires]
 gpu_memory_gb = 8
@@ -39,14 +44,14 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 
 [[install_variants]]
 backend = "cuda"
-extra_index = "https://download.pytorch.org/whl/cu124"
-# Torch 2.6.0 ma cudnn 9.5+ ktory sglang akceptuje (>=9.15 wymagane dla
-# konv3d). Pinned tu, zeby uv nie wciagnal torch 2.9.x z cudnn 9.10 ktore
-# sglang odrzuca jako "CRITICAL WARNING: KNOWN BUG".
-extras = ["torch==2.6.0", "torchvision==0.21.0"]
+extra_index = "https://download.pytorch.org/whl/cu130"
+# Torch 2.11 cu130 to jedyne kola dla sm_103 / B300 (cu124/torch 2.6 NIE
+# obsluguja Blackwella). Pinned, zeby uv trzymal sie wersji zgodnej z
+# sgl-kernel 0.5.13.
+extras = ["torch==2.11.0", "torchvision==0.26.0"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.6.0", "torchvision==0.21.0"]
+extras = ["torch==2.11.0", "torchvision==0.26.0"]
 install_hint = "SGLANG_BACKEND=rocm"

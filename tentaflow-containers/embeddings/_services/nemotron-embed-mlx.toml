@@ -1,0 +1,34 @@
+# Manifest serwisu NVIDIA Llama-Nemotron Embed (MLX) — wbudowany silnik
+# embeddingow dla Apple Silicon (macOS/iOS). Runtime embedded przez MLX; brak
+# kontekstu docker / python-bundle. Wariant CUDA/ROCm ma osobny silnik
+# `nemotron-embed` (vLLM) w nemotron-embed.toml.
+
+[engine]
+id = "nemotron-embed-mlx"
+provider = "nvidia"
+category = "embeddings"
+name = "NVIDIA Llama-Nemotron Embed (MLX)"
+description_pl = "Embeddingi tekstu NVIDIA Llama-Nemotron na Apple Silicon przez MLX. Konwersja modelu przez mlx-embeddings w runtime."
+description_en = "NVIDIA Llama-Nemotron text embeddings on Apple Silicon via MLX. Model converted by mlx-embeddings at runtime."
+homepage = "https://huggingface.co/nvidia"
+license = "nvidia-open-model-license"
+icon = "mlx"
+default_port = 8080
+api = "openai-compatible"
+version = "v2"
+service_surfaces = ["embeddings"]
+input_modalities = ["text"]
+output_modalities = ["embedding"]
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx-embeddings"
+
+# Brak presetu mlx-community dla tego modelu — laduje zrodlo NVIDIA, runtime
+# (mlx-embeddings) konwertuje wagi do MLX przy pierwszym zaladowaniu.
+[[model_preset]]
+id = "llama-nemotron-embed-1b-v2-mlx"
+display_name = "Llama-Nemotron Embed 1B v2 (MLX)"
+repo = "nvidia/llama-nemotron-embed-1b-v2"
+recommended = true

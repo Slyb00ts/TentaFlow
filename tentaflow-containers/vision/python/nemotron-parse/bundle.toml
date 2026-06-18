@@ -1,0 +1,35 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle dla Nemotron-Parse (NVIDIA-Nemotron-Parse-v1.2).
+#       Parser dokumentow przez transformers (C-RADIO ViT-H + mBART 885M).
+#       Warianty instalacji: cuda (torch CUDA) oraz rocm (torch ROCm dla GPU
+#       AMD). Uruchamia server.py (FastAPI) z endpointem /parse.
+# =============================================================================
+
+[bundle]
+engine = "nemotron-parse"
+description = "NVIDIA Nemotron-Parse document parser server (transformers, CUDA + ROCm)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "transformers==4.49.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8094}"]
+internal_port = 8094
+
+[requires]
+gpu_memory_gb = 6
+disk_gb = 8
+platforms = ["linux-x86_64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
