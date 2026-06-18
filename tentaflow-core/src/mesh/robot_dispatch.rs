@@ -268,11 +268,15 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             .clone()
             .or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
         // Tenant of this robot, read from the running addon instance's
-        // `AddonState` (the only place a robot addon's org lives — the DB
-        // `addons` row is org-agnostic). An instance with no org context
-        // (system/boot start) advertises an empty org_id, which the
-        // requester-side scope check treats as a non-match.
-        let org_id = am.instance_org_id(&c.addon_id).unwrap_or_default();
+        // `AddonState`. A service/boot-started instance has no user org context
+        // (`instance_org_id` is None), and an unscoped install carries an empty
+        // org — both fall back to the default org so the robot is visible to the
+        // default-org session (the same org a membership-less-default session
+        // resolves to). A real multi-org install keeps its explicit org.
+        let org_id = am
+            .instance_org_id(&c.addon_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
         robots.push(AdvertisedRobot {
             robot_id: c.addon_id,
             package_id: c.package_id,
