@@ -353,12 +353,15 @@ class TfVideoStream extends HTMLElement {
     // hiccup underran the decoder and stalled. A ~1s cushion keeps a few
     // fragments queued ahead of the playhead; the camera's wall-clock latency
     // stays low while the player no longer starves on jitter.
-    const TARGET_LATENCY_SECS = 1.0;
-    // Upper bound on how far behind live the playhead may drift before we snap
-    // it back to TARGET. Without this, every brief decoder stall on network
-    // jitter left the playhead permanently further behind (latency grew to 2s+
-    // and never recovered, since the only correction fired at KEEP_WINDOW=30s).
-    const MAX_LATENCY_SECS = 1.6;
+    // Jitter buffer ahead of the playhead — NOT network latency (a LAN robot is
+    // ~3-4ms). It only needs to cover a couple of fMP4 fragments so the decoder
+    // never starves between fragments. With a clean continuous server timeline
+    // (h264timestamper + param-only AUs dropped) a small cushion suffices.
+    const TARGET_LATENCY_SECS = 0.3;
+    // Upper bound on drift before snapping back to TARGET. Without this, every
+    // brief decoder stall left the playhead permanently further behind (latency
+    // grew and never recovered, since the only correction fired at KEEP_WINDOW).
+    const MAX_LATENCY_SECS = 0.7;
     // Only build the initial cushion before first play: wait until enough is
     // buffered so playback starts with room ahead rather than at the edge.
     if (v.paused && end - start < TARGET_LATENCY_SECS && v.currentTime <= start) {
