@@ -68,3 +68,6 @@
 .access-keys-body .perm-matrix th.grp { text-align: center; color: var(--accent-2);
   border-bottom: 1px solid var(--border-hover); font-size: 10px; }
 .access-keys-body .perm-matrix th.grp .icon { width: 11px; height: 11px; vertical-align: -1px; }
+
+/* Highlighted row when jumping from a key's "Zakres" action to the matrix */
+.access-keys-body .perm-matrix tr.ak-row-hl td { background: var(--accent-glow); }
