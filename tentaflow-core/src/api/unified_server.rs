@@ -371,6 +371,7 @@ pub fn start_unified_server_with_permissions(
                             if is_openai_path(&path) {
                                 let mut owner_user_ctx: Option<crate::auth::acl::UserContext> =
                                     None;
+                                let mut principal: Option<crate::auth::acl::Principal> = None;
                                 // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
                                 if path != "/health" && path != "/ready" {
                                     let api_key = req
@@ -386,29 +387,102 @@ pub fn start_unified_server_with_permissions(
 
                                     let auth_error_msg = match api_key {
                                         Some(key) => {
-                                            let key_hash =
-                                                crate::api::dashboard::auth::hash_api_key(key);
+                                            // Fail-closed: without a valid pepper we MUST NOT
+                                            // compute a verifier (an empty pepper would derive
+                                            // the HMAC under the wrong key and could match a
+                                            // forged row), so a pepper error rejects the request.
+                                            match crate::db::repository::get_or_create_api_key_pepper(&db, &sc) {
+                                                Err(_) => Some(
+                                                    r#"{"error":{"type":"authentication_error","message":"Blad weryfikacji API key","code":"api_key_verification_unavailable"}}"#,
+                                                ),
+                                                Ok(pepper) => {
+                                            let verifier =
+                                                crate::api::dashboard::auth::api_key_verifier(
+                                                    key, &pepper,
+                                                );
                                             match crate::db::repository::verify_api_key(
-                                                &db, &key_hash,
+                                                &db, &verifier,
                                             ) {
                                                 Ok(Some(api_key_row)) => {
-                                                    if let Some(uid) = api_key_row.owner_user_id {
-                                                        let role = crate::db::repository::get_user_account_by_id(&db, &uid)
-                                                        .ok()
-                                                        .flatten()
-                                                        .map(|u| u.role)
-                                                        .unwrap_or_else(|| "user".to_string());
-                                                        owner_user_ctx = Some(
-                                                            crate::auth::acl::UserContext::new(
-                                                                uid, role,
-                                                            ),
-                                                        );
+                                                    match api_key_row.key_type.as_str() {
+                                                        "user" => {
+                                                            // A 'user' key MUST resolve to an
+                                                            // existing, active user; otherwise it
+                                                            // would slip through with no Principal.
+                                                            match api_key_row.subject_id.as_deref().and_then(|uid| {
+                                                                crate::db::repository::get_user_account_by_id(&db, uid)
+                                                                    .ok()
+                                                                    .flatten()
+                                                                    .map(|u| (uid.to_string(), u))
+                                                            }) {
+                                                                Some((uid, user)) if user.is_active => {
+                                                                    // Keep UserContext so Tier1
+                                                                    // `*_for_user` paths still work,
+                                                                    // and add the authoritative /v1
+                                                                    // Principal used by the gate.
+                                                                    owner_user_ctx = Some(
+                                                                        crate::auth::acl::UserContext::new(
+                                                                            uid.clone(), user.role.clone(),
+                                                                        ),
+                                                                    );
+                                                                    principal = Some(
+                                                                        crate::auth::acl::Principal::User {
+                                                                            user_id: uid,
+                                                                            role: user.role,
+                                                                        },
+                                                                    );
+                                                                    None
+                                                                }
+                                                                _ => Some(
+                                                                    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
+                                                                ),
+                                                            }
+                                                        }
+                                                        "group" => {
+                                                            // A 'group' key MUST resolve to an
+                                                            // existing group; no UserContext, no
+                                                            // admin-bypass — only group rules apply.
+                                                            match api_key_row.subject_id.as_deref().and_then(|gid| {
+                                                                crate::db::repository::get_group_by_id(&db, gid)
+                                                                    .ok()
+                                                                    .flatten()
+                                                                    .map(|_| gid.to_string())
+                                                            }) {
+                                                                Some(gid) => {
+                                                                    principal = Some(
+                                                                        crate::auth::acl::Principal::Group {
+                                                                            group_id: gid,
+                                                                        },
+                                                                    );
+                                                                    None
+                                                                }
+                                                                None => Some(
+                                                                    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
+                                                                ),
+                                                            }
+                                                        }
+                                                        "general" => {
+                                                            // A 'general' key carries its own
+                                                            // explicit allowlist (subject_type=
+                                                            // 'api_key', subject_id=uid). No role,
+                                                            // never admin-bypass.
+                                                            principal = Some(
+                                                                crate::auth::acl::Principal::ApiKey {
+                                                                    uid: api_key_row.uid.clone(),
+                                                                },
+                                                            );
+                                                            None
+                                                        }
+                                                        _ => Some(
+                                                            r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
+                                                        ),
                                                     }
-                                                    None
                                                 }
                                                 _ => Some(
                                                     r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
                                                 ),
+                                            }
+                                                }
                                             }
                                         }
                                         None => Some(
@@ -433,11 +507,14 @@ pub fn start_unified_server_with_permissions(
                                     }
                                 }
 
-                                // Wstrzykuje UserContext do request extensions zeby
-                                // openai::server::handle_request mogl uzyc go w
-                                // route_*_for_user wariantach.
+                                // Wstrzykuje UserContext (Tier1 `*_for_user`) oraz Principal
+                                // (autorytatywna brama /v1 — dziala dla user/group/general)
+                                // do request extensions.
                                 if let Some(uc) = owner_user_ctx {
                                     req.extensions_mut().insert(uc);
+                                }
+                                if let Some(p) = principal {
+                                    req.extensions_mut().insert(p);
                                 }
                                 let resp =
                                     crate::api::openai::server::handle_request(req, router).await?;

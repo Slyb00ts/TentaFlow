@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 06-bezpieczenstwo-sync.html
+     Opis: Model bezpieczeństwa /v1 (ścieżka żądania, twarde 401/403, co blokujemy)
+           oraz synchronizacja kluczy i uprawnień przez mesh (węzły A/B/C). Mniej
+           formularzy, więcej diagramu i listy zasad egzekwowania default-DENY.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Dostęp i klucze API — Bezpieczeństwo i sync</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/><path d="m14 9 2 1"/><path d="m18 7 2 1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5z"/><polyline points="9 12 11 14 15 10"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5 11 16.5"/><path d="M16.5 7.5 13 16.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-catalog" viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 9h16"/><path d="M4 14h16"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="12" r="2"/><path d="M6.4 7.1 10.6 10.9"/><path d="M17.6 7.1 13.4 10.9"/><path d="M6.4 16.9 10.6 13.1"/><path d="M17.6 16.9 13.4 13.1"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="m19 6-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">06</span>
+    <h2>Model bezpieczeństwa /v1 i synchronizacja przez mesh</h2>
+    <div class="desc">Ścieżka żądania z twardymi <strong>401/403</strong>, czego nie da się obejść, oraz jak klucze i uprawnienia replikują się na węzły A/B/C.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Katalog usług</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-network"/></svg>Mesh</div>
+        </div>
+        <div class="nav-section"><div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy i grupy<span class="badge">5</span></div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-key"/></svg>Dostęp i klucze API</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-puzzle"/></svg>Addony</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer"><div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr J.</div><div class="role">Administrator</div></div></div></div>
+      </aside>
+
+      <main class="main">
+        <div class="page-header">
+          <div>
+            <h1><svg class="icon icon-xl"><use href="#i-shield"/></svg>Bezpieczeństwo i sync</h1>
+            <div class="sub">Egzekwowanie /v1: <strong style="color:var(--danger)">default-DENY</strong> · twarde 401/403 · brak admin-bypass dla kluczy ogólnych</div>
+          </div>
+          <div class="actions">
+            <span class="badge-pill sync"><svg class="icon"><use href="#i-refresh"/></svg>3/3</span>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-key"/></svg>Klucze</div>
+          <div class="tab"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Macierz dostępu</div>
+          <div class="tab active"><svg class="icon icon-sm"><use href="#i-shield"/></svg>Bezpieczeństwo</div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-shield"/></svg>Ścieżka żądania /v1 <span class="muted">· twarde 401/403</span></h3>
+          <div class="section-sub">Każde /v1/* przechodzi tę sekwencję. Pierwszy niespełniony warunek = odrzucenie + wpis audytu.</div>
+
+          <div class="pick-row">
+            <div class="r-ico"><svg class="icon"><use href="#i-key"/></svg></div>
+            <div class="r-info"><div class="r-name">1 · Odczyt klucza</div><div class="r-meta">Nagłówek <span class="mono">Authorization: Bearer</span> lub <span class="mono">x-api-key</span></div></div>
+          </div>
+          <div class="pick-row">
+            <div class="r-ico"><svg class="icon"><use href="#i-shield"/></svg></div>
+            <div class="r-info"><div class="r-name">2 · Hash i porównanie</div><div class="r-meta">SHA-256 tokena, porównanie stałoczasowe z hashem w bazie (<span class="mono">subtle</span>)</div></div>
+          </div>
+          <div class="pick-row">
+            <div class="r-ico" style="color:var(--danger)"><svg class="icon"><use href="#i-x"/></svg></div>
+            <div class="r-info"><div class="r-name">3 · Brak / zły klucz = bezwzględne 401 <span class="status-pill accent" style="margin-left:6px">NOWE</span></div><div class="r-meta">Nigdy nie przepuszczamy anonima — usuwamy lukę „klucz bez ownera = anonim”</div></div>
+          </div>
+          <div class="pick-row">
+            <div class="r-ico"><svg class="icon"><use href="#i-user"/></svg></div>
+            <div class="r-info"><div class="r-name">4 · Rozwiązanie podmiotu i scope</div><div class="r-meta">user/grupa → uprawnienia podmiotu · ogólny → własna allowlista</div></div>
+          </div>
+          <div class="pick-row">
+            <div class="r-ico"><svg class="icon"><use href="#i-shield"/></svg></div>
+            <div class="r-info"><div class="r-name">5 · Sprawdzenie per-żądanie (default-DENY)</div><div class="r-meta"><span class="mono">resource_permissions ∩ scope_klucza</span> — brak jawnego allow = <strong>403</strong></div></div>
+          </div>
+          <div class="pick-row">
+            <div class="r-ico"><svg class="icon"><use href="#i-audit"/></svg></div>
+            <div class="r-info"><div class="r-name">6 · Audyt wyniku</div><div class="r-meta">Wpis allow/deny do <span class="mono">audit_log</span> (klucz, zasób, podmiot, wynik)</div></div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-x"/></svg>Co blokujemy <span class="muted">· nie da się obejść bokiem</span></h3>
+          <div class="alert danger">
+            <svg class="icon"><use href="#i-x"/></svg>
+            <div><strong>Brak admin-bypass dla kluczy ogólnych.</strong> Klucz ogólny działa wyłącznie na swoją jawną allowlistę — uprawnienia admina właściciela go nie podbijają.</div>
+          </div>
+          <div class="alert info">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>/v1/models pokazuje TYLKO</strong> zasoby dostępne dla danego klucza. Enumeracja modeli nie ujawnia niczego spoza scope.</div>
+          </div>
+          <div class="alert warn">
+            <svg class="icon"><use href="#i-shield"/></svg>
+            <div><strong>Flow i alias też ACL-owane</strong> <span class="status-pill accent" style="margin-left:4px">NOWE</span> — dziś bywały default-allow; teraz domknięte. Alias respektuje też ACL targetu i fallbacku.</div>
+          </div>
+          <div class="alert info">
+            <svg class="icon"><use href="#i-clock"/></svg>
+            <div><strong>Rate-limit per klucz</strong> (429 + <span class="mono">Retry-After</span>) oraz <strong>rewokacja natychmiastowa</strong> — zrewokowany klucz to 401 na każdym węźle od razu po sync.</div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon icon-sm"><use href="#i-network"/></svg>Synchronizacja przez mesh</h3>
+          <div class="section-sub">Klucze (metadane + scope) i <span class="mono">resource_permissions</span> trafiają do ledgera (CoreSyncDescriptor) z polityką <span class="mono">replicated_by_permission</span> → identyczne na A, B i C.</div>
+
+          <div class="kpis" style="grid-template-columns:repeat(3,1fr)">
+            <div class="kpi"><div class="v" style="color:var(--info)">A</div><div class="l">Węzeł lokalny</div><div class="cell-sub">źródło zmiany · macierz, klucze</div></div>
+            <div class="kpi"><div class="v" style="color:var(--accent-2)">B</div><div class="l">Rig GPU</div><div class="cell-sub">replikacja przez ledger</div></div>
+            <div class="kpi"><div class="v" style="color:var(--success)">C</div><div class="l">Mac</div><div class="cell-sub">replikacja przez ledger</div></div>
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:center;gap:10px;color:var(--text-3);font-size:11px;margin:4px 0 14px">
+            <span class="badge-pill"><svg class="icon"><use href="#i-network"/></svg>UFP/2 · CBOR · channel 0x06 SyncLedger</span>
+            <svg class="icon icon-sm"><use href="#i-chevron"/></svg>
+            <span class="badge-pill sync"><svg class="icon"><use href="#i-refresh"/></svg>3/3 zsync.</span>
+          </div>
+
+          <table class="tbl">
+            <thead><tr><th>Co replikujemy</th><th>Jak</th><th>Uwaga</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="strong mono">api_keys</span></td>
+                <td>metadane + typ + scope</td>
+                <td><span class="cell-sub">token jawny nigdy nie krąży; replikowany jest wyłącznie <span class="mono">key_hash</span> (SHA-256)</span></td>
+              </tr>
+              <tr>
+                <td><span class="strong mono">resource_permissions</span></td>
+                <td>ledger → <span class="mono">replicated_by_permission</span></td>
+                <td><span class="cell-sub">każda zmiana komórki macierzy emituje wpis do outboxu</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="alert success">
+          <svg class="icon"><use href="#i-check"/></svg>
+          <div>Uderzysz w /v1 na <strong>dowolnym węźle</strong> — ten sam klucz, ten sam wynik. Egzekwowanie default-DENY i scope jest identyczne na A, B i C.</div>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+</body>
+</html>

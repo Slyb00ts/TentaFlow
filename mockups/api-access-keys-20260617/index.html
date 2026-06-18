@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: index.html
+     Opis: Spis mockupów "Dostęp i klucze API" — twardo zabezpieczone, OpenAI-
+           compatible /v1 z kluczami API (user / grupa / ogólny), uprawnienia z
+           obu stron (podmiot ↔ zasób) w macierzy w stylu uprawnień addonów,
+           synchronizacja kluczy i uprawnień przez cały mesh.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — Dostęp i klucze API — mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>Dostęp i klucze API</h1>
+  <p class="subtitle">
+    Zewnętrzne, zgodne z OpenAI API <strong>/v1</strong> (chat, embeddings, audio, <strong>/v1/models</strong>) zabezpieczone
+    kluczami API. Trzy typy klucza, uprawnienia edytowalne z obu stron (od podmiotu i od zasobu) w macierzy
+    identycznej jak uprawnienia funkcji addonów, oraz pełna synchronizacja kluczy i uprawnień przez mesh —
+    ten sam klucz działa identycznie na każdym węźle (A / B / C).
+  </p>
+
+  <div class="v2-note">
+    <strong>Trzy niezależne osie.</strong> (1) <strong>Typ klucza</strong> — komu klucz odpowiada (user / grupa / ogólny).
+    (2) <strong>Uprawnienia do zasobów</strong> — model / flow / alias, allow / deny / dziedzicz, edytowalne z obu stron.
+    (3) <strong>Egzekwowanie /v1</strong> — <strong>default-DENY</strong>: nic nie jest dostępne, dopóki nie zostanie jawnie nadane;
+    efektywny dostęp = <code>scope_klucza ∩ uprawnienia_podmiotu</code>.
+  </div>
+
+  <div class="grp-title">1 · Klucze API<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card start" href="01-klucze-lista.html"><div class="id">01 · START</div><h3>Lista kluczy API</h3><p>Dedykowany ekran „Dostęp i klucze API”. Kolumny: nazwa, <strong>typ</strong> (user/grupa/ogólny), podmiot/zakres, status, ostatnie użycie, <strong>sync</strong>. Tworzenie, rotacja, rewokacja. Obecny stan (tylko nazwa) + nowe kolumny.</p></a>
+    <a class="index-card" href="02-kreator-klucza.html"><div class="id">02</div><h3>Kreator klucza</h3><p>Wizard 3-krokowy: typ klucza → przypisanie (user/grupa) lub <strong>allowlista zasobów</strong> (ogólny) → jednorazowy podgląd tokenu. Klucz ogólny = jawna lista modeli/flow/aliasów.</p></a>
+  </div>
+
+  <div class="grp-title">2 · Uprawnienia — macierz (jak w addonach)<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="03-macierz-dostepu.html"><div class="id">03</div><h3>Macierz dostępu</h3><p>Macierz 1:1 z uprawnieniami funkcji addonów: podzakładki <strong>Per grupa / Per user / Per klucz / Domyślne</strong>, kolumny = zasoby (Modele / Flow / Aliasy), komórki tri-state <strong>✓ allow / ✗ deny / — dziedzicz</strong>, legenda + kolejność rozwiązywania.</p></a>
+    <a class="index-card" href="04-zasob-dostep.html"><div class="id">04</div><h3>Dostęp od strony zasobu</h3><p>Detal modelu / flow / aliasu → „kto ma dostęp”: grupy, userzy, klucze ogólne. Ten sam zapis co macierz, druga perspektywa (wymóg: edycja z każdej strony). Przełącznik widoku podmiot/zasób.</p></a>
+    <a class="index-card" href="05-podmiot-uprawnienia.html"><div class="id">05</div><h3>Uprawnienia podmiotu (user / grupa)</h3><p>Zakładka „Uprawnienia” w detalu usera (dziś placeholder TODO) i grupy (dziś model/flow/addon) — uzupełniona o <strong>aliasy</strong> i spójna z macierzą. Klucze user/grupa dziedziczą stąd 1:1.</p></a>
+  </div>
+
+  <div class="grp-title">3 · Bezpieczeństwo i mesh<span class="ln"></span></div>
+  <div class="index-grid">
+    <a class="index-card" href="06-bezpieczenstwo-sync.html"><div class="id">06</div><h3>Model bezpieczeństwa + sync mesh</h3><p>Diagram: weryfikacja klucza (SHA-256, stały czas, bezwzględne 401), default-DENY, <code>scope ∩ podmiot</code>, brak admin-bypass dla kluczy ogólnych, audyt. Synchronizacja <code>api_keys</code> + <code>resource_permissions</code> przez ledger na wszystkie węzły.</p></a>
+  </div>
+
+  <div class="v2-note" style="border-color:var(--warning);">
+    <strong>Stan obecny vs nowe.</strong> Mockupy oznaczają <span class="status-pill ok" style="display:inline-flex">JEST</span> (już w produkcji: lista kluczy z samą nazwą,
+    macierz uprawnień grupy model/flow/addon, IAM users/grupy) oraz <span class="status-pill accent" style="display:inline-flex">NOWE</span> (typy kluczy, scope, default-DENY,
+    flow/alias ACL, dostęp od strony zasobu, zakładka uprawnień usera, sync kluczy/uprawnień).
+  </div>
+</div>
+</body>
+</html>

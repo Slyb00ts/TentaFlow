@@ -18,11 +18,11 @@ use crate::mesh::security::MeshSecurity;
 use crate::paths;
 use crate::sync::hlc::HlcClock;
 use crate::sync::ledger::{
-    ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore, HexNodeIdOperationVerifier,
-    partition_materialization_order, HybridLogicalTimestamp, InboxEntry, LedgerResult,
-    NewSyncOperation, NodeChainEntry, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery,
-    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
-    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
+    partition_materialization_order, ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore,
+    HexNodeIdOperationVerifier, HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation,
+    NodeChainEntry, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery, PartitionId,
+    PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore,
+    SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
 use crate::sync::snapshot::{
     verify_snapshot_signature, SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore,
@@ -452,7 +452,9 @@ pub fn acknowledged_outbox_count(operation_id: OperationId) -> LedgerResult<Opti
 /// Local node id of the running sync runtime, if started. Used by callers that
 /// must address the local node's own chain (e.g. building a pull for it).
 pub fn local_node_id() -> Option<String> {
-    SYNC_RUNTIME.get().map(|runtime| runtime.local_node_id.clone())
+    SYNC_RUNTIME
+        .get()
+        .map(|runtime| runtime.local_node_id.clone())
 }
 
 pub fn handle_pull_payload(
@@ -1300,7 +1302,11 @@ impl SyncRuntime {
         };
         let mut from_node_seq = payload.from_node_seq;
         if serving_floor_node_seq > payload.from_node_seq {
-            match self.escalate_pull_to_snapshot(source_node_id, &payload, serving_floor_node_seq)? {
+            match self.escalate_pull_to_snapshot(
+                source_node_id,
+                &payload,
+                serving_floor_node_seq,
+            )? {
                 Some(result) => return Ok(result),
                 // CR-W3: the requester sits below our serving floor but we hold no
                 // snapshot covering the prefix. This is the normal state after a
@@ -1387,10 +1393,7 @@ impl SyncRuntime {
             None => return Ok(None),
         };
         let partition_id = self.ledger.get_operation(floor_op_id)?.body.partition_id;
-        let Some(snapshot) = self
-            .ledger
-            .latest_snapshot(partition_id.clone(), None)?
-        else {
+        let Some(snapshot) = self.ledger.latest_snapshot(partition_id.clone(), None)? else {
             return Ok(None);
         };
         let response = self.build_snapshot_response_from_snapshot(
@@ -1789,9 +1792,7 @@ impl SyncRuntime {
             // its body. A node that hands us a full op we are not a target for is
             // not punished — we simply do not retain the body.
             let entry = match &entry {
-                NodeChainEntry::Full(operation)
-                    if !self.local_target_allowed(operation)? =>
-                {
+                NodeChainEntry::Full(operation) if !self.local_target_allowed(operation)? => {
                     NodeChainEntry::Redacted(RedactedRecord {
                         op_id: operation.op_id,
                         operation_hash: operation.operation_hash,
@@ -2099,12 +2100,7 @@ impl SyncRuntime {
                         }
                         Ok(BlobApplyOutcome::Pending) => {}
                         Err(e) => {
-                            self.classify_inbox_failure(
-                                &entry,
-                                e,
-                                None,
-                                &mut deferred_this_drain,
-                            )?;
+                            self.classify_inbox_failure(&entry, e, None, &mut deferred_this_drain)?;
                         }
                     }
                     continue;
@@ -2137,12 +2133,7 @@ impl SyncRuntime {
                             }
                         }
                         Err(e) => {
-                            self.classify_inbox_failure(
-                                &entry,
-                                e,
-                                None,
-                                &mut deferred_this_drain,
-                            )?;
+                            self.classify_inbox_failure(&entry, e, None, &mut deferred_this_drain)?;
                         }
                     }
                     continue;
@@ -2158,12 +2149,7 @@ impl SyncRuntime {
                                 .remove(&(entry.source.clone(), entry.operation.op_id));
                         }
                         Err(e) => {
-                            self.classify_inbox_failure(
-                                &entry,
-                                e,
-                                None,
-                                &mut deferred_this_drain,
-                            )?;
+                            self.classify_inbox_failure(&entry, e, None, &mut deferred_this_drain)?;
                         }
                     }
                     continue;
@@ -4611,7 +4597,10 @@ mod tests {
                 .filter(|op| op.redacted.is_some())
                 .collect();
             assert_eq!(redacted.len(), 1, "exactly the denied op is redacted");
-            assert!(redacted[0].operation.is_empty(), "redacted op carries no body");
+            assert!(
+                redacted[0].operation.is_empty(),
+                "redacted op carries no body"
+            );
             assert!(
                 redacted[0].partition_id.is_empty(),
                 "redacted op withholds the partition name"
@@ -4632,11 +4621,9 @@ mod tests {
             assert_eq!(frontier.last_seq, 2);
 
             // Only the allowed flow materialized; the denied one never reached SQL.
-            assert!(
-                repository::get_flow(&receiver.runtime.db, "flow-allow")
-                    .expect("get allow")
-                    .is_some()
-            );
+            assert!(repository::get_flow(&receiver.runtime.db, "flow-allow")
+                .expect("get allow")
+                .is_some());
             assert!(
                 repository::get_flow(&receiver.runtime.db, "flow-deny")
                     .expect("get deny")
@@ -4772,7 +4759,10 @@ mod tests {
                 .runtime
                 .backfill_outbox_for_permission_grants()
                 .expect("idempotent backfill");
-            assert_eq!(again, 0, "backfill is idempotent once the epoch is recorded");
+            assert_eq!(
+                again, 0,
+                "backfill is idempotent once the epoch is recorded"
+            );
         });
     }
 
@@ -4842,12 +4832,7 @@ mod tests {
                     .runtime
                     .ledger
                     .list_outbox_for_operation(
-                        source
-                            .runtime
-                            .ledger
-                            .list_all_operations()
-                            .expect("ops")[0]
-                            .op_id
+                        source.runtime.ledger.list_all_operations().expect("ops")[0].op_id
                     )
                     .expect("outbox")
                     .is_empty(),
@@ -5354,7 +5339,10 @@ mod tests {
             // Now the instance exists: the package's targets equal the instance's.
             seed_installed_addon(&db, "pkg-x", "1.0.0", "inst-x");
             let nodes = repository::list_sync_target_nodes_for_addon_package(
-                &db, "org-default", "pkg-x", "1.0.0",
+                &db,
+                "org-default",
+                "pkg-x",
+                "1.0.0",
             )
             .expect("package targets");
             assert_eq!(nodes, vec!["receiver-node".to_string()]);
@@ -5372,7 +5360,9 @@ mod tests {
                     .list_outbox_for_operation(op.op_id)
                     .expect("outbox");
                 assert!(
-                    outbox.iter().any(|entry| entry.target.as_str() == "receiver-node"),
+                    outbox
+                        .iter()
+                        .any(|entry| entry.target.as_str() == "receiver-node"),
                     "blob op missing outbox entry for the standard trusted node"
                 );
             }
@@ -6141,8 +6131,7 @@ mod tests {
             }
             open_contacts_table(addon_id);
 
-            let insert_op =
-                addon_sql_operation(&source, capture(addon_id, "person-1", "Anna"));
+            let insert_op = addon_sql_operation(&source, capture(addon_id, "person-1", "Anna"));
             let update_op =
                 addon_sql_operation(&source, update_capture(addon_id, "person-1", "Anna Nowak"));
             let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
@@ -6184,7 +6173,10 @@ mod tests {
             assert!(
                 pool.get()
                     .expect("conn")
-                    .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get::<_, String>(0))
+                    .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row
+                        .get::<_, String>(
+                        0
+                    ))
                     .is_err(),
                 "row must not exist before its INSERT arrives"
             );
@@ -6204,7 +6196,9 @@ mod tests {
             let name: String = pool
                 .get()
                 .expect("conn")
-                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
                 .expect("row exists");
             assert_eq!(name, "Anna Nowak");
             let applied = receiver
@@ -6359,7 +6353,11 @@ mod tests {
                 10,
             )
             .expect("conflicts");
-            assert_eq!(conflicts.len(), 1, "conflict must be recorded for the operator");
+            assert_eq!(
+                conflicts.len(),
+                1,
+                "conflict must be recorded for the operator"
+            );
             assert_eq!(conflicts[0].resource_id, "2");
         });
     }
@@ -6423,7 +6421,9 @@ mod tests {
             let name: String = pool
                 .get()
                 .expect("conn")
-                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| row.get(0))
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
                 .expect("row exists");
             assert_eq!(name, "Anna Nowak");
         });
@@ -6553,7 +6553,11 @@ mod tests {
                     .ledger
                     .get_inbox_entry(peer.clone(), op.op_id)
                     .expect("chain inbox entry");
-                assert!(entry.applied, "chain op {} must be applied", op.op_id.to_hex());
+                assert!(
+                    entry.applied,
+                    "chain op {} must be applied",
+                    op.op_id.to_hex()
+                );
                 assert!(!entry.conflicted);
                 assert!(
                     entry.deferred_count <= 1,
@@ -6628,7 +6632,11 @@ mod tests {
                 10,
             )
             .expect("conflicts");
-            assert_eq!(conflicts.len(), 1, "escalation must record an operator conflict");
+            assert_eq!(
+                conflicts.len(),
+                1,
+                "escalation must record an operator conflict"
+            );
             assert_eq!(conflicts[0].resource_id, "person-1");
         });
     }
@@ -8189,7 +8197,13 @@ mod tests {
         // compacted prefix as a snapshot package with its tail.
         let pull = source
             .runtime
-            .build_snapshot_pull_payload(partition.as_str(), 1, snapshot.snapshot_id.as_str(), true, 64)
+            .build_snapshot_pull_payload(
+                partition.as_str(),
+                1,
+                snapshot.snapshot_id.as_str(),
+                true,
+                64,
+            )
             .expect("build snapshot pull");
         let pull = MeshSyncSnapshotPullPayload {
             from_node_id: receiver.runtime.local_node_id.clone(),
@@ -9876,6 +9890,287 @@ mod tests {
         });
     }
 
+    // =========================================================================
+    // Slice-4: api_keys + resource_permissions materializer round-trip
+    // =========================================================================
+
+    /// Builds a `core.api_key` Insert capture with an explicit HLC so the test
+    /// can order concurrent edits deterministically. Mirrors the replicated field
+    /// set the repository emits (no `last_used_at`).
+    fn api_key_capture(
+        uid: &str,
+        verifier: &str,
+        is_active: bool,
+        hlc: HybridLogicalTimestamp,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "key_verifier".to_string(),
+            FieldValue::String(verifier.to_string()),
+        );
+        fields.insert(
+            "key_prefix".to_string(),
+            FieldValue::String("sk-...x".to_string()),
+        );
+        fields.insert("name".to_string(), FieldValue::String("k".to_string()));
+        fields.insert(
+            "key_type".to_string(),
+            FieldValue::String("user".to_string()),
+        );
+        fields.insert(
+            "subject_id".to_string(),
+            FieldValue::String("user-uid-1".to_string()),
+        );
+        fields.insert("rate_limit_rps".to_string(), FieldValue::I64(60));
+        fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
+            "org-default",
+            uid,
+            SqlWriteAction::Insert,
+            fields,
+            None,
+            hlc,
+            test_epoch(),
+        )
+    }
+
+    fn perm_capture(
+        action: SqlWriteAction,
+        access_level: Option<&str>,
+        hlc: HybridLogicalTimestamp,
+    ) -> crate::sync::core_capture::CoreWriteCapture {
+        let rid = crate::sync::resource_id::composite_resource_id(&["model", "gpt-4o", "user", "u1"]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "resource_type".to_string(),
+            FieldValue::String("model".to_string()),
+        );
+        fields.insert(
+            "resource_id".to_string(),
+            FieldValue::String("gpt-4o".to_string()),
+        );
+        fields.insert(
+            "subject_type".to_string(),
+            FieldValue::String("user".to_string()),
+        );
+        fields.insert(
+            "subject_id".to_string(),
+            FieldValue::String("u1".to_string()),
+        );
+        if let Some(level) = access_level {
+            fields.insert(
+                "access_level".to_string(),
+                FieldValue::String(level.to_string()),
+            );
+        }
+        crate::sync::core_capture::CoreWriteCapture::new(
+            crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+            "org-default",
+            rid,
+            action,
+            fields,
+            None,
+            hlc,
+            test_epoch(),
+        )
+    }
+
+    fn api_key_active(db: &DbPool, uid: &str) -> Option<bool> {
+        use rusqlite::OptionalExtension;
+        db.lock()
+            .expect("db lock")
+            .query_row(
+                "SELECT is_active FROM api_keys WHERE uid = ?1",
+                rusqlite::params![uid],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .expect("query api key")
+    }
+
+    fn perm_level(db: &DbPool) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        db.lock()
+            .expect("db lock")
+            .query_row(
+                "SELECT access_level FROM resource_permissions \
+                 WHERE resource_type = 'model' AND resource_id = 'gpt-4o' \
+                   AND subject_type = 'user' AND subject_id = 'u1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("query perm")
+    }
+
+    /// An api_key issued on node A replicates onto node B and, with the SAME org
+    /// pepper, verifies there. last_used_at on B stays node-local across the apply.
+    #[test]
+    fn e2e_api_key_replicates_and_verifies_on_peer() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(81);
+            let cipher = make_settings_cipher(81);
+            let db_b = make_db();
+
+            // Same pepper on both ends: derive a verifier the way auth does.
+            let pepper = b"pepper-shared-org-wide-012345678".to_vec();
+            let verifier = crate::api::dashboard::auth::api_key_verifier("sk-secret", &pepper);
+
+            let cap = api_key_capture("uid-1", &verifier, true, hlc_at(1_000, 0, "node-a"));
+            let op = signed_flow_op(&node_a, cap);
+            let rows = crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op)
+                .expect("apply api key on B");
+            assert_eq!(rows, 1);
+
+            // Set the same pepper on B and verify the replicated key.
+            crate::db::repository::set_shared_secret_setting_secure(
+                &db_b,
+                "api_key_pepper",
+                &hex::encode(&pepper),
+                &cipher,
+                None,
+            )
+            .expect("seed pepper on B");
+            let recovered = crate::db::repository::get_or_create_api_key_pepper(&db_b, &cipher)
+                .expect("read pepper on B");
+            assert_eq!(recovered, pepper, "B must use the org pepper, not a fresh one");
+
+            let found = crate::db::repository::verify_api_key(&db_b, &verifier)
+                .expect("verify")
+                .expect("replicated key verifies on B");
+            assert_eq!(found.uid, "uid-1");
+        });
+    }
+
+    /// last_used_at is node-local: a replicated api_key UPSERT must not reset a
+    /// value B already stamped locally.
+    #[test]
+    fn e2e_api_key_upsert_preserves_local_last_used_at() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(82);
+            let cipher = make_settings_cipher(82);
+            let db_b = make_db();
+
+            let op1 = signed_flow_op(
+                &node_a,
+                api_key_capture("uid-2", "v1", true, hlc_at(1_000, 0, "node-a")),
+            );
+            crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op1)
+                .expect("first apply");
+
+            // B stamps last_used_at locally (simulating a verify on B).
+            db_b.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE api_keys SET last_used_at = '2026-01-01T00:00:00Z' WHERE uid = 'uid-2'",
+                    [],
+                )
+                .unwrap();
+
+            // A newer edit (rotation) arrives from A.
+            let op2 = signed_flow_op(
+                &node_a,
+                api_key_capture("uid-2", "v2", true, hlc_at(2_000, 0, "node-a")),
+            );
+            crate::sync::core_materializer::apply_core_operation(&db_b, &cipher, &op2)
+                .expect("second apply");
+
+            use rusqlite::OptionalExtension;
+            let last_used: Option<String> = db_b
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT last_used_at FROM api_keys WHERE uid = 'uid-2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                last_used.as_deref(),
+                Some("2026-01-01T00:00:00Z"),
+                "synced UPSERT must not reset node-local last_used_at"
+            );
+        });
+    }
+
+    /// A `clear` (Delete tombstone) authored AFTER an `allow` removes the rule on a
+    /// peer and a stale older `allow` arriving later must NOT resurrect it.
+    #[test]
+    fn e2e_resource_permission_clear_tombstone_beats_stale_allow() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(83);
+            let cipher = make_settings_cipher(83);
+
+            let allow_op = signed_flow_op(
+                &node_a,
+                perm_capture(SqlWriteAction::Insert, Some("allow"), hlc_at(1_000, 0, "node-a")),
+            );
+            let clear_op = signed_flow_op(
+                &node_a,
+                perm_capture(SqlWriteAction::Delete, None, hlc_at(2_000, 0, "node-a")),
+            );
+
+            // Order 1: allow then clear → rule gone.
+            let db1 = make_db();
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &allow_op)
+                .expect("db1 allow");
+            assert_eq!(perm_level(&db1).as_deref(), Some("allow"));
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &clear_op)
+                .expect("db1 clear");
+            assert_eq!(perm_level(&db1), None, "clear removes the rule");
+
+            // Order 2: clear (newer) then stale allow (older) → allow is dropped by
+            // LWW, the tombstone wins, rule stays absent.
+            let db2 = make_db();
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &clear_op)
+                .expect("db2 clear");
+            let stale =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &allow_op)
+                    .expect("db2 stale allow");
+            assert_eq!(stale, 0, "older allow loses LWW against newer clear");
+            assert_eq!(
+                perm_level(&db2),
+                None,
+                "stale allow must not resurrect a cleared rule"
+            );
+        });
+    }
+
+    /// Set/active state is concurrently editable: the higher-HLC active flag wins
+    /// regardless of apply order (mirrors the flow LWW guarantee).
+    #[test]
+    fn e2e_api_key_active_flag_is_lww() {
+        with_tmp_home(|| {
+            let node_a = make_runtime(84);
+            let node_b = make_runtime(85);
+            let cipher = make_settings_cipher(84);
+
+            let older = signed_flow_op(
+                &node_a,
+                api_key_capture("uid-3", "v", true, hlc_at(1_000, 0, "node-a")),
+            );
+            let newer = signed_flow_op(
+                &node_b,
+                api_key_capture("uid-3", "v", false, hlc_at(2_000, 0, "node-b")),
+            );
+
+            let db1 = make_db();
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &older).unwrap();
+            crate::sync::core_materializer::apply_core_operation(&db1, &cipher, &newer).unwrap();
+
+            let db2 = make_db();
+            crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &newer).unwrap();
+            let stale =
+                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &older).unwrap();
+            assert_eq!(stale, 0, "older active=true dropped by LWW");
+
+            assert_eq!(api_key_active(&db1, "uid-3"), Some(false));
+            assert_eq!(api_key_active(&db2, "uid-3"), Some(false));
+        });
+    }
+
     /// Records an `addon.kv` write on `node` with a caller-chosen wall time, so the
     /// resulting signed op carries a deterministic HLC (wall = `created_at_ms`,
     /// node = the runtime's own id) for the LWW comparison.
@@ -9935,10 +10230,22 @@ mod tests {
             let node_b = make_runtime(142);
 
             // Two concurrent writes of the same addon key: A older, B newer.
-            let op_older =
-                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
-            let op_newer =
-                signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", Some(b"dark"), 2_000);
+            let op_older = signed_kv_op(
+                &node_a,
+                "kv-addon",
+                "inst-1",
+                "settings/theme",
+                Some(b"light"),
+                1_000,
+            );
+            let op_newer = signed_kv_op(
+                &node_b,
+                "kv-addon",
+                "inst-1",
+                "settings/theme",
+                Some(b"dark"),
+                2_000,
+            );
 
             let db1 = make_db();
             let db2 = make_db();
@@ -9954,14 +10261,23 @@ mod tests {
             assert_eq!(stale, 0, "stale older kv op must be dropped by LWW");
 
             // Both databases converge to the newer-HLC value.
-            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
-            assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+            assert_eq!(
+                kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(),
+                Some(&b"dark"[..])
+            );
+            assert_eq!(
+                kv_value(&db2, "kv-addon", "inst-1", "settings/theme").as_deref(),
+                Some(&b"dark"[..])
+            );
 
             // Re-delivering the winning op is idempotent: same HLC fails the strict
             // `>` gate and applies nothing, value unchanged.
             let redelivered = apply_kv_operation(&db1, &op_newer).expect("db1 re-deliver");
             assert_eq!(redelivered, 0, "re-delivered op must be a no-op");
-            assert_eq!(kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(), Some(&b"dark"[..]));
+            assert_eq!(
+                kv_value(&db1, "kv-addon", "inst-1", "settings/theme").as_deref(),
+                Some(&b"dark"[..])
+            );
         });
     }
 
@@ -9976,8 +10292,14 @@ mod tests {
             let node_b = make_runtime(144);
 
             // Older insert on A, newer delete on B of the same key.
-            let op_insert =
-                signed_kv_op(&node_a, "kv-addon", "inst-1", "settings/theme", Some(b"light"), 1_000);
+            let op_insert = signed_kv_op(
+                &node_a,
+                "kv-addon",
+                "inst-1",
+                "settings/theme",
+                Some(b"light"),
+                1_000,
+            );
             let op_delete =
                 signed_kv_op(&node_b, "kv-addon", "inst-1", "settings/theme", None, 2_000);
 
@@ -9993,7 +10315,10 @@ mod tests {
             // insert, so the late insert is dropped and the key stays absent.
             apply_kv_operation(&db2, &op_delete).expect("db2 delete");
             let stale = apply_kv_operation(&db2, &op_insert).expect("db2 late insert");
-            assert_eq!(stale, 0, "older insert after a newer delete must be dropped");
+            assert_eq!(
+                stale, 0,
+                "older insert after a newer delete must be dropped"
+            );
             assert_eq!(kv_value(&db2, "kv-addon", "inst-1", "settings/theme"), None);
         });
     }
@@ -10444,11 +10769,7 @@ mod tests {
             total += node
                 .runtime
                 .ledger
-                .list_due_repair_requests(
-                    PeerId::new(peer.clone()).expect("peer"),
-                    i64::MAX,
-                    1024,
-                )
+                .list_due_repair_requests(PeerId::new(peer.clone()).expect("peer"), i64::MAX, 1024)
                 .expect("repair requests")
                 .len();
         }
@@ -10630,8 +10951,7 @@ mod tests {
         // independently-computed LWW winner per key.
         for key in key_pool {
             let expected_name = expected.get(key).map(|(_, name)| name.clone());
-            let names: Vec<Option<String>> =
-                nodes.iter().map(|n| read_org_name(n, key)).collect();
+            let names: Vec<Option<String>> = nodes.iter().map(|n| read_org_name(n, key)).collect();
             for (idx, name) in names.iter().enumerate() {
                 assert_eq!(
                     name, &expected_name,
@@ -10861,10 +11181,11 @@ mod tests {
         new_value: &str,
     ) -> SyncOperation {
         let mut body = original.body.clone();
-        body.changed_fields
-            .insert("name".to_string(), FieldValue::String(new_value.to_string()));
-        let operation_hash =
-            crate::sync::ledger::hash_canonical(&body).expect("hash forged body");
+        body.changed_fields.insert(
+            "name".to_string(),
+            FieldValue::String(new_value.to_string()),
+        );
+        let operation_hash = crate::sync::ledger::hash_canonical(&body).expect("hash forged body");
         let op_id = OperationId::from_hash(operation_hash);
         let mut forged = SyncOperation {
             op_id,
@@ -10877,7 +11198,9 @@ mod tests {
             .signer
             .sign_operation(&forged.signing_bytes())
             .expect("sign forged op");
-        forged.validate_integrity().expect("forged op self-consistent");
+        forged
+            .validate_integrity()
+            .expect("forged op self-consistent");
         assert_ne!(
             forged.op_id, original.op_id,
             "forged op must differ from the original at the same (node, seq)"
@@ -11129,10 +11452,8 @@ mod tests {
                 runtime: SyncRuntime {
                     db: make_db(),
                     ledger: Arc::new(
-                        FjallSyncLedgerStore::open(
-                            tempfile::tempdir().expect("forge dir").path(),
-                        )
-                        .expect("forge ledger"),
+                        FjallSyncLedgerStore::open(tempfile::tempdir().expect("forge dir").path())
+                            .expect("forge ledger"),
                     ),
                     signer: RuntimeSigner {
                         node_id: author_id.clone(),
@@ -11172,7 +11493,10 @@ mod tests {
                 .expect("honest seq1 accepted");
             deliver(&victim, &author_id, std::slice::from_ref(&honest_op2))
                 .expect("honest seq2 accepted");
-            assert_eq!(read_org_name(&victim, "org-alpha").as_deref(), Some("honest-2"));
+            assert_eq!(
+                read_org_name(&victim, "org-alpha").as_deref(),
+                Some("honest-2")
+            );
 
             // Now the forged seq2 arrives. Its node_seq (2) is below the frontier
             // (next expected 3), so it is treated as already-known IF its op_id
@@ -11227,19 +11551,34 @@ mod tests {
             let op1 = {
                 let cap = org_capture("org-alpha", "seq1", hlc_at(8_000, 0, &author_id));
                 let r = author.runtime.record_core_capture(cap).expect("op1");
-                author.runtime.ledger.get_operation(r.op_id).expect("get op1")
+                author
+                    .runtime
+                    .ledger
+                    .get_operation(r.op_id)
+                    .expect("get op1")
             };
             let op2 = {
                 let cap = org_capture("org-alpha", "seq2", hlc_at(8_001, 0, &author_id));
                 let r = author.runtime.record_core_capture(cap).expect("op2");
-                author.runtime.ledger.get_operation(r.op_id).expect("get op2")
+                author
+                    .runtime
+                    .ledger
+                    .get_operation(r.op_id)
+                    .expect("get op2")
             };
             let op3 = {
                 let cap = org_capture("org-alpha", "seq3", hlc_at(8_002, 0, &author_id));
                 let r = author.runtime.record_core_capture(cap).expect("op3");
-                author.runtime.ledger.get_operation(r.op_id).expect("get op3")
+                author
+                    .runtime
+                    .ledger
+                    .get_operation(r.op_id)
+                    .expect("get op3")
             };
-            assert_eq!((op1.body.node_seq, op2.body.node_seq, op3.body.node_seq), (1, 2, 3));
+            assert_eq!(
+                (op1.body.node_seq, op2.body.node_seq, op3.body.node_seq),
+                (1, 2, 3)
+            );
 
             // Deliver seq 3 FIRST: it is a gap above the expected frontier (1).
             deliver(&target, &author_id, std::slice::from_ref(&op3)).expect("deliver seq3 early");
@@ -11350,8 +11689,12 @@ mod tests {
                     if src_idx == target_idx {
                         continue;
                     }
-                    deliver(&nodes[target_idx], &node_ids[src_idx], std::slice::from_ref(&ops[src_idx]))
-                        .expect("delivery never errors on epoch mismatch");
+                    deliver(
+                        &nodes[target_idx],
+                        &node_ids[src_idx],
+                        std::slice::from_ref(&ops[src_idx]),
+                    )
+                    .expect("delivery never errors on epoch mismatch");
                 }
             }
 
@@ -11384,7 +11727,10 @@ mod tests {
                 if idx == winner_idx {
                     continue;
                 }
-                node.runtime.ledger.set_epoch(winner_epoch.clone()).expect("adopt epoch");
+                node.runtime
+                    .ledger
+                    .set_epoch(winner_epoch.clone())
+                    .expect("adopt epoch");
             }
             for target_idx in 0..nodes.len() {
                 if target_idx == winner_idx {
@@ -11402,7 +11748,11 @@ mod tests {
                     "after adopting the winning epoch there must be no further mismatch"
                 );
                 assert!(
-                    node_holds_op(&nodes[target_idx], &node_ids[winner_idx], ops[winner_idx].op_id),
+                    node_holds_op(
+                        &nodes[target_idx],
+                        &node_ids[winner_idx],
+                        ops[winner_idx].op_id
+                    ),
                     "winner's op must be admitted once epochs agree"
                 );
             }
@@ -11464,7 +11814,8 @@ mod tests {
             local
                 .runtime
                 .clear_adopt_inflight(&donor_id, donor_epoch.counter);
-            deliver(&local, &donor_id, std::slice::from_ref(&ops[0])).expect("redeliver after clear");
+            deliver(&local, &donor_id, std::slice::from_ref(&ops[0]))
+                .expect("redeliver after clear");
             assert_eq!(
                 local.runtime.take_pending_reconcile().len(),
                 1,
@@ -11639,7 +11990,10 @@ mod tests {
                 .earliest_live_node_seq(&author_id)
                 .expect("serving floor")
                 .expect("relay holds live post-adopt content");
-            assert!(floor > pre_adopt_tip, "floor must sit above the deleted prefix");
+            assert!(
+                floor > pre_adopt_tip,
+                "floor must sit above the deleted prefix"
+            );
 
             // THE LIVE BUG: a pull for the author's chain from seq 1.
             let pull = MeshSyncPullPayload {

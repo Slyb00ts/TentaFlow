@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 02-kreator-klucza.html
+     Opis: Kreator klucza API jako MODAL (tf-window) z wizardem — wskaźnik kroków
+           1:1 z wizardem deploy serwisu (.wizard-step-indicator/.wizard-step-dot).
+           Trzy stany: 1) typ klucza, 2) zakres (allowlista / dziedziczenie),
+           3) jednorazowy token.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Dostęp i klucze API — Kreator klucza</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7" cy="14" r="4"/><path d="m10 11 10-5"/><path d="m14 9 2 1"/><path d="m18 7 2 1"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5 11 16.5"/><path d="M16.5 7.5 13 16.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+</defs></svg>
+
+<!-- ===================== KROK 1 — TYP KLUCZA ===================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">02a</span>
+    <h2>Kreator klucza — Krok 1: Typ klucza</h2>
+    <div class="desc">Modal (tf-window) nad przyciemnionym ekranem. Wskaźnik kroków identyczny jak w kreatorze deploy serwisu: aktywny indigo-glow, ukończony zielony-glow.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop">
+      <div class="tf-window">
+        <div class="tf-window-titlebar"><svg class="icon"><use href="#i-key"/></svg>Nowy klucz API<span class="close"><svg class="icon"><use href="#i-x"/></svg></span></div>
+        <div class="tf-window-body">
+          <div class="wizard-step-indicator">
+            <div class="wizard-step-dot active"><span>1</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot"><span>2</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot"><span>3</span></div>
+          </div>
+          <h4 class="wizard-step-title">Wybierz typ klucza</h4>
+          <div class="type-grid">
+            <div class="type-card user active">
+              <div class="radio"></div>
+              <div class="mode-icon"><svg class="icon icon-lg"><use href="#i-user"/></svg></div>
+              <h4>Klucz użytkownika</h4>
+              <p>Dziedziczy efektywne uprawnienia wybranego usera i jego grup. Zmiana uprawnień usera od razu zmienia zasięg klucza.</p>
+            </div>
+            <div class="type-card group">
+              <div class="radio"></div>
+              <div class="mode-icon"><svg class="icon icon-lg"><use href="#i-users"/></svg></div>
+              <h4>Klucz grupy</h4>
+              <p>Dziedziczy uprawnienia grupy. Dla integracji zespołowych — jeden klucz na rolę/zespół.</p>
+            </div>
+            <div class="type-card general">
+              <div class="radio"></div>
+              <div class="mode-icon"><svg class="icon icon-lg"><use href="#i-key"/></svg></div>
+              <h4>Klucz ogólny (scoped)</h4>
+              <p>Własna jawna allowlista modeli/flow/aliasów. Brak admin-bypass. Nic poza zaznaczonym (default-DENY).</p>
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:16px">
+            <label>Nazwa klucza<div class="label-desc">Do identyfikacji na liście</div></label>
+            <input class="input" placeholder="np. CI Pipeline" value="CI Pipeline">
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <button class="btn btn-ghost">Anuluj</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary">Dalej</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== KROK 2 — ZAKRES ===================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">02b</span>
+    <h2>Kreator klucza — Krok 2: Zakres</h2>
+    <div class="desc">Dla klucza OGÓLNEGO: allowlista zasobów (model/flow/alias). Dla user/grupa: podgląd dziedziczonych uprawnień (read-only) — wariant w notce.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop">
+      <div class="tf-window">
+        <div class="tf-window-titlebar"><svg class="icon"><use href="#i-key"/></svg>Nowy klucz API · Ogólny<span class="close"><svg class="icon"><use href="#i-x"/></svg></span></div>
+        <div class="tf-window-body">
+          <div class="wizard-step-indicator">
+            <div class="wizard-step-dot done"><span>1</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot active"><span>2</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot"><span>3</span></div>
+          </div>
+          <h4 class="wizard-step-title">Zaznacz zasoby dostępne dla klucza</h4>
+          <div class="alert danger">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>Default-DENY.</strong> Klucz nie ma dostępu do niczego poza zaznaczonymi. Brak zaznaczenia = 403 na każde żądanie /v1.</div>
+          </div>
+          <div class="pick-toolbar">
+            <div class="search-box"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj zasobu..."></div>
+            <div class="filter-chip active">Wszystkie</div>
+            <div class="filter-chip"><svg class="icon icon-sm"><use href="#i-model"/></svg>Modele</div>
+            <div class="filter-chip"><svg class="icon icon-sm"><use href="#i-flow"/></svg>Flow</div>
+            <div class="filter-chip"><svg class="icon icon-sm"><use href="#i-link"/></svg>Aliasy</div>
+          </div>
+          <div class="pick-row checked"><div class="chk"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-model"/></svg></div><div class="r-info"><div class="r-name">guard-pl</div><div class="r-meta">model · LLM · lokalny + B</div></div></div>
+          <div class="pick-row checked"><div class="chk"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-model"/></svg></div><div class="r-info"><div class="r-name">embeddings-gemma</div><div class="r-meta">model · embeddings</div></div></div>
+          <div class="pick-row"><div class="chk"></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-model"/></svg></div><div class="r-info"><div class="r-name">whisper-base</div><div class="r-meta">model · STT</div></div></div>
+          <div class="pick-row checked"><div class="chk"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-flow"/></svg></div><div class="r-info"><div class="r-name">chat-acme</div><div class="r-meta">flow · opublikowany</div></div></div>
+          <div class="pick-row"><div class="chk"></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-flow"/></svg></div><div class="r-info"><div class="r-name">rag-korpus</div><div class="r-meta">flow · RAG</div></div></div>
+          <div class="pick-row checked"><div class="chk"><svg class="icon icon-sm"><use href="#i-check"/></svg></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-link"/></svg></div><div class="r-info"><div class="r-name">chat-prod</div><div class="r-meta">alias → guard-pl (+ fallback emb-prod)</div></div></div>
+          <div class="pick-row"><div class="chk"></div><div class="r-ico"><svg class="icon icon-sm"><use href="#i-link"/></svg></div><div class="r-info"><div class="r-name">emb-prod</div><div class="r-meta">alias → embeddings-gemma</div></div></div>
+          <div class="alert info" style="margin-top:14px;margin-bottom:0">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>Wariant user/grupa:</strong> ten krok nie pokazuje allowlisty — zamiast tego read-only podgląd uprawnień dziedziczonych od podmiotu (klucz ściśle je dziedziczy).</div>
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <button class="btn btn-secondary">Wstecz</button>
+          <div class="spacer"></div>
+          <span class="muted" style="font-size:12px">4 zaznaczone</span>
+          <button class="btn btn-primary">Dalej</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== KROK 3 — TOKEN ===================== -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">02c</span>
+    <h2>Kreator klucza — Krok 3: Gotowe</h2>
+    <div class="desc">Token pokazywany jednorazowo. W bazie trzymany jest tylko weryfikator HMAC-SHA256(org_pepper, token), nigdy sam token.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop">
+      <div class="tf-window">
+        <div class="tf-window-titlebar"><svg class="icon"><use href="#i-key"/></svg>Klucz utworzony<span class="close"><svg class="icon"><use href="#i-x"/></svg></span></div>
+        <div class="tf-window-body">
+          <div class="wizard-step-indicator">
+            <div class="wizard-step-dot done"><span>1</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot done"><span>2</span></div>
+            <div class="wizard-step-line"></div>
+            <div class="wizard-step-dot active"><span>3</span></div>
+          </div>
+          <h4 class="wizard-step-title">Skopiuj token teraz</h4>
+          <div class="token-box">
+            <div class="token-val"><span>sk-9f3c1a77b2104e8da6c0f5e3b8472d019c5a6f3b2e1d0a4c</span><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj</button></div>
+          </div>
+          <div class="alert warn" style="margin-top:14px">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>Pokazujemy token tylko raz.</strong> Skopiuj go teraz — nie da się go odzyskać. W bazie zapisany jest wyłącznie HMAC-SHA256(org_pepper, token).</div>
+          </div>
+          <div class="section-card" style="margin-bottom:0">
+            <h3><svg class="icon icon-sm"><use href="#i-key"/></svg>Podsumowanie</h3>
+            <table class="tbl">
+              <tbody>
+                <tr><td class="strong">Nazwa</td><td>CI Pipeline</td></tr>
+                <tr><td class="strong">Typ</td><td><span class="badge-pill general"><svg class="icon"><use href="#i-key"/></svg>Ogólny (scoped)</span></td></tr>
+                <tr><td class="strong">Zakres</td><td>2 modele · 1 flow · 1 alias (4 zasoby)</td></tr>
+                <tr><td class="strong">Synchronizacja</td><td><span class="badge-pill sync"><svg class="icon"><use href="#i-refresh"/></svg>replikacja na 3 węzły (A/B/C)</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <div class="spacer"></div>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-check"/></svg>Skopiowałem — zakończ</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</body>
+</html>

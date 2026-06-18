@@ -9,16 +9,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbApiKey {
     pub id: i64,
-    pub key_hash: String,
+    /// Stable UUID used as the sync key and as `subject_id` for general keys.
+    pub uid: String,
+    /// HMAC-SHA256(org_pepper, token), hex-encoded. Replicated, never the token.
+    pub key_verifier: String,
     pub key_prefix: String,
     pub name: String,
+    /// 'user' | 'group' | 'general'.
+    pub key_type: String,
+    /// user_id (user) / group_id (group) / NULL (general).
+    pub subject_id: Option<String>,
     pub rate_limit_rps: i64,
     pub is_active: bool,
     pub created_at: String,
     pub last_used_at: Option<String>,
-    /// Migracja 51 — nullable. None = legacy admin-equivalent.
-    #[serde(default)]
-    pub owner_user_id: Option<String>,
 }
 
 /// Ustawienie
