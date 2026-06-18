@@ -45,7 +45,6 @@ vision-cuda = ["vision-burn", "burn/cuda"]
 vision-metal = ["vision-burn", "burn/metal"]
 vision-rocm = ["vision-burn", "burn/rocm"]
 inference-diarization = ["dep:tentaflow-voice"]
-dashboard-api = []
 rdma-probe = []
 # Udostępnia `flow_engine::node_adapter::test_support` (stub dispatcherów +
 # stub_ctx) poza testami, żeby benchmarki mogły konstruować ExecutionContext

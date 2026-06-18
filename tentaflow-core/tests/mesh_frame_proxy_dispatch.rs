@@ -7,7 +7,7 @@
 //          IrohMeshEvent variant with all payload fields preserved.
 //
 // Run:
-//   cargo test --test mesh_frame_proxy_dispatch --features dashboard-api \
+//   cargo test --test mesh_frame_proxy_dispatch \
 //     -- --nocapture --test-threads=1
 // =============================================================================
 

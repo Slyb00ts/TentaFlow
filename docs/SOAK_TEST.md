@@ -187,7 +187,7 @@ Requirements:
 - Or ONVIF simulator: https://github.com/Vorlent/onvif-discovery-server
 
 Integration test paths:
-- `cargo test --features camera,dashboard-api --test camera_onvif_integration -- --include-ignored`
+- `cargo test --features camera --test camera_onvif_integration -- --include-ignored`
   (requires live ONVIF device on LAN)
 
 ONVIF cameras are discovery-only in F1b. To add as camera, operator

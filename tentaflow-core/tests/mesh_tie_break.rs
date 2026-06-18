@@ -8,7 +8,7 @@
 //       (3) `IrohMeshConfig { relay_url: None }` bind'uje sie bez internetu.
 //
 // Uruchomienie:
-//   cargo test --test mesh_tie_break --features dashboard-api \
+//   cargo test --test mesh_tie_break \
 //     -- --nocapture --test-threads=1
 // =============================================================================
 

@@ -16,14 +16,10 @@ pub mod recording;
 
 pub mod legal;
 
-#[cfg(feature = "dashboard-api")]
 pub mod dashboard;
 
-#[cfg(feature = "dashboard-api")]
 pub mod unified_server;
 
-#[cfg(feature = "dashboard-api")]
 pub mod tls_pem;
 
-#[cfg(feature = "dashboard-api")]
 pub mod mtls;

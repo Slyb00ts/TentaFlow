@@ -7,13 +7,10 @@
 
 pub mod types;
 
-#[cfg(feature = "dashboard-api")]
 pub mod server;
 
 pub use types::*;
 
-#[cfg(feature = "dashboard-api")]
 pub use server::OpenAIServer;
 
-#[cfg(feature = "dashboard-api")]
 pub use server::OpenAIBody;

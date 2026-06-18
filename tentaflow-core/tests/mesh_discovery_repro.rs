@@ -11,7 +11,7 @@
 //       2. INTEGRACJA: IrohMeshManager::new() nie udostepnia DiscoveryEvent
 //          i nie spawnuje taska ktory dialowalby odkryte peery.
 //
-// Uruchomienie: cargo test --test mesh_discovery_repro --features dashboard-api -- --nocapture
+// Uruchomienie: cargo test --test mesh_discovery_repro -- --nocapture
 // =============================================================================
 
 use std::net::SocketAddr;

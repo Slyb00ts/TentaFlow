@@ -13,7 +13,7 @@
 // fed each of the response variants.
 //
 // Run:
-//   cargo test --test frame_pickup_cross_node --features dashboard-api \
+//   cargo test --test frame_pickup_cross_node \
 //     -- --nocapture
 // =============================================================================
 

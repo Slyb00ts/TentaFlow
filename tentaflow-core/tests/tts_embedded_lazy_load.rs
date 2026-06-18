@@ -14,7 +14,7 @@
 // VITS Piper bundle on first run). Marked `#[ignore]`. Run manually:
 //
 //   cargo test --manifest-path tentaflow-core/Cargo.toml \
-//     --features dashboard-api,inference-sherpa \
+//     --features inference-sherpa \
 //     --test tts_embedded_lazy_load -- --ignored --nocapture
 
 #![cfg(feature = "inference-sherpa")]

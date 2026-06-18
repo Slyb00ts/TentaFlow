@@ -4,7 +4,7 @@
 //       tworzy venv, instaluje wheels. Silnik NIE jest spawnowany —
 //       sprawdzamy sam bootstrap.
 // Uzycie: cargo run --release --example bootstrap_python_bundle \
-//           --features inference-diarization,docker,dashboard-api -- voxcpm
+//           --features inference-diarization,docker -- voxcpm
 // =============================================================================
 
 fn main() -> anyhow::Result<()> {

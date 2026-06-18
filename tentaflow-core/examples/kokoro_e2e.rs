@@ -4,7 +4,7 @@
 //       bridge) -> synthesize -> zapisz WAV.
 //
 //   cargo run --release --example kokoro_e2e \
-//     --features "inference-mlx-kokoro dashboard-api" -- \
+//     --features "inference-mlx-kokoro" -- \
 //     "Hello world" af_heart /tmp/whisper-test/kokoro.wav
 // =============================================================================
 

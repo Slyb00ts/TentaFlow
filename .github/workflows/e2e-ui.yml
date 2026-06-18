@@ -49,7 +49,7 @@ jobs:
 
       - name: Build tentaflow release
         working-directory: tentaflow
-        run: cargo build --release --features dashboard-api,camera
+        run: cargo build --release --features camera
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

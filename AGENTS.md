@@ -35,9 +35,8 @@ Feature flags on `tentaflow-core`:
 | `docker` | Docker management (bollard) |
 | `inference-llamacpp` | llama.cpp backend |
 | `inference-mlx` | Apple MLX (macOS only) |
-| `dashboard-api` | Axum HTTP dashboard + API |
 
-The main binary enables `docker` and `dashboard-api` by default. macOS additionally enables `inference-mlx`.
+The main binary enables `docker` by default. macOS additionally enables `inference-mlx`.
 
 ## Tests
 

@@ -42,10 +42,8 @@ Or directly:
 
 ```bash
 cd tentaflow-core
-# --features dashboard-api is required: the core lib references api::dashboard
-# unconditionally from dispatch/{handlers,state}.rs, so the lib won't link without it.
-RUSTC_WRAPPER= cargo bench --features dashboard-api --bench camera_frame_hotpath_perf
-RUSTC_WRAPPER= cargo bench --features dashboard-api --bench camera_frame_allocs
+RUSTC_WRAPPER= cargo bench --features camera --bench camera_frame_hotpath_perf
+RUSTC_WRAPPER= cargo bench --features camera --bench camera_frame_allocs
 ```
 
 ## Reading the results

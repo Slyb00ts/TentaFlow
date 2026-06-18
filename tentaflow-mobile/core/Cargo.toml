@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib"]
 # Swift (TentaFlowAI/Whisper/*), wiec whisper.cpp sie tam nie linkuje.
 # `camera` (GStreamer) zostawiamy — apka mobilna uczestniczy w pipeline video
 # i wymaga GStreamer SDK podpietego w buildzie platformy.
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp"] }
 # tentaflow-ui (egui/wgpu) usuniete z mobile — UI idzie przez webview (SwiftUI),
 # egui app (run_gui) byl martwym kodem (nigdy nie wolany). To wycina tez
 # eframe/egui/wgpu z buildu mobile.
@@ -31,7 +31,7 @@ data-encoding = "2"
 # iOS (device + symulator): MLX bridge to lekkie FFI po stronie Rust (Swift
 # dostarcza implementacje w apce), wiec dziala na obu.
 [target.'cfg(target_os = "ios")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
 
 # inference-sherpa TYLKO na device (nie symulator). sherpa-rs-sys pobiera prebuilt
 # onnxruntime.a; slice symulatora to FAT archive (arm64+x86_64), ktorego cargo
