@@ -1301,10 +1301,7 @@ fn vllm_spec_method(method: &str) -> Option<&'static str> {
 /// vLLM recipe's `VLLM_USE_FLASHINFER_MOE_FP4`). Shared by the native and docker
 /// deploy paths. Reserved runtime keys owned by the deploy flow are never
 /// overridden — recipes only set `VLLM_*`-style tuning vars, guarded defensively.
-pub(crate) fn apply_engine_env(
-    user_config: &serde_json::Value,
-    env: &mut HashMap<String, String>,
-) {
+pub(crate) fn apply_engine_env(user_config: &serde_json::Value, env: &mut HashMap<String, String>) {
     const RESERVED: &[&str] = &[
         "PORT",
         "MODEL",
@@ -1511,6 +1508,7 @@ mod apply_parameters_deploy_tests {
                 download_image: None,
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
+                gpus: None,
             }),
             native: None,
             external: None,
@@ -1791,6 +1789,7 @@ mod hf_token_gate_tests {
                 download_image: None,
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
+                gpus: None,
             }),
             native: None,
             external: None,

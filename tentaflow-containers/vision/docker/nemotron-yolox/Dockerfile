@@ -25,21 +25,31 @@ RUN cargo build --release --bin tentaflow-sidecar \
 
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv git curl ca-certificates \
+      python3 python3-pip python3-venv python3-dev git curl ca-certificates \
+      build-essential ninja-build \
       libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 # torch cu130 serwuje inferencje YOLOX bezposrednio na GPU (wspiera sm_103/B300).
-# YOLOX dostarcza definicje sieci do zaladowania wag .pth. Bez onnxruntime.
-RUN pip install --no-cache-dir --upgrade pip wheel \
+# YOLOX dostarcza tylko definicje sieci do zaladowania wag .pth — server.py
+# importuje wylacznie `yolox.exp`. Instalujemy go z `--no-deps`, zeby pominac
+# ciezkie zaleznosci treningowe (pycocotools/onnx/onnx-simplifier/tensorboard),
+# ktorych inferencja nie potrzebuje, a ktore i tak wymagaja kompilacji. Z importu
+# `yolox.exp` na top-levelu wynikaja tylko loguru + psutil + packaging + tabulate.
+# `--no-build-isolation`, bo setup.py YOLOX na Linuksie wymusza kompilacje op
+# FastCOCOEvalOp (CppExtension) i `assert TORCH_AVAILABLE` — w izolacji PEP 517
+# torch jest niewidoczny i build pada; tu uzywamy torcha juz w /opt/venv, a
+# build-essential + ninja dostarczaja g++ do kompilacji op. Bez onnxruntime.
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
  && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
       torch torchvision \
  && pip install --no-cache-dir \
       fastapi uvicorn python-multipart \
       opencv-python-headless pillow numpy \
-      huggingface_hub \
+      huggingface_hub loguru psutil packaging tabulate \
+ && pip install --no-cache-dir --no-build-isolation --no-deps \
       "yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar

@@ -110,6 +110,10 @@
           "type": "string",
           "enum": ["sidecar-quic", "direct-http"],
           "description": "Required. sidecar-quic: TentaFlow sidecar wraps the engine HTTP API into QUIC for mesh-routed clients. direct-http: TentaFlow speaks HTTP directly to the host-mapped port."
+        },
+        "gpus": {
+          "type": "string",
+          "description": "GPU passthrough (docker run --gpus). 'all' = every GPU, a number = that many, 'none'/'0' = CPU-only. Absent = all GPUs iff the host has an NVIDIA GPU."
         }
       },
       "oneOf": [

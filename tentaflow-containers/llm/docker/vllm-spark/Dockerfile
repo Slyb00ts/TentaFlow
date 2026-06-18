@@ -65,7 +65,7 @@ RUN git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.gi
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
 # do pobierania zrodel. Na Sparku (sm_121a) NVFP4 ma akceleracje sprzetowa.
-RUN pip install --no-cache-dir llm-compressor "huggingface_hub[cli,hf_transfer]"
+RUN pip install --no-cache-dir llmcompressor "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
     QUANT_SCRIPT=/app/quantize_nvfp4.py
 
