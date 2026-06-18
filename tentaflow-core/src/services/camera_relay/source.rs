@@ -221,7 +221,14 @@ impl BinaryStreamSource for RemoteCameraStreamSource {
         }
         match tokio::time::timeout(INIT_SEGMENT_TIMEOUT, notified).await {
             Ok(()) => self.init_segment.lock().clone(),
-            Err(_) => None,
+            Err(_) => {
+                // Init never arrived in time: make the source terminal so
+                // `chunk_broadcaster()` returns None and subscribe fails cleanly
+                // (live receivers get Closed) instead of registering a hung empty
+                // stream that never delivers an init segment.
+                self.mark_terminal();
+                None
+            }
         }
     }
 
