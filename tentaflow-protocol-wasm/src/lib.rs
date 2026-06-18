@@ -7883,7 +7883,35 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
     }
     set(&obj, "actionsMeta", actions.clone().into());
     set(&obj, "actions_meta", actions.into());
+    match &r.lidar {
+        Some(l) => set(&obj, "lidar", robot_lidar_to_js(l)),
+        None => set(&obj, "lidar", JsValue::NULL),
+    }
     obj
+}
+
+/// SMALL LiDAR availability snapshot → JS object (camel + snake keys). Never the
+/// point cloud — only the metadata the card needs and a renderer pulls on demand.
+fn robot_lidar_to_js(l: &tentaflow_protocol::RobotLidarStatus) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "enabled", l.enabled.into());
+    set(&obj, "available", l.available.into());
+    set(&obj, "pointCount", (l.point_count as f64).into());
+    set(&obj, "point_count", (l.point_count as f64).into());
+    match l.resolution {
+        Some(r) => set(&obj, "resolution", (r as f64).into()),
+        None => set(&obj, "resolution", JsValue::NULL),
+    }
+    let origin = js_sys::Array::new();
+    for v in &l.origin {
+        origin.push(&JsValue::from(*v));
+    }
+    set(&obj, "origin", origin.into());
+    set(&obj, "frameSeq", (l.frame_seq as f64).into());
+    set(&obj, "frame_seq", (l.frame_seq as f64).into());
+    set(&obj, "lastUpdateTs", (l.last_update_ts as f64).into());
+    set(&obj, "last_update_ts", (l.last_update_ts as f64).into());
+    obj.into()
 }
 
 fn robot_action_meta_to_js(a: &tentaflow_protocol::RobotActionMeta) -> JsValue {
@@ -7934,6 +7962,11 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
+            }
+            // Read-only actions (lidar_frame) return their JSON payload here.
+            match resp.result {
+                Some(r) => set(obj, "result", r.into()),
+                None => set(obj, "result", JsValue::NULL),
             }
         }
         P::CameraShareRequest(req) => {

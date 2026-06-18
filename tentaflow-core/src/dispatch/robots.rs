@@ -20,7 +20,7 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
-    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot,
+    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot, RobotLidarStatus,
     RobotTelemetrySnapshot, RobotsListResponse, RobotsPayload,
 };
 
@@ -76,6 +76,21 @@ fn to_entry(r: AdvertisedRobot, local_node_id: &str) -> RobotEntry {
             })
             .collect(),
         telemetry: r.telemetry.map(to_telemetry),
+        lidar: r.lidar.map(to_lidar),
+    }
+}
+
+/// Project the mesh-layer `RobotLidarSnapshot` onto the protocol wire type (two
+/// distinct types over the same SMALL shape — never the point cloud).
+fn to_lidar(l: crate::mesh::robot_dispatch::RobotLidarSnapshot) -> RobotLidarStatus {
+    RobotLidarStatus {
+        enabled: l.enabled,
+        available: l.available,
+        point_count: l.point_count,
+        resolution: l.resolution,
+        origin: l.origin,
+        frame_seq: l.frame_seq,
+        last_update_ts: l.last_update_ts,
     }
 }
 
@@ -201,12 +216,15 @@ pub async fn robots_control(
             ok: r.ok,
             rejected: r.rejected.as_ref().map(|reason| reject_tag(reason).to_string()),
             error: r.error,
+            // Read-only actions (lidar_frame/status) return their JSON payload here.
+            result: r.result_json,
         },
         // Context not wired (mesh not started) — there is no node to route to.
         None => RobotControlResponse {
             ok: false,
             rejected: None,
             error: Some("robot dispatch context unavailable".to_string()),
+            result: None,
         },
     };
     Ok(MessageBody::RobotsBody(RobotsPayload::ControlResponse(wire)))

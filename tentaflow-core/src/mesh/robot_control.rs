@@ -85,6 +85,14 @@ pub enum RobotAction {
     FrontPounce,
     /// Read-only telemetry/status snapshot.
     Status,
+    /// Enable the LiDAR sensor (subscribe to the voxel map). Data-path only — does
+    /// NOT move hardware, but it is an actuator toggle so it needs `robot.command`.
+    LidarOn,
+    /// Disable the LiDAR sensor.
+    LidarOff,
+    /// Read-only fetch of the latest decoded LiDAR frame (points + metadata) for an
+    /// on-demand renderer. Reports state only, never moves hardware.
+    LidarFrame,
 }
 
 /// Per-axis body-orientation clamp (radians). Go2 accepts roughly ±0.75 rad on
@@ -153,6 +161,9 @@ impl RobotAction {
             "front_jump" => RobotAction::FrontJump,
             "front_pounce" => RobotAction::FrontPounce,
             "status" => RobotAction::Status,
+            "lidar_on" => RobotAction::LidarOn,
+            "lidar_off" => RobotAction::LidarOff,
+            "lidar_frame" => RobotAction::LidarFrame,
             _ => return None,
         })
     }
@@ -174,7 +185,7 @@ impl RobotAction {
 
     /// Read-only (reports state, never moves hardware or changes a latch).
     pub fn is_read_only(&self) -> bool {
-        matches!(self, RobotAction::Status)
+        matches!(self, RobotAction::Status | RobotAction::LidarFrame)
     }
 
     /// Audit-safe label: the action NAME only — never the `Move` velocity values
@@ -206,6 +217,9 @@ impl RobotAction {
             RobotAction::FrontJump => "FrontJump",
             RobotAction::FrontPounce => "FrontPounce",
             RobotAction::Status => "Status",
+            RobotAction::LidarOn => "LidarOn",
+            RobotAction::LidarOff => "LidarOff",
+            RobotAction::LidarFrame => "LidarFrame",
         }
     }
 
@@ -213,7 +227,7 @@ impl RobotAction {
     /// `robot.telemetry` grant can never move hardware.
     pub fn required_permission(&self) -> &'static str {
         match self {
-            RobotAction::Status => "robot.telemetry",
+            RobotAction::Status | RobotAction::LidarFrame => "robot.telemetry",
             RobotAction::Stop | RobotAction::Estop | RobotAction::ResetEstop => "robot.estop",
             _ => "robot.command",
         }
@@ -356,6 +370,9 @@ impl RobotAction {
                 params: json!({ "roll": roll, "pitch": pitch, "yaw": yaw, "height": height }),
             },
             RobotAction::Status => tool("go2.status"),
+            RobotAction::LidarOn => tool("go2.lidar_on"),
+            RobotAction::LidarOff => tool("go2.lidar_off"),
+            RobotAction::LidarFrame => tool("go2.lidar_frame"),
         }
     }
 }
@@ -714,6 +731,9 @@ mod tests {
             ("front_jump", RobotAction::FrontJump),
             ("front_pounce", RobotAction::FrontPounce),
             ("status", RobotAction::Status),
+            ("lidar_on", RobotAction::LidarOn),
+            ("lidar_off", RobotAction::LidarOff),
+            ("lidar_frame", RobotAction::LidarFrame),
         ];
         for (kind, want) in cases {
             assert_eq!(RobotAction::from_kind_axes(kind, 0.0, 0.0, 0.0), Some(want));
@@ -898,6 +918,24 @@ mod tests {
             "robot.command"
         );
         assert_eq!(RobotAction::Hello.required_permission(), "robot.command");
+        // LiDAR enable/disable is an actuator toggle → robot.command; the read-only
+        // frame fetch is telemetry-class and can never move hardware.
+        assert_eq!(RobotAction::LidarOn.required_permission(), "robot.command");
+        assert_eq!(RobotAction::LidarOff.required_permission(), "robot.command");
+        assert_eq!(RobotAction::LidarFrame.required_permission(), "robot.telemetry");
+        assert!(RobotAction::LidarFrame.is_read_only());
+        assert!(!RobotAction::LidarOn.is_read_only());
+    }
+
+    #[test]
+    fn lidar_actions_map_to_go2_tools() {
+        let tool_of = |a: RobotAction| match a.to_go2_call() {
+            Go2Call::Tool { tool, .. } => tool,
+            other => panic!("expected Tool, got {other:?}"),
+        };
+        assert_eq!(tool_of(RobotAction::LidarOn), "go2.lidar_on");
+        assert_eq!(tool_of(RobotAction::LidarOff), "go2.lidar_off");
+        assert_eq!(tool_of(RobotAction::LidarFrame), "go2.lidar_frame");
     }
 
     #[test]

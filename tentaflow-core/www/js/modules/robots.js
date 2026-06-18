@@ -23,6 +23,7 @@ import '/js/components/tf-badge.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
+import '/js/components/tf-toggle.js';
 import '/js/components/tf-modal.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
@@ -152,6 +153,12 @@ function actionsMeta(r) {
 // camel/snake tolerant; null when the robot reports none.
 function telemetry(r) {
   return field(r, 'telemetry', 'telemetry') || null;
+}
+
+// SMALL LiDAR availability snapshot (no point cloud). camel/snake tolerant; null
+// when the robot has no LiDAR capability.
+function lidar(r) {
+  return field(r, 'lidar', 'lidar') || null;
 }
 
 function telNum(t, camel, snake) {
@@ -628,6 +635,9 @@ function updateCard(el, r) {
   // node above it). Only present fields render; an absent snapshot hides it.
   updateTelemetry(el, r);
 
+  // Refresh the LiDAR row in place (its own container, never the video node).
+  updateLidar(el, r);
+
   // Rebuild the capability-driven controls only when the advertised action set
   // actually changed (signature compare inside buildControls). This never touches
   // the video node above it.
@@ -740,6 +750,97 @@ function updateTelemetry(el, r) {
     <div class="robots-telemetry-rows">${rows.join('')}</div>`;
 }
 
+// Renders the LiDAR row IN PLACE inside [data-field="lidar"]: an enable/disable
+// toggle (routed to go2.lidar_on/off via the standard control path) plus a compact
+// "aktywny, N punktów" status. NO 3D canvas/renderer here — this is the data-path
+// surface only. The container sits below the telemetry panel and is never the video
+// node, so the live <tf-video-stream> is untouched. The button + status nodes are
+// built once and then updated in place each poll so a click handler is never lost.
+function updateLidar(el, r) {
+  const host = el.querySelector('[data-field="lidar"]');
+  if (!host) return;
+  const l = lidar(r);
+  // Only show the row for a robot that advertises a LiDAR snapshot (capability).
+  if (!l) {
+    host.hidden = true;
+    host.innerHTML = '';
+    host.dataset.built = '';
+    return;
+  }
+  const id = robotId(r);
+  const offline = !isControllable(r.status || '');
+  const enabled = !!l.enabled;
+  const available = !!l.available;
+  const points = Number(l.pointCount ?? l.point_count ?? 0);
+  const resolution = l.resolution;
+
+  // Build the static structure once; subsequent polls only refresh text/state.
+  if (host.dataset.built !== '1') {
+    host.innerHTML = `
+      <div class="robots-lidar-title">LiDAR</div>
+      <div class="robots-lidar-row">
+        <tf-toggle data-lidar-toggle></tf-toggle>
+        <span class="robots-lidar-status" data-lidar-status></span>
+      </div>`;
+    const toggle = host.querySelector('[data-lidar-toggle]');
+    toggle.addEventListener('change', (e) => {
+      // tf-toggle emits its boolean either on e.detail or as its `checked` prop.
+      const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
+      handleLidarToggle(id, !!on, toggle);
+    });
+    host.dataset.built = '1';
+  }
+
+  host.hidden = false;
+  const toggle = host.querySelector('[data-lidar-toggle]');
+  const status = host.querySelector('[data-lidar-status]');
+  if (toggle) {
+    if (enabled) toggle.setAttribute('checked', '');
+    else toggle.removeAttribute('checked');
+    if (offline) toggle.setAttribute('disabled', '');
+    else toggle.removeAttribute('disabled');
+  }
+  if (status) {
+    let text;
+    if (!enabled) {
+      text = 'wyłączony';
+    } else if (available) {
+      const res = typeof resolution === 'number' && Number.isFinite(resolution)
+        ? `  ·  ${resolution.toFixed(2)} m`
+        : '';
+      text = `aktywny, ${points} ${plural(points, 'punkt', 'punkty', 'punktów')}${res}`;
+    } else {
+      text = 'aktywny, oczekiwanie na dane…';
+    }
+    status.textContent = text;
+  }
+}
+
+// Sends a LiDAR enable/disable through the standard robot control path
+// (lidar_on / lidar_off kinds → go2.lidar_on/off, routed locally or over the mesh).
+async function handleLidarToggle(id, on, toggle) {
+  if (!id) return;
+  toggle.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.action('robotControlRequest', {
+      robotId: id,
+      kind: on ? 'lidar_on' : 'lidar_off',
+      vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
+    });
+    if (resp.ok) {
+      toast(`LiDAR ${on ? 'włączony' : 'wyłączony'} ✓`, 'success');
+    } else if (resp.rejected) {
+      toast(`LiDAR: odrzucono — ${resp.rejected}`, 'error');
+    } else {
+      toast(`LiDAR: błąd — ${resp.error || 'nieznany'}`, 'error');
+    }
+  } catch (err) {
+    toast(`LiDAR: ${err.message}`, 'error');
+  } finally {
+    toggle.removeAttribute('disabled');
+  }
+}
+
 // One compact telemetry row (label + value), mirroring the metricRow pattern.
 function telRow(label, value) {
   return `
@@ -800,6 +901,8 @@ function robotCard(r) {
       ${cameraHtml}
 
       <div class="robots-telemetry" data-field="telemetry" hidden></div>
+
+      <div class="robots-lidar" data-field="lidar" hidden></div>
 
       <div class="robots-controls" data-field="controls"></div>
 
