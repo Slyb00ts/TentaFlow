@@ -527,6 +527,7 @@ pub use message_body::{
     RobotControlResponse,
     RobotEntry,
     RobotImuSnapshot,
+    RobotLidarStatus,
     RobotTelemetrySnapshot,
     RobotsListRequest,
     RobotsListResponse,

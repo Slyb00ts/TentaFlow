@@ -13,6 +13,14 @@ tentaflow-hardware = { path = "../../../tentaflow-hardware", default-features = 
 minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = "0.22"
+# LZ4 block decompression for the Go2 voxel map (no_std + alloc, no SIMD/std).
+# Matches the upstream go2_webrtc_connect native decoder (`lz4.block.decompress`).
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
+
+# Tests build a synthetic compressed voxel frame, so the encode side is needed
+# only for `cargo test` — never in the wasm artifact (decode-only at runtime).
+[dev-dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
 
 [profile.release]
 opt-level = "s"

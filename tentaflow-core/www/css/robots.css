@@ -149,6 +149,36 @@
   font-variant-numeric: tabular-nums;
 }
 
+.robots-lidar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+}
+
+.robots-lidar-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+
+.robots-lidar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.robots-lidar-status {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
 .robots-camera {
   display: flex;
   flex-direction: column;

@@ -2005,6 +2005,36 @@ pub struct RobotTelemetrySnapshot {
     pub battery: Option<RobotBatterySnapshot>,
 }
 
+/// SMALL LiDAR availability snapshot — NEVER the point cloud (which would be far
+/// too large to advertise every ~10 s). It carries only enough for the UI to show
+/// "LiDAR active, N points" and for a future renderer to know a fresh frame exists
+/// (then pull it on demand via the `lidar_frame` action). Every field is plain so
+/// an addon that reports no LiDAR simply advertises `None` for the whole block.
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotLidarStatus {
+    /// Operator intent: the LiDAR sensor has been switched on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// At least one voxel frame has decoded this session (a renderer can fetch it).
+    #[serde(default)]
+    pub available: bool,
+    /// Number of decoded points in the latest frame.
+    #[serde(default)]
+    pub point_count: u32,
+    /// Voxel resolution in metres (cube edge), when known.
+    #[serde(default)]
+    pub resolution: Option<f32>,
+    /// Grid origin [x, y, z] in metres (empty when unknown).
+    #[serde(default)]
+    pub origin: Vec<f64>,
+    /// Monotonic frame counter this session (0 = no frame yet).
+    #[serde(default)]
+    pub frame_seq: u64,
+    /// Wall-clock seconds of the last decoded frame (0 = none).
+    #[serde(default)]
+    pub last_update_ts: i64,
+}
+
 /// One robot row for the Robots list screen: a projection of the mesh registry's
 /// `AdvertisedRobot`, scoped to the caller's org. `is_local` lets the UI label a
 /// robot this node physically owns vs one controlled over the mesh.
@@ -2032,6 +2062,11 @@ pub struct RobotEntry {
     /// APPEND-AT-END rule) — the UI then renders no telemetry panel.
     #[serde(default)]
     pub telemetry: Option<RobotTelemetrySnapshot>,
+    /// SMALL LiDAR availability snapshot (no point cloud). Appended last for CBOR
+    /// back-compat: an older owner without LiDAR decodes with `None`
+    /// (`#[serde(default)]`, ciborium APPEND-AT-END rule).
+    #[serde(default)]
+    pub lidar: Option<RobotLidarStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -2056,6 +2091,13 @@ pub struct RobotControlResponse {
     pub ok: bool,
     pub rejected: Option<String>,
     pub error: Option<String>,
+    /// Optional JSON result payload for read-only actions that return data (e.g.
+    /// `lidar_frame` returns the decoded point set + metadata). Appended last for
+    /// CBOR back-compat: an older peer decodes it as `None`
+    /// (`#[serde(default)]`, ciborium APPEND-AT-END rule). Action-class commands
+    /// (move/pose/…) leave it `None`.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -7601,6 +7643,10 @@ mod tests {
             decoded.telemetry.is_none(),
             "missing telemetry must default to None"
         );
+        assert!(
+            decoded.lidar.is_none(),
+            "missing lidar must default to None"
+        );
 
         // Same guarantee through the list wrapper the UI actually consumes.
         #[derive(SerdeSerialize)]
@@ -7626,6 +7672,47 @@ mod tests {
         assert_eq!(decoded_list.robots.len(), 1);
         assert!(decoded_list.robots[0].actions_meta.is_empty());
         assert!(decoded_list.robots[0].telemetry.is_none());
+        assert!(decoded_list.robots[0].lidar.is_none());
+    }
+
+    #[test]
+    fn robot_control_response_legacy_decode_without_result_defaults_none() {
+        // Mirror of a pre-`result` RobotControlResponse sender: the field did not
+        // exist on the wire. ciborium APPEND-AT-END + #[serde(default)] must decode
+        // it to None so an older peer interoperates with read-only actions.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotControlResponse {
+            ok: bool,
+            rejected: Option<String>,
+            error: Option<String>,
+        }
+
+        let legacy = LegacyRobotControlResponse {
+            ok: true,
+            rejected: None,
+            error: None,
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode legacy");
+        let decoded: RobotControlResponse = crate::cbor::decode(&bytes).expect("decode legacy");
+        assert!(decoded.ok);
+        assert_eq!(decoded.rejected, None);
+        assert_eq!(decoded.error, None);
+        assert_eq!(decoded.result, None, "missing result must default to None");
+
+        // Roundtrip preserving a populated result payload.
+        let full = RobotControlResponse {
+            ok: true,
+            rejected: None,
+            error: None,
+            result: Some("{\"lidar_frame\":{\"point_count\":42}}".to_string()),
+        };
+        let full_bytes = crate::cbor::encode(&full).expect("encode full");
+        let back: RobotControlResponse = crate::cbor::decode(&full_bytes).expect("decode full");
+        assert_eq!(back, full);
+        assert_eq!(
+            back.result.as_deref(),
+            Some("{\"lidar_frame\":{\"point_count\":42}}")
+        );
     }
 
     #[test]
@@ -7665,6 +7752,15 @@ mod tests {
                     current: Some(-2.1),
                     temperature: Some(36.0),
                 }),
+            }),
+            lidar: Some(RobotLidarStatus {
+                enabled: true,
+                available: true,
+                point_count: 4096,
+                resolution: Some(0.05),
+                origin: vec![-1.5, -1.5, -0.2],
+                frame_seq: 7,
+                last_update_ts: 1_700_000_000,
             }),
         };
         let bytes = crate::cbor::encode(&entry).expect("encode");

@@ -104,6 +104,36 @@ pub struct AdvertisedRobot {
     /// (`#[serde(default)]`, ciborium APPEND-AT-END rule).
     #[serde(default)]
     pub telemetry: Option<RobotTelemetrySnapshot>,
+    /// SMALL LiDAR availability snapshot (enabled / available / point count /
+    /// resolution / origin / frame_seq / ts) — NOT the point cloud. Like
+    /// `telemetry` it is EXCLUDED from `robots_structurally_equal` so its per-frame
+    /// `frame_seq`/`point_count` churn never drives an `Updated`-delta storm; the
+    /// latest snapshot still rides any structural `Updated` and the periodic full
+    /// ANNOUNCE. Appended last for wire compat (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule): an old peer decodes it as `None`.
+    #[serde(default)]
+    pub lidar: Option<RobotLidarSnapshot>,
+}
+
+/// SMALL LiDAR availability snapshot mirrored from the owning addon's
+/// `status.lidar`. NEVER carries the point cloud — only enough for the UI and for
+/// a future renderer to know a fresh frame exists (then pull it on demand).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RobotLidarSnapshot {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub point_count: u32,
+    #[serde(default)]
+    pub resolution: Option<f32>,
+    #[serde(default)]
+    pub origin: Vec<f64>,
+    #[serde(default)]
+    pub frame_seq: u64,
+    #[serde(default)]
+    pub last_update_ts: i64,
 }
 
 /// IMU snapshot a robot reports (orientation + temperature). Every field is
@@ -389,6 +419,7 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             capabilities: telemetry.capabilities,
             actions_meta: telemetry.actions_meta,
             telemetry: telemetry.telemetry,
+            lidar: telemetry.lidar,
         });
     }
     global().replace_local(local_node_id, robots.clone());
@@ -408,6 +439,7 @@ pub struct RobotStatusTelemetry {
     pub capabilities: Vec<String>,
     pub actions_meta: Vec<AdvertisedAction>,
     pub telemetry: Option<RobotTelemetrySnapshot>,
+    pub lidar: Option<RobotLidarSnapshot>,
 }
 
 impl RobotStatusTelemetry {
@@ -422,6 +454,7 @@ impl RobotStatusTelemetry {
             capabilities: Vec::new(),
             actions_meta: Vec::new(),
             telemetry: None,
+            lidar: None,
         }
     }
 }
@@ -517,6 +550,7 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
         .unwrap_or_default();
     let actions_meta = parse_actions_meta(status);
     let telemetry = parse_telemetry_snapshot(status);
+    let lidar = parse_lidar_snapshot(status);
     RobotStatusTelemetry {
         is_online,
         status: raw_status,
@@ -526,7 +560,44 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
         capabilities,
         actions_meta,
         telemetry,
+        lidar,
     }
+}
+
+/// PURE extraction of the SMALL `lidar` availability sub-object from a `status`
+/// result. Absence of the whole object → `None` (no LiDAR capability). Within it,
+/// each field is read independently; a missing scalar uses the safe absent value
+/// (false / 0 / `None` / empty) and is NEVER fabricated. The point cloud is never
+/// carried here — only availability metadata.
+fn parse_lidar_snapshot(status: &serde_json::Value) -> Option<RobotLidarSnapshot> {
+    let l = status.get("lidar")?;
+    if !l.is_object() {
+        return None;
+    }
+    let enabled = l.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let available = l.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+    let point_count = l
+        .get("point_count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(0);
+    let resolution = l
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .map(|n| n as f32);
+    let origin = parse_fixed_f64_array(l.get("origin"));
+    let frame_seq = l.get("frame_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_update_ts = l.get("last_update_ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some(RobotLidarSnapshot {
+        enabled,
+        available,
+        point_count,
+        resolution,
+        origin,
+        frame_seq,
+        last_update_ts,
+    })
 }
 
 /// PURE all-or-nothing read of a fixed-layout `[a, b, c, ...]` numeric sensor
@@ -715,9 +786,11 @@ pub fn sort_advertised(mut robots: Vec<AdvertisedRobot>) -> Vec<AdvertisedRobot>
 }
 
 /// PURE structural equality of two advertised robots, EXCLUDING the volatile
-/// `rtt_ms` AND the high-rate `telemetry` snapshot. Used as the `Updated`-delta
-/// trigger so neither RTT jitter nor per-tick telemetry churn (imu/velocity/foot
-/// force, which change every tick) alone re-advertises. Both are still CARRIED in
+/// `rtt_ms`, the high-rate `telemetry` snapshot AND the per-frame `lidar`
+/// availability snapshot (its `frame_seq`/`point_count`/`last_update_ts` change on
+/// every voxel frame). Used as the `Updated`-delta trigger so neither RTT jitter,
+/// per-tick telemetry churn (imu/velocity/foot force) nor LiDAR frame churn alone
+/// re-advertises. All three are still CARRIED in
 /// the struct (the dashboard shows them) and refreshed mesh-wide by the periodic
 /// anti-drift full ANNOUNCE; they just must not drive a per-tick `ROBOTS_UPDATE`
 /// broadcast storm given the ~10 s advertiser cadence. Every other field
@@ -1180,6 +1253,7 @@ mod tests {
             capabilities: vec!["move".to_string(), "sit".to_string()],
             actions_meta: Vec::new(),
             telemetry: None,
+            lidar: None,
         }
     }
 
@@ -1712,6 +1786,110 @@ mod tests {
         // never renders an empty panel.
         let status = serde_json::json!({ "status": "online", "telemetry": {} });
         assert_eq!(parse_status_telemetry(&status).telemetry, None);
+    }
+
+    // ----- LiDAR availability snapshot (PURE) -----
+
+    #[test]
+    fn parse_status_lidar_present() {
+        // A representative go2 `status.lidar` sub-object parses into the snapshot.
+        let status = serde_json::json!({
+            "status": "online",
+            "lidar": {
+                "enabled": true,
+                "available": true,
+                "point_count": 4096,
+                "resolution": 0.05,
+                "origin": [-1.5, -1.5, -0.2],
+                "frame_seq": 7,
+                "last_update_ts": 1_700_000_000_i64
+            }
+        });
+        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        assert!(l.enabled);
+        assert!(l.available);
+        assert_eq!(l.point_count, 4096);
+        assert_eq!(l.resolution, Some(0.05));
+        assert_eq!(l.origin, vec![-1.5, -1.5, -0.2]);
+        assert_eq!(l.frame_seq, 7);
+        assert_eq!(l.last_update_ts, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_status_lidar_absent_is_none() {
+        // No `lidar` object at all → None (capability-absent, not an error).
+        let status = serde_json::json!({ "status": "online", "capabilities": ["move"] });
+        assert_eq!(parse_status_telemetry(&status).lidar, None);
+    }
+
+    #[test]
+    fn parse_status_lidar_partial_uses_safe_defaults() {
+        // Only `enabled` reported (no frame yet): available=false, point_count=0,
+        // resolution/origin absent — never fabricated.
+        let status = serde_json::json!({
+            "status": "online",
+            "lidar": { "enabled": true }
+        });
+        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        assert!(l.enabled);
+        assert!(!l.available);
+        assert_eq!(l.point_count, 0);
+        assert_eq!(l.resolution, None);
+        assert!(l.origin.is_empty());
+        assert_eq!(l.frame_seq, 0);
+    }
+
+    #[test]
+    fn lidar_snapshot_churn_does_not_emit_updated_delta() {
+        // The LiDAR snapshot (frame_seq / point_count / last_update_ts) changes on
+        // EVERY voxel frame. Like telemetry, it must NOT drive an `Updated`-delta:
+        // two robots identical except for their lidar snapshot are structurally
+        // equal, so `diff_advertised` emits nothing.
+        let mut old = ad("go2", "go2", "node-a");
+        old.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 1000,
+            resolution: Some(0.05),
+            origin: vec![0.0, 0.0, 0.0],
+            frame_seq: 5,
+            last_update_ts: 100,
+        });
+        let mut new = old.clone();
+        new.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 1234, // new frame, different count
+            resolution: Some(0.05),
+            origin: vec![0.1, 0.0, 0.0],
+            frame_seq: 6, // bumped
+            last_update_ts: 200,
+        });
+        assert!(
+            robots_structurally_equal(&old, &new),
+            "lidar snapshot churn must not change structural equality"
+        );
+        assert!(
+            diff_advertised(&[old], &[new]).is_empty(),
+            "lidar frame churn must not emit an Updated delta"
+        );
+    }
+
+    #[test]
+    fn advertised_robot_lidar_roundtrips() {
+        let mut robot = ad("go2", "go2", "node-b");
+        robot.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 2048,
+            resolution: Some(0.1),
+            origin: vec![-1.0, -1.0, 0.0],
+            frame_seq: 3,
+            last_update_ts: 1_700_000_000,
+        });
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, robot);
     }
 
     #[test]
@@ -2313,6 +2491,7 @@ mod tests {
             capabilities: Vec::new(),
             actions_meta: Vec::new(),
             telemetry: None,
+            lidar: None,
         };
 
         // A remote node advertises the SAME robot_id with its own camera id.
