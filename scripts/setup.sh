@@ -1170,14 +1170,17 @@ install_android_gstreamer_sdk() {
     local sha_path="$archive_path.sha256sum"
 
     mkdir -p "$download_dir" "$target_dir"
-    if [[ ! -f "$archive_path" ]]; then
-        log_info "Pobieranie GStreamer Android SDK ${gst_version} (~939 MB)..."
-        curl -fL --progress-bar -o "$archive_path" "$archive_url"
+    # Small checksum first; use it to decide whether the (possibly partial)
+    # archive is already complete and valid — skip the 939 MB download if so.
+    curl -fL -o "$sha_path" "$sha_url"
+    if [[ -f "$archive_path" ]] && ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" >/dev/null 2>&1 ); then
+        log_ok "Archiwum GStreamer Android ${gst_version} juz pobrane (checksum OK) — pomijam download."
+    else
+        log_info "Pobieranie GStreamer Android SDK ${gst_version} (~939 MB, wznawialne)..."
+        # -C - wznawia przerwane pobieranie zamiast startowac od zera.
+        curl -fL -C - --progress-bar -o "$archive_path" "$archive_url"
+        ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" )
     fi
-    if [[ ! -f "$sha_path" ]]; then
-        curl -fL -o "$sha_path" "$sha_url"
-    fi
-    ( cd "$download_dir" && sha256sum -c "$(basename "$sha_path")" )
 
     log_info "Wypakowuje GStreamer Android SDK do $target_dir..."
     rm -rf "$target_dir"
@@ -1266,14 +1269,25 @@ install_vulkan() {
             INSTALLED+=("vulkan-sdk")
             ;;
         debian)
+            # Core, required for the Vulkan llama.cpp backend: loader+headers,
+            # shader compiler, SPIR-V tools.
             local pkgs=(
                 libvulkan-dev
-                vulkan-validationlayers-dev
                 glslang-dev
                 spirv-tools
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
+            # Validation layers are debug-only and the package name churns across
+            # Ubuntu releases — 24.04 dropped `vulkan-validationlayers-dev` in
+            # favour of `vulkan-validationlayers` + `vulkan-utility-libraries-dev`.
+            # apt has no --skip-unavailable, so install each best-effort (a missing
+            # debug layer must never abort setup).
+            for opt in vulkan-validationlayers vulkan-validationlayers-dev vulkan-utility-libraries-dev; do
+                if run_privileged apt-get install -y "$opt" >/dev/null 2>&1; then
+                    log_ok "  + $opt"
+                fi
+            done
             INSTALLED+=("vulkan-sdk")
             ;;
         fedora)

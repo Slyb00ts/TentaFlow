@@ -8,7 +8,7 @@
 const CATEGORY_ORDER = [
   'llm', 'stt', 'tts', 'embeddings', 'reranker', 'vision',
   'image-gen', 'video-gen', 'music-gen', 'model-3d-gen',
-  'agents', 'tools',
+  'agents', 'tools', 'training',
 ];
 
 let services = [];

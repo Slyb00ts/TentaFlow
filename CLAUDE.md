@@ -346,6 +346,19 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
   ggml i nie ma kolizji — bez dawnego hacka `--allow-multiple-definition`.
   Izolacja jest zaimplementowana dla Linux i macOS w `build-whisper-cpp.sh`;
   na Windows izolowany DLL (eksport whisper_* przez `.def`) buduje `build-all.ps1`.
+- **INWARIANT izolacji symboli (OBOWIĄZKOWY dla każdej vendorowanej biblioteki natywnej).**
+  Każda samowystarczalna biblioteka natywna (whisper, zvec, …) MUSI eksportować WYŁĄCZNIE
+  własne publiczne API (`whisper_*`, `zvec_*`) i CHOWAĆ całą zbundlowaną resztę
+  (protobuf, abseil, RocksDB, Arrow, ggml). Inaczej dwie kopie tej samej biblioteki C++
+  (np. protobuf w zvec ORAZ w warstwie ONNX binarki) interpozycjonują się przez dynamiczny
+  linker na Linuxie i psują stertę przy static-init (`corrupted size vs prev_size`, crash
+  przed `main`; macOS chroni two-level namespace, ale i tak izolujemy). Mechanizm:
+  Linux `-Wl,--version-script` z `{ global: <name>_*; local: *; }`; macOS
+  `-Wl,-exported_symbols_list` z `_<name>_*`; Windows `.def`. zvec: `scripts/build-zvec.sh`.
+  PUŁAPKA: deploy uruchamia binarkę z `LD_LIBRARY_PATH=target/<profile>`, który ma
+  pierwszeństwo nad rpath do vendora — `tentaflow/build.rs` MUSI kopiować świeży vendored
+  `.so/.dylib` do `target/<profile>` (pełna kopia, nie hardlink), inaczej stara kopia
+  shadow'uje nowy vendored. Weryfikacja: `nm -D --defined-only <so> | grep -ic protobuf` = 0.
 - Deploy `llama.cpp` z HuggingFace GGUF musi wskazywać pojedynczy plik `.gguf`
   (`config_json.model_file`) albo preset z `quantization`; downloader nie powinien
   pobierać wszystkich kwantyzacji z repozytorium.

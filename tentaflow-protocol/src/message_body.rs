@@ -64,9 +64,7 @@ pub struct ModelSummary {
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceModelEntry {
     pub model_name: String,
     pub display_name: Option<String>,
@@ -81,9 +79,7 @@ pub struct ServiceModelEntry {
 /// — typed mape wartosci ktore BackendClient materializuje przy kazdym
 /// requestcie (Ollama options, python wrapper extra fields, whisper/mlx
 /// deploy defaults z opcjonalnym per-request override).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInfo {
     pub id: i64,
     /// Owning mesh node — endpoint-id hex. Same as the local node when the row
@@ -143,15 +139,7 @@ pub struct ServiceInfo {
 ///     `request_override = true`; backend uzywa jako baseline, klient API
 ///     moze nadpisac per request.
 ///   * `mlx_overridable` → analogicznie dla MLX engine.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Default,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestTimeParameters {
     pub ollama_options: Vec<KeyValue>,
     pub python_request: Vec<KeyValue>,
@@ -162,9 +150,7 @@ pub struct RequestTimeParameters {
 /// Generic key-value pair dla typed parametrow propagowanych przez wire.
 /// Wartosc jako serialized JSON string (CBOR nie obsluguje natywnie
 /// `serde_json::Value`).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct KeyValue {
     pub key: String,
     /// JSON-serialized value. Konsument deserializuje przez `serde_json::from_str`.
@@ -174,9 +160,7 @@ pub struct KeyValue {
 /// Incremental change applied to one entry in the mesh services registry. Used
 /// by `MeshServicesUpdate` push messages so peers do not have to re-broadcast
 /// the full snapshot on every deploy / stop / pin / pause / rename / delete.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ServiceChange {
     Added(ServiceInfo),
     Updated(ServiceInfo),
@@ -260,9 +244,7 @@ pub struct ServicePauseResponse {
 /// są materializowane do `services.config_json` jako manifest schema
 /// parameters — backend regeneruje `vllm_args` ze schema bindings, więc
 /// klient może wysłać albo typed pola albo `vllm_args` raw (power user).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ServiceUpdateRequest {
     pub service_id: i64,
     /// See `ServiceDeleteRequest::node_id` — None = local node.
@@ -567,12 +549,34 @@ pub struct ApiKeySummary {
     pub name: String,
     pub created_at_epoch: u64,
     pub last_used_at_epoch: Option<u64>,
+    /// 'user' | 'group' | 'general'.
+    pub key_type: String,
+    /// user_id (user) / group_id (group) / None (general).
+    pub subject_id: Option<String>,
+    /// Human label for the subject (user display name / group name), if any.
+    pub subject_label: Option<String>,
+    /// Count of `resource_permissions` rows scoped to this key (general keys).
+    pub scope_count: u32,
+    pub is_active: bool,
+}
+
+/// One resource entry on a general key's explicit allowlist at creation time.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ResourceRef {
+    /// 'model' | 'flow' | 'alias'.
+    pub resource_type: String,
+    pub resource_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ApiKeyCreateRequest {
     pub name: String,
-    pub scopes: Vec<String>,
+    /// 'user' | 'group' | 'general'.
+    pub key_type: String,
+    /// Required for 'user'/'group' (the user/group id); None for 'general'.
+    pub subject_id: Option<String>,
+    /// Explicit allowlist seeded for 'general' keys; ignored for user/group.
+    pub scope_resources: Vec<ResourceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1066,8 +1070,8 @@ pub enum SchedulerPayload {
 
 /// One ML Studio project type with a stable machine slug and a Polish UI label.
 /// The slug is what flows/handlers branch on; the label is what the wizard
-/// shows. Six types are fixed by the product (recognition, ft_llm,
-/// ft_vision_audio, tabular_anomaly, rag, distillation).
+/// shows. The types are fixed by the product (recognition, ft_llm,
+/// ft_vision_audio, tabular_anomaly, distillation).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioProjectTypeInfo {
     pub slug: String,
@@ -1086,6 +1090,11 @@ pub struct MlStudioProjectSummary {
     pub status: String,
     pub dataset_count: u32,
     pub model_count: u32,
+    pub training_count: u32,
+    /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
+    pub role: String,
+    /// Convenience flag for the UI: the requesting user owns this project.
+    pub is_owner: bool,
     pub created_at: String,
     pub updated_at: String,
     // Live training KPIs (progress/loss/ETA) come from training_runs in later slices
@@ -1102,6 +1111,10 @@ pub struct MlStudioProjectDetail {
     pub owner_user_id: String,
     pub org_id: String,
     pub model_count: u32,
+    /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
+    pub role: String,
+    /// Convenience flag for the UI: the requesting user owns this project.
+    pub is_owner: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1144,7 +1157,656 @@ pub struct MlStudioProjectTypesListResponse {
     pub types: Vec<MlStudioProjectTypeInfo>,
 }
 
+/// One project membership row for the sharing screen (`p02-udostepnianie.html`):
+/// who is a member, with what role and whether their invitation is still pending.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMember {
+    pub user_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub status: String,
+    pub invited_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMembersListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMembersListResponse {
+    pub members: Vec<MlStudioProjectMember>,
+}
+
+/// One training-run row for the project overview tab (`Przegląd`). Mirrors the
+/// `training_runs` table; `model_id`/`started_at`/`finished_at` are NULL until the
+/// run produces a model or transitions state.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunSummary {
+    pub run_id: String,
+    pub model_id: Option<String>,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainingRunsListResponse {
+    pub runs: Vec<MlStudioTrainingRunSummary>,
+}
+
+/// One model row for the project overview tab. Mirrors the `models` table;
+/// `metrics_json` carries the serialized metric snapshot for the model card.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelSummary {
+    pub model_id: String,
+    pub name: String,
+    pub framework: String,
+    pub base_model: String,
+    pub status: String,
+    pub metrics_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioModelsListResponse {
+    pub models: Vec<MlStudioModelSummary>,
+}
+
+/// Member-accessible view of the resource grants allocated to one project,
+/// reusing `MlStudioResourceGrant`. The admin-wide `ResourceGrantsList` stays
+/// Admin-only; this one is gated by project membership.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectGrantsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectGrantsListResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectInviteRequest {
+    pub project_id: String,
+    pub invitee_user_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectInviteResponse {
+    pub member: MlStudioProjectMember,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRemoveRequest {
+    pub project_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRemoveResponse {
+    pub project_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRoleSetRequest {
+    pub project_id: String,
+    pub user_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectMemberRoleSetResponse {
+    pub member: MlStudioProjectMember,
+}
+
+/// One distinct value of a categorical column with its row count. Mirrors
+/// `ml_studio::profile::ClassCount`; feeds the "wykryto N klas" UI list.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClassCount {
+    pub value: String,
+    pub count: u64,
+}
+
+/// Profile of one dataset column. `column_type` is a stable slug
+/// (`categorical`/`integer`/`float`/`date`/`text`). `classes` is non-empty only
+/// for small categorical columns. Mirrors `ml_studio::profile::ColumnProfile`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct ColumnProfile {
+    pub name: String,
+    pub column_type: String,
+    pub unique_count: u64,
+    pub missing_ratio: f64,
+    pub examples: Vec<String>,
+    pub classes: Vec<ClassCount>,
+    pub unique_capped: bool,
+}
+
+/// Full profile of an uploaded table. Mirrors `ml_studio::profile::TableProfile`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct TableProfile {
+    pub format: String,
+    pub row_count: u64,
+    pub scanned_rows: u64,
+    pub column_count: u32,
+    pub columns: Vec<ColumnProfile>,
+    pub truncated: bool,
+}
+
+/// Compact dataset row for the project data screen (`t-dane`): identity, source
+/// kind and the row/column KPIs. The full per-column profile is fetched
+/// separately via `DatasetProfileRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct DatasetSummary {
+    pub dataset_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub kind: String,
+    pub row_count: u64,
+    pub column_count: u32,
+    pub created_at: String,
+    /// Profil datasetu (JSON): dla COCO niesie `classes`/`splits`/`image_count`,
+    /// dla tabel `TableProfile`. UI recognition czyta z niego listę klas.
+    #[serde(default)]
+    pub profile_json: String,
+}
+
+/// Upload a tabular file (CSV/XLSX) into a project for profiling. `bytes` is the
+/// raw file content carried inline in the CBOR body (no multipart for the
+/// dashboard); `filename` selects the parser by extension.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadRequest {
+    pub project_id: String,
+    pub name: String,
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadResponse {
+    pub dataset: DatasetSummary,
+}
+
+/// Jeden fragment przesyłanego datasetu. Duże pliki (np. ZIP COCO, dataset SFT)
+/// przekraczają limit pojedynczej ramki WS, więc klient dzieli plik na części o
+/// numerach `seq` (0..total_chunks). Serwer akumuluje fragmenty po `upload_id` i
+/// tworzy dataset dopiero po odebraniu ostatniego fragmentu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadChunkRequest {
+    pub project_id: String,
+    pub name: String,
+    pub filename: String,
+    pub upload_id: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Odpowiedź na fragment uploadu. Dla fragmentów pośrednich `dataset` jest `None`
+/// i zwracamy postęp odebranych bajtów; po ostatnim fragmencie `dataset` zawiera
+/// utworzony rekord.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetUploadChunkResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub dataset: Option<DatasetSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetsListResponse {
+    pub datasets: Vec<DatasetSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetProfileRequest {
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetProfileResponse {
+    pub dataset: DatasetSummary,
+    pub profile: TableProfile,
+}
+
+/// One admin-managed mesh resource grant (§11.3). A record of an allocation of
+/// a node resource to a subject, not live usage. `subject_kind` ∈
+/// {user, group, project}; `resource_kind` ∈ {gpu, cpu, ram}. `resource_ref`
+/// names the card (e.g. GPU name/index) and is empty for cpu/ram; `quota` is
+/// free-form text (GPU count, hours, or empty).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrant {
+    pub grant_id: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub node_id: String,
+    pub resource_kind: String,
+    pub resource_ref: String,
+    pub quota: String,
+    pub granted_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantCreateRequest {
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub node_id: String,
+    pub resource_kind: String,
+    pub resource_ref: String,
+    pub quota: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantCreateResponse {
+    pub grant: MlStudioResourceGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantsListRequest;
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantsListResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantRevokeRequest {
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioResourceGrantRevokeResponse {
+    pub grant_id: String,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectResourcesRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectResourcesResponse {
+    pub grants: Vec<MlStudioResourceGrant>,
+}
+
+/// Request to train the tabular baseline: pick a `target_column` in a dataset
+/// and a `task` (`classification`/`regression`); Core re-parses the dataset's
+/// stored raw bytes and trains several pure-Rust models, returning a ranked
+/// leaderboard. `project_id` scopes authorization (owner/editor membership).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularTrainRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub target_column: String,
+    pub task: String,
+    /// Wybór silnika treningu: `None`/`""`/`"rust"` → wbudowany silnik Rust
+    /// (domyślny, kompatybilny wstecz); `"autogluon"` → zewnętrzny serwis HTTP
+    /// AutoGluon. Pole na końcu structu, żeby starsi klienci dekodowali bez zmian.
+    pub engine: Option<String>,
+}
+
+/// One leaderboard row returned by a tabular training run. Classification fills
+/// `accuracy`/`f1_macro`; regression fills `rmse`/`r2`. `train_secs` is the
+/// model's wall-clock training time.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularLeaderboardEntry {
+    pub model_name: String,
+    pub framework: String,
+    pub accuracy: Option<f64>,
+    pub f1_macro: Option<f64>,
+    pub rmse: Option<f64>,
+    pub r2: Option<f64>,
+    pub train_secs: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTabularTrainResponse {
+    pub run_id: String,
+    pub best_model_id: String,
+    pub best_model_name: String,
+    pub task: String,
+    pub target_column: String,
+    pub train_rows: u64,
+    pub holdout_rows: u64,
+    pub leaderboard: Vec<MlStudioTabularLeaderboardEntry>,
+}
+
+/// Hiperparametry asynchronicznego fine-tuningu LLM. Lustro pól, których
+/// oczekuje serwis ml-training (`hyperparams{...}` w `POST /train`). Wartości
+/// idą wprost do serwisu; Core ich nie waliduje poza zakresem typu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtHyperparams {
+    pub learning_rate: f64,
+    pub batch_size: u32,
+    pub grad_accum_steps: u32,
+    pub epochs: u32,
+    pub lora_r: u32,
+    pub lora_alpha: u32,
+    pub lora_dropout: f64,
+    pub max_seq_len: u32,
+}
+
+/// Żądanie startu fine-tuningu LLM. Trening biegnie ASYNCHRONICZNIE w tle Core
+/// (zob. `train_llm.rs`), więc odpowiedź wraca natychmiast z `run_id`, a UI
+/// odpytuje postęp przez `MlStudioFtTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub base_model: String,
+    pub method: String,
+    pub objective: String,
+    /// Model-nauczyciel dla KD (objective=="kd"); None dla sft/dpo.
+    #[serde(default)]
+    pub teacher_model: Option<String>,
+    pub hyperparams: MlStudioFtHyperparams,
+    pub merge_adapter: bool,
+    /// Węzeł docelowy treningu (mesh). Pusty/None → trening lokalny na tym węźle;
+    /// inny node_id → zlecenie przez mesh (komenda MlTrainStart kind="llm").
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+    /// Liczba GPU na węźle treningowym (None → wszystkie dostępne). Multi-GPU DDP.
+    #[serde(default)]
+    pub num_gpus: Option<u32>,
+    /// Konfiguracja treningu rozproszonego między węzłami (multi-rig). None →
+    /// single-node (num_gpus decyduje o liczbie kart).
+    #[serde(default)]
+    pub dist: Option<MlStudioDistConfig>,
+}
+
+/// Konfiguracja treningu rozproszonego multi-node (multi-rig). Mapuje wprost na
+/// argumenty `torchrun --nnodes/--node-rank/--rdzv-endpoint` po stronie serwisu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistConfig {
+    pub nnodes: u32,
+    pub node_rank: u32,
+    pub master_addr: String,
+    pub master_port: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Pojedynczy punkt krzywej straty (krok treningu) do wykresu w UI (f02).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLossPoint {
+    pub step: u64,
+    pub train_loss: Option<f64>,
+    pub eval_loss: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub step: u64,
+    pub total_steps: u64,
+    pub train_loss: Option<f64>,
+    pub eval_loss: Option<f64>,
+    pub error: Option<String>,
+    pub loss_curve: Vec<MlStudioLossPoint>,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping"|"syncing"|
+    /// "starting"; None gdy lokalnie lub po zmaterializowaniu. UI: pasek B/s.
+    #[serde(default)]
+    pub sync_phase: Option<String>,
+    #[serde(default)]
+    pub sync_bytes_sent: u64,
+    #[serde(default)]
+    pub sync_bytes_total: u64,
+    #[serde(default)]
+    pub sync_rate_bps: u64,
+}
+
+// ----- Recognition (RF-DETR detekcja obiektów) — trening na COCO -----
+
+/// Rejestracja datasetu COCO przez ŚCIEŻKĘ do katalogu na serwerze (a nie
+/// upload bajtów) — zbiory detekcji to dziesiątki/setki MB obrazów, ponad limit
+/// ramki WS (~0.9 MB). Katalog musi mieć splity z `_annotations.coco.json`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDatasetRegisterRequest {
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDatasetRegisterResponse {
+    pub dataset: DatasetSummary,
+}
+
+/// Detekcja na obrazie wytrenowanym modelem recognition. `image_b64` to małe
+/// zdjęcie (limit ramki WS ~0.9MB). Odpowiedź niesie detekcje jako JSON
+/// (`detections_json`: [{class_id,class_name,score,bbox_xyxy}]) — bez osobnych
+/// struktur per-detekcja w warstwie wasm.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDetectRequest {
+    pub model_id: String,
+    pub threshold: f64,
+    pub image_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogDetectResponse {
+    pub detections_json: String,
+    pub width: u32,
+    pub height: u32,
+    pub error: Option<String>,
+}
+
+// ----- Recognition: edytor anotacji (galeria + edycja bboxów COCO) -----
+
+/// Lista obrazów datasetu COCO do galerii anotacji. `images_json` =
+/// [{image_id,file_name,split,width,height,ann_count}] (image_id syntetyczny
+/// "split|coco_id"), `categories_json` = [{id,name}].
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImagesListRequest {
+    pub dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImagesListResponse {
+    pub images_json: String,
+    pub categories_json: String,
+}
+
+/// Pobranie jednego obrazu (przeskalowanego do wyświetlenia) + jego anotacji.
+/// `annotations_json` = [{id,category_id,bbox:[x,y,w,h]}] w ORYGINALNYCH
+/// współrzędnych; UI mapuje na przeskalowany obraz przez orig_width/height.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImageRequest {
+    pub dataset_id: String,
+    pub image_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImageResponse {
+    pub image_b64: String,
+    pub mime: String,
+    pub orig_width: u32,
+    pub orig_height: u32,
+    pub annotations_json: String,
+    pub error: Option<String>,
+}
+
+/// Zapis anotacji jednego obrazu z powrotem do `_annotations.coco.json` splitu.
+/// `annotations_json` = [{category_id,bbox:[x,y,w,h]}] w ORYGINALNYCH współrz.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogSaveAnnotationsRequest {
+    pub dataset_id: String,
+    pub image_id: String,
+    pub annotations_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogSaveAnnotationsResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogHyperparams {
+    pub epochs: u32,
+    pub batch_size: u32,
+    pub grad_accum: u32,
+    pub learning_rate: f64,
+    pub resolution: u32,
+    pub early_stopping: bool,
+}
+
+/// Start treningu detekcji RF-DETR. Dataset to COCO (zip) wgrany wcześniej.
+/// Biegnie ASYNCHRONICZNIE (zob. `train_recognition.rs`); UI pyta o postęp przez
+/// `MlStudioRecogTrainStatusRequest`. `variant` = nano|small|medium|base|large.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub variant: String,
+    pub hyperparams: MlStudioRecogHyperparams,
+    /// Mesh-distributed: węzeł docelowy treningu. None/pusty/local → trening
+    /// lokalny; inny node_id → trening uruchamiany na zdalnym węźle (Node B)
+    /// przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Punkt krzywej treningu detekcji (epoka): train loss + mAP@50 do wykresu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogMetricPoint {
+    pub epoch: u64,
+    pub train_loss: Option<f64>,
+    pub map50: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub epoch: u64,
+    pub total_epochs: u64,
+    pub train_loss: Option<f64>,
+    pub map50: Option<f64>,
+    pub map50_95: Option<f64>,
+    pub error: Option<String>,
+    pub curve: Vec<MlStudioRecogMetricPoint>,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping" | "syncing"
+    /// | "starting"; None gdy lokalnie lub gdy transfer zakończony i trening leci
+    /// na węźle B. UI pokazuje pasek postępu z prędkością B/s w fazie "syncing".
+    pub sync_phase: Option<String>,
+    pub sync_bytes_sent: u64,
+    pub sync_bytes_total: u64,
+    pub sync_rate_bps: u64,
+}
+
+/// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
+/// konwersja) trwa, więc biegnie ASYNCHRONICZNIE w tle Core (zob.
+/// `export_llm.rs`); odpowiedź wraca natychmiast, a UI odpytuje przez
+/// `MlStudioFtExportStatusRequest`. `outtype` to format kwantyzacji: "f16"|"q8_0".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportRequest {
+    pub model_id: String,
+    pub outtype: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportResponse {
+    pub model_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportStatusRequest {
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtExportStatusResponse {
+    pub model_id: String,
+    pub status: String,
+    pub gguf_path: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Żądanie DEPLOY wytrenowanego modelu FT (lokalny GGUF po eksporcie) jako
+/// embedded serwisu inferencji llama.cpp. Domyka cykl FT: trenuj→eksportuj→
+/// DEPLOY→używaj. Deploy biegnie przez istniejący `service_manifest_deploy`
+/// (engine `llama-cpp`, `native` embedded); model staje się dostępny pod
+/// aliasem `model_name` w routingu `/v1`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtDeployRequest {
+    pub model_id: String,
+    /// Węzeł docelowy deployu. Pusty = węzeł, na którym żyje artefakt (domyślne).
+    /// Inny niż węzeł artefaktu → Core przenosi artefakt przez mesh przed deployem.
+    #[serde(default)]
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtDeployResponse {
+    pub model_id: String,
+    pub model_name: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// Zapytanie do wdrożonego modelu FT (test/„użyj"). Dashboard używa protokołu
+/// binarnego (nie REST /v1), a gdy model żyje na innym węźle mesh, Core proxuje
+/// zapytanie do węzła-właściciela komendą `MlChat`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtChatRequest {
+    pub model_id: String,
+    pub message: String,
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioFtChatResponse {
+    pub answer: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
     ProjectsListResponse(MlStudioProjectsListResponse),
@@ -1154,6 +1816,64 @@ pub enum MlStudioPayload {
     ProjectDetailResponse(MlStudioProjectDetailResponse),
     ProjectTypesListRequest(MlStudioProjectTypesListRequest),
     ProjectTypesListResponse(MlStudioProjectTypesListResponse),
+    ProjectMembersListRequest(MlStudioProjectMembersListRequest),
+    ProjectMembersListResponse(MlStudioProjectMembersListResponse),
+    ProjectInviteRequest(MlStudioProjectInviteRequest),
+    ProjectInviteResponse(MlStudioProjectInviteResponse),
+    ProjectMemberRemoveRequest(MlStudioProjectMemberRemoveRequest),
+    ProjectMemberRemoveResponse(MlStudioProjectMemberRemoveResponse),
+    ProjectMemberRoleSetRequest(MlStudioProjectMemberRoleSetRequest),
+    ProjectMemberRoleSetResponse(MlStudioProjectMemberRoleSetResponse),
+    DatasetUploadRequest(MlStudioDatasetUploadRequest),
+    DatasetUploadResponse(MlStudioDatasetUploadResponse),
+    DatasetsListRequest(MlStudioDatasetsListRequest),
+    DatasetsListResponse(MlStudioDatasetsListResponse),
+    DatasetProfileRequest(MlStudioDatasetProfileRequest),
+    DatasetProfileResponse(MlStudioDatasetProfileResponse),
+    TabularTrainRequest(MlStudioTabularTrainRequest),
+    TabularTrainResponse(MlStudioTabularTrainResponse),
+    ResourceGrantCreateRequest(MlStudioResourceGrantCreateRequest),
+    ResourceGrantCreateResponse(MlStudioResourceGrantCreateResponse),
+    ResourceGrantsListRequest(MlStudioResourceGrantsListRequest),
+    ResourceGrantsListResponse(MlStudioResourceGrantsListResponse),
+    ResourceGrantRevokeRequest(MlStudioResourceGrantRevokeRequest),
+    ResourceGrantRevokeResponse(MlStudioResourceGrantRevokeResponse),
+    ProjectResourcesRequest(MlStudioProjectResourcesRequest),
+    ProjectResourcesResponse(MlStudioProjectResourcesResponse),
+    TrainingRunsListRequest(MlStudioTrainingRunsListRequest),
+    TrainingRunsListResponse(MlStudioTrainingRunsListResponse),
+    ModelsListRequest(MlStudioModelsListRequest),
+    ModelsListResponse(MlStudioModelsListResponse),
+    ProjectGrantsListRequest(MlStudioProjectGrantsListRequest),
+    ProjectGrantsListResponse(MlStudioProjectGrantsListResponse),
+    FtTrainStartRequest(MlStudioFtTrainStartRequest),
+    FtTrainStartResponse(MlStudioFtTrainStartResponse),
+    FtTrainStatusRequest(MlStudioFtTrainStatusRequest),
+    FtTrainStatusResponse(MlStudioFtTrainStatusResponse),
+    FtExportRequest(MlStudioFtExportRequest),
+    FtExportResponse(MlStudioFtExportResponse),
+    FtExportStatusRequest(MlStudioFtExportStatusRequest),
+    FtExportStatusResponse(MlStudioFtExportStatusResponse),
+    FtDeployRequest(MlStudioFtDeployRequest),
+    FtDeployResponse(MlStudioFtDeployResponse),
+    RecogTrainStartRequest(MlStudioRecogTrainStartRequest),
+    RecogTrainStartResponse(MlStudioRecogTrainStartResponse),
+    RecogTrainStatusRequest(MlStudioRecogTrainStatusRequest),
+    RecogTrainStatusResponse(MlStudioRecogTrainStatusResponse),
+    RecogDatasetRegisterRequest(MlStudioRecogDatasetRegisterRequest),
+    RecogDatasetRegisterResponse(MlStudioRecogDatasetRegisterResponse),
+    RecogDetectRequest(MlStudioRecogDetectRequest),
+    RecogDetectResponse(MlStudioRecogDetectResponse),
+    RecogImagesListRequest(MlStudioRecogImagesListRequest),
+    RecogImagesListResponse(MlStudioRecogImagesListResponse),
+    RecogImageRequest(MlStudioRecogImageRequest),
+    RecogImageResponse(MlStudioRecogImageResponse),
+    RecogSaveAnnotationsRequest(MlStudioRecogSaveAnnotationsRequest),
+    RecogSaveAnnotationsResponse(MlStudioRecogSaveAnnotationsResponse),
+    DatasetUploadChunkRequest(MlStudioDatasetUploadChunkRequest),
+    DatasetUploadChunkResponse(MlStudioDatasetUploadChunkResponse),
+    FtChatRequest(MlStudioFtChatRequest),
+    FtChatResponse(MlStudioFtChatResponse),
 }
 
 // ----- Robots screen (UserSession) -----
@@ -2976,18 +3696,14 @@ pub struct NimCatalogListResponse {
 // f64 fields drop Eq; PartialEq only.
 // =============================================================================
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmGpuInfo {
     pub index: u32,
     pub name: String,
     pub memory_gb: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmRecommendRequest {
     pub model: String,
     pub gpus: Vec<DeployVllmGpuInfo>,
@@ -3022,9 +3738,7 @@ pub struct DeployVllmRecommendRequest {
     pub max_num_batched_tokens: Option<u64>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmConfig {
     pub tensor_parallel: u32,
     pub pipeline_parallel: u32,
@@ -3034,9 +3748,7 @@ pub struct DeployVllmConfig {
     pub gpu_memory_utilization: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmModelSpecSummary {
     pub model_type: String,
     pub architectures: Vec<String>,
@@ -3053,9 +3765,7 @@ pub struct DeployVllmModelSpecSummary {
     pub bytes_per_param: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmVramEstimate {
     pub model_weights_gb: f64,
     pub kv_cache_gb: f64,
@@ -3079,9 +3789,7 @@ pub struct DeployVllmVramEstimate {
     pub concurrent_full_len_seqs: f64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmGpuCompatibility {
     pub used_tp: u32,
     pub used_pp: u32,
@@ -3091,9 +3799,7 @@ pub struct DeployVllmGpuCompatibility {
     pub warning: Option<String>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct DeployVllmRecommendResponse {
     pub model_spec: DeployVllmModelSpecSummary,
     pub vram_estimate: DeployVllmVramEstimate,
@@ -3266,9 +3972,7 @@ pub struct AddonAccessDecisionRequest {
 /// Ask the server which host port a fresh deploy would be assigned (the first
 /// free port in the services range, skipping leased / OS-bound / docker-bound
 /// ports). The deploy wizard pre-fills the editable port field with it.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct SuggestServicePortRequest {
     /// Deploy method the wizard is targeting ("docker", "native", …) — purely
     /// informational for now; the suggestion comes from the shared allocator.
@@ -3278,9 +3982,7 @@ pub struct SuggestServicePortRequest {
 /// Response to [`SuggestServicePortRequest`]. `available = false` (port 0) when
 /// the whole range is exhausted. Advisory: the deploy re-allocates at commit, so
 /// the value can change if another deploy grabs it first.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct SuggestServicePortResponse {
     pub port: u32,
     pub available: bool,
@@ -3291,9 +3993,7 @@ pub struct SuggestServicePortResponse {
 /// tensorrt-llm uzywaja `auto_fit_config` z mapowaniem do typed pol; inne
 /// silniki maja proste defaulty per kategoria). Zwraca typed mape
 /// `parameter.key → JSON value` ktora wizard pre-filluje do formularza.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct EngineRecommendRequest {
     pub engine_id: String,
     pub model_repo: String,
@@ -3301,9 +4001,7 @@ pub struct EngineRecommendRequest {
     pub hf_token: Option<String>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct EngineRecommendResponse {
     /// JSON-serialized values per parameter key. Wizard JS deserializuje
     /// zgodnie z `parameter.kind` z manifestu.
@@ -5615,7 +6313,40 @@ pub enum MessageBody {
     AddonStorageBody(AddonStoragePayload),
     // Vector backend picker addona (zvec / Milvus config + discovery).
     AddonVectorBody(AddonVectorPayload),
+
+    // ---- API key scope + rotation (admin-only) ----
+    // Appended at the END of the enum: ciborium 0.8 encodes variants by index
+    // (256-variant cap), so new discriminants must never be inserted mid-list.
+    /// Lists the explicit allowlist of a general key (subject_type='api_key').
+    ApiKeyScopeListRequest {
+        key_uid: String,
+    },
+    ApiKeyScopeListResponse {
+        entries: Vec<PermissionEntry>,
+    },
+    /// Sets one allow/deny scope entry for a general key.
+    ApiKeyScopeSetRequest {
+        key_uid: String,
+        resource_type: String,
+        resource_id: String,
+        access_level: String,
+    },
+    /// Removes one scope entry for a general key.
+    ApiKeyScopeClearRequest {
+        key_uid: String,
+        resource_type: String,
+        resource_id: String,
+    },
+    /// Rotates a key's secret: new token, same uid + scope, old token invalid.
+    ApiKeyRotateRequest {
+        key_uid: String,
+    },
+    ApiKeyRotateResponse {
+        token: String,
+    },
     // Robots core app: list (org-scoped) + control routing + camera share.
+    // Appended AFTER the API-key variants so origin's variant indices stay
+    // wire-stable across the fleet; RobotsBody takes the new highest index.
     RobotsBody(RobotsPayload),
 }
 
@@ -5827,13 +6558,23 @@ mod tests {
                 name: "primary".to_string(),
                 created_at_epoch: 1_700_000_000,
                 last_used_at_epoch: Some(1_700_100_000),
+                key_type: "general".to_string(),
+                subject_id: None,
+                subject_label: None,
+                scope_count: 2,
+                is_active: true,
             }],
         };
         assert_eq!(round_trip(list.clone()), list);
 
         let create = MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
             name: "svc".to_string(),
-            scopes: vec!["read".to_string(), "write".to_string()],
+            key_type: "general".to_string(),
+            subject_id: None,
+            scope_resources: vec![ResourceRef {
+                resource_type: "model".to_string(),
+                resource_id: "gpt-4o".to_string(),
+            }],
         });
         assert_eq!(round_trip(create.clone()), create);
 
@@ -6032,9 +6773,9 @@ mod tests {
             MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
                 skill_id: "s3".to_string(),
             })),
-            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(SkillsHubApproveResponse {
-                approved: true,
-            })),
+            MessageBody::SkillsBody(SkillsPayload::HubApproveResponse(
+                SkillsHubApproveResponse { approved: true },
+            )),
             MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
                 skill_id: "s3".to_string(),
             })),
@@ -6579,10 +7320,7 @@ mod tests {
             MessageBody::BaselineDonorListResponseBody(r) => {
                 assert_eq!(r.candidates.len(), 2);
                 assert_eq!(r.candidates[0].node_id, "aabbccdd");
-                assert_eq!(
-                    r.candidates[0].summary.as_ref().map(|s| s.users),
-                    Some(12)
-                );
+                assert_eq!(r.candidates[0].summary.as_ref().map(|s| s.users), Some(12));
                 assert!(r.candidates[1].summary.is_none());
             }
             other => panic!("expected BaselineDonorListResponseBody, got {other:?}"),
@@ -6676,15 +7414,13 @@ mod tests {
     fn body_nests_inside_envelope() {
         use crate::envelope::{message_kind, Envelope};
         let body = MessageBody::ModelListRequest;
-        let body_bytes = crate::cbor::encode(&body).expect("encode body")
-            .to_vec();
+        let body_bytes = crate::cbor::encode(&body).expect("encode body").to_vec();
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, body_bytes);
         let env_bytes = crate::cbor::encode(&env).expect("encode env");
         let decoded_env: Envelope =
             crate::cbor::decode::<Envelope>(&env_bytes).expect("decode env");
         let decoded_body: MessageBody =
-            crate::cbor::decode::<MessageBody>(&decoded_env.body)
-                .expect("decode body");
+            crate::cbor::decode::<MessageBody>(&decoded_env.body).expect("decode body");
         assert_eq!(decoded_body, body);
     }
 }

@@ -98,8 +98,13 @@ with ThreadPoolExecutor(max_workers=12) as ex:
 
 payload = {"source": base, "count": len(merged), "recipes": merged}
 raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-with gzip.open(out_file, "wb", compresslevel=9) as f:
-    f.write(raw)
+# Deterministic gzip: zero mtime + no stored filename, so identical recipe
+# content always produces byte-identical output. Without this, every refresh
+# (e.g. setup.sh) rewrites the gzip header timestamp and dirties the git tree.
+with open(out_file, "wb") as fh, gzip.GzipFile(
+    fileobj=fh, mode="wb", compresslevel=9, mtime=0
+) as gz:
+    gz.write(raw)
 print(f"[recipes] wrote {out_file}: {len(merged)} entries, {len(raw)} bytes raw")
 PY
 

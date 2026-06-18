@@ -6,9 +6,12 @@
 // =============================================================================
 
 use crate::api::openai::types::*;
+use crate::auth::acl::Principal;
 use crate::config::ProtocolConfig;
+use crate::db::DbPool;
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
+use crate::services::catalog::{CatalogEntryKind, CatalogSnapshot};
 
 use futures::TryStreamExt;
 use http_body_util::{BodyExt, StreamBody};
@@ -77,6 +80,123 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
             "internal_error",
             e.to_string(),
         )
+    }
+}
+
+/// resource_type string used in `resource_permissions` for a catalog entry,
+/// derived from its kind. Canonical resource_id is always `entry.id` (model id,
+/// catalog flow id, alias id) — never a published alias/name.
+fn resource_type_for_kind(kind: &CatalogEntryKind) -> &'static str {
+    match kind {
+        CatalogEntryKind::ServiceModel { .. } => "model",
+        CatalogEntryKind::Flow { .. } => "flow",
+        CatalogEntryKind::Alias { .. } => "alias",
+    }
+}
+
+/// Outcome of an authorization check. `ModelNotInCatalog` and `Denied` both
+/// surface as 404 `model_not_found` to callers — we never reveal whether a
+/// resource exists.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthDecision {
+    Allow,
+    /// Requested model is not advertised in the catalog.
+    ModelNotInCatalog,
+    /// Resource exists but the principal is not allowed (default-DENY).
+    Denied,
+}
+
+/// Pure /v1 authorization decision, decoupled from HTTP so it can be unit
+/// tested with a synthetic snapshot + in-memory DB. fail-CLOSED:
+///   * model absent from catalog → `ModelNotInCatalog`,
+///   * alias requires allow on the alias **and** on the resolved target
+///     (resource_type of the target depends on what the target is in the
+///     catalog); a missing/denied target denies the whole request,
+///   * a deny anywhere wins.
+pub fn authorize_model(
+    snapshot: &CatalogSnapshot,
+    db: &DbPool,
+    principal: &Principal,
+    requested_model: &str,
+) -> AuthDecision {
+    let entry = match snapshot
+        .advertised_entries()
+        .find(|e| e.id == requested_model)
+    {
+        Some(e) => e,
+        None => return AuthDecision::ModelNotInCatalog,
+    };
+
+    let rt = resource_type_for_kind(&entry.kind);
+    if !crate::auth::acl::check_v1_access(db, rt, &entry.id, principal) {
+        return AuthDecision::Denied;
+    }
+
+    // For aliases the principal must also be allowed on the resolved target
+    // (and on any declared fallback) — otherwise an alias would let a caller
+    // reach a model/flow whose own ACL denies them.
+    if let CatalogEntryKind::Alias {
+        target,
+        fallback_targets,
+        ..
+    } = &entry.kind
+    {
+        for resolved in std::iter::once(target).chain(fallback_targets.iter()) {
+            let target_entry = match snapshot.advertised_entries().find(|e| &e.id == resolved) {
+                Some(e) => e,
+                // A target missing from the catalog cannot be authorized — be
+                // conservative and deny rather than silently skip it.
+                None => return AuthDecision::Denied,
+            };
+            let target_rt = resource_type_for_kind(&target_entry.kind);
+            if !crate::auth::acl::check_v1_access(db, target_rt, &target_entry.id, principal) {
+                return AuthDecision::Denied;
+            }
+        }
+    }
+
+    AuthDecision::Allow
+}
+
+/// Central /v1 gate. Called at the top of every handler that accepts a `model`
+/// field. Returns `Err(Response)` (404 `model_not_found`) on any denial, or 401
+/// when no Principal was injected (should not happen — the unified server gate
+/// builds one for every accepted key — but fail-CLOSED here too).
+fn v1_authorize(
+    router: &Router,
+    principal: Option<&Principal>,
+    requested_model: &str,
+) -> std::result::Result<(), Response<OpenAIBody>> {
+    let principal = match principal {
+        Some(p) => p,
+        None => {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Brak Principal dla zadania /v1".to_string(),
+            ));
+        }
+    };
+
+    let db = match router.db.as_ref() {
+        Some(db) => db,
+        None => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("model '{}' not found", requested_model),
+            ));
+        }
+    };
+
+    let snapshot = router.catalog_snapshot();
+    match authorize_model(&snapshot, db, principal, requested_model) {
+        AuthDecision::Allow => Ok(()),
+        AuthDecision::ModelNotInCatalog | AuthDecision::Denied => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "model_not_found",
+            format!("model '{}' not found", requested_model),
+        )),
     }
 }
 
@@ -222,8 +342,11 @@ pub async fn handle_request(
         // Readiness check - zwraca 200 jesli >=1 backend zdrowy
         ("GET", "/ready") | ("GET", "/v1/ready") => handle_readiness_check(router).await,
 
-        // Lista dostepnych modeli
-        ("GET", "/v1/models") => handle_models_list(router).await,
+        // Lista dostepnych modeli — filtrowana per-Principal (fail-CLOSED).
+        ("GET", "/v1/models") => {
+            let principal = req.extensions().get::<Principal>().cloned();
+            handle_models_list(router, principal.as_ref()).await
+        }
 
         // 404 Not Found
         _ => {
@@ -264,6 +387,7 @@ async fn handle_chat_completions(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -280,6 +404,10 @@ async fn handle_chat_completions(
             ));
         }
     };
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &request.model) {
+        return Ok(resp);
+    }
 
     let is_streaming = request.stream;
     debug!(
@@ -438,6 +566,7 @@ async fn handle_audio_tts(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     // Parsuj body jako JSON
     let body_bytes = match req.into_body().collect().await {
@@ -461,6 +590,10 @@ async fn handle_audio_tts(
             ));
         }
     };
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &tts_request.model) {
+        return Ok(resp);
+    }
 
     // Rozwiazanie pola `language`: body klienta -> preferencja uzytkownika -> "en".
     // Pozwala wymusic jezyk per-request, a jesli brak — backend dostaje jawna
@@ -577,6 +710,7 @@ async fn handle_audio_tts_stream(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
@@ -600,6 +734,12 @@ async fn handle_audio_tts_stream(
             }
         };
 
+    // Autorytatywna brama /v1 — egzekwuje default-DENY dla user/group/general
+    // (zastepuje dawny check_access_safe widoczny tylko dla UserContext).
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &api_request.model) {
+        return Ok(resp);
+    }
+
     let dispatcher = match router.flow_dispatcher.as_ref() {
         Some(d) => d.clone(),
         None => {
@@ -610,31 +750,6 @@ async fn handle_audio_tts_stream(
             ));
         }
     };
-
-    // Etap 3c CRITICAL fix: model-level ACL gate przed dispatchem.
-    // Mirror /v1/audio/speech sciezka (routing/tts.rs:41).
-    if let Some(ref u) = user_ctx {
-        if let Some(ref db) = router.db {
-            if !crate::auth::acl::check_access_safe(
-                db,
-                "model",
-                &api_request.model,
-                &u.user_id,
-                &u.role,
-            ) {
-                tracing::warn!(
-                    user_id = %u.user_id,
-                    model = %api_request.model,
-                    "ACL denied TTS stream model"
-                );
-                return Ok(error_response(
-                    StatusCode::NOT_FOUND,
-                    "model_not_found",
-                    format!("model '{}' not found", api_request.model),
-                ));
-            }
-        }
-    }
 
     if api_request.input.is_empty() {
         return Ok(error_response(
@@ -765,6 +880,7 @@ async fn handle_audio_speech_flow_stream(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
@@ -788,6 +904,10 @@ async fn handle_audio_speech_flow_stream(
             }
         };
 
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &api_request.model) {
+        return Ok(resp);
+    }
+
     let dispatcher = match router.flow_dispatcher.as_ref() {
         Some(d) => d.clone(),
         None => {
@@ -798,29 +918,6 @@ async fn handle_audio_speech_flow_stream(
             ));
         }
     };
-
-    if let Some(ref u) = user_ctx {
-        if let Some(ref db) = router.db {
-            if !crate::auth::acl::check_access_safe(
-                db,
-                "model",
-                &api_request.model,
-                &u.user_id,
-                &u.role,
-            ) {
-                tracing::warn!(
-                    user_id = %u.user_id,
-                    model = %api_request.model,
-                    "ACL denied flow audio stream model"
-                );
-                return Ok(error_response(
-                    StatusCode::NOT_FOUND,
-                    "model_not_found",
-                    format!("model '{}' not found", api_request.model),
-                ));
-            }
-        }
-    }
 
     if api_request.input.is_empty() {
         return Ok(error_response(
@@ -895,6 +992,7 @@ async fn handle_audio_transcriptions(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     // Wyciagnij Content-Type header aby sprawdzic boundary
     let content_type = match req.headers().get("content-type") {
@@ -952,12 +1050,28 @@ async fn handle_audio_transcriptions(
     let mut avg_logprob_threshold: Option<f32> = None;
     let mut compression_ratio_threshold: Option<f32> = None;
 
+    // Authorize BEFORE buffering the (potentially large) `file` part. An
+    // unauthenticated/denied caller must not be able to force the server to
+    // read the whole upload into memory ahead of the default-DENY gate. We
+    // require `model` to be authorized before any `file` bytes are accepted:
+    // a `file` part arriving while `model` is still unknown/unauthorized is
+    // rejected without buffering. `model` is authorized inline the moment it
+    // is parsed.
+    let mut model_authorized = false;
+
     // Iteruj przez pola
     while let Some(field) = multipart.next_field().await.ok().flatten() {
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
             "file" => {
+                if !model_authorized {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "Pole 'model' musi poprzedzac 'file' w multipart".to_string(),
+                    ));
+                }
                 filename = field.file_name().map(|s| s.to_string());
                 file_data = Some(
                     field
@@ -969,7 +1083,12 @@ async fn handle_audio_transcriptions(
                 );
             }
             "model" => {
-                model = Some(field.text().await.ok().unwrap_or_default());
+                let model_name = field.text().await.ok().unwrap_or_default();
+                if let Err(resp) = v1_authorize(&router, principal.as_ref(), &model_name) {
+                    return Ok(resp);
+                }
+                model_authorized = true;
+                model = Some(model_name);
             }
             "language" => {
                 language = Some(field.text().await.ok().unwrap_or_default());
@@ -1024,6 +1143,8 @@ async fn handle_audio_transcriptions(
         }
     };
 
+    // `model` is required and was already authorized inline (before `file`
+    // bytes were accepted); see the multipart loop above.
     let model_name = match model {
         Some(m) => m,
         None => {
@@ -1143,6 +1264,7 @@ async fn handle_embeddings(
         .extensions()
         .get::<crate::auth::acl::UserContext>()
         .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -1159,6 +1281,10 @@ async fn handle_embeddings(
             ));
         }
     };
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &request.model) {
+        return Ok(resp);
+    }
 
     debug!("Embeddings request: model={}", request.model);
 
@@ -1226,6 +1352,7 @@ async fn handle_readiness_check(
 
 async fn handle_models_list(
     router: Arc<Router>,
+    principal: Option<&Principal>,
 ) -> std::result::Result<
     Response<
         StreamBody<
@@ -1253,15 +1380,26 @@ async fn handle_models_list(
         data: Vec<ModelObject>,
     }
 
-    let mut model_objects: Vec<ModelObject> = snapshot
-        .advertised_entries()
-        .map(|entry| ModelObject {
-            id: entry.id.clone(),
-            object: "model".to_string(),
-            created: 1686935002,
-            owned_by: entry.owned_by().to_string(),
-        })
-        .collect();
+    // fail-CLOSED: no Principal → empty list. Otherwise keep only entries the
+    // Principal is actually allowed to reach via /v1 (resource_type per kind).
+    let mut model_objects: Vec<ModelObject> = match (principal, router.db.as_ref()) {
+        (Some(principal), Some(db)) => snapshot
+            .advertised_entries()
+            .filter(|entry| {
+                matches!(
+                    authorize_model(&snapshot, db, principal, &entry.id),
+                    AuthDecision::Allow
+                )
+            })
+            .map(|entry| ModelObject {
+                id: entry.id.clone(),
+                object: "model".to_string(),
+                created: 1686935002,
+                owned_by: entry.owned_by().to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     model_objects.sort_by(|a, b| a.id.cmp(&b.id));
 
     let response = ModelsListResponse {

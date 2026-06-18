@@ -33,6 +33,7 @@
     "logout": "Logout",
     "addons": "Addons",
     "users": "Users",
+    "access_keys": "Access & API keys",
     "roles_catalog": "Role catalog",
     "audit": "Audit Log",
     "legal": "Legal Documents",
@@ -2982,6 +2983,7 @@
     "perm_hint": "Change this group permissions for resources. Auto = default access (allow), Zezwól = explicit allow, Odmów = explicit deny. Priority: User > Group > Default.",
     "perm_models": "Models",
     "perm_flows": "Flows",
+    "perm_aliases": "Aliases",
     "perm_addons": "Addons",
     "perm_auto": "Auto",
     "perm_allow": "Allow",
@@ -3022,7 +3024,7 @@
     "delete_account": "Delete account",
     "delete_group": "Delete group",
     "group_label": "Group",
-    "perms_user_todo": "User permissions (override over groups) — next release."
+    "perms_user_effective": "Effective permissions = user override on top of the user's groups. — = inherit from group."
   },
   "groups": {
     "title": "Groups",

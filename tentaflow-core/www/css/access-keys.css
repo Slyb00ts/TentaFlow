@@ -1,0 +1,73 @@
+/* =============================================================================
+   Plik: access-keys.css
+   Opis: Style ekranu "Dostęp i klucze API" (modules/access-keys.js). Reużywa
+         globalnych .perm-matrix/.perm-btn/.legend/.subtabs (addons.css) i
+         .wizard-step-* (style.css); tu tylko klasy ak-* specyficzne dla ekranu.
+   ============================================================================= */
+
+.access-keys-screen { padding: 4px 2px; }
+.access-keys-screen .page-header h1 { display: flex; align-items: center; gap: 10px; }
+
+/* Tab bar */
+.tf-tabs-bar { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 14px 0 16px; }
+.tf-tab-btn { display: flex; align-items: center; gap: 7px; padding: 10px 16px; font-size: 13px; font-weight: 600;
+  color: var(--text-3); background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer; transition: all .15s; }
+.tf-tab-btn:hover { color: var(--text-2); }
+.tf-tab-btn.active { color: var(--text); border-bottom-color: var(--accent-1); }
+
+/* Keys table toolbar */
+.ak-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.ak-info { flex: 1; min-width: 240px; font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
+.access-keys-body .cell-sub { font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+.access-keys-body .strong { color: var(--text); font-weight: 700; }
+.access-keys-body .mono { font-family: ui-monospace, 'SF Mono', monospace; }
+.ak-type-user .icon, .tf-chip.ak-type-user { color: var(--info); }
+.ak-type-group .icon, .tf-chip.ak-type-group { color: var(--accent-2); }
+.ak-type-general .icon, .tf-chip.ak-type-general { color: var(--warning); }
+
+/* Wizard */
+.ak-wizard { padding: 18px 20px 4px; }
+.ak-wizard-footer { display: flex; align-items: center; gap: 8px; padding: 4px 4px; }
+.ak-form-row { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.ak-form-row label { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.ak-type-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.ak-type-card { background: var(--bg-input); border: 2px solid var(--border); border-radius: var(--radius);
+  padding: 16px; cursor: pointer; transition: all .2s; }
+.ak-type-card:hover { border-color: var(--border-hover); }
+.ak-type-card.active { border-color: var(--accent-1); background: var(--accent-glow); }
+.ak-type-ico { width: 38px; height: 38px; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; margin-bottom: 10px; }
+.ak-type-ico.ak-type-user { background: rgba(96,165,250,.15); }
+.ak-type-ico.ak-type-group { background: rgba(167,139,250,.2); }
+.ak-type-ico.ak-type-general { background: rgba(245,158,11,.15); }
+.ak-type-name { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+.ak-type-desc { font-size: 12px; color: var(--text-2); line-height: 1.5; }
+
+.ak-deny-note { font-size: 12.5px; line-height: 1.5; padding: 10px 12px; border-radius: var(--radius-sm); margin: 14px 0;
+  background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: var(--danger); }
+.ak-deny-note.info { background: rgba(96,165,250,.1); border-color: rgba(96,165,250,.3); color: var(--info); }
+.ak-deny-note.warn { background: rgba(245,158,11,.1); border-color: rgba(245,158,11,.3); color: var(--warning); }
+
+.ak-pick-list { max-height: 360px; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.ak-pick-row { display: flex; align-items: center; gap: 12px; padding: 9px 12px; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.ak-pick-row.checked { border-color: var(--accent-1); background: var(--accent-glow); }
+.ak-pick-name { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); }
+.ak-pick-meta { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
+.ak-pick-count { font-size: 12px; color: var(--text-3); }
+
+.ak-token-box { background: var(--bg-input); border: 1px solid var(--success); border-radius: var(--radius);
+  padding: 14px; display: flex; align-items: center; gap: 12px; }
+.ak-token { flex: 1; font-family: ui-monospace, 'SF Mono', monospace; font-size: 13px; color: var(--success); word-break: break-all; }
+
+/* Matrix */
+.ak-resolution { font-size: 12px; color: var(--text-2); background: rgba(96,165,250,.08);
+  border: 1px solid rgba(96,165,250,.25); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 14px; line-height: 1.5; }
+.access-keys-body .perm-matrix th.func br + span { font-size: 9px; }
+
+/* Grouped resource headers in the matrix (Modele / Flow / Aliasy spanning) */
+.access-keys-body .perm-matrix th.grp { text-align: center; color: var(--accent-2);
+  border-bottom: 1px solid var(--border-hover); font-size: 10px; }
+.access-keys-body .perm-matrix th.grp .icon { width: 11px; height: 11px; vertical-align: -1px; }
+
+/* Highlighted row when jumping from a key's "Zakres" action to the matrix */
+.access-keys-body .perm-matrix tr.ak-row-hl td { background: var(--accent-glow); }

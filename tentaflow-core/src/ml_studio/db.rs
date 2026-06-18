@@ -114,7 +114,13 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 /// Ordered ML Studio schema migrations. `owner_user_id`/`org_id` are TEXT
 /// references to core identity (app-level, no SQL FK — different DB file).
-const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, INITIAL_SCHEMA),
+    (2, PROJECT_MEMBERS),
+    (3, DATASET_PROFILE),
+    (4, RESOURCE_GRANTS),
+    (5, DATASET_RAW_DATA),
+];
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -206,4 +212,53 @@ CREATE TABLE service_models (
     source            TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL DEFAULT 'available'
 );
+";
+
+const PROJECT_MEMBERS: &str = "
+CREATE TABLE project_members (
+    project_id TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    invited_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, user_id)
+);
+CREATE INDEX idx_project_members_user ON project_members(user_id);
+INSERT OR IGNORE INTO project_members (project_id, user_id, role, status, invited_by)
+SELECT project_id, owner_user_id, 'owner', 'active', owner_user_id
+FROM projects WHERE owner_user_id IS NOT NULL AND owner_user_id != '';
+";
+
+const DATASET_PROFILE: &str = "
+ALTER TABLE datasets ADD COLUMN column_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE datasets ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}';
+";
+
+// Admin-managed mesh resource grants (§11.3). One row = one allocation of a
+// node resource (gpu/cpu/ram) to a subject (user/group/project). These are
+// GRANT records, not live usage: `quota` is free-form text (GPU count, hours,
+// or empty). `node_id`/`subject_id`/`granted_by` are app-level identifiers
+// (no SQL FK — pool of nodes comes from the mesh registry, not this DB).
+const RESOURCE_GRANTS: &str = "
+CREATE TABLE resource_grants (
+    grant_id      TEXT PRIMARY KEY,
+    subject_kind  TEXT NOT NULL,
+    subject_id    TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    resource_ref  TEXT NOT NULL DEFAULT '',
+    quota         TEXT NOT NULL DEFAULT '',
+    granted_by    TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_resource_grants_subject ON resource_grants(subject_kind, subject_id);
+CREATE INDEX idx_resource_grants_node ON resource_grants(node_id);
+";
+
+// Stores the raw uploaded file bytes (already bounded to <= 1 MiB by the upload
+// limit) so a later training run can re-parse the original data without keeping
+// a separate file store. NULL for datasets created before this migration.
+const DATASET_RAW_DATA: &str = "
+ALTER TABLE datasets ADD COLUMN raw_data BLOB;
 ";

@@ -82,4 +82,5 @@ export const categoryIconKey = {
   'vision': 'search',
   'agents': 'wrench',
   'tools': 'wrench',
+  'training': 'brain',
 };

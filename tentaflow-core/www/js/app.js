@@ -35,6 +35,7 @@ import ChatScreen from '/js/modules/chat.js';
 import PromptsScreen from '/js/modules/prompts.js';
 import RulesScreen from '/js/modules/rules.js';
 import UsersScreen from '/js/modules/users.js';
+import AccessKeysScreen from '/js/modules/access-keys.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
 import AddonsScreen from '/js/modules/addons.js';
@@ -148,6 +149,7 @@ const ADMIN_NAV = [
     items: [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
+      { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
@@ -164,6 +166,9 @@ const USER_NAV = [
     items: [
       { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
+      // ML Studio jest narzedziem zaawansowanym — widoczne tylko dla Power User
+      // i Admin (wymog §11.2). Gate realizuje filtr `requiresPowerUser` w paint().
+      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
       { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
@@ -274,13 +279,26 @@ async function renderApp() {
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
   const role = (me?.role ?? 'user').toLowerCase();
   const isAdmin = role === 'admin';
+  // Power User to rola posrednia miedzy `user` a `admin` (zob. users.js: role
+  // moze byc 'admin' | 'power_user' | 'user'). Admin jest nadzbiorem Power Usera.
+  const isPowerUser = isAdmin || role === 'power_user';
   const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
 
   function paint() {
     // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
-    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
-    const userClass = isAdmin ? 'admin' : 'user';
-    const roleLabel = I18n.t(isAdmin ? 'role.administrator' : 'role.user');
+    const rawNav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
+    // Gate pozycji wymagajacych roli: `requiresPowerUser` widoczne tylko dla
+    // Power User i Admin. Filtrujemy itemy, sekcje pomijamy gdy zostaja puste.
+    const nav = rawNav
+      .map((section) => ({
+        ...section,
+        items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
+      }))
+      .filter((section) => section.items.length > 0);
+    const userClass = isAdmin ? 'admin' : isPowerUser ? 'power' : 'user';
+    const roleLabel = I18n.t(
+      isAdmin ? 'role.administrator' : isPowerUser ? 'users.role_power' : 'role.user',
+    );
     const logoutLabel = I18n.t('nav.logout');
 
     root.innerHTML = `
@@ -504,6 +522,7 @@ async function renderApp() {
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('users', UsersScreen);
+  Router.register('access-keys', AccessKeysScreen);
   Router.register('roles-catalog', RolesCatalogScreen);
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);

@@ -195,6 +195,10 @@ pub enum Category {
     Model3dGen,
     Agents,
     Tools,
+    /// LLM fine-tuning / training server (SFT, LoRA, QLoRA, DPO). The base
+    /// model is a per-job parameter, not picked at deploy time, so this
+    /// category never advertises a model registry.
+    Training,
 }
 
 // Wire-string allow-lists live in `vocabulary.rs` so build.rs can `include!`
@@ -221,6 +225,7 @@ impl Category {
             "model-3d-gen" => Some(Self::Model3dGen),
             "agents" => Some(Self::Agents),
             "tools" => Some(Self::Tools),
+            "training" => Some(Self::Training),
             _ => None,
         }
     }
@@ -240,7 +245,7 @@ impl Category {
             Self::Vision => &["chat"],
             Self::ImageGen => &["image_gen"],
             Self::Agents => &["agents"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
         }
     }
 
@@ -252,7 +257,7 @@ impl Category {
             Self::Stt => &["audio"],
             Self::Vision => &["text", "image"],
             Self::Agents => &["text"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
         }
     }
 
@@ -264,7 +269,7 @@ impl Category {
             Self::Tts => &["audio"],
             Self::Embeddings => &["embedding"],
             Self::ImageGen => &["image"],
-            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools => &[],
+            Self::VideoGen | Self::MusicGen | Self::Model3dGen | Self::Tools | Self::Training => &[],
         }
     }
 }

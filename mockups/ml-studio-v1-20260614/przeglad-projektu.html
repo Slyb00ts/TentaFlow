@@ -18,6 +18,16 @@
   .origin { font-size: 10px; color: var(--text-3); display: flex; align-items: center; gap: 5px; margin-top: 4px; }
   .origin .icon { width: 11px; height: 11px; }
   .job-prog { min-width: 140px; }
+  /* ----- Mini-lista członków projektu ----- */
+  .members-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .member-chip { display: flex; align-items: center; gap: 9px; padding: 6px 12px 6px 6px;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 20px; }
+  .member-chip .m-av {
+    width: 28px; height: 28px; border-radius: 50%; background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center; color: white; font-weight: 700; font-size: 11px;
+  }
+  .member-chip .m-nm { font-size: 12px; font-weight: 700; line-height: 1.2; }
+  .member-chip .m-rl { font-size: 10px; color: var(--text-3); }
 </style>
 </head>
 <body>
@@ -49,6 +59,12 @@
   <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
   <symbol id="i-cube" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-mesh" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><line x1="7" y1="6" x2="17" y2="6"/><line x1="6" y1="8" x2="11" y2="16"/><line x1="18" y1="8" x2="13" y2="16"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+  <symbol id="i-crown" viewBox="0 0 24 24"><path d="M2 18h20l-2-11-5 5-3-7-3 7-5-5z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
 </defs>
 </svg>
 
@@ -96,6 +112,9 @@
         <div class="nav-section">
           <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Integrations</div>
           <div class="nav-item"><svg class="icon"><use href="#i-catalog"/></svg>Service Catalog</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-apps"/></svg>Aplikacje<span class="chip accent" style="margin-left:auto;font-size:8px;letter-spacing:0.06em;">Power User</span></div>
           <div class="nav-item active"><svg class="icon"><use href="#i-brain"/></svg>ML Studio<span class="badge">3</span></div>
         </div>
         <div class="nav-section">
@@ -140,6 +159,7 @@
               <span class="chip accent"><svg class="icon"><use href="#i-image"/></svg>typ: rozpoznawanie obrazu</span>
               <span class="chip"><svg class="icon"><use href="#i-clock"/></svg>utworzony 14 dni temu</span>
               <span class="chip info"><svg class="icon"><use href="#i-box"/></svg>schemat: 5 klas</span>
+              <span class="chip success"><svg class="icon"><use href="#i-mesh"/></svg>zsynchronizowano z mesh (4 nody)</span>
             </div>
           </div>
           <div class="d-actions">
@@ -170,6 +190,60 @@
             <div class="value">2</div>
             <div class="delta">wersje wytrenowane w projekcie</div>
           </div>
+        </div>
+
+        <!-- Członkowie projektu -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-users"/></svg>Członkowie projektu <span class="text-3">— właściciel i osoby z dostępem</span></div>
+            <a class="btn btn-ghost btn-sm" href="p02-udostepnianie.html"><svg class="icon"><use href="#i-share"/></svg>Zarządzaj dostępem<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+          <div class="members-row">
+            <div class="member-chip">
+              <div class="m-av">PJ</div>
+              <div><div class="m-nm">Piotr Jarocki <span class="text-3">(Ty)</span></div><div class="m-rl">Właściciel</div></div>
+              <span class="chip accent" style="margin-left:4px;"><svg class="icon"><use href="#i-crown"/></svg>Właściciel</span>
+            </div>
+            <div class="member-chip">
+              <div class="m-av">AK</div>
+              <div><div class="m-nm">Anna Kowalska</div><div class="m-rl">dodana 5 dni temu</div></div>
+              <span class="chip" style="margin-left:4px;"><svg class="icon"><use href="#i-edit"/></svg>Edytor</span>
+            </div>
+            <div class="member-chip">
+              <div class="m-av">MN</div>
+              <div><div class="m-nm">Marek Nowak</div><div class="m-rl">dodany 2 dni temu</div></div>
+              <span class="chip" style="margin-left:4px;"><svg class="icon"><use href="#i-eye"/></svg>Przeglądający</span>
+            </div>
+            <a class="btn btn-secondary btn-sm" href="p02-udostepnianie.html"><svg class="icon"><use href="#i-plus"/></svg>Zaproś</a>
+          </div>
+        </div>
+
+        <!-- Zasoby przydzielone temu projektowi -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Zasoby przydzielone <span class="text-3">— GPU/nody dostępne dla treningu tego projektu</span></div>
+            <a class="btn btn-ghost btn-sm" href="admin-zasoby.html">Zarządzaj (admin)<svg class="icon"><use href="#i-chevron"/></svg></a>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Zasób</th><th>Node</th><th>Limit</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono"><svg class="icon" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-server"/></svg> 2× RTX 4090</td>
+                <td>warszawa-gpu <span class="text-3">(node-A)</span></td>
+                <td>2 GPU</td>
+                <td><span class="status-pill ok">dostępne</span></td>
+              </tr>
+              <tr>
+                <td class="mono"><svg class="icon" style="vertical-align:-2px;color:var(--accent-2)"><use href="#i-server"/></svg> 1× B300</td>
+                <td>dgx-01 <span class="text-3">(node-B, przez mesh)</span></td>
+                <td>1 GPU · 8 h/dobę</td>
+                <td><span class="status-pill warn">zajęte treningiem v2</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="origin"><svg class="icon"><use href="#i-mesh"/></svg>Przydzielone przez administratora z puli mesh · job treningowy trafia na node z dostępnym grantem</div>
         </div>
 
         <!-- Ostatnie joby tego projektu -->

@@ -136,7 +136,13 @@ mod serde_array64 {
 // tool catalog). The variant is inserted after SkillsBody, shifting every
 // later variant's CBOR tag value — by the convention above this mandates a
 // handshake bump so old/new node mixes are rejected at handshake.
-pub const SCHEMA_VERSION: u16 = 16;
+// v17 changes (breaking — synchronous peer rollout required): the API key wire
+// layout changed. `ApiKeyCreateRequest` dropped its flat `scopes` field and now
+// carries `key_type` + `subject_id` + `scope_resources: Vec<ResourceRef>`, and
+// `ApiKeySummary` gained required fields (`key_type`, `subject_id`,
+// `subject_label`, `scope_count`, `is_active`). Old peers cannot decode the new
+// struct layout, so the handshake must reject mixed old/new nodes.
+pub const SCHEMA_VERSION: u16 = 17;
 
 // =============================================================================
 // Message kind discriminants
@@ -447,8 +453,7 @@ mod tests {
     fn envelope_direct_round_trip() {
         let env = Envelope::new_direct(42, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
         let bytes = crate::cbor::encode(&env).expect("encode");
-        let decoded: Envelope =
-            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
+        let decoded: Envelope = crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert_eq!(decoded, env);
         assert_eq!(decoded.schema_version, SCHEMA_VERSION);
         assert!(matches!(decoded.routing, Routing::Direct));
@@ -467,8 +472,7 @@ mod tests {
             vec![0xAA, 0xBB],
         );
         let bytes = crate::cbor::encode(&env).expect("encode");
-        let decoded: Envelope =
-            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
+        let decoded: Envelope = crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert_eq!(decoded, env);
         match decoded.routing {
             Routing::Forward { target_node_id } => assert_eq!(target_node_id, [9u8; 32]),
@@ -496,8 +500,7 @@ mod tests {
         let mut env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![]);
         env = env.with_stream_chunk().with_stream_end();
         let bytes = crate::cbor::encode(&env).expect("encode");
-        let decoded: Envelope =
-            crate::cbor::decode::<Envelope>(&bytes).expect("decode");
+        let decoded: Envelope = crate::cbor::decode::<Envelope>(&bytes).expect("decode");
         assert!(decoded.flags.contains(EnvelopeFlags::IS_STREAM_CHUNK));
         assert!(decoded.flags.contains(EnvelopeFlags::IS_STREAM_END));
     }
@@ -523,8 +526,7 @@ mod tests {
     #[test]
     fn corrupted_tail_rejected() {
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
-        let mut bytes = crate::cbor::encode(&env).expect("encode")
-            .to_vec();
+        let mut bytes = crate::cbor::encode(&env).expect("encode").to_vec();
         // Uszkodzenie ostatniego bajtu (relative pointer / len trailer w CBOR)
         if let Some(last) = bytes.last_mut() {
             *last = last.wrapping_add(0x7F);
@@ -607,8 +609,7 @@ mod tests {
             },
         ] {
             let bytes = crate::cbor::encode(&auth).expect("encode");
-            let decoded: SessionAuth =
-                crate::cbor::decode::<SessionAuth>(&bytes).expect("decode");
+            let decoded: SessionAuth = crate::cbor::decode::<SessionAuth>(&bytes).expect("decode");
             assert_eq!(decoded, auth);
         }
     }

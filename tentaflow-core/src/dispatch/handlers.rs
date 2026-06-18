@@ -257,7 +257,13 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         Some(&ctx.state.local_node_id),
     );
 
-    let role = if user.is_admin { "admin" } else { "user" };
+    let role = if user.is_admin || user.role == "admin" {
+        "admin"
+    } else if user.role == "power_user" {
+        "power_user"
+    } else {
+        "user"
+    };
 
     let user_id_bytes = uuid_to_user_id_bytes(&user.id)?;
 
@@ -282,8 +288,10 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
         user_id: user_id_bytes,
         username: user.username,
-        role: if user.is_admin {
+        role: if user.is_admin || user.role == "admin" {
             "admin".into()
+        } else if user.role == "power_user" {
+            "power_user".into()
         } else {
             "user".into()
         },
@@ -344,29 +352,72 @@ pub fn me_preferences_update(
 // =============================================================================
 
 #[handler(variant = "ApiKeyListRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_list_request(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let keys = repository::list_api_keys(&ctx.state.db).map_err(db_err)?;
+    let db = &ctx.state.db;
+    let keys = repository::list_api_keys(db).map_err(db_err)?;
 
     let summaries: Vec<ApiKeySummary> = keys
         .into_iter()
-        .map(|k| ApiKeySummary {
-            key_id: k.key_prefix,
-            name: k.name,
-            created_at_epoch: parse_ts(&k.created_at),
-            last_used_at_epoch: parse_ts_opt(&k.last_used_at),
+        .map(|k| {
+            // subject_label resolves the user/group display name; general keys
+            // carry no subject. scope_count only matters for general keys whose
+            // allowlist lives in resource_permissions keyed by the key uid.
+            let subject_label = match (k.key_type.as_str(), k.subject_id.as_deref()) {
+                ("user", Some(uid)) => repository::get_user_account_by_id(db, uid)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.display_name),
+                ("group", Some(gid)) => repository::get_group_by_id(db, gid)
+                    .ok()
+                    .flatten()
+                    .map(|g| g.name),
+                _ => None,
+            };
+            let scope_count = if k.key_type == "general" {
+                repository::resource_permissions::count_for_subject(db, "api_key", &k.uid)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            ApiKeySummary {
+                key_id: k.uid,
+                name: k.name,
+                created_at_epoch: parse_ts(&k.created_at),
+                last_used_at_epoch: parse_ts_opt(&k.last_used_at),
+                key_type: k.key_type,
+                subject_id: k.subject_id,
+                subject_label,
+                scope_count,
+                is_active: k.is_active,
+            }
         })
         .collect();
 
     Ok(MessageBody::ApiKeyListResponse { keys: summaries })
 }
 
+/// Shared validation for a general key's scope resource. `resource_type` must be
+/// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
+/// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
+fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
+    if !matches!(resource_type, "model" | "flow" | "alias") {
+        return Err(ProtocolError::bad_request(
+            "resource_type must be 'model', 'flow' or 'alias'",
+        ));
+    }
+    if resource_id.is_empty() {
+        return Err(ProtocolError::bad_request("resource_id is empty"));
+    }
+    Ok(())
+}
+
 #[handler(variant = "ApiKeyCreateRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_create(
     req: &MessageBody,
@@ -385,35 +436,112 @@ pub fn api_key_create(
         return Err(ProtocolError::bad_request("name must be 1-200 chars"));
     }
 
-    let raw_key = format!("sk-{}", uuid::Uuid::new_v4().simple());
-    let key_hash = auth::hash_api_key(&raw_key);
+    let db = &ctx.state.db;
+
+    // Resolve the key's subject per type. Fail-closed: a user/group key that does
+    // not resolve to an existing, active subject must never be created, otherwise
+    // the /v1 gate would later reject it as anonymous — better to refuse here.
+    let subject_id: Option<String> = match payload.key_type.as_str() {
+        "user" => {
+            let uid = payload
+                .subject_id
+                .as_deref()
+                .ok_or_else(|| ProtocolError::bad_request("key_type='user' requires subject_id"))?;
+            let user = repository::get_user_account_by_id(db, uid)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("subject user not found"))?;
+            if !user.is_active {
+                return Err(ProtocolError::bad_request("subject user is not active"));
+            }
+            Some(uid.to_string())
+        }
+        "group" => {
+            let gid = payload.subject_id.as_deref().ok_or_else(|| {
+                ProtocolError::bad_request("key_type='group' requires subject_id")
+            })?;
+            repository::get_group_by_id(db, gid)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("subject group not found"))?;
+            Some(gid.to_string())
+        }
+        "general" => {
+            if payload.subject_id.is_some() {
+                return Err(ProtocolError::bad_request(
+                    "key_type='general' must not carry a subject_id",
+                ));
+            }
+            None
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "key_type must be 'user', 'group' or 'general'",
+            ));
+        }
+    };
+
+    // General keys may seed an explicit allowlist. Validate resource types up
+    // front so a bad request cannot leave a half-created key with no scopes.
+    if payload.key_type != "general" && !payload.scope_resources.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "scope_resources only valid for key_type='general'",
+        ));
+    }
+    for r in &payload.scope_resources {
+        validate_scope_resource(&r.resource_type, &r.resource_id)?;
+    }
+
+    // Token = "sk-" + 256-bit CSPRNG hex (NOT a UUID). Only the HMAC verifier is
+    // persisted; the raw token is returned once and never stored.
+    let mut token_bytes = [0u8; 32];
+    getrandom::fill(&mut token_bytes).expect("OS RNG fill_bytes");
+    let mut token_hex = String::with_capacity(token_bytes.len() * 2);
+    for b in token_bytes.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(token_hex, "{:02x}", b);
+    }
+    let raw_key = format!("sk-{}", token_hex);
+    let pepper =
+        repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
     let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
 
-    let id = repository::create_api_key(&ctx.state.db, &key_hash, &key_prefix, &payload.name, 60)
-        .map_err(db_err)?;
+    let scopes: Vec<(String, String)> = if payload.key_type == "general" {
+        payload
+            .scope_resources
+            .iter()
+            .map(|r| (r.resource_type.clone(), r.resource_id.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        user_id.as_deref(),
-        None,
-        "apikey.create",
-        Some(&format!("apikey:{}", id)),
-        Some(&payload.name),
-        None,
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    // Key INSERT, scope seeding and the audit entry commit in ONE transaction: a
+    // scope failure rolls the whole thing back, so no half-created key survives.
+    let (_id, uid) = repository::create_api_key_with_scopes(
+        db,
+        &key_verifier,
+        &key_prefix,
+        &payload.name,
+        &payload.key_type,
+        subject_id.as_deref(),
+        60,
+        &scopes,
+        actor.as_deref(),
         Some(&ctx.state.local_node_id),
-    );
+    )
+    .map_err(db_err)?;
 
     Ok(MessageBody::ApiKeyCreateResponseBody(
         ApiKeyCreateResponse {
-            key_id: key_prefix,
+            key_id: uid,
             token: raw_key,
         },
     ))
 }
 
 #[handler(variant = "ApiKeyRevokeRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn api_key_revoke(
     req: &MessageBody,
@@ -428,30 +556,240 @@ pub fn api_key_revoke(
         }
     };
 
-    // key_id z protocolu to key_prefix (np. "sk-...abc123") — query po prefix.
-    let keys = repository::list_api_keys(&ctx.state.db).map_err(db_err)?;
-    let target = keys
-        .iter()
-        .find(|k| k.key_prefix == *key_id)
-        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
-
-    let affected = repository::delete_api_key(&ctx.state.db, target.id).map_err(db_err)?;
+    // key_id z protocolu to stabilny uid klucza (NIE key_prefix — ten jest
+    // wylacznie do wyswietlania i moze kolidowac miedzy kluczami).
+    let affected = repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
+    if affected == 0 {
+        return Err(ProtocolError::not_found("api key not found"));
+    }
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
-    let _ = repository::log_audit(
+    repository::log_audit(
         &ctx.state.db,
         user_id.as_deref(),
         None,
         "apikey.delete",
-        Some(&format!("apikey:{}", target.id)),
+        Some(&format!("apikey:{}", key_id)),
         None,
         None,
         Some(&ctx.state.local_node_id),
-    );
+    )
+    .map_err(db_err)?;
 
     Ok(MessageBody::ApiKeyRevokeResponse {
         deleted: affected > 0,
     })
+}
+
+// =============================================================================
+// API key scope (general keys) + rotation — admin-only
+// =============================================================================
+
+/// Resolves a general key by uid; rejects non-existent or non-general keys so a
+/// scope operation cannot silently attach an allowlist to a user/group key.
+fn require_general_key(
+    ctx: &HandlerContext,
+    key_uid: &str,
+) -> Result<crate::db::models::DbApiKey, ProtocolError> {
+    let key = repository::get_api_key_by_uid(&ctx.state.db, key_uid)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
+    if key.key_type != "general" {
+        return Err(ProtocolError::bad_request(
+            "scope operations are only valid for general keys",
+        ));
+    }
+    Ok(key)
+}
+
+#[handler(variant = "ApiKeyScopeListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ApiKeyScopeListRequest { key_uid } => key_uid,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_list expected ApiKeyScopeListRequest variant",
+            ));
+        }
+    };
+    require_general_key(ctx, key_uid)?;
+    let rows =
+        repository::resource_permissions::list_for_subject(&ctx.state.db, "api_key", key_uid)
+            .map_err(db_err)?;
+    let entries = rows
+        .into_iter()
+        .map(|r| tentaflow_protocol::PermissionEntry {
+            resource_type: r.resource_type,
+            resource_id: r.resource_id,
+            subject_type: r.subject_type,
+            subject_id: r.subject_id,
+            access_level: r.access_level,
+        })
+        .collect();
+    Ok(MessageBody::ApiKeyScopeListResponse { entries })
+}
+
+#[handler(variant = "ApiKeyScopeSetRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (key_uid, resource_type, resource_id, access_level) = match req {
+        MessageBody::ApiKeyScopeSetRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+            access_level,
+        } => (key_uid, resource_type, resource_id, access_level),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_set expected ApiKeyScopeSetRequest variant",
+            ));
+        }
+    };
+    validate_scope_resource(resource_type, resource_id)?;
+    require_general_key(ctx, key_uid)?;
+    repository::resource_permissions::set(
+        &ctx.state.db,
+        resource_type,
+        resource_id,
+        "api_key",
+        key_uid,
+        access_level,
+    )
+    .map_err(iam_err)?;
+
+    // Audit is mandatory: a successful mutation that cannot be recorded must fail
+    // the request rather than silently drop the trail. The write commits in its own
+    // transaction right after the mutation's (separate repo calls); folding it into
+    // the mutation's tx would mean threading audit through every resource_permissions
+    // repo fn — deferred as too invasive for set/clear. create/revoke ARE in-tx.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        &ctx.state.db,
+        actor.as_deref(),
+        None,
+        "apikey.scope.set",
+        Some(&format!("apikey:{}", key_uid)),
+        Some(&format!(
+            "{}:{}={}",
+            resource_type, resource_id, access_level
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+    Ok(MessageBody::IamBody(tentaflow_protocol::IamPayload::ResOk))
+}
+
+#[handler(variant = "ApiKeyScopeClearRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_scope_clear(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (key_uid, resource_type, resource_id) = match req {
+        MessageBody::ApiKeyScopeClearRequest {
+            key_uid,
+            resource_type,
+            resource_id,
+        } => (key_uid, resource_type, resource_id),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_scope_clear expected ApiKeyScopeClearRequest variant",
+            ));
+        }
+    };
+    validate_scope_resource(resource_type, resource_id)?;
+    require_general_key(ctx, key_uid)?;
+    repository::resource_permissions::clear(
+        &ctx.state.db,
+        resource_type,
+        resource_id,
+        "api_key",
+        key_uid,
+    )
+    .map_err(db_err)?;
+
+    // Audit mandatory (see api_key_scope_set): propagate the failure.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        &ctx.state.db,
+        actor.as_deref(),
+        None,
+        "apikey.scope.clear",
+        Some(&format!("apikey:{}", key_uid)),
+        Some(&format!("{}:{}", resource_type, resource_id)),
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+    Ok(MessageBody::IamBody(tentaflow_protocol::IamPayload::ResOk))
+}
+
+#[handler(variant = "ApiKeyRotateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn api_key_rotate(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let key_uid = match req {
+        MessageBody::ApiKeyRotateRequest { key_uid } => key_uid,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "api_key_rotate expected ApiKeyRotateRequest variant",
+            ));
+        }
+    };
+    let db = &ctx.state.db;
+    // Confirm the key exists before minting a new secret.
+    repository::get_api_key_by_uid(db, key_uid)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("api key not found"))?;
+
+    let mut token_bytes = [0u8; 32];
+    getrandom::fill(&mut token_bytes).expect("OS RNG fill_bytes");
+    let mut token_hex = String::with_capacity(token_bytes.len() * 2);
+    for b in token_bytes.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(token_hex, "{:02x}", b);
+    }
+    let raw_key = format!("sk-{}", token_hex);
+    let pepper =
+        repository::get_or_create_api_key_pepper(db, &ctx.state.settings_cipher).map_err(db_err)?;
+    let key_verifier = auth::api_key_verifier(&raw_key, &pepper);
+    let key_prefix = format!("sk-...{}", &raw_key[raw_key.len() - 6..]);
+
+    let rotated =
+        repository::rotate_api_key(db, key_uid, &key_verifier, &key_prefix).map_err(db_err)?;
+    if !rotated {
+        return Err(ProtocolError::not_found("api key not found"));
+    }
+
+    // Audit mandatory (see api_key_scope_set): propagate the failure.
+    let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    repository::log_audit(
+        db,
+        actor.as_deref(),
+        None,
+        "apikey.rotate",
+        Some(&format!("apikey:{}", key_uid)),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    )
+    .map_err(db_err)?;
+
+    Ok(MessageBody::ApiKeyRotateResponse { token: raw_key })
 }
 
 // =============================================================================
@@ -1100,8 +1438,7 @@ pub fn flow_node_templates_list(
         )
         .unwrap_or_default();
         for a in agents {
-            let default_config =
-                serde_json::json!({ "agent_id": a.id }).to_string();
+            let default_config = serde_json::json!({ "agent_id": a.id }).to_string();
             let label = a.display_name.clone().unwrap_or_else(|| a.name.clone());
             templates.push(tentaflow_protocol::FlowNodeTemplate {
                 id: 0,
@@ -1861,6 +2198,30 @@ pub fn settings_update(
         }
     };
 
+    // Konfigurowalne lokalizacje instalacji — node-local, walidowane i
+    // stosowane na zywo po zapisie.
+    const PATH_SETTING_KEYS: [&str; 3] = ["models_dir", "containers_dir", "cache_dir"];
+    let touches_path_settings = payload
+        .entries
+        .iter()
+        .any(|e| PATH_SETTING_KEYS.contains(&e.key.as_str()));
+
+    // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
+    // odrzucamy caly request, zeby nie zapisac nieuzywalnej lokalizacji.
+    for entry in &payload.entries {
+        if PATH_SETTING_KEYS.contains(&entry.key.as_str()) {
+            let trimmed = entry.value.trim();
+            if !trimmed.is_empty() {
+                if let Err(e) = std::fs::create_dir_all(trimmed) {
+                    return Err(ProtocolError::bad_request(format!(
+                        "Nie można utworzyć katalogu '{}' dla ustawienia '{}': {}",
+                        trimmed, entry.key, e
+                    )));
+                }
+            }
+        }
+    }
+
     let mut applied = 0u32;
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     for entry in &payload.entries {
@@ -1886,6 +2247,22 @@ pub fn settings_update(
             Ok(_) => applied += 1,
             Err(e) => tracing::warn!("settings_update '{}' failed: {}", entry.key, e),
         }
+    }
+
+    // Zastosuj nowe lokalizacje na zywo: odczytaj aktualne 3 wartosci z bazy,
+    // ustaw override i utworz nowe katalogi (idempotentne).
+    if touches_path_settings {
+        let models = repository::get_setting(&ctx.state.db, "models_dir")
+            .ok()
+            .flatten();
+        let containers = repository::get_setting(&ctx.state.db, "containers_dir")
+            .ok()
+            .flatten();
+        let cache = repository::get_setting(&ctx.state.db, "cache_dir")
+            .ok()
+            .flatten();
+        crate::paths::set_path_overrides(models, containers, cache);
+        let _ = crate::paths::ensure_app_dirs();
     }
 
     let _ = repository::log_audit(
@@ -3549,7 +3926,10 @@ pub async fn service_manifest_deploy(
             }
         }
         let resp = iroh
-            .send_command_and_wait(&target, cmd, 30)
+            // 120 s (nie 30): odbiorca embedded (np. MLX na Macu) przy deployu
+            // przebudowuje serwis i może odpowiedzieć z opóźnieniem; krótki timeout
+            // gubił ACK mimo udanego deployu (model wdrożony, UI nie widziało sukcesu).
+            .send_command_and_wait(&target, cmd, 120)
             .await
             .map_err(|e| ProtocolError::internal(e.to_string()))?;
         if !resp.ok {
@@ -3670,8 +4050,10 @@ pub async fn service_manifest_deploy(
     // settings cipher before it flows into the placeholder/deployment/service
     // config_json. The key stays node-local; remote deploys are forwarded with
     // the plaintext key over the encrypted mesh and re-encrypted by the receiver.
-    let user_config =
-        crate::services::deploy::encrypt_api_key_in_config(&user_config, &ctx.state.settings_cipher);
+    let user_config = crate::services::deploy::encrypt_api_key_in_config(
+        &user_config,
+        &ctx.state.settings_cipher,
+    );
 
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
@@ -4014,9 +4396,9 @@ pub async fn deploy_vllm_recommend(
     use crate::deploy::vram_calculator::{
         analyze_gpu_compatibility, analyze_gpu_compatibility_llamacpp, auto_fit_config,
         build_llamacpp_args_string, build_vllm_args_string, estimate_vram, fetch_gguf_spec,
-        fetch_hf_config, fetch_safetensors_total_size,
-        max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config_with_override,
-        AutoFitOutcome, AutoFitRequest, DeployEngine,
+        fetch_hf_config, fetch_safetensors_total_size, max_concurrent_seqs_for_budget,
+        max_context_for_budget, parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest,
+        DeployEngine,
     };
 
     let payload = match req {
@@ -4221,8 +4603,7 @@ pub async fn deploy_vllm_recommend(
                     // Merge our tuned args (gpu-mem, ctx, kv) with the recipe
                     // expert flags; recipe is appended last so dedup last-wins
                     // lets it override on overlap.
-                    let mut toks: Vec<String> =
-                        base.split_whitespace().map(String::from).collect();
+                    let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
                     toks.extend(rargv);
                     toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
                     base = toks.join(" ");
@@ -4353,11 +4734,13 @@ fn to_access_transitions(
 ) -> Vec<tentaflow_protocol::AccessTransition> {
     transitions
         .into_iter()
-        .map(|(addon_id, before, after)| tentaflow_protocol::AccessTransition {
-            addon_id,
-            before,
-            after,
-        })
+        .map(
+            |(addon_id, before, after)| tentaflow_protocol::AccessTransition {
+                addon_id,
+                before,
+                after,
+            },
+        )
         .collect()
 }
 
@@ -4370,7 +4753,11 @@ pub fn alias_consumer_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerListRequest",
+            ))
+        }
     };
     let rows = repository::list_alias_consumers(&ctx.state.db, payload.alias_id).map_err(db_err)?;
     let consumers = rows
@@ -4399,11 +4786,19 @@ pub fn alias_consumer_grant(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerGrantRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerGrantRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerGrantRequest",
+            ))
+        }
     };
-    let transitions =
-        repository::grant_alias_consumer_audited(&ctx.state.db, payload.alias_id, &payload.addon_id, None)
-            .map_err(db_err)?;
+    let transitions = repository::grant_alias_consumer_audited(
+        &ctx.state.db,
+        payload.alias_id,
+        &payload.addon_id,
+        None,
+    )
+    .map_err(db_err)?;
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
         ctx,
@@ -4429,7 +4824,11 @@ pub fn alias_consumer_revoke(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasConsumerRevokeRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasConsumerRevokeRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasConsumerRevokeRequest",
+            ))
+        }
     };
     let transitions = repository::revoke_alias_consumer_audited(
         &ctx.state.db,
@@ -4463,9 +4862,16 @@ pub fn alias_visibility_set(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AliasVisibilitySetRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AliasVisibilitySetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AliasVisibilitySetRequest",
+            ))
+        }
     };
-    if !matches!(payload.visibility.as_str(), "private" | "restricted" | "public") {
+    if !matches!(
+        payload.visibility.as_str(),
+        "private" | "restricted" | "public"
+    ) {
         return Err(ProtocolError::bad_request(
             "visibility must be private/restricted/public",
         ));
@@ -4522,7 +4928,11 @@ pub fn model_visibility_set(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelVisibilitySetRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelVisibilitySetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelVisibilitySetRequest",
+            ))
+        }
     };
     if !matches!(payload.visibility.as_str(), "restricted" | "public") {
         return Err(ProtocolError::bad_request(
@@ -4561,7 +4971,11 @@ pub fn model_consumer_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerListRequest",
+            ))
+        }
     };
     let rows =
         repository::list_model_consumers(&ctx.state.db, &payload.model_id).map_err(db_err)?;
@@ -4591,7 +5005,11 @@ pub fn model_consumer_grant(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerGrantRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerGrantRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerGrantRequest",
+            ))
+        }
     };
     let transitions = repository::grant_model_consumer_audited(
         &ctx.state.db,
@@ -4625,7 +5043,11 @@ pub fn model_consumer_revoke(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelConsumerRevokeRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelConsumerRevokeRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelConsumerRevokeRequest",
+            ))
+        }
     };
     let transitions = repository::revoke_model_consumer_audited(
         &ctx.state.db,
@@ -4659,7 +5081,11 @@ pub fn addon_access_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AddonAccessListRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AddonAccessListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonAccessListRequest",
+            ))
+        }
     };
     let alias_rows =
         repository::list_addon_uses_alias(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
@@ -4723,7 +5149,11 @@ pub fn addon_access_decision(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AddonAccessDecisionRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected AddonAccessDecisionRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonAccessDecisionRequest",
+            ))
+        }
     };
     let approve = match payload.decision.as_str() {
         "approve" => true,
@@ -4767,24 +5197,22 @@ pub fn addon_access_decision(
             }
             .map_err(db_err)?
         }
-        "model" => {
-            if approve {
-                repository::grant_model_consumer_audited(
-                    &ctx.state.db,
-                    &payload.target,
-                    &payload.addon_id,
-                    None,
-                )
-            } else {
-                repository::revoke_model_consumer_audited(
-                    &ctx.state.db,
-                    &payload.target,
-                    &payload.addon_id,
-                    None,
-                )
-            }
-            .map_err(db_err)?
+        "model" => if approve {
+            repository::grant_model_consumer_audited(
+                &ctx.state.db,
+                &payload.target,
+                &payload.addon_id,
+                None,
+            )
+        } else {
+            repository::revoke_model_consumer_audited(
+                &ctx.state.db,
+                &payload.target,
+                &payload.addon_id,
+                None,
+            )
         }
+        .map_err(db_err)?,
         _ => return Err(ProtocolError::bad_request("kind must be alias/model")),
     };
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
@@ -5240,10 +5668,13 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 .map(|latest| latest != &a.package_version)
                 .unwrap_or(false);
             let content_changed = {
-                let catalog_hash =
-                    repository::get_package_bundle_hash(&ctx.state.db, &a.package_id, &a.package_version)
-                        .map_err(db_err)?
-                        .unwrap_or_default();
+                let catalog_hash = repository::get_package_bundle_hash(
+                    &ctx.state.db,
+                    &a.package_id,
+                    &a.package_version,
+                )
+                .map_err(db_err)?
+                .unwrap_or_default();
                 let installed_hash =
                     repository::get_instance_installed_bundle_hash(&ctx.state.db, &a.addon_id)
                         .map_err(db_err)?;
@@ -5957,8 +6388,8 @@ pub async fn skills_hub_search(
             ));
         }
     };
-    let taps_setting = repository::get_setting(&ctx.state.db, SKILLS_HUB_TAPS_SETTING)
-        .map_err(db_err)?;
+    let taps_setting =
+        repository::get_setting(&ctx.state.db, SKILLS_HUB_TAPS_SETTING).map_err(db_err)?;
     // A `source` override scopes to one tap; otherwise enumerate configured taps.
     let taps: Vec<String> = match payload.source.as_deref().filter(|s| !s.is_empty()) {
         Some(src) => vec![src.to_string()],
@@ -5966,12 +6397,11 @@ pub async fn skills_hub_search(
     };
     let query = payload.query.trim().to_lowercase();
 
-    let results = tokio::task::spawn_blocking(move || {
-        crate::skills_hub::search_taps(&taps, &query)
-    })
-    .await
-    .map_err(|e| ProtocolError::internal(format!("hub search task failed: {e}")))?
-    .map_err(|e| ProtocolError::internal(format!("hub search failed: {e}")))?;
+    let results =
+        tokio::task::spawn_blocking(move || crate::skills_hub::search_taps(&taps, &query))
+            .await
+            .map_err(|e| ProtocolError::internal(format!("hub search task failed: {e}")))?
+            .map_err(|e| ProtocolError::internal(format!("hub search failed: {e}")))?;
 
     let results_json = serde_json::to_string(&results)
         .map_err(|e| ProtocolError::internal(format!("hub search encode failed: {e}")))?;
@@ -6028,23 +6458,20 @@ pub async fn skills_hub_import(
 
     let verdict = crate::skills_hub::scan_skill(&parsed.body, &fetched.files);
 
-    let preferred = parsed
-        .name
-        .clone()
-        .unwrap_or_else(|| match &source {
-            crate::skills_hub::HubSource::Github { repo, path, .. } => {
-                if path.is_empty() {
-                    repo.clone()
-                } else {
-                    path.rsplit('/').next().unwrap_or(repo).to_string()
-                }
+    let preferred = parsed.name.clone().unwrap_or_else(|| match &source {
+        crate::skills_hub::HubSource::Github { repo, path, .. } => {
+            if path.is_empty() {
+                repo.clone()
+            } else {
+                path.rsplit('/').next().unwrap_or(repo).to_string()
             }
-            crate::skills_hub::HubSource::Url(url) => url
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .unwrap_or("hub-skill")
-                .to_string(),
-        });
+        }
+        crate::skills_hub::HubSource::Url(url) => url
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or("hub-skill")
+            .to_string(),
+    });
     let name = hub_resolve_name(&ctx.state.db, &preferred)?;
     let description = parsed
         .description
@@ -6237,25 +6664,33 @@ pub async fn skills_curator_run(
     match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRunRequest(_)) => {}
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorRunRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorRunRequest",
+            ));
         }
     }
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
     let model = crate::skills::resolve_model(&ctx.state.db);
     let router = ctx.state.router.clone();
     let call_model = model.clone();
-    let outcome = crate::skills::run_curator_review(&ctx.state.db, Some(&user_id), &model, move |prompt| {
-        Box::pin(async move { crate::skills::router_complete(&router, &call_model, prompt).await })
-    })
-    .await
-    .map_err(|e| ProtocolError::internal(format!("curator review failed: {e}")))?;
+    let outcome =
+        crate::skills::run_curator_review(&ctx.state.db, Some(&user_id), &model, move |prompt| {
+            Box::pin(
+                async move { crate::skills::router_complete(&router, &call_model, prompt).await },
+            )
+        })
+        .await
+        .map_err(|e| ProtocolError::internal(format!("curator review failed: {e}")))?;
 
     audit(
         ctx,
         Some(&user_id),
         "skill.curator_run",
         Some(&format!("snapshot:{}", outcome.snapshot_id)),
-        Some(&format!("{} proposed action(s)", outcome.proposal.actions.len())),
+        Some(&format!(
+            "{} proposed action(s)",
+            outcome.proposal.actions.len()
+        )),
     );
 
     let proposal_json = serde_json::to_string(&outcome.proposal)
@@ -6280,7 +6715,9 @@ pub fn skills_curator_apply(
     let payload = match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorApplyRequest(p)) => p,
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorApplyRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorApplyRequest",
+            ));
         }
     };
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
@@ -6320,16 +6757,22 @@ pub fn skills_curator_rollback(
     let payload = match req {
         MessageBody::SkillsBody(tentaflow_protocol::SkillsPayload::CuratorRollbackRequest(p)) => p,
         _ => {
-            return Err(ProtocolError::bad_request("expected SkillsCuratorRollbackRequest"));
+            return Err(ProtocolError::bad_request(
+                "expected SkillsCuratorRollbackRequest",
+            ));
         }
     };
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
     let audit_fn = |event_kind: &str, resource: Option<&str>, message: Option<&str>| {
         audit(ctx, Some(&user_id), event_kind, resource, message);
     };
-    let restored =
-        crate::skills::rollback_snapshot(&ctx.state.db, &payload.snapshot_id, Some(&user_id), &audit_fn)
-            .map_err(|e| ProtocolError::bad_request(format!("curator rollback failed: {e}")))?;
+    let restored = crate::skills::rollback_snapshot(
+        &ctx.state.db,
+        &payload.snapshot_id,
+        Some(&user_id),
+        &audit_fn,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("curator rollback failed: {e}")))?;
 
     Ok(MessageBody::SkillsBody(
         tentaflow_protocol::SkillsPayload::CuratorRollbackResponse(
@@ -6745,7 +7188,9 @@ pub fn agent_run_detail(
     let actor_id = user_id_to_uuid(&require_user_id(ctx)?);
     let run = repository::get_agent_run(&ctx.state.db, &payload.run_id)
         .map_err(db_err)?
-        .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {}", payload.run_id)))?;
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("agent run not found: {}", payload.run_id))
+        })?;
     // ACL: a non-admin can only read a run whose principal is themselves. A run
     // with no principal (unattended) is admin-only.
     if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor_id.as_str()) {
@@ -6823,7 +7268,11 @@ pub fn agent_permission_reply(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::PermissionReplyRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected AgentPermissionReplyRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AgentPermissionReplyRequest",
+            ))
+        }
     };
     assert_run_reply_access(ctx, &payload.run_id)?;
 
@@ -7170,6 +7619,23 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             for gid in group_ids {
                 let _ = repository::add_user_to_group(db, gid, &user_id);
             }
+            // Bez wiersza org_memberships sesja binary-WS rozwiazuje sie do
+            // org_context=None i wszystkie sciezki filtrowane po org (ML Studio,
+            // kamery, compliance) odrzucaja requesty tego usera. Rola org mapuje
+            // sie z roli konta. Idempotentne przez PK (org_id, user_id).
+            let org_role = match role.as_str() {
+                "admin" => "role-org-admin",
+                "power_user" => "role-org-operator",
+                _ => "role-org-viewer",
+            };
+            crate::services::org::repo::add_membership(
+                db,
+                crate::services::org::DEFAULT_ORG_ID,
+                &user_id,
+                org_role,
+                "system",
+            )
+            .map_err(|e| iam_err(anyhow::anyhow!("org membership: {}", e)))?;
             P::ResCreateUser { user_id }
         }
         P::ReqUpdateUser {
@@ -9016,7 +9482,15 @@ pub async fn service_update(
 fn resolve_external_request_ctx(
     ctx: &HandlerContext,
     row: &crate::services_repo::services::ServiceRow,
-) -> Result<(crate::services::manifest::ApiKind, String, String, Option<String>), String> {
+) -> Result<
+    (
+        crate::services::manifest::ApiKind,
+        String,
+        String,
+        Option<String>,
+    ),
+    String,
+> {
     if row.deploy_method != crate::services_repo::services::DeployMethod::External {
         return Err("service is not an external provider".to_string());
     }
@@ -9172,7 +9646,9 @@ pub async fn service_model_selection(
     if forward_target_node(ctx, &payload.node_id).is_some() {
         return resp(
             false,
-            Some("model selection must be performed on the node that owns the provider".to_string()),
+            Some(
+                "model selection must be performed on the node that owns the provider".to_string(),
+            ),
         );
     }
 
@@ -9208,7 +9684,10 @@ pub async fn service_model_selection(
 
     audit(
         ctx,
-        require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b)).as_deref(),
+        require_user_id(ctx)
+            .ok()
+            .map(|b| user_id_to_uuid(&b))
+            .as_deref(),
         "service.model.selection",
         Some(&row.engine_id),
         Some(&format!("{} models", selected.len())),
@@ -9233,18 +9712,19 @@ pub async fn service_oauth_start(
         }
     };
 
-    let resp = |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
-        Ok(MessageBody::ServiceBody(
-            tentaflow_protocol::ServicePayload::ResOauthStart(
-                tentaflow_protocol::ServiceOauthStartResponse {
-                    flow_id,
-                    authorize_url,
-                    user_code,
-                    error,
-                },
-            ),
-        ))
-    };
+    let resp =
+        |flow_id: String, authorize_url: String, user_code: String, error: Option<String>| {
+            Ok(MessageBody::ServiceBody(
+                tentaflow_protocol::ServicePayload::ResOauthStart(
+                    tentaflow_protocol::ServiceOauthStartResponse {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                        error,
+                    },
+                ),
+            ))
+        };
 
     // The OAuth flow must run on the node that will own the service + tokens.
     // When deploying to a mesh peer, forward the login there (the peer holds the
@@ -9326,7 +9806,11 @@ pub async fn service_oauth_poll(
                     account_label,
                     error,
                 } => poll_resp(status, account_label, error),
-                _ => poll_resp("error".to_string(), None, Some("unexpected mesh response".to_string())),
+                _ => poll_resp(
+                    "error".to_string(),
+                    None,
+                    Some("unexpected mesh response".to_string()),
+                ),
             },
             Err(e) => poll_resp("error".to_string(), None, Some(e)),
         };

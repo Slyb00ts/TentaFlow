@@ -1,0 +1,41 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle natywnego serwera treningowego detekcji (RF-DETR).
+#       server.py uruchamiany przez uvicorn na :8202.
+# Przykład: TentaFlow startuje server.py, a Core wysyła POST /train (COCO).
+# =============================================================================
+
+[bundle]
+engine = "rfdetr-training"
+description = "RF-DETR object detection training server (COCO → fine-tune → ONNX)"
+python_version = "3.12"
+# Zależności pinowane w pyproject. `pypi_package` to identity-package bundla
+# (rfdetr); torch z wariantu CUDA przez install_variants.extra_index.
+source = "pypi"
+pypi_package = "rfdetr==1.7.1"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8202}",
+]
+internal_port = 8202
+
+[requires]
+gpu_memory_gb = 10
+disk_gb = 30
+platforms = ["linux-x86_64"]
+
+# torch z kołami CUDA 12.1 (PyPI domyślnie serwuje wariant CPU). Brak GPU →
+# wariant `cpu`. RF-DETR wymaga GPU realnie do treningu (CPU tylko smoke).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu121"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []

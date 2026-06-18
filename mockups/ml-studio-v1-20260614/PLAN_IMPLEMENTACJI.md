@@ -262,7 +262,42 @@ Mockupy używają surowych `<button>/<input>/<select>` i własnego canvasu — t
 
 ## 10. Świadomie POZA zakresem (na teraz)
 
-- Rozproszony trening multi-node (single-host/sidecar; multi-GPU na jednym hoście OK).
 - Real-time collaborative annotation (jedno-użytkownikowo na start).
 - Wizualizacja architektury sieci/tensorów.
 - Pełny MLOps (lineage/DVC) — minimalne wersjonowanie zbiorów/modeli.
+
+(Rozproszony trening multi-node oraz sync bazy między nodami — PRZENIESIONE DO ZAKRESU, patrz §11.)
+
+---
+
+## 11. WYMAGANIA v2 (2026-06-14) — uprawnienia, miejsce w Aplikacjach, zasoby mesh, sync + trening rozproszony
+
+Cztery twarde wymagania, które rozszerzają architekturę i wymuszają rework S0/S1.
+
+### 11.1 Uprawnienia per-projekt + zaproszenia
+- Projekt ma **właściciela** (twórcę). Domyślnie **każdy widzi TYLKO swoje projekty** (gdzie jest owner lub zaproszonym członkiem). NIE org-shared (to unieważnia model z plastra S0, gdzie `list_projects` filtrował po `org_id`).
+- Właściciel może **zaprosić** innych użytkowników do projektu (rola: owner / editor / viewer). Zaproszeni widzą projekt i działają wg roli.
+- **Backend:** tabela `project_members(project_id, user_id, role, invited_by, created_at)` (owner wpisany przy tworzeniu). `list_projects(user_id)` = `WHERE owner_user_id = ? OR EXISTS member`. Handlery: `project_members_list`, `project_invite`, `project_member_remove`, `project_role_set`. Autoryzacja akcji wg roli (np. tylko owner zaprasza/usuwa).
+- **Mockupy:** `p00` → sekcje „Moje projekty" + „Udostępnione mi" (+ badge właściciela/roli); per-karta akcja „Udostępnij". NOWY ekran `p02-udostepnianie` (członkowie + zaproszenie po użytkowniku/e-mailu + role). `przeglad-projektu` → zakładka/sekcja „Członkowie".
+
+### 11.2 Miejsce w „Aplikacjach", widoczność Power User
+- ML Studio (mimo że moduł rdzenia) ma być w sekcji **Aplikacje** dashboardu, jak `chat.js` — NIE w Integrations/Addons, NIE w Admin-nav. (Rework rejestracji nawigacji z plastra S1.)
+- Widoczny **tylko dla Power Userów i Adminów** (rola/uprawnienie Power User istnieje w core). Gate po roli przy renderowaniu pozycji + na handlerach (`#[policy(...)]` Power User/Admin).
+- **Mockupy:** sidebar pokazuje ML Studio pod nagłówkiem „Aplikacje"; nota o widoczności Power User. (Wzór: jak `chat` jest w Aplikacjach.)
+
+### 11.3 Alokacja zasobów przez Admina — per osoba / grupa / projekt, mesh-wide
+- **Domyślnie NIKT nie ma zasobów** (GPU/CPU/RAM). Można założyć projekt, ale trening wymaga przydzielonych zasobów.
+- Admin przydziela zasoby z **puli WSZYSTKICH nodów mesh**: będąc na node A można przydzielić GPU z node B → subjectowi (user / grupa / projekt). Projekt pokazuje „jakie zasoby przydzielono i z których nodów".
+- **Backend:** rejestr zasobów per-node (z mesh: `node_resources_get` + mesh registry → karty GPU/VRAM/CPU per node). Tabela grantów `resource_grants(grant_id, subject_kind[user|group|project], subject_id, node_id, resource_kind[gpu|cpu|ram], resource_ref, quota, granted_by, created_at)`. Rozstrzyganie efektywnych zasobów usera/projektu = suma grantów (user + jego grupy + projekt). Scheduler treningu wybiera node wg dostępnych grantów.
+- **Mockupy:** NOWY ekran admina `admin-zasoby` (pula nodów mesh z kartami GPU; przydział do user/grupa/projekt; domyślnie pusto). `przeglad-projektu` → sekcja „Zasoby przydzielone" (które GPU/nody). Kreatory treningu (f02/a-trening/c-trening/t02/d03) → wybór z PRZYDZIELONYCH zasobów (jeśli brak → komunikat „brak przydzielonych zasobów, poproś admina").
+
+### 11.4 Sync bazy + trening rozproszony po mesh
+- **`ml_studio.db` synchronizuje się między nodami** (Sync Ledger / Fjall, `sync/core_registry.rs`) — projekty/schematy/modele/zadania widoczne na każdym node usera. Nawet telefon tworzy projekty/uruchamia uczenie; job idzie na node z zasobami. Tabele ML Studio rejestrowane w sync runtime (z Permission/Sync Policy gate — synchronizują się tylko do nodów uprawnionego usera).
+- **Trening rozproszony:** dane przenoszone po mesh na node z zasobami; możliwość podziału (część pipeline'u na jednym node, część na innym). Scheduler mesh-aware (wybór node wg zasobów §11.3). Na laptopie/telefonie część treningów lokalnie.
+- **Backend:** rejestracja tabel ml_studio w `sync/core_registry.rs` (z politykami `replicated_by_permission`); job dispatcher świadomy mesh (mapuje run → node z grantem; przerzut datasetu/artefaktu przez mesh stream, jak frame pickup). To duże, fazowane (patrz nowa Faza 6+).
+- **Mockupy:** ekrany treningu pokazują „node wykonawczy" / „rozproszony na N nodów" + wskaźnik sync; `przeglad-projektu` wskaźnik „zsynchronizowano z mesh".
+
+### 11.5 Wpływ na plan
+- **Rework S0/S1:** (a) `list_projects` per-user + `project_members` + zaproszenia; (b) nawigacja → Aplikacje + gate Power User. To pierwsze do zrobienia po mockupach.
+- **Nowe fazy:** Faza 6 — zasoby mesh (rejestr + granty + UI admina + widok w projekcie). Faza 7 — sync `ml_studio.db` + trening rozproszony mesh-aware.
+- **Nowe mockupy:** `p02-udostepnianie`, `admin-zasoby`; przeróbki: `p00` (moje/udostępnione), `przeglad-projektu` (członkowie + zasoby + sync), ekrany treningu (node/rozproszenie), nawigacja (Aplikacje/Power User), `index.html`.

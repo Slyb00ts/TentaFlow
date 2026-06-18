@@ -551,6 +551,168 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ProjectTypesListResponse(_) => {
                 "MlStudioProjectTypesListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListRequest(_) => {
+                "MlStudioProjectMembersListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMembersListResponse(_) => {
+                "MlStudioProjectMembersListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteRequest(_) => {
+                "MlStudioProjectInviteRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectInviteResponse(_) => {
+                "MlStudioProjectInviteResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveRequest(_) => {
+                "MlStudioProjectMemberRemoveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRemoveResponse(_) => {
+                "MlStudioProjectMemberRemoveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetRequest(_) => {
+                "MlStudioProjectMemberRoleSetRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(_) => {
+                "MlStudioProjectMemberRoleSetResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(_) => {
+                "MlStudioDatasetUploadRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(_) => {
+                "MlStudioDatasetUploadResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(_) => {
+                "MlStudioDatasetUploadChunkRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetUploadChunkResponse(_) => {
+                "MlStudioDatasetUploadChunkResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListRequest(_) => {
+                "MlStudioDatasetsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetsListResponse(_) => {
+                "MlStudioDatasetsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileRequest(_) => {
+                "MlStudioDatasetProfileRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
+                "MlStudioDatasetProfileResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TabularTrainRequest(_) => {
+                "MlStudioTabularTrainRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TabularTrainResponse(_) => {
+                "MlStudioTabularTrainResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantCreateRequest(_) => {
+                "MlStudioResourceGrantCreateRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantCreateResponse(_) => {
+                "MlStudioResourceGrantCreateResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantsListRequest(_) => {
+                "MlStudioResourceGrantsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantsListResponse(_) => {
+                "MlStudioResourceGrantsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeRequest(_) => {
+                "MlStudioResourceGrantRevokeRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ResourceGrantRevokeResponse(_) => {
+                "MlStudioResourceGrantRevokeResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectResourcesRequest(_) => {
+                "MlStudioProjectResourcesRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectResourcesResponse(_) => {
+                "MlStudioProjectResourcesResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainingRunsListRequest(_) => {
+                "MlStudioTrainingRunsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainingRunsListResponse(_) => {
+                "MlStudioTrainingRunsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ModelsListRequest(_) => {
+                "MlStudioModelsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ModelsListResponse(_) => {
+                "MlStudioModelsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectGrantsListRequest(_) => {
+                "MlStudioProjectGrantsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectGrantsListResponse(_) => {
+                "MlStudioProjectGrantsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStartRequest(_) => {
+                "MlStudioFtTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStartResponse(_) => {
+                "MlStudioFtTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(_) => {
+                "MlStudioFtTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtTrainStatusResponse(_) => {
+                "MlStudioFtTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportRequest(_) => "MlStudioFtExportRequest",
+            tentaflow_protocol::MlStudioPayload::FtExportResponse(_) => "MlStudioFtExportResponse",
+            tentaflow_protocol::MlStudioPayload::FtExportStatusRequest(_) => {
+                "MlStudioFtExportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::FtExportStatusResponse(_) => {
+                "MlStudioFtExportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::FtDeployRequest(_) => "MlStudioFtDeployRequest",
+            tentaflow_protocol::MlStudioPayload::FtDeployResponse(_) => "MlStudioFtDeployResponse",
+            tentaflow_protocol::MlStudioPayload::FtChatRequest(_) => "MlStudioFtChatRequest",
+            tentaflow_protocol::MlStudioPayload::FtChatResponse(_) => "MlStudioFtChatResponse",
+            tentaflow_protocol::MlStudioPayload::RecogTrainStartRequest(_) => {
+                "MlStudioRecogTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStartResponse(_) => {
+                "MlStudioRecogTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStatusRequest(_) => {
+                "MlStudioRecogTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogTrainStatusResponse(_) => {
+                "MlStudioRecogTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(_) => {
+                "MlStudioRecogDatasetRegisterRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterResponse(_) => {
+                "MlStudioRecogDatasetRegisterResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDetectRequest(_) => {
+                "MlStudioRecogDetectRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogDetectResponse(_) => {
+                "MlStudioRecogDetectResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImagesListRequest(_) => {
+                "MlStudioRecogImagesListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImagesListResponse(_) => {
+                "MlStudioRecogImagesListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImageRequest(_) => {
+                "MlStudioRecogImageRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImageResponse(_) => {
+                "MlStudioRecogImageResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsRequest(_) => {
+                "MlStudioRecogSaveAnnotationsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsResponse(_) => {
+                "MlStudioRecogSaveAnnotationsResponse"
+            }
         },
         MessageBody::RobotsBody(p) => match p {
             tentaflow_protocol::RobotsPayload::ListRequest(_) => "RobotsListRequest",
@@ -581,7 +743,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::SkillsPayload::HubRejectResponse(_) => "SkillsHubRejectResponse",
             tentaflow_protocol::SkillsPayload::CuratorRunRequest(_) => "SkillsCuratorRunRequest",
             tentaflow_protocol::SkillsPayload::CuratorRunResponse(_) => "SkillsCuratorRunResponse",
-            tentaflow_protocol::SkillsPayload::CuratorApplyRequest(_) => "SkillsCuratorApplyRequest",
+            tentaflow_protocol::SkillsPayload::CuratorApplyRequest(_) => {
+                "SkillsCuratorApplyRequest"
+            }
             tentaflow_protocol::SkillsPayload::CuratorApplyResponse(_) => {
                 "SkillsCuratorApplyResponse"
             }
@@ -702,7 +866,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::ServicePayload::ReqModelCatalog(_) => "ServiceModelCatalogRequest",
             tentaflow_protocol::ServicePayload::ResModelCatalog(_) => "ServiceModelCatalogResponse",
-            tentaflow_protocol::ServicePayload::ReqModelSelection(_) => "ServiceModelSelectionRequest",
+            tentaflow_protocol::ServicePayload::ReqModelSelection(_) => {
+                "ServiceModelSelectionRequest"
+            }
             tentaflow_protocol::ServicePayload::ResModelSelection(_) => {
                 "ServiceModelSelectionResponse"
             }
@@ -1137,6 +1303,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
         },
         MessageBody::Error(_) => "Error",
+        MessageBody::ApiKeyScopeListRequest { .. } => "ApiKeyScopeListRequest",
+        MessageBody::ApiKeyScopeListResponse { .. } => "ApiKeyScopeListResponse",
+        MessageBody::ApiKeyScopeSetRequest { .. } => "ApiKeyScopeSetRequest",
+        MessageBody::ApiKeyScopeClearRequest { .. } => "ApiKeyScopeClearRequest",
+        MessageBody::ApiKeyRotateRequest { .. } => "ApiKeyRotateRequest",
+        MessageBody::ApiKeyRotateResponse { .. } => "ApiKeyRotateResponse",
     }
 }
 
@@ -1653,8 +1825,19 @@ mod tests {
             org_context: None,
         };
 
-        // R-LIST — empty test DB → empty Vec, valid response.
-        let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_user).await;
+        // R-LIST — admin-only now; empty test DB → empty Vec, valid response.
+        let ctx_admin = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_bytes,
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 101,
+            connection_id: 0,
+            resume_secret: None,
+            state: state::AppState::for_test(),
+            org_context: None,
+        };
+        let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_admin).await;
         assert!(!r_list.1);
         assert!(matches!(r_list.0, MessageBody::ApiKeyListResponse { .. }));
 
@@ -1718,7 +1901,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
-                role: None,
+                role: Some("admin".to_string()),
             },
             correlation_id: 7,
             connection_id: 0,
@@ -1749,6 +1932,29 @@ mod tests {
         }
     }
 
+    /// API key handlers are admin-only (plaster 5): a non-admin user session must
+    /// be rejected by the policy gate, not the handler body.
+    #[tokio::test]
+    async fn dispatch_policy_denies_non_admin_for_api_key_list() {
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("power_user".to_string()),
+            },
+            correlation_id: 81,
+            connection_id: 0,
+            resume_secret: None,
+            state: state::AppState::for_test(),
+            org_context: None,
+        };
+        let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+            _ => panic!("expected PolicyDenied error"),
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_model_list_allows_anonymous() {
         let ctx = HandlerContext {
@@ -1764,7 +1970,11 @@ mod tests {
         assert!(matches!(resp, MessageBody::ModelListResponse { .. }));
     }
 
-    fn agents_ctx(role: &str, user_id: [u8; 16], state: std::sync::Arc<state::AppState>) -> HandlerContext {
+    fn agents_ctx(
+        role: &str,
+        user_id: [u8; 16],
+        state: std::sync::Arc<state::AppState>,
+    ) -> HandlerContext {
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id,
@@ -1789,7 +1999,9 @@ mod tests {
 
     #[tokio::test]
     async fn agents_upsert_then_list_and_detail_round_trip() {
-        use tentaflow_protocol::{AgentsDetailRequest, AgentsListRequest, AgentsPayload, AgentsUpsertRequest};
+        use tentaflow_protocol::{
+            AgentsDetailRequest, AgentsListRequest, AgentsPayload, AgentsUpsertRequest,
+        };
         let state = state::AppState::for_test();
         let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
 
@@ -1862,7 +2074,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_runs_list_filters_to_own_principal_for_non_admin() {
-        use tentaflow_protocol::{AgentsPayload, AgentRunsListRequest};
+        use tentaflow_protocol::{AgentRunsListRequest, AgentsPayload};
         let state = state::AppState::for_test();
         // Seed an agent + two runs owned by two different principals.
         let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
@@ -1939,7 +2151,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_run_detail_hidden_from_other_principal() {
-        use tentaflow_protocol::{AgentsPayload, AgentRunDetailRequest};
+        use tentaflow_protocol::{AgentRunDetailRequest, AgentsPayload};
         let state = state::AppState::for_test();
         let owner = uuid::Uuid::from_bytes([7u8; 16]).to_string();
         let params = crate::db::models::AgentParams {
@@ -1992,7 +2204,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_reply_delivers_for_owner_and_is_acl_gated() {
-        use tentaflow_protocol::{AgentPermissionReplyRequest, AgentRunReplyRequest, AgentsPayload};
+        use tentaflow_protocol::{
+            AgentPermissionReplyRequest, AgentRunReplyRequest, AgentsPayload,
+        };
         let state = state::AppState::for_test();
         let owner_bytes = [42u8; 16];
         let owner = uuid::Uuid::from_bytes(owner_bytes).to_string();
@@ -2048,25 +2262,23 @@ mod tests {
 
         // A stranger may not answer it — NotFound (no existence leak).
         let stranger = agents_ctx("user", [7u8; 16], state.clone());
-        let strange_req = MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(
-            AgentRunReplyRequest {
+        let strange_req =
+            MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(AgentRunReplyRequest {
                 run_id: "run-ask".into(),
                 question_id: "q-1".into(),
                 answer: "a".into(),
-            },
-        ));
+            }));
         let (_resp, is_err) = dispatch(&strange_req, &stranger).await;
         assert!(is_err, "stranger must be denied");
 
         // The owner's reply is delivered.
         let owner_ctx = agents_ctx("user", owner_bytes, state.clone());
-        let owner_req = MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(
-            AgentRunReplyRequest {
+        let owner_req =
+            MessageBody::AgentsBody(AgentsPayload::RunReplyRequest(AgentRunReplyRequest {
                 run_id: "run-ask".into(),
                 question_id: "q-1".into(),
                 answer: "a".into(),
-            },
-        ));
+            }));
         let (resp, is_err) = dispatch(&owner_req, &owner_ctx).await;
         assert!(!is_err);
         match resp {
@@ -2100,7 +2312,8 @@ mod tests {
         // Admin-only: the catalog discloses every addon's tool surface and its
         // sole consumer is the admin-gated agent editor (handler #[policy(Admin)]).
         let admin = agents_ctx("admin", [5u8; 16], state.clone());
-        let req = MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
+        let req =
+            MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
         let (resp, is_err) = dispatch(&req, &admin).await;
         assert!(!is_err);
         let catalog: serde_json::Value = match resp {
@@ -2119,7 +2332,8 @@ mod tests {
         use tentaflow_protocol::{AgentsPayload, ToolsCatalogRequest};
         let state = state::AppState::for_test();
         let user = agents_ctx("user", [6u8; 16], state.clone());
-        let req = MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
+        let req =
+            MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
         let (resp, is_err) = dispatch(&req, &user).await;
         assert!(is_err, "non-admin must be denied the tools catalog");
         match resp {
@@ -2156,10 +2370,11 @@ mod tests {
         let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
         // A loopback target never leaves the box — the public-URL guard denies it
         // before any socket is opened.
-        let req = MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
-            source: "https://127.0.0.1/SKILL.md".to_string(),
-            git_ref: None,
-        }));
+        let req =
+            MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
+                source: "https://127.0.0.1/SKILL.md".to_string(),
+                git_ref: None,
+            }));
         let (resp, is_err) = dispatch(&req, &admin).await;
         assert!(is_err, "private URL must be rejected");
         match resp {
@@ -2180,10 +2395,11 @@ mod tests {
         use tentaflow_protocol::{SkillsHubImportRequest, SkillsPayload};
         let state = state::AppState::for_test();
         let user = agents_ctx("user", [7u8; 16], state.clone());
-        let req = MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
-            source: "acme/skills/x".to_string(),
-            git_ref: None,
-        }));
+        let req =
+            MessageBody::SkillsBody(SkillsPayload::HubImportRequest(SkillsHubImportRequest {
+                source: "acme/skills/x".to_string(),
+                git_ref: None,
+            }));
         let (resp, is_err) = dispatch(&req, &user).await;
         assert!(is_err);
         match resp {
@@ -2200,9 +2416,10 @@ mod tests {
         let skill_id = "11111111-1111-4111-8111-111111111111";
         seed_quarantine_hub_skill(&state.db, skill_id, "imported-skill");
 
-        let req = MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
-            skill_id: skill_id.to_string(),
-        }));
+        let req =
+            MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
+                skill_id: skill_id.to_string(),
+            }));
         let (resp, is_err) = dispatch(&req, &admin).await;
         assert!(!is_err, "approve failed: {:?}", resp);
         match resp {
@@ -2229,11 +2446,10 @@ mod tests {
         let skill_id = "22222222-2222-4222-8222-222222222222";
         seed_quarantine_hub_skill(&state.db, skill_id, "already-active");
         // First approval activates it; a second must be refused (not quarantine).
-        let approve = MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(
-            SkillsHubApproveRequest {
+        let approve =
+            MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
                 skill_id: skill_id.to_string(),
-            },
-        ));
+            }));
         let (_resp, is_err) = dispatch(&approve, &admin).await;
         assert!(!is_err);
         let (resp, is_err) = dispatch(&approve, &admin).await;
@@ -2249,9 +2465,10 @@ mod tests {
         let skill_id = "33333333-3333-4333-8333-333333333333";
         seed_quarantine_hub_skill(&state.db, skill_id, "to-reject");
 
-        let req = MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
-            skill_id: skill_id.to_string(),
-        }));
+        let req =
+            MessageBody::SkillsBody(SkillsPayload::HubRejectRequest(SkillsHubRejectRequest {
+                skill_id: skill_id.to_string(),
+            }));
         let (resp, is_err) = dispatch(&req, &admin).await;
         assert!(!is_err, "reject failed: {:?}", resp);
         match resp {

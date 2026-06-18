@@ -1,0 +1,22 @@
+# Pinowane wheels dla bundla autogluon-training. Te same wersje co obraz Docker
+# (training/docker/autogluon-training/Dockerfile).
+#
+# LEAN, tabular-only. Używamy `autogluon.tabular` z extrasami drzew (lightgbm,
+# catboost, xgboost) — NIE meta `autogluon`, które ciągnęłoby multimodal/
+# timeseries.
+#
+# torch przypięty JAWNIE i BEZ lokalnego sufixu +cu121 — `--extra-index-url` z
+# bundle.toml install_variants decyduje który wheel torcha uv pobierze:
+#   * variant `cuda` + extra_index cu121 -> torch-2.4.1+cu121-...whl (GPU NVIDIA)
+#   * variant `cpu`  (brak extra_index)  -> torch-2.4.1-...-manylinux (CPU)
+# Jawny pin jest konieczny, bo torch wchodzi tu tranzytywnie przez
+# autogluon.tabular — bez niego extra_index nie miałby na czym zadziałać.
+torch==2.4.1
+autogluon.tabular[lightgbm,catboost,xgboost]==1.4.0
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pandas==2.2.3
+scikit-learn==1.5.2
+numpy==1.26.4
+openpyxl==3.1.5
+python-multipart==0.0.12

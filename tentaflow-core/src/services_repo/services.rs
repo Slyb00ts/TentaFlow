@@ -293,6 +293,43 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
     Ok(rows)
 }
 
+/// Lists running services in a given category, optionally narrowed to a single
+/// `engine_id`. Used to resolve a live engine endpoint (np. silnik treningu
+/// AutoGluon) bez przeszukiwania całej tabeli — zwraca wyłącznie `running`.
+pub fn list_by_category(
+    conn: &Connection,
+    category: &str,
+    engine_id: Option<&str>,
+) -> Result<Vec<ServiceRow>> {
+    let rows = match engine_id {
+        Some(eid) => {
+            let sql = format!(
+                "SELECT {} FROM services WHERE category = ?1 AND status = 'running' \
+                 AND engine_id = ?2 ORDER BY id ASC",
+                SELECT_COLUMNS
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![category, eid], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+        None => {
+            let sql = format!(
+                "SELECT {} FROM services WHERE category = ?1 AND status = 'running' \
+                 ORDER BY id ASC",
+                SELECT_COLUMNS
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![category], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        }
+    };
+    Ok(rows)
+}
+
 /// Lists services that the supervisor must keep watch over: runtime states
 /// after deployment has produced an executable endpoint. Terminal states are
 /// excluded — they require an explicit user action to come back online.
