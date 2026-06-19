@@ -16,7 +16,7 @@ version = "1.7.4"
 [deploy.docker]
 context_path = "stt/docker/whisper"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 # Apple (macOS/iOS) pominiete — tam STT idzie WYLACZNIE przez mlx-whisper

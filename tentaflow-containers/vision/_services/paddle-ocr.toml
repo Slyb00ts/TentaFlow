@@ -32,7 +32,7 @@ bundle_path = "vision/python/paddle-ocr"
 [deploy.docker]
 context_path = "vision/docker/paddle-ocr"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [[model_preset]]
 id = "pp-ocrv5-server"

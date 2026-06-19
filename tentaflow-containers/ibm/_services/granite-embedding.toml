@@ -19,7 +19,7 @@ dgx_spark = false
 [deploy.docker]
 context_path = "ibm/docker/granite-embedding"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [[model_preset]]
 id = "granite-embedding-30m-english"

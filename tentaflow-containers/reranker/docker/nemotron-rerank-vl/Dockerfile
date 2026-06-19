@@ -1,26 +1,13 @@
 # =============================================================================
 # Plik: Dockerfile
 # Opis: Obraz NVIDIA Llama-Nemotron Rerank VL = vLLM 0.23.0 (PyPI wheels) w
-#       trybie score/rerank (--task score) + sidecar TentaFlow. Multimodalny
-#       cross-encoder (Eagle VLM: Llama 3.2 1B + SigLIP2). vLLM nasluchuje
-#       OpenAI API na 127.0.0.1:8000 (/v1/rerank, /v1/score), sidecar QUIC.
+#       trybie score/rerank (--task score), direct-http (bez sidecara).
+#       Multimodalny cross-encoder (Eagle VLM: Llama 3.2 1B + SigLIP2). vLLM
+#       nasluchuje OpenAI API na 0.0.0.0:${VLLM_PORT} (/v1/rerank, /v1/score);
+#       Core gada HTTP wprost.
 # =============================================================================
 
-# --- Stage 1: sidecar z Rust ---
-FROM rust:slim-bookworm AS sidecar-builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev cmake build-essential \
-    && rm -rf /var/lib/apt/lists/*
-COPY tentaflow-protocol /build/tentaflow-protocol
-COPY tentaflow-transport /build/tentaflow-transport
-COPY vendor /build/vendor
-COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
-WORKDIR /build/tentaflow-containers/sidecar
-RUN cargo build --release --bin tentaflow-sidecar \
-    && cp target/release/tentaflow-sidecar /tentaflow-sidecar
-
-# --- Stage 2: vLLM z PyPI ---
+# --- vLLM z PyPI ---
 # CUDA 13.0 + cudnn runtime — vLLM 0.23.0 wymaga PyTorch 2.11 + cu130.
 # Runtime variant (nie devel) bo nie kompilujemy z source — wheels z PyPI maja
 # prebuilt extensions (vllm, xformers, flashinfer).
@@ -49,14 +36,10 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
-COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/reranker/docker/nemotron-rerank-vl/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/reranker/docker/nemotron-rerank-vl/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 5000/udp
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
-    CMD pgrep tentaflow-sidecar || exit 1
+    CMD curl -fsS "http://127.0.0.1:${VLLM_PORT:-8000}/health" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

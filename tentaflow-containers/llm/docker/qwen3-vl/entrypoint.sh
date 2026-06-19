@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: Uruchamia sidecar QUIC + vLLM w trybie generacyjnym chat z obsluga
-#       obrazow (Qwen3-VL) rownolegle. Sidecar nasluchuje iroh natychmiast;
-#       vLLM laduje multimodalny model w tle i serwuje /v1/chat/completions dla
-#       tekstu i obrazow. Flagi --trust-remote-code oraz --limit-mm-per-prompt
-#       wlaczaja sciezke obrazow w vLLM. Logi obu procesow trafiaja na stdout
-#       z prefixem. PID 1 czeka na pierwszy padly proces, drugi konczy
-#       grzecznie i wychodzi z jego kodem.
+# Opis: vLLM w trybie generacyjnym chat z obsluga obrazow (Qwen3-VL),
+#       direct-http (bez sidecara). vLLM laduje multimodalny model i serwuje
+#       /v1/chat/completions dla tekstu i obrazow. Flagi --trust-remote-code
+#       oraz --limit-mm-per-prompt wlaczaja sciezke obrazow w vLLM. vLLM bind
+#       0.0.0.0:$PORT i biegnie jako PID1.
 # =============================================================================
 
 set -uo pipefail
 
-CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
-[[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
-
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen3-VL-30B-A3B-Instruct'}"
-VLLM_PORT="${VLLM_PORT:-8000}"
+VLLM_PORT="${PORT:-${VLLM_PORT:-8000}}"
 
 # Maksymalna liczba obrazow na pojedynczy request. Konfigurowalne przez env
 # z deploy configu; domyslnie 1 (typowy chat z jednym obrazem).
@@ -53,35 +48,11 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   esac
 fi
 
-echo "[entrypoint] sidecar config=$CONFIG_PATH"
-NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
-  | sed -u 's/^/[sidecar] /' &
-SIDECAR_PID=$!
-echo "[entrypoint] sidecar PID=$SIDECAR_PID"
-
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (chat multimodal, ${#ENGINE_ARGS[@]} args)"
-vllm serve "$MODEL" \
-  --host 127.0.0.1 \
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (chat multimodal, ${#ENGINE_ARGS[@]} args)"
+exec vllm serve "$MODEL" \
+  --host 0.0.0.0 \
   --port "$VLLM_PORT" \
   --trust-remote-code \
   --limit-mm-per-prompt "{\"image\": ${MM_IMAGE_LIMIT}}" \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
-  "${ENGINE_ARGS[@]}" 2>&1 \
-  | sed -u 's/^/[vllm] /' &
-VLLM_PID=$!
-echo "[entrypoint] vllm PID=$VLLM_PID"
-
-cleanup() {
-  echo "[entrypoint] shutdown sidecar=$SIDECAR_PID vllm=$VLLM_PID"
-  kill -TERM "$SIDECAR_PID" 2>/dev/null || true
-  kill -TERM "$VLLM_PID" 2>/dev/null || true
-  wait "$SIDECAR_PID" 2>/dev/null || true
-  wait "$VLLM_PID" 2>/dev/null || true
-}
-trap cleanup SIGTERM SIGINT
-
-wait -n "$SIDECAR_PID" "$VLLM_PID"
-EXIT_CODE=$?
-echo "[entrypoint] proces ($EXIT_CODE) zakonczony - wychodze"
-cleanup
-exit $EXIT_CODE
+  "${ENGINE_ARGS[@]}"

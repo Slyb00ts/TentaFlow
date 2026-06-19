@@ -22,7 +22,7 @@ output_modalities = ["text"]
 [deploy.docker]
 context_path = "llm/docker/vllm"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [[model_preset]]
 id = "granite-vision-3-3-2b"

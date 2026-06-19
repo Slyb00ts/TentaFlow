@@ -27,7 +27,7 @@ output_modalities = ["text"]
 [deploy.docker]
 context_path = "vision/docker/nemotron-yolox"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]

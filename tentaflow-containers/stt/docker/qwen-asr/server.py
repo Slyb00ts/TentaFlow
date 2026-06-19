@@ -42,6 +42,11 @@ def get_model():
     return _model, _processor
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/v1/models")
 def list_models():
     return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]}
