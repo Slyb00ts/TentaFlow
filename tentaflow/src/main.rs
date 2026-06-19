@@ -922,6 +922,15 @@ async fn run_server(args: Args) -> Result<()> {
     // spawn_blocking task), drop running instances. Bez tego proces nie
     // konczyl sie po SIGINT.
     addon_manager.shutdown();
+    // Await the write-behind state flusher's final drain so pending durable
+    // addon state is persisted before the process exits (bounded — a stuck DB
+    // never hangs shutdown).
+    if let Err(e) = addon_manager
+        .await_state_flusher_drain(std::time::Duration::from_secs(10))
+        .await
+    {
+        tracing::warn!("addon state flusher drain on shutdown: {}", e);
+    }
     // Zatrzymaj wszystkie supervised services (native python-bundle / native
     // binary / docker) zanim router shutdown zwolni RwLocki. Bez tego vLLM /
     // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB
