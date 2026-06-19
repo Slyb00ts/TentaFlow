@@ -1,8 +1,11 @@
 # =============================================================================
 # Plik: bundle.toml
-# Opis: Native Python bundle dla Nemotron-OCR (nvidia/nemotron-ocr-v1).
-#       Model jest CUDA-only, wiec jedyny wariant instalacji to cuda (torch z
-#       wheelami CUDA). Uruchamia server.py (FastAPI) z endpointem /ocr.
+# Opis: Native Python bundle dla Nemotron-OCR (nvidia/nemotron-ocr-v1). Model NIE
+#       jest modelem transformers — to pakiet `nemotron-ocr` z repo HF z wlasnym
+#       pipeline'em (detector+recognizer+relational) i rozszerzeniem CUDA C++
+#       (hatch_build → nvcc). Instalujemy go z --no-build-isolation (widzi torch),
+#       z GIT_LFS_SKIP_SMUDGE=1 (klon bez wag LFS; wagi pobiera pipeline w runtime).
+#       Wymaga nvcc na hoscie (toolkit CUDA). Tylko CUDA. server.py wystawia /ocr.
 # =============================================================================
 
 [bundle]
@@ -10,7 +13,7 @@ engine = "nemotron-ocr"
 description = "NVIDIA Nemotron-OCR document OCR server (CUDA only)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "transformers==4.49.0"
+pypi_package = "huggingface_hub"
 
 [launch]
 command = "uvicorn"
@@ -20,13 +23,17 @@ internal_port = 8093
 
 [requires]
 gpu_memory_gb = 8
-disk_gb = 8
+disk_gb = 12
 platforms = ["linux-x86_64", "windows-x86_64"]
 
-# Tylko CUDA — model nie ma sciezki CPU. torch z wheelami CUDA, reszta
-# zaleznosci serwera (pillow, accelerate, fastapi, uvicorn) jako extras.
+# Tylko CUDA — model nie ma sciezki CPU. torch+torchvision z wheelami cu130 +
+# zaleznosci runtime pipeline'u (shapely/pandas/scikit-learn/numpy/pillow) oraz
+# backend buildu (hatchling/setuptools). Sam pakiet nemotron-ocr instalujemy w
+# extras_no_build_isolation, zeby hatch_build widzial zainstalowany torch.
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
-install_hint = "CUDA_VISIBLE_DEVICES=0"
+extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow>=12", "shapely", "pandas", "scikit-learn", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "hatchling", "setuptools"]
+extras_no_build_isolation = ["nemotron-ocr @ git+https://huggingface.co/nvidia/nemotron-ocr-v1#subdirectory=nemotron-ocr"]
+env = { GIT_LFS_SKIP_SMUDGE = "1" }
+install_hint = "CUDA_VISIBLE_DEVICES=0; wymaga nvcc (toolkit CUDA) na hoscie"
