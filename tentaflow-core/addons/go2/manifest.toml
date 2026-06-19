@@ -135,6 +135,12 @@ description = "Rejestracja kamery robota jako źródła (backed) dla podglądu i
 risk = "medium"
 
 [[permission]]
+id = "lidar.publish"
+display_name = "Publikacja chmury punktów LiDAR"
+description = "Publikacja kanonicznej, niezależnej od producenta ramki chmury punktów (spakowane f32) robota do hosta na potrzeby podglądu 3D."
+risk = "low"
+
+[[permission]]
 id = "flow_blocks"
 display_name = "Bloczki Flow"
 description = "Udostępnianie bloczków sterowania robotem (ruch, pozy, akcje, e-stop) w Flow Builderze."

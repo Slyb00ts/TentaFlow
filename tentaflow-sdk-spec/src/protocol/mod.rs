@@ -18,6 +18,7 @@ pub mod flow;
 pub mod frame;
 pub mod gate;
 pub mod ids;
+pub mod lidar;
 pub mod recording;
 pub mod robot;
 pub mod services;

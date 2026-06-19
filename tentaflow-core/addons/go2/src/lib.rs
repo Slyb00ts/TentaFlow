@@ -22,6 +22,7 @@ use serde_json::{json, Value as JsonValue};
 
 use tentaflow_hardware::unitree::go2::protocol;
 use tentaflow_sdk_spec::protocol::control::CborMap;
+use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ};
 use tentaflow_sdk_spec::protocol::ui::{
     actions::Button as ButtonComp,
     bind::BindRef,
@@ -123,6 +124,17 @@ extern "C" {
     fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn lidar_publish_v1(in_ptr: i32, in_len: i32) -> i32;
+}
+
+/// Publish ONE canonical LiDAR frame (packed f32, sdk-spec layout) to the host
+/// LidarLatest holder. A single byte buffer, single host copy; non-fatal on
+/// failure (the next frame retries). Logs a warning on a real ABI error.
+fn publish_lidar_frame(frame: &[u8]) {
+    let ret = unsafe { lidar_publish_v1(frame.as_ptr() as i32, frame.len() as i32) };
+    if ret != 0 {
+        log::warn(&alloc::format!("go2 lidar: publish abi error {ret}"));
+    }
 }
 
 /// Reads an install-time connection param from `addon_config` (scoped to this
@@ -932,6 +944,64 @@ fn count_voxel_points(buf: &[u8]) -> usize {
     buf.iter().map(|b| b.count_ones() as usize).sum()
 }
 
+/// Decode the Go2 voxel-map occupancy bitfield DIRECTLY into a canonical,
+/// vendor-agnostic `LidarFrame` (packed f32, sdk-spec layout) — the format Core
+/// and the renderer consume identically for every robot. This is the path used
+/// on the service tick instead of building a `Vec<[f32;3]>` + JSON.
+///
+/// INVARIANT (the whole point of L1): zero JSON; the output `Vec<u8>` is
+/// PREALLOCATED to exactly `LIDAR_HEADER_LEN + point_count*3*4` from the exact
+/// popcount, so it never grows during the bit-scan, and the whole frame is one
+/// buffer for a single WASM->host copy in `publish_lidar_frame`.
+///
+/// Returns `None` if the occupied count exceeds `LIDAR_MAX_POINTS` (caller logs
+/// + drops the frame — never a partial cloud, which would misplace points).
+fn decode_voxel_to_canonical(
+    decompressed: &[u8],
+    resolution: f32,
+    origin: [f32; 3],
+    frame_seq: u32,
+    ts_us: i64,
+) -> Option<Vec<u8>> {
+    let point_count = count_voxel_points(decompressed);
+    if point_count > LIDAR_MAX_POINTS {
+        return None;
+    }
+    let header = LidarFrameHeader {
+        version: LIDAR_FRAME_VERSION,
+        layout: LIDAR_LAYOUT_XYZ,
+        point_count: point_count as u32,
+        frame_seq,
+        timestamp_us: ts_us,
+        resolution,
+        origin,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(LIDAR_HEADER_LEN + point_count * 3 * 4);
+    out.extend_from_slice(&header.encode_header());
+    let res = resolution;
+    for (i, &byte) in decompressed.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        let z = (i / 0x800) as f32;
+        let n_slice = i % 0x800;
+        let y = (n_slice / 0x10) as f32;
+        let x_base = ((n_slice % 0x10) * 8) as f32;
+        // Bit-scan: only set bits do work. The Go2 grid is MSB-first along x
+        // (bit 0 == 0x80), so reverse the trailing-zero index to recover x.
+        let mut bits = byte;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            bits &= bits - 1;
+            let x = x_base + (7 - b) as f32;
+            out.extend_from_slice(&(x * res + origin[0]).to_le_bytes());
+            out.extend_from_slice(&(y * res + origin[1]).to_le_bytes());
+            out.extend_from_slice(&(z * res + origin[2]).to_le_bytes());
+        }
+    }
+    Some(out)
+}
+
 /// Read a 3-element `[x,y,z]` numeric origin from the lidar frame JSON `data`.
 /// All-or-nothing: a missing/non-numeric element drops the whole origin (we never
 /// place points against a fabricated origin).
@@ -1052,7 +1122,7 @@ fn ingest_voxel_map(raw: &[u8]) {
     // Cheap popcount over the bitfield — the tick NEVER materializes the cloud.
     let point_count = count_voxel_points(&decompressed[..n]);
     let now = db::now_secs();
-    let should_persist = LIDAR.with(|cell| {
+    let (should_persist, frame_seq, enabled) = LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
         l.resolution = Some(resolution_f32);
         l.origin = Some(origin);
@@ -1072,14 +1142,33 @@ fn ingest_voxel_map(raw: &[u8]) {
         let state = (l.enabled, l.frame_seq > 0 && l.point_count > 0);
         let transitioned = state != l.status_persist_state;
         let due = now - l.status_persist_ts >= LIDAR_STATUS_REFRESH_SECS;
-        if transitioned || due {
+        let should = if transitioned || due {
             l.status_persist_state = state;
             l.status_persist_ts = now;
             true
         } else {
             false
-        }
+        };
+        (should, l.frame_seq, l.enabled)
     });
+    // Decode the bitfield DIRECTLY into the canonical packed-f32 frame and publish
+    // it to the host (one preallocated buffer, one WASM->host copy, zero JSON) so
+    // the L2 stream hub / renderer get vendor-agnostic points. Only when LiDAR is
+    // enabled and the grid actually has occupied voxels. db::now_secs has 1s
+    // granularity here; scale to the canonical us field (no sub-second source on
+    // the drain path). A frame above LIDAR_MAX_POINTS is dropped + logged.
+    if enabled && point_count > 0 {
+        match decode_voxel_to_canonical(
+            &decompressed[..n],
+            resolution_f32,
+            [origin[0] as f32, origin[1] as f32, origin[2] as f32],
+            frame_seq as u32,
+            now.saturating_mul(1_000_000),
+        ) {
+            Some(frame) => publish_lidar_frame(&frame),
+            None => log::warn("go2 lidar: frame exceeds LIDAR_MAX_POINTS — not published"),
+        }
+    }
     // Persist the SMALL status (metadata only) so any worker's go2.status /
     // lidar_frame sees the latest availability. The full point cloud stays in the
     // service instance's memory (never persisted — see lidar_frame).
@@ -2468,6 +2557,8 @@ mod host_stubs {
     extern "C" fn camera_grant_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
     #[no_mangle]
     extern "C" fn robot_dispatch_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn lidar_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
     // Native tests can't round-trip the host SQL ABI: it passes pointers as i32,
     // which truncates 64-bit stack addresses → SIGSEGV. Under `#[cfg(test)]` the
     // `db` module routes SQL to its own in-memory `robot_live` store instead, so
@@ -2579,6 +2670,78 @@ mod tests {
             .collect();
         assert_eq!(xs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn decode_voxel_to_canonical_round_trips_points() {
+        // A synthetic grid with K known set bits must decode to a canonical buffer
+        // that (a) parses back to exactly K points, (b) is preallocated EXACTLY
+        // (no spare capacity), and (c) places points at the same coords the JSON
+        // decoder (voxel_bits_to_points) produces.
+        let resolution = 0.05f32;
+        let origin = [1.0f32, -2.0, 0.5];
+        // byte 0 = 0x81 (bits for x=0 and x=7), byte at y-stride 0x10 = 0x01 (x=7,y=1).
+        let mut grid = vec![0u8; 0x20];
+        grid[0] = 0x81; // x=0 and x=7 at y=0,z=0
+        grid[0x10] = 0x01; // x=7 at y=1,z=0
+        let k = count_voxel_points(&grid);
+        assert_eq!(k, 3);
+
+        let frame = decode_voxel_to_canonical(&grid, resolution, origin, 5, 1_234_000_000)
+            .expect("under cap");
+        // Preallocation is EXACT: no growth during the bit-scan.
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + k * 3 * 4);
+        assert_eq!(frame.capacity(), LIDAR_HEADER_LEN + k * 3 * 4);
+
+        let h = LidarFrameHeader::decode_header(&frame).expect("header");
+        assert_eq!(h.point_count as usize, k);
+        assert_eq!(h.frame_seq, 5);
+        assert_eq!(h.timestamp_us, 1_234_000_000);
+        assert_eq!(h.resolution, resolution);
+        assert_eq!(h.origin, origin);
+
+        // Reconstruct points from the packed body and compare to voxel_bits_to_points.
+        let body = &frame[LIDAR_HEADER_LEN..];
+        let mut got: Vec<[f32; 3]> = Vec::new();
+        for i in 0..k {
+            let off = i * 3 * 4;
+            let rd = |o: usize| {
+                f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
+            };
+            got.push([rd(off), rd(off + 4), rd(off + 8)]);
+        }
+        let expected = voxel_bits_to_points(
+            &grid,
+            [origin[0] as f64, origin[1] as f64, origin[2] as f64],
+            resolution,
+        )
+        .expect("ref decode");
+        assert_eq!(got.len(), expected.len());
+        // Point ORDER within a byte differs (the canonical decoder bit-scans
+        // LSB-first for speed; the reference walks MSB-first), but the SET of
+        // points must be identical — compare order-insensitively.
+        let key = |p: &[f32; 3]| {
+            (
+                (p[0] * 1000.0).round() as i64,
+                (p[1] * 1000.0).round() as i64,
+                (p[2] * 1000.0).round() as i64,
+            )
+        };
+        let mut got_keys: Vec<_> = got.iter().map(key).collect();
+        let mut exp_keys: Vec<_> = expected.iter().map(key).collect();
+        got_keys.sort_unstable();
+        exp_keys.sort_unstable();
+        assert_eq!(got_keys, exp_keys);
+    }
+
+    #[test]
+    fn decode_voxel_to_canonical_rejects_over_cap() {
+        // A grid whose popcount exceeds LIDAR_MAX_POINTS must return None (the
+        // caller drops + logs it) — never a partial cloud.
+        let bytes_needed = (LIDAR_MAX_POINTS / 8) + 16;
+        let grid = vec![0xFFu8; bytes_needed];
+        assert!(count_voxel_points(&grid) > LIDAR_MAX_POINTS);
+        assert!(decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0).is_none());
     }
 
     #[test]
