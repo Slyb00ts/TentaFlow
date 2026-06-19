@@ -107,6 +107,13 @@ pub struct BundleMeta {
     /// package, uruchamia sie przez python main.py).
     #[serde(default)]
     pub install_mode: Option<String>,
+    /// Git source + editable: instaluj `requirements.txt` z repo PRZED
+    /// `pip install -e .` i rob editable z `--no-build-isolation`. Wymagane gdy
+    /// `setup.py` importuje wlasny pakiet w czasie buildu (np. SearXNG:
+    /// `from searx.version import VERSION_TAG` ciagnie `import msgspec`), bo
+    /// build-isolation nie widzi runtime deps i build pada na ModuleNotFound.
+    #[serde(default)]
+    pub editable_no_build_isolation: bool,
     /// source="vllm-metal": wersja upstream vllm tarballa z GitHub Releases
     /// (np. "0.19.1"). Wymagana dla tego source.
     #[serde(default)]
@@ -828,6 +835,9 @@ fn template_identity(
     if let Some(mode) = &spec.bundle.install_mode {
         hasher.update(mode.as_bytes());
     }
+    if spec.bundle.editable_no_build_isolation {
+        hasher.update(b"editable_no_build_isolation");
+    }
     if let Some(ver) = &spec.bundle.vllm_version {
         hasher.update(ver.as_bytes());
     }
@@ -1084,6 +1094,19 @@ fn install_deps(
             // Tryb instalacji: editable (domyslne) vs requirements_txt (ComfyUI)
             let mode = spec.bundle.install_mode.as_deref().unwrap_or("editable");
             match mode {
+                "editable" if spec.bundle.editable_no_build_isolation => {
+                    // setup.py importuje wlasny pakiet -> deps musza byc w venv
+                    // PRZED buildem, a build bez izolacji (zeby je widzial).
+                    let req = pkg_dir.join("requirements.txt");
+                    if req.exists() {
+                        installer
+                            .install_requirements(&req)
+                            .context("install repo requirements.txt (przed editable)")?;
+                    }
+                    installer
+                        .install_editable_no_build_isolation(&pkg_dir)
+                        .context("install -e . --no-build-isolation")?;
+                }
                 "editable" => installer
                     .install_editable(&pkg_dir)
                     .context("install -e .")?,
@@ -1534,6 +1557,22 @@ impl<'a> Installer<'a> {
         // (`python setup.py build`, `cmake --build`, `nvcc ...`), wiec user
         // widzi co sie dzieje w tle bez polegania tylko na heartbeacie.
         c.arg("-v");
+        c.arg("-e").arg(path);
+        self.run_install(&mut c)
+    }
+    /// Editable + `--no-build-isolation`: build widzi runtime deps juz
+    /// zainstalowane w venv (setup.py importujacy wlasny pakiet, np. SearXNG).
+    fn install_editable_no_build_isolation(&self, path: &Path) -> Result<()> {
+        (self.log)(&format!(
+            "pip: install -e {} --no-build-isolation (verbose)",
+            path.display()
+        ));
+        let mut c = self.cmd();
+        c.arg("install");
+        self.add_index(&mut c);
+        self.add_install_flags(&mut c);
+        c.arg("-v");
+        c.arg("--no-build-isolation");
         c.arg("-e").arg(path);
         self.run_install(&mut c)
     }
