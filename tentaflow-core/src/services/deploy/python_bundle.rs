@@ -383,6 +383,9 @@ impl DeployStrategy for PythonBundleDeploy {
             instance_name: Some(instance_name.clone()),
             env,
             extra_args,
+            // Bundle wspoldzielony (np. nemotron-yolox dla 3 silnikow) ma engine_id
+            // rozny od nazwy katalogu — przekazujemy jawny bundle_path z manifestu.
+            bundle_subpath: native.bundle_path.clone(),
         };
         let log = self.build_venv_log();
 

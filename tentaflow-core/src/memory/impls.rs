@@ -80,11 +80,19 @@ impl LoadableEngine for PythonBundleEngine {
         if self.is_loaded() {
             return Ok(());
         }
+        // Bundle wspoldzielony (engine_id != nazwa katalogu) wymaga jawnego
+        // bundle_path z manifestu — inaczej respawn po restarcie aplikacji nie
+        // znajduje katalogu bundla (np. nemotron-yolox dla page/graphic/table).
+        let bundle_subpath = crate::services::manifest::registry()
+            .by_id(&self.engine_id)
+            .and_then(|m| m.deploy.native.as_ref())
+            .and_then(|n| n.bundle_path.clone());
         let req = crate::deploy::python_venv::NativeDeployRequest {
             engine: self.engine_id.clone(),
             instance_name: Some(self.instance_name.clone()),
             env: self.env.clone(),
             extra_args: Vec::new(),
+            bundle_subpath,
         };
         let running =
             tokio::task::spawn_blocking(move || crate::deploy::python_venv::relaunch(&req))
