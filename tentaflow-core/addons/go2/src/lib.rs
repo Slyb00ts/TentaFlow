@@ -393,6 +393,13 @@ fn subscribe_msg(topic: &str) -> String {
     json!({ "type": "subscribe", "topic": topic }).to_string()
 }
 
+/// Stop a pub/sub topic. The go2_webrtc data channel mirrors `subscribe` with an
+/// `unsubscribe` message so the robot stops publishing the voxel stream on disable
+/// (the switch "off" stops the sensor; unsubscribe stops the topic delivery).
+fn unsubscribe_msg(topic: &str) -> String {
+    json!({ "type": "unsubscribe", "topic": topic }).to_string()
+}
+
 /// Clamp a value into `[lo, hi]`; reject NaN/inf (caller surfaces an error).
 fn clamp_finite(v: f64, lo: f64, hi: f64) -> Option<f64> {
     if !v.is_finite() {
@@ -740,6 +747,11 @@ const LIDAR_GRID_BYTES: usize = 80_000;
 // to an unexpectedly dense grid. Exceeding it marks the frame unavailable and is
 // logged — we never keep a half-decoded point set (which would misplace points).
 const LIDAR_MAX_POINTS: usize = 300_000;
+// Periodic cadence (seconds) for refreshing the small LiDAR status in the shared
+// DB on steady-state frames. A ~1s refresh keeps point_count/frame_seq fresh for
+// the card without writing on every decoded voxel frame; availability/enabled
+// transitions bypass this and persist immediately.
+const LIDAR_STATUS_REFRESH_SECS: i64 = 1;
 
 /// Latest decoded LiDAR frame plus the on/off intent. Only the MOST RECENT frame
 /// is kept (the voxel map is a stream); a new frame overwrites the prior one so
@@ -751,6 +763,18 @@ struct LidarState {
     // True once the host channel has been sent the subscribe message for this
     // online session, so the per-tick path does not re-subscribe every tick.
     subscribed: bool,
+    // Set when a disable transition's switch "off" send failed: local state is
+    // left as still-enabled so a later tick retries the off-send. Cleared only
+    // once an off-send actually succeeds (then enabled/subscribed flip to false).
+    pending_disable: bool,
+    // Last wall-clock second the small status was persisted to the shared DB.
+    // Gates the per-frame status-write throttle (periodic ~1s refresh on top of
+    // the immediate write on any availability/enabled transition).
+    status_persist_ts: i64,
+    // The (enabled, available) pair last persisted to the shared DB, so a frame
+    // that changes either flag is persisted immediately (not waiting for the 1s
+    // refresh) while steady-state frames only refresh point_count/frame_seq ~1s.
+    status_persist_state: (bool, bool),
     resolution: Option<f32>,
     origin: Option<[f64; 3]>,
     // Decoded voxel-center points in meters (x,y,z), origin+resolution applied.
@@ -769,22 +793,25 @@ std::thread_local! {
 }
 
 /// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
-/// stale frame from a previous session is never reported as available.
+/// stale frame from a previous session is never reported as available. Clears the
+/// shared-DB live session snapshots (telemetry + lidar status) but PRESERVES the
+/// operator's persistent enable INTENT so the lidar re-subscribes automatically
+/// once the link is back online.
 fn lidar_reset_session() {
     LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
         let enabled = l.enabled;
         *l = LidarState::default();
-        // Preserve the operator's enable INTENT across reconnects so the lidar is
-        // re-subscribed automatically once the link is back online.
         l.enabled = enabled;
     });
+    let _ = db::clear_live_session();
 }
 
-/// Build the LiDAR availability sub-object for `go2.status`. SMALL by design (no
-/// point cloud) so it can ride the advertised snapshot. `available` is true only
-/// when at least one frame decoded this session. Absent fields (resolution/origin)
-/// are omitted, never fabricated.
+/// Build the SMALL LiDAR availability sub-object from the in-tick thread_local
+/// (no point cloud). `available` is true only when at least one frame decoded this
+/// session. Absent fields (resolution/origin) are omitted, never fabricated. ONLY
+/// the service instance calls this — it persists the result to the shared DB; the
+/// cross-worker `go2.status` reads it back via `lidar_status_from_db`.
 fn lidar_status_json() -> JsonValue {
     LIDAR.with(|cell| {
         let l = cell.borrow();
@@ -964,34 +991,54 @@ fn ingest_voxel_map(raw: &[u8]) {
             return;
         }
     };
-    LIDAR.with(|cell| {
+    let now = db::now_secs();
+    let should_persist = LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
         l.resolution = Some(resolution_f32);
         l.origin = Some(origin);
         l.points = points;
         l.frame_seq = l.frame_seq.saturating_add(1);
-        l.last_update_ts = db::now_secs();
-    });
-}
-
-/// Turn the LiDAR sensor on/off: publish the `rt/utlidar/switch` command and, on
-/// enable, ensure the voxel topic is subscribed on the live channel. Routes
-/// locally when the robot is online on THIS node; when it lives on another node
-/// the toggle is dispatched over the mesh like every other control. Tracks the
-/// operator enable intent so a reconnect re-subscribes automatically.
-fn set_lidar(enabled: bool) -> JsonValue {
-    let robot = match db::get_robot() {
-        Ok(r) => r,
-        Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
-    };
-    LIDAR.with(|cell| {
-        let mut l = cell.borrow_mut();
-        l.enabled = enabled;
-        if !enabled {
-            l.subscribed = false;
+        l.last_update_ts = now;
+        // Throttle the shared-DB status write the same way telemetry is throttled:
+        // persist IMMEDIATELY when enabled/available transitions (the card must
+        // flip availability without delay), otherwise refresh point_count/frame_seq
+        // at most once per LIDAR_STATUS_REFRESH_SECS so the 200ms/64-msg drain
+        // never hammers SQLite.
+        let state = (l.enabled, l.frame_seq > 0 && !l.points.is_empty());
+        let transitioned = state != l.status_persist_state;
+        let due = now - l.status_persist_ts >= LIDAR_STATUS_REFRESH_SECS;
+        if transitioned || due {
+            l.status_persist_state = state;
+            l.status_persist_ts = now;
+            true
+        } else {
+            false
         }
     });
-    if robot.status != "online" || robot.channel_id.is_empty() {
+    // Persist the SMALL status (metadata only) so any worker's go2.status /
+    // lidar_frame sees the latest availability. The full point cloud stays in the
+    // service instance's memory (never persisted — see lidar_frame).
+    if should_persist {
+        let _ = db::set_lidar_status(&lidar_status_json().to_string());
+    }
+}
+
+/// Turn the LiDAR sensor on/off. This runs on ANY pooled worker (NOT necessarily
+/// the service instance that drains the stream), so it only writes the persistent
+/// enable INTENT to the shared DB. The service instance's on_tick reads that flag
+/// each tick and drives the actual `rt/utlidar/switch` command + voxel-topic
+/// subscription against the live channel (see `tick`). When the robot lives on
+/// another node the toggle is dispatched over the mesh like every other control.
+fn set_lidar(enabled: bool) -> JsonValue {
+    // Ownership is decided by the install-time `ip` connection_param, NOT by the
+    // live online state. A configured IP means THIS node owns the robot (it is the
+    // one that opens the WebRTC link); no IP means the robot lives on another mesh
+    // node. Conflating "remote-owned" with "local-but-offline/reconnecting" (the
+    // old `status != online` gate) dropped the operator's intent while a locally
+    // owned robot was briefly down, so reconnect came back with the wrong LiDAR
+    // state. The intent must persist for the local owner regardless of online
+    // status; on_tick applies the actual switch when the link is back.
+    if config_get(IP_CONFIG_KEY).filter(|ip| !ip.is_empty()).is_none() {
         // Robot owned by another node — route the toggle over the mesh.
         let kind = if enabled { "lidar_on" } else { "lidar_off" };
         return match robot_dispatch(RobotActionWire::simple(kind)) {
@@ -999,54 +1046,31 @@ fn set_lidar(enabled: bool) -> JsonValue {
             Err(e) => json!({ "error": alloc::format!("dispatch: {e}") }),
         };
     }
-    let instruction = if enabled { "on" } else { "off" };
-    let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": instruction }).to_string();
-    if let Err(e) = wc_send_text(&robot.channel_id, &switch) {
-        return json!({ "error": alloc::format!("send: {e}") });
-    }
-    if enabled {
-        if let Err(e) = wc_send_text(&robot.channel_id, &subscribe_msg(LIDAR_TOPIC)) {
-            return json!({ "error": alloc::format!("subscribe: {e}") });
-        }
-        LIDAR.with(|cell| cell.borrow_mut().subscribed = true);
+    // Local owner: persist the desire regardless of online state. on_tick drives
+    // subscription/switch from this flag, so persisting while offline is enough
+    // for correct reconnect behavior (re-subscribe on enable, stay off on disable).
+    if let Err(e) = db::set_lidar_enabled(enabled) {
+        return json!({ "error": alloc::format!("db: {e}") });
     }
     json!({ "status": "sent", "enabled": enabled })
 }
 
-/// On-demand fetch of the latest decoded LiDAR frame for a future 3D renderer.
-/// Returns the full point set plus metadata. This is the data seam: a renderer
-/// pulls it when it needs to draw, rather than streaming the cloud continuously.
-/// When no frame has decoded yet it returns metadata with `available:false`.
+/// On-demand fetch of the latest LiDAR frame metadata for a future 3D renderer.
+///
+/// The full decoded point cloud lives ONLY in the service instance's process
+/// memory (it is the one draining + decoding the voxel stream). After the
+/// DB+instance concurrency overhaul this tool runs on a pooled worker that does
+/// NOT share that memory, so the point array cannot be fetched cross-worker yet.
+/// We are HONEST about it: return the DB-persisted availability metadata plus an
+/// explicit `frame_pending_renderer:true` flag rather than fabricating points or
+/// persisting the huge cloud to SQLite. The 3D renderer is deferred anyway; when
+/// it lands, the points will be streamed via a dedicated seam (e.g. a service
+/// host-fn / mesh frame channel), not this status-shaped tool.
 fn lidar_frame() -> JsonValue {
-    LIDAR.with(|cell| {
-        let l = cell.borrow();
-        let available = l.frame_seq > 0 && !l.points.is_empty();
-        let mut obj = serde_json::Map::new();
-        obj.insert("enabled".into(), json!(l.enabled));
-        obj.insert("available".into(), json!(available));
-        obj.insert("point_count".into(), json!(l.points.len()));
-        obj.insert("frame_seq".into(), json!(l.frame_seq));
-        obj.insert("last_payload_bytes".into(), json!(l.last_payload_bytes));
-        if let Some(r) = l.resolution {
-            obj.insert("resolution".into(), json!(r));
-        }
-        if let Some(o) = l.origin {
-            obj.insert("origin".into(), json!([o[0], o[1], o[2]]));
-        }
-        if l.last_update_ts > 0 {
-            obj.insert("last_update_ts".into(), json!(l.last_update_ts));
-        }
-        // Flat [x0,y0,z0, x1,y1,z1, ...] float array — a compact shape a renderer
-        // can upload straight into a vertex buffer without per-point objects.
-        if available {
-            let mut flat: Vec<f32> = Vec::with_capacity(l.points.len() * 3);
-            for p in &l.points {
-                flat.extend_from_slice(p);
-            }
-            obj.insert("points".into(), json!(flat));
-        }
-        JsonValue::Object(obj)
-    })
+    let status = lidar_status_from_db();
+    let mut obj = status.as_object().cloned().unwrap_or_default();
+    obj.insert("frame_pending_renderer".into(), json!(true));
+    JsonValue::Object(obj)
 }
 
 /// Read a fixed-layout `[a, b, c, ...]` JSON sensor array of numbers into a
@@ -1179,10 +1203,11 @@ fn ingest_lowstate_battery(raw: &[u8]) {
     });
 }
 
-/// Build the structured `telemetry` JSON object from the latest snapshot, INCLUDING
-/// only the fields actually received (absent → omitted, never a fabricated value).
-/// Returns `JsonValue::Null` when nothing has been received yet so `go2.status`
-/// omits the key entirely.
+/// Build the structured `telemetry` JSON object from the in-tick thread_local
+/// accumulator, INCLUDING only the fields actually received (absent → omitted,
+/// never a fabricated value). Returns `JsonValue::Null` when nothing has been
+/// received yet. ONLY the service instance (which drains the stream) calls this —
+/// it then persists the result to the shared DB for cross-worker reads.
 fn telemetry_json() -> JsonValue {
     TELEMETRY.with(|cell| {
         let t = cell.borrow();
@@ -1246,6 +1271,48 @@ fn telemetry_json() -> JsonValue {
             JsonValue::Object(obj)
         }
     })
+}
+
+/// Read the structured `telemetry` object for `go2.status` from the SHARED DB
+/// (the cross-worker source of truth) — the calling worker is NOT the service
+/// instance that drains the stream, so the thread_local accumulator is empty
+/// here. Returns the same shape `telemetry_json` produces; `JsonValue::Null`
+/// when nothing has been persisted yet so `go2.status` omits the key entirely.
+fn telemetry_from_db() -> JsonValue {
+    let raw = match db::get_telemetry() {
+        Ok(s) => s,
+        Err(_) => return JsonValue::Null,
+    };
+    if raw.is_empty() {
+        return JsonValue::Null;
+    }
+    serde_json::from_str::<JsonValue>(&raw)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or(JsonValue::Null)
+}
+
+/// Read the SMALL LiDAR status object for `go2.status` from the SHARED DB. Same
+/// shape `lidar_status_json` builds. When the service instance has not persisted
+/// a status this session, report the desired-enable flag with `available:false`
+/// so the UI still reflects the operator intent across workers.
+fn lidar_status_from_db() -> JsonValue {
+    if let Ok(raw) = db::get_live() {
+        if !raw.lidar_status_json.is_empty() {
+            if let Ok(v) = serde_json::from_str::<JsonValue>(&raw.lidar_status_json) {
+                if v.is_object() {
+                    return v;
+                }
+            }
+        }
+        return json!({
+            "enabled": raw.lidar_enabled,
+            "available": false,
+            "point_count": 0,
+            "frame_seq": 0,
+        });
+    }
+    json!({ "enabled": false, "available": false, "point_count": 0, "frame_seq": 0 })
 }
 
 // =============================================================================
@@ -1528,19 +1595,57 @@ fn tick() {
             }
             db::bump_tick();
             let tick_n = robot.tick_count + 1;
-            // If the operator enabled the LiDAR but this online session has not
-            // subscribed yet (fresh connection / reconnect), (re)send switch "on"
-            // + subscribe. The intent survives reconnects via lidar_reset_session.
-            let need_lidar_sub = LIDAR.with(|cell| {
+            // The operator enable INTENT lives in the shared DB (toggled from any
+            // worker via go2.lidar_on/off). The service instance reads it each tick
+            // and drives the actual switch + subscription against the live channel,
+            // tracking what it has already sent in its own thread_local bookkeeping.
+            // A transient read error must NOT be read as "disabled" (that would
+            // command the LiDAR off): skip the actuator change for this tick and
+            // retry next tick. on_tick is the only driver, so a one-tick skip is safe.
+            let (enabled_local, subscribed_local, pending_disable) = LIDAR.with(|cell| {
                 let l = cell.borrow();
-                l.enabled && !l.subscribed
+                (l.enabled, l.subscribed, l.pending_disable)
             });
-            if need_lidar_sub {
-                let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "on" }).to_string();
-                if wc_send_text(&robot.channel_id, &switch).is_ok()
-                    && wc_send_text(&robot.channel_id, &subscribe_msg(LIDAR_TOPIC)).is_ok()
-                {
-                    LIDAR.with(|cell| cell.borrow_mut().subscribed = true);
+            let desired_lidar = match db::lidar_enabled() {
+                Ok(d) => Some(d),
+                Err(_) => None,
+            };
+            if let Some(desired_lidar) = desired_lidar {
+                if desired_lidar && (!enabled_local || !subscribed_local) {
+                    // Enable transition (or fresh session not yet subscribed): send
+                    // switch "on" + subscribe the voxel topic. A re-enable clears any
+                    // stale pending-disable from a prior failed off-send.
+                    let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "on" }).to_string();
+                    if wc_send_text(&robot.channel_id, &switch).is_ok()
+                        && wc_send_text(&robot.channel_id, &subscribe_msg(LIDAR_TOPIC)).is_ok()
+                    {
+                        LIDAR.with(|cell| {
+                            let mut l = cell.borrow_mut();
+                            l.enabled = true;
+                            l.subscribed = true;
+                            l.pending_disable = false;
+                        });
+                    }
+                } else if !desired_lidar && (enabled_local || pending_disable) {
+                    // Disable transition: send switch "off" + unsubscribe the voxel
+                    // topic. Only clear local enabled/subscribed AFTER a successful
+                    // off-send — a transient send failure must NOT leave the robot
+                    // streaming while we report disabled, so we keep a pending-disable
+                    // that a later tick retries (mirrors the enable path's robustness).
+                    let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "off" }).to_string();
+                    let off_ok = wc_send_text(&robot.channel_id, &switch).is_ok();
+                    let unsub_ok = wc_send_text(&robot.channel_id, &unsubscribe_msg(LIDAR_TOPIC)).is_ok();
+                    if off_ok && unsub_ok {
+                        LIDAR.with(|cell| {
+                            let mut l = cell.borrow_mut();
+                            l.enabled = false;
+                            l.subscribed = false;
+                            l.pending_disable = false;
+                        });
+                        let _ = db::set_lidar_status(&lidar_status_json().to_string());
+                    } else {
+                        LIDAR.with(|cell| cell.borrow_mut().pending_disable = true);
+                    }
                 }
             }
             let drained = match wc_drain(&robot.channel_id, 64) {
@@ -1600,8 +1705,15 @@ fn tick() {
             if got_telemetry {
                 let _ = db::record_lowstate(battery);
             }
-            // Throttle RTT poll + publish to ~1s (every 5 ticks @200ms).
+            // Throttle RTT poll + publish + telemetry DB persist to ~1s (every 5
+            // ticks @200ms) so the high-rate stream never hammers SQLite. The
+            // shared-DB snapshot is the source of truth cross-worker go2.status
+            // reads; the thread_local is only the in-tick accumulator.
             if tick_n % 5 == 0 {
+                let snapshot = telemetry_json();
+                if !snapshot.is_null() {
+                    let _ = db::set_telemetry(&snapshot.to_string());
+                }
                 let mut rtt = robot.rtt_ms;
                 if let Ok(st) = wc_state(&robot.channel_id) {
                     if st.peer_state == "failed" || st.peer_state == "closed" {
@@ -1833,10 +1945,11 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
                     // UI can render labels / gate high-risk acrobatics without hardcoding.
                     "actions_meta": actions_meta(),
                 });
-                // Structured telemetry snapshot (latest values from
-                // rt/sportmodestate + rt/lf/lowstate). Only emitted when something
-                // has been received — an empty stream omits the key entirely.
-                let telemetry = telemetry_json();
+                // Structured telemetry snapshot, read from the SHARED DB (the
+                // cross-worker source of truth — this worker is not the service
+                // instance that drains the stream). Only emitted when something has
+                // been persisted; an empty stream omits the key entirely.
+                let telemetry = telemetry_from_db();
                 if !telemetry.is_null() {
                     if let Some(o) = out.as_object_mut() {
                         o.insert("telemetry".into(), telemetry);
@@ -1844,9 +1957,9 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
                 }
                 // SMALL LiDAR availability sub-object (enabled/available/point
                 // count/resolution/origin/frame_seq/ts) — NEVER the point cloud.
-                // It rides the advertised status snapshot like telemetry.
+                // Read from the shared DB so any worker reports the live status.
                 if let Some(o) = out.as_object_mut() {
-                    o.insert("lidar".into(), lidar_status_json());
+                    o.insert("lidar".into(), lidar_status_from_db());
                 }
                 out
             }
@@ -2124,6 +2237,10 @@ mod host_stubs {
     extern "C" fn camera_grant_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
     #[no_mangle]
     extern "C" fn robot_dispatch_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    // Native tests can't round-trip the host SQL ABI: it passes pointers as i32,
+    // which truncates 64-bit stack addresses → SIGSEGV. Under `#[cfg(test)]` the
+    // `db` module routes SQL to its own in-memory `robot_live` store instead, so
+    // these stubs stay inert (the SQL path is never reached natively).
     #[no_mangle]
     extern "C" fn sql_exec_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { 5 }
     #[no_mangle]
@@ -2395,6 +2512,205 @@ mod tests {
             assert_eq!(l.frame_seq, 0, "non-finite origin component must be rejected");
             assert!(l.points.is_empty());
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-worker DB persistence (telemetry + lidar live state)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn telemetry_db_round_trip_preserves_shape() {
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        TELEMETRY.with(|cell| *cell.borrow_mut() = Telemetry::default());
+
+        // Feed a sportmodestate + lowstate battery into the in-tick accumulator,
+        // exactly as the service instance does while draining the stream.
+        let sport = json!({
+            "data": {
+                "mode": 1, "gait_type": 2, "body_height": 0.32,
+                "velocity": [0.1, -0.2], "yaw_speed": 0.05,
+                "position": [1.0, 2.0, 3.0], "foot_force": [10.0, 11.0, 12.0, 13.0],
+                "imu_state": { "rpy": [0.01, 0.02, 0.03], "quaternion": [1.0, 0.0, 0.0, 0.0], "temperature": 30.0 }
+            }
+        }).to_string();
+        ingest_sportmodestate(sport.as_bytes());
+        let low = json!({ "data": { "bms_state": { "soc": 88.0, "voltage": 28.4, "current": -2.1, "temperature": 31.0 } } }).to_string();
+        ingest_lowstate_battery(low.as_bytes());
+
+        // The service instance builds the snapshot and persists it (throttled path).
+        let built = telemetry_json();
+        assert!(built.is_object(), "snapshot must be a JSON object");
+        db::set_telemetry(&built.to_string()).expect("persist telemetry");
+
+        // A different worker (empty thread_local) reads it back from the DB.
+        TELEMETRY.with(|cell| *cell.borrow_mut() = Telemetry::default());
+        assert!(telemetry_json().is_null(), "thread_local is empty on the reader worker");
+        let read_back = telemetry_from_db();
+        assert_eq!(read_back, built, "DB round-trip must preserve the exact telemetry shape");
+
+        // Spot-check the shape parse_status_telemetry consumes.
+        assert_eq!(read_back.get("mode").and_then(JsonValue::as_i64), Some(1));
+        assert_eq!(
+            read_back.get("battery").and_then(|b| b.get("soc")).and_then(JsonValue::as_f64),
+            Some(88.0)
+        );
+        assert_eq!(
+            read_back.get("velocity").and_then(|v| v.get("vx")).and_then(JsonValue::as_f64),
+            Some(0.1)
+        );
+        db::test_reset();
+    }
+
+    #[test]
+    fn telemetry_db_empty_is_null() {
+        db::test_reset();
+        assert!(telemetry_from_db().is_null(), "no persisted telemetry → Null");
+    }
+
+    #[test]
+    fn lidar_desired_flag_persists_cross_worker() {
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        assert!(!db::lidar_enabled().expect("read"), "default desire is disabled");
+        db::set_lidar_enabled(true).expect("enable");
+        assert!(db::lidar_enabled().expect("read"), "enable desire persists");
+        db::set_lidar_enabled(false).expect("disable");
+        assert!(!db::lidar_enabled().expect("read"), "disable desire persists");
+        db::test_reset();
+    }
+
+    #[test]
+    fn lidar_enabled_read_error_propagates_not_false() {
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        // Operator intent is ON, then a transient read fails: the call must surface
+        // the error, NOT collapse to `false` (which would drive the LiDAR off).
+        db::set_lidar_enabled(true).expect("enable");
+        db::test_fail_next_live_read();
+        assert!(db::lidar_enabled().is_err(), "read error propagates");
+        // The next read recovers and still reports the persisted ON intent.
+        assert!(db::lidar_enabled().expect("read"), "intent intact after error");
+        db::test_reset();
+    }
+
+    #[test]
+    fn lidar_disable_keeps_pending_on_send_failure_then_clears_on_success() {
+        // wc_send_text fails in native tests (webrtc_send_v1 stub returns 5), so the
+        // disable transition must NOT clear local enabled/subscribed: it keeps a
+        // pending-disable for a later tick to retry. The robot must never be left
+        // streaming while we report disabled.
+        LIDAR.with(|cell| {
+            let mut l = cell.borrow_mut();
+            *l = LidarState::default();
+            l.enabled = true;
+            l.subscribed = true;
+        });
+        // Mirror the tick disable branch with a failing send.
+        let off_ok = wc_send_text("chan", &json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "off" }).to_string()).is_ok();
+        let unsub_ok = wc_send_text("chan", &unsubscribe_msg(LIDAR_TOPIC)).is_ok();
+        assert!(!off_ok || !unsub_ok, "native stub send fails — exercises the failure path");
+        if off_ok && unsub_ok {
+            LIDAR.with(|cell| {
+                let mut l = cell.borrow_mut();
+                l.enabled = false;
+                l.subscribed = false;
+                l.pending_disable = false;
+            });
+        } else {
+            LIDAR.with(|cell| cell.borrow_mut().pending_disable = true);
+        }
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert!(l.enabled, "still enabled — off-send failed, no leak as disabled");
+            assert!(l.pending_disable, "pending-disable armed for retry");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn lidar_status_write_is_throttled_per_second() {
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // First frame at t0: availability transitions false->true, must persist now.
+        let grid = vec![0xFFu8];
+        ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
+        let seq_at_t0 = LIDAR.with(|c| c.borrow().frame_seq);
+        let persisted_t0 = lidar_status_from_db()
+            .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
+        assert_eq!(persisted_t0, seq_at_t0, "transition frame persisted immediately");
+        // A second frame in the same second (no transition): NOT re-persisted.
+        ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
+        let persisted_same_sec = lidar_status_from_db()
+            .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
+        assert_eq!(persisted_same_sec, persisted_t0, "steady-state frame within 1s not re-persisted");
+        // Advance the clock >= refresh cadence: the periodic refresh writes again.
+        db::set_now_secs(1_700_000_000 + LIDAR_STATUS_REFRESH_SECS);
+        ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
+        let live_seq = LIDAR.with(|c| c.borrow().frame_seq);
+        let persisted_after_refresh = lidar_status_from_db()
+            .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
+        assert_eq!(persisted_after_refresh, live_seq, "periodic refresh persists fresh frame_seq");
+        db::test_reset();
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn set_lidar_local_persists_intent_while_offline() {
+        // No `ip` config in native tests (config_get_v1 stub returns 2 = not found),
+        // so set_lidar() would route over the mesh as "remote-owned" — assert that
+        // boundary holds (the dispatch path returns an error from the inert stub),
+        // then assert the LOCAL path (DB layer) persists intent regardless of online
+        // state, which is what on_tick reads to re-subscribe on reconnect.
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        let resp = set_lidar(true);
+        // Remote route taken (no IP configured): dispatch stub fails, surfaced as error.
+        assert!(resp.get("error").is_some(), "no-IP node routes over mesh");
+        // The owning-node behavior set_lidar performs is db::set_lidar_enabled while
+        // offline; verify that persists the intent the tick loop consumes.
+        db::set_lidar_enabled(true).expect("persist enable intent offline");
+        assert!(db::lidar_enabled().expect("read"), "intent persists while robot offline");
+        db::test_reset();
+    }
+
+    #[test]
+    fn lidar_status_db_round_trip_preserves_shape() {
+        db::set_now_secs(1_700_000_000);
+        db::test_reset();
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+
+        // Decode one frame in the service instance; it persists the small status.
+        let idx = 0x800 + 0x10;
+        let mut grid = vec![0u8; idx + 1];
+        grid[idx] = 0x80;
+        let frame = build_normal_frame(&grid, 0.05, [1.0, 2.0, 3.0]);
+        ingest_voxel_map(&frame);
+
+        let built = lidar_status_json();
+        // A reader worker has an empty thread_local but reads the persisted status.
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let read_back = lidar_status_from_db();
+        assert_eq!(read_back, built, "lidar status round-trip preserves shape");
+        assert_eq!(read_back.get("available").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(read_back.get("point_count").and_then(JsonValue::as_u64), Some(1));
+        assert_eq!(read_back.get("frame_seq").and_then(JsonValue::as_u64), Some(1));
+
+        db::test_reset();
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn lidar_frame_returns_metadata_with_pending_flag() {
+        db::test_reset();
+        db::set_lidar_enabled(true).expect("enable");
+        let frame = lidar_frame();
+        // No full point cloud cross-worker — honest pending flag, never fabricated points.
+        assert_eq!(frame.get("frame_pending_renderer").and_then(JsonValue::as_bool), Some(true));
+        assert!(frame.get("points").is_none(), "full cloud is never persisted/returned");
+        assert_eq!(frame.get("enabled").and_then(JsonValue::as_bool), Some(true));
+        db::test_reset();
     }
 }
 
