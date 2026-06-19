@@ -482,7 +482,7 @@ async fn read_robot_status(
     let join = tokio::time::timeout(
         STATUS_CALL_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            am.call_tool_preauthorized(&addon, &tool_name, serde_json::Value::Null, "system")
+            am.call_tool_system(&addon, &tool_name, serde_json::Value::Null)
         }),
     )
     .await;
