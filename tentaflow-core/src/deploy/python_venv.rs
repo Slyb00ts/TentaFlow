@@ -2581,6 +2581,7 @@ mod tests {
                 git_ref: None,
                 install_subdir: None,
                 install_mode: None,
+                editable_no_build_isolation: false,
                 vllm_version: None,
                 vllm_metal_repo: None,
             },

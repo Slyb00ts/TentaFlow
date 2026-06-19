@@ -1288,9 +1288,7 @@ fn ingest_sportmodestate(raw: &[u8]) {
 /// when a lowstate frame is the throttled snapshot carrier. Tolerant of the two
 /// documented shapes: a top-level `bms_state` object or a flat layout.
 fn ingest_lowstate_battery(raw: &[u8]) {
-    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
-        return;
-    };
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else { return; };
     let data = v.get("data").unwrap_or(&v);
     let bms = data.get("bms_state").or_else(|| data.get("bms"));
     TELEMETRY.with(|cell| {
@@ -1324,6 +1322,25 @@ fn ingest_lowstate_battery(raw: &[u8]) {
             .and_then(JsonValue::as_f64)
         {
             t.bat_temperature = Some(temp);
+        }
+        // IMU lives in `rt/lf/lowstate` (`data.imu_state.rpy`) on this firmware —
+        // `rt/sportmodestate` is NOT published over WebRTC, so lowstate is the only
+        // live source of orientation. Same `imu_state` shape sportmodestate carries.
+        if let Some(imu) = data.get("imu_state") {
+            if let Some(rpy) = imu.get("rpy").and_then(JsonValue::as_array) {
+                if let Some(r) = rpy.first().and_then(JsonValue::as_f64) {
+                    t.imu_roll = Some(r);
+                }
+                if let Some(p) = rpy.get(1).and_then(JsonValue::as_f64) {
+                    t.imu_pitch = Some(p);
+                }
+                if let Some(y) = rpy.get(2).and_then(JsonValue::as_f64) {
+                    t.imu_yaw = Some(y);
+                }
+            }
+            if let Some(temp) = imu.get("temperature").and_then(JsonValue::as_f64) {
+                t.imu_temperature = Some(temp);
+            }
         }
     });
 }

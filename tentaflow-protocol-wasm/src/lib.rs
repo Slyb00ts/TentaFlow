@@ -7887,7 +7887,117 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
         Some(l) => set(&obj, "lidar", robot_lidar_to_js(l)),
         None => set(&obj, "lidar", JsValue::NULL),
     }
+    match &r.telemetry {
+        Some(t) => set(&obj, "telemetry", robot_telemetry_to_js(t)),
+        None => set(&obj, "telemetry", JsValue::NULL),
+    }
     obj
+}
+
+/// Structured telemetry snapshot → JS object (camel + snake keys). Mirrors
+/// `robot_lidar_to_js`: present scalars are emitted, absent ones become NULL, and
+/// the nested velocity/imu/battery objects are only created when their source
+/// fields are present (capability-absent → omitted, never fabricated).
+fn robot_telemetry_to_js(t: &tentaflow_protocol::RobotTelemetrySnapshot) -> JsValue {
+    let obj = js_sys::Object::new();
+    match t.mode {
+        Some(m) => set(&obj, "mode", (m as f64).into()),
+        None => set(&obj, "mode", JsValue::NULL),
+    }
+    match t.gait_type {
+        Some(g) => {
+            set(&obj, "gaitType", (g as f64).into());
+            set(&obj, "gait_type", (g as f64).into());
+        }
+        None => {
+            set(&obj, "gaitType", JsValue::NULL);
+            set(&obj, "gait_type", JsValue::NULL);
+        }
+    }
+    match t.body_height {
+        Some(h) => {
+            set(&obj, "bodyHeight", h.into());
+            set(&obj, "body_height", h.into());
+        }
+        None => {
+            set(&obj, "bodyHeight", JsValue::NULL);
+            set(&obj, "body_height", JsValue::NULL);
+        }
+    }
+    let position = js_sys::Array::new();
+    for v in &t.position {
+        position.push(&JsValue::from(*v));
+    }
+    set(&obj, "position", position.into());
+    let foot_force = js_sys::Array::new();
+    for v in &t.foot_force {
+        foot_force.push(&JsValue::from(*v));
+    }
+    set(&obj, "footForce", foot_force.clone().into());
+    set(&obj, "foot_force", foot_force.into());
+    match t.vx {
+        Some(vx) => set(&obj, "vx", vx.into()),
+        None => set(&obj, "vx", JsValue::NULL),
+    }
+    match t.vy {
+        Some(vy) => set(&obj, "vy", vy.into()),
+        None => set(&obj, "vy", JsValue::NULL),
+    }
+    match t.vyaw {
+        Some(vyaw) => set(&obj, "vyaw", vyaw.into()),
+        None => set(&obj, "vyaw", JsValue::NULL),
+    }
+    if t.vx.is_some() || t.vy.is_some() || t.vyaw.is_some() {
+        let vel = js_sys::Object::new();
+        if let Some(vx) = t.vx {
+            set(&vel, "vx", vx.into());
+        }
+        if let Some(vy) = t.vy {
+            set(&vel, "vy", vy.into());
+        }
+        if let Some(vyaw) = t.vyaw {
+            set(&vel, "vyaw", vyaw.into());
+        }
+        set(&obj, "velocity", vel.into());
+    }
+    if let Some(imu) = &t.imu {
+        let io = js_sys::Object::new();
+        if let Some(roll) = imu.roll {
+            set(&io, "roll", roll.into());
+        }
+        if let Some(pitch) = imu.pitch {
+            set(&io, "pitch", pitch.into());
+        }
+        if let Some(yaw) = imu.yaw {
+            set(&io, "yaw", yaw.into());
+        }
+        if let Some(temp) = imu.temperature {
+            set(&io, "temperature", temp.into());
+        }
+        let quat = js_sys::Array::new();
+        for v in &imu.quaternion {
+            quat.push(&JsValue::from(*v));
+        }
+        set(&io, "quaternion", quat.into());
+        set(&obj, "imu", io.into());
+    }
+    if let Some(bat) = &t.battery {
+        let bo = js_sys::Object::new();
+        if let Some(soc) = bat.soc {
+            set(&bo, "soc", soc.into());
+        }
+        if let Some(voltage) = bat.voltage {
+            set(&bo, "voltage", voltage.into());
+        }
+        if let Some(current) = bat.current {
+            set(&bo, "current", current.into());
+        }
+        if let Some(temp) = bat.temperature {
+            set(&bo, "temperature", temp.into());
+        }
+        set(&obj, "battery", bo.into());
+    }
+    obj.into()
 }
 
 /// SMALL LiDAR availability snapshot → JS object (camel + snake keys). Never the
