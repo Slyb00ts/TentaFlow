@@ -628,6 +628,16 @@ fn pick_aliases_to_activate<'a>(
         .collect()
 }
 
+/// Principal pod jaki wykonywane jest wywołanie narzędzia. Rozstrzyga tożsamość
+/// `AddonState` workera (a więc decyzję `check_permission`): `User` = konkretny
+/// principal z per-user grantami; `System` = core-internal trusted call bez
+/// principala (CR-006: `user_id=None` + `is_system_call=true`).
+#[derive(Clone, Copy)]
+enum CallIdentity<'a> {
+    User(&'a str),
+    System,
+}
+
 impl AddonManager {
     /// Tworzy nowy AddonManager z podana baza danych
     pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
@@ -1482,9 +1492,10 @@ impl AddonManager {
         &self,
         addon_id: &str,
         user_id: Option<String>,
+        system: bool,
     ) -> Result<(AddonInstance, bool)> {
         // (1) wolny, nie-serwisowy worker z puli.
-        if let Some(inst) = self.take_idle_instance(addon_id, &user_id) {
+        if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system) {
             return Ok((inst, false));
         }
 
@@ -1525,7 +1536,7 @@ impl AddonManager {
         // (3) przy limicie — krótkie oczekiwanie aż ktoś zwróci worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Some(inst) = self.take_idle_instance(addon_id, &user_id) {
+            if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system) {
                 return Ok((inst, false));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1537,13 +1548,21 @@ impl AddonManager {
         Ok((inst, true))
     }
 
-    /// Bierze wolny, nie-serwisowy worker z puli i ustawia tożsamość user na czas
-    /// wywołania (org zostaje — worker zna swojego najemcę z budowy). `None` gdy
-    /// brak wolnego workera nie-serwisowego.
+    /// Bierze wolny, nie-serwisowy worker z puli i ustawia tożsamość wywołania na
+    /// czas wywołania (org zostaje — worker zna swojego najemcę z budowy). `None`
+    /// gdy brak wolnego workera nie-serwisowego.
+    ///
+    /// Workery są reużywane między wywołaniami różnych principalów, więc tożsamość
+    /// decydująca o uprawnieniach (`user_id` + `is_system_call`) MUSI być
+    /// nadpisana PER WYWOŁANIE — inaczej worker zbudowany dla usera mógłby wykonać
+    /// system call ze starym user_id (lub odwrotnie), psując decyzję permission.
+    /// `system=true` ⇒ `user_id=None` + `is_system_call=true` (ścieżka CR-006);
+    /// wywołanie user-facing ⇒ konkretny `user_id` + `is_system_call=false`.
     fn take_idle_instance(
         &self,
         addon_id: &str,
         user_id: &Option<String>,
+        system: bool,
     ) -> Option<AddonInstance> {
         // Kolejność locków: ZAWSZE instances przed service_instance_ids (ta sama
         // co w stop_addon) — inaczej groziłoby zakleszczenie.
@@ -1554,10 +1573,10 @@ impl AddonManager {
             list.iter().position(|i| !svc.contains(&i.instance_id))?
         };
         let mut inst = list.remove(pos);
-        if user_id.is_some() {
-            inst.store.data_mut().user_id = user_id.clone();
-            inst.user_id = user_id.clone();
-        }
+        let state = inst.store.data_mut();
+        state.user_id = user_id.clone();
+        state.is_system_call = system;
+        inst.user_id = user_id.clone();
         Some(inst)
     }
 
@@ -1981,7 +2000,7 @@ impl AddonManager {
     ) -> Result<bool> {
         // Wypożycz worker z puli (rośnie do limitu, bez 3s busy-loopa). Instancja
         // serwisowa jest pomijana, więc panel nie kłóci się z on_tick.
-        let (mut addon_instance, ephemeral) = self.acquire_instance(addon_id, user_id)?;
+        let (mut addon_instance, ephemeral) = self.acquire_instance(addon_id, user_id, false)?;
 
         // Cała praca WASM w domknięciu, żeby worker został ZWRÓCONY na każdej
         // ścieżce (błąd też) — inaczej pula by się kurczyła / licznik przeciekał.
@@ -2234,7 +2253,7 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: &str,
     ) -> Result<serde_json::Value> {
-        self.call_tool_inner(addon_id, tool_name, params, user_id, false)
+        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::User(user_id), false)
     }
 
     /// Like `call_tool` but skips the per-addon `"llm"` permission check because
@@ -2250,7 +2269,25 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: &str,
     ) -> Result<serde_json::Value> {
-        self.call_tool_inner(addon_id, tool_name, params, user_id, true)
+        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::User(user_id), true)
+    }
+
+    /// Invokes a tool as a GENUINE system call: the worker's `AddonState` runs
+    /// with `user_id = None` and `is_system_call = true`, so host-fn
+    /// `check_permission` takes the CR-006 path and grants the addon's DECLARED
+    /// permissions (still gated on the addon actually declaring them) WITHOUT a
+    /// per-user grant. The tool-level `"llm"` check is skipped because there is no
+    /// principal to adjudicate. This is for CORE-INTERNAL trusted reads only
+    /// (e.g. the robot status refresh loop), NOT for LLM/user tool calls — those
+    /// MUST keep per-user `permission_checker` gating via `call_tool` /
+    /// `call_tool_preauthorized`.
+    pub fn call_tool_system(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::System, true)
     }
 
     fn call_tool_inner(
@@ -2258,25 +2295,39 @@ impl AddonManager {
         addon_id: &str,
         tool_name: &str,
         params: serde_json::Value,
-        user_id: &str,
+        identity: CallIdentity<'_>,
         skip_permission_check: bool,
     ) -> Result<serde_json::Value> {
+        // System calls carry no principal; user calls carry their user_id.
+        let acquire_user = match identity {
+            CallIdentity::System => None,
+            CallIdentity::User(uid) => Some(uid.to_string()),
+        };
+        let system = matches!(identity, CallIdentity::System);
+        // For audit + request JSON, system calls are tagged "system" (clearly a
+        // system-originated call, not a real principal); user calls carry the uid.
+        let audit_user = match identity {
+            CallIdentity::System => "system",
+            CallIdentity::User(uid) => uid,
+        };
         info!(
-            "Wywolanie narzedzia '{}.{}' przez user_id={}",
-            addon_id, tool_name, user_id
+            "Wywolanie narzedzia '{}.{}' przez user_id={} (system={})",
+            addon_id, tool_name, audit_user, system
         );
 
-        // Sprawdz uprawnienia uzytkownika (pomijane gdy harness już wydał zgodę).
+        // Sprawdz uprawnienia uzytkownika (pomijane gdy harness już wydał zgodę
+        // lub gdy to system call — system call nie ma principala do adjudykacji,
+        // a uprawnienia host-fn rozstrzyga check_permission ścieżką CR-006).
         if !skip_permission_check {
-            let perm_result = self
-                .permission_checker
-                .check(addon_id, user_id, "llm", None);
+            let perm_result =
+                self.permission_checker
+                    .check(addon_id, audit_user, "llm", None);
             if !perm_result.is_granted() {
                 bail!(
                     "Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}",
                     addon_id,
                     tool_name,
-                    user_id
+                    audit_user
                 );
             }
         }
@@ -2284,8 +2335,10 @@ impl AddonManager {
         // Wypożycz worker z puli — rośnie do limitu, pomija instancję serwisową,
         // bez dawnego 3s busy-loopa, który padał „zajęty" gdy tick trzymał
         // jedyną instancję. `ephemeral` = worker burstowy (drop przy zwrocie).
+        // `system` ⇒ worker dostaje user_id=None + is_system_call=true na czas
+        // tego wywołania (mirror dawnej semantyki boot/service instancji).
         let (mut addon_instance, ephemeral) =
-            self.acquire_instance(addon_id, Some(user_id.to_string()))?;
+            self.acquire_instance(addon_id, acquire_user, system)?;
 
         // Refuel przed wywolaniem — workery są reużywane, więc każde wywołanie
         // dostaje świeży budżet (refuel_store ustawia, nie dodaje).
@@ -2298,7 +2351,7 @@ impl AddonManager {
         let request_json = serde_json::json!({
             "tool": tool_name,
             "params": params,
-            "user_id": user_id,
+            "user_id": audit_user,
         });
         let request_bytes = serde_json::to_vec(&request_json)?;
 
@@ -2459,7 +2512,7 @@ impl AddonManager {
         self.release_instance(addon_id, addon_instance, ephemeral);
 
         // Loguj do audit
-        self.log_audit(addon_id, user_id, "tool.call", Some(tool_name), None);
+        self.log_audit(addon_id, audit_user, "tool.call", Some(tool_name), None);
 
         result
     }
