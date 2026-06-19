@@ -11,15 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-# torch cu130 instalowany jawnie PRZED TTS, bo coqui-TTS ciagnie torch posrednio
-# (TT>=0.22 pinuje torch>=2.2 bez gornej granicy — wymuszamy cu130 dla B300/sm_103)
+# torch cu130 jawnie PRZED coqui-tts (cu130 dla B300/sm_103). Spojne z native
+# bundle: coqui-tts==0.27.4 (fork IDIAP), torchcodec (od torch 2.9 wymagany do
+# audio IO), force-pin transformers/tokenizers/hub (coqui XTTS gpt.py uzywa
+# isin_mps_friendly usunietego w transformers>=4.57).
 RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir \
-      torch>=2.11 torchaudio \
+      torch==2.11.0 torchaudio==2.11.0 \
       --index-url https://download.pytorch.org/whl/cu130 \
+ && pip install --no-cache-dir torchcodec \
  && pip install --no-cache-dir \
-      "TTS>=0.22" \
-      fastapi uvicorn
+      "coqui-tts==0.27.4" \
+      fastapi uvicorn \
+ && pip install --no-cache-dir \
+      "transformers==4.55.4" "tokenizers==0.21.4" "huggingface-hub==0.34.4"
 
 COPY tentaflow-containers/tts/docker/xtts/server.py /app/server.py
 COPY tentaflow-containers/tts/docker/xtts/entrypoint.sh /app/entrypoint.sh

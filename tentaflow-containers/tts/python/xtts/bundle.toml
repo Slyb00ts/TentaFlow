@@ -27,7 +27,9 @@ extra_index = "https://download.pytorch.org/whl/cu130"
 # Od coqui-tts 0.27.4 PyTorch nie jest pulled jako runtime dep — musimy
 # zainstalowac go sami. coqui-tts 0.27.4 pinuje torch>=2.2 bez gornej granicy,
 # wiec 2.11 jest OK. transformers force-pinowany nizej (isin_mps_friendly).
-extras = ["torch==2.11.0", "torchaudio==2.11.0"]
+# torchcodec: od torch 2.9 coqui-tts (TTS) wymaga go do audio IO — bez niego
+# `from TTS.api import TTS` rzuca ImportError. Wymaga ffmpeg libs na hoscie.
+extras = ["torch==2.11.0", "torchaudio==2.11.0", "torchcodec"]
 # Coqui-TTS 0.27.4 wymaga transformers >=4.50, co przy main install
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
@@ -41,7 +43,7 @@ force_pins = [
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.11.0", "torchaudio==2.11.0"]
+extras = ["torch==2.11.0", "torchaudio==2.11.0", "torchcodec"]
 # Coqui-TTS 0.27.4 wymaga transformers >=4.50, co przy main install
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
@@ -54,7 +56,7 @@ force_pins = [
 
 [[install_variants]]
 backend = "metal"
-extras = ["torch==2.11.0", "torchaudio==2.11.0"]
+extras = ["torch==2.11.0", "torchaudio==2.11.0", "torchcodec"]
 # Coqui-TTS 0.27.4 wymaga transformers >=4.50, co przy main install
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
