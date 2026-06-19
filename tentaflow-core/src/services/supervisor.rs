@@ -1392,14 +1392,18 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
             let status = resp.status();
             if status.is_success() {
                 HealthStatus::Ok
-            } else if status.as_u16() == 404 && !probe_url.ends_with("/health") {
-                // Fallback: try /health if /v1/models is not exposed.
-                let fallback = format!("{}/health", trimmed);
-                match client.get(&fallback).send().await {
-                    Ok(r2) if r2.status().is_success() => HealthStatus::Ok,
-                    Ok(r2) => HealthStatus::Degraded(format!("http {}", r2.status())),
-                    Err(e) => HealthStatus::Failed(format!("http error: {}", e)),
+            } else if status.as_u16() == 404 && !probe_url.contains("/health") {
+                // Fallback: /v1/models nieobecne — probuj /health, potem /healthz
+                // (konwencja k8s, np. SearXNG / kokoro wystawiaja /healthz).
+                let mut last = HealthStatus::Degraded(format!("http {}", status));
+                for path in ["/health", "/healthz"] {
+                    match client.get(&format!("{}{}", trimmed, path)).send().await {
+                        Ok(r2) if r2.status().is_success() => return HealthStatus::Ok,
+                        Ok(r2) => last = HealthStatus::Degraded(format!("http {}", r2.status())),
+                        Err(e) => last = HealthStatus::Failed(format!("http error: {}", e)),
+                    }
                 }
+                last
             } else {
                 HealthStatus::Degraded(format!("http {}", status))
             }
