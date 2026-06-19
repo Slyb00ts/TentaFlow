@@ -15,6 +15,10 @@ CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 
 PORT="${NEMOTRON_YOLOX_PORT:-8086}"
 
+# Core wstrzykuje repo modelu jako env MODEL; serwer yolox czyta MODEL_REPO
+# (jeden obraz, trzy modele wybierane repo). Mapujemy MODEL -> MODEL_REPO.
+export MODEL_REPO="${MODEL_REPO:-$MODEL}"
+
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
   | sed -u 's/^/[sidecar] /' &

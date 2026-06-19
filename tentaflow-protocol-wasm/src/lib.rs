@@ -1080,16 +1080,41 @@ pub fn encode_addon_catalog_list_request() -> Result<Vec<u8>, JsError> {
 }
 
 /// MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+/// `config` is a JS `Array<[key, value]>` of install-time connection-param
+/// values (e.g. the robot IP). Empty for non-robot packages.
 #[wasm_bindgen(js_name = encodeAddonInstanceInstallRequest)]
 pub fn encode_addon_instance_install_request(
     package_id: String,
     version: String,
     display_name: String,
+    config: JsValue,
 ) -> Result<Vec<u8>, JsError> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if !config.is_undefined() && !config.is_null() {
+        let arr: js_sys::Array = config
+            .dyn_into()
+            .map_err(|_| JsError::new("config musi byc Array<[key, value]>"))?;
+        for i in 0..arr.length() {
+            let pair: js_sys::Array = arr
+                .get(i)
+                .dyn_into()
+                .map_err(|_| JsError::new("config element musi byc [key, value]"))?;
+            let key = pair
+                .get(0)
+                .as_string()
+                .ok_or_else(|| JsError::new("config key musi byc string"))?;
+            let value = pair
+                .get(1)
+                .as_string()
+                .ok_or_else(|| JsError::new("config value musi byc string"))?;
+            pairs.push((key, value));
+        }
+    }
     encode_addon_instance(AddonInstancePayload::ReqInstall(AddonInstanceInstallRequest {
         package_id,
         version,
         display_name,
+        config: pairs,
     }))
 }
 
@@ -4810,6 +4835,19 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "source", pkg.source.into());
                         set(&item, "installedInstances", pkg.installed_instances.into());
                         set(&item, "installed_instances", pkg.installed_instances.into());
+                        let params = js_sys::Array::new();
+                        for p in pkg.connection_params {
+                            let pv = js_sys::Object::new();
+                            set(&pv, "key", p.key.into());
+                            set(&pv, "label", p.label.into());
+                            set(&pv, "paramType", p.param_type.clone().into());
+                            set(&pv, "param_type", p.param_type.into());
+                            set(&pv, "required", p.required.into());
+                            set(&pv, "placeholder", p.placeholder.into());
+                            params.push(&pv.into());
+                        }
+                        set(&item, "connectionParams", params.clone().into());
+                        set(&item, "connection_params", params.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());
@@ -7839,7 +7877,61 @@ fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
         caps.push(&JsValue::from(c.clone()));
     }
     set(&obj, "capabilities", caps.into());
+    let actions = js_sys::Array::new();
+    for a in &r.actions_meta {
+        actions.push(&robot_action_meta_to_js(a));
+    }
+    set(&obj, "actionsMeta", actions.clone().into());
+    set(&obj, "actions_meta", actions.into());
+    match &r.lidar {
+        Some(l) => set(&obj, "lidar", robot_lidar_to_js(l)),
+        None => set(&obj, "lidar", JsValue::NULL),
+    }
     obj
+}
+
+/// SMALL LiDAR availability snapshot → JS object (camel + snake keys). Never the
+/// point cloud — only the metadata the card needs and a renderer pulls on demand.
+fn robot_lidar_to_js(l: &tentaflow_protocol::RobotLidarStatus) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "enabled", l.enabled.into());
+    set(&obj, "available", l.available.into());
+    set(&obj, "pointCount", (l.point_count as f64).into());
+    set(&obj, "point_count", (l.point_count as f64).into());
+    match l.resolution {
+        Some(r) => set(&obj, "resolution", (r as f64).into()),
+        None => set(&obj, "resolution", JsValue::NULL),
+    }
+    let origin = js_sys::Array::new();
+    for v in &l.origin {
+        origin.push(&JsValue::from(*v));
+    }
+    set(&obj, "origin", origin.into());
+    set(&obj, "frameSeq", (l.frame_seq as f64).into());
+    set(&obj, "frame_seq", (l.frame_seq as f64).into());
+    set(&obj, "lastUpdateTs", (l.last_update_ts as f64).into());
+    set(&obj, "last_update_ts", (l.last_update_ts as f64).into());
+    obj.into()
+}
+
+fn robot_action_meta_to_js(a: &tentaflow_protocol::RobotActionMeta) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "kind", a.kind.clone().into());
+    set(&obj, "label", a.label.clone().into());
+    set(&obj, "risk", a.risk.clone().into());
+    set(&obj, "acrobatic", a.acrobatic.into());
+    set(&obj, "readOnly", a.read_only.into());
+    set(&obj, "read_only", a.read_only.into());
+    let params = js_sys::Array::new();
+    for p in &a.params {
+        let pobj = js_sys::Object::new();
+        set(&pobj, "name", p.name.clone().into());
+        set(&pobj, "min", p.min.into());
+        set(&pobj, "max", p.max.into());
+        params.push(&pobj.into());
+    }
+    set(&obj, "params", params.into());
+    obj.into()
 }
 
 fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::RobotsPayload) {
@@ -7870,6 +7962,11 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
+            }
+            // Read-only actions (lidar_frame) return their JSON payload here.
+            match resp.result {
+                Some(r) => set(obj, "result", r.into()),
+                None => set(obj, "result", JsValue::NULL),
             }
         }
         P::CameraShareRequest(req) => {
@@ -13791,22 +13888,29 @@ pub fn encode_robots_list_request() -> Result<Vec<u8>, JsError> {
 }
 
 /// MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action to
-/// the robot's owning node. `kind` is one of: "move", "stop", "estop",
-/// "reset_estop", "recovery_stand", "stand_up", "stand_down", "sit", "hello",
-/// "stretch", "status". The `vx`/`vy`/`vyaw` axes apply to "move" only.
+/// the robot's owning node. The `vx`/`vy`/`vyaw` axes apply to "move" only; the
+/// `p1..p4` generic params carry parametered poses/levels keyed by `kind` (euler
+/// → roll/pitch/yaw; body_height/foot_raise_height → p1=height; speed_level →
+/// p1=level; pose → roll/pitch/yaw/height). The owner clamps every numeric param
+/// to the documented Go2 range.
 #[wasm_bindgen(js_name = encodeRobotControlRequest)]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_robot_control_request(
     robot_id: String,
     kind: String,
     vx: f64,
     vy: f64,
     vyaw: f64,
+    p1: f64,
+    p2: f64,
+    p3: f64,
+    p4: f64,
 ) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{RobotActionWire, RobotControlRequest, RobotsPayload};
     encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::ControlRequest(
         RobotControlRequest {
             robot_id,
-            action: RobotActionWire { kind, vx, vy, vyaw },
+            action: RobotActionWire { kind, vx, vy, vyaw, p1, p2, p3, p4 },
         },
     )))
     .map_err(|e| JsError::new(&e))

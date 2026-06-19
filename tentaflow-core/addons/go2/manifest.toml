@@ -33,11 +33,14 @@ sort_order = 60
 enabled = true
 tick_interval_ms = 200
 
-# LAN signaling to the robot (con_notify / con_ing). Exact host — admin approves
-# the private address in the Network tab. Update host when the robot IP changes.
+# LAN signaling to the robot (con_notify / con_ing). `${ip}` is a per-install
+# placeholder: at install time the entered `ip` connection_param is substituted
+# into the persisted per-instance manifest, so the admin approves THAT concrete
+# robot address in the Network tab. Installing this package twice yields two
+# instances each pinned to its own robot IP.
 [[network_rule]]
 id = "go2-webrtc-signaling"
-host = "192.168.0.190"
+host = "${ip}"
 port = 9991
 protocol = "tcp"
 description = "Unitree Go2 WebRTC LAN signaling (con_notify / con_ing over HTTP/TCP)."
@@ -62,7 +65,9 @@ transports = ["webrtc-lan"]  # how the controller reaches the robot
 [[robot.connection_param]]
 key = "ip"
 label = "Adres IP robota"
-type = "string"
+# `host`: this value is substituted into the addon's network_rule host, so the
+# install form and the server both validate it as a bare IP/hostname token.
+type = "host"
 required = true
 placeholder = "192.168.0.190"
 
@@ -75,9 +80,17 @@ required = false
 # What the robot can do — lets the Robots app / Flow Builder expose controls,
 # status tiles and sensor previews uniformly across robot types.
 [robot.capabilities]
-locomotion = true                 # Move(vx, vy, vyaw)
-poses = true                      # StandUp/StandDown/RecoveryStand/Sit/Pose(euler,height)
-actions = ["hello", "stretch", "sit", "stand_up", "stand_down", "recovery_stand", "dance1", "dance2"]
+locomotion = true                 # Move(vx, vy, vyaw) + SpeedLevel
+poses = true                      # StandUp/StandDown/RecoveryStand/BalanceStand/Sit/Euler/BodyHeight/FootRaiseHeight/Pose
+# Full implemented action surface. Acrobatics (dance1/dance2/scrape/front_flip/
+# front_jump/front_pounce) are high-risk and may be firmware/Air-locked — the
+# rich `actions_meta` from go2.status tags each with a risk tier so the UI gates them.
+actions = [
+    "hello", "stretch", "sit", "stand_up", "stand_down", "recovery_stand",
+    "balance_stand", "wiggle_hips", "heart", "dance1", "dance2",
+    "scrape", "front_flip", "front_jump", "front_pounce",
+    "euler", "body_height", "foot_raise_height", "speed_level", "pose",
+]
 estop = true
 telemetry = ["battery", "imu", "pose", "mode"]
 camera = true                     # provides a video source (consumable by TentaVision)

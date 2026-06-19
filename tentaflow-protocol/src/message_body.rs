@@ -1892,6 +1892,147 @@ pub struct RobotActionWire {
     pub vx: f64,
     pub vy: f64,
     pub vyaw: f64,
+    /// Generic numeric params for parametered poses/levels, keyed by `kind` (see
+    /// the SDK `RobotActionWire` and core `RobotAction::from_kind_params`).
+    /// Defaulted to 0 for parameterless kinds and older senders. The owner clamps
+    /// each to the documented Go2 range.
+    #[serde(default)]
+    pub p1: f64,
+    #[serde(default)]
+    pub p2: f64,
+    #[serde(default)]
+    pub p3: f64,
+    #[serde(default)]
+    pub p4: f64,
+}
+
+/// One numeric parameter of a parametered robot action, with the inclusive range
+/// the UI must bound its input to (the owner re-clamps on receipt regardless).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotActionParam {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Rich descriptor of ONE advertised robot control: enough for a capability-driven
+/// UI to render the right widget (button / bounded inputs / dpad), gate high-risk
+/// acrobatics behind a confirmation, and label it — without hardcoding any action
+/// list. Projected verbatim from the owning addon's `actions_meta`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotActionMeta {
+    pub kind: String,
+    pub label: String,
+    /// Risk tier: "low" / "medium" / "high". "high" (or `acrobatic`) requires the
+    /// UI to confirm before sending.
+    pub risk: String,
+    #[serde(default)]
+    pub acrobatic: bool,
+    /// A read-only action (e.g. status) the UI must NOT render as a control.
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub params: Vec<RobotActionParam>,
+}
+
+/// Inertial-measurement snapshot the robot reports (orientation + temperature).
+/// Every field is optional so a robot that omits one (or a whole IMU block) is
+/// representable without inventing a reading.
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotImuSnapshot {
+    #[serde(default)]
+    pub roll: Option<f64>,
+    #[serde(default)]
+    pub pitch: Option<f64>,
+    #[serde(default)]
+    pub yaw: Option<f64>,
+    /// Orientation quaternion [w, x, y, z] (empty when the robot omits it).
+    #[serde(default)]
+    pub quaternion: Vec<f64>,
+    /// IMU board temperature in °C.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Battery detail beyond the flat percentage: voltage / current / cell SOC /
+/// pack temperature. All optional (capability-absent → `None`).
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotBatterySnapshot {
+    #[serde(default)]
+    pub soc: Option<f64>,
+    #[serde(default)]
+    pub voltage: Option<f64>,
+    #[serde(default)]
+    pub current: Option<f64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Structured runtime telemetry snapshot of a robot, projected from the owning
+/// addon's `status.telemetry` object. This is a SNAPSHOT read at the existing
+/// advertisement cadence, NOT a high-rate stream. Every field is optional / a
+/// possibly-empty vector so a robot that does not report a value simply omits it
+/// (capability-absent, never a fabricated reading).
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotTelemetrySnapshot {
+    /// Sport/gait mode integer the robot reports (firmware-specific).
+    #[serde(default)]
+    pub mode: Option<i64>,
+    /// Gait type integer (trot / run / climb …).
+    #[serde(default)]
+    pub gait_type: Option<i64>,
+    /// Current body height in metres.
+    #[serde(default)]
+    pub body_height: Option<f64>,
+    /// Forward velocity (m/s).
+    #[serde(default)]
+    pub vx: Option<f64>,
+    /// Lateral velocity (m/s).
+    #[serde(default)]
+    pub vy: Option<f64>,
+    /// Yaw rate (rad/s).
+    #[serde(default)]
+    pub vyaw: Option<f64>,
+    /// Odometry position [x, y, z] (empty when absent).
+    #[serde(default)]
+    pub position: Vec<f64>,
+    /// Per-foot contact force (empty when absent).
+    #[serde(default)]
+    pub foot_force: Vec<f64>,
+    #[serde(default)]
+    pub imu: Option<RobotImuSnapshot>,
+    #[serde(default)]
+    pub battery: Option<RobotBatterySnapshot>,
+}
+
+/// SMALL LiDAR availability snapshot — NEVER the point cloud (which would be far
+/// too large to advertise every ~10 s). It carries only enough for the UI to show
+/// "LiDAR active, N points" and for a future renderer to know a fresh frame exists
+/// (then pull it on demand via the `lidar_frame` action). Every field is plain so
+/// an addon that reports no LiDAR simply advertises `None` for the whole block.
+#[derive(Debug, Clone, PartialEq, Default, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotLidarStatus {
+    /// Operator intent: the LiDAR sensor has been switched on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// At least one voxel frame has decoded this session (a renderer can fetch it).
+    #[serde(default)]
+    pub available: bool,
+    /// Number of decoded points in the latest frame.
+    #[serde(default)]
+    pub point_count: u32,
+    /// Voxel resolution in metres (cube edge), when known.
+    #[serde(default)]
+    pub resolution: Option<f32>,
+    /// Grid origin [x, y, z] in metres (empty when unknown).
+    #[serde(default)]
+    pub origin: Vec<f64>,
+    /// Monotonic frame counter this session (0 = no frame yet).
+    #[serde(default)]
+    pub frame_seq: u64,
+    /// Wall-clock seconds of the last decoded frame (0 = none).
+    #[serde(default)]
+    pub last_update_ts: i64,
 }
 
 /// One robot row for the Robots list screen: a projection of the mesh registry's
@@ -1909,6 +2050,23 @@ pub struct RobotEntry {
     pub rtt_ms: Option<u32>,
     pub camera_id: Option<String>,
     pub capabilities: Vec<String>,
+    /// Rich capability descriptors driving the capability-based control UI.
+    /// Appended last for CBOR back-compat: an older owner that advertises no
+    /// `actions_meta` decodes with an empty vec (`#[serde(default)]`,
+    /// ciborium APPEND-AT-END rule) — the UI then falls back to plain chips.
+    #[serde(default)]
+    pub actions_meta: Vec<RobotActionMeta>,
+    /// Structured runtime telemetry snapshot (gait / velocity / IMU / battery
+    /// detail). Appended last for CBOR back-compat: an older owner that reports
+    /// no telemetry decodes with `None` (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule) — the UI then renders no telemetry panel.
+    #[serde(default)]
+    pub telemetry: Option<RobotTelemetrySnapshot>,
+    /// SMALL LiDAR availability snapshot (no point cloud). Appended last for CBOR
+    /// back-compat: an older owner without LiDAR decodes with `None`
+    /// (`#[serde(default)]`, ciborium APPEND-AT-END rule).
+    #[serde(default)]
+    pub lidar: Option<RobotLidarStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -1933,6 +2091,13 @@ pub struct RobotControlResponse {
     pub ok: bool,
     pub rejected: Option<String>,
     pub error: Option<String>,
+    /// Optional JSON result payload for read-only actions that return data (e.g.
+    /// `lidar_frame` returns the decoded point set + metadata). Appended last for
+    /// CBOR back-compat: an older peer decodes it as `None`
+    /// (`#[serde(default)]`, ciborium APPEND-AT-END rule). Action-class commands
+    /// (move/pose/…) leave it `None`.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4091,6 +4256,24 @@ pub struct AddonPackageInfo {
     pub source: String,
     /// Ile instancji tego pakietu jest aktualnie zainstalowanych.
     pub installed_instances: i32,
+    /// Connection parameters the package declares via `[[robot.connection_param]]`.
+    /// Empty for non-robot packages. The install UI renders one input per entry
+    /// and passes the collected values back in `AddonInstanceInstallRequest.config`.
+    /// `#[serde(default)]` keeps CBOR compatibility with older peers.
+    #[serde(default)]
+    pub connection_params: Vec<AddonConnectionParam>,
+}
+
+/// One declared connection parameter (`[[robot.connection_param]]`). Drives the
+/// per-install form so each robot instance carries its own concrete values
+/// (e.g. the robot IP) instead of a hardcoded default.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonConnectionParam {
+    pub key: String,
+    pub label: String,
+    pub param_type: String,
+    pub required: bool,
+    pub placeholder: String,
 }
 
 /// Instalacja nowej instancji pakietu z katalogu pod nadana nazwa.
@@ -4099,6 +4282,12 @@ pub struct AddonInstanceInstallRequest {
     pub package_id: String,
     pub version: String,
     pub display_name: String,
+    /// Connection-param values entered at install time (key → value). For robot
+    /// packages this carries the per-instance IP/serial; substituted into
+    /// `${key}` placeholders in network rules and persisted to `addon_config`.
+    /// `#[serde(default)]` keeps CBOR compatibility with older peers.
+    #[serde(default)]
+    pub config: Vec<(String, String)>,
 }
 
 /// Wspolna odpowiedz dla install/duplicate — zwraca addon_id nowej instancji.
@@ -7408,6 +7597,179 @@ mod tests {
             }
             other => panic!("expected BaselineAdoptClearResponseBody, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn robot_entry_legacy_decode_without_actions_meta_defaults_empty() {
+        // Mirror of a pre-actions_meta RobotEntry sender: the field simply did not
+        // exist on the wire. ciborium APPEND-AT-END + #[serde(default)] must decode
+        // it to an empty vec so the UI degrades to plain chips instead of failing.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotEntry {
+            robot_id: String,
+            owner_node_id: String,
+            is_local: bool,
+            kind: Option<String>,
+            status: String,
+            battery_percent: Option<f32>,
+            rtt_ms: Option<u32>,
+            camera_id: Option<String>,
+            capabilities: Vec<String>,
+        }
+
+        let legacy = LegacyRobotEntry {
+            robot_id: "go2-001".to_string(),
+            owner_node_id: "abcdef0123".to_string(),
+            is_local: true,
+            kind: Some("quadruped".to_string()),
+            status: "online".to_string(),
+            battery_percent: Some(87.5),
+            rtt_ms: Some(12),
+            camera_id: Some("front".to_string()),
+            capabilities: vec!["move".to_string(), "stop".to_string()],
+        };
+
+        let bytes = crate::cbor::encode(&legacy).expect("encode legacy");
+        let decoded: RobotEntry = crate::cbor::decode(&bytes).expect("decode legacy");
+
+        assert_eq!(decoded.robot_id, "go2-001");
+        assert_eq!(decoded.status, "online");
+        assert_eq!(decoded.capabilities, vec!["move", "stop"]);
+        assert!(
+            decoded.actions_meta.is_empty(),
+            "missing actions_meta must default to an empty vec"
+        );
+        assert!(
+            decoded.telemetry.is_none(),
+            "missing telemetry must default to None"
+        );
+        assert!(
+            decoded.lidar.is_none(),
+            "missing lidar must default to None"
+        );
+
+        // Same guarantee through the list wrapper the UI actually consumes.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotsListResponse {
+            robots: Vec<LegacyRobotEntry>,
+        }
+        let list = LegacyRobotsListResponse {
+            robots: vec![LegacyRobotEntry {
+                robot_id: "go2-002".to_string(),
+                owner_node_id: "0011223344".to_string(),
+                is_local: false,
+                kind: None,
+                status: "offline".to_string(),
+                battery_percent: None,
+                rtt_ms: None,
+                camera_id: None,
+                capabilities: vec![],
+            }],
+        };
+        let list_bytes = crate::cbor::encode(&list).expect("encode legacy list");
+        let decoded_list: RobotsListResponse =
+            crate::cbor::decode(&list_bytes).expect("decode legacy list");
+        assert_eq!(decoded_list.robots.len(), 1);
+        assert!(decoded_list.robots[0].actions_meta.is_empty());
+        assert!(decoded_list.robots[0].telemetry.is_none());
+        assert!(decoded_list.robots[0].lidar.is_none());
+    }
+
+    #[test]
+    fn robot_control_response_legacy_decode_without_result_defaults_none() {
+        // Mirror of a pre-`result` RobotControlResponse sender: the field did not
+        // exist on the wire. ciborium APPEND-AT-END + #[serde(default)] must decode
+        // it to None so an older peer interoperates with read-only actions.
+        #[derive(SerdeSerialize)]
+        struct LegacyRobotControlResponse {
+            ok: bool,
+            rejected: Option<String>,
+            error: Option<String>,
+        }
+
+        let legacy = LegacyRobotControlResponse {
+            ok: true,
+            rejected: None,
+            error: None,
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode legacy");
+        let decoded: RobotControlResponse = crate::cbor::decode(&bytes).expect("decode legacy");
+        assert!(decoded.ok);
+        assert_eq!(decoded.rejected, None);
+        assert_eq!(decoded.error, None);
+        assert_eq!(decoded.result, None, "missing result must default to None");
+
+        // Roundtrip preserving a populated result payload.
+        let full = RobotControlResponse {
+            ok: true,
+            rejected: None,
+            error: None,
+            result: Some("{\"lidar_frame\":{\"point_count\":42}}".to_string()),
+        };
+        let full_bytes = crate::cbor::encode(&full).expect("encode full");
+        let back: RobotControlResponse = crate::cbor::decode(&full_bytes).expect("decode full");
+        assert_eq!(back, full);
+        assert_eq!(
+            back.result.as_deref(),
+            Some("{\"lidar_frame\":{\"point_count\":42}}")
+        );
+    }
+
+    #[test]
+    fn robot_entry_telemetry_snapshot_roundtrips() {
+        // A full telemetry snapshot must survive CBOR encode/decode, including the
+        // nested IMU + battery sub-snapshots and the variable-length vectors.
+        let entry = RobotEntry {
+            robot_id: "go2-001".to_string(),
+            owner_node_id: "abcdef0123".to_string(),
+            is_local: true,
+            kind: Some("quadruped".to_string()),
+            status: "online".to_string(),
+            battery_percent: Some(73.0),
+            rtt_ms: Some(12),
+            camera_id: Some("front".to_string()),
+            capabilities: vec!["move".to_string()],
+            actions_meta: vec![],
+            telemetry: Some(RobotTelemetrySnapshot {
+                mode: Some(1),
+                gait_type: Some(3),
+                body_height: Some(0.32),
+                vx: Some(0.4),
+                vy: Some(-0.1),
+                vyaw: Some(0.05),
+                position: vec![1.0, 2.0, 0.3],
+                foot_force: vec![120.0, 118.0, 121.0, 119.0],
+                imu: Some(RobotImuSnapshot {
+                    roll: Some(0.01),
+                    pitch: Some(-0.02),
+                    yaw: Some(1.57),
+                    quaternion: vec![0.707, 0.0, 0.0, 0.707],
+                    temperature: Some(41.0),
+                }),
+                battery: Some(RobotBatterySnapshot {
+                    soc: Some(73.0),
+                    voltage: Some(28.4),
+                    current: Some(-2.1),
+                    temperature: Some(36.0),
+                }),
+            }),
+            lidar: Some(RobotLidarStatus {
+                enabled: true,
+                available: true,
+                point_count: 4096,
+                resolution: Some(0.05),
+                origin: vec![-1.5, -1.5, -0.2],
+                frame_seq: 7,
+                last_update_ts: 1_700_000_000,
+            }),
+        };
+        let bytes = crate::cbor::encode(&entry).expect("encode");
+        let back: RobotEntry = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, entry);
+        let t = back.telemetry.expect("telemetry present");
+        assert_eq!(t.foot_force.len(), 4);
+        assert_eq!(t.imu.unwrap().yaw, Some(1.57));
+        assert_eq!(t.battery.unwrap().voltage, Some(28.4));
     }
 
     #[test]

@@ -248,6 +248,7 @@ impl DeployStrategy for PythonBundleDeploy {
         apply_hf_token_env(hf_token_for_env, &mut env);
         apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
         super::apply_engine_env(&self.user_config, &mut env);
+        super::apply_gpu_selection_env(&self.user_config, &mut env);
 
         // Strukturalne argi CLI budowane przez Rust (speculative, gpu-memory).
         // Plyna do silnika jako osobne elementy argv przez

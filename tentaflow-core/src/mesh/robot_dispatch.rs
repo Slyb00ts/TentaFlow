@@ -88,6 +88,135 @@ pub struct AdvertisedRobot {
     /// controller node can present available actions without owning the addon.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Rich capability descriptors (label / risk / param schema) driving a
+    /// capability-based control UI. Appended last for wire compat: an old peer's
+    /// announce decodes with an empty vec (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule), and a robot addon that emits no `actions_meta` simply
+    /// advertises none — the UI then falls back to the flat capability chips.
+    #[serde(default)]
+    pub actions_meta: Vec<AdvertisedAction>,
+    /// Structured runtime telemetry SNAPSHOT (gait / velocity / IMU / battery
+    /// detail) read at the advertisement cadence — NOT a high-rate stream. It is
+    /// EXCLUDED from `robots_structurally_equal` so its per-tick jitter (imu, etc.)
+    /// never drives an `Updated`-delta broadcast storm; the latest snapshot still
+    /// rides along on any structural `Updated` and on the periodic full ANNOUNCE.
+    /// Appended last for wire compat: an old peer's announce decodes with `None`
+    /// (`#[serde(default)]`, ciborium APPEND-AT-END rule).
+    #[serde(default)]
+    pub telemetry: Option<RobotTelemetrySnapshot>,
+    /// SMALL LiDAR availability snapshot (enabled / available / point count /
+    /// resolution / origin / frame_seq / ts) — NOT the point cloud. Like
+    /// `telemetry` it is EXCLUDED from `robots_structurally_equal` so its per-frame
+    /// `frame_seq`/`point_count` churn never drives an `Updated`-delta storm; the
+    /// latest snapshot still rides any structural `Updated` and the periodic full
+    /// ANNOUNCE. Appended last for wire compat (`#[serde(default)]`, ciborium
+    /// APPEND-AT-END rule): an old peer decodes it as `None`.
+    #[serde(default)]
+    pub lidar: Option<RobotLidarSnapshot>,
+}
+
+/// SMALL LiDAR availability snapshot mirrored from the owning addon's
+/// `status.lidar`. NEVER carries the point cloud — only enough for the UI and for
+/// a future renderer to know a fresh frame exists (then pull it on demand).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RobotLidarSnapshot {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub point_count: u32,
+    #[serde(default)]
+    pub resolution: Option<f32>,
+    #[serde(default)]
+    pub origin: Vec<f64>,
+    #[serde(default)]
+    pub frame_seq: u64,
+    #[serde(default)]
+    pub last_update_ts: i64,
+}
+
+/// IMU snapshot a robot reports (orientation + temperature). Every field is
+/// optional so absence is representable (capability-absent, never fabricated).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RobotImuSnapshot {
+    #[serde(default)]
+    pub roll: Option<f64>,
+    #[serde(default)]
+    pub pitch: Option<f64>,
+    #[serde(default)]
+    pub yaw: Option<f64>,
+    #[serde(default)]
+    pub quaternion: Vec<f64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Battery detail beyond the flat percentage: voltage / current / cell SOC /
+/// pack temperature. All optional.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RobotBatterySnapshot {
+    #[serde(default)]
+    pub soc: Option<f64>,
+    #[serde(default)]
+    pub voltage: Option<f64>,
+    #[serde(default)]
+    pub current: Option<f64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+}
+
+/// Structured runtime telemetry snapshot, mirrored from the owning addon's
+/// `status.telemetry`. Every field optional / a possibly-empty vector so a robot
+/// that omits a value simply leaves it out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RobotTelemetrySnapshot {
+    #[serde(default)]
+    pub mode: Option<i64>,
+    #[serde(default)]
+    pub gait_type: Option<i64>,
+    #[serde(default)]
+    pub body_height: Option<f64>,
+    #[serde(default)]
+    pub vx: Option<f64>,
+    #[serde(default)]
+    pub vy: Option<f64>,
+    #[serde(default)]
+    pub vyaw: Option<f64>,
+    #[serde(default)]
+    pub position: Vec<f64>,
+    #[serde(default)]
+    pub foot_force: Vec<f64>,
+    #[serde(default)]
+    pub imu: Option<RobotImuSnapshot>,
+    #[serde(default)]
+    pub battery: Option<RobotBatterySnapshot>,
+}
+
+/// One numeric parameter of a parametered robot action, with the inclusive range
+/// the UI bounds its input to (the owner re-clamps on receipt regardless).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisedActionParam {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Rich descriptor of ONE advertised robot control, mirrored from the owning
+/// addon's `<pkg>.status` `actions_meta`. Carries the human label, risk tier and
+/// param schema so a controller node can render a capability-driven UI and gate
+/// high-risk acrobatics without hardcoding any per-robot action list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdvertisedAction {
+    pub kind: String,
+    pub label: String,
+    pub risk: String,
+    #[serde(default)]
+    pub acrobatic: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub params: Vec<AdvertisedActionParam>,
 }
 
 /// CBOR wire payload for the robot advertisement broadcast: one node's complete
@@ -288,6 +417,9 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             battery_percent: telemetry.battery_percent,
             rtt_ms: telemetry.rtt_ms,
             capabilities: telemetry.capabilities,
+            actions_meta: telemetry.actions_meta,
+            telemetry: telemetry.telemetry,
+            lidar: telemetry.lidar,
         });
     }
     global().replace_local(local_node_id, robots.clone());
@@ -305,6 +437,9 @@ pub struct RobotStatusTelemetry {
     pub battery_percent: Option<f32>,
     pub rtt_ms: Option<u32>,
     pub capabilities: Vec<String>,
+    pub actions_meta: Vec<AdvertisedAction>,
+    pub telemetry: Option<RobotTelemetrySnapshot>,
+    pub lidar: Option<RobotLidarSnapshot>,
 }
 
 impl RobotStatusTelemetry {
@@ -317,6 +452,9 @@ impl RobotStatusTelemetry {
             battery_percent: None,
             rtt_ms: None,
             capabilities: Vec::new(),
+            actions_meta: Vec::new(),
+            telemetry: None,
+            lidar: None,
         }
     }
 }
@@ -410,6 +548,9 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
                 .collect()
         })
         .unwrap_or_default();
+    let actions_meta = parse_actions_meta(status);
+    let telemetry = parse_telemetry_snapshot(status);
+    let lidar = parse_lidar_snapshot(status);
     RobotStatusTelemetry {
         is_online,
         status: raw_status,
@@ -417,7 +558,200 @@ fn parse_status_telemetry(status: &serde_json::Value) -> RobotStatusTelemetry {
         battery_percent,
         rtt_ms,
         capabilities,
+        actions_meta,
+        telemetry,
+        lidar,
     }
+}
+
+/// PURE extraction of the SMALL `lidar` availability sub-object from a `status`
+/// result. Absence of the whole object → `None` (no LiDAR capability). Within it,
+/// each field is read independently; a missing scalar uses the safe absent value
+/// (false / 0 / `None` / empty) and is NEVER fabricated. The point cloud is never
+/// carried here — only availability metadata.
+fn parse_lidar_snapshot(status: &serde_json::Value) -> Option<RobotLidarSnapshot> {
+    let l = status.get("lidar")?;
+    if !l.is_object() {
+        return None;
+    }
+    let enabled = l.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let available = l.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+    let point_count = l
+        .get("point_count")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(0);
+    let resolution = l
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .map(|n| n as f32);
+    let origin = parse_fixed_f64_array(l.get("origin"));
+    let frame_seq = l.get("frame_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_update_ts = l.get("last_update_ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some(RobotLidarSnapshot {
+        enabled,
+        available,
+        point_count,
+        resolution,
+        origin,
+        frame_seq,
+        last_update_ts,
+    })
+}
+
+/// PURE all-or-nothing read of a fixed-layout `[a, b, c, ...]` numeric sensor
+/// array (position, foot_force, quaternion, …). These arrays carry positional
+/// identity (e.g. `foot_force[0]` is a specific foot), so if ANY element is
+/// missing/null/non-numeric the WHOLE vector is dropped rather than compacted —
+/// a compacted partial would shift indices and corrupt the per-position mapping.
+/// Empty when absent, not an array, or any element is non-numeric.
+fn parse_fixed_f64_array(v: Option<&serde_json::Value>) -> Vec<f64> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        match elem.as_f64() {
+            Some(n) => out.push(n),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// PURE extraction of the structured `telemetry` snapshot from a `status` result.
+/// Absence of the whole object → `None` (capability-absent). Within it, every
+/// field is read independently: a missing scalar stays `None`, a missing array
+/// stays empty — never an invented value. The IMU and battery sub-objects are
+/// likewise omitted entirely when neither carries any value.
+fn parse_telemetry_snapshot(status: &serde_json::Value) -> Option<RobotTelemetrySnapshot> {
+    let t = status.get("telemetry")?;
+    if !t.is_object() {
+        return None;
+    }
+    let num = |k: &str| t.get(k).and_then(|v| v.as_f64());
+    let int = |k: &str| t.get(k).and_then(|v| v.as_i64());
+    let arr = |k: &str| -> Vec<f64> { parse_fixed_f64_array(t.get(k)) };
+
+    let velocity = t.get("velocity");
+    let vnum = |k: &str| velocity.and_then(|v| v.get(k)).and_then(|v| v.as_f64());
+
+    let imu = parse_imu_snapshot(t.get("imu"));
+    let battery = parse_battery_snapshot(t.get("battery"));
+
+    let snapshot = RobotTelemetrySnapshot {
+        mode: int("mode"),
+        gait_type: int("gait_type"),
+        body_height: num("body_height"),
+        vx: vnum("vx"),
+        vy: vnum("vy"),
+        vyaw: vnum("vyaw"),
+        position: arr("position"),
+        foot_force: arr("foot_force"),
+        imu,
+        battery,
+    };
+
+    // An object that carried no usable value at all degrades to None so the UI
+    // does not render an empty telemetry panel.
+    if snapshot == RobotTelemetrySnapshot::default() {
+        None
+    } else {
+        Some(snapshot)
+    }
+}
+
+/// PURE extraction of the IMU sub-snapshot. `None` when the block is absent or
+/// holds no usable value.
+fn parse_imu_snapshot(imu: Option<&serde_json::Value>) -> Option<RobotImuSnapshot> {
+    let imu = imu?;
+    let num = |k: &str| imu.get(k).and_then(|v| v.as_f64());
+    let snapshot = RobotImuSnapshot {
+        roll: num("roll"),
+        pitch: num("pitch"),
+        yaw: num("yaw"),
+        quaternion: parse_fixed_f64_array(imu.get("quaternion")),
+        temperature: num("temperature"),
+    };
+    if snapshot == RobotImuSnapshot::default() {
+        None
+    } else {
+        Some(snapshot)
+    }
+}
+
+/// PURE extraction of the battery sub-snapshot. `None` when absent / empty.
+fn parse_battery_snapshot(battery: Option<&serde_json::Value>) -> Option<RobotBatterySnapshot> {
+    let battery = battery?;
+    let num = |k: &str| battery.get(k).and_then(|v| v.as_f64());
+    let snapshot = RobotBatterySnapshot {
+        soc: num("soc"),
+        voltage: num("voltage"),
+        current: num("current"),
+        temperature: num("temperature"),
+    };
+    if snapshot == RobotBatterySnapshot::default() {
+        None
+    } else {
+        Some(snapshot)
+    }
+}
+
+/// PURE extraction of the rich `actions_meta` descriptor from a `status` result.
+/// Absence is a first-class capability-absent case (an older/other robot addon
+/// that emits no rich descriptor) → empty vec, NOT an error. Each entry must have
+/// a non-empty `kind` and `label`; malformed entries are skipped individually so
+/// one bad entry can't drop the whole set. `risk` defaults to "medium" (the safer
+/// "needs care" tier) when absent.
+fn parse_actions_meta(status: &serde_json::Value) -> Vec<AdvertisedAction> {
+    let Some(arr) = status.get("actions_meta").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let kind = entry.get("kind").and_then(|v| v.as_str())?.trim();
+            let label = entry.get("label").and_then(|v| v.as_str()).unwrap_or(kind);
+            if kind.is_empty() {
+                return None;
+            }
+            let risk = entry
+                .get("risk")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("medium")
+                .to_string();
+            let acrobatic = entry.get("acrobatic").and_then(|v| v.as_bool()).unwrap_or(false);
+            let read_only = entry.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let params = entry
+                .get("params")
+                .and_then(|v| v.as_array())
+                .map(|ps| {
+                    ps.iter()
+                        .filter_map(|p| {
+                            let name = p.get("name").and_then(|v| v.as_str())?.trim();
+                            if name.is_empty() {
+                                return None;
+                            }
+                            Some(AdvertisedActionParam {
+                                name: name.to_string(),
+                                min: p.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY),
+                                max: p.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AdvertisedAction {
+                kind: kind.to_string(),
+                label: label.to_string(),
+                risk,
+                acrobatic,
+                read_only,
+                params,
+            })
+        })
+        .collect()
 }
 
 /// Last camera_id THIS node advertised for `addon_id` (its robot_id), read from
@@ -452,13 +786,17 @@ pub fn sort_advertised(mut robots: Vec<AdvertisedRobot>) -> Vec<AdvertisedRobot>
 }
 
 /// PURE structural equality of two advertised robots, EXCLUDING the volatile
-/// `rtt_ms` telemetry. Used as the `Updated`-delta trigger so RTT jitter alone
-/// does not re-advertise. RTT is still CARRIED in the struct (the dashboard shows
-/// it) and is refreshed mesh-wide by the periodic anti-drift full ANNOUNCE; it
-/// just must not drive a per-tick `ROBOTS_UPDATE` broadcast storm given the ~10 s
-/// advertiser cadence. Every other field (id/node/org/camera/status/battery/
-/// capabilities) is structural: a real change in any of them re-advertises.
-/// `battery_percent` changes slowly, so keeping it in the trigger is safe.
+/// `rtt_ms`, the high-rate `telemetry` snapshot AND the per-frame `lidar`
+/// availability snapshot (its `frame_seq`/`point_count`/`last_update_ts` change on
+/// every voxel frame). Used as the `Updated`-delta trigger so neither RTT jitter,
+/// per-tick telemetry churn (imu/velocity/foot force) nor LiDAR frame churn alone
+/// re-advertises. All three are still CARRIED in
+/// the struct (the dashboard shows them) and refreshed mesh-wide by the periodic
+/// anti-drift full ANNOUNCE; they just must not drive a per-tick `ROBOTS_UPDATE`
+/// broadcast storm given the ~10 s advertiser cadence. Every other field
+/// (id/node/org/camera/status/battery/capabilities) is structural: a real change
+/// in any of them re-advertises. `battery_percent` (the coarse bucket) changes
+/// slowly, so keeping it in the trigger is safe.
 fn robots_structurally_equal(a: &AdvertisedRobot, b: &AdvertisedRobot) -> bool {
     a.robot_id == b.robot_id
         && a.package_id == b.package_id
@@ -469,6 +807,7 @@ fn robots_structurally_equal(a: &AdvertisedRobot, b: &AdvertisedRobot) -> bool {
         && a.status == b.status
         && a.battery_percent == b.battery_percent
         && a.capabilities == b.capabilities
+        && a.actions_meta == b.actions_meta
 }
 
 /// PURE diff of two advertised-robot snapshots keyed by `robot_id`. Produces the
@@ -679,27 +1018,29 @@ fn now_ms() -> u64 {
 /// = now, an expiry window sized to the action (`Move` ≤ `MAX_MOVE_DURATION_MS`,
 /// others `DEFAULT_COMMAND_WINDOW_MS`), and the SENDER-side velocity clamp
 /// (`action.sanitized(MAX_VELOCITY)`) as defense-in-depth — the receiver clamps
-/// again to its own `[robot.safety]`. Pure (apart from uuid/clock).
+/// again to its own `[robot.safety]`. Returns `Err(RejectReason::Malformed)` if the
+/// action carries a non-finite numeric param (NaN/inf is rejected, never coerced),
+/// so a bad command is stopped at the sender too. Pure (apart from uuid/clock).
 pub fn build_request(
     action: RobotAction,
     robot_id: &str,
     actor_user_id: &str,
     org_id: &str,
-) -> RobotControlRequest {
+) -> Result<RobotControlRequest, RejectReason> {
     let issued_at_ms = now_ms();
     let window = match action {
         RobotAction::Move { .. } => MAX_MOVE_DURATION_MS,
         _ => DEFAULT_COMMAND_WINDOW_MS,
     };
-    RobotControlRequest {
+    Ok(RobotControlRequest {
         robot_id: robot_id.to_string(),
         org_id: org_id.to_string(),
         command_id: uuid::Uuid::new_v4().to_string(),
         actor_user_id: actor_user_id.to_string(),
-        action: action.sanitized(MAX_VELOCITY),
+        action: action.sanitized(MAX_VELOCITY)?,
         issued_at_ms,
         expires_at_ms: issued_at_ms.saturating_add(window),
-    }
+    })
 }
 
 /// Force every advertised robot's `node_id` to the transport-authenticated
@@ -839,7 +1180,10 @@ pub async fn dispatch_robot_action(
     local_node_id: &str,
     sender: &dyn RobotCommandSender,
 ) -> RobotControlResponse {
-    let request = build_request(action, robot_id, actor_user_id, org_id);
+    let request = match build_request(action, robot_id, actor_user_id, org_id) {
+        Ok(req) => req,
+        Err(reason) => return RobotControlResponse::rejected(reason),
+    };
 
     match resolve_robot_owner(db, local_node_id, robot_id) {
         RobotOwner::Local => {
@@ -907,6 +1251,9 @@ mod tests {
             battery_percent: Some(80.0),
             rtt_ms: Some(12),
             capabilities: vec!["move".to_string(), "sit".to_string()],
+            actions_meta: Vec::new(),
+            telemetry: None,
+            lidar: None,
         }
     }
 
@@ -1065,7 +1412,8 @@ mod tests {
             "go2",
             "u1",
             "org-1",
-        );
+        )
+        .unwrap();
         assert!(!req.command_id.is_empty());
         // Move window is bounded by MAX_MOVE_DURATION_MS.
         assert_eq!(req.expires_at_ms - req.issued_at_ms, MAX_MOVE_DURATION_MS);
@@ -1076,7 +1424,7 @@ mod tests {
 
     #[test]
     fn build_request_non_move_uses_default_window() {
-        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1");
+        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1").unwrap();
         assert_eq!(req.expires_at_ms - req.issued_at_ms, DEFAULT_COMMAND_WINDOW_MS);
     }
 
@@ -1089,7 +1437,8 @@ mod tests {
             "go2",
             "u1",
             "org-1",
-        );
+        )
+        .unwrap();
         assert_eq!(
             req.action,
             RobotAction::Move {
@@ -1102,8 +1451,8 @@ mod tests {
 
     #[test]
     fn build_request_unique_command_ids() {
-        let a = build_request(RobotAction::Stop, "go2", "u1", "org-1");
-        let b = build_request(RobotAction::Stop, "go2", "u1", "org-1");
+        let a = build_request(RobotAction::Stop, "go2", "u1", "org-1").unwrap();
+        let b = build_request(RobotAction::Stop, "go2", "u1", "org-1").unwrap();
         assert_ne!(a.command_id, b.command_id);
     }
 
@@ -1150,7 +1499,7 @@ mod tests {
         assert_eq!(owner, RobotOwner::Remote("node-b".to_string()));
 
         let fake = FakeSender::new(RobotControlResponse::ok());
-        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1");
+        let req = build_request(RobotAction::Sit, "go2", "u1", "org-1").unwrap();
         let resp = futures::executor::block_on(async {
             if let RobotOwner::Remote(node) = owner {
                 fake.send_remote(&node, &req).await.unwrap()
@@ -1302,6 +1651,400 @@ mod tests {
         assert_eq!(t.battery_percent, Some(73.0));
         assert_eq!(t.rtt_ms, Some(18));
         assert_eq!(t.capabilities, vec!["move", "sit", "stand_up"]);
+    }
+
+    #[test]
+    fn parse_status_telemetry_parses_actions_meta() {
+        let status = serde_json::json!({
+            "status": "online",
+            "capabilities": ["move", "sit", "front_flip"],
+            "actions_meta": [
+                { "kind": "sit", "label": "Siad", "risk": "low", "params": [] },
+                { "kind": "move", "label": "Ruch", "risk": "medium", "params": [
+                    { "name": "vx", "min": -1.0, "max": 1.0 },
+                    { "name": "vyaw", "min": -1.0, "max": 1.0 } ] },
+                { "kind": "front_flip", "label": "Front Flip", "risk": "high",
+                  "acrobatic": true, "params": [] },
+                { "kind": "status", "label": "Status", "risk": "low",
+                  "read_only": true, "params": [] },
+            ],
+        });
+        let t = parse_status_telemetry(&status);
+        assert_eq!(t.actions_meta.len(), 4);
+
+        let sit = &t.actions_meta[0];
+        assert_eq!(sit.kind, "sit");
+        assert_eq!(sit.label, "Siad");
+        assert_eq!(sit.risk, "low");
+        assert!(!sit.acrobatic);
+        assert!(!sit.read_only);
+        assert!(sit.params.is_empty());
+
+        let mv = &t.actions_meta[1];
+        assert_eq!(mv.kind, "move");
+        assert_eq!(mv.params.len(), 2);
+        assert_eq!(mv.params[0].name, "vx");
+        assert_eq!(mv.params[0].min, -1.0);
+        assert_eq!(mv.params[0].max, 1.0);
+
+        let flip = &t.actions_meta[2];
+        assert_eq!(flip.risk, "high");
+        assert!(flip.acrobatic);
+
+        assert!(t.actions_meta[3].read_only);
+    }
+
+    #[test]
+    fn parse_status_telemetry_absent_actions_meta_is_empty() {
+        // An older/other robot addon that emits no rich descriptor: capability-
+        // absent, not an error. The UI falls back to flat capability chips.
+        let status = serde_json::json!({
+            "status": "online", "capabilities": ["move", "sit"],
+        });
+        let t = parse_status_telemetry(&status);
+        assert!(t.actions_meta.is_empty());
+        assert_eq!(t.capabilities, vec!["move", "sit"]);
+    }
+
+    #[test]
+    fn parse_actions_meta_skips_malformed_entries_and_defaults_risk() {
+        let status = serde_json::json!({
+            "actions_meta": [
+                { "label": "no kind here", "risk": "low" },
+                { "kind": "", "label": "empty kind" },
+                { "kind": "hello" },
+                { "kind": "euler", "params": [
+                    { "min": 0.0, "max": 1.0 },
+                    { "name": "roll", "min": -0.5, "max": 0.5 } ] },
+            ],
+        });
+        let metas = parse_actions_meta(&status);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].kind, "hello");
+        assert_eq!(metas[0].label, "hello", "label defaults to kind when absent");
+        assert_eq!(metas[0].risk, "medium", "risk defaults to medium when absent");
+        assert_eq!(metas[1].kind, "euler");
+        assert_eq!(metas[1].params.len(), 1, "param without name is skipped");
+        assert_eq!(metas[1].params[0].name, "roll");
+    }
+
+    #[test]
+    fn parse_actions_meta_roundtrips_through_advertised_robot() {
+        let mut robot = ad("go2", "go2", "node-b");
+        robot.actions_meta = vec![
+            AdvertisedAction {
+                kind: "sit".to_string(),
+                label: "Siad".to_string(),
+                risk: "low".to_string(),
+                acrobatic: false,
+                read_only: false,
+                params: vec![],
+            },
+            AdvertisedAction {
+                kind: "front_flip".to_string(),
+                label: "Front Flip".to_string(),
+                risk: "high".to_string(),
+                acrobatic: true,
+                read_only: false,
+                params: vec![],
+            },
+        ];
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, robot);
+        assert_eq!(back.actions_meta.len(), 2);
+        assert!(back.actions_meta[1].acrobatic);
+    }
+
+    #[test]
+    fn diff_advertised_actions_meta_change_emits_updated() {
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.actions_meta = vec![AdvertisedAction {
+            kind: "sit".to_string(),
+            label: "Siad".to_string(),
+            risk: "low".to_string(),
+            acrobatic: false,
+            read_only: false,
+            params: vec![],
+        }];
+        let new = vec![changed.clone()];
+        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+    }
+
+    #[test]
+    fn parse_status_telemetry_absent_telemetry_is_none() {
+        // No `telemetry` object at all → None (capability-absent, not an error).
+        let status = serde_json::json!({ "status": "online", "capabilities": ["move"] });
+        let t = parse_status_telemetry(&status);
+        assert_eq!(t.telemetry, None);
+    }
+
+    #[test]
+    fn parse_status_telemetry_empty_telemetry_object_is_none() {
+        // An empty `telemetry` object carries no usable value → None, so the UI
+        // never renders an empty panel.
+        let status = serde_json::json!({ "status": "online", "telemetry": {} });
+        assert_eq!(parse_status_telemetry(&status).telemetry, None);
+    }
+
+    // ----- LiDAR availability snapshot (PURE) -----
+
+    #[test]
+    fn parse_status_lidar_present() {
+        // A representative go2 `status.lidar` sub-object parses into the snapshot.
+        let status = serde_json::json!({
+            "status": "online",
+            "lidar": {
+                "enabled": true,
+                "available": true,
+                "point_count": 4096,
+                "resolution": 0.05,
+                "origin": [-1.5, -1.5, -0.2],
+                "frame_seq": 7,
+                "last_update_ts": 1_700_000_000_i64
+            }
+        });
+        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        assert!(l.enabled);
+        assert!(l.available);
+        assert_eq!(l.point_count, 4096);
+        assert_eq!(l.resolution, Some(0.05));
+        assert_eq!(l.origin, vec![-1.5, -1.5, -0.2]);
+        assert_eq!(l.frame_seq, 7);
+        assert_eq!(l.last_update_ts, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_status_lidar_absent_is_none() {
+        // No `lidar` object at all → None (capability-absent, not an error).
+        let status = serde_json::json!({ "status": "online", "capabilities": ["move"] });
+        assert_eq!(parse_status_telemetry(&status).lidar, None);
+    }
+
+    #[test]
+    fn parse_status_lidar_partial_uses_safe_defaults() {
+        // Only `enabled` reported (no frame yet): available=false, point_count=0,
+        // resolution/origin absent — never fabricated.
+        let status = serde_json::json!({
+            "status": "online",
+            "lidar": { "enabled": true }
+        });
+        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        assert!(l.enabled);
+        assert!(!l.available);
+        assert_eq!(l.point_count, 0);
+        assert_eq!(l.resolution, None);
+        assert!(l.origin.is_empty());
+        assert_eq!(l.frame_seq, 0);
+    }
+
+    #[test]
+    fn lidar_snapshot_churn_does_not_emit_updated_delta() {
+        // The LiDAR snapshot (frame_seq / point_count / last_update_ts) changes on
+        // EVERY voxel frame. Like telemetry, it must NOT drive an `Updated`-delta:
+        // two robots identical except for their lidar snapshot are structurally
+        // equal, so `diff_advertised` emits nothing.
+        let mut old = ad("go2", "go2", "node-a");
+        old.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 1000,
+            resolution: Some(0.05),
+            origin: vec![0.0, 0.0, 0.0],
+            frame_seq: 5,
+            last_update_ts: 100,
+        });
+        let mut new = old.clone();
+        new.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 1234, // new frame, different count
+            resolution: Some(0.05),
+            origin: vec![0.1, 0.0, 0.0],
+            frame_seq: 6, // bumped
+            last_update_ts: 200,
+        });
+        assert!(
+            robots_structurally_equal(&old, &new),
+            "lidar snapshot churn must not change structural equality"
+        );
+        assert!(
+            diff_advertised(&[old], &[new]).is_empty(),
+            "lidar frame churn must not emit an Updated delta"
+        );
+    }
+
+    #[test]
+    fn advertised_robot_lidar_roundtrips() {
+        let mut robot = ad("go2", "go2", "node-b");
+        robot.lidar = Some(RobotLidarSnapshot {
+            enabled: true,
+            available: true,
+            point_count: 2048,
+            resolution: Some(0.1),
+            origin: vec![-1.0, -1.0, 0.0],
+            frame_seq: 3,
+            last_update_ts: 1_700_000_000,
+        });
+        let bytes = crate::mesh::cbor::encode(&robot).expect("encode");
+        let back: AdvertisedRobot = crate::mesh::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, robot);
+    }
+
+    #[test]
+    fn parse_status_telemetry_parses_snapshot_fields() {
+        // A representative go2 `status.telemetry` object (the shape the addon emits
+        // from rt/sportmodestate + rt/lf/lowstate) parses into the snapshot.
+        let status = serde_json::json!({
+            "status": "online",
+            "telemetry": {
+                "mode": 1,
+                "gait_type": 3,
+                "body_height": 0.32,
+                "velocity": { "vx": 0.4, "vy": -0.1, "vyaw": 0.05 },
+                "position": [1.0, 2.0, 0.3],
+                "foot_force": [120.0, 118.0, 121.0, 119.0],
+                "imu": {
+                    "roll": 0.01, "pitch": -0.02, "yaw": 1.57,
+                    "quaternion": [0.707, 0.0, 0.0, 0.707],
+                    "temperature": 41.0
+                },
+                "battery": { "soc": 73.0, "voltage": 28.4, "current": -2.1, "temperature": 36.0 }
+            }
+        });
+        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        assert_eq!(t.mode, Some(1));
+        assert_eq!(t.gait_type, Some(3));
+        assert_eq!(t.body_height, Some(0.32));
+        assert_eq!(t.vx, Some(0.4));
+        assert_eq!(t.vy, Some(-0.1));
+        assert_eq!(t.vyaw, Some(0.05));
+        assert_eq!(t.position, vec![1.0, 2.0, 0.3]);
+        assert_eq!(t.foot_force, vec![120.0, 118.0, 121.0, 119.0]);
+        let imu = t.imu.expect("imu present");
+        assert_eq!(imu.roll, Some(0.01));
+        assert_eq!(imu.yaw, Some(1.57));
+        assert_eq!(imu.quaternion, vec![0.707, 0.0, 0.0, 0.707]);
+        assert_eq!(imu.temperature, Some(41.0));
+        let bat = t.battery.expect("battery present");
+        assert_eq!(bat.soc, Some(73.0));
+        assert_eq!(bat.voltage, Some(28.4));
+        assert_eq!(bat.current, Some(-2.1));
+        assert_eq!(bat.temperature, Some(36.0));
+    }
+
+    #[test]
+    fn parse_status_telemetry_partial_snapshot_omits_absent_fields() {
+        // Only velocity + battery soc reported: the rest stay None / empty, never
+        // fabricated. The IMU block is absent → None.
+        let status = serde_json::json!({
+            "status": "online",
+            "telemetry": {
+                "velocity": { "vx": 0.2 },
+                "battery": { "soc": 55.0 }
+            }
+        });
+        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        assert_eq!(t.vx, Some(0.2));
+        assert_eq!(t.vy, None);
+        assert_eq!(t.mode, None);
+        assert!(t.position.is_empty());
+        assert!(t.foot_force.is_empty());
+        assert_eq!(t.imu, None);
+        let bat = t.battery.expect("battery");
+        assert_eq!(bat.soc, Some(55.0));
+        assert_eq!(bat.voltage, None);
+    }
+
+    #[test]
+    fn parse_status_telemetry_fixed_array_with_null_element_is_omitted() {
+        // A fixed-layout sensor array (foot_force) carries one bad element. The
+        // WHOLE array must be dropped (left empty) rather than compacted — a
+        // compacted [120,121,119] would shift indices and misattribute the force
+        // to the wrong foot. position has a non-numeric element → also dropped.
+        // imu.quaternion likewise. Valid scalar/array fields still parse.
+        let status = serde_json::json!({
+            "status": "online",
+            "telemetry": {
+                "mode": 1,
+                "body_height": 0.32,
+                "position": [1.0, "bad", 0.3],
+                "foot_force": [120.0, null, 121.0, 119.0],
+                "imu": {
+                    "roll": 0.01,
+                    "quaternion": [0.707, 0.0, null, 0.707],
+                    "temperature": 41.0
+                }
+            }
+        });
+        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        assert_eq!(t.mode, Some(1));
+        assert_eq!(t.body_height, Some(0.32));
+        assert!(t.position.is_empty(), "position with non-numeric element must be omitted whole");
+        assert!(t.foot_force.is_empty(), "foot_force with null element must be omitted whole");
+        let imu = t.imu.expect("imu present (roll/temperature still valid)");
+        assert_eq!(imu.roll, Some(0.01));
+        assert_eq!(imu.temperature, Some(41.0));
+        assert!(imu.quaternion.is_empty(), "quaternion with null element must be omitted whole");
+    }
+
+    #[test]
+    fn telemetry_change_only_does_not_emit_updated_delta() {
+        // Two snapshots differing ONLY in telemetry (and rtt) must NOT trigger an
+        // Updated delta: telemetry jitter every tick would otherwise storm the mesh.
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.rtt_ms = Some(999);
+        changed.telemetry = Some(RobotTelemetrySnapshot {
+            vx: Some(0.5),
+            imu: Some(RobotImuSnapshot { yaw: Some(0.9), ..Default::default() }),
+            ..Default::default()
+        });
+        let new = vec![changed];
+        assert!(
+            diff_advertised(&old, &new).is_empty(),
+            "telemetry/rtt-only change must not re-advertise"
+        );
+    }
+
+    #[test]
+    fn telemetry_rides_along_on_structural_update() {
+        // A genuine structural change (status) re-advertises and carries the fresh
+        // telemetry snapshot, so the dashboard stays current without a telemetry
+        // delta of its own.
+        let old = vec![ad("go2", "go2", "node-a")];
+        let mut changed = ad("go2", "go2", "node-a");
+        changed.status = "degraded".to_string();
+        changed.telemetry = Some(RobotTelemetrySnapshot {
+            body_height: Some(0.3),
+            ..Default::default()
+        });
+        let new = vec![changed.clone()];
+        let changes = diff_advertised(&old, &new);
+        assert_eq!(changes, vec![RobotChange::Updated(changed)]);
+        match &changes[0] {
+            RobotChange::Updated(r) => {
+                assert_eq!(r.telemetry.as_ref().unwrap().body_height, Some(0.3))
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_battery_keeps_telemetry_battery_detail() {
+        // The flat battery_pct is -1 (unknown) but the detailed telemetry battery
+        // still reports voltage: the flat field is None while telemetry carries it.
+        let status = serde_json::json!({
+            "status": "online", "battery_pct": -1,
+            "telemetry": { "battery": { "voltage": 27.9 } }
+        });
+        let t = parse_status_telemetry(&status);
+        assert_eq!(t.battery_percent, None);
+        assert_eq!(
+            t.telemetry.unwrap().battery.unwrap().voltage,
+            Some(27.9)
+        );
     }
 
     #[test]
@@ -1746,6 +2489,9 @@ mod tests {
             battery_percent: None,
             rtt_ms: None,
             capabilities: Vec::new(),
+            actions_meta: Vec::new(),
+            telemetry: None,
+            lidar: None,
         };
 
         // A remote node advertises the SAME robot_id with its own camera id.

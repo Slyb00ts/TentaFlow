@@ -1349,6 +1349,62 @@ pub(crate) fn apply_engine_env(user_config: &serde_json::Value, env: &mut HashMa
     }
 }
 
+/// GPU card selection for native (python-bundle) deploys. Docker has `--gpus`
+/// to scope visible devices; native spawns the engine process directly, so the
+/// only portable knob is the vendor visibility env (`CUDA_VISIBLE_DEVICES` and
+/// the AMD/ROCm equivalents). Without this the engine grabs card 0 / all cards
+/// regardless of the wizard's GPU selection. Runs AFTER `apply_engine_env`, so an
+/// explicit `engine_env.CUDA_VISIBLE_DEVICES` wins — we only fill the gap.
+pub(crate) fn apply_gpu_selection_env(
+    user_config: &serde_json::Value,
+    env: &mut HashMap<String, String>,
+) {
+    const VISIBILITY_KEYS: &[&str] = &[
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+    ];
+    let set_visibility = |env: &mut HashMap<String, String>, value: &str| {
+        for key in VISIBILITY_KEYS {
+            env.entry((*key).to_string())
+                .or_insert_with(|| value.to_string());
+        }
+    };
+
+    let mode = user_config
+        .get("gpu_select_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+    match mode {
+        // Empty visibility string = no cards visible, forcing CPU execution.
+        "none" => set_visibility(env, ""),
+        "specific" => {
+            let ids: Vec<String> = user_config
+                .get("gpu_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|id| match id {
+                            serde_json::Value::String(s) => {
+                                let t = s.trim();
+                                (!t.is_empty()).then(|| t.to_string())
+                            }
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Empty / missing list behaves like "all" — inherit the environment.
+            if !ids.is_empty() {
+                set_visibility(env, &ids.join(","));
+            }
+        }
+        // "all" / unknown / missing: inherit the ambient environment.
+        _ => {}
+    }
+}
+
 /// Builds the `VLLM_*` container env for a vLLM featured preset: NVFP4
 /// self-quantization (`VLLM_MODEL_QUANTIZE` / `VLLM_SPEC_DRAFT_QUANTIZE`) and
 /// speculative decoding (`VLLM_SPEC_METHOD` / `VLLM_SPEC_REPO` /
