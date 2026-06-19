@@ -17,35 +17,18 @@ from kokoro_onnx import Kokoro
 log = logging.getLogger("kokoro-server")
 logging.basicConfig(level=logging.INFO)
 
-MODEL_PATH = os.environ.get("KOKORO_MODEL", "/app/models/onnx/model.onnx")
-VOICES_DIR = os.environ.get("KOKORO_VOICES_DIR", "/app/models/voices")
+MODEL_PATH = os.environ.get("KOKORO_MODEL", "/app/models/kokoro-v1.0.onnx")
+VOICES_PATH = os.environ.get("KOKORO_VOICES", "/app/models/voices-v1.0.bin")
 DEFAULT_VOICE = os.environ.get("KOKORO_DEFAULT_VOICE", "af_heart")
 
-# kokoro_onnx >=0.4 przyjmuje katalog z plikami `*.bin` ALBO konkretny
-# `voices.json`. Skladamy katalog do dict aby moc swobodnie dodawac voices.
-def _load_voices(voices_dir: str) -> dict:
-    voices = {}
-    if not os.path.isdir(voices_dir):
-        return voices
-    for fname in sorted(os.listdir(voices_dir)):
-        if not fname.endswith(".bin"):
-            continue
-        name = fname[:-4]
-        path = os.path.join(voices_dir, fname)
-        # voice .bin to surowy float32 array stylu — kokoro-onnx 0.4 reads
-        # bytes through `np.fromfile`. Konwertujemy do dict zgodnego z API.
-        try:
-            arr = np.fromfile(path, dtype=np.float32)
-            voices[name] = arr
-        except Exception as e:
-            log.warning("voice %s: %s", name, e)
-    return voices
-
-log.info("loading kokoro from %s", MODEL_PATH)
-voices = _load_voices(VOICES_DIR)
-log.info("loaded %d voices: %s", len(voices), list(voices.keys()))
-# kokoro-onnx 0.4 API: Kokoro(model_path, voices_path_or_dict)
-kk = Kokoro(MODEL_PATH, voices)
+# kokoro-onnx 0.4.x: Kokoro(model_path, voices_path) gdzie voices_path to
+# pojedynczy plik npz (`voices-v1.0.bin`) ladowany przez np.load i indeksowany
+# nazwa glosu. Model i glosy musza pochodzic z tego samego wydania kokoro-onnx
+# (inny model.onnx ma niezgodne typy wejsc ONNX -> InvalidArgument).
+log.info("loading kokoro model=%s voices=%s", MODEL_PATH, VOICES_PATH)
+kk = Kokoro(MODEL_PATH, VOICES_PATH)
+voices = kk.get_voices()
+log.info("loaded %d voices: %s", len(voices), voices)
 
 
 class SpeechRequest(BaseModel):
@@ -62,20 +45,20 @@ app = FastAPI(title="kokoro-onnx TTS", version="1.0.0")
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "voices": list(voices.keys())}
+    return {"status": "ok", "voices": voices}
 
 
 @app.get("/v1/audio/voices")
 def list_voices():
     """Lista nazw dostepnych voices dla GUI/panel."""
-    return {"voices": list(voices.keys())}
+    return {"voices": voices}
 
 
 @app.post("/v1/audio/speech")
 def speech(req: SpeechRequest):
     voice = req.voice or DEFAULT_VOICE
     if voice not in voices:
-        raise HTTPException(404, f"voice '{voice}' not in {list(voices.keys())}")
+        raise HTTPException(404, f"voice '{voice}' not in {voices}")
     try:
         samples, sr = kk.create(
             req.input,

@@ -18,15 +18,13 @@ WORKDIR /app
 
 COPY tentaflow-containers/tts/docker/kokoro/requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
-RUN python -c "import os; os.makedirs('/app/models', exist_ok=True); \
-from huggingface_hub import hf_hub_download; \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'onnx/model.onnx', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/af_heart.bin', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/af_bella.bin', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/am_michael.bin', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/am_adam.bin', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/bf_alice.bin', local_dir='/app/models'); \
-hf_hub_download('onnx-community/Kokoro-82M-v1.0-ONNX', 'voices/bm_george.bin', local_dir='/app/models')"
+# Model i glosy z tego samego wydania kokoro-onnx — model.onnx z onnx-community
+# ma niezgodne typy wejsc ONNX (int32 vs float). voices-v1.0.bin to npz z 54
+# glosami ladowany przez np.load.
+RUN python -c "import os,urllib.request; os.makedirs('/app/models', exist_ok=True); \
+base='https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/'; \
+urllib.request.urlretrieve(base+'kokoro-v1.0.onnx', '/app/models/kokoro-v1.0.onnx'); \
+urllib.request.urlretrieve(base+'voices-v1.0.bin', '/app/models/voices-v1.0.bin')"
 COPY tentaflow-containers/tts/docker/kokoro/server.py /app/server.py
 
 COPY tentaflow-containers/tts/docker/kokoro/entrypoint.sh /app/entrypoint.sh
