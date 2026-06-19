@@ -1,31 +1,31 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener TTS z sherpa-onnx (modele jarvis, justyna) — direct-http.
-#       sherpa-onnx-offline-tts-server eksponuje /tts (custom JSON); Core gada
-#       HTTP wprost do host-mapped portu (no sidecar).
+# Opis: Kontener TTS sherpa-onnx (modele VITS Piper) — direct-http (bez
+#       sidecara). Python FastAPI (server.py) wystawia /audio/speech; model VITS
+#       pobierany w runtime z repo HF (env MODEL). Upstream sherpa-onnx nie ma
+#       gotowego binarnego serwera HTTP TTS, wiec uzywamy pip-owego wrappera.
 # =============================================================================
 
-FROM debian:bookworm-slim AS sherpa-builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git cmake build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /build
-RUN git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx.git
-WORKDIR /build/sherpa-onnx
-RUN cmake -B build -DSHERPA_ONNX_ENABLE_TTS=ON -DBUILD_SHARED_LIBS=OFF \
-      -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --target sherpa-onnx-offline-tts-server -j"$(nproc)" \
-    && strip build/bin/sherpa-onnx-offline-tts-server
+FROM python:3.11-slim
 
-FROM debian:bookworm-slim
+ENV PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/app/cache/huggingface
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl libgomp1 \
+        libsndfile1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=sherpa-builder /build/sherpa-onnx/build/bin/sherpa-onnx-offline-tts-server /usr/local/bin/sherpa-tts
+
+WORKDIR /app
+
+COPY tentaflow-containers/tts/docker/sherpa-onnx/requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY tentaflow-containers/tts/docker/sherpa-onnx/server.py /app/server.py
 COPY tentaflow-containers/tts/docker/sherpa-onnx/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD pgrep -f sherpa-tts || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8084')+'/healthz').read()" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
