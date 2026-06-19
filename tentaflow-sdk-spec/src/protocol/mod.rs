@@ -21,6 +21,7 @@ pub mod ids;
 pub mod recording;
 pub mod robot;
 pub mod services;
+pub mod state;
 pub mod stream;
 pub mod streaming;
 pub mod ui;

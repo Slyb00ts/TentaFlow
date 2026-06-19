@@ -55,6 +55,9 @@ pub use protocol::{
         GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
         ServiceListOutput,
     },
+    state::{
+        StateEntryMeta, StateListOutput, StateSetInput, STATE_TIER_DURABLE, STATE_TIER_EPHEMERAL,
+    },
     stream::{
         StreamAccepted, StreamCancel, StreamChunk, StreamEnd, StreamError, StreamKind,
         StreamOpen, StreamPayload, StreamProgress, StreamRejected, StreamTag,

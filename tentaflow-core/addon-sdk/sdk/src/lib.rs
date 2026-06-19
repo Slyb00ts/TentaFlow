@@ -154,6 +154,22 @@ extern "C" {
     /// Zapis do klucz-wartosc storage
     fn storage_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
 
+    /// Shared in-memory state API (A3) — host-side AddonStateStore exposed to
+    /// every instance of the SAME addon. Scoped to the calling addon_id only.
+    /// Requires `state.read` (get/list) / `state.write` (set/delete).
+    /// state_get: (key_ptr, key_len, out_ptr, out_cap, out_len_ptr) -> i32
+    fn state_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    /// state_set: CBOR `StateSetInput { key, value, tier }` -> i32
+    fn state_set_v1(in_ptr: i32, in_len: i32) -> i32;
+    /// state_delete: (key_ptr, key_len) -> 1 (deleted) / 0 (absent) / err
+    fn state_delete_v1(key_ptr: i32, key_len: i32) -> i32;
+    /// state_list: (prefix_ptr, prefix_len, out_ptr, out_cap, out_len_ptr) -> i32
+    /// Output is CBOR `StateListOutput`.
+    fn state_list_v1(
+        prefix_ptr: i32, prefix_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     fn sync_acl_upsert_v1(payload_ptr: i32, payload_len: i32) -> i32;
 
     fn sync_acl_delete_v1(payload_ptr: i32, payload_len: i32) -> i32;
@@ -746,6 +762,147 @@ pub fn store_set(key: &str, value: &str) -> Result<(), String> {
 }
 
 // =============================================================================
+// Wysokopoziomowe wrappery — Shared state (host-side AddonStateStore, A3)
+// =============================================================================
+
+/// Persistence intent of a shared-state entry.
+///
+/// * `Ephemeral` — RAM-only, never persisted; evicted under the per-addon cap.
+/// * `Durable` — RAM-served and flushed to the backing store by the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateTier {
+    Ephemeral,
+    Durable,
+}
+
+impl StateTier {
+    fn to_wire(self) -> u8 {
+        match self {
+            StateTier::Ephemeral => tentaflow_sdk_spec::STATE_TIER_EPHEMERAL,
+            StateTier::Durable => tentaflow_sdk_spec::STATE_TIER_DURABLE,
+        }
+    }
+
+    fn from_wire(raw: u8) -> StateTier {
+        // Unknown wire values fall back to Ephemeral (the safe, RAM-only intent);
+        // a host that returns an unknown tier is a version skew, not a hard error
+        // for a read-only metadata view.
+        if raw == tentaflow_sdk_spec::STATE_TIER_DURABLE {
+            StateTier::Durable
+        } else {
+            StateTier::Ephemeral
+        }
+    }
+}
+
+/// Errors surfaced by the shared-state wrappers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateError {
+    /// Missing `state.read` / `state.write` permission.
+    Permission,
+    /// Value exceeded the per-value host cap.
+    ValueTooLarge,
+    /// The write would exceed the calling addon's state quota.
+    QuotaExceeded,
+    /// Any other host-side failure (malformed call, memory error, ...).
+    Other(AbiError),
+}
+
+impl From<AbiError> for StateError {
+    fn from(e: AbiError) -> Self {
+        match e {
+            AbiError::Permission => StateError::Permission,
+            AbiError::PayloadTooLarge => StateError::ValueTooLarge,
+            AbiError::QuotaExceeded => StateError::QuotaExceeded,
+            other => StateError::Other(other),
+        }
+    }
+}
+
+/// One entry's metadata returned by `state_list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateEntryMeta {
+    pub key: String,
+    /// Value byte length.
+    pub size: u64,
+    pub tier: StateTier,
+}
+
+/// Result of `state_list` — the matching entries plus a `truncated` flag the host
+/// sets when the shard had more entries than one call may return (DoS guard).
+/// When `truncated` is true the addon should narrow its prefix to page further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateListResult {
+    pub entries: Vec<StateEntryMeta>,
+    pub truncated: bool,
+}
+
+/// Reads a value from the calling addon's shared state. Returns `Ok(None)` when
+/// the key is absent (a normal outcome); a permission or host error is returned
+/// as `Err` so the addon never confuses "denied" with "missing". Requires
+/// `state.read`.
+pub fn state_get(key: &str) -> Result<Option<Vec<u8>>, StateError> {
+    match call_sql_with_one_input(state_get_v1, key.as_bytes()) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(AbiError::NotFound) => Ok(None),
+        Err(e) => Err(StateError::from(e)),
+    }
+}
+
+/// Writes a value into the calling addon's shared state under `tier`. Requires
+/// `state.write`.
+pub fn state_set(key: &str, value: &[u8], tier: StateTier) -> Result<(), StateError> {
+    let input = tentaflow_sdk_spec::StateSetInput {
+        key: key.to_string(),
+        value: value.to_vec(),
+        tier: tier.to_wire(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    call_host_binary_status(state_set_v1, &payload).map_err(StateError::from)
+}
+
+/// Removes a key from the calling addon's shared state. Returns `Ok(true)` if the
+/// key existed, `Ok(false)` if it was absent, and `Err` on a permission/host
+/// failure (never silently swallowed). Requires `state.write`.
+pub fn state_delete(key: &str) -> Result<bool, StateError> {
+    let key_bytes = key.as_bytes();
+    let rc = unsafe { state_delete_v1(key_bytes.as_ptr() as i32, key_bytes.len() as i32) };
+    match rc {
+        1 => Ok(true),
+        0 => Ok(false),
+        other => Err(StateError::from(AbiError::from_i32(other))),
+    }
+}
+
+/// Lists `{key, size, tier}` for every key under `prefix` (or all keys when
+/// `prefix` is `None`), scoped to the calling addon. Requires `state.read`. A
+/// permission or host error is returned as `Err`; the `truncated` flag tells the
+/// addon the host clipped the result.
+///
+/// Uses the 8 MiB output cap so a host-legal response (the host budgets the list
+/// well under that) is never silently dropped as an over-cap empty.
+pub fn state_list(prefix: Option<&str>) -> Result<StateListResult, StateError> {
+    let prefix_bytes = prefix.unwrap_or("").as_bytes();
+    let bytes = call_sql_with_one_input_capped(state_list_v1, prefix_bytes, MAX_OUT_CAP_STATE_LIST)
+        .map_err(StateError::from)?;
+    let out: tentaflow_sdk_spec::StateListOutput =
+        decode_cbor(&bytes).map_err(StateError::from)?;
+    let entries = out
+        .entries
+        .into_iter()
+        .map(|e| StateEntryMeta {
+            key: e.key,
+            size: e.size,
+            tier: StateTier::from_wire(e.tier),
+        })
+        .collect();
+    Ok(StateListResult {
+        entries,
+        truncated: out.truncated,
+    })
+}
+
+// =============================================================================
 // Wysokopoziomowe wrappery — Sync ACL
 // =============================================================================
 
@@ -1322,6 +1479,12 @@ const MAX_OUT_CAP: usize = 4 * 1024 * 1024;
 /// payloads without raising the cap for every other call.
 const MAX_OUT_CAP_SNAPSHOT: usize = 8 * 1024 * 1024;
 
+/// Hard cap for `state_list` responses. Matches the host's
+/// `PayloadKind::ServiceCall` (8 MiB) ceiling so a host-legal list (which the
+/// host budgets well under that) is never silently dropped as over-cap. The
+/// generic `MAX_OUT_CAP` (4 MiB) would hide 4-8 MiB legal responses.
+const MAX_OUT_CAP_STATE_LIST: usize = 8 * 1024 * 1024;
+
 /// Hard cap for webrtc_drain. The host caps the drained batch at MAX_DRAIN_BYTES
 /// (3 MiB raw), which base64-encodes to ~4 MiB plus CBOR overhead — above the
 /// generic `MAX_OUT_CAP`. Match the host's `PayloadKind::ServiceCall` (8 MiB) so
@@ -1818,6 +1981,8 @@ pub mod prelude {
         read_string, write_string,
         generate,
         store_get, store_set,
+        state_get, state_set, state_delete, state_list,
+        StateTier, StateError, StateEntryMeta, StateListResult,
         http_get, http_post, http_send, HttpRequest, HttpResponse,
         publish_event, subscribe_event, Event,
         render_panel, render_panel_typed, render_panel_binary, notify, notify_with_level,
@@ -3367,5 +3532,59 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
         .expect("Niepoprawny layout dealokacji");
     unsafe {
         std::alloc::dealloc(ptr as *mut u8, layout);
+    }
+}
+
+#[cfg(test)]
+mod state_wrapper_tests {
+    use super::*;
+
+    // The state wrappers must never erase a host error into None/false/empty.
+    // The error path is the pure `From<AbiError> for StateError` mapping the
+    // wrappers apply, so we assert that mapping precisely here.
+    #[test]
+    fn abi_error_maps_to_state_error() {
+        assert_eq!(StateError::from(AbiError::Permission), StateError::Permission);
+        assert_eq!(
+            StateError::from(AbiError::PayloadTooLarge),
+            StateError::ValueTooLarge
+        );
+        assert_eq!(
+            StateError::from(AbiError::QuotaExceeded),
+            StateError::QuotaExceeded
+        );
+        // Any other code is carried through as Other(..) — never swallowed.
+        assert_eq!(
+            StateError::from(AbiError::Operation),
+            StateError::Other(AbiError::Operation)
+        );
+    }
+
+    // state_get returns Ok(None) for NotFound but Err for a real failure: the
+    // NotFound code is the only one mapped to a successful "absent" result.
+    #[test]
+    fn not_found_is_absent_not_error() {
+        // NotFound must not become an Err (it is a normal absent outcome).
+        assert_eq!(AbiError::from_i32(2), AbiError::NotFound);
+        // Permission must map to an Err variant, never to absent.
+        assert_eq!(StateError::from(AbiError::NotFound), StateError::Other(AbiError::NotFound));
+        assert_ne!(StateError::from(AbiError::Permission), StateError::Other(AbiError::NotFound));
+    }
+
+    #[test]
+    fn state_list_output_cap_matches_host_ceiling() {
+        // The list output cap must be >= the host's 8 MiB ServiceCall ceiling so
+        // a host-legal response is never silently dropped as over-cap.
+        assert!(MAX_OUT_CAP_STATE_LIST >= 8 * 1024 * 1024);
+        assert!(MAX_OUT_CAP_STATE_LIST > MAX_OUT_CAP);
+    }
+
+    #[test]
+    fn tier_from_wire_roundtrip() {
+        assert_eq!(StateTier::from_wire(StateTier::Durable.to_wire()), StateTier::Durable);
+        assert_eq!(
+            StateTier::from_wire(StateTier::Ephemeral.to_wire()),
+            StateTier::Ephemeral
+        );
     }
 }
