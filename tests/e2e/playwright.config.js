@@ -18,6 +18,7 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
+    { name: 'direct-http', testMatch: 'services-direct-http.spec.js' },
     { name: 'mesh-pairing', testMatch: 'mesh-pairing.spec.js' },
     { name: 'm16-aliases', testMatch: 'm16-services-aliases.spec.js' },
     { name: 'm14-bindings', testMatch: 'm14-bindings.spec.js' },

@@ -74,7 +74,7 @@ pub fn config_get_v1(
     let addon_id = caller.data().addon_id.clone();
 
     let value: Option<String> = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => conn
                 .query_row(
                     "SELECT value FROM addon_config \
