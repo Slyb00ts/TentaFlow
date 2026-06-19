@@ -11,20 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-# torch cu130 jawnie z dedykowanego indexu (B300/sm_103 wymaga CUDA 13)
+# torch cu130 jawnie PRZED voxcpm (B300/sm_103 wymaga CUDA 13). Spojne z native
+# bundle: voxcpm instalowany jako pakiet z git (nie clone+PYTHONPATH), ciagnie
+# wlasne deps (transformers itd.); soundfile/fastapi/uvicorn dla serwera.
 RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir \
-      torch>=2.11 torchaudio \
+      torch==2.11.0 torchaudio==2.11.0 \
       --index-url https://download.pytorch.org/whl/cu130 \
  && pip install --no-cache-dir \
-      transformers accelerate soundfile \
-      fastapi uvicorn
-
-# VoxCPM nie ma stabilnego pip pakietu — klonujemy z git
-WORKDIR /opt
-RUN git clone --depth 1 https://github.com/OpenBMB/VoxCPM.git || \
-    echo "[warn] VoxCPM repo nie sklonowane — sprawdz URL"
-ENV PYTHONPATH="/opt/VoxCPM:$PYTHONPATH"
+      "git+https://github.com/OpenBMB/VoxCPM.git" \
+      soundfile fastapi uvicorn
 
 COPY tentaflow-containers/tts/docker/voxcpm/server.py /app/server.py
 COPY tentaflow-containers/tts/docker/voxcpm/entrypoint.sh /app/entrypoint.sh

@@ -24,6 +24,6 @@ bundle_path = "tts/python/voxcpm"
 
 [[model_preset]]
 id = "voxcpm-base"
-display_name = "VoxCPM2 Base"
-repo = "openbmb/VoxCPM-base"
+display_name = "VoxCPM 0.5B"
+repo = "openbmb/VoxCPM-0.5B"
 recommended = true
