@@ -26,7 +26,6 @@ args = [
     "--host", "127.0.0.1",
     "--port", "${PORT:-8000}",
     "--model", "${MODEL}",
-    "--task", "embed",
     "--trust-remote-code",
     "--limit-mm-per-prompt", "{\"image\": ${MM_IMAGE_LIMIT:-1}}",
     # Serwuj pod slugiem ktory core routuje (preset id), nie pod sciezka repo.

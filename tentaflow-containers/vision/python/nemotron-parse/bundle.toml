@@ -11,7 +11,9 @@ engine = "nemotron-parse"
 description = "NVIDIA Nemotron-Parse document parser server (transformers, CUDA + ROCm)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "transformers==4.49.0"
+# Nemotron-Parse (Eagle VLM) wymaga transformers >=4.51.3; skrypty pomocnicze
+# (postprocessing.py/hf_logits_processor.py/latex2html.py) sa w katalogu bundla.
+pypi_package = "transformers==4.51.3"
 
 [launch]
 command = "uvicorn"
@@ -27,9 +29,9 @@ platforms = ["linux-x86_64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "open-clip-torch>=3.3.0", "beautifulsoup4==4.12.3", "einops", "albumentations", "opencv-python-headless", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "open-clip-torch>=3.3.0", "beautifulsoup4==4.12.3", "einops", "albumentations", "opencv-python-headless", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]

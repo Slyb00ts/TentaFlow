@@ -33,12 +33,17 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub"]
+# YOLOX z --no-build-isolation: jego setup.py kompiluje op FastCOCOEvalOp
+# (CppExtension) i wymaga widocznego torcha przy buildzie — build isolation by go
+# ukryl. Inferencja uzywa tylko `yolox.exp` (siec), op COCO-eval nie jest wolany.
+extras_no_build_isolation = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
 install_hint = "TORCH_DEVICE=cuda"
 
 # Wariant ROCm: torch z wheelami rocm7.0 dla GPU AMD (torch raportuje cuda API).
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub"]
+extras_no_build_isolation = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
 install_hint = "TORCH_DEVICE=cuda"
