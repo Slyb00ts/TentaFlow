@@ -151,6 +151,10 @@ pub struct NativeDeployRequest {
     /// sam cytuje. Last-wins z dedup nadpisuje pokrywajace sie flagi z
     /// bundle.toml i `VLLM_ARGS`.
     pub extra_args: Vec<String>,
+    /// Jawna sciezka katalogu bundla z manifestu (`[deploy.native].bundle_path`),
+    /// wzgledem tentaflow-containers/. Wymagane dla bundli wspoldzielonych przez
+    /// kilka silnikow (engine_id != nazwa katalogu). None => skan po engine_id.
+    pub bundle_subpath: Option<String>,
 }
 
 /// Wynik: uruchomiony subprocess + sciezki.
@@ -220,19 +224,45 @@ fn find_bundle_dir(workspace_root: &Path, engine_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Odczytuje bundle.toml z rozpakowanego kontekstu.
-pub fn read_bundle_spec(extracted_root: &Path, engine: &str) -> Result<BundleSpec> {
-    let bundle_dir = find_bundle_dir(extracted_root, engine)
-        .ok_or_else(|| anyhow::anyhow!(
-            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
-            engine
-        ))?;
+/// Odczytuje bundle.toml z konkretnego katalogu bundla.
+pub fn read_bundle_spec_from_dir(bundle_dir: &Path) -> Result<BundleSpec> {
     let path = bundle_dir.join("bundle.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("brak bundle.toml: {}", path.display()))?;
     let spec: BundleSpec =
         toml::from_str(&content).with_context(|| format!("parsowanie {}", path.display()))?;
     Ok(spec)
+}
+
+/// Odczytuje bundle.toml z rozpakowanego kontekstu, rozwiazujac katalog po engine_id.
+pub fn read_bundle_spec(extracted_root: &Path, engine: &str) -> Result<BundleSpec> {
+    let bundle_dir = find_bundle_dir(extracted_root, engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        ))?;
+    read_bundle_spec_from_dir(&bundle_dir)
+}
+
+/// Rozwiazuje katalog bundla: preferuje jawny `bundle_subpath` z manifestu
+/// (wymagany dla bundli WSPOLDZIELONYCH przez kilka silnikow, np. nemotron-yolox
+/// uzywany przez page/graphic/table-elements), inaczej skanuje po engine_id.
+fn resolve_bundle_src(workspace: &Path, engine: &str, subpath: Option<&str>) -> Result<PathBuf> {
+    if let Some(sub) = subpath.map(str::trim).filter(|s| !s.is_empty()) {
+        // bundle_path z manifestu jest wzgledem tentaflow-containers/ (jak baza
+        // find_bundle_dir), a `workspace` to jego rodzic.
+        let dir = workspace.join("tentaflow-containers").join(sub);
+        if dir.is_dir() {
+            return Ok(dir);
+        }
+        anyhow::bail!("bundle_path nie istnieje: {}", dir.display());
+    }
+    find_bundle_dir(workspace, engine).ok_or_else(|| {
+        anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        )
+    })
 }
 
 /// Wynik bootstrapu bez uruchamiania procesu silnika — sluzy do walidacji
@@ -304,7 +334,8 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
 
 pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<RunningEngine> {
     let workspace = runtime_bundle_root()?;
-    let spec = read_bundle_spec(&workspace, &req.engine)?;
+    let bundle_src = resolve_bundle_src(&workspace, &req.engine, req.bundle_subpath.as_deref())?;
+    let spec = read_bundle_spec_from_dir(&bundle_src)?;
 
     check_platform_compat(&spec.requires)?;
 
@@ -321,12 +352,6 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
     log("przygotowanie Pythona i uv");
     let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
     let uv_bin = ensure_uv(&cache, log).ok();
-
-    let bundle_src = find_bundle_dir(&workspace, &req.engine)
-        .ok_or_else(|| anyhow::anyhow!(
-            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
-            req.engine
-        ))?;
 
     let instance_name = req
         .instance_name
@@ -1103,7 +1128,8 @@ fn install_deps(
 /// zdecydowac czy oznaczyc serwis jako `stopped` w DB.
 pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
     let workspace = runtime_bundle_root()?;
-    let spec = read_bundle_spec(&workspace, &req.engine)?;
+    let bundle_src = resolve_bundle_src(&workspace, &req.engine, req.bundle_subpath.as_deref())?;
+    let spec = read_bundle_spec_from_dir(&bundle_src)?;
     check_platform_compat(&spec.requires)?;
 
     let cache = cache_root()?;
