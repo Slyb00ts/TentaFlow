@@ -1,0 +1,21 @@
+-- =============================================================================
+-- go2 addon — retire the robot_live live-state table. Live telemetry, the small
+-- LiDAR status and the operator LiDAR enable intent moved to the host-side shared
+-- AddonStateStore (state.* host functions), which is visible across ALL instances
+-- of the addon (the service instance that drains the stream AND the ephemeral
+-- pooled workers serving go2.status / go2.lidar_*). That fixes the cross-worker
+-- invisibility AND removes the per-read SQLite round-trip from the live hot path.
+-- The `robot` connection-state table (with its CAS connect lock) stays the
+-- source of truth for the connection state machine.
+--
+-- The table is NOT dropped here on purpose: an existing install carries the
+-- operator's persistent `lidar_enabled` INTENT in robot_live.lidar_enabled, and
+-- the durable store key (`lidar:enabled`) does not exist yet at first upgrade.
+-- Migrations run BEFORE on_start, so dropping the table here would make the
+-- one-time on_start bridge (which reads robot_live to seed the store key) read a
+-- missing table. We instead truncate the columns that have fully moved to the
+-- store (telemetry / status snapshots are ephemeral and rebuild on the next tick)
+-- but KEEP the table + lidar_enabled so the bridge can preserve intent. The
+-- now-vestigial table is dropped by a later migration once the bridge has shipped.
+DELETE FROM robot_live WHERE id <> 'go2';
+UPDATE robot_live SET telemetry_json = '', telemetry_ts = 0, lidar_status_json = '';
