@@ -4,7 +4,7 @@
 
 [engine]
 id = "nemotron-embed-vl"
-provider = "nvidia"
+provider = "tentaflow"
 category = "embeddings"
 name = "NVIDIA Llama-Nemotron Embed VL"
 description_pl = "Multimodalne embeddingi (tekst i obraz) NVIDIA Llama-Nemotron serwowane przez vLLM (--task embed). Wybierz wariant w kreatorze."
