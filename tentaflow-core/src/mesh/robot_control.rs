@@ -52,12 +52,61 @@ pub enum RobotAction {
     RecoveryStand,
     StandUp,
     StandDown,
+    /// Force-balance standing pose (Go2 BalanceStand).
+    BalanceStand,
     Sit,
     Hello,
     Stretch,
+    /// Body orientation in radians. Clamped to `EULER_LIMIT` per axis.
+    Euler { roll: f64, pitch: f64, yaw: f64 },
+    /// Body height delta in meters. Clamped to `BODY_HEIGHT_RANGE`.
+    BodyHeight { height: f64 },
+    /// Foot lift height in meters (trot gait). Clamped to `FOOT_RAISE_RANGE`.
+    FootRaiseHeight { height: f64 },
+    /// Gait speed level: -1 slow, 0 normal, 1 fast. Clamped to [-1, 1] integer.
+    SpeedLevel { level: f64 },
+    /// Composite static body pose: an `Euler` orientation plus a `BodyHeight`
+    /// delta. Implemented as a composite (Euler+BodyHeight) rather than relying on
+    /// the firmware `Pose` toggle id, so it works on every firmware.
+    Pose { roll: f64, pitch: f64, yaw: f64, height: f64 },
+    /// Hip wiggle gesture (Go2 WiggleHips).
+    WiggleHips,
+    /// "Finger heart" gesture (Go2 FingerHeart).
+    Heart,
+    Dance1,
+    Dance2,
+    /// High-risk acrobatic: scrape gesture. Air-locked on some firmware.
+    Scrape,
+    /// High-risk acrobatic: front flip. Air-locked on some firmware.
+    FrontFlip,
+    /// High-risk acrobatic: front jump. Air-locked on some firmware.
+    FrontJump,
+    /// High-risk acrobatic: front pounce. Air-locked on some firmware.
+    FrontPounce,
     /// Read-only telemetry/status snapshot.
     Status,
+    /// Enable the LiDAR sensor (subscribe to the voxel map). Data-path only — does
+    /// NOT move hardware, but it is an actuator toggle so it needs `robot.command`.
+    LidarOn,
+    /// Disable the LiDAR sensor.
+    LidarOff,
+    /// Read-only fetch of the latest decoded LiDAR frame (points + metadata) for an
+    /// on-demand renderer. Reports state only, never moves hardware.
+    LidarFrame,
 }
+
+/// Per-axis body-orientation clamp (radians). Go2 accepts roughly ±0.75 rad on
+/// each Euler axis; clamp conservatively so a bad caller can never command an
+/// extreme tilt.
+pub const EULER_LIMIT: f64 = 0.75;
+
+/// Body-height delta clamp (meters). Negative lowers the body; positive raises it.
+pub const BODY_HEIGHT_MIN: f64 = -0.18;
+pub const BODY_HEIGHT_MAX: f64 = 0.03;
+
+/// Foot lift height clamp (meters) during trot.
+pub const FOOT_RAISE_MIN: f64 = -0.06;
+pub const FOOT_RAISE_MAX: f64 = 0.10;
 
 impl RobotAction {
     /// The SINGLE source of the `kind`→action allowlist, keyed on primitives so
@@ -66,6 +115,26 @@ impl RobotAction {
     /// An unknown `kind` returns `None` so every caller refuses it identically;
     /// there is no duplicated tool→action mapping anywhere.
     pub fn from_kind_axes(kind: &str, vx: f64, vy: f64, vyaw: f64) -> Option<RobotAction> {
+        Self::from_kind_params(kind, vx, vy, vyaw, 0.0, 0.0, 0.0, 0.0)
+    }
+
+    /// The full constructor: the move axes plus four generic numeric params whose
+    /// meaning is keyed by `kind` (euler → p1/p2/p3 = roll/pitch/yaw; body_height
+    /// → p1 = height; foot_raise_height → p1 = height; speed_level → p1 = level;
+    /// pose → p1/p2/p3/p4 = roll/pitch/yaw/height). An unknown `kind` returns
+    /// `None` so every caller refuses it identically. Raw values are NOT clamped
+    /// here — `sanitized()` is the single clamp point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_kind_params(
+        kind: &str,
+        vx: f64,
+        vy: f64,
+        vyaw: f64,
+        p1: f64,
+        p2: f64,
+        p3: f64,
+        p4: f64,
+    ) -> Option<RobotAction> {
         Some(match kind {
             "move" => RobotAction::Move { vx, vy, vyaw },
             "stop" => RobotAction::Stop,
@@ -74,18 +143,37 @@ impl RobotAction {
             "recovery_stand" => RobotAction::RecoveryStand,
             "stand_up" => RobotAction::StandUp,
             "stand_down" => RobotAction::StandDown,
+            "balance_stand" => RobotAction::BalanceStand,
             "sit" => RobotAction::Sit,
             "hello" => RobotAction::Hello,
             "stretch" => RobotAction::Stretch,
+            "euler" => RobotAction::Euler { roll: p1, pitch: p2, yaw: p3 },
+            "body_height" => RobotAction::BodyHeight { height: p1 },
+            "foot_raise_height" => RobotAction::FootRaiseHeight { height: p1 },
+            "speed_level" => RobotAction::SpeedLevel { level: p1 },
+            "pose" => RobotAction::Pose { roll: p1, pitch: p2, yaw: p3, height: p4 },
+            "wiggle_hips" => RobotAction::WiggleHips,
+            "heart" => RobotAction::Heart,
+            "dance1" => RobotAction::Dance1,
+            "dance2" => RobotAction::Dance2,
+            "scrape" => RobotAction::Scrape,
+            "front_flip" => RobotAction::FrontFlip,
+            "front_jump" => RobotAction::FrontJump,
+            "front_pounce" => RobotAction::FrontPounce,
             "status" => RobotAction::Status,
+            "lidar_on" => RobotAction::LidarOn,
+            "lidar_off" => RobotAction::LidarOff,
+            "lidar_frame" => RobotAction::LidarFrame,
             _ => return None,
         })
     }
 
     /// Map a flat `RobotActionWire` (SDK + host ABI minicbor shape) onto the core
-    /// allowlist via the shared `from_kind_axes`.
+    /// allowlist via the shared `from_kind_params`.
     pub fn from_wire(wire: &tentaflow_sdk_spec::RobotActionWire) -> Option<RobotAction> {
-        Self::from_kind_axes(&wire.kind, wire.vx, wire.vy, wire.vyaw)
+        Self::from_kind_params(
+            &wire.kind, wire.vx, wire.vy, wire.vyaw, wire.p1, wire.p2, wire.p3, wire.p4,
+        )
     }
 
     /// E-stop-class actions are never blocked by an active e-stop latch and are
@@ -97,7 +185,7 @@ impl RobotAction {
 
     /// Read-only (reports state, never moves hardware or changes a latch).
     pub fn is_read_only(&self) -> bool {
-        matches!(self, RobotAction::Status)
+        matches!(self, RobotAction::Status | RobotAction::LidarFrame)
     }
 
     /// Audit-safe label: the action NAME only — never the `Move` velocity values
@@ -111,10 +199,27 @@ impl RobotAction {
             RobotAction::RecoveryStand => "RecoveryStand",
             RobotAction::StandUp => "StandUp",
             RobotAction::StandDown => "StandDown",
+            RobotAction::BalanceStand => "BalanceStand",
             RobotAction::Sit => "Sit",
             RobotAction::Hello => "Hello",
             RobotAction::Stretch => "Stretch",
+            RobotAction::Euler { .. } => "Euler",
+            RobotAction::BodyHeight { .. } => "BodyHeight",
+            RobotAction::FootRaiseHeight { .. } => "FootRaiseHeight",
+            RobotAction::SpeedLevel { .. } => "SpeedLevel",
+            RobotAction::Pose { .. } => "Pose",
+            RobotAction::WiggleHips => "WiggleHips",
+            RobotAction::Heart => "Heart",
+            RobotAction::Dance1 => "Dance1",
+            RobotAction::Dance2 => "Dance2",
+            RobotAction::Scrape => "Scrape",
+            RobotAction::FrontFlip => "FrontFlip",
+            RobotAction::FrontJump => "FrontJump",
+            RobotAction::FrontPounce => "FrontPounce",
             RobotAction::Status => "Status",
+            RobotAction::LidarOn => "LidarOn",
+            RobotAction::LidarOff => "LidarOff",
+            RobotAction::LidarFrame => "LidarFrame",
         }
     }
 
@@ -122,18 +227,24 @@ impl RobotAction {
     /// `robot.telemetry` grant can never move hardware.
     pub fn required_permission(&self) -> &'static str {
         match self {
-            RobotAction::Status => "robot.telemetry",
+            RobotAction::Status | RobotAction::LidarFrame => "robot.telemetry",
             RobotAction::Stop | RobotAction::Estop | RobotAction::ResetEstop => "robot.estop",
             _ => "robot.command",
         }
     }
 
-    /// Return a safety-clamped copy: velocities clamped to `[-max_velocity,
-    /// max_velocity]` (and to the protocol ceiling), NaN coerced to 0. Non-move
-    /// actions are returned unchanged.
-    pub fn sanitized(&self, max_velocity: f64) -> RobotAction {
-        match self {
+    /// Return a safety-clamped copy, or `Err(RejectReason::Malformed)` if ANY
+    /// numeric param is non-finite (NaN / ±inf). NaN/inf are REJECTED, never
+    /// coerced — coercing infinity would let a CBOR/mesh/browser sender command
+    /// max tilt/height/speed by sending infinity. Finite-but-out-of-range values
+    /// are clamped to the documented safety envelope (clamping in-range motion is
+    /// the intended behavior). Non-numeric actions are returned unchanged.
+    pub fn sanitized(&self, max_velocity: f64) -> Result<RobotAction, RejectReason> {
+        Ok(match self {
             RobotAction::Move { vx, vy, vyaw } => {
+                if !vx.is_finite() || !vy.is_finite() || !vyaw.is_finite() {
+                    return Err(RejectReason::Malformed);
+                }
                 let cap = max_velocity.clamp(0.0, MAX_VELOCITY);
                 RobotAction::Move {
                     vx: clamp_velocity(*vx, cap),
@@ -141,8 +252,58 @@ impl RobotAction {
                     vyaw: clamp_velocity(*vyaw, cap),
                 }
             }
+            RobotAction::Euler { roll, pitch, yaw } => {
+                if !roll.is_finite() || !pitch.is_finite() || !yaw.is_finite() {
+                    return Err(RejectReason::Malformed);
+                }
+                RobotAction::Euler {
+                    roll: clamp_range(*roll, -EULER_LIMIT, EULER_LIMIT),
+                    pitch: clamp_range(*pitch, -EULER_LIMIT, EULER_LIMIT),
+                    yaw: clamp_range(*yaw, -EULER_LIMIT, EULER_LIMIT),
+                }
+            }
+            RobotAction::BodyHeight { height } => {
+                if !height.is_finite() {
+                    return Err(RejectReason::Malformed);
+                }
+                RobotAction::BodyHeight {
+                    height: clamp_range(*height, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX),
+                }
+            }
+            RobotAction::FootRaiseHeight { height } => {
+                if !height.is_finite() {
+                    return Err(RejectReason::Malformed);
+                }
+                RobotAction::FootRaiseHeight {
+                    height: clamp_range(*height, FOOT_RAISE_MIN, FOOT_RAISE_MAX),
+                }
+            }
+            RobotAction::SpeedLevel { level } => {
+                if !level.is_finite() {
+                    return Err(RejectReason::Malformed);
+                }
+                RobotAction::SpeedLevel {
+                    // Discrete -1/0/1; round finite then clamp.
+                    level: level.round().clamp(-1.0, 1.0),
+                }
+            }
+            RobotAction::Pose { roll, pitch, yaw, height } => {
+                if !roll.is_finite()
+                    || !pitch.is_finite()
+                    || !yaw.is_finite()
+                    || !height.is_finite()
+                {
+                    return Err(RejectReason::Malformed);
+                }
+                RobotAction::Pose {
+                    roll: clamp_range(*roll, -EULER_LIMIT, EULER_LIMIT),
+                    pitch: clamp_range(*pitch, -EULER_LIMIT, EULER_LIMIT),
+                    yaw: clamp_range(*yaw, -EULER_LIMIT, EULER_LIMIT),
+                    height: clamp_range(*height, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX),
+                }
+            }
             other => other.clone(),
-        }
+        })
     }
 
     /// The ONLY action→addon bridge. Maps a (sanitized) `RobotAction` to a
@@ -176,10 +337,42 @@ impl RobotAction {
             RobotAction::RecoveryStand => tool("go2.action_recovery"),
             RobotAction::StandUp => tool("go2.action_standup"),
             RobotAction::StandDown => tool("go2.action_standdown"),
+            RobotAction::BalanceStand => tool("go2.action_balance_stand"),
             RobotAction::Sit => tool("go2.action_sit"),
             RobotAction::Hello => tool("go2.action_hello"),
             RobotAction::Stretch => tool("go2.action_stretch"),
+            RobotAction::WiggleHips => tool("go2.action_wiggle_hips"),
+            RobotAction::Heart => tool("go2.action_heart"),
+            RobotAction::Dance1 => tool("go2.action_dance1"),
+            RobotAction::Dance2 => tool("go2.action_dance2"),
+            RobotAction::Scrape => tool("go2.action_scrape"),
+            RobotAction::FrontFlip => tool("go2.action_front_flip"),
+            RobotAction::FrontJump => tool("go2.action_front_jump"),
+            RobotAction::FrontPounce => tool("go2.action_front_pounce"),
+            RobotAction::Euler { roll, pitch, yaw } => Go2Call::Tool {
+                tool: "go2.euler".to_string(),
+                params: json!({ "roll": roll, "pitch": pitch, "yaw": yaw }),
+            },
+            RobotAction::BodyHeight { height } => Go2Call::Tool {
+                tool: "go2.body_height".to_string(),
+                params: json!({ "height": height }),
+            },
+            RobotAction::FootRaiseHeight { height } => Go2Call::Tool {
+                tool: "go2.foot_raise_height".to_string(),
+                params: json!({ "height": height }),
+            },
+            RobotAction::SpeedLevel { level } => Go2Call::Tool {
+                tool: "go2.speed_level".to_string(),
+                params: json!({ "level": level }),
+            },
+            RobotAction::Pose { roll, pitch, yaw, height } => Go2Call::Tool {
+                tool: "go2.pose".to_string(),
+                params: json!({ "roll": roll, "pitch": pitch, "yaw": yaw, "height": height }),
+            },
             RobotAction::Status => tool("go2.status"),
+            RobotAction::LidarOn => tool("go2.lidar_on"),
+            RobotAction::LidarOff => tool("go2.lidar_off"),
+            RobotAction::LidarFrame => tool("go2.lidar_frame"),
         }
     }
 }
@@ -199,6 +392,19 @@ pub enum Go2Call {
         block_type: String,
         params: serde_json::Value,
     },
+}
+
+/// Clamp a value into `[lo, hi]`. Callers reject non-finite values BEFORE reaching
+/// here (`sanitized()` returns `RejectReason::Malformed` for NaN/inf), so this only
+/// ever sees finite input in practice; the NaN guards remain purely defensive to
+/// avoid a `clamp` panic (min>max) if a NaN bound is ever passed.
+pub fn clamp_range(v: f64, lo: f64, hi: f64) -> f64 {
+    let lo = if lo.is_nan() { 0.0 } else { lo };
+    let hi = if hi.is_nan() { 0.0 } else { hi };
+    if v.is_nan() {
+        return lo;
+    }
+    v.clamp(lo, hi)
 }
 
 /// Clamp one velocity component to `[-cap, cap]`; NaN → 0.0.
@@ -421,7 +627,7 @@ pub fn plan_execution(
     if !authorized {
         return Err(RejectReason::PermissionDenied);
     }
-    let action = req.action.sanitized(resolved.max_velocity);
+    let action = req.action.sanitized(resolved.max_velocity)?;
     Ok(RobotExecutionPlan {
         addon_id: resolved.addon_id.clone(),
         actor_user_id: req.actor_user_id.clone(),
@@ -512,10 +718,22 @@ mod tests {
             ("recovery_stand", RobotAction::RecoveryStand),
             ("stand_up", RobotAction::StandUp),
             ("stand_down", RobotAction::StandDown),
+            ("balance_stand", RobotAction::BalanceStand),
             ("sit", RobotAction::Sit),
             ("hello", RobotAction::Hello),
             ("stretch", RobotAction::Stretch),
+            ("wiggle_hips", RobotAction::WiggleHips),
+            ("heart", RobotAction::Heart),
+            ("dance1", RobotAction::Dance1),
+            ("dance2", RobotAction::Dance2),
+            ("scrape", RobotAction::Scrape),
+            ("front_flip", RobotAction::FrontFlip),
+            ("front_jump", RobotAction::FrontJump),
+            ("front_pounce", RobotAction::FrontPounce),
             ("status", RobotAction::Status),
+            ("lidar_on", RobotAction::LidarOn),
+            ("lidar_off", RobotAction::LidarOff),
+            ("lidar_frame", RobotAction::LidarFrame),
         ];
         for (kind, want) in cases {
             assert_eq!(RobotAction::from_kind_axes(kind, 0.0, 0.0, 0.0), Some(want));
@@ -523,6 +741,154 @@ mod tests {
         // Closed allowlist: an unknown kind is refused.
         assert_eq!(RobotAction::from_kind_axes("explode", 0.0, 0.0, 0.0), None);
         assert_eq!(RobotAction::from_kind_axes("", 0.0, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn from_kind_params_maps_parametered_actions() {
+        assert_eq!(
+            RobotAction::from_kind_params("euler", 0.0, 0.0, 0.0, 0.1, -0.2, 0.3, 0.0),
+            Some(RobotAction::Euler { roll: 0.1, pitch: -0.2, yaw: 0.3 })
+        );
+        assert_eq!(
+            RobotAction::from_kind_params("body_height", 0.0, 0.0, 0.0, -0.05, 0.0, 0.0, 0.0),
+            Some(RobotAction::BodyHeight { height: -0.05 })
+        );
+        assert_eq!(
+            RobotAction::from_kind_params("foot_raise_height", 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0),
+            Some(RobotAction::FootRaiseHeight { height: 0.05 })
+        );
+        assert_eq!(
+            RobotAction::from_kind_params("speed_level", 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+            Some(RobotAction::SpeedLevel { level: 1.0 })
+        );
+        assert_eq!(
+            RobotAction::from_kind_params("pose", 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, -0.05),
+            Some(RobotAction::Pose { roll: 0.1, pitch: 0.2, yaw: 0.3, height: -0.05 })
+        );
+    }
+
+    #[test]
+    fn sanitized_clamps_euler_body_foot_speed_and_rejects_nan() {
+        // Finite-but-out-of-range Euler is clamped to ±limit.
+        assert_eq!(
+            RobotAction::Euler { roll: 5.0, pitch: -5.0, yaw: 0.1 }.sanitized(1.0),
+            Ok(RobotAction::Euler { roll: EULER_LIMIT, pitch: -EULER_LIMIT, yaw: 0.1 })
+        );
+        // A NaN axis is REJECTED (never coerced to a bound).
+        assert_eq!(
+            RobotAction::Euler { roll: 5.0, pitch: -5.0, yaw: f64::NAN }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        // +inf axis is REJECTED.
+        assert_eq!(
+            RobotAction::Euler { roll: f64::INFINITY, pitch: 0.0, yaw: 0.0 }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        // Body height clamped to range; out-of-range below clamps to min.
+        assert_eq!(
+            RobotAction::BodyHeight { height: -1.0 }.sanitized(1.0),
+            Ok(RobotAction::BodyHeight { height: BODY_HEIGHT_MIN })
+        );
+        assert_eq!(
+            RobotAction::BodyHeight { height: 1.0 }.sanitized(1.0),
+            Ok(RobotAction::BodyHeight { height: BODY_HEIGHT_MAX })
+        );
+        // NaN / -inf body height is REJECTED.
+        assert_eq!(
+            RobotAction::BodyHeight { height: f64::NAN }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        assert_eq!(
+            RobotAction::BodyHeight { height: f64::NEG_INFINITY }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        // Foot raise clamped; non-finite rejected.
+        assert_eq!(
+            RobotAction::FootRaiseHeight { height: 9.0 }.sanitized(1.0),
+            Ok(RobotAction::FootRaiseHeight { height: FOOT_RAISE_MAX })
+        );
+        assert_eq!(
+            RobotAction::FootRaiseHeight { height: f64::INFINITY }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        // Speed level rounded + clamped to discrete -1/0/1.
+        assert_eq!(
+            RobotAction::SpeedLevel { level: 7.0 }.sanitized(1.0),
+            Ok(RobotAction::SpeedLevel { level: 1.0 })
+        );
+        assert_eq!(
+            RobotAction::SpeedLevel { level: 0.4 }.sanitized(1.0),
+            Ok(RobotAction::SpeedLevel { level: 0.0 })
+        );
+        // NaN / inf speed level is REJECTED (not coerced to 0/1).
+        assert_eq!(
+            RobotAction::SpeedLevel { level: f64::NAN }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        assert_eq!(
+            RobotAction::SpeedLevel { level: f64::INFINITY }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+        // Pose clamps both orientation and height when all finite.
+        assert_eq!(
+            RobotAction::Pose { roll: 5.0, pitch: 0.0, yaw: 0.0, height: -1.0 }.sanitized(1.0),
+            Ok(RobotAction::Pose {
+                roll: EULER_LIMIT,
+                pitch: 0.0,
+                yaw: 0.0,
+                height: BODY_HEIGHT_MIN
+            })
+        );
+        // Any non-finite Pose param REJECTS (no partial sanitization).
+        assert_eq!(
+            RobotAction::Pose { roll: 0.0, pitch: 0.0, yaw: 0.0, height: f64::NAN }.sanitized(1.0),
+            Err(RejectReason::Malformed)
+        );
+    }
+
+    #[test]
+    fn new_motion_actions_require_robot_command_only_status_read_only() {
+        for a in [
+            RobotAction::BalanceStand,
+            RobotAction::Euler { roll: 0.0, pitch: 0.0, yaw: 0.0 },
+            RobotAction::BodyHeight { height: 0.0 },
+            RobotAction::FootRaiseHeight { height: 0.0 },
+            RobotAction::SpeedLevel { level: 0.0 },
+            RobotAction::Pose { roll: 0.0, pitch: 0.0, yaw: 0.0, height: 0.0 },
+            RobotAction::WiggleHips,
+            RobotAction::Heart,
+            RobotAction::Dance1,
+            RobotAction::Dance2,
+            RobotAction::Scrape,
+            RobotAction::FrontFlip,
+            RobotAction::FrontJump,
+            RobotAction::FrontPounce,
+        ] {
+            assert_eq!(a.required_permission(), "robot.command", "{a:?}");
+            assert!(!a.is_read_only(), "{a:?}");
+            assert!(!a.is_estop_class(), "{a:?}");
+        }
+        assert!(RobotAction::Status.is_read_only());
+    }
+
+    #[test]
+    fn parametered_actions_map_to_param_tools() {
+        match (RobotAction::Euler { roll: 0.1, pitch: -0.2, yaw: 0.3 }).to_go2_call() {
+            Go2Call::Tool { tool, params } => {
+                assert_eq!(tool, "go2.euler");
+                assert_eq!(params.get("roll").and_then(|v| v.as_f64()), Some(0.1));
+                assert_eq!(params.get("pitch").and_then(|v| v.as_f64()), Some(-0.2));
+                assert_eq!(params.get("yaw").and_then(|v| v.as_f64()), Some(0.3));
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
+        match (RobotAction::SpeedLevel { level: 1.0 }).to_go2_call() {
+            Go2Call::Tool { tool, params } => {
+                assert_eq!(tool, "go2.speed_level");
+                assert_eq!(params.get("level").and_then(|v| v.as_f64()), Some(1.0));
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
     }
 
     #[test]
@@ -537,9 +903,9 @@ mod tests {
     #[test]
     fn sanitized_clamps_move_to_safety_cap() {
         let a = RobotAction::Move { vx: 5.0, vy: -5.0, vyaw: 0.7 }.sanitized(0.5);
-        assert_eq!(a, RobotAction::Move { vx: 0.5, vy: -0.5, vyaw: 0.5 });
+        assert_eq!(a, Ok(RobotAction::Move { vx: 0.5, vy: -0.5, vyaw: 0.5 }));
         // non-move unchanged
-        assert_eq!(RobotAction::Sit.sanitized(0.5), RobotAction::Sit);
+        assert_eq!(RobotAction::Sit.sanitized(0.5), Ok(RobotAction::Sit));
     }
 
     #[test]
@@ -552,6 +918,24 @@ mod tests {
             "robot.command"
         );
         assert_eq!(RobotAction::Hello.required_permission(), "robot.command");
+        // LiDAR enable/disable is an actuator toggle → robot.command; the read-only
+        // frame fetch is telemetry-class and can never move hardware.
+        assert_eq!(RobotAction::LidarOn.required_permission(), "robot.command");
+        assert_eq!(RobotAction::LidarOff.required_permission(), "robot.command");
+        assert_eq!(RobotAction::LidarFrame.required_permission(), "robot.telemetry");
+        assert!(RobotAction::LidarFrame.is_read_only());
+        assert!(!RobotAction::LidarOn.is_read_only());
+    }
+
+    #[test]
+    fn lidar_actions_map_to_go2_tools() {
+        let tool_of = |a: RobotAction| match a.to_go2_call() {
+            Go2Call::Tool { tool, .. } => tool,
+            other => panic!("expected Tool, got {other:?}"),
+        };
+        assert_eq!(tool_of(RobotAction::LidarOn), "go2.lidar_on");
+        assert_eq!(tool_of(RobotAction::LidarOff), "go2.lidar_off");
+        assert_eq!(tool_of(RobotAction::LidarFrame), "go2.lidar_frame");
     }
 
     #[test]
@@ -612,8 +996,8 @@ mod tests {
     #[test]
     fn nan_max_velocity_does_not_panic() {
         let a = RobotAction::Move { vx: 0.5, vy: 0.5, vyaw: 0.5 }.sanitized(f64::NAN);
-        // NaN cap coerced to 0 → no motion.
-        assert_eq!(a, RobotAction::Move { vx: 0.0, vy: 0.0, vyaw: 0.0 });
+        // NaN cap coerced to 0 → no motion (action params are finite, so accepted).
+        assert_eq!(a, Ok(RobotAction::Move { vx: 0.0, vy: 0.0, vyaw: 0.0 }));
     }
 
     #[test]

@@ -45,7 +45,9 @@ const VISION_ADDON_ID: &str = "tentavision";
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const ADDON_ID: &str = "go2";
 const PANEL_ID: &str = "overview";
-const DEFAULT_IP: &str = "192.168.0.190";
+// The robot IP is provided per-install via the `ip` connection_param and read
+// from addon_config at runtime — there is intentionally NO hardcoded default.
+const IP_CONFIG_KEY: &str = "ip";
 const LATENCY_ALERT_MS: i64 = 500;
 const BATTERY_ALERT_PCT: i64 = 20;
 // Watchdogs (seconds). Validation must complete promptly; an online connection
@@ -57,17 +59,47 @@ const ONLINE_STALE_SECS: i64 = 12;
 static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
-// Sport command api_ids (normal mode) — only safe motions exposed (no Air-locked
-// flips / handstand).
+// Sport command api_ids (Go2 normal mode). This addon drives the robot over the
+// WebRTC firmware channel, so the authoritative id source is the WebRTC SPORT_CMD
+// table, NOT the DDS `unitree_sdk2` header. Cross-checked on 2026-06-18 against:
+//   - DDS:    https://raw.githubusercontent.com/unitreerobotics/unitree_sdk2/main/include/unitree/robot/go2/sport/sport_api.hpp
+//   - WebRTC: https://raw.githubusercontent.com/legion1581/unitree_webrtc_connect/master/unitree_webrtc_connect/constants.py (SPORT_CMD)
+// 19 of the 22 ids appear in BOTH tables identically. The remaining three —
+// BODY_HEIGHT (1013), FOOT_RAISE_HEIGHT (1014) and WIGGLE_HIPS (1033) — are NOT in
+// the DDS sport_api.hpp but ARE in the WebRTC SPORT_CMD table, which is the table
+// this transport uses. 1036 is `FingerHeart`/HEART in both, mapped to `heart`.
+// These IDs move a REAL robot, so they are not invented.
 const SPORT_DAMP: u32 = 1001;
+const SPORT_BALANCE_STAND: u32 = 1002;
 const SPORT_STOP_MOVE: u32 = 1003;
 const SPORT_STAND_UP: u32 = 1004;
 const SPORT_STAND_DOWN: u32 = 1005;
 const SPORT_RECOVERY_STAND: u32 = 1006;
+const SPORT_EULER: u32 = 1007;
 const SPORT_MOVE: u32 = 1008;
 const SPORT_SIT: u32 = 1009;
-const SPORT_STRETCH: u32 = 1017;
+const SPORT_BODY_HEIGHT: u32 = 1013;
+const SPORT_FOOT_RAISE_HEIGHT: u32 = 1014;
+const SPORT_SPEED_LEVEL: u32 = 1015;
 const SPORT_HELLO: u32 = 1016;
+const SPORT_STRETCH: u32 = 1017;
+const SPORT_DANCE1: u32 = 1022;
+const SPORT_DANCE2: u32 = 1023;
+const SPORT_SCRAPE: u32 = 1029;
+const SPORT_FRONT_FLIP: u32 = 1030;
+const SPORT_FRONT_JUMP: u32 = 1031;
+const SPORT_FRONT_POUNCE: u32 = 1032;
+const SPORT_WIGGLE_HIPS: u32 = 1033;
+const SPORT_FINGER_HEART: u32 = 1036;
+
+// Safe parameter clamps (mirrors core robot_control limits) — applied here too so
+// a LOCAL tool/block call (which does not pass through the mesh sanitizer) can
+// never send an out-of-range pose to the robot.
+const EULER_LIMIT: f64 = 0.75;
+const BODY_HEIGHT_MIN: f64 = -0.18;
+const BODY_HEIGHT_MAX: f64 = 0.03;
+const FOOT_RAISE_MIN: f64 = -0.06;
+const FOOT_RAISE_MAX: f64 = 0.10;
 
 // =============================================================================
 // Host imports
@@ -89,6 +121,43 @@ extern "C" {
     fn webrtc_register_camera_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+}
+
+/// Reads an install-time connection param from `addon_config` (scoped to this
+/// instance). Returns None when the key is absent/empty — there is NO default.
+fn config_get(key: &str) -> Option<String> {
+    let mut cap = 256usize;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let mut out_len: i32 = 0;
+        let ret = unsafe {
+            config_get_v1(
+                key.as_ptr() as i32,
+                key.len() as i32,
+                buf.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut i32 as i32,
+            )
+        };
+        if ret == 6 {
+            let want = if out_len > 0 { out_len as usize } else { 0 };
+            cap = want.max(cap.saturating_mul(2));
+            continue;
+        }
+        if ret != 0 {
+            return None;
+        }
+        if out_len <= 0 || out_len as usize > cap {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&buf[..out_len as usize]).into_owned();
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
 }
 
 // =============================================================================
@@ -324,24 +393,58 @@ fn subscribe_msg(topic: &str) -> String {
     json!({ "type": "subscribe", "topic": topic }).to_string()
 }
 
+/// Clamp a value into `[lo, hi]`; reject NaN/inf (caller surfaces an error).
+fn clamp_finite(v: f64, lo: f64, hi: f64) -> Option<f64> {
+    if !v.is_finite() {
+        return None;
+    }
+    Some(v.clamp(lo, hi))
+}
+
+/// Read a JSON number param from the tool/block input (supports a raw number or a
+/// FlowValue `{kind,data}`). Returns None when absent/unparseable so the caller
+/// can reject rather than silently default a motion command.
+fn param_num(params: &JsonValue, key: &str) -> Option<f64> {
+    let v = params.get(key)?;
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    flow_value_num(v)
+}
+
 /// Map a local sport command `(api_id, parameter)` to the vendor-agnostic
 /// `RobotActionWire` used for cross-node dispatch. `parameter` is the go2 move
 /// JSON (`{"x","y","z"}`) for SPORT_MOVE; ignored otherwise. Returns `None` for
 /// an api_id with no remote-control equivalent (so the caller keeps it local).
 fn sport_to_action(api_id: u32, parameter: &str) -> Option<RobotActionWire> {
+    let p: JsonValue = serde_json::from_str(parameter).unwrap_or(JsonValue::Null);
+    let num = |k: &str| p.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0);
     Some(match api_id {
-        SPORT_MOVE => {
-            let p: JsonValue = serde_json::from_str(parameter).unwrap_or(JsonValue::Null);
-            let axis = |k: &str| p.get(k).and_then(JsonValue::as_f64).unwrap_or(0.0);
-            RobotActionWire::move_to(axis("x"), axis("y"), axis("z"))
-        }
+        SPORT_MOVE => RobotActionWire::move_to(num("x"), num("y"), num("z")),
         SPORT_STOP_MOVE | SPORT_DAMP => RobotActionWire::simple("stop"),
         SPORT_STAND_UP => RobotActionWire::simple("stand_up"),
         SPORT_STAND_DOWN => RobotActionWire::simple("stand_down"),
         SPORT_RECOVERY_STAND => RobotActionWire::simple("recovery_stand"),
+        SPORT_BALANCE_STAND => RobotActionWire::simple("balance_stand"),
         SPORT_SIT => RobotActionWire::simple("sit"),
         SPORT_HELLO => RobotActionWire::simple("hello"),
         SPORT_STRETCH => RobotActionWire::simple("stretch"),
+        SPORT_WIGGLE_HIPS => RobotActionWire::simple("wiggle_hips"),
+        SPORT_FINGER_HEART => RobotActionWire::simple("heart"),
+        SPORT_DANCE1 => RobotActionWire::simple("dance1"),
+        SPORT_DANCE2 => RobotActionWire::simple("dance2"),
+        SPORT_SCRAPE => RobotActionWire::simple("scrape"),
+        SPORT_FRONT_FLIP => RobotActionWire::simple("front_flip"),
+        SPORT_FRONT_JUMP => RobotActionWire::simple("front_jump"),
+        SPORT_FRONT_POUNCE => RobotActionWire::simple("front_pounce"),
+        // The Go2 sport `parameter` for Euler is a JSON object with x/y/z (the
+        // roll/pitch/yaw radians); map it back onto the generic params shape.
+        SPORT_EULER => RobotActionWire::params("euler", num("x"), num("y"), num("z"), 0.0),
+        SPORT_BODY_HEIGHT => RobotActionWire::params("body_height", num("data"), 0.0, 0.0, 0.0),
+        SPORT_FOOT_RAISE_HEIGHT => {
+            RobotActionWire::params("foot_raise_height", num("data"), 0.0, 0.0, 0.0)
+        }
+        SPORT_SPEED_LEVEL => RobotActionWire::params("speed_level", num("data"), 0.0, 0.0, 0.0),
         _ => return None,
     })
 }
@@ -405,6 +508,117 @@ fn send_sport_gated(api_id: u32, parameter: &str) -> JsonValue {
         Ok(()) => json!({ "status": "sent" }),
         Err(e) => json!({ "error": alloc::format!("send: {e}") }),
     }
+}
+
+/// Euler tool: clamp roll/pitch/yaw to ±EULER_LIMIT, reject NaN/inf, send 1007.
+/// The Go2 sport `parameter` for Euler is `{"x":roll,"y":pitch,"z":yaw}`.
+fn send_euler(params: &JsonValue) -> JsonValue {
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        param_num(params, "roll"),
+        param_num(params, "pitch"),
+        param_num(params, "yaw"),
+    ) else {
+        return json!({ "error": "euler requires numeric roll/pitch/yaw" });
+    };
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        clamp_finite(roll, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(pitch, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(yaw, -EULER_LIMIT, EULER_LIMIT),
+    ) else {
+        return json!({ "error": "euler params must be finite" });
+    };
+    let p = json!({ "x": roll, "y": pitch, "z": yaw }).to_string();
+    send_sport_gated(SPORT_EULER, &p)
+}
+
+/// BodyHeight tool: clamp delta to [BODY_HEIGHT_MIN, BODY_HEIGHT_MAX], send 1013.
+fn send_body_height(params: &JsonValue) -> JsonValue {
+    let Some(h) = param_num(params, "height") else {
+        return json!({ "error": "body_height requires numeric height" });
+    };
+    let Some(h) = clamp_finite(h, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) else {
+        return json!({ "error": "body_height must be finite" });
+    };
+    send_sport_gated(SPORT_BODY_HEIGHT, &json!({ "data": h }).to_string())
+}
+
+/// FootRaiseHeight tool: clamp to [FOOT_RAISE_MIN, FOOT_RAISE_MAX], send 1014.
+fn send_foot_raise(params: &JsonValue) -> JsonValue {
+    let Some(h) = param_num(params, "height") else {
+        return json!({ "error": "foot_raise_height requires numeric height" });
+    };
+    let Some(h) = clamp_finite(h, FOOT_RAISE_MIN, FOOT_RAISE_MAX) else {
+        return json!({ "error": "foot_raise_height must be finite" });
+    };
+    send_sport_gated(SPORT_FOOT_RAISE_HEIGHT, &json!({ "data": h }).to_string())
+}
+
+/// SpeedLevel tool: discrete -1/0/1, NaN/out-of-range rejected, send 1015.
+fn send_speed_level(params: &JsonValue) -> JsonValue {
+    let Some(l) = param_num(params, "level") else {
+        return json!({ "error": "speed_level requires numeric level" });
+    };
+    if !l.is_finite() {
+        return json!({ "error": "speed_level must be finite" });
+    }
+    let l = l.round();
+    if !(-1.0..=1.0).contains(&l) {
+        return json!({ "error": "speed_level must be -1, 0 or 1" });
+    }
+    send_sport_gated(SPORT_SPEED_LEVEL, &json!({ "data": l as i64 }).to_string())
+}
+
+/// Composite body pose: Euler orientation (1007) + optional BodyHeight delta (1013).
+/// This is deliberately NOT the canonical `Pose` (1028) toggle — 1028 is a mode
+/// switch whose bool-flag semantics vary across Go2 firmware variants, so it can
+/// leave the robot in an unexpected state. The composite gives a deterministic
+/// body-orientation+height pose on every firmware; 1028 is intentionally omitted.
+///
+/// SAFETY: validate and clamp ALL params {roll,pitch,yaw,height} up front and send
+/// nothing until every value is known-safe. A bad height must NOT move the robot
+/// via the Euler leg first. NaN/inf are rejected (never coerced); finite-but-out-of
+/// -range values are clamped to the documented envelope.
+fn send_pose(params: &JsonValue) -> JsonValue {
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        param_num(params, "roll"),
+        param_num(params, "pitch"),
+        param_num(params, "yaw"),
+    ) else {
+        return json!({ "error": "pose requires numeric roll/pitch/yaw" });
+    };
+    let (Some(roll), Some(pitch), Some(yaw)) = (
+        clamp_finite(roll, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(pitch, -EULER_LIMIT, EULER_LIMIT),
+        clamp_finite(yaw, -EULER_LIMIT, EULER_LIMIT),
+    ) else {
+        return json!({ "error": "pose orientation params must be finite" });
+    };
+
+    // `height` is optional for a pure-orientation pose; default to no height change.
+    let height = match params.get("height") {
+        Some(_) => match param_num(params, "height") {
+            Some(h) => match clamp_finite(h, BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) {
+                Some(h) => Some(h),
+                None => return json!({ "error": "pose height must be finite" }),
+            },
+            None => return json!({ "error": "pose height must be numeric" }),
+        },
+        None => None,
+    };
+
+    // Everything is validated and clamped: now (and only now) emit motion commands.
+    let euler_param = json!({ "x": roll, "y": pitch, "z": yaw }).to_string();
+    let euler = send_sport_gated(SPORT_EULER, &euler_param);
+    if euler.get("error").is_some() {
+        return euler;
+    }
+    if let Some(h) = height {
+        let body = send_sport_gated(SPORT_BODY_HEIGHT, &json!({ "data": h }).to_string());
+        if body.get("error").is_some() {
+            return body;
+        }
+    }
+    json!({ "status": "sent" })
 }
 
 /// Find `needle` in `hay` starting at `from` (plain substring scan).
@@ -471,13 +685,586 @@ fn parse_soc(bytes: &[u8]) -> Option<i64> {
 }
 
 // =============================================================================
+// Latest-telemetry snapshot (rt/sportmodestate + rt/lf/lowstate)
+// =============================================================================
+
+/// Most-recent values parsed from the high-rate telemetry streams. Every field is
+/// optional so an absent value is NEVER fabricated — a stream that omits a field
+/// (or a whole sub-block) simply leaves it `None`/empty. This lives in process
+/// memory (single-threaded WASM) and is overwritten with the latest values on
+/// every tick; `go2.status` reads it at the existing status cadence (it is NOT
+/// advertised at the raw stream rate).
+#[derive(Clone, Default)]
+struct Telemetry {
+    mode: Option<i64>,
+    gait_type: Option<i64>,
+    body_height: Option<f64>,
+    vx: Option<f64>,
+    vy: Option<f64>,
+    vyaw: Option<f64>,
+    position: Vec<f64>,
+    foot_force: Vec<f64>,
+    imu_roll: Option<f64>,
+    imu_pitch: Option<f64>,
+    imu_yaw: Option<f64>,
+    imu_quaternion: Vec<f64>,
+    imu_temperature: Option<f64>,
+    bat_soc: Option<f64>,
+    bat_voltage: Option<f64>,
+    bat_current: Option<f64>,
+    bat_temperature: Option<f64>,
+}
+
+std::thread_local! {
+    static TELEMETRY: core::cell::RefCell<Telemetry> = core::cell::RefCell::new(Telemetry::default());
+}
+
+// =============================================================================
+// LiDAR voxel map (rt/utlidar/voxel_map_compressed)
+// =============================================================================
+
+const LIDAR_TOPIC: &str = "rt/utlidar/voxel_map_compressed";
+const LIDAR_SWITCH_TOPIC: &str = "rt/utlidar/switch";
+// Upstream decoder buffers the decompressed occupancy grid at exactly 80_000 bytes
+// (go2_webrtc_connect `decompressBuffer`). The grid addresses z*0x800 + y*0x10 +
+// x_byte: z-stride 0x800 (2048), y-stride 0x10 (16), 16 x-bytes => 128 x-voxels.
+// The upstream-documented uncompressed grid is 80_000 bytes (the maximum valid
+// `index + 1`); a frame can hold at most 80_000*8 occupied voxels. `src_size` is
+// the documented uncompressed grid size, so any frame declaring a larger size is
+// malformed and rejected (logged), never silently truncated. This is also the
+// hard cap so a malformed `src_size` cannot make the LZ4 decoder allocate without
+// bound.
+const LIDAR_GRID_BYTES: usize = 80_000;
+// Hard cap on retained decoded points. The Go2 voxel map is sparse (a few k
+// occupied voxels per frame in practice); this bounds memory if a frame decodes
+// to an unexpectedly dense grid. Exceeding it marks the frame unavailable and is
+// logged — we never keep a half-decoded point set (which would misplace points).
+const LIDAR_MAX_POINTS: usize = 300_000;
+
+/// Latest decoded LiDAR frame plus the on/off intent. Only the MOST RECENT frame
+/// is kept (the voxel map is a stream); a new frame overwrites the prior one so
+/// memory stays bounded. `enabled` is the operator intent (we sent switch "on"),
+/// distinct from `available` (we have actually decoded at least one fresh frame).
+#[derive(Clone, Default)]
+struct LidarState {
+    enabled: bool,
+    // True once the host channel has been sent the subscribe message for this
+    // online session, so the per-tick path does not re-subscribe every tick.
+    subscribed: bool,
+    resolution: Option<f32>,
+    origin: Option<[f64; 3]>,
+    // Decoded voxel-center points in meters (x,y,z), origin+resolution applied.
+    points: Vec<[f32; 3]>,
+    // Monotonic counter of frames decoded this session (UI freshness indicator).
+    frame_seq: u64,
+    // Wall-clock seconds of the last decoded frame.
+    last_update_ts: i64,
+    // Size of the last compressed payload received (bytes), for diagnostics even
+    // when a frame failed to decode.
+    last_payload_bytes: usize,
+}
+
+std::thread_local! {
+    static LIDAR: core::cell::RefCell<LidarState> = core::cell::RefCell::new(LidarState::default());
+}
+
+/// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
+/// stale frame from a previous session is never reported as available.
+fn lidar_reset_session() {
+    LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        let enabled = l.enabled;
+        *l = LidarState::default();
+        // Preserve the operator's enable INTENT across reconnects so the lidar is
+        // re-subscribed automatically once the link is back online.
+        l.enabled = enabled;
+    });
+}
+
+/// Build the LiDAR availability sub-object for `go2.status`. SMALL by design (no
+/// point cloud) so it can ride the advertised snapshot. `available` is true only
+/// when at least one frame decoded this session. Absent fields (resolution/origin)
+/// are omitted, never fabricated.
+fn lidar_status_json() -> JsonValue {
+    LIDAR.with(|cell| {
+        let l = cell.borrow();
+        let mut obj = serde_json::Map::new();
+        obj.insert("enabled".into(), json!(l.enabled));
+        obj.insert("available".into(), json!(l.frame_seq > 0 && !l.points.is_empty()));
+        obj.insert("point_count".into(), json!(l.points.len()));
+        if let Some(r) = l.resolution {
+            obj.insert("resolution".into(), json!(r));
+        }
+        if let Some(o) = l.origin {
+            obj.insert("origin".into(), json!([o[0], o[1], o[2]]));
+        }
+        obj.insert("frame_seq".into(), json!(l.frame_seq));
+        if l.last_update_ts > 0 {
+            obj.insert("last_update_ts".into(), json!(l.last_update_ts));
+        }
+        JsonValue::Object(obj)
+    })
+}
+
+/// Decode the Go2 voxel-map occupancy bitfield into voxel-center points (meters).
+/// Mirrors the upstream `go2_webrtc_connect` NATIVE decoder exactly:
+///   - the decompressed buffer is a 3D occupancy grid addressed as
+///     `index = z*0x800 + y*0x10 + x_byte`; each byte packs 8 voxels along x
+///     (`x = x_byte*8 + bit`, MSB-first).
+///   - a point is emitted for every set bit, at `[x,y,z]*resolution + origin`.
+/// The grid dimensions (0x800 z-stride, 0x10 y-stride, 16 bytes => 128 x-voxels)
+/// are the upstream constants. Returns the points or `None` if the count would
+/// exceed `LIDAR_MAX_POINTS` (logged by the caller — never a partial set).
+fn voxel_bits_to_points(buf: &[u8], origin: [f64; 3], resolution: f32) -> Option<Vec<[f32; 3]>> {
+    let res = resolution as f64;
+    let mut out: Vec<[f32; 3]> = Vec::new();
+    for (i, &byte) in buf.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        let z = (i / 0x800) as f64;
+        let n_slice = i % 0x800;
+        let y = (n_slice / 0x10) as f64;
+        let x_base = ((n_slice % 0x10) * 8) as f64;
+        // MSB-first bit order (matches numpy `unpackbits`).
+        for bit in 0..8u32 {
+            if byte & (0x80 >> bit) != 0 {
+                if out.len() >= LIDAR_MAX_POINTS {
+                    return None;
+                }
+                let x = x_base + bit as f64;
+                out.push([
+                    (x * res + origin[0]) as f32,
+                    (y * res + origin[1]) as f32,
+                    (z * res + origin[2]) as f32,
+                ]);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Read a 3-element `[x,y,z]` numeric origin from the lidar frame JSON `data`.
+/// All-or-nothing: a missing/non-numeric element drops the whole origin (we never
+/// place points against a fabricated origin).
+fn parse_origin3(v: Option<&JsonValue>) -> Option<[f64; 3]> {
+    let arr = v.and_then(JsonValue::as_array)?;
+    if arr.len() < 3 {
+        return None;
+    }
+    Some([arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?])
+}
+
+/// Parse the two binary data-channel framings the Go2 uses for an inbound voxel
+/// map (matches upstream `deal_array_buffer`):
+///   - LiDAR framing: leading `<HH>` == (2,0); then at +4 a `<I>` json length,
+///     JSON at [8..8+len], compressed bytes after.
+///   - normal framing: `<H>` json length at 0, JSON at [4..4+len], compressed
+///     bytes after.
+/// Returns `(data_json, compressed_bytes)` where `data_json` is the inner `data`
+/// object carrying `{resolution, origin, src_size}`. `None` if the frame is too
+/// short, the JSON is invalid, or the topic is not the voxel map.
+fn parse_voxel_frame(raw: &[u8]) -> Option<(JsonValue, &[u8])> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let h1 = u16::from_le_bytes([raw[0], raw[1]]);
+    let h2 = u16::from_le_bytes([raw[2], raw[3]]);
+    let (json_bytes, compressed): (&[u8], &[u8]) = if h1 == 2 && h2 == 0 {
+        // LiDAR framing: skip the 4-byte (2,0) header, then a u32 length at +0.
+        let body = &raw[4..];
+        if body.len() < 8 {
+            return None;
+        }
+        let len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        let json_end = 8usize.checked_add(len)?;
+        if body.len() < json_end {
+            return None;
+        }
+        (&body[8..json_end], &body[json_end..])
+    } else {
+        // Normal framing: u16 length at 0, JSON at [4..4+len].
+        let len = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+        let json_end = 4usize.checked_add(len)?;
+        if raw.len() < json_end {
+            return None;
+        }
+        (&raw[4..json_end], &raw[json_end..])
+    };
+    let envelope: JsonValue = serde_json::from_slice(json_bytes).ok()?;
+    let topic = envelope.get("topic").and_then(JsonValue::as_str).unwrap_or("");
+    // EXACT match: only the voxel-map topic decodes into the voxel frame. An
+    // unrelated utlidar binary message must never enter the LZ4 decode path.
+    if topic != LIDAR_TOPIC {
+        return None;
+    }
+    let data = envelope.get("data")?.clone();
+    Some((data, compressed))
+}
+
+/// Ingest one inbound binary voxel-map frame: parse the framing, LZ4-decompress to
+/// `src_size`, decode the occupancy bits to points, and overwrite the latest-frame
+/// slot (bounded memory: only the newest frame is kept). Tolerant: a malformed or
+/// oversized frame updates the diagnostic byte size + logs, but leaves the prior
+/// decoded frame untouched and `available` unchanged rather than fabricating data.
+fn ingest_voxel_map(raw: &[u8]) {
+    let Some((data, compressed)) = parse_voxel_frame(raw) else {
+        return;
+    };
+    LIDAR.with(|cell| {
+        cell.borrow_mut().last_payload_bytes = compressed.len();
+    });
+    let resolution = data.get("resolution").and_then(JsonValue::as_f64);
+    let origin = parse_origin3(data.get("origin"));
+    // `src_size` is the decompressed-buffer size the robot used (LZ4 block needs
+    // the exact uncompressed length, like `lz4.block.decompress(uncompressed_size)`).
+    let src_size = data
+        .get("src_size")
+        .and_then(JsonValue::as_u64)
+        .map(|n| n as usize);
+    let (Some(resolution), Some(origin), Some(src_size)) = (resolution, origin, src_size) else {
+        log::warn("go2 lidar: frame missing resolution/origin/src_size — skipped");
+        return;
+    };
+    // Range-check resolution/origin BEFORE allocating/decompressing. A non-positive
+    // or non-finite resolution, or any non-finite origin component, is malformed —
+    // reject the frame rather than spend CPU/memory decoding an unplaceable grid.
+    if !resolution.is_finite() || resolution <= 0.0 {
+        log::warn("go2 lidar: non-positive or non-finite resolution — frame skipped");
+        return;
+    }
+    if origin.iter().any(|c| !c.is_finite()) {
+        log::warn("go2 lidar: non-finite origin component — frame skipped");
+        return;
+    }
+    if src_size == 0 || src_size > LIDAR_GRID_BYTES {
+        log::warn("go2 lidar: src_size out of bounds — frame skipped");
+        return;
+    }
+    let mut decompressed = vec![0u8; src_size];
+    let n = match lz4_flex::block::decompress_into(compressed, &mut decompressed) {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn("go2 lidar: LZ4 decompress failed — frame skipped");
+            return;
+        }
+    };
+    // `src_size` is the documented uncompressed grid size: a short decompress means
+    // the declared size and the actual block disagree — malformed, not a partial
+    // grid. Reject and keep prior state.
+    if n != src_size {
+        log::warn("go2 lidar: decompressed length != src_size — frame skipped");
+        return;
+    }
+    let resolution_f32 = resolution as f32;
+    let points = match voxel_bits_to_points(&decompressed[..n], origin, resolution_f32) {
+        Some(p) => p,
+        None => {
+            log::warn("go2 lidar: decoded point count exceeded cap — frame dropped");
+            return;
+        }
+    };
+    LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.resolution = Some(resolution_f32);
+        l.origin = Some(origin);
+        l.points = points;
+        l.frame_seq = l.frame_seq.saturating_add(1);
+        l.last_update_ts = db::now_secs();
+    });
+}
+
+/// Turn the LiDAR sensor on/off: publish the `rt/utlidar/switch` command and, on
+/// enable, ensure the voxel topic is subscribed on the live channel. Routes
+/// locally when the robot is online on THIS node; when it lives on another node
+/// the toggle is dispatched over the mesh like every other control. Tracks the
+/// operator enable intent so a reconnect re-subscribes automatically.
+fn set_lidar(enabled: bool) -> JsonValue {
+    let robot = match db::get_robot() {
+        Ok(r) => r,
+        Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
+    };
+    LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.enabled = enabled;
+        if !enabled {
+            l.subscribed = false;
+        }
+    });
+    if robot.status != "online" || robot.channel_id.is_empty() {
+        // Robot owned by another node — route the toggle over the mesh.
+        let kind = if enabled { "lidar_on" } else { "lidar_off" };
+        return match robot_dispatch(RobotActionWire::simple(kind)) {
+            Ok(resp) => dispatch_result_json(resp),
+            Err(e) => json!({ "error": alloc::format!("dispatch: {e}") }),
+        };
+    }
+    let instruction = if enabled { "on" } else { "off" };
+    let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": instruction }).to_string();
+    if let Err(e) = wc_send_text(&robot.channel_id, &switch) {
+        return json!({ "error": alloc::format!("send: {e}") });
+    }
+    if enabled {
+        if let Err(e) = wc_send_text(&robot.channel_id, &subscribe_msg(LIDAR_TOPIC)) {
+            return json!({ "error": alloc::format!("subscribe: {e}") });
+        }
+        LIDAR.with(|cell| cell.borrow_mut().subscribed = true);
+    }
+    json!({ "status": "sent", "enabled": enabled })
+}
+
+/// On-demand fetch of the latest decoded LiDAR frame for a future 3D renderer.
+/// Returns the full point set plus metadata. This is the data seam: a renderer
+/// pulls it when it needs to draw, rather than streaming the cloud continuously.
+/// When no frame has decoded yet it returns metadata with `available:false`.
+fn lidar_frame() -> JsonValue {
+    LIDAR.with(|cell| {
+        let l = cell.borrow();
+        let available = l.frame_seq > 0 && !l.points.is_empty();
+        let mut obj = serde_json::Map::new();
+        obj.insert("enabled".into(), json!(l.enabled));
+        obj.insert("available".into(), json!(available));
+        obj.insert("point_count".into(), json!(l.points.len()));
+        obj.insert("frame_seq".into(), json!(l.frame_seq));
+        obj.insert("last_payload_bytes".into(), json!(l.last_payload_bytes));
+        if let Some(r) = l.resolution {
+            obj.insert("resolution".into(), json!(r));
+        }
+        if let Some(o) = l.origin {
+            obj.insert("origin".into(), json!([o[0], o[1], o[2]]));
+        }
+        if l.last_update_ts > 0 {
+            obj.insert("last_update_ts".into(), json!(l.last_update_ts));
+        }
+        // Flat [x0,y0,z0, x1,y1,z1, ...] float array — a compact shape a renderer
+        // can upload straight into a vertex buffer without per-point objects.
+        if available {
+            let mut flat: Vec<f32> = Vec::with_capacity(l.points.len() * 3);
+            for p in &l.points {
+                flat.extend_from_slice(p);
+            }
+            obj.insert("points".into(), json!(flat));
+        }
+        JsonValue::Object(obj)
+    })
+}
+
+/// Read a fixed-layout `[a, b, c, ...]` JSON sensor array of numbers into a
+/// `Vec<f64>`. All-or-nothing: these arrays carry positional identity (e.g.
+/// `foot_force[0]` is one specific foot), so if ANY element is missing/null/
+/// non-numeric the WHOLE vector is dropped rather than compacted — a compacted
+/// partial would silently shift indices and corrupt the per-position mapping.
+/// Empty when the value is absent, not an array, or any element is non-numeric
+/// (no invented entries, no shifted entries).
+fn json_f64_array(v: Option<&JsonValue>) -> Vec<f64> {
+    let Some(arr) = v.and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        match elem.as_f64() {
+            Some(n) => out.push(n),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// Parse a `rt/sportmodestate` message body into the latest-telemetry snapshot,
+/// overwriting ONLY the fields actually present (an absent field keeps the prior
+/// value rather than clobbering it to None — the stream sometimes omits sub-blocks
+/// between frames). The documented go2_webrtc_connect shape carries the sport
+/// fields under `data`.
+fn ingest_sportmodestate(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        if let Some(n) = data.get("mode").and_then(JsonValue::as_i64) {
+            t.mode = Some(n);
+        }
+        if let Some(n) = data.get("gait_type").and_then(JsonValue::as_i64) {
+            t.gait_type = Some(n);
+        }
+        if let Some(n) = data.get("body_height").and_then(JsonValue::as_f64) {
+            t.body_height = Some(n);
+        }
+        if let Some(vel) = data.get("velocity").and_then(JsonValue::as_array) {
+            if let Some(x) = vel.first().and_then(JsonValue::as_f64) {
+                t.vx = Some(x);
+            }
+            if let Some(y) = vel.get(1).and_then(JsonValue::as_f64) {
+                t.vy = Some(y);
+            }
+        }
+        if let Some(n) = data.get("yaw_speed").and_then(JsonValue::as_f64) {
+            t.vyaw = Some(n);
+        }
+        let pos = json_f64_array(data.get("position"));
+        if !pos.is_empty() {
+            t.position = pos;
+        }
+        let ff = json_f64_array(data.get("foot_force"));
+        if !ff.is_empty() {
+            t.foot_force = ff;
+        }
+        if let Some(imu) = data.get("imu_state") {
+            if let Some(rpy) = imu.get("rpy").and_then(JsonValue::as_array) {
+                if let Some(r) = rpy.first().and_then(JsonValue::as_f64) {
+                    t.imu_roll = Some(r);
+                }
+                if let Some(p) = rpy.get(1).and_then(JsonValue::as_f64) {
+                    t.imu_pitch = Some(p);
+                }
+                if let Some(y) = rpy.get(2).and_then(JsonValue::as_f64) {
+                    t.imu_yaw = Some(y);
+                }
+            }
+            let quat = json_f64_array(imu.get("quaternion"));
+            if !quat.is_empty() {
+                t.imu_quaternion = quat;
+            }
+            if let Some(n) = imu.get("temperature").and_then(JsonValue::as_f64) {
+                t.imu_temperature = Some(n);
+            }
+        }
+    });
+}
+
+/// Parse the extra battery detail (voltage / current / bms temperature) out of a
+/// `rt/lf/lowstate` body, updating the snapshot. SOC is handled separately by the
+/// zero-alloc `parse_soc` byte scan on the hot path; this richer parse runs only
+/// when a lowstate frame is the throttled snapshot carrier. Tolerant of the two
+/// documented shapes: a top-level `bms_state` object or a flat layout.
+fn ingest_lowstate_battery(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    let bms = data.get("bms_state").or_else(|| data.get("bms"));
+    TELEMETRY.with(|cell| {
+        let mut t = cell.borrow_mut();
+        if let Some(soc) = bms
+            .and_then(|b| b.get("soc"))
+            .or_else(|| data.get("soc"))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_soc = Some(soc);
+        }
+        // Pack voltage/current can be reported at the lowstate root (`power_v`,
+        // `power_a`) or inside the bms block (`voltage`, `current`).
+        if let Some(volt) = data
+            .get("power_v")
+            .or_else(|| bms.and_then(|b| b.get("voltage")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_voltage = Some(volt);
+        }
+        if let Some(curr) = data
+            .get("power_a")
+            .or_else(|| bms.and_then(|b| b.get("current")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_current = Some(curr);
+        }
+        if let Some(temp) = bms
+            .and_then(|b| b.get("temperature"))
+            .or_else(|| bms.and_then(|b| b.get("bms_temperature")))
+            .and_then(JsonValue::as_f64)
+        {
+            t.bat_temperature = Some(temp);
+        }
+    });
+}
+
+/// Build the structured `telemetry` JSON object from the latest snapshot, INCLUDING
+/// only the fields actually received (absent → omitted, never a fabricated value).
+/// Returns `JsonValue::Null` when nothing has been received yet so `go2.status`
+/// omits the key entirely.
+fn telemetry_json() -> JsonValue {
+    TELEMETRY.with(|cell| {
+        let t = cell.borrow();
+        let mut obj = serde_json::Map::new();
+        let put_num = |obj: &mut serde_json::Map<String, JsonValue>, k: &str, v: Option<f64>| {
+            if let Some(n) = v {
+                obj.insert(k.into(), json!(n));
+            }
+        };
+        if let Some(n) = t.mode {
+            obj.insert("mode".into(), json!(n));
+        }
+        if let Some(n) = t.gait_type {
+            obj.insert("gait_type".into(), json!(n));
+        }
+        put_num(&mut obj, "body_height", t.body_height);
+        let mut vel = serde_json::Map::new();
+        if let Some(n) = t.vx {
+            vel.insert("vx".into(), json!(n));
+        }
+        if let Some(n) = t.vy {
+            vel.insert("vy".into(), json!(n));
+        }
+        if let Some(n) = t.vyaw {
+            vel.insert("vyaw".into(), json!(n));
+        }
+        if !vel.is_empty() {
+            obj.insert("velocity".into(), JsonValue::Object(vel));
+        }
+        if !t.position.is_empty() {
+            obj.insert("position".into(), json!(t.position));
+        }
+        if !t.foot_force.is_empty() {
+            obj.insert("foot_force".into(), json!(t.foot_force));
+        }
+
+        let mut imu = serde_json::Map::new();
+        put_num(&mut imu, "roll", t.imu_roll);
+        put_num(&mut imu, "pitch", t.imu_pitch);
+        put_num(&mut imu, "yaw", t.imu_yaw);
+        if !t.imu_quaternion.is_empty() {
+            imu.insert("quaternion".into(), json!(t.imu_quaternion));
+        }
+        put_num(&mut imu, "temperature", t.imu_temperature);
+        if !imu.is_empty() {
+            obj.insert("imu".into(), JsonValue::Object(imu));
+        }
+
+        let mut bat = serde_json::Map::new();
+        put_num(&mut bat, "soc", t.bat_soc);
+        put_num(&mut bat, "voltage", t.bat_voltage);
+        put_num(&mut bat, "current", t.bat_current);
+        put_num(&mut bat, "temperature", t.bat_temperature);
+        if !bat.is_empty() {
+            obj.insert("battery".into(), JsonValue::Object(bat));
+        }
+
+        if obj.is_empty() {
+            JsonValue::Null
+        } else {
+            JsonValue::Object(obj)
+        }
+    })
+}
+
+// =============================================================================
 // Connection state machine
 // =============================================================================
 
 fn do_connect() -> JsonValue {
     log::info("go2: do_connect entered");
     let robot = db::get_robot().unwrap_or_default();
-    let ip = if robot.ip.is_empty() { DEFAULT_IP.to_string() } else { robot.ip.clone() };
+    // The configured IP (install-time `ip` connection_param) is the single source
+    // of truth. No default — an unconfigured instance refuses to connect.
+    let ip = match config_get(IP_CONFIG_KEY) {
+        Some(ip) => ip,
+        None => {
+            log::warn("go2: no IP configured — cannot connect");
+            let _ = db::set_offline("error", "no IP configured");
+            return json!({ "error": "no IP configured" });
+        }
+    };
     log::info(&alloc::format!("go2: do_connect ip={ip} status={}", robot.status));
     if db::ensure_robot(&ip).is_err() {
         log::warn("go2: ensure_robot failed");
@@ -580,6 +1367,7 @@ fn do_disconnect() -> JsonValue {
             wc_close(&robot.channel_id);
         }
     }
+    lidar_reset_session();
     let _ = db::set_offline("offline", "");
     json!({ "status": "offline" })
 }
@@ -733,17 +1521,34 @@ fn tick() {
             // drain failure). last_telemetry advances ONLY on actual lowstate.
             if db::now_secs() - robot.last_telemetry > ONLINE_STALE_SECS {
                 wc_close(&robot.channel_id);
+                lidar_reset_session();
                 let _ = db::set_offline("error", "telemetry stalled");
                 publish_event("go2.offline", json!({ "reason": "telemetry stalled" }));
                 return;
             }
             db::bump_tick();
             let tick_n = robot.tick_count + 1;
+            // If the operator enabled the LiDAR but this online session has not
+            // subscribed yet (fresh connection / reconnect), (re)send switch "on"
+            // + subscribe. The intent survives reconnects via lidar_reset_session.
+            let need_lidar_sub = LIDAR.with(|cell| {
+                let l = cell.borrow();
+                l.enabled && !l.subscribed
+            });
+            if need_lidar_sub {
+                let switch = json!({ "type": "msg", "topic": LIDAR_SWITCH_TOPIC, "data": "on" }).to_string();
+                if wc_send_text(&robot.channel_id, &switch).is_ok()
+                    && wc_send_text(&robot.channel_id, &subscribe_msg(LIDAR_TOPIC)).is_ok()
+                {
+                    LIDAR.with(|cell| cell.borrow_mut().subscribed = true);
+                }
+            }
             let drained = match wc_drain(&robot.channel_id, 64) {
                 Ok(d) => d,
                 Err(_) => return,
             };
             if drained.closed {
+                lidar_reset_session();
                 let _ = db::set_offline("error", "channel closed");
                 publish_event("go2.offline", json!({ "reason": "channel closed" }));
                 return;
@@ -753,10 +1558,10 @@ fn tick() {
             DECODE_BUF.with(|cell| {
                 let mut dec = cell.borrow_mut();
                 for msg in &drained.messages {
-                    if !msg.is_text {
-                        continue;
-                    }
                     let src = msg.data_b64.as_bytes();
+                    // base64 decodes to at most 3/4 of the input length; size the
+                    // scratch to the source length (an upper bound) so the slice
+                    // decode always fits.
                     if dec.len() < src.len() {
                         dec.resize(src.len(), 0);
                     }
@@ -765,13 +1570,27 @@ fn tick() {
                         Err(_) => continue,
                     };
                     let raw = &dec[..n];
+                    // Binary frames carry the LiDAR voxel map (and other binary
+                    // pub/sub payloads). The voxel topic is identified inside the
+                    // binary framing's JSON header by parse_voxel_frame.
+                    if !msg.is_text {
+                        ingest_voxel_map(raw);
+                        continue;
+                    }
                     // Only lowstate carries battery; gate on the topic substring,
-                    // then pull the integer soc with a zero-alloc byte scan.
+                    // then pull the integer soc with a zero-alloc byte scan. The
+                    // richer battery detail (voltage/current/temp) is parsed into
+                    // the latest-telemetry snapshot read at the status cadence.
                     if find_sub(raw, b"lowstate", 0).is_some() {
                         if let Some(soc) = parse_soc(raw) {
                             battery = soc;
                             got_telemetry = true;
                         }
+                        ingest_lowstate_battery(raw);
+                    } else if find_sub(raw, b"sportmodestate", 0).is_some() {
+                        // High-rate motion/IMU stream: keep only the latest values
+                        // in memory; never advertise at this raw rate.
+                        ingest_sportmodestate(raw);
                     }
                 }
             });
@@ -906,7 +1725,11 @@ fn render_panel() {
     } else {
         "—".into()
     };
-    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, if robot.ip.is_empty() { DEFAULT_IP } else { &robot.ip });
+    // IP pochodzi WYLACZNIE z konfiguracji instalacji (connection-param). Brak
+    // fallbacku do starej kolumny robot.ip — niesakonfigurowana instancja pokazuje
+    // marker, zeby UI nie sugerowal polaczenia z nieaktualnym/legacy adresem.
+    let ip_display = config_get(IP_CONFIG_KEY).unwrap_or_else(|| "(brak konfiguracji)".to_string());
+    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, ip_display);
     let estop_line = if robot.estop_active { "E-STOP AKTYWNY".into() } else { "e-stop: wyłączony".to_string() };
 
     let layout = card(
@@ -952,7 +1775,7 @@ fn render_panel() {
 // Request dispatch
 // =============================================================================
 
-fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
+fn handle(tool: &str, params: &JsonValue) -> JsonValue {
     let mv = |vx: f64, vy: f64, vyaw: f64| -> JsonValue {
         let p = json!({ "x": vx, "y": vy, "z": vyaw }).to_string();
         send_sport_gated(SPORT_MOVE, &p)
@@ -967,27 +1790,131 @@ fn handle(tool: &str, _params: &JsonValue) -> JsonValue {
         "go2.action_sit" => send_sport_gated(SPORT_SIT, ""),
         "go2.action_standup" => send_sport_gated(SPORT_STAND_UP, ""),
         "go2.action_standdown" => send_sport_gated(SPORT_STAND_DOWN, ""),
+        "go2.action_balance_stand" => send_sport_gated(SPORT_BALANCE_STAND, ""),
         "go2.action_stretch" => send_sport_gated(SPORT_STRETCH, ""),
+        "go2.action_wiggle_hips" => send_sport_gated(SPORT_WIGGLE_HIPS, ""),
+        "go2.action_heart" => send_sport_gated(SPORT_FINGER_HEART, ""),
+        "go2.action_dance1" => send_sport_gated(SPORT_DANCE1, ""),
+        "go2.action_dance2" => send_sport_gated(SPORT_DANCE2, ""),
+        "go2.action_scrape" => send_sport_gated(SPORT_SCRAPE, ""),
+        "go2.action_front_flip" => send_sport_gated(SPORT_FRONT_FLIP, ""),
+        "go2.action_front_jump" => send_sport_gated(SPORT_FRONT_JUMP, ""),
+        "go2.action_front_pounce" => send_sport_gated(SPORT_FRONT_POUNCE, ""),
+        "go2.euler" => send_euler(params),
+        "go2.body_height" => send_body_height(params),
+        "go2.foot_raise_height" => send_foot_raise(params),
+        "go2.speed_level" => send_speed_level(params),
+        "go2.pose" => send_pose(params),
+        "go2.lidar_on" => set_lidar(true),
+        "go2.lidar_off" => set_lidar(false),
+        // Combined toggle: `{enabled: bool}`; defaults to enabling when absent.
+        "go2.lidar" => {
+            let enabled = params
+                .get("enabled")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true);
+            set_lidar(enabled)
+        }
+        "go2.lidar_frame" => lidar_frame(),
         "go2.move_fwd" => mv(0.3, 0.0, 0.0),
         "go2.move_back" => mv(-0.3, 0.0, 0.0),
         "go2.move_left" => mv(0.0, 0.3, 0.0),
         "go2.move_right" => mv(0.0, -0.3, 0.0),
         "go2.status" => match db::get_robot() {
-            Ok(r) => json!({
-                "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
-                "estop_active": r.estop_active, "camera_id": r.camera_id,
-                // Capabilities the go2 driver exposes. Advertised on the mesh so a
-                // controller node can present available actions without owning the
-                // addon. Keep in sync with the `go2.action_*` / `go2.move_*` tools.
-                "capabilities": [
-                    "move", "sit", "stand_up", "stand_down", "recovery_stand",
-                    "hello", "stretch", "stop", "camera",
-                ],
-            }),
+            Ok(r) => {
+                let mut out = json!({
+                    "status": r.status, "battery_pct": r.battery_pct, "rtt_ms": r.rtt_ms,
+                    "estop_active": r.estop_active, "camera_id": r.camera_id,
+                    // Flat capability tags (kept for backward compatibility with any
+                    // consumer that reads a string array). Keep in sync with `actions_meta`.
+                    "capabilities": capability_kinds(),
+                    // Rich, capability-driven descriptor: every implemented control with
+                    // a human label, risk tier and param schema, so a capability-driven
+                    // UI can render labels / gate high-risk acrobatics without hardcoding.
+                    "actions_meta": actions_meta(),
+                });
+                // Structured telemetry snapshot (latest values from
+                // rt/sportmodestate + rt/lf/lowstate). Only emitted when something
+                // has been received — an empty stream omits the key entirely.
+                let telemetry = telemetry_json();
+                if !telemetry.is_null() {
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("telemetry".into(), telemetry);
+                    }
+                }
+                // SMALL LiDAR availability sub-object (enabled/available/point
+                // count/resolution/origin/frame_seq/ts) — NEVER the point cloud.
+                // It rides the advertised status snapshot like telemetry.
+                if let Some(o) = out.as_object_mut() {
+                    o.insert("lidar".into(), lidar_status_json());
+                }
+                out
+            }
             Err(e) => json!({ "error": alloc::format!("{e}") }),
         },
         other => json!({ "error": alloc::format!("unknown tool: {other}") }),
     }
+}
+
+/// Flat list of control `kind` strings this driver exposes (matches the core
+/// `RobotAction` allowlist kinds + the non-motion `camera`/`status` tags).
+fn capability_kinds() -> Vec<&'static str> {
+    vec![
+        "move", "stop", "estop", "reset_estop", "recovery_stand", "stand_up",
+        "stand_down", "balance_stand", "sit", "hello", "stretch", "euler",
+        "body_height", "foot_raise_height", "speed_level", "pose", "wiggle_hips",
+        "heart", "dance1", "dance2", "scrape", "front_flip", "front_jump",
+        "front_pounce", "status", "camera", "lidar_on", "lidar_off", "lidar_frame",
+    ]
+}
+
+/// Rich capability descriptor for a capability-driven UI: each entry carries the
+/// control `kind`, a human label, a risk tier ("low"/"medium"/"high") and the
+/// numeric param schema (name + min/max). High-risk acrobatics are tagged so the
+/// UI can require an explicit confirmation before sending them.
+fn actions_meta() -> JsonValue {
+    let p = |name: &str, min: f64, max: f64| json!({ "name": name, "min": min, "max": max });
+    json!([
+        { "kind": "move", "label": "Ruch", "risk": "medium", "params": [
+            p("vx", -1.0, 1.0), p("vy", -1.0, 1.0), p("vyaw", -1.0, 1.0) ] },
+        { "kind": "stop", "label": "Stop", "risk": "low", "params": [] },
+        { "kind": "estop", "label": "E-STOP", "risk": "low", "params": [] },
+        { "kind": "reset_estop", "label": "Reset e-stop", "risk": "low", "params": [] },
+        { "kind": "recovery_stand", "label": "RecoveryStand", "risk": "medium", "params": [] },
+        { "kind": "stand_up", "label": "Wstań", "risk": "medium", "params": [] },
+        { "kind": "stand_down", "label": "Połóż się", "risk": "low", "params": [] },
+        { "kind": "balance_stand", "label": "BalanceStand", "risk": "medium", "params": [] },
+        { "kind": "sit", "label": "Siad", "risk": "low", "params": [] },
+        { "kind": "hello", "label": "Przywitanie", "risk": "low", "params": [] },
+        { "kind": "stretch", "label": "Przeciąganie", "risk": "low", "params": [] },
+        { "kind": "euler", "label": "Orientacja (Euler)", "risk": "medium", "params": [
+            p("roll", -EULER_LIMIT, EULER_LIMIT),
+            p("pitch", -EULER_LIMIT, EULER_LIMIT),
+            p("yaw", -EULER_LIMIT, EULER_LIMIT) ] },
+        { "kind": "body_height", "label": "Wysokość ciała", "risk": "medium", "params": [
+            p("height", BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) ] },
+        { "kind": "foot_raise_height", "label": "Wysokość kroku", "risk": "medium", "params": [
+            p("height", FOOT_RAISE_MIN, FOOT_RAISE_MAX) ] },
+        { "kind": "speed_level", "label": "Poziom prędkości", "risk": "medium", "params": [
+            p("level", -1.0, 1.0) ] },
+        { "kind": "pose", "label": "Poza ciała", "risk": "medium", "params": [
+            p("roll", -EULER_LIMIT, EULER_LIMIT),
+            p("pitch", -EULER_LIMIT, EULER_LIMIT),
+            p("yaw", -EULER_LIMIT, EULER_LIMIT),
+            p("height", BODY_HEIGHT_MIN, BODY_HEIGHT_MAX) ] },
+        { "kind": "wiggle_hips", "label": "Wiggle Hips", "risk": "medium", "params": [] },
+        { "kind": "heart", "label": "Serduszko", "risk": "medium", "params": [] },
+        { "kind": "dance1", "label": "Taniec 1", "risk": "high", "params": [] },
+        { "kind": "dance2", "label": "Taniec 2", "risk": "high", "params": [] },
+        { "kind": "scrape", "label": "Scrape", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_flip", "label": "Front Flip", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_jump", "label": "Front Jump", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "front_pounce", "label": "Front Pounce", "risk": "high", "acrobatic": true, "params": [] },
+        { "kind": "status", "label": "Status", "risk": "low", "read_only": true, "params": [] },
+        { "kind": "lidar_on", "label": "LiDAR włącz", "risk": "low", "params": [] },
+        { "kind": "lidar_off", "label": "LiDAR wyłącz", "risk": "low", "params": [] },
+        { "kind": "lidar_frame", "label": "LiDAR klatka", "risk": "low", "read_only": true, "params": [] },
+    ])
 }
 
 /// Decode a `FlowValue` (`{"kind":"json"|"text","data":...}`) into a number.
@@ -1014,6 +1941,17 @@ fn block_num(params: &JsonValue, key: &str) -> f64 {
     0.0
 }
 
+/// Extract the flow block's `variables` map (the contract for typed block params,
+/// each a FlowValue `{kind,data}`). `param_num` reads FlowValues directly, so a
+/// parametered block (euler/body_height/…) feeds this sub-object to the same
+/// param parser the tool path uses. Missing → empty object (param parser rejects).
+fn block_vars(params: &JsonValue) -> JsonValue {
+    params
+        .get("variables")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
 /// Flow-block dispatch. Executes the robot action, then returns the INPUT
 /// envelope (a valid FlowEnvelope) with the result recorded in `meta.go2` so the
 /// flow continues. `params` IS the FlowEnvelope the host sent.
@@ -1026,6 +1964,20 @@ fn handle_block(block_type: &str, params: &JsonValue) -> JsonValue {
         "go2.sit" => send_sport_gated(SPORT_SIT, ""),
         "go2.hello" => send_sport_gated(SPORT_HELLO, ""),
         "go2.stretch" => send_sport_gated(SPORT_STRETCH, ""),
+        "go2.balance_stand" => send_sport_gated(SPORT_BALANCE_STAND, ""),
+        "go2.wiggle_hips" => send_sport_gated(SPORT_WIGGLE_HIPS, ""),
+        "go2.heart" => send_sport_gated(SPORT_FINGER_HEART, ""),
+        "go2.dance1" => send_sport_gated(SPORT_DANCE1, ""),
+        "go2.dance2" => send_sport_gated(SPORT_DANCE2, ""),
+        "go2.scrape" => send_sport_gated(SPORT_SCRAPE, ""),
+        "go2.front_flip" => send_sport_gated(SPORT_FRONT_FLIP, ""),
+        "go2.front_jump" => send_sport_gated(SPORT_FRONT_JUMP, ""),
+        "go2.front_pounce" => send_sport_gated(SPORT_FRONT_POUNCE, ""),
+        "go2.euler" => send_euler(&block_vars(params)),
+        "go2.body_height" => send_body_height(&block_vars(params)),
+        "go2.foot_raise_height" => send_foot_raise(&block_vars(params)),
+        "go2.speed_level" => send_speed_level(&block_vars(params)),
+        "go2.pose" => send_pose(&block_vars(params)),
         "go2.move" => {
             let p = json!({
                 "x": block_num(params, "vx"),
@@ -1070,15 +2022,23 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
     }
 }
 
+/// Seeds the singleton robot row from the install-time `ip` config. Passing an
+/// empty ip when no config exists creates the row in offline state WITHOUT
+/// inventing a default (ensure_robot keeps the existing ip on empty input).
+fn ensure_robot_from_config() {
+    let ip = config_get(IP_CONFIG_KEY).unwrap_or_default();
+    let _ = db::ensure_robot(&ip);
+}
+
 #[no_mangle]
 pub extern "C" fn on_install() -> i32 {
-    let _ = db::ensure_robot(DEFAULT_IP);
+    ensure_robot_from_config();
     0
 }
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
-    let _ = db::ensure_robot(DEFAULT_IP);
+    ensure_robot_from_config();
     0
 }
 
@@ -1089,6 +2049,7 @@ pub extern "C" fn on_stop() -> i32 {
             wc_close(&robot.channel_id);
         }
     }
+    lidar_reset_session();
     let _ = db::set_offline("offline", "");
     0
 }
@@ -1112,6 +2073,329 @@ pub extern "C" fn on_tick(ts_ms: i64) -> i32 {
     db::set_now_secs(ts_ms / 1000);
     tick();
     0
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+//
+// Decode CONFIDENCE: the voxel grid layout, MSB-first bit packing, LZ4-block
+// decompression and `point = [x,y,z]*resolution + origin` are taken VERBATIM from
+// the upstream go2_webrtc_connect NATIVE decoder
+// (unitree_webrtc_connect/lidar/lidar_decoder_native.py). These synthetic-frame
+// tests assert THIS implementation matches that reference for hand-computed
+// indices/bits. They do NOT — and cannot, offline — prove the bytes a real Go2
+// emits map to physically correct geometry; that needs a live robot.
+
+// Host-import stubs so the lib's `#[link(wasm_import_module="tentaflow")]` externs
+// resolve when the crate is linked as a NATIVE test binary (they are real imports
+// only under wasm). The decode tests never invoke the robot/SQL/UI paths, so these
+// are inert; SQL/UI/webrtc stubs return an error code, logs are no-ops. now_secs is
+// seeded via set_now_secs in tests so the SQL clock path is never taken.
+#[cfg(test)]
+mod host_stubs {
+    #[no_mangle]
+    extern "C" fn log_info(_p: i32, _l: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn log_warn(_p: i32, _l: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn event_publish(_a: i32, _b: i32, _c: i32, _d: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn ui_render_cbor(_p: i32, _l: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn config_get_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 2 }
+    #[no_mangle]
+    extern "C" fn http_raw_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_connect_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_set_answer_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_state_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_send_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_drain_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_close_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn webrtc_register_camera_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn camera_grant_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn robot_dispatch_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn sql_exec_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn sql_query_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { 5 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal "normal-framing" voxel-map binary message: `<u16 json_len>`,
+    /// 2 pad bytes, the JSON envelope, then the LZ4-block-compressed occupancy grid.
+    fn build_normal_frame(grid: &[u8], resolution: f64, origin: [f64; 3]) -> Vec<u8> {
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": resolution, "origin": origin, "src_size": grid.len() },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(grid);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(json_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8, 0u8]); // header is 4 bytes total before JSON
+        out.extend_from_slice(json_bytes);
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn voxel_decode_single_voxel_matches_reference() {
+        db::set_now_secs(1_700_000_000);
+        // One occupied voxel at grid index z=1, y=1, x_byte=0, MSB bit 0 (=> x=0).
+        // index = z*0x800 + y*0x10 + x_byte = 0x800 + 0x10 + 0 = 0x810.
+        // Byte value 0x80 sets the MSB => bit 0 => x = x_byte*8 + 0 = 0.
+        let idx = 0x800 + 0x10;
+        let mut grid = vec![0u8; idx + 1];
+        grid[idx] = 0x80;
+        let resolution = 0.05;
+        let origin = [1.0, 2.0, 3.0];
+        let frame = build_normal_frame(&grid, resolution, origin);
+
+        ingest_voxel_map(&frame);
+
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.points.len(), 1, "exactly one occupied voxel decodes");
+            let p = l.points[0];
+            // x = 0 -> 0*0.05 + 1.0 = 1.0; y = 1 -> 0.05 + 2.0; z = 1 -> 0.05 + 3.0.
+            assert!((p[0] - 1.0).abs() < 1e-5, "x={}", p[0]);
+            assert!((p[1] - 2.05).abs() < 1e-5, "y={}", p[1]);
+            assert!((p[2] - 3.05).abs() < 1e-5, "z={}", p[2]);
+            assert_eq!(l.frame_seq, 1);
+            assert_eq!(l.resolution, Some(resolution as f32));
+        });
+        lidar_reset_session();
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn voxel_decode_bit_order_is_msb_first() {
+        // Byte 0x01 at index 0 sets only the LSB => MSB-first bit 7 => x = 7.
+        let mut grid = vec![0u8; 1];
+        grid[0] = 0x01;
+        let frame = build_normal_frame(&grid, 0.1, [0.0, 0.0, 0.0]);
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.points.len(), 1);
+            // x = 7 -> 7 * 0.1 = 0.7; y = z = 0.
+            assert!((l.points[0][0] - 0.7).abs() < 1e-5, "x={}", l.points[0][0]);
+            assert!(l.points[0][1].abs() < 1e-5);
+            assert!(l.points[0][2].abs() < 1e-5);
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn voxel_decode_full_byte_yields_eight_points() {
+        // 0xFF at index 0 => all 8 x positions (0..7) at y=z=0.
+        let grid = vec![0xFFu8];
+        let frame = build_normal_frame(&grid, 1.0, [0.0, 0.0, 0.0]);
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.points.len(), 8);
+            let xs: Vec<i32> = l.points.iter().map(|p| p[0].round() as i32).collect();
+            assert_eq!(xs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn malformed_frame_leaves_prior_state_untouched() {
+        // Decode one good frame, then feed a frame with a non-utlidar topic and a
+        // truncated frame; neither must overwrite or clear the prior decoded frame.
+        let grid = vec![0x80u8];
+        let frame = build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]);
+        ingest_voxel_map(&frame);
+        let seq_after_good = LIDAR.with(|cell| cell.borrow().frame_seq);
+        assert_eq!(seq_after_good, 1);
+
+        ingest_voxel_map(&[1, 2, 3]); // too short to frame
+        ingest_voxel_map(&[]); // empty
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 1, "malformed frames do not bump frame_seq");
+            assert_eq!(l.points.len(), 1, "prior decoded points retained");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn lidar_status_json_reports_availability() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // No frame yet: available=false, enabled=false.
+        let s = lidar_status_json();
+        assert_eq!(s.get("available").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(s.get("enabled").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(s.get("point_count").and_then(JsonValue::as_u64), Some(0));
+
+        let grid = vec![0xFFu8];
+        let frame = build_normal_frame(&grid, 0.05, [1.0, 2.0, 3.0]);
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| cell.borrow_mut().enabled = true);
+        let s = lidar_status_json();
+        assert_eq!(s.get("available").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(s.get("enabled").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(s.get("point_count").and_then(JsonValue::as_u64), Some(8));
+        assert!(s.get("resolution").is_some());
+        assert!(s.get("origin").is_some());
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn frame_missing_fields_is_skipped() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // Valid framing + topic but the data omits origin/src_size: must skip.
+        let json = json!({
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": 0.05 },
+        })
+        .to_string();
+        let jb = json.as_bytes();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(jb.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&[0u8, 0u8]);
+        frame.extend_from_slice(jb);
+        frame.extend_from_slice(&[0u8, 0u8, 0u8]);
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "incomplete frame must not decode");
+        });
+    }
+
+    /// Build a normal-framing binary message with full control over the topic, the
+    /// declared `src_size` and the resolution, for adversarial-input tests.
+    fn build_frame_with(
+        topic: &str,
+        grid: &[u8],
+        declared_src_size: usize,
+        resolution: f64,
+        origin: [f64; 3],
+    ) -> Vec<u8> {
+        let json = json!({
+            "type": "msg",
+            "topic": topic,
+            "data": { "resolution": resolution, "origin": origin, "src_size": declared_src_size },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(grid);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(json_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8, 0u8]);
+        out.extend_from_slice(json_bytes);
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn non_voxel_utlidar_topic_is_ignored() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // A different utlidar topic that merely CONTAINS "utlidar" must never enter
+        // the voxel decode path (exact-topic match).
+        let grid = vec![0xFFu8];
+        let frame = build_frame_with(
+            "rt/utlidar/switch",
+            &grid,
+            grid.len(),
+            0.05,
+            [0.0, 0.0, 0.0],
+        );
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "non-voxel utlidar topic must not decode");
+            assert!(l.points.is_empty());
+        });
+    }
+
+    #[test]
+    fn decompressed_len_mismatch_is_rejected() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // The block decompresses to 1 byte but src_size declares a larger grid:
+        // a valid-but-short block with a larger declared size is malformed.
+        let grid = vec![0x80u8];
+        let frame = build_frame_with(
+            LIDAR_TOPIC,
+            &grid,
+            grid.len() + 16,
+            0.05,
+            [0.0, 0.0, 0.0],
+        );
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "n != src_size must be rejected");
+            assert!(l.points.is_empty());
+        });
+    }
+
+    #[test]
+    fn src_size_over_grid_cap_is_rejected() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // src_size beyond the documented grid (80_000) is malformed and rejected
+        // before any allocation/decompress.
+        let grid = vec![0x80u8];
+        let frame = build_frame_with(
+            LIDAR_TOPIC,
+            &grid,
+            LIDAR_GRID_BYTES + 1,
+            0.05,
+            [0.0, 0.0, 0.0],
+        );
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "src_size over grid cap must be rejected");
+            assert!(l.points.is_empty());
+        });
+    }
+
+    #[test]
+    fn non_positive_resolution_is_rejected() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0x80u8];
+        for bad in [0.0_f64, -0.05, f64::NAN, f64::INFINITY] {
+            let frame = build_frame_with(LIDAR_TOPIC, &grid, grid.len(), bad, [0.0, 0.0, 0.0]);
+            ingest_voxel_map(&frame);
+        }
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "non-positive/non-finite resolution must be rejected");
+            assert!(l.points.is_empty());
+        });
+    }
+
+    #[test]
+    fn non_finite_origin_is_rejected() {
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0x80u8];
+        let frame =
+            build_frame_with(LIDAR_TOPIC, &grid, grid.len(), 0.05, [0.0, f64::NAN, 0.0]);
+        ingest_voxel_map(&frame);
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "non-finite origin component must be rejected");
+            assert!(l.points.is_empty());
+        });
+    }
 }
 
 #[no_mangle]

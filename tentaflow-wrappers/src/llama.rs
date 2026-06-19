@@ -280,6 +280,14 @@ pub struct LlamaLoadConfig {
     pub batch_size: u32,
     pub threads: Option<u32>,
     pub flash_attn: FlashAttentionMode,
+    // Indeks karty głównej (skupia bufory pomocnicze). Wybór kart embedded idzie
+    // przez te pola, bo jeden proces core inicjalizuje CUDA raz i nie reaguje na
+    // CUDA_VISIBLE_DEVICES ustawiane po starcie.
+    pub main_gpu: i32,
+    // Wagi rozkładu warstw na karty (long. = liczba kart). Pusty = domyślny
+    // rozkład na wszystkie karty. Waga 0.0 dla karty wyklucza ją z użycia, więc
+    // to jedyny sposób zawężenia embedded llama.cpp do podzbioru kart.
+    pub tensor_split: Vec<f32>,
 }
 
 impl Default for LlamaLoadConfig {
@@ -290,6 +298,8 @@ impl Default for LlamaLoadConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             threads: None,
             flash_attn: DEFAULT_FLASH_ATTN,
+            main_gpu: 0,
+            tensor_split: Vec::new(),
         }
     }
 }
@@ -317,6 +327,16 @@ impl LlamaLoadConfig {
         config.threads = read("threads").and_then(|v| v.as_u64()).map(|v| v as u32);
         if let Some(value) = read("flash_attn").and_then(parse_flash_attention_mode) {
             config.flash_attn = value;
+        }
+        if let Some(value) = read("main_gpu").and_then(|v| v.as_i64()) {
+            config.main_gpu = value as i32;
+        }
+        if let Some(array) = read("tensor_split").and_then(|v| v.as_array()) {
+            config.tensor_split = array
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .map(|v| v as f32)
+                .collect();
         }
         config
     }
@@ -560,6 +580,17 @@ impl LlamaRuntime {
         let c_path = path_to_c_string(path)?;
         let mut params = unsafe { sys::llama_model_default_params() };
         params.n_gpu_layers = config.n_gpu_layers as i32;
+        params.main_gpu = config.main_gpu;
+        // tensor_split przekazujemy jako surowy wskaźnik do FFI, więc wektor MUSI
+        // żyć aż do końca llama_model_load_from_file. `tensor_split` jest tu lokalną
+        // zmienną i nie jest dropowany przed loadem. Waga 0.0 wyklucza kartę —
+        // bez tego embedded llama.cpp rozkładałby model na WSZYSTKIE karty mimo
+        // ustawionego main_gpu (CUDA_VISIBLE_DEVICES nie działa w jednym procesie).
+        let tensor_split = config.tensor_split.clone();
+        if !tensor_split.is_empty() {
+            params.split_mode = sys::LLAMA_SPLIT_MODE_LAYER;
+            params.tensor_split = tensor_split.as_ptr();
+        }
 
         let log_lock = LLAMA_LOG_CAPTURE_LOCK.get_or_init(|| Mutex::new(()));
         let _log_guard = log_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

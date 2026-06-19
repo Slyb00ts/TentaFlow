@@ -482,19 +482,22 @@ export function encodeAddonInstanceDuplicateRequest(source_addon_id, new_display
 
 /**
  * MessageBody::AddonInstanceBody(ReqInstall) — instalacja instancji z katalogu.
+ * `config` is a JS `Array<[key, value]>` of install-time connection-param
+ * values (e.g. the robot IP). Empty for non-robot packages.
  * @param {string} package_id
  * @param {string} version
  * @param {string} display_name
+ * @param {any} config
  * @returns {Uint8Array}
  */
-export function encodeAddonInstanceInstallRequest(package_id, version, display_name) {
+export function encodeAddonInstanceInstallRequest(package_id, version, display_name, config) {
     const ptr0 = passStringToWasm0(package_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(version, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(display_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeAddonInstanceInstallRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    const ret = wasm.encodeAddonInstanceInstallRequest(ptr0, len0, ptr1, len1, ptr2, len2, config);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -4769,22 +4772,28 @@ export function encodeRobotCameraShareRequest(robot_id, camera_id) {
 
 /**
  * MessageBody::RobotsBody(ControlRequest) — route a typed, allowlisted action to
- * the robot's owning node. `kind` is one of: "move", "stop", "estop",
- * "reset_estop", "recovery_stand", "stand_up", "stand_down", "sit", "hello",
- * "stretch", "status". The `vx`/`vy`/`vyaw` axes apply to "move" only.
+ * the robot's owning node. The `vx`/`vy`/`vyaw` axes apply to "move" only; the
+ * `p1..p4` generic params carry parametered poses/levels keyed by `kind` (euler
+ * → roll/pitch/yaw; body_height/foot_raise_height → p1=height; speed_level →
+ * p1=level; pose → roll/pitch/yaw/height). The owner clamps every numeric param
+ * to the documented Go2 range.
  * @param {string} robot_id
  * @param {string} kind
  * @param {number} vx
  * @param {number} vy
  * @param {number} vyaw
+ * @param {number} p1
+ * @param {number} p2
+ * @param {number} p3
+ * @param {number} p4
  * @returns {Uint8Array}
  */
-export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw) {
+export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw, p1, p2, p3, p4) {
     const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeRobotControlRequest(ptr0, len0, ptr1, len1, vx, vy, vyaw);
+    const ret = wasm.encodeRobotControlRequest(ptr0, len0, ptr1, len1, vx, vy, vyaw, p1, p2, p3, p4);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

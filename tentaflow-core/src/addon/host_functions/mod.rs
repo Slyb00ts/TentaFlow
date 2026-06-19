@@ -12,6 +12,7 @@ pub mod camera;
 #[cfg(feature = "camera")]
 pub mod camera_metadata;
 pub mod cbor_io;
+pub mod config;
 pub mod events;
 pub mod flow;
 pub mod gate;
@@ -106,6 +107,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "storage_list", storage::storage_list)
         .map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
+
+    // --- Config API (read own install-time connection params) ---
+    linker
+        .func_wrap("tentaflow", "config_get_v1", config::config_get_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja config_get_v1: {e}"))?;
 
     linker
         .func_wrap(

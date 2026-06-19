@@ -171,6 +171,10 @@ impl LlamaCppEngine {
             n_batch: load.batch_size.max(1),
             n_ubatch: read_u32("n_ubatch").unwrap_or(defaults.n_ubatch),
             n_gpu_layers: load.n_gpu_layers,
+            // main_gpu/tensor_split sparsowane już w LlamaLoadConfig — to jedyna
+            // droga wyboru kart dla embedded llama.cpp (CUDA init raz na proces).
+            main_gpu: load.main_gpu,
+            tensor_split: load.tensor_split.clone(),
             threads: load.threads,
             flash_attn: load.flash_attn,
             kv_unified: map

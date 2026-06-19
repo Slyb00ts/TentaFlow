@@ -180,6 +180,7 @@ impl SttEngine for WhisperEngine {
     ) -> Result<SttModelInfo> {
         let path = model_path.to_path_buf();
         let device_str = device.unwrap_or("cpu").to_string();
+        let gpu_device = deploy_params.gpu_device;
         // Zachowaj deploy_params zeby `transcribe()` moglo ich uzyc jako
         // baseline gdy `TranscribeParams` per-call nie ma wartosci
         // (default_language/default_translate/default_beam_size/n_threads).
@@ -196,6 +197,7 @@ impl SttEngine for WhisperEngine {
                 &path,
                 WhisperLoadConfig {
                     use_gpu: !device_str.eq_ignore_ascii_case("cpu"),
+                    gpu_device,
                     ..Default::default()
                 },
             )

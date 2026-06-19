@@ -357,11 +357,11 @@ class TfVideoStream extends HTMLElement {
     // ~3-4ms). It only needs to cover a couple of fMP4 fragments so the decoder
     // never starves between fragments. With a clean continuous server timeline
     // (h264timestamper + param-only AUs dropped) a small cushion suffices.
-    const TARGET_LATENCY_SECS = 0.3;
+    const TARGET_LATENCY_SECS = 0.1;
     // Upper bound on drift before snapping back to TARGET. Without this, every
     // brief decoder stall left the playhead permanently further behind (latency
     // grew and never recovered, since the only correction fired at KEEP_WINDOW).
-    const MAX_LATENCY_SECS = 0.7;
+    const MAX_LATENCY_SECS = 0.16;
     // Only build the initial cushion before first play: wait until enough is
     // buffered so playback starts with room ahead rather than at the edge.
     if (v.paused && end - start < TARGET_LATENCY_SECS && v.currentTime <= start) {

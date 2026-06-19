@@ -29,6 +29,10 @@ name = "seq_rm_probe"
 required-features = ["llama"]
 
 [[example]]
+name = "gpu_pin_test"
+required-features = ["llama"]
+
+[[example]]
 name = "whisper_smoke"
 required-features = ["whisper"]
 

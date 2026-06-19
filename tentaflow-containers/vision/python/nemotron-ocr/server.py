@@ -1,8 +1,10 @@
 # =============================================================================
 # Plik: server.py
-# Opis: Serwer FastAPI dla Nemotron-OCR. Laduje model nvidia/nemotron-ocr-v1 na
-#       CUDA i wystawia POST /ocr przyjmujacy obraz (multipart lub base64),
-#       zwraca rozpoznany tekst oraz uklad (bboxy linii). GET /health do probow.
+# Opis: Serwer FastAPI dla Nemotron-OCR. Uzywa oficjalnego pipeline'u
+#       `nemotron_ocr.inference.pipeline.NemotronOCR` (detector + recognizer +
+#       relational). Wystawia POST /ocr (multipart) oraz /ocr/base64, zwraca
+#       rozpoznane regiony tekstu. GET /health do probow. Model nie jest
+#       modelem transformers — ma wlasny pipeline i wagi .pth pobierane z HF.
 # Przyklad: curl -F image=@strona.png http://127.0.0.1:8093/ocr
 # =============================================================================
 
@@ -10,48 +12,43 @@ import base64
 import io
 import os
 
+import numpy as np
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image
 from pydantic import BaseModel
-from transformers import AutoModel, AutoProcessor
 
-# Repo modelu — nadpisywalne przez MODEL (deploy ustawia repo z preseta).
-MODEL_ID = os.environ.get("MODEL", "nvidia/nemotron-ocr-v1")
+from nemotron_ocr.inference.pipeline import NemotronOCR
+
+# merge_level steruje granulacja laczenia tekstu (word/sentence/paragraph).
+MERGE_LEVEL = os.environ.get("OCR_MERGE_LEVEL", "paragraph")
 
 app = FastAPI(title="Nemotron-OCR")
 
-# Stan globalny modelu — ladowany leniwie przy pierwszym zadaniu, zeby serwer
-# odpowiadal na /health zanim wagi sie sciagna.
-_state: dict = {"model": None, "processor": None}
+# Pipeline ladowany leniwie przy pierwszym zadaniu — wagi .pth (detector,
+# recognizer, relational) sciagaja sie z HF przy inicjalizacji, wiec /health
+# odpowiada zanim model bedzie gotowy.
+_state: dict = {"pipeline": None}
 
 
 class OcrBase64Request(BaseModel):
     image_base64: str
 
 
-def _require_cuda() -> str:
+def _require_cuda() -> None:
     if not torch.cuda.is_available():
         raise HTTPException(
             status_code=503,
             detail="Nemotron-OCR wymaga CUDA — brak dostepnego GPU.",
         )
-    return "cuda"
 
 
-def _ensure_model() -> None:
-    if _state["model"] is not None:
-        return
-    device = _require_cuda()
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        MODEL_ID,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-    ).to(device)
-    model.eval()
-    _state["processor"] = processor
-    _state["model"] = model
+def _ensure_pipeline() -> NemotronOCR:
+    if _state["pipeline"] is None:
+        _require_cuda()
+        # model_dir=None => pipeline sam pobiera checkpointy z HF Hub i cachuje.
+        _state["pipeline"] = NemotronOCR(model_dir=None)
+    return _state["pipeline"]
 
 
 def _decode_image(raw: bytes) -> Image.Image:
@@ -62,23 +59,19 @@ def _decode_image(raw: bytes) -> Image.Image:
 
 
 def _run_ocr(image: Image.Image) -> dict:
-    _ensure_model()
-    processor = _state["processor"]
-    model = _state["model"]
-    inputs = processor(images=image, return_tensors="pt").to(model.device)
-    with torch.inference_mode():
-        outputs = model.generate(**inputs, max_new_tokens=4096)
-    decoded = processor.batch_decode(outputs, skip_special_tokens=True)
-    text = decoded[0] if decoded else ""
-    # Layout zwracany przez procesor, gdy model dostarcza bboxy linii; przy
-    # braku struktury oddajemy pojedynczy blok z calym tekstem.
-    layout = _state.get("last_layout") or [{"text": text, "bbox": None}]
-    return {"text": text, "layout": layout}
+    pipeline = _ensure_pipeline()
+    # Pipeline nie przyjmuje PIL.Image — wspiera NumPy (H, W, C), wiec konwertujemy.
+    predictions = pipeline(np.asarray(image), merge_level=MERGE_LEVEL, visualize=False)
+    # Pipeline zwraca liste dictow regionow. Skladamy plaski tekst z pola "text"
+    # (gdy obecne), a pelne regiony oddajemy w "regions".
+    parts = [str(p.get("text", "")) for p in predictions if isinstance(p, dict)]
+    text = "\n".join(t for t in parts if t)
+    return {"text": text, "regions": predictions}
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model": MODEL_ID, "loaded": _state["model"] is not None}
+    return {"status": "ok", "model": "nvidia/nemotron-ocr-v1", "loaded": _state["pipeline"] is not None}
 
 
 @app.post("/ocr")

@@ -19,8 +19,9 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    MessageBody, ProtocolError, RobotCameraShareResponse, RobotControlResponse, RobotEntry,
-    RobotsListResponse, RobotsPayload,
+    MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
+    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot, RobotLidarStatus,
+    RobotTelemetrySnapshot, RobotsListResponse, RobotsPayload,
 };
 
 use super::HandlerContext;
@@ -54,6 +55,73 @@ fn to_entry(r: AdvertisedRobot, local_node_id: &str) -> RobotEntry {
         rtt_ms: r.rtt_ms,
         camera_id: r.camera_id,
         capabilities: r.capabilities,
+        actions_meta: r
+            .actions_meta
+            .into_iter()
+            .map(|a| RobotActionMeta {
+                kind: a.kind,
+                label: a.label,
+                risk: a.risk,
+                acrobatic: a.acrobatic,
+                read_only: a.read_only,
+                params: a
+                    .params
+                    .into_iter()
+                    .map(|p| RobotActionParam {
+                        name: p.name,
+                        min: p.min,
+                        max: p.max,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        telemetry: r.telemetry.map(to_telemetry),
+        lidar: r.lidar.map(to_lidar),
+    }
+}
+
+/// Project the mesh-layer `RobotLidarSnapshot` onto the protocol wire type (two
+/// distinct types over the same SMALL shape — never the point cloud).
+fn to_lidar(l: crate::mesh::robot_dispatch::RobotLidarSnapshot) -> RobotLidarStatus {
+    RobotLidarStatus {
+        enabled: l.enabled,
+        available: l.available,
+        point_count: l.point_count,
+        resolution: l.resolution,
+        origin: l.origin,
+        frame_seq: l.frame_seq,
+        last_update_ts: l.last_update_ts,
+    }
+}
+
+/// Project the mesh-layer `RobotTelemetrySnapshot` onto the protocol wire type
+/// (two distinct types over the same shape — the mesh struct is the registry's
+/// own, the protocol struct is the wire contract).
+fn to_telemetry(
+    t: crate::mesh::robot_dispatch::RobotTelemetrySnapshot,
+) -> RobotTelemetrySnapshot {
+    RobotTelemetrySnapshot {
+        mode: t.mode,
+        gait_type: t.gait_type,
+        body_height: t.body_height,
+        vx: t.vx,
+        vy: t.vy,
+        vyaw: t.vyaw,
+        position: t.position,
+        foot_force: t.foot_force,
+        imu: t.imu.map(|i| RobotImuSnapshot {
+            roll: i.roll,
+            pitch: i.pitch,
+            yaw: i.yaw,
+            quaternion: i.quaternion,
+            temperature: i.temperature,
+        }),
+        battery: t.battery.map(|b| RobotBatterySnapshot {
+            soc: b.soc,
+            voltage: b.voltage,
+            current: b.current,
+            temperature: b.temperature,
+        }),
     }
 }
 
@@ -113,11 +181,15 @@ pub async fn robots_control(
     // The protocol `RobotActionWire` is one of two wire encodings (ciborium here,
     // minicbor for the host ABI) over the SAME flat shape; run the SINGLE shared
     // `kind`→action allowlist directly. Closed allowlist: an unknown kind is refused.
-    let action = RobotAction::from_kind_axes(
+    let action = RobotAction::from_kind_params(
         &payload.action.kind,
         payload.action.vx,
         payload.action.vy,
         payload.action.vyaw,
+        payload.action.p1,
+        payload.action.p2,
+        payload.action.p3,
+        payload.action.p4,
     )
     .ok_or_else(|| ProtocolError::bad_request("unknown robot action kind"))?;
 
@@ -144,12 +216,15 @@ pub async fn robots_control(
             ok: r.ok,
             rejected: r.rejected.as_ref().map(|reason| reject_tag(reason).to_string()),
             error: r.error,
+            // Read-only actions (lidar_frame/status) return their JSON payload here.
+            result: r.result_json,
         },
         // Context not wired (mesh not started) — there is no node to route to.
         None => RobotControlResponse {
             ok: false,
             rejected: None,
             error: Some("robot dispatch context unavailable".to_string()),
+            result: None,
         },
     };
     Ok(MessageBody::RobotsBody(RobotsPayload::ControlResponse(wire)))
