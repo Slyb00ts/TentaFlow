@@ -23,7 +23,13 @@ runtime = "python-bundle"
 bundle_path = "stt/python/qwen-asr"
 
 [[model_preset]]
-id = "qwen-audio-asr"
-display_name = "Qwen-Audio ASR"
-repo = "Qwen/Qwen-Audio"
+id = "qwen3-asr-1.7b"
+display_name = "Qwen3-ASR 1.7B"
+repo = "Qwen/Qwen3-ASR-1.7B"
 recommended = true
+
+[[model_preset]]
+id = "qwen3-asr-0.6b"
+display_name = "Qwen3-ASR 0.6B"
+repo = "Qwen/Qwen3-ASR-0.6B"
+recommended = false

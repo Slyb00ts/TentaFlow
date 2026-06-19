@@ -1,10 +1,11 @@
 [bundle]
 engine = "qwen-asr"
-description = "Qwen3-ASR-1.7B (multimodal STT, transformers git HEAD)"
+description = "Qwen3-ASR (STT) via qwen-asr PyPI package (Qwen3ASRModel)"
 python_version = "3.12"
-source = "git"
-git_repo = "https://github.com/huggingface/transformers.git"
-git_ref = "main"
+# Qwen3-ASR NIE jest w mainline transformers — uzywamy oficjalnego pakietu
+# `qwen-asr` (ciagnie zgodny transformers + rejestruje architekture qwen3_asr).
+source = "pypi"
+pypi_package = "qwen-asr"
 
 [launch]
 command = "uvicorn"
@@ -14,24 +15,22 @@ internal_port = 8083
 
 [requires]
 gpu_memory_gb = 6
-disk_gb = 10
+disk_gb = 12
 platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 
 [[install_variants]]
 backend = "cuda"
 # B300/sm_103 wymaga torch cu130 (cu124 nie ma kerneli sm_103); spojne z Dockerfile.
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "torchaudio==2.11.0", "accelerate"]
-# Pakiety ktore wymagaja `torch` juz zainstalowanego (buduja kernele CUDA
-# z torch.utils.cpp_extension) — instalowane PO glownym pakiecie z flaga
-# --no-build-isolation.
+# torch PRZED qwen-asr (qwen-asr ciagnie torch posrednio — wymuszamy cu130).
+extras = ["torch==2.11.0", "torchaudio==2.11.0", "soundfile", "fastapi", "uvicorn", "python-multipart"]
+# flash-attn buduje sie z torcha (--no-build-isolation). Domyslna parallelizacja
+# nvcc przekracza limity i build pada — MAX_JOBS ogranicza liczbe rownoleglych
+# kompilacji (build ~30 min, ale stabilny). Brak prebuilt wheela pod torch 2.11/cu130.
 extras_no_build_isolation = ["flash-attn"]
+env = { MAX_JOBS = "8" }
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.11.0", "torchaudio==2.11.0", "accelerate"]
-
-[[install_variants]]
-backend = "metal"
-extras = ["accelerate"]
+extras = ["torch==2.11.0", "torchaudio==2.11.0", "soundfile", "fastapi", "uvicorn", "python-multipart"]
