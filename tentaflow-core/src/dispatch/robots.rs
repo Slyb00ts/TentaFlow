@@ -20,8 +20,9 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
-    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot, RobotLidarStatus,
-    RobotTelemetrySnapshot, RobotsListResponse, RobotsPayload,
+    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot,
+    RobotLidarFrameResponse, RobotLidarStatus, RobotTelemetrySnapshot, RobotsListResponse,
+    RobotsPayload,
 };
 
 use super::HandlerContext;
@@ -285,6 +286,80 @@ pub fn robots_camera_share(
         &org.user_id,
     );
     Ok(MessageBody::RobotsBody(RobotsPayload::CameraShareResponse(resp)))
+}
+
+/// On-demand pull of the latest canonical LiDAR frame for a robot (L2). The
+/// client polls with the `frame_seq` it last rendered; Core returns the raw L1
+/// frame bytes only if the local hub holds something newer, else `frame: None`.
+///
+/// Permission: `robot.telemetry` — the same read grant `RobotAction::LidarFrame`
+/// requires, so the LiDAR cloud is gated exactly like the small lidar status.
+/// Org scoping mirrors the list/camera handlers: a robot outside the caller's org
+/// is invisible (returns `None`, never another org's frame).
+///
+/// Remote robots return `None` for now: the frame lives in the OWNING node's hub
+/// and there is no cross-node pull wired yet — that is L3, not a stub but an
+/// explicit not-yet-supported-locally answer the client treats as "no frame".
+#[handler(variant = "RobotLidarFrameRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn robots_lidar_frame(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::RobotsBody(RobotsPayload::LidarFrameRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected RobotLidarFrameRequest")),
+    };
+    let org = require_org(ctx)?;
+    if !org.has("robot.telemetry") {
+        return Err(ProtocolError::new(
+            tentaflow_protocol::ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+
+    // Resolve the robot in the caller's org (org scoping enforced here, like list).
+    let owner = robot_dispatch::global()
+        .all()
+        .into_iter()
+        .find(|r| r.org_id == org.org_id && r.robot_id == payload.robot_id);
+    let Some(robot) = owner else {
+        // Unknown robot in this org → nothing to return (indistinguishable from
+        // "no frame yet" by design; never leak existence across org boundaries).
+        return Ok(MessageBody::RobotsBody(RobotsPayload::LidarFrameResponse(
+            RobotLidarFrameResponse { frame: None },
+        )));
+    };
+
+    // L3: cross-node lidar relay — the frame lives in the owning node's hub.
+    if robot.node_id != local_node_id {
+        return Ok(MessageBody::RobotsBody(RobotsPayload::LidarFrameResponse(
+            RobotLidarFrameResponse { frame: None },
+        )));
+    }
+
+    // Local robot: read the latest frame from the hub and gate on the header seq.
+    // Latest-wins, wrap-immune: deliver the current frame whenever its seq DIFFERS
+    // from the `since_seq` the client last saw. A `>` gate would wedge after the
+    // u32 `frame_seq` wraps; `!=` just means "you don't have this frame yet". The
+    // addon publishes 1-based seqs, so a fresh client (since_seq=0) always gets the
+    // first real frame.
+    let frame = crate::services::lidar_hub::LidarStreamHub::global()
+        .latest(&payload.robot_id)
+        .and_then(|bytes| {
+            let header = tentaflow_sdk_spec::LidarFrameHeader::decode_header(&bytes)?;
+            if header.frame_seq != payload.since_seq {
+                Some(bytes.to_vec())
+            } else {
+                None
+            }
+        });
+
+    Ok(MessageBody::RobotsBody(RobotsPayload::LidarFrameResponse(
+        RobotLidarFrameResponse { frame },
+    )))
 }
 
 /// Grant `read` on a node-local robot camera to every enabled TentaVision
