@@ -61,7 +61,6 @@ echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (--task score VL, $
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
-  --task score \
   --trust-remote-code \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
   "${ENGINE_ARGS[@]}" 2>&1 \
