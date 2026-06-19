@@ -778,8 +778,18 @@ struct LidarState {
     status_persist_state: (bool, bool),
     resolution: Option<f32>,
     origin: Option<[f64; 3]>,
-    // Decoded voxel-center points in meters (x,y,z), origin+resolution applied.
-    points: Vec<[f32; 3]>,
+    // Cheap occupied-voxel count of the latest frame (popcount over the bitfield).
+    // The on_tick path NEVER materializes the full point cloud — it only counts set
+    // bits — so a dense frame cannot blow the per-tick fuel budget and wedge the
+    // connection. The full Vec<[f32;3]> is built only on demand in lidar_frame from
+    // the retained compressed raw frame below.
+    point_count: usize,
+    // Latest raw (LZ4-compressed) voxel payload + its origin/resolution, kept so the
+    // full point cloud can be decoded ON DEMAND (off the tick path) in lidar_frame.
+    // Compressed (≤ ~80KB), so retaining one frame stays bounded. The framing header
+    // is stripped: this is the bytes passed directly to lz4 decompress.
+    latest_raw: Vec<u8>,
+    latest_src_size: usize,
     // Monotonic counter of frames decoded this session (UI freshness indicator).
     frame_seq: u64,
     // Wall-clock seconds of the last decoded frame.
@@ -859,8 +869,8 @@ fn lidar_status_json() -> JsonValue {
         let l = cell.borrow();
         let mut obj = serde_json::Map::new();
         obj.insert("enabled".into(), json!(l.enabled));
-        obj.insert("available".into(), json!(l.frame_seq > 0 && !l.points.is_empty()));
-        obj.insert("point_count".into(), json!(l.points.len()));
+        obj.insert("available".into(), json!(l.frame_seq > 0 && l.point_count > 0));
+        obj.insert("point_count".into(), json!(l.point_count));
         if let Some(r) = l.resolution {
             obj.insert("resolution".into(), json!(r));
         }
@@ -911,6 +921,15 @@ fn voxel_bits_to_points(buf: &[u8], origin: [f64; 3], resolution: f32) -> Option
         }
     }
     Some(out)
+}
+
+/// Cheap occupied-voxel count: popcount over the decompressed occupancy bitfield.
+/// This is the ONLY voxel work done on the service tick — it is O(bitfield bytes)
+/// and allocates nothing, so a dense frame can never exceed the per-tick fuel
+/// budget (the failure mode that wedged the connection). The full point cloud is
+/// built only on demand in `lidar_frame`, never here.
+fn count_voxel_points(buf: &[u8]) -> usize {
+    buf.iter().map(|b| b.count_ones() as usize).sum()
 }
 
 /// Read a 3-element `[x,y,z]` numeric origin from the lidar frame JSON `data`.
@@ -972,10 +991,14 @@ fn parse_voxel_frame(raw: &[u8]) -> Option<(JsonValue, &[u8])> {
 }
 
 /// Ingest one inbound binary voxel-map frame: parse the framing, LZ4-decompress to
-/// `src_size`, decode the occupancy bits to points, and overwrite the latest-frame
-/// slot (bounded memory: only the newest frame is kept). Tolerant: a malformed or
-/// oversized frame updates the diagnostic byte size + logs, but leaves the prior
-/// decoded frame untouched and `available` unchanged rather than fabricating data.
+/// `src_size`, COUNT occupied voxels (cheap popcount — no point Vec), and overwrite
+/// the latest-frame slot (bounded memory: only the newest frame's metadata + its
+/// compressed raw payload are kept). Tolerant: a malformed or oversized frame
+/// updates the diagnostic byte size + logs, but leaves the prior decoded frame
+/// untouched and `available` unchanged rather than fabricating data.
+///
+/// INVARIANT: lidar processing on the service tick is O(bitfield) and cannot exceed
+/// the fuel budget; the full point cloud is built only on-demand in `lidar_frame`.
 fn ingest_voxel_map(raw: &[u8]) {
     let Some((data, compressed)) = parse_voxel_frame(raw) else {
         return;
@@ -1026,19 +1049,19 @@ fn ingest_voxel_map(raw: &[u8]) {
         return;
     }
     let resolution_f32 = resolution as f32;
-    let points = match voxel_bits_to_points(&decompressed[..n], origin, resolution_f32) {
-        Some(p) => p,
-        None => {
-            log::warn("go2 lidar: decoded point count exceeded cap — frame dropped");
-            return;
-        }
-    };
+    // Cheap popcount over the bitfield — the tick NEVER materializes the cloud.
+    let point_count = count_voxel_points(&decompressed[..n]);
     let now = db::now_secs();
     let should_persist = LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
         l.resolution = Some(resolution_f32);
         l.origin = Some(origin);
-        l.points = points;
+        l.point_count = point_count;
+        // Retain the compressed raw frame so lidar_frame can decode the full cloud
+        // on demand (off the tick path). Compressed payload stays small (≤ grid).
+        l.latest_raw.clear();
+        l.latest_raw.extend_from_slice(compressed);
+        l.latest_src_size = src_size;
         l.frame_seq = l.frame_seq.saturating_add(1);
         l.last_update_ts = now;
         // Throttle the shared-DB status write the same way telemetry is throttled:
@@ -1046,7 +1069,7 @@ fn ingest_voxel_map(raw: &[u8]) {
         // flip availability without delay), otherwise refresh point_count/frame_seq
         // at most once per LIDAR_STATUS_REFRESH_SECS so the 200ms/64-msg drain
         // never hammers SQLite.
-        let state = (l.enabled, l.frame_seq > 0 && !l.points.is_empty());
+        let state = (l.enabled, l.frame_seq > 0 && l.point_count > 0);
         let transitioned = state != l.status_persist_state;
         let due = now - l.status_persist_ts >= LIDAR_STATUS_REFRESH_SECS;
         if transitioned || due {
@@ -1102,20 +1125,59 @@ fn set_lidar(enabled: bool) -> JsonValue {
     json!({ "status": "sent", "enabled": enabled })
 }
 
-/// On-demand fetch of the latest LiDAR frame metadata for a future 3D renderer.
+/// On-demand fetch of the latest LiDAR frame for a future 3D renderer.
 ///
-/// The full decoded point cloud lives ONLY in the service instance's process
-/// memory (it is the one draining + decoding the voxel stream). After the
-/// DB+instance concurrency overhaul this tool runs on a pooled worker that does
-/// NOT share that memory, so the point array cannot be fetched cross-worker yet.
-/// We are HONEST about it: return the DB-persisted availability metadata plus an
-/// explicit `frame_pending_renderer:true` flag rather than fabricating points or
-/// persisting the huge cloud to SQLite. The 3D renderer is deferred anyway; when
-/// it lands, the points will be streamed via a dedicated seam (e.g. a service
-/// host-fn / mesh frame channel), not this status-shaped tool.
+/// The full point cloud is built ONLY here (on demand), NEVER on the service tick —
+/// the tick only counts occupied voxels (see `ingest_voxel_map`). When this tool
+/// runs ON the service instance (the one draining + decoding the voxel stream) the
+/// retained latest compressed frame is LZ4-decompressed and decoded into points via
+/// `voxel_bits_to_points`, capped by `LIDAR_MAX_POINTS`.
+///
+/// After the DB+instance concurrency overhaul this tool can also run on a pooled
+/// worker that does NOT share the service instance's memory. In that case there is
+/// no retained raw frame here, so we are HONEST about it: return the DB-persisted
+/// availability metadata plus an explicit `frame_pending_renderer:true` flag rather
+/// than fabricating points or persisting the huge cloud to SQLite. The 3D renderer
+/// is deferred anyway; when it lands, the points will be streamed via a dedicated
+/// seam (e.g. a service host-fn / mesh frame channel) on the service instance.
 fn lidar_frame() -> JsonValue {
-    // A REAL read error must NOT be papered over as an empty/"disabled" frame —
-    // surface it so the renderer can distinguish "no data yet" from "read failed".
+    // Same-instance fast path: decode the retained latest compressed frame on demand.
+    let decoded = LIDAR.with(|cell| {
+        let l = cell.borrow();
+        if l.latest_raw.is_empty() || l.latest_src_size == 0 {
+            return None;
+        }
+        let (resolution, origin) = match (l.resolution, l.origin) {
+            (Some(r), Some(o)) => (r, o),
+            _ => return None,
+        };
+        let mut decompressed = alloc::vec![0u8; l.latest_src_size];
+        let n = match lz4_flex::block::decompress_into(&l.latest_raw, &mut decompressed) {
+            Ok(n) if n == l.latest_src_size => n,
+            _ => return None,
+        };
+        let points = voxel_bits_to_points(&decompressed[..n], origin, resolution)?;
+        Some((points, resolution, origin, l.frame_seq, l.last_update_ts))
+    });
+    if let Some((points, resolution, origin, frame_seq, ts)) = decoded {
+        let pts: Vec<JsonValue> = points
+            .iter()
+            .map(|p| json!([p[0], p[1], p[2]]))
+            .collect();
+        return json!({
+            "enabled": true,
+            "available": true,
+            "point_count": points.len(),
+            "resolution": resolution,
+            "origin": [origin[0], origin[1], origin[2]],
+            "frame_seq": frame_seq,
+            "last_update_ts": ts,
+            "points": pts,
+        });
+    }
+    // Cross-worker path: no retained raw frame in this process. A REAL read error
+    // must NOT be papered over as an empty/"disabled" frame — surface it so the
+    // renderer can distinguish "no data yet" from "read failed".
     let status = match lidar_status_from_store() {
         Ok(s) => s,
         Err(e) => return json!({ "error": alloc::format!("lidar status read: {e}") }),
@@ -1745,7 +1807,15 @@ fn tick() {
             let mut got_telemetry = false;
             DECODE_BUF.with(|cell| {
                 let mut dec = cell.borrow_mut();
-                for msg in &drained.messages {
+                // Index of the LAST binary frame drained this tick. The voxel map is
+                // a stream where each frame supersedes the prior one, so we decode at
+                // most ONE per tick (the latest) — this bounds per-tick lidar work
+                // regardless of stream rate so it can never blow the fuel budget.
+                let last_binary = drained
+                    .messages
+                    .iter()
+                    .rposition(|m| !m.is_text);
+                for (idx, msg) in drained.messages.iter().enumerate() {
                     let src = msg.data_b64.as_bytes();
                     // base64 decodes to at most 3/4 of the input length; size the
                     // scratch to the source length (an upper bound) so the slice
@@ -1760,9 +1830,12 @@ fn tick() {
                     let raw = &dec[..n];
                     // Binary frames carry the LiDAR voxel map (and other binary
                     // pub/sub payloads). The voxel topic is identified inside the
-                    // binary framing's JSON header by parse_voxel_frame.
+                    // binary framing's JSON header by parse_voxel_frame. Only the
+                    // latest binary frame is ingested; earlier ones are superseded.
                     if !msg.is_text {
-                        ingest_voxel_map(raw);
+                        if Some(idx) == last_binary {
+                            ingest_voxel_map(raw);
+                        }
                         continue;
                     }
                     // Only lowstate carries battery; gate on the topic substring,
@@ -2434,17 +2507,22 @@ mod tests {
 
         ingest_voxel_map(&frame);
 
+        // Tick path: only the cheap count is materialized — no point Vec.
         LIDAR.with(|cell| {
             let l = cell.borrow();
-            assert_eq!(l.points.len(), 1, "exactly one occupied voxel decodes");
-            let p = l.points[0];
-            // x = 0 -> 0*0.05 + 1.0 = 1.0; y = 1 -> 0.05 + 2.0; z = 1 -> 0.05 + 3.0.
-            assert!((p[0] - 1.0).abs() < 1e-5, "x={}", p[0]);
-            assert!((p[1] - 2.05).abs() < 1e-5, "y={}", p[1]);
-            assert!((p[2] - 3.05).abs() < 1e-5, "z={}", p[2]);
+            assert_eq!(l.point_count, 1, "exactly one occupied voxel counted");
             assert_eq!(l.frame_seq, 1);
             assert_eq!(l.resolution, Some(resolution as f32));
         });
+        // On-demand path: lidar_frame decodes the retained raw frame into points.
+        let frame_json = lidar_frame();
+        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
+        assert_eq!(pts.len(), 1, "exactly one occupied voxel decodes on demand");
+        let p = pts[0].as_array().expect("xyz");
+        // x = 0 -> 0*0.05 + 1.0 = 1.0; y = 1 -> 0.05 + 2.0; z = 1 -> 0.05 + 3.0.
+        assert!((p[0].as_f64().unwrap() - 1.0).abs() < 1e-5);
+        assert!((p[1].as_f64().unwrap() - 2.05).abs() < 1e-5);
+        assert!((p[2].as_f64().unwrap() - 3.05).abs() < 1e-5);
         lidar_reset_session();
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
@@ -2456,14 +2534,15 @@ mod tests {
         grid[0] = 0x01;
         let frame = build_normal_frame(&grid, 0.1, [0.0, 0.0, 0.0]);
         ingest_voxel_map(&frame);
-        LIDAR.with(|cell| {
-            let l = cell.borrow();
-            assert_eq!(l.points.len(), 1);
-            // x = 7 -> 7 * 0.1 = 0.7; y = z = 0.
-            assert!((l.points[0][0] - 0.7).abs() < 1e-5, "x={}", l.points[0][0]);
-            assert!(l.points[0][1].abs() < 1e-5);
-            assert!(l.points[0][2].abs() < 1e-5);
-        });
+        LIDAR.with(|cell| assert_eq!(cell.borrow().point_count, 1));
+        let frame_json = lidar_frame();
+        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
+        assert_eq!(pts.len(), 1);
+        let p = pts[0].as_array().unwrap();
+        // x = 7 -> 7 * 0.1 = 0.7; y = z = 0.
+        assert!((p[0].as_f64().unwrap() - 0.7).abs() < 1e-5);
+        assert!(p[1].as_f64().unwrap().abs() < 1e-5);
+        assert!(p[2].as_f64().unwrap().abs() < 1e-5);
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
 
@@ -2473,11 +2552,47 @@ mod tests {
         let grid = vec![0xFFu8];
         let frame = build_normal_frame(&grid, 1.0, [0.0, 0.0, 0.0]);
         ingest_voxel_map(&frame);
+        LIDAR.with(|cell| assert_eq!(cell.borrow().point_count, 8));
+        let frame_json = lidar_frame();
+        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
+        assert_eq!(pts.len(), 8);
+        let xs: Vec<i32> = pts
+            .iter()
+            .map(|p| p.as_array().unwrap()[0].as_f64().unwrap().round() as i32)
+            .collect();
+        assert_eq!(xs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn count_voxel_points_sums_set_bits() {
+        // Synthetic bitfield: count_voxel_points must equal the total set bits.
+        let buf = [0x00u8, 0xFF, 0x80, 0x01, 0b1010_1010, 0x00];
+        let expected: usize = buf.iter().map(|b| b.count_ones() as usize).sum();
+        assert_eq!(count_voxel_points(&buf), expected);
+        assert_eq!(count_voxel_points(&buf), 0 + 8 + 1 + 1 + 4 + 0);
+        assert_eq!(count_voxel_points(&[]), 0);
+    }
+
+    #[test]
+    fn tick_path_uses_cheap_count_not_full_cloud() {
+        // ingest_voxel_map (the tick path) must materialize ONLY the cheap popcount,
+        // identical to count_voxel_points over the decompressed grid — never a Vec.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        // 0xFF (8 bits) + 0x0F (4 bits) = 12 occupied voxels.
+        let grid = vec![0xFFu8, 0x0F];
+        let expected = count_voxel_points(&grid);
+        let frame = build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]);
+        ingest_voxel_map(&frame);
         LIDAR.with(|cell| {
             let l = cell.borrow();
-            assert_eq!(l.points.len(), 8);
-            let xs: Vec<i32> = l.points.iter().map(|p| p[0].round() as i32).collect();
-            assert_eq!(xs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(l.point_count, expected, "tick stores the cheap popcount");
+            assert_eq!(l.point_count, 12);
+            // The retained raw frame is the compressed payload, not a decoded cloud.
+            assert!(!l.latest_raw.is_empty(), "raw kept for on-demand decode");
+            assert_eq!(l.latest_src_size, grid.len());
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
@@ -2497,7 +2612,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 1, "malformed frames do not bump frame_seq");
-            assert_eq!(l.points.len(), 1, "prior decoded points retained");
+            assert_eq!(l.point_count, 1, "prior counted points retained");
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
@@ -2588,7 +2703,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 0, "non-voxel utlidar topic must not decode");
-            assert!(l.points.is_empty());
+            assert_eq!(l.point_count, 0);
         });
     }
 
@@ -2609,7 +2724,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 0, "n != src_size must be rejected");
-            assert!(l.points.is_empty());
+            assert_eq!(l.point_count, 0);
         });
     }
 
@@ -2630,7 +2745,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 0, "src_size over grid cap must be rejected");
-            assert!(l.points.is_empty());
+            assert_eq!(l.point_count, 0);
         });
     }
 
@@ -2645,7 +2760,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 0, "non-positive/non-finite resolution must be rejected");
-            assert!(l.points.is_empty());
+            assert_eq!(l.point_count, 0);
         });
     }
 
@@ -2659,7 +2774,7 @@ mod tests {
         LIDAR.with(|cell| {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 0, "non-finite origin component must be rejected");
-            assert!(l.points.is_empty());
+            assert_eq!(l.point_count, 0);
         });
     }
 
@@ -2868,6 +2983,9 @@ mod tests {
     #[test]
     fn lidar_frame_returns_metadata_with_pending_flag() {
         state::test_reset();
+        // Empty thread_local => no retained raw frame in this worker => cross-worker
+        // pending path (no fabricated cloud).
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
         set_lidar_intent(true);
         let frame = lidar_frame();
         // No full point cloud cross-worker — honest pending flag, never fabricated points.
