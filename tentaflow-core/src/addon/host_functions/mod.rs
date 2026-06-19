@@ -29,6 +29,7 @@ pub mod secrets;
 pub mod service;
 pub mod services;
 pub mod sql;
+pub mod state;
 pub mod storage;
 #[cfg(feature = "camera")]
 pub mod streaming;
@@ -112,6 +113,20 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "config_get_v1", config::config_get_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja config_get_v1: {e}"))?;
+
+    // --- Shared state API (A3 — host-side AddonStateStore, per-addon scope) ---
+    linker
+        .func_wrap("tentaflow", "state_get_v1", state::state_get_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja state_get_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "state_set_v1", state::state_set_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja state_set_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "state_delete_v1", state::state_delete_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja state_delete_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "state_list_v1", state::state_list_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja state_list_v1: {e}"))?;
 
     linker
         .func_wrap(

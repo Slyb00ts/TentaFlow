@@ -51,6 +51,13 @@ pub const MAX_BYTES_PER_ADDON: usize = 32 * 1024 * 1024;
 /// Writes above this are rejected outright (before any cap accounting).
 pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
+/// Per-entry CBOR framing overhead used by `list_bounded` to estimate the
+/// encoded size of one `StateEntryMeta`. Covers the map header, the three
+/// integer keys, the `size` u64 (worst case 9 bytes) and the `tier` byte, plus
+/// the `key` string header — an upper bound, so the real encoded output stays
+/// within the byte budget the host passes.
+pub const STATE_LIST_ENTRY_OVERHEAD: usize = 24;
+
 // =============================================================================
 // Public types
 // =============================================================================
@@ -614,7 +621,10 @@ impl AddonStateStore {
     }
 
     /// List keys for an addon, optionally filtered by prefix. Returns
-    /// `(key, value_size_bytes, tier)`. Order is unspecified.
+    /// `(key, value_size_bytes, tier)`. Order is unspecified. UNBOUNDED — only
+    /// for internal callers/tests that know the shard is small; the host ABI
+    /// path uses `list_bounded` so a 50k-key shard can never materialise a
+    /// multi-megabyte response.
     pub fn list(&self, addon_id: &str, prefix: Option<&str>) -> Vec<(String, usize, Tier)> {
         let Some(shard) = self.shards.get(addon_id) else {
             return Vec::new();
@@ -626,6 +636,59 @@ impl AddonStateStore {
             .filter(|(k, _)| prefix.map(|p| k.starts_with(p)).unwrap_or(true))
             .map(|(k, e)| (k.clone(), e.value.len(), e.tier))
             .collect()
+    }
+
+    /// Bounded variant of `list` for the host ABI path. Collects at most
+    /// `max_entries` matching entries AND stops once the estimated encoded byte
+    /// budget `max_bytes` would be exceeded, so the host never clones all keys of
+    /// a full (50k-entry) shard before encoding. Returns the collected metadata
+    /// and `truncated = true` when either limit cut the scan short (the caller
+    /// surfaces this so the addon knows the list was clipped).
+    ///
+    /// The scan and the early-stop both happen UNDER the shard read lock, so the
+    /// host allocates only the bounded result set, not the full key space. The
+    /// per-entry byte estimate is `key.len() + STATE_LIST_ENTRY_OVERHEAD` (a
+    /// fixed allowance for the CBOR map keys, the `size` u64 and the `tier` byte),
+    /// which is an upper bound on the actual encoded `StateEntryMeta` size — so
+    /// `max_bytes` is a safe budget that the real encoded output never exceeds.
+    pub fn list_bounded(
+        &self,
+        addon_id: &str,
+        prefix: Option<&str>,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> (Vec<(String, usize, Tier)>, bool) {
+        let Some(shard) = self.shards.get(addon_id) else {
+            return (Vec::new(), false);
+        };
+        let inner = shard.entries.read();
+
+        let mut out: Vec<(String, usize, Tier)> = Vec::new();
+        let mut est_bytes: usize = 0;
+        let mut truncated = false;
+
+        for (k, e) in inner.map.iter() {
+            if !prefix.map(|p| k.starts_with(p)).unwrap_or(true) {
+                continue;
+            }
+            if out.len() >= max_entries {
+                truncated = true;
+                break;
+            }
+            let entry_cost = k.len().saturating_add(STATE_LIST_ENTRY_OVERHEAD);
+            let next_est = est_bytes.saturating_add(entry_cost);
+            if !out.is_empty() && next_est > max_bytes {
+                // Stop before exceeding the byte budget; always admit at least
+                // one entry so a single oversized key still returns a (clipped)
+                // result rather than an empty list.
+                truncated = true;
+                break;
+            }
+            est_bytes = next_est;
+            out.push((k.clone(), e.value.len(), e.tier));
+        }
+
+        (out, truncated)
     }
 
     /// Remove the whole shard for an addon (unload / uninstall). Any unflushed
@@ -1544,5 +1607,66 @@ mod tests {
             "oldest key must survive a shrinking replace (no over-eviction)"
         );
         assert_eq!(s.get("a", &last), Some(b"tiny".to_vec()));
+    }
+
+    #[test]
+    fn list_bounded_stops_at_entry_cap() {
+        let s = store();
+        for i in 0..50 {
+            s.set("a", &format!("k{i:03}"), b"v".to_vec(), Tier::Ephemeral)
+                .unwrap();
+        }
+        // Generous byte budget so only the entry cap can trigger truncation.
+        let (entries, truncated) = s.list_bounded("a", None, 10, 1024 * 1024);
+        assert_eq!(entries.len(), 10);
+        assert!(truncated, "entry cap must mark the result truncated");
+    }
+
+    #[test]
+    fn list_bounded_stops_at_byte_budget() {
+        let s = store();
+        for i in 0..50 {
+            s.set("a", &format!("k{i:03}"), b"v".to_vec(), Tier::Ephemeral)
+                .unwrap();
+        }
+        // Tiny byte budget: only a couple of entries fit before the byte cap.
+        let per_entry = "k000".len() + STATE_LIST_ENTRY_OVERHEAD;
+        let budget = per_entry * 3;
+        let (entries, truncated) = s.list_bounded("a", None, 1000, budget);
+        assert!(entries.len() <= 3, "byte budget must cap collected entries");
+        assert!(!entries.is_empty(), "at least one entry must be returned");
+        assert!(truncated, "byte budget must mark the result truncated");
+    }
+
+    #[test]
+    fn list_bounded_under_limits_not_truncated() {
+        let s = store();
+        s.set("a", "k1", b"v".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("a", "k2", b"vv".to_vec(), Tier::Durable).unwrap();
+        let (entries, truncated) = s.list_bounded("a", None, 1000, 1024 * 1024);
+        assert_eq!(entries.len(), 2);
+        assert!(!truncated, "a small list must not be marked truncated");
+    }
+
+    #[test]
+    fn list_bounded_admits_single_oversized_key() {
+        let s = store();
+        s.set("a", "k", b"v".to_vec(), Tier::Ephemeral).unwrap();
+        // A byte budget smaller than one entry still returns that one entry.
+        let (entries, truncated) = s.list_bounded("a", None, 1000, 1);
+        assert_eq!(entries.len(), 1, "first entry always admitted");
+        assert!(!truncated, "single matching entry is not truncated");
+    }
+
+    #[test]
+    fn list_bounded_respects_prefix() {
+        let s = store();
+        s.set("a", "robot:1", b"x".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("a", "robot:2", b"y".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("a", "user:1", b"z".to_vec(), Tier::Ephemeral).unwrap();
+        let (entries, truncated) = s.list_bounded("a", Some("robot:"), 1000, 1024 * 1024);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|(k, _, _)| k.starts_with("robot:")));
+        assert!(!truncated);
     }
 }
