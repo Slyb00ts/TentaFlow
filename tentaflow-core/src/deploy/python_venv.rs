@@ -77,6 +77,13 @@ pub struct InstallVariant {
     /// nadpisuje resolver decision bez zmiany topologii grafu zaleznosci.
     #[serde(default)]
     pub force_pins: Vec<String>,
+    /// Jak `extras_no_build_isolation`, ale instalowane DODATKOWO z `--no-deps`.
+    /// Dla pakietow ktore buduja sie z torcha (no-build-isolation), ale ich
+    /// graf zaleznosci ciagnie ciezkie/niekompilowalne pakiety nieuzywane w
+    /// runtime (np. YOLOX -> onnx-simplifier/pycocotools); realne deps runtime
+    /// dostarczamy jawnie w `extras`.
+    #[serde(default)]
+    pub extras_no_build_isolation_no_deps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -839,6 +846,9 @@ fn template_identity(
         for extra in &v.extras_no_build_isolation {
             hasher.update(extra.as_bytes());
         }
+        for extra in &v.extras_no_build_isolation_no_deps {
+            hasher.update(extra.as_bytes());
+        }
         // `env` (np. TORCH_CUDA_ARCH_LIST) i `force_pins` realnie zmieniaja
         // skompilowane kernele / rozwiazany graf pakietow → musza wejsc do
         // hasha. HashMap nie ma deterministycznej kolejnosci, wiec sortujemy
@@ -1103,6 +1113,11 @@ fn install_deps(
             installer
                 .install_package_no_build_isolation(extra)
                 .with_context(|| format!("install {} (no-build-isolation)", extra))?;
+        }
+        for extra in &v.extras_no_build_isolation_no_deps {
+            installer
+                .install_package_no_build_isolation_no_deps(extra)
+                .with_context(|| format!("install {} (no-build-isolation,no-deps)", extra))?;
         }
     }
 
@@ -1532,6 +1547,17 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--no-build-isolation").arg(pkg);
+        self.run_install(&mut c)
+    }
+    /// Jak wyzej, ale z `--no-deps` — buduje z torcha, lecz NIE instaluje grafu
+    /// zaleznosci pakietu (dostarczamy je jawnie w `extras`).
+    fn install_package_no_build_isolation_no_deps(&self, pkg: &str) -> Result<()> {
+        (self.log)(&format!("pip: install --no-build-isolation --no-deps {}", pkg));
+        let mut c = self.cmd();
+        c.arg("install");
+        self.add_index(&mut c);
+        self.add_install_flags(&mut c);
+        c.arg("--no-build-isolation").arg("--no-deps").arg(pkg);
         self.run_install(&mut c)
     }
     /// `pip install --force-reinstall --no-deps <pkg>` — nadpisuje wersje

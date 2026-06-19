@@ -33,17 +33,19 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub"]
-# YOLOX z --no-build-isolation: jego setup.py kompiluje op FastCOCOEvalOp
-# (CppExtension) i wymaga widocznego torcha przy buildzie — build isolation by go
-# ukryl. Inferencja uzywa tylko `yolox.exp` (siec), op COCO-eval nie jest wolany.
-extras_no_build_isolation = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+# Realne deps runtime yolox.exp (loguru/psutil/packaging/tabulate) dostarczamy
+# jawnie, bo yolox instalujemy z --no-deps (jego graf ciagnie onnx-simplifier/
+# pycocotools, ktore sie nie buduja i sa nieuzywane w inferencji).
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "loguru", "psutil", "packaging", "tabulate"]
+# YOLOX z --no-build-isolation (setup.py kompiluje FastCOCOEvalOp i wymaga
+# widocznego torcha) + --no-deps (patrz wyzej). Inferencja uzywa tylko yolox.exp.
+extras_no_build_isolation_no_deps = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
 install_hint = "TORCH_DEVICE=cuda"
 
 # Wariant ROCm: torch z wheelami rocm7.0 dla GPU AMD (torch raportuje cuda API).
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub"]
-extras_no_build_isolation = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
+extras = ["torch", "torchvision", "fastapi", "uvicorn", "python-multipart", "opencv-python-headless", "pillow", "numpy", "huggingface_hub", "loguru", "psutil", "packaging", "tabulate"]
+extras_no_build_isolation_no_deps = ["yolox @ git+https://github.com/Megvii-BaseDetection/YOLOX.git"]
 install_hint = "TORCH_DEVICE=cuda"
