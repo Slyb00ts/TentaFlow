@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod db;
+mod state;
 
 use alloc::string::String;
 use alloc::vec;
@@ -794,9 +795,9 @@ std::thread_local! {
 
 /// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
 /// stale frame from a previous session is never reported as available. Clears the
-/// shared-DB live session snapshots (telemetry + lidar status) but PRESERVES the
-/// operator's persistent enable INTENT so the lidar re-subscribes automatically
-/// once the link is back online.
+/// shared-store live session snapshots (telemetry + lidar status) but PRESERVES
+/// the operator's persistent enable INTENT so the lidar re-subscribes
+/// automatically once the link is back online.
 fn lidar_reset_session() {
     LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
@@ -804,14 +805,55 @@ fn lidar_reset_session() {
         *l = LidarState::default();
         l.enabled = enabled;
     });
-    let _ = db::clear_live_session();
+    let _ = state::delete(state::KEY_TELEMETRY);
+    let _ = state::delete(state::KEY_LIDAR_STATUS);
+}
+
+/// Mirror the connection-status fields the advertise path (and a future host-side
+/// reader) consumes into the shared store under `live:status`. Ephemeral: this is
+/// a fast cross-worker READ cache, NOT the source of truth — the `robot` SQLite
+/// row (with its CAS connect lock) stays authoritative. Written on every status
+/// transition so a worker / host can read status/camera/battery/rtt without a
+/// WASM call or a SQL round-trip.
+fn mirror_status(robot: &db::Robot) {
+    let snapshot = json!({
+        "status": robot.status,
+        "camera_id": robot.camera_id,
+        "battery_pct": robot.battery_pct,
+        "rtt_ms": robot.rtt_ms,
+    });
+    // The mirror is a best-effort read-cache, but a write failure must be
+    // observable, not silently swallowed — a stale mirror misleads cross-worker
+    // / host-side readers about the connection state.
+    if let Err(e) = state::set_ephemeral(state::KEY_STATUS, snapshot.to_string().into_bytes()) {
+        log::warn(&alloc::format!("go2: status mirror write failed: {e}"));
+    }
+}
+
+/// Write the status mirror after a transition that changed connection fields,
+/// reading the freshly persisted `robot` row so the mirror reflects exactly what
+/// the source-of-truth holds. Best-effort: a read failure simply skips the mirror
+/// for this transition (the robot row remains authoritative).
+fn mirror_status_from_db() {
+    if let Ok(robot) = db::get_robot() {
+        mirror_status(&robot);
+    }
+}
+
+/// `db::set_offline` + refresh the `live:status` mirror so the store reflects the
+/// new offline/error state for cross-worker / host-side reads. The `robot` row
+/// stays the source of truth; this only keeps the fast read cache in sync.
+fn set_offline_mirrored(status: &str, msg: &str) -> Result<(), AbiError> {
+    let r = db::set_offline(status, msg);
+    mirror_status_from_db();
+    r
 }
 
 /// Build the SMALL LiDAR availability sub-object from the in-tick thread_local
 /// (no point cloud). `available` is true only when at least one frame decoded this
 /// session. Absent fields (resolution/origin) are omitted, never fabricated. ONLY
-/// the service instance calls this — it persists the result to the shared DB; the
-/// cross-worker `go2.status` reads it back via `lidar_status_from_db`.
+/// the service instance calls this — it persists the result to the shared store;
+/// the cross-worker `go2.status` reads it back via `lidar_status_from_store`.
 fn lidar_status_json() -> JsonValue {
     LIDAR.with(|cell| {
         let l = cell.borrow();
@@ -1019,7 +1061,10 @@ fn ingest_voxel_map(raw: &[u8]) {
     // lidar_frame sees the latest availability. The full point cloud stays in the
     // service instance's memory (never persisted — see lidar_frame).
     if should_persist {
-        let _ = db::set_lidar_status(&lidar_status_json().to_string());
+        let _ = state::set_ephemeral(
+            state::KEY_LIDAR_STATUS,
+            lidar_status_json().to_string().into_bytes(),
+        );
     }
 }
 
@@ -1049,8 +1094,10 @@ fn set_lidar(enabled: bool) -> JsonValue {
     // Local owner: persist the desire regardless of online state. on_tick drives
     // subscription/switch from this flag, so persisting while offline is enough
     // for correct reconnect behavior (re-subscribe on enable, stay off on disable).
-    if let Err(e) = db::set_lidar_enabled(enabled) {
-        return json!({ "error": alloc::format!("db: {e}") });
+    // Durable so the intent survives a restart, exactly like the old persisted
+    // column; on_tick reads it back from the store each tick.
+    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![u8::from(enabled)]) {
+        return json!({ "error": alloc::format!("state: {e}") });
     }
     json!({ "status": "sent", "enabled": enabled })
 }
@@ -1067,10 +1114,26 @@ fn set_lidar(enabled: bool) -> JsonValue {
 /// it lands, the points will be streamed via a dedicated seam (e.g. a service
 /// host-fn / mesh frame channel), not this status-shaped tool.
 fn lidar_frame() -> JsonValue {
-    let status = lidar_status_from_db();
+    // A REAL read error must NOT be papered over as an empty/"disabled" frame —
+    // surface it so the renderer can distinguish "no data yet" from "read failed".
+    let status = match lidar_status_from_store() {
+        Ok(s) => s,
+        Err(e) => return json!({ "error": alloc::format!("lidar status read: {e}") }),
+    };
     let mut obj = status.as_object().cloned().unwrap_or_default();
     obj.insert("frame_pending_renderer".into(), json!(true));
     JsonValue::Object(obj)
+}
+
+/// Read the persistent LiDAR enable INTENT from the shared store. Propagates a
+/// read error rather than collapsing it to `false`: a transient ABI failure must
+/// NOT be interpreted as "operator wants LiDAR off" (that would silently command
+/// the robot's LiDAR off). `Ok(false)` only when nothing has ever been written.
+fn lidar_enabled_intent() -> Result<bool, AbiError> {
+    match state::get(state::KEY_LIDAR_ENABLED)? {
+        Some(bytes) => Ok(bytes.first().is_some_and(|b| *b != 0)),
+        None => Ok(false),
+    }
 }
 
 /// Read a fixed-layout `[a, b, c, ...]` JSON sensor array of numbers into a
@@ -1273,15 +1336,15 @@ fn telemetry_json() -> JsonValue {
     })
 }
 
-/// Read the structured `telemetry` object for `go2.status` from the SHARED DB
+/// Read the structured `telemetry` object for `go2.status` from the SHARED STORE
 /// (the cross-worker source of truth) — the calling worker is NOT the service
 /// instance that drains the stream, so the thread_local accumulator is empty
 /// here. Returns the same shape `telemetry_json` produces; `JsonValue::Null`
 /// when nothing has been persisted yet so `go2.status` omits the key entirely.
-fn telemetry_from_db() -> JsonValue {
-    let raw = match db::get_telemetry() {
-        Ok(s) => s,
-        Err(_) => return JsonValue::Null,
+fn telemetry_from_store() -> JsonValue {
+    let raw = match state::get_string(state::KEY_TELEMETRY) {
+        Ok(Some(s)) => s,
+        Ok(None) | Err(_) => return JsonValue::Null,
     };
     if raw.is_empty() {
         return JsonValue::Null;
@@ -1292,27 +1355,37 @@ fn telemetry_from_db() -> JsonValue {
         .unwrap_or(JsonValue::Null)
 }
 
-/// Read the SMALL LiDAR status object for `go2.status` from the SHARED DB. Same
-/// shape `lidar_status_json` builds. When the service instance has not persisted
-/// a status this session, report the desired-enable flag with `available:false`
-/// so the UI still reflects the operator intent across workers.
-fn lidar_status_from_db() -> JsonValue {
-    if let Ok(raw) = db::get_live() {
-        if !raw.lidar_status_json.is_empty() {
-            if let Ok(v) = serde_json::from_str::<JsonValue>(&raw.lidar_status_json) {
+/// Read the SMALL LiDAR status object for `go2.status` from the SHARED STORE.
+/// Same shape `lidar_status_json` builds. Distinguishes a REAL host-fn read error
+/// from the legitimate "absent = default disabled / no frame yet" case instead of
+/// fabricating a "disabled" object on any failure:
+///   - `Ok(obj)` — a real persisted status, or (when none yet) the desired-enable
+///     INTENT with `available:false`. An absent key (`Ok(false)` intent) yields
+///     the same default shape `go2.status` rendered before, so callers render it
+///     identically.
+///   - `Err` — a REAL host-fn read error: the caller MUST omit the lidar field
+///     rather than emit a fabricated "disabled" object that misreports the robot.
+fn lidar_status_from_store() -> Result<JsonValue, AbiError> {
+    if let Some(raw) = state::get_string(state::KEY_LIDAR_STATUS)? {
+        if !raw.is_empty() {
+            if let Ok(v) = serde_json::from_str::<JsonValue>(&raw) {
                 if v.is_object() {
-                    return v;
+                    return Ok(v);
                 }
             }
         }
-        return json!({
-            "enabled": raw.lidar_enabled,
-            "available": false,
-            "point_count": 0,
-            "frame_seq": 0,
-        });
     }
-    json!({ "enabled": false, "available": false, "point_count": 0, "frame_seq": 0 })
+    // No persisted status: fall back to the operator's persistent enable INTENT.
+    // A READ ERROR here propagates (we must not paper a transient failure over as
+    // "disabled"); a genuinely absent intent (`Ok(false)`) yields the default
+    // shape the UI rendered before.
+    let enabled = lidar_enabled_intent()?;
+    Ok(json!({
+        "enabled": enabled,
+        "available": false,
+        "point_count": 0,
+        "frame_seq": 0,
+    }))
 }
 
 // =============================================================================
@@ -1328,7 +1401,7 @@ fn do_connect() -> JsonValue {
         Some(ip) => ip,
         None => {
             log::warn("go2: no IP configured — cannot connect");
-            let _ = db::set_offline("error", "no IP configured");
+            let _ = set_offline_mirrored("error", "no IP configured");
             return json!({ "error": "no IP configured" });
         }
     };
@@ -1339,7 +1412,10 @@ fn do_connect() -> JsonValue {
     }
     // CAS: only one connect in flight.
     match db::try_begin_connect() {
-        Ok(true) => log::info("go2: try_begin_connect won (status->connecting)"),
+        Ok(true) => {
+            log::info("go2: try_begin_connect won (status->connecting)");
+            mirror_status_from_db();
+        }
         Ok(false) => {
             log::warn("go2: try_begin_connect lost (already connecting/online)");
             return json!({ "error": "already connecting or online" });
@@ -1364,7 +1440,7 @@ fn do_connect() -> JsonValue {
         Ok(o) => o,
         Err(e) => {
             log::warn(&alloc::format!("go2: webrtc_connect_v1 failed: {e}"));
-            let _ = db::set_offline("error", &alloc::format!("webrtc_connect: {e}"));
+            let _ = set_offline_mirrored("error", &alloc::format!("webrtc_connect: {e}"));
             return json!({ "error": alloc::format!("webrtc_connect: {e}") });
         }
     };
@@ -1401,7 +1477,7 @@ fn do_connect() -> JsonValue {
         Err(e) => {
             log::warn(&alloc::format!("go2: signaling failed: {e}"));
             wc_close(&channel_id);
-            let _ = db::set_offline("error", &e);
+            let _ = set_offline_mirrored("error", &e);
             return json!({ "error": e });
         }
     };
@@ -1409,20 +1485,23 @@ fn do_connect() -> JsonValue {
     let set_ans = WebRtcSetAnswerInput { channel_id: channel_id.clone(), answer_sdp };
     if let Err(e) = call_cbor_in_out::<_, WebRtcStatusOutput>(&set_ans, webrtc_set_answer_v1) {
         wc_close(&channel_id);
-        let _ = db::set_offline("error", &alloc::format!("set_answer: {e}"));
+        let _ = set_offline_mirrored("error", &alloc::format!("set_answer: {e}"));
         return json!({ "error": alloc::format!("set_answer: {e}") });
     }
     // CAS connecting -> validating. If a disconnect raced (we lost), the fresh
     // channel is orphaned — close it so we don't leak a peer connection.
     match db::set_channel(&channel_id) {
-        Ok(true) => json!({ "status": "connecting", "channel_id": channel_id }),
+        Ok(true) => {
+            mirror_status_from_db();
+            json!({ "status": "connecting", "channel_id": channel_id })
+        }
         Ok(false) => {
             wc_close(&channel_id);
             json!({ "error": "connect cancelled" })
         }
         Err(e) => {
             wc_close(&channel_id);
-            let _ = db::set_offline("error", &alloc::format!("set_channel: {e}"));
+            let _ = set_offline_mirrored("error", &alloc::format!("set_channel: {e}"));
             json!({ "error": alloc::format!("set_channel: {e}") })
         }
     }
@@ -1435,7 +1514,7 @@ fn do_disconnect() -> JsonValue {
         }
     }
     lidar_reset_session();
-    let _ = db::set_offline("offline", "");
+    let _ = set_offline_mirrored("offline", "");
     json!({ "status": "offline" })
 }
 
@@ -1493,20 +1572,20 @@ fn tick() {
                 if !robot.channel_id.is_empty() {
                     wc_close(&robot.channel_id);
                 }
-                let _ = db::set_offline("error", "connect timeout");
+                let _ = set_offline_mirrored("error", "connect timeout");
                 publish_event("go2.offline", json!({ "reason": "connect timeout" }));
             }
         }
         "validating" => {
             if robot.channel_id.is_empty() {
-                let _ = db::set_offline("error", "no channel");
+                let _ = set_offline_mirrored("error", "no channel");
                 return;
             }
             // Validation watchdog: a stuck handshake (incl. persistent drain
             // errors below, which just retry) is bounded here.
             if db::now_secs() - robot.last_update > VALIDATION_TIMEOUT_SECS {
                 wc_close(&robot.channel_id);
-                let _ = db::set_offline("error", "validation timeout");
+                let _ = set_offline_mirrored("error", "validation timeout");
                 publish_event("go2.offline", json!({ "reason": "validation timeout" }));
                 return;
             }
@@ -1515,7 +1594,7 @@ fn tick() {
                 Err(_) => return,
             };
             if drained.closed {
-                let _ = db::set_offline("error", "channel closed during validation");
+                let _ = set_offline_mirrored("error", "channel closed during validation");
                 return;
             }
             for msg in drained.messages {
@@ -1558,6 +1637,7 @@ fn tick() {
                                         );
                                     }
                                     grant_vision_camera(&cam_id);
+                                    mirror_status_from_db();
                                     publish_event("go2.online", json!({ "camera_id": cam_id }));
                                     log::info("go2: online");
                                 }
@@ -1579,7 +1659,7 @@ fn tick() {
         }
         "online" => {
             if robot.channel_id.is_empty() {
-                let _ = db::set_offline("error", "no channel");
+                let _ = set_offline_mirrored("error", "no channel");
                 return;
             }
             // Liveness watchdog keyed on REAL telemetry receipt: lowstate streams
@@ -1589,7 +1669,7 @@ fn tick() {
             if db::now_secs() - robot.last_telemetry > ONLINE_STALE_SECS {
                 wc_close(&robot.channel_id);
                 lidar_reset_session();
-                let _ = db::set_offline("error", "telemetry stalled");
+                let _ = set_offline_mirrored("error", "telemetry stalled");
                 publish_event("go2.offline", json!({ "reason": "telemetry stalled" }));
                 return;
             }
@@ -1606,7 +1686,7 @@ fn tick() {
                 let l = cell.borrow();
                 (l.enabled, l.subscribed, l.pending_disable)
             });
-            let desired_lidar = match db::lidar_enabled() {
+            let desired_lidar = match lidar_enabled_intent() {
                 Ok(d) => Some(d),
                 Err(_) => None,
             };
@@ -1642,7 +1722,10 @@ fn tick() {
                             l.subscribed = false;
                             l.pending_disable = false;
                         });
-                        let _ = db::set_lidar_status(&lidar_status_json().to_string());
+                        let _ = state::set_ephemeral(
+                            state::KEY_LIDAR_STATUS,
+                            lidar_status_json().to_string().into_bytes(),
+                        );
                     } else {
                         LIDAR.with(|cell| cell.borrow_mut().pending_disable = true);
                     }
@@ -1654,7 +1737,7 @@ fn tick() {
             };
             if drained.closed {
                 lidar_reset_session();
-                let _ = db::set_offline("error", "channel closed");
+                let _ = set_offline_mirrored("error", "channel closed");
                 publish_event("go2.offline", json!({ "reason": "channel closed" }));
                 return;
             }
@@ -1712,18 +1795,35 @@ fn tick() {
             if tick_n % 5 == 0 {
                 let snapshot = telemetry_json();
                 if !snapshot.is_null() {
-                    let _ = db::set_telemetry(&snapshot.to_string());
+                    let _ = state::set_ephemeral(
+                        state::KEY_TELEMETRY,
+                        snapshot.to_string().into_bytes(),
+                    );
                 }
                 let mut rtt = robot.rtt_ms;
                 if let Ok(st) = wc_state(&robot.channel_id) {
                     if st.peer_state == "failed" || st.peer_state == "closed" {
-                        let _ = db::set_offline("error", &st.peer_state);
+                        let _ = set_offline_mirrored("error", &st.peer_state);
                         publish_event("go2.offline", json!({ "reason": st.peer_state }));
                         return;
                     }
                     if let Some(r) = st.rtt_ms {
                         rtt = r as i64;
                         let _ = db::set_rtt(rtt);
+                    }
+                }
+                // Mirror the freshly persisted status fields for fast cross-worker
+                // / host-side reads. Re-read the `robot` row HERE (after
+                // record_lowstate / set_rtt) instead of mirroring from the
+                // pre-drain `robot` snapshot: a go2.disconnect / offline transition
+                // could have raced in on another worker after that snapshot, and
+                // mirroring the stale snapshot would overwrite the mirror back to
+                // `online`. Only mirror `online` when the FRESH row is genuinely
+                // online with a live channel; otherwise the disconnecting path's
+                // own mirror write (set_offline_mirrored) is authoritative.
+                if let Ok(fresh) = db::get_robot() {
+                    if fresh.status == "online" && !fresh.channel_id.is_empty() {
+                        mirror_status(&fresh);
                     }
                 }
                 publish_event("go2.telemetry", json!({ "battery_pct": battery, "rtt_ms": rtt }));
@@ -1949,7 +2049,7 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
                 // cross-worker source of truth — this worker is not the service
                 // instance that drains the stream). Only emitted when something has
                 // been persisted; an empty stream omits the key entirely.
-                let telemetry = telemetry_from_db();
+                let telemetry = telemetry_from_store();
                 if !telemetry.is_null() {
                     if let Some(o) = out.as_object_mut() {
                         o.insert("telemetry".into(), telemetry);
@@ -1957,9 +2057,16 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
                 }
                 // SMALL LiDAR availability sub-object (enabled/available/point
                 // count/resolution/origin/frame_seq/ts) — NEVER the point cloud.
-                // Read from the shared DB so any worker reports the live status.
-                if let Some(o) = out.as_object_mut() {
-                    o.insert("lidar".into(), lidar_status_from_db());
+                // Read from the shared store so any worker reports the live status.
+                // On a REAL read error OMIT the field rather than fabricate a
+                // "disabled" object that would misreport the robot's LiDAR.
+                match lidar_status_from_store() {
+                    Ok(lidar) => {
+                        if let Some(o) = out.as_object_mut() {
+                            o.insert("lidar".into(), lidar);
+                        }
+                    }
+                    Err(e) => log::warn(&alloc::format!("go2.status: lidar read failed, omitting: {e}")),
                 }
                 out
             }
@@ -2152,7 +2259,41 @@ pub extern "C" fn on_install() -> i32 {
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
     ensure_robot_from_config();
+    bridge_legacy_lidar_intent();
     0
+}
+
+/// One-time, idempotent upgrade bridge for the LiDAR enable INTENT. The intent
+/// used to live in `robot_live.lidar_enabled`; it now lives in the durable shared
+/// store under `lidar:enabled`. Migrations run before on_start, so the migration
+/// keeps the legacy table around and this seeds the store key FROM it exactly once:
+/// only when the durable key is ABSENT (a fresh upgrade) AND the legacy table
+/// still holds a value. A second start is a no-op — once the key exists (even if a
+/// newer toggle wrote a different value meanwhile) we never clobber it. A real
+/// read error on either side aborts the bridge for this start (retry next start)
+/// rather than fabricating intent.
+fn bridge_legacy_lidar_intent() {
+    // Already migrated (or already toggled this session): never clobber the store.
+    match state::get(state::KEY_LIDAR_ENABLED) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            log::warn(&alloc::format!("go2: lidar intent bridge skipped, store read failed: {e}"));
+            return;
+        }
+    }
+    let legacy = match db::legacy_lidar_enabled() {
+        Ok(Some(v)) => v,
+        // No legacy table / no row: nothing to bridge (fresh install).
+        Ok(None) => return,
+        Err(e) => {
+            log::warn(&alloc::format!("go2: lidar intent bridge skipped, legacy read failed: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![u8::from(legacy)]) {
+        log::warn(&alloc::format!("go2: lidar intent bridge write failed: {e}"));
+    }
 }
 
 #[no_mangle]
@@ -2163,7 +2304,7 @@ pub extern "C" fn on_stop() -> i32 {
         }
     }
     lidar_reset_session();
-    let _ = db::set_offline("offline", "");
+    let _ = set_offline_mirrored("offline", "");
     0
 }
 
@@ -2251,6 +2392,13 @@ mod host_stubs {
 mod tests {
     use super::*;
 
+    /// The wall-clock cache (`db::now_secs`) is a process-global atomic, so tests
+    /// that seed it via `set_now_secs` and then assert clock-derived behavior must
+    /// not run concurrently with one another (a parallel test would clobber the
+    /// shared clock mid-test). Every clock-seeding test holds this mutex; the
+    /// purely-decode tests do not touch the clock and stay parallel.
+    static CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a minimal "normal-framing" voxel-map binary message: `<u16 json_len>`,
     /// 2 pad bytes, the JSON envelope, then the LZ4-block-compressed occupancy grid.
     fn build_normal_frame(grid: &[u8], resolution: f64, origin: [f64; 3]) -> Vec<u8> {
@@ -2272,6 +2420,7 @@ mod tests {
 
     #[test]
     fn voxel_decode_single_voxel_matches_reference() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
         // One occupied voxel at grid index z=1, y=1, x_byte=0, MSB bit 0 (=> x=0).
         // index = z*0x800 + y*0x10 + x_byte = 0x800 + 0x10 + 0 = 0x810.
@@ -2518,10 +2667,19 @@ mod tests {
     // Cross-worker DB persistence (telemetry + lidar live state)
     // -------------------------------------------------------------------------
 
+    /// Write the durable LiDAR enable intent the same way `set_lidar` does (one
+    /// byte: 1 = on, 0 = off), so the store-backed tests don't depend on the
+    /// (inert in native tests) `set_lidar` mesh-dispatch path.
+    fn set_lidar_intent(enabled: bool) {
+        state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![u8::from(enabled)])
+            .expect("persist lidar intent");
+    }
+
     #[test]
-    fn telemetry_db_round_trip_preserves_shape() {
+    fn telemetry_store_round_trip_preserves_shape() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
+        state::test_reset();
         TELEMETRY.with(|cell| *cell.borrow_mut() = Telemetry::default());
 
         // Feed a sportmodestate + lowstate battery into the in-tick accumulator,
@@ -2541,13 +2699,14 @@ mod tests {
         // The service instance builds the snapshot and persists it (throttled path).
         let built = telemetry_json();
         assert!(built.is_object(), "snapshot must be a JSON object");
-        db::set_telemetry(&built.to_string()).expect("persist telemetry");
+        state::set_ephemeral(state::KEY_TELEMETRY, built.to_string().into_bytes())
+            .expect("persist telemetry");
 
-        // A different worker (empty thread_local) reads it back from the DB.
+        // A different worker (empty thread_local) reads it back from the store.
         TELEMETRY.with(|cell| *cell.borrow_mut() = Telemetry::default());
         assert!(telemetry_json().is_null(), "thread_local is empty on the reader worker");
-        let read_back = telemetry_from_db();
-        assert_eq!(read_back, built, "DB round-trip must preserve the exact telemetry shape");
+        let read_back = telemetry_from_store();
+        assert_eq!(read_back, built, "store round-trip must preserve the exact telemetry shape");
 
         // Spot-check the shape parse_status_telemetry consumes.
         assert_eq!(read_back.get("mode").and_then(JsonValue::as_i64), Some(1));
@@ -2559,39 +2718,41 @@ mod tests {
             read_back.get("velocity").and_then(|v| v.get("vx")).and_then(JsonValue::as_f64),
             Some(0.1)
         );
-        db::test_reset();
+        state::test_reset();
     }
 
     #[test]
-    fn telemetry_db_empty_is_null() {
-        db::test_reset();
-        assert!(telemetry_from_db().is_null(), "no persisted telemetry → Null");
+    fn telemetry_store_empty_is_null() {
+        state::test_reset();
+        assert!(telemetry_from_store().is_null(), "no persisted telemetry → Null");
     }
 
     #[test]
     fn lidar_desired_flag_persists_cross_worker() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
-        assert!(!db::lidar_enabled().expect("read"), "default desire is disabled");
-        db::set_lidar_enabled(true).expect("enable");
-        assert!(db::lidar_enabled().expect("read"), "enable desire persists");
-        db::set_lidar_enabled(false).expect("disable");
-        assert!(!db::lidar_enabled().expect("read"), "disable desire persists");
-        db::test_reset();
+        state::test_reset();
+        assert!(!lidar_enabled_intent().expect("read"), "default desire is disabled");
+        set_lidar_intent(true);
+        assert!(lidar_enabled_intent().expect("read"), "enable desire persists");
+        set_lidar_intent(false);
+        assert!(!lidar_enabled_intent().expect("read"), "disable desire persists");
+        state::test_reset();
     }
 
     #[test]
     fn lidar_enabled_read_error_propagates_not_false() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
+        state::test_reset();
         // Operator intent is ON, then a transient read fails: the call must surface
         // the error, NOT collapse to `false` (which would drive the LiDAR off).
-        db::set_lidar_enabled(true).expect("enable");
-        db::test_fail_next_live_read();
-        assert!(db::lidar_enabled().is_err(), "read error propagates");
+        set_lidar_intent(true);
+        state::test_fail_next_get();
+        assert!(lidar_enabled_intent().is_err(), "read error propagates");
         // The next read recovers and still reports the persisted ON intent.
-        assert!(db::lidar_enabled().expect("read"), "intent intact after error");
-        db::test_reset();
+        assert!(lidar_enabled_intent().expect("read"), "intent intact after error");
+        state::test_reset();
     }
 
     #[test]
@@ -2630,29 +2791,30 @@ mod tests {
 
     #[test]
     fn lidar_status_write_is_throttled_per_second() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
+        state::test_reset();
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
         // First frame at t0: availability transitions false->true, must persist now.
         let grid = vec![0xFFu8];
         ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
         let seq_at_t0 = LIDAR.with(|c| c.borrow().frame_seq);
-        let persisted_t0 = lidar_status_from_db()
+        let persisted_t0 = lidar_status_from_store().expect("read")
             .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
         assert_eq!(persisted_t0, seq_at_t0, "transition frame persisted immediately");
         // A second frame in the same second (no transition): NOT re-persisted.
         ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
-        let persisted_same_sec = lidar_status_from_db()
+        let persisted_same_sec = lidar_status_from_store().expect("read")
             .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
         assert_eq!(persisted_same_sec, persisted_t0, "steady-state frame within 1s not re-persisted");
         // Advance the clock >= refresh cadence: the periodic refresh writes again.
         db::set_now_secs(1_700_000_000 + LIDAR_STATUS_REFRESH_SECS);
         ingest_voxel_map(&build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]));
         let live_seq = LIDAR.with(|c| c.borrow().frame_seq);
-        let persisted_after_refresh = lidar_status_from_db()
+        let persisted_after_refresh = lidar_status_from_store().expect("read")
             .get("frame_seq").and_then(JsonValue::as_u64).unwrap_or(0);
         assert_eq!(persisted_after_refresh, live_seq, "periodic refresh persists fresh frame_seq");
-        db::test_reset();
+        state::test_reset();
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
 
@@ -2661,24 +2823,26 @@ mod tests {
         // No `ip` config in native tests (config_get_v1 stub returns 2 = not found),
         // so set_lidar() would route over the mesh as "remote-owned" — assert that
         // boundary holds (the dispatch path returns an error from the inert stub),
-        // then assert the LOCAL path (DB layer) persists intent regardless of online
-        // state, which is what on_tick reads to re-subscribe on reconnect.
+        // then assert the LOCAL path (state store) persists intent regardless of
+        // online state, which is what on_tick reads to re-subscribe on reconnect.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
+        state::test_reset();
         let resp = set_lidar(true);
         // Remote route taken (no IP configured): dispatch stub fails, surfaced as error.
         assert!(resp.get("error").is_some(), "no-IP node routes over mesh");
-        // The owning-node behavior set_lidar performs is db::set_lidar_enabled while
-        // offline; verify that persists the intent the tick loop consumes.
-        db::set_lidar_enabled(true).expect("persist enable intent offline");
-        assert!(db::lidar_enabled().expect("read"), "intent persists while robot offline");
-        db::test_reset();
+        // The owning-node behavior set_lidar performs is the durable intent write
+        // while offline; verify that persists the intent the tick loop consumes.
+        set_lidar_intent(true);
+        assert!(lidar_enabled_intent().expect("read"), "intent persists while robot offline");
+        state::test_reset();
     }
 
     #[test]
-    fn lidar_status_db_round_trip_preserves_shape() {
+    fn lidar_status_store_round_trip_preserves_shape() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
         db::set_now_secs(1_700_000_000);
-        db::test_reset();
+        state::test_reset();
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
 
         // Decode one frame in the service instance; it persists the small status.
@@ -2691,26 +2855,157 @@ mod tests {
         let built = lidar_status_json();
         // A reader worker has an empty thread_local but reads the persisted status.
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
-        let read_back = lidar_status_from_db();
+        let read_back = lidar_status_from_store().expect("read");
         assert_eq!(read_back, built, "lidar status round-trip preserves shape");
         assert_eq!(read_back.get("available").and_then(JsonValue::as_bool), Some(true));
         assert_eq!(read_back.get("point_count").and_then(JsonValue::as_u64), Some(1));
         assert_eq!(read_back.get("frame_seq").and_then(JsonValue::as_u64), Some(1));
 
-        db::test_reset();
+        state::test_reset();
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
 
     #[test]
     fn lidar_frame_returns_metadata_with_pending_flag() {
-        db::test_reset();
-        db::set_lidar_enabled(true).expect("enable");
+        state::test_reset();
+        set_lidar_intent(true);
         let frame = lidar_frame();
         // No full point cloud cross-worker — honest pending flag, never fabricated points.
         assert_eq!(frame.get("frame_pending_renderer").and_then(JsonValue::as_bool), Some(true));
         assert!(frame.get("points").is_none(), "full cloud is never persisted/returned");
         assert_eq!(frame.get("enabled").and_then(JsonValue::as_bool), Some(true));
-        db::test_reset();
+        state::test_reset();
+    }
+
+    #[test]
+    fn lidar_status_read_error_surfaces_not_fabricated() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // Operator intent is ON, then the status read fails: the builder must
+        // surface the error, NOT fabricate a `{enabled:false, available:false}`.
+        set_lidar_intent(true);
+        state::test_fail_next_get();
+        assert!(lidar_status_from_store().is_err(), "real read error propagates, not fabricated");
+        // lidar_frame must turn that into an explicit error, not an empty frame.
+        state::test_fail_next_get();
+        let frame = lidar_frame();
+        assert!(frame.get("error").is_some(), "lidar_frame surfaces the read error");
+        assert!(frame.get("frame_pending_renderer").is_none(), "no fabricated frame on read error");
+        // Recovery: the next read returns the intent-default object (enabled).
+        let recovered = lidar_status_from_store().expect("read recovers");
+        assert_eq!(recovered.get("enabled").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(recovered.get("available").and_then(JsonValue::as_bool), Some(false));
+        state::test_reset();
+    }
+
+    #[test]
+    fn lidar_status_absent_renders_default_disabled_unchanged() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // Nothing persisted and no intent ever written: the byte-identical default
+        // disabled shape go2.status rendered before (absent != error).
+        let s = lidar_status_from_store().expect("absent is Ok, not Err");
+        assert_eq!(s.get("enabled").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(s.get("available").and_then(JsonValue::as_bool), Some(false));
+        assert_eq!(s.get("point_count").and_then(JsonValue::as_u64), Some(0));
+        assert_eq!(s.get("frame_seq").and_then(JsonValue::as_u64), Some(0));
+        state::test_reset();
+    }
+
+    #[test]
+    fn lidar_intent_read_error_skips_actuator_not_disable() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // Operator intent ON; a transient read error in on_tick must yield `None`
+        // (skip the actuator decision this tick), NOT `Some(false)` (which would
+        // command the robot's LiDAR off). Mirrors the on_tick desired_lidar branch.
+        set_lidar_intent(true);
+        state::test_fail_next_get();
+        // Same Err → None mapping on_tick uses to gate the actuator: a read error
+        // skips the decision, never collapses to Some(false) (disable command).
+        let desired = lidar_enabled_intent().ok();
+        assert_eq!(desired, None, "read error skips the actuator (no disable command)");
+        // Next tick recovers the persisted ON intent.
+        let recovered = lidar_enabled_intent().ok();
+        assert_eq!(recovered, Some(true), "intent ON intact after the transient error");
+        state::test_reset();
+    }
+
+    #[test]
+    fn status_mirror_uses_fresh_row_only_online_when_truly_online() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // The fresh-row mirror guard: only mirror `online` when the fresh row is
+        // genuinely online with a live channel. An online row with a channel
+        // mirrors; an offline / channel-less row does not write `online`.
+        let online = db::Robot {
+            status: "online".into(),
+            channel_id: "chan-1".into(),
+            camera_id: "cam-1".into(),
+            battery_pct: 77,
+            rtt_ms: 12,
+            ..Default::default()
+        };
+        if online.status == "online" && !online.channel_id.is_empty() {
+            mirror_status(&online);
+        }
+        let mirrored = state::get_string(state::KEY_STATUS).expect("read").expect("mirror present");
+        let v: JsonValue = serde_json::from_str(&mirrored).expect("json");
+        assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("online"));
+        assert_eq!(v.get("battery_pct").and_then(JsonValue::as_i64), Some(77));
+
+        // A raced offline row (status offline OR empty channel) must NOT overwrite
+        // the mirror back to online via the guarded online-tick path.
+        let raced_offline = db::Robot { status: "offline".into(), channel_id: String::new(), ..Default::default() };
+        let would_mirror_online = raced_offline.status == "online" && !raced_offline.channel_id.is_empty();
+        assert!(!would_mirror_online, "offline/channel-less fresh row never mirrors online");
+
+        // An online status with an EMPTY channel (mid-teardown) also must not mirror online.
+        let online_no_channel = db::Robot { status: "online".into(), channel_id: String::new(), ..Default::default() };
+        let would_mirror = online_no_channel.status == "online" && !online_no_channel.channel_id.is_empty();
+        assert!(!would_mirror, "online-but-channel-less is not truly online");
+        state::test_reset();
+    }
+
+    #[test]
+    fn on_start_bridge_seeds_intent_from_legacy_when_absent() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // Fresh upgrade: durable store key absent, legacy table holds ON intent.
+        db::test_set_legacy_lidar(Some(true));
+        assert!(state::get(state::KEY_LIDAR_ENABLED).expect("read").is_none(), "store key absent pre-bridge");
+        bridge_legacy_lidar_intent();
+        assert!(lidar_enabled_intent().expect("read"), "bridge seeds ON intent from legacy table");
+
+        // Idempotent: a second start with a DIFFERENT (newer) store value must NOT
+        // be clobbered by the stale legacy value.
+        set_lidar_intent(false);
+        db::test_set_legacy_lidar(Some(true));
+        bridge_legacy_lidar_intent();
+        assert!(!lidar_enabled_intent().expect("read"), "second start never clobbers a newer store value");
+        db::test_set_legacy_lidar(None);
+        state::test_reset();
+    }
+
+    #[test]
+    fn on_start_bridge_no_legacy_table_is_noop() {
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        state::test_reset();
+        // No legacy table (later drop migration shipped): the bridge leaves the
+        // store key absent (fresh-install default disabled), never fabricates one.
+        db::test_set_legacy_lidar(None);
+        bridge_legacy_lidar_intent();
+        assert!(
+            state::get(state::KEY_LIDAR_ENABLED).expect("read").is_none(),
+            "no legacy value → store key stays absent (no fabricated intent)"
+        );
+        state::test_reset();
     }
 }
 

@@ -158,6 +158,18 @@ display_name = "Zapis SQL"
 description = "Zapis konfiguracji/stanu robota w per-addon bazie."
 risk = "medium"
 
+[[permission]]
+id = "state.read"
+display_name = "Odczyt stanu współdzielonego"
+description = "Odczyt szybkiego, współdzielonego między instancjami stanu live (telemetria, status LiDAR, mirror statusu połączenia)."
+risk = "low"
+
+[[permission]]
+id = "state.write"
+display_name = "Zapis stanu współdzielonego"
+description = "Zapis stanu live (telemetria, status LiDAR, intencja LiDAR, mirror statusu) do współdzielonego magazynu stanu, widocznego dla wszystkich instancji addonu."
+risk = "low"
+
 [visibility]
 admin_only = false
 show_in_catalog = true
