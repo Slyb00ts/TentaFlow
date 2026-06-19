@@ -80,9 +80,14 @@ pub async fn build_server_endpoint(
         builder = builder.address_lookup(DhtAddressLookup::builder());
     }
 
-    if let Some(relay) = config.relay_url.clone() {
-        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay)));
-    }
+    // No relay configured → disable relays entirely. These endpoints (sidecar,
+    // teams-bot) are reached over loopback by direct address, so the default n0
+    // public relays are dead weight (noisy ping-timeout reconnects to
+    // *.relay.n0.iroh-canary.iroh.link). A custom relay is honoured when set.
+    builder = match config.relay_url.clone() {
+        Some(relay) => builder.relay_mode(RelayMode::Custom(RelayMap::from(relay))),
+        None => builder.relay_mode(RelayMode::Disabled),
+    };
 
     builder
         .bind()
@@ -100,9 +105,8 @@ pub fn parse_iroh_url(url: &str) -> Result<EndpointId, TransportError> {
         .trim_end_matches('/')
         .trim_start_matches("0x");
 
-    let bytes = hex::decode(hex_str).map_err(|e| {
-        TransportError::invalid_config(format!("hex EndpointId: {e}"))
-    })?;
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| TransportError::invalid_config(format!("hex EndpointId: {e}")))?;
     if bytes.len() != 32 {
         return Err(TransportError::invalid_config(format!(
             "EndpointId musi miec 32 bajty, ma {}",
@@ -111,9 +115,8 @@ pub fn parse_iroh_url(url: &str) -> Result<EndpointId, TransportError> {
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
-    EndpointId::from_bytes(&arr).map_err(|e| {
-        TransportError::invalid_config(format!("niepoprawny EndpointId: {e}"))
-    })
+    EndpointId::from_bytes(&arr)
+        .map_err(|e| TransportError::invalid_config(format!("niepoprawny EndpointId: {e}")))
 }
 
 /// Krotki timeout uzywany w kilku miejscach na default.

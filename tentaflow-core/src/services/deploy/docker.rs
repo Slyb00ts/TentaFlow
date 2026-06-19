@@ -32,6 +32,12 @@ use crate::services::transport::Transport;
 use crate::services_repo::services::DeployMethod;
 use crate::services_repo::services::{self as services_repo, ServiceStatus};
 
+/// Fixed container-side QUIC port the sidecar binds (its baked
+/// `config.default.toml [transport].port`). The host-allocated sidecar port maps
+/// to this inside the container.
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+const SIDECAR_QUIC_CONTAINER_PORT: u16 = 5000;
+
 pub struct DockerDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
@@ -625,7 +631,11 @@ mod backend {
             port_bindings.insert(
                 key.clone(),
                 Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".into()),
+                    // Bind published ports to loopback only: Core reaches services
+                    // via 127.0.0.1 and they must not be exposed to the LAN. With
+                    // the sidecar gone, this host binding is the containment that
+                    // keeps the engine's HTTP port off the network.
+                    host_ip: Some("127.0.0.1".into()),
                     host_port: Some(host.to_string()),
                 }]),
             );
@@ -927,6 +937,11 @@ impl DeployStrategy for DockerDeploy {
                 // Spark wymaga wylaczenia flashinfer autotune; dedup last-wins
                 // skasuje ewentualny `--enable-...` z user args.
                 engine_args.push("--no-enable-flashinfer-autotune".to_string());
+                // GB10 ma pamiec ZUNIFIKOWANA (GPU == RAM). torch.compile + CUDA
+                // graphs alokuja pamiec POZA budzetem `--gpu-memory-utilization`,
+                // wiec 0.6 puchnie do ~100% calego poola. `--enforce-eager`
+                // wylacza compile/cudagraphs → vLLM trzyma sie budzetu.
+                engine_args.push("--enforce-eager".to_string());
             }
         }
         // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
@@ -941,7 +956,12 @@ impl DeployStrategy for DockerDeploy {
 
         let mut port_map = vec![(host_http, internal_port, "tcp")];
         if let Some(q) = sidecar_quic {
-            port_map.push((q, q, "udp"));
+            // The sidecar always listens on the fixed container port 5000 (its
+            // baked `config.default.toml [transport].port`; Core does not inject
+            // a generated config), so the allocated host port `q` must map to
+            // 5000 inside the container — NOT `q → q`, which targeted a container
+            // port nothing listens on.
+            port_map.push((q, SIDECAR_QUIC_CONTAINER_PORT, "udp"));
         }
 
         let container_name = format!("tentaflow-{}-{}", self.manifest.engine.id, host_http);

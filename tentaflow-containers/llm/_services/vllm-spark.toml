@@ -23,7 +23,7 @@ dgx_spark = true
 [deploy.docker]
 context_path = "llm/docker/vllm-spark"
 platforms = ["linux"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux"]
