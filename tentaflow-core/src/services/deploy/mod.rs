@@ -665,21 +665,43 @@ pub async fn stop(
                     .output()
                     .await;
             }
-        } else if let (Ok(docker), Some(port)) = (
-            bollard::Docker::connect_with_local_defaults(),
-            svc.runtime_port,
-        ) {
-            let name = format!("tentaflow-{}-{}", svc.engine_id, port);
-            let _ = docker.stop_container(&name, None).await;
-            let _ = docker
-                .remove_container(
-                    &name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+        } else if let Ok(docker) = bollard::Docker::connect_with_local_defaults() {
+            // Names to tear down. Normally the exact `tentaflow-<engine>-<port>`
+            // from the row. When `runtime_port` is missing (row never finished
+            // deploy / legacy), sweep every container for this engine by name
+            // prefix so a delete can't silently orphan a running container that
+            // keeps eating GPU/RAM — the observed bug.
+            let prefix = format!("tentaflow-{}-", svc.engine_id);
+            let mut names: Vec<String> = match svc.runtime_port {
+                Some(port) => vec![format!("tentaflow-{}-{}", svc.engine_id, port)],
+                None => Vec::new(),
+            };
+            if names.is_empty() {
+                if let Ok(o) = tokio::process::Command::new("docker")
+                    .args(["ps", "-a", "--format", "{{.Names}}"])
+                    .output()
+                    .await
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        let n = line.trim();
+                        if n.starts_with(&prefix) {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+            for name in names {
+                let _ = docker.stop_container(&name, None).await;
+                let _ = docker
+                    .remove_container(
+                        &name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
         }
     }
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh (vllm-spark)
-# Opis: Identyczny lifecycle co `llm/docker/vllm/entrypoint.sh` (sidecar QUIC
-#       + vllm OpenAI API rownolegle), ale z DGX Spark env baseline dla
-#       GB10/SM121 i stabilnego startu bez FlashInfer autotune.
+# Opis: vLLM OpenAI API (direct-http, bez sidecara). Core gada HTTP wprost do
+#       host-mapped portu. DGX Spark env baseline dla GB10/SM121 i stabilnego
+#       startu bez FlashInfer autotune.
 # =============================================================================
 
 set -uo pipefail
@@ -15,15 +15,12 @@ export VLLM_USE_FLASHINFER_MXFP4_MOE="${VLLM_USE_FLASHINFER_MXFP4_MOE:-1}"
 export VLLM_SKIP_P2P_CHECK="${VLLM_SKIP_P2P_CHECK:-1}"
 export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
 
-CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
-[[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
-
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen3.5-0.8B'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
 # Argi silnika jako "$@" (bollard Cmd z Rust). JSON --speculative-config
 # nietkniety, bez re-tokenizacji. Defaulty (--no-enable-flashinfer-autotune,
-# gpu-memory) dodaje Rust docker.rs.
+# gpu-memory, --enforce-eager) dodaje Rust docker.rs.
 ENGINE_ARGS=("$@")
 
 # DGX Spark to single-GPU SoC (jeden GB10) — TP=1 default. Dorzucamy tylko gdy
@@ -41,33 +38,11 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   ENGINE_ARGS+=(--tensor-parallel-size "$GPU_COUNT")
 fi
 
-echo "[entrypoint] sidecar config=$CONFIG_PATH"
-NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
-  | sed -u 's/^/[sidecar] /' &
-SIDECAR_PID=$!
-echo "[entrypoint] sidecar PID=$SIDECAR_PID"
-
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (sm_121a, ${#ENGINE_ARGS[@]} args)"
-vllm serve "$MODEL" \
-  --host 127.0.0.1 \
+# Bind 0.0.0.0 WEWNATRZ kontenera: ruch z docker-publish (host 127.0.0.1:host_http)
+# trafia na interfejs kontenera, nie na jego loopback. Containment robi host bind.
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (sm_121a, ${#ENGINE_ARGS[@]} args)"
+exec vllm serve "$MODEL" \
+  --host 0.0.0.0 \
   --port "$VLLM_PORT" \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
-  "${ENGINE_ARGS[@]}" 2>&1 \
-  | sed -u 's/^/[vllm] /' &
-VLLM_PID=$!
-echo "[entrypoint] vllm PID=$VLLM_PID"
-
-cleanup() {
-  echo "[entrypoint] shutdown sidecar=$SIDECAR_PID vllm=$VLLM_PID"
-  kill -TERM "$SIDECAR_PID" 2>/dev/null || true
-  kill -TERM "$VLLM_PID" 2>/dev/null || true
-  wait "$SIDECAR_PID" 2>/dev/null || true
-  wait "$VLLM_PID" 2>/dev/null || true
-}
-trap cleanup SIGTERM SIGINT
-
-wait -n "$SIDECAR_PID" "$VLLM_PID"
-EXIT_CODE=$?
-echo "[entrypoint] proces ($EXIT_CODE) zakonczony - wychodze"
-cleanup
-exit $EXIT_CODE
+  "${ENGINE_ARGS[@]}"
