@@ -1053,6 +1053,28 @@ export const encode = {
   },
 
   /**
+   * MessageBody::RobotsBody(LidarFrameRequest) — on-demand pull of the latest
+   * canonical LiDAR frame for a robot (L2). The client passes the `frameSeq` it
+   * last rendered as `sinceSeq` (u32); Core replies with frame bytes only when
+   * the hub holds something newer (latest-wins poll, no per-frame queue) and
+   * otherwise returns a `hasFrame:false` RobotLidarFrameResponse.
+   * payload: { robotId, sinceSeq }
+   */
+  robotLidarFrameRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotLidarFrameRequest(
+      payload.robotId,
+      Number(payload.sinceSeq ?? 0) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
    * TentaVision (local: persists a cross-addon read grant; remote: view-only).
    * payload: { robotId, cameraId }

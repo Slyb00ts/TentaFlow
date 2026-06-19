@@ -33,6 +33,24 @@ import '/js/components/tf-video-stream.js';
 // and online/offline transitions appear without a manual reload.
 const REFRESH_INTERVAL_MS = 4000;
 
+// Fast on-demand LiDAR pull. The hub publishes the canonical frame at ~5 fps, so
+// a 150 ms poll is cheap: most calls return hasFrame:false (latest-wins, no
+// per-frame queue) and only a changed frame_seq carries bytes back. This is the
+// live data-path consumer that proves L1→L2 end to end (no 3D render here).
+const LIDAR_POLL_INTERVAL_MS = 150;
+
+// Sliding window for the measured frame rate. Wide enough to smooth the ~5 fps
+// arrival jitter, short enough to react quickly when streaming stops.
+const LIDAR_FPS_WINDOW_MS = 2000;
+
+// A frame older than this reads as "stale" — at 5 fps a healthy stream lands a
+// new frame every ~200 ms, so 1.5 s without one means the source went quiet.
+const LIDAR_STALE_AFTER_MS = 1500;
+
+// Back-off after a transport error so a flapping connection isn't hammered every
+// 150 ms; the next attempt waits at least this long.
+const LIDAR_ERROR_BACKOFF_MS = 2000;
+
 // Locomotion magnitude (m/s) for the directional pad, matching the go2 driver's
 // own move buttons. The owner re-clamps to its safety cap regardless.
 const MOVE_SPEED = 0.3;
@@ -87,6 +105,17 @@ let inFlightRefresh = false;
 // every REFRESH_INTERVAL_MS and the video never stabilizes.
 let cardEls = new Map();
 
+// Per-robot live LiDAR state, keyed by robotId. An entry exists ONLY while that
+// robot's LiDAR row is on screen AND enabled AND the robot is online — it's added
+// by updateLidar() and removed the moment any of those stops holding (toggle off,
+// card gone, robot offline) so no interval keeps polling a dead source.
+// Shape: { lastSeq, frameTimes:number[], lastPointCount, lastFrameAtMs,
+//          inFlight, nextAllowedAtMs }.
+let lidarLive = new Map();
+// Single shared fast timer driving every active robot's pull. Started lazily when
+// the first robot becomes active, stopped when the set empties or on unmount.
+let lidarTimer = null;
+
 const RobotsScreen = {
   get title() { return 'Roboty'; },
 
@@ -119,6 +148,7 @@ const RobotsScreen = {
       window.clearInterval(refreshTimer);
       refreshTimer = null;
     }
+    stopLidarLoop();
     robots = [];
     inFlightRefresh = false;
     cardEls = new Map();
@@ -244,8 +274,10 @@ async function loadRobots({ showSpinner }) {
 function renderError(list, err) {
   if (!list) return;
   // The error empty-state replaces the grid contents; drop stale card refs so a
-  // later successful poll rebuilds every card from scratch.
+  // later successful poll rebuilds every card from scratch. No cards remain on
+  // screen, so no robot can be an active LiDAR source — stop the fast loop.
   cardEls = new Map();
+  stopLidarLoop();
   list.innerHTML = '';
   const empty = document.createElement('tf-empty-state');
   empty.setAttribute('icon', 'alert');
@@ -269,6 +301,8 @@ function renderList() {
   if (!robots.length) {
     host.innerHTML = '';
     cardEls = new Map();
+    // No robots on screen → no LiDAR sources; stop the fast loop.
+    stopLidarLoop();
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'cpu');
     empty.setAttribute('title', 'Brak robotów w sieci mesh');
@@ -313,6 +347,8 @@ function renderList() {
     if (!present.has(id)) {
       el.remove();
       cardEls.delete(id);
+      // A gone robot can't produce frames — drop its live loop entry too.
+      stopRobotLidar(id);
     }
   }
 }
@@ -751,27 +787,35 @@ function updateTelemetry(el, r) {
 }
 
 // Renders the LiDAR row IN PLACE inside [data-field="lidar"]: an enable/disable
-// toggle (routed to go2.lidar_on/off via the standard control path) plus a compact
-// "aktywny, N punktów" status. NO 3D canvas/renderer here — this is the data-path
-// surface only. The container sits below the telemetry panel and is never the video
-// node, so the live <tf-video-stream> is untouched. The button + status nodes are
-// built once and then updated in place each poll so a click handler is never lost.
+// toggle (routed to go2.lidar_on/off via the standard control path) plus a LIVE
+// status (point count, measured FPS, freshness) fed by the fast binary pull loop.
+// NO 3D canvas/renderer here — this is the data-path surface only. The container
+// sits below the telemetry panel and is never the video node, so the live
+// <tf-video-stream> is untouched. The toggle + status nodes are built once and
+// then updated in place each poll so a click handler is never lost.
+//
+// This also OWNS the live-loop lifecycle: a robot is registered for fast polling
+// only while its row is visible AND LiDAR is enabled AND the robot is online; any
+// of those dropping unregisters it (and stops the shared timer when none remain),
+// so no interval ever polls a disabled / gone / offline source.
 function updateLidar(el, r) {
   const host = el.querySelector('[data-field="lidar"]');
   if (!host) return;
   const l = lidar(r);
+  const id = robotId(r);
   // Only show the row for a robot that advertises a LiDAR snapshot (capability).
   if (!l) {
     host.hidden = true;
     host.innerHTML = '';
     host.dataset.built = '';
+    stopRobotLidar(id);
     return;
   }
-  const id = robotId(r);
   const offline = !isControllable(r.status || '');
   const enabled = !!l.enabled;
   const available = !!l.available;
-  const points = Number(l.pointCount ?? l.point_count ?? 0);
+  // Snapshot point count from the list — shown until the first live frame lands.
+  const snapshotPoints = Number(l.pointCount ?? l.point_count ?? 0);
   const resolution = l.resolution;
 
   // Build the static structure once; subsequent polls only refresh text/state.
@@ -781,6 +825,7 @@ function updateLidar(el, r) {
       <div class="robots-lidar-row">
         <tf-toggle data-lidar-toggle></tf-toggle>
         <span class="robots-lidar-status" data-lidar-status></span>
+        <tf-badge data-lidar-fresh tone="info" value="—" hidden></tf-badge>
       </div>`;
     const toggle = host.querySelector('[data-lidar-toggle]');
     toggle.addEventListener('change', (e) => {
@@ -793,27 +838,198 @@ function updateLidar(el, r) {
 
   host.hidden = false;
   const toggle = host.querySelector('[data-lidar-toggle]');
-  const status = host.querySelector('[data-lidar-status]');
   if (toggle) {
     if (enabled) toggle.setAttribute('checked', '');
     else toggle.removeAttribute('checked');
     if (offline) toggle.setAttribute('disabled', '');
     else toggle.removeAttribute('disabled');
   }
-  if (status) {
-    let text;
-    if (!enabled) {
-      text = 'wyłączony';
-    } else if (available) {
-      const res = typeof resolution === 'number' && Number.isFinite(resolution)
-        ? `  ·  ${resolution.toFixed(2)} m`
-        : '';
-      text = `aktywny, ${points} ${plural(points, 'punkt', 'punkty', 'punktów')}${res}`;
-    } else {
-      text = 'aktywny, oczekiwanie na dane…';
-    }
-    status.textContent = text;
+
+  // Register / unregister the fast live pull. We only pull when the source can
+  // actually produce frames; otherwise the static status text (below) is enough.
+  if (enabled && !offline) {
+    startRobotLidar(id);
+  } else {
+    stopRobotLidar(id);
   }
+
+  // Render the status. While a live entry has frames, the live numbers win; the
+  // snapshot value is only the placeholder shown before the first frame arrives.
+  renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution });
+}
+
+// Writes the LiDAR status text + freshness badge. Called from updateLidar() (poll
+// cadence) and from the fast loop (per live frame) so the live numbers refresh at
+// frame rate, not only every 4 s.
+function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution }) {
+  const status = host.querySelector('[data-lidar-status]');
+  const fresh = host.querySelector('[data-lidar-fresh]');
+  if (!status) return;
+
+  if (!enabled) {
+    status.textContent = 'wyłączony';
+    if (fresh) fresh.hidden = true;
+    return;
+  }
+  if (offline) {
+    status.textContent = 'robot offline';
+    if (fresh) fresh.hidden = true;
+    return;
+  }
+
+  const res = typeof resolution === 'number' && Number.isFinite(resolution)
+    ? `  ·  ${resolution.toFixed(2)} m`
+    : '';
+
+  // The live entry exists for an active robot; once a frame has landed we show the
+  // live point count + measured FPS, otherwise we fall back to the snapshot count.
+  const id = host.closest('[data-robot-card]')?.dataset.robotCard || '';
+  const live = lidarLive.get(id);
+  const hasLiveFrame = !!(live && live.lastFrameAtMs);
+
+  if (hasLiveFrame) {
+    const points = live.lastPointCount;
+    const fps = computeLidarFps(live);
+    const ageMs = performance.now() - live.lastFrameAtMs;
+    const stale = ageMs > LIDAR_STALE_AFTER_MS;
+    status.textContent =
+      `${points} ${plural(points, 'punkt', 'punkty', 'punktów')}  ·  ${fps.toFixed(1)} kl./s${res}`;
+    if (fresh) {
+      fresh.hidden = false;
+      fresh.setAttribute('tone', stale ? 'warning' : 'success');
+      fresh.setAttribute('value', stale ? 'nieaktualne' : 'na żywo');
+    }
+    return;
+  }
+
+  // Active but no live frame yet: show the snapshot count (if any) as a hint while
+  // we wait for the first binary frame to arrive.
+  if (available && snapshotPoints > 0) {
+    status.textContent =
+      `${snapshotPoints} ${plural(snapshotPoints, 'punkt', 'punkty', 'punktów')}${res}`;
+  } else {
+    status.textContent = 'aktywny, oczekiwanie na dane…';
+  }
+  if (fresh) {
+    fresh.hidden = false;
+    fresh.setAttribute('tone', 'info');
+    fresh.setAttribute('value', 'łączenie…');
+  }
+}
+
+// Measured frame rate over the sliding window: count frames whose arrival falls
+// inside the last LIDAR_FPS_WINDOW_MS and divide by the actual span covered. Using
+// the real span (not the nominal window) keeps the number honest right after the
+// stream starts when fewer than a full window of samples exist.
+function computeLidarFps(live) {
+  const now = performance.now();
+  const cutoff = now - LIDAR_FPS_WINDOW_MS;
+  const times = live.frameTimes;
+  while (times.length && times[0] < cutoff) times.shift();
+  if (times.length < 2) return 0;
+  const spanMs = times[times.length - 1] - times[0];
+  if (spanMs <= 0) return 0;
+  return ((times.length - 1) * 1000) / spanMs;
+}
+
+// Registers a robot for fast live polling (idempotent) and ensures the shared
+// timer is running. Does NOT reset an existing entry, so an in-progress FPS window
+// survives a 4 s list refresh.
+function startRobotLidar(id) {
+  if (!id) return;
+  if (!lidarLive.has(id)) {
+    lidarLive.set(id, {
+      lastSeq: 0,
+      frameTimes: [],
+      lastPointCount: 0,
+      lastFrameAtMs: 0,
+      inFlight: false,
+      nextAllowedAtMs: 0,
+    });
+  }
+  if (lidarTimer == null) {
+    lidarTimer = window.setInterval(pollLidarOnce, LIDAR_POLL_INTERVAL_MS);
+  }
+}
+
+// Unregisters a robot from live polling and stops the shared timer once no robot
+// remains active. Called on toggle-off, robot offline, card removal and unmount.
+function stopRobotLidar(id) {
+  if (id) lidarLive.delete(id);
+  if (lidarLive.size === 0) stopLidarLoop();
+}
+
+function stopLidarLoop() {
+  if (lidarTimer != null) {
+    window.clearInterval(lidarTimer);
+    lidarTimer = null;
+  }
+  lidarLive.clear();
+}
+
+// One tick of the shared fast loop: for every active robot, pull the latest frame
+// since the last seq we saw. hasFrame:false is the common (cheap) return and must
+// not throw or churn; a transport error backs that robot off so a flapping link
+// isn't hammered. Each robot's request is independent — one failing doesn't stall
+// the others, and the slow 4 s list refresh is never blocked.
+function pollLidarOnce() {
+  const now = performance.now();
+  for (const [id, live] of lidarLive) {
+    // Refresh the badge every tick so the freshness indicator flips to "stale"
+    // even when frames STOP arriving (no pull success would otherwise re-render).
+    if (live.lastFrameAtMs) refreshLidarCard(id);
+    if (live.inFlight || now < live.nextAllowedAtMs) continue;
+    live.inFlight = true;
+    pullLidarFrame(id, live);
+  }
+}
+
+async function pullLidarFrame(id, live) {
+  try {
+    const resp = await ApiBinary.one('robotLidarFrameRequest', { robotId: id, sinceSeq: live.lastSeq });
+    // The robot may have been unregistered (toggle off / offline / card gone)
+    // while this request was in flight — drop the result rather than resurrect it.
+    if (!lidarLive.has(id)) return;
+    const hasFrame = resp.hasFrame ?? resp.has_frame;
+    if (hasFrame) {
+      const seq = resp.frameSeq ?? resp.frame_seq ?? live.lastSeq;
+      const points = Number(resp.pointCount ?? resp.point_count ?? 0);
+      live.lastSeq = Number(seq) >>> 0;
+      live.lastPointCount = points;
+      live.lastFrameAtMs = performance.now();
+      live.frameTimes.push(live.lastFrameAtMs);
+      // Bound the window buffer so a long-lived stream can't grow it unbounded.
+      const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
+      while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
+      refreshLidarCard(id);
+    }
+  } catch {
+    // Transport / decode failure: don't spam, just back this robot off. The list
+    // refresh keeps the toggle/offline state authoritative regardless.
+    if (lidarLive.has(id)) live.nextAllowedAtMs = performance.now() + LIDAR_ERROR_BACKOFF_MS;
+  } finally {
+    if (lidarLive.has(id)) live.inFlight = false;
+  }
+}
+
+// Re-renders just one robot's LiDAR status from its current live state, without a
+// full list refresh — driven by the fast loop on each new frame and by a periodic
+// staleness sweep so the freshness badge flips even when frames stop arriving.
+function refreshLidarCard(id) {
+  const el = cardEls.get(id);
+  if (!el) return;
+  const host = el.querySelector('[data-field="lidar"]');
+  if (!host || host.hidden) return;
+  const r = robots.find((x) => robotId(x) === id);
+  const l = r ? lidar(r) : null;
+  const offline = r ? !isControllable(r.status || '') : false;
+  renderLidarStatus(host, {
+    enabled: !!(l && l.enabled),
+    available: !!(l && l.available),
+    offline,
+    snapshotPoints: Number(l?.pointCount ?? l?.point_count ?? 0),
+    resolution: l?.resolution,
+  });
 }
 
 // Sends a LiDAR enable/disable through the standard robot control path
@@ -828,6 +1044,17 @@ async function handleLidarToggle(id, on, toggle) {
       vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
     });
     if (resp.ok) {
+      // React to the action RESULT immediately so the live loop reflects the new
+      // state without waiting for (or depending on) the 4 s list refresh: stop
+      // polling a now-disabled source at once; start polling only AFTER a
+      // confirmed enable. Also patch the local snapshot row so the toggle/status
+      // stay consistent until the next authoritative refresh.
+      const r = robots.find((x) => robotId(x) === id);
+      const l = r ? lidar(r) : null;
+      if (l) l.enabled = on;
+      if (on) startRobotLidar(id);
+      else stopRobotLidar(id);
+      refreshLidarCard(id);
       toast(`LiDAR ${on ? 'włączony' : 'wyłączony'} ✓`, 'success');
     } else if (resp.rejected) {
       toast(`LiDAR: odrzucono — ${resp.rejected}`, 'error');
