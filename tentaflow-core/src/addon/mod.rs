@@ -24,6 +24,7 @@ pub mod rate_limiter;
 pub mod runtime;
 pub mod sdk_version;
 pub mod signature;
+pub mod state_store;
 pub mod storage_sql;
 pub mod storage_sql_exec;
 pub mod tool_dispatch;
