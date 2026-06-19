@@ -31,7 +31,7 @@ bundle_path = "vision/python/nemotron-ocr"
 [deploy.docker]
 context_path = "vision/docker/nemotron-ocr"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [[model_preset]]
 id = "nemotron-ocr-v1"

@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: Uruchamia sidecar QUIC + vLLM w trybie rerankingu multimodalnego (vllm
-#       serve --task score) rownolegle. Sidecar nasluchuje iroh natychmiast
-#       (klient tentaflow widzi peera od razu); vLLM laduje cross-encoder VL w
-#       tle i serwuje /v1/rerank + /v1/score dla tekstu i obrazow. Logi obu
-#       procesow trafiaja na stdout kontenera z prefixem. PID 1 czeka na
-#       pierwszego z procesow ktory padnie - druga konczymy grzecznie i exit z
-#       jego kodem (docker restart policy decyduje co dalej).
+# Opis: vLLM w trybie rerankingu multimodalnego (vllm serve --task score),
+#       direct-http (bez sidecara). vLLM laduje cross-encoder VL i serwuje
+#       /v1/rerank + /v1/score dla tekstu i obrazow na 0.0.0.0:${VLLM_PORT};
+#       Core gada HTTP wprost do host-mapped portu.
 # =============================================================================
 
 set -uo pipefail
-
-CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
-[[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
 
 MODEL="${MODEL:?MODEL env required, np. 'nvidia/llama-nemotron-rerank-vl-1b-v2'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -49,36 +43,14 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   esac
 fi
 
-echo "[entrypoint] sidecar config=$CONFIG_PATH"
-NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
-  | sed -u 's/^/[sidecar] /' &
-SIDECAR_PID=$!
-echo "[entrypoint] sidecar PID=$SIDECAR_PID"
-
 # --task score = tryb cross-encoder vLLM; wystawia /v1/rerank i /v1/score.
 # --trust-remote-code wymagane dla Eagle VLM (wlasny kod modelu w repo HF).
-echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT (--task score VL, ${#ENGINE_ARGS[@]} args)"
-vllm serve "$MODEL" \
-  --host 127.0.0.1 \
+# Bind 0.0.0.0 WEWNATRZ kontenera: ruch z docker-publish (host 127.0.0.1:host_http)
+# trafia na interfejs kontenera, nie na jego loopback. Containment robi host bind.
+echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (--task score VL, ${#ENGINE_ARGS[@]} args)"
+exec vllm serve "$MODEL" \
+  --host 0.0.0.0 \
   --port "$VLLM_PORT" \
   --trust-remote-code \
   --served-model-name "${SERVED_MODEL_NAME:-$MODEL}" \
-  "${ENGINE_ARGS[@]}" 2>&1 \
-  | sed -u 's/^/[vllm] /' &
-VLLM_PID=$!
-echo "[entrypoint] vllm PID=$VLLM_PID"
-
-cleanup() {
-  echo "[entrypoint] shutdown sidecar=$SIDECAR_PID vllm=$VLLM_PID"
-  kill -TERM "$SIDECAR_PID" 2>/dev/null || true
-  kill -TERM "$VLLM_PID" 2>/dev/null || true
-  wait "$SIDECAR_PID" 2>/dev/null || true
-  wait "$VLLM_PID" 2>/dev/null || true
-}
-trap cleanup SIGTERM SIGINT
-
-wait -n "$SIDECAR_PID" "$VLLM_PID"
-EXIT_CODE=$?
-echo "[entrypoint] proces ($EXIT_CODE) zakonczony - wychodze"
-cleanup
-exit $EXIT_CODE
+  "${ENGINE_ARGS[@]}"

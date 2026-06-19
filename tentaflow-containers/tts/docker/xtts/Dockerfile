@@ -1,20 +1,7 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener TTS z XTTS v2 (coqui) — voice cloning. Sidecar.
+# Opis: Kontener TTS z XTTS v2 (coqui) — voice cloning. Direct-http (no sidecar).
 # =============================================================================
-
-FROM rust:slim-bookworm AS sidecar-builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev cmake build-essential \
-    && rm -rf /var/lib/apt/lists/*
-COPY tentaflow-protocol /build/tentaflow-protocol
-COPY tentaflow-transport /build/tentaflow-transport
-COPY vendor /build/vendor
-COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
-WORKDIR /build/tentaflow-containers/sidecar
-RUN cargo build --release --bin tentaflow-sidecar \
-    && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
 FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,14 +21,11 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
       "TTS>=0.22" \
       fastapi uvicorn
 
-COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/tts/docker/xtts/server.py /app/server.py
-COPY tentaflow-containers/tts/docker/xtts/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/tts/docker/xtts/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 5000/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD pgrep tentaflow-sidecar || exit 1
+    CMD pgrep -f uvicorn || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

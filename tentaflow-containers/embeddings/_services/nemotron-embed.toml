@@ -24,7 +24,7 @@ output_modalities = ["embedding"]
 [deploy.docker]
 context_path = "embeddings/docker/nemotron-embed"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "windows"]

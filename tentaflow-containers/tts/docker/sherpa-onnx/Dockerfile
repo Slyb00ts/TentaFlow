@@ -1,22 +1,9 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener TTS z sherpa-onnx (modele jarvis, justyna) + sidecar.
-#       sherpa-onnx-offline-tts-server eksponuje /tts (custom JSON), sidecar
-#       forwarduje surowo (api = "raw_http") i nie tlumaczy do OpenAI.
+# Opis: Kontener TTS z sherpa-onnx (modele jarvis, justyna) — direct-http.
+#       sherpa-onnx-offline-tts-server eksponuje /tts (custom JSON); Core gada
+#       HTTP wprost do host-mapped portu (no sidecar).
 # =============================================================================
-
-FROM rust:slim-bookworm AS sidecar-builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev cmake build-essential \
-    && rm -rf /var/lib/apt/lists/*
-COPY tentaflow-protocol /build/tentaflow-protocol
-COPY tentaflow-transport /build/tentaflow-transport
-COPY vendor /build/vendor
-COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
-WORKDIR /build/tentaflow-containers/sidecar
-RUN cargo build --release --bin tentaflow-sidecar \
-    && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
 FROM debian:bookworm-slim AS sherpa-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -35,14 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=sherpa-builder /build/sherpa-onnx/build/bin/sherpa-onnx-offline-tts-server /usr/local/bin/sherpa-tts
-COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/tts/docker/sherpa-onnx/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/tts/docker/sherpa-onnx/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 5000/udp
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD pgrep tentaflow-sidecar || exit 1
+    CMD pgrep -f sherpa-tts || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -23,7 +23,7 @@ dgx_spark = false
 [deploy.docker]
 context_path = "llm/docker/vllm"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "windows"]

@@ -16,7 +16,7 @@ version = "0.5.13"
 [deploy.docker]
 context_path = "llm/docker/sglang"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "windows"]

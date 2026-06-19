@@ -1,20 +1,7 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener ComfyUI (image generation) + sidecar TentaFlow.
+# Opis: Kontener ComfyUI (image generation) — direct-http, bez sidecara.
 # =============================================================================
-
-FROM rust:slim-bookworm AS sidecar-builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev cmake build-essential \
-    && rm -rf /var/lib/apt/lists/*
-COPY tentaflow-protocol /build/tentaflow-protocol
-COPY tentaflow-transport /build/tentaflow-transport
-COPY vendor /build/vendor
-COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
-WORKDIR /build/tentaflow-containers/sidecar
-RUN cargo build --release --bin tentaflow-sidecar \
-    && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
 # Baza CUDA 13 wymagana przez Blackwell B300 (sm_103); torch cu130 dziala wstecz na starszych GPU.
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
@@ -36,13 +23,10 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
       --index-url https://download.pytorch.org/whl/cu130 \
  && pip install --no-cache-dir -r requirements.txt
 
-COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/image-gen/docker/comfyui/config.default.toml /app/config.default.toml
 COPY tentaflow-containers/image-gen/docker/comfyui/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 5000/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD pgrep tentaflow-sidecar || exit 1
+    CMD curl -fsS "http://127.0.0.1:${COMFY_PORT:-8188}/system_stats" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

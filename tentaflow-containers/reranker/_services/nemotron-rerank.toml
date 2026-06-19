@@ -25,7 +25,7 @@ dgx_spark = false
 [deploy.docker]
 context_path = "reranker/docker/nemotron-rerank"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux", "windows"]

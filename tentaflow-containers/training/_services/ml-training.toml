@@ -21,7 +21,7 @@ requires_model = false
 [deploy.docker]
 context_path = "training/docker/ml-training"
 platforms = ["linux"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [deploy.native]
 platforms = ["linux"]

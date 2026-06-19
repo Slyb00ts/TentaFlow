@@ -30,7 +30,7 @@ bundle_path = "vision/python/nemotron-parse"
 [deploy.docker]
 context_path = "vision/docker/nemotron-parse"
 platforms = ["linux", "windows"]
-transport = "sidecar-quic"
+transport = "direct-http"
 
 [[model_preset]]
 id = "nemotron-parse-v1-2"
