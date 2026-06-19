@@ -336,7 +336,7 @@ fn audit_log_for_addon_in_org_a_carries_org_id_a() {
         "ok",
         None,
     );
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let org_id: Option<String> = conn
         .query_row(
             "SELECT org_id FROM audit_log WHERE resource_id = 'audit-cross'",

@@ -398,7 +398,7 @@ pub fn emit_broadcast_audit(
         Some(p) => p,
         None => return,
     };
-    // (Hold onto `pool` past the match scope so its temporary MutexGuard
+    // (Hold onto `pool` past the match scope so its temporary write guard
     // below can borrow it for the duration of the INSERT.)
 
     let (result, error_message, details) = match outcome {
@@ -452,7 +452,7 @@ pub fn emit_broadcast_audit(
         }
     };
 
-    let guard = pool.lock();
+    let guard = pool.write();
     if let Ok(conn) = guard {
         let severity = if result == "ok" { "info" } else { "warn" };
         let _ = conn.execute(

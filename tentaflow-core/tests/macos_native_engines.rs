@@ -12,7 +12,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tentaflow_core::db::DbPool;
@@ -26,7 +26,7 @@ fn open_db() -> DbPool {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     tentaflow_core::db::migrations::run(&conn).unwrap();
-    Arc::new(Mutex::new(conn))
+    Arc::new(tentaflow_core::db::Db::from_connection(conn))
 }
 
 /// Deterministyczny cipher dla `deploy()` — testy nie zapisuja sekretu HF, wiec
@@ -70,7 +70,7 @@ async fn run_deploy(
 ///   - w `model_registry` jest >=1 wiersz z service_id == outcome.handle.id
 ///   - w `deployments` jest >=1 wiersz status='success' dla tego engine_id
 fn assert_deployed(db: &DbPool, outcome: &DeployOutcome, engine_id: &str) {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     let svc_id = outcome.endpoint.handle.id;
 
     let row_engine: String = conn

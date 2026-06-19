@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn migrate_plaintext_secrets_works() {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -468,7 +468,7 @@ mod tests {
         )
         .unwrap();
 
-        let pool: crate::db::DbPool = Arc::new(Mutex::new(conn));
+        let pool: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(conn));
 
         // Wstaw plaintext sekrety
         crate::db::repository::set_setting(&pool, "jwt_secret", "abcdef123456").unwrap();

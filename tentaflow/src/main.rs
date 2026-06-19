@@ -103,8 +103,32 @@ fn main() -> Result<()> {
         return run_subcommand(cmd, args.verbose);
     }
 
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Build the runtime honoring `[server].worker_threads` from the config.
+    // The full config is loaded inside run_server (async), but the worker-thread
+    // count must be known BEFORE the runtime exists, so peek the file here.
+    // 0 / missing / unreadable → tokio default (= num_cpus), so a fresh node
+    // still uses every core.
+    let worker_threads = peek_worker_threads(&args.config);
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if worker_threads > 0 {
+        builder.worker_threads(worker_threads);
+    }
+    let runtime = builder.build()?;
     runtime.block_on(run_server(args))
+}
+
+/// Best-effort read of `[server].worker_threads` from the config file before the
+/// async runtime is built. Any error (missing file, parse/validation failure)
+/// returns 0 → tokio default; run_server re-loads the config and surfaces real
+/// errors there.
+fn peek_worker_threads(config_path: &std::path::Path) -> usize {
+    if !config_path.exists() {
+        return 0;
+    }
+    NodeConfig::from_file(config_path)
+        .map(|c| c.server.worker_threads)
+        .unwrap_or(0)
 }
 
 async fn run_server(args: Args) -> Result<()> {
@@ -408,7 +432,7 @@ async fn run_server(args: Args) -> Result<()> {
     // nim nie wie po restarcie procesu) → respawn pinned dostawał konflikt
     // i wpadał w fallback z innym portem, czyli "magiczna" zmiana portu.
     if let Some(port_allocator) = services_port_allocator.clone() {
-        match db.lock() {
+        match db.read() {
             Ok(conn) => match tentaflow_core::services_repo::services::list_all(&conn) {
                 Ok(services) => {
                     for svc in services {
@@ -1047,7 +1071,7 @@ async fn resume_interrupted_deployments(
     quic_mesh: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>>,
     settings_cipher: Arc<tentaflow_core::crypto::SettingsCipher>,
 ) {
-    let rows = match db.lock() {
+    let rows = match db.read() {
         Ok(conn) => match tentaflow_core::services_repo::deployments::list_resumable(&conn) {
             Ok(rows) => rows,
             Err(e) => {
@@ -1068,7 +1092,7 @@ async fn resume_interrupted_deployments(
         let Some(deploy_id) = row.slug.clone() else {
             continue;
         };
-        let service = match db.lock() {
+        let service = match db.read() {
             Ok(conn) => match tentaflow_core::services_repo::services::get(&conn, service_id) {
                 Ok(Some(service)) => service,
                 Ok(None) => {
@@ -1125,7 +1149,7 @@ async fn resume_interrupted_deployments(
             }
         };
 
-        if let Ok(conn) = db.lock() {
+        if let Ok(conn) = db.write() {
             let _ = tentaflow_core::services_repo::services::update_status(
                 &conn,
                 service_id,
@@ -1261,7 +1285,7 @@ fn mark_resume_failed(
     deploy_id: &str,
     message: Option<&str>,
 ) {
-    if let Ok(conn) = db.lock() {
+    if let Ok(conn) = db.write() {
         let _ = tentaflow_core::services_repo::deployments::mark_finished(
             &conn,
             deployment_id,

@@ -241,7 +241,7 @@ fn namespace_manager_routes_to_milvus_per_addon_config() {
     let root = tempfile::TempDir::new().unwrap();
     let pool = tentaflow_core::db::init(&dir.path().join("test.db")).expect("init db");
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         // Structured `__vector_config` (manual external Milvus) — the format the
         // backend picker persists and NamespaceManager reads.
         let cfg = format!(

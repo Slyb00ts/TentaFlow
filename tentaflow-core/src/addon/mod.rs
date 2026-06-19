@@ -11,7 +11,6 @@ pub mod event_publish;
 pub mod flow_blocks;
 pub mod fs_sandbox;
 pub mod host_functions;
-pub mod instance_pool;
 pub mod lifecycle;
 pub mod manifest;
 pub mod migrations;
@@ -39,7 +38,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use parking_lot::{Mutex, RwLock as PlRwLock};
-use runtime::{WasmEngine, WasmInstance, WasmModule, WasmStore};
+use runtime::{WasmEngine, WasmInstance, WasmLinker, WasmModule, WasmStore};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -500,6 +499,34 @@ pub struct AddonState {
     pub wasi: wasmtime_wasi::p1::WasiP1Ctx,
 }
 
+impl AddonState {
+    /// Stabilny klucz izolacji storage KV — ODPIĘTY od `instance_id` WASM, więc
+    /// pula wielu wymiennych instancji obsługujących ten sam zakres widzi te same
+    /// dane (a restart procesu nie gubi storage, jak działo się gdy kluczem był
+    /// losowy uuid instancji). Zakres z manifestu: `org` (współdzielony w
+    /// organizacji — domyślny, np. TentaVision) albo `user` (per użytkownik).
+    /// Wartość trafia do kolumny `addon_storage.instance_id` oraz pola
+    /// `instance_id` protokołu storage-proxy — te nazwy pozostają, ale niosą
+    /// teraz klucz zakresu (deterministyczny → poprawny przy replikacji synca).
+    pub fn storage_scope_key(&self) -> String {
+        let org = self
+            .org_id
+            .clone()
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+        let user_scoped = self
+            .manifest
+            .storage
+            .as_ref()
+            .map(|s| s.is_user_scoped())
+            .unwrap_or(false);
+        if user_scoped {
+            format!("{org}::user::{}", self.user_id.clone().unwrap_or_default())
+        } else {
+            org
+        }
+    }
+}
+
 // =============================================================================
 // AddonInstance — uruchomiona instancja addonu WASM
 // =============================================================================
@@ -532,6 +559,11 @@ pub struct AddonManager {
     instances: Arc<Mutex<HashMap<String, Vec<AddonInstance>>>>,
     event_bus: Arc<EventBus>,
     engine: WasmEngine,
+    /// Linker zbudowany RAZ (host-funkcje + WASI) i współdzielony przez wszystkie
+    /// instancjacje. Linker jest niezmienny po zbudowaniu, a `instantiate` tylko
+    /// go czyta — dawniej tworzyliśmy go i rejestrowali ~50 host-fn przy KAŻDYM
+    /// tworzeniu instancji (start_addon / pula / invoke_block).
+    linker: WasmLinker<AddonState>,
     permission_checker: Arc<PermissionChecker>,
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Skompilowane moduly WASM — cache po addon_id
@@ -560,6 +592,13 @@ pub struct AddonManager {
     /// "tool not found" until re-register completes — acceptable for a hot update
     /// (no corruption), and keeping it lock-free avoids penalizing invocations.
     addon_op_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// instance_id'y zarezerwowane dla pętli serwisowej (on_tick). Ścieżki
+    /// user-facing (call_tool/call_panel_open) pomijają je przy wyborze z puli,
+    /// żeby tick nie kolidował z obsługą żądań (i odwrotnie).
+    service_instance_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Liczba ŻYWYCH instancji per addon (idle w puli + wypożyczone). Limit
+    /// wzrostu puli — patrz `pool_cap`. Reset w stop_addon/disable.
+    instance_total: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl crate::sync::runtime::AddonSyncReconciler for AddonManager {
@@ -594,6 +633,12 @@ impl AddonManager {
     pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
         let engine = runtime::create_engine()?;
 
+        // Zbuduj Linker raz — host-funkcje + WASI rejestrowane jednokrotnie,
+        // reużywane przy każdym instantiate (anty-narzut na ścieżce tworzenia
+        // instancji).
+        let mut linker = runtime::create_linker(&engine);
+        host_functions::register_host_functions(&mut linker)?;
+
         let event_bus = Arc::new(EventBus::new());
         // Publish a process-global handle so core flow nodes (camera_alert) can
         // emit events to subscribed addons without threading the bus through.
@@ -613,6 +658,7 @@ impl AddonManager {
             instances: Arc::new(Mutex::new(HashMap::new())),
             event_bus,
             engine,
+            linker,
             permission_checker,
             settings_cipher,
             compiled_modules: Arc::new(PlRwLock::new(HashMap::new())),
@@ -623,6 +669,8 @@ impl AddonManager {
             service_tasks: Arc::new(Mutex::new(HashMap::new())),
             ui_panels: Arc::new(PlRwLock::new(HashMap::new())),
             addon_op_locks: Arc::new(Mutex::new(HashMap::new())),
+            service_instance_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            instance_total: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -904,8 +952,8 @@ impl AddonManager {
 
         let mut conn = self
             .db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("db lock for alias install: {}", e))?;
+            .write()
+            .map_err(|e| anyhow::anyhow!("db write for alias install: {}", e))?;
         let tx = conn.transaction()?;
 
         // 1. Register owned [[alias]] entries: model_aliases + ownership +
@@ -1307,6 +1355,228 @@ impl AddonManager {
         Ok(())
     }
 
+    /// Buduje w pełni zainicjalizowaną instancję WASM: state → store →
+    /// instantiate → WASI `_start`/`_initialize` → `on_start`. Wspólne dla
+    /// `start_addon` (instancja główna/serwisowa) i puli workerów
+    /// (`acquire_instance`). `on_start` to inicjalizacja PER-INSTANCJA, więc
+    /// każdy worker przechodzi ją niezależnie — zamierzone (instancje są
+    /// wymienne, stan trwały idzie przez scope-keyed storage, nie pamięć WASM).
+    fn build_ready_instance(
+        &self,
+        addon_id: &str,
+        user_id: Option<String>,
+        org_id: Option<String>,
+        module: &WasmModule,
+        manifest: AddonManifest,
+        permissions: Vec<String>,
+    ) -> Result<AddonInstance> {
+        let rt_id = manifest
+            .runtime
+            .clone()
+            .unwrap_or_else(|| "wasmtime".to_string());
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let is_system_call = user_id.is_none();
+        let state = AddonState {
+            addon_id: addon_id.to_string(),
+            instance_id: instance_id.clone(),
+            user_id: user_id.clone(),
+            org_id,
+            db: self.db.clone(),
+            permissions,
+            event_bus: self.event_bus.clone(),
+            permission_checker: self.permission_checker.clone(),
+            fuel_consumed: 0,
+            is_system_call,
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(
+                host_functions::network::NetworkConnectionManager::new(),
+            )),
+            settings_cipher: self.settings_cipher.clone(),
+            manifest: Arc::new(manifest),
+            memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
+            router: self.router.read().clone(),
+            oauth_refresh_guard: self.oauth_refresh_guard.clone(),
+            ui_panels: Some(self.ui_panels.clone()),
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            store_limits: wasmi::StoreLimitsBuilder::new()
+                .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
+                .trap_on_grow_failure(true)
+                .instances(10)
+                .memories(1)
+                .tables(10)
+                .build(),
+        };
+
+        let mut store = runtime::create_store(&self.engine, state)?;
+        let instance = runtime::instantiate(&self.linker, &mut store, module)?;
+
+        let adapter =
+            runtime::adapter_for_runtime(&rt_id).unwrap_or_else(|| Box::new(runtime::RustAdapter));
+
+        // .NET NativeAOT / CPython need _start or _initialize to bootstrap their
+        // managed runtime before any lifecycle call.
+        if adapter.needs_wasi_start() {
+            let init_fuel = adapter.init_fuel_budget();
+            if init_fuel > 0 {
+                runtime::refuel_store(&mut store, init_fuel)?;
+            }
+            let wasi_start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .ok()
+                .or_else(|| {
+                    instance
+                        .get_typed_func::<(), ()>(&mut store, "_initialize")
+                        .ok()
+                });
+            if let Some(f) = wasi_start {
+                f.call(&mut store, ())
+                    .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
+            }
+            runtime::refuel_store(&mut store, DEFAULT_FUEL_LIMIT)?;
+        }
+
+        if let Ok(on_start) =
+            instance.get_typed_func::<(), i32>(&mut store, adapter.export_on_start())
+        {
+            let result = on_start.call(&mut store, ()).map_err(|e| {
+                anyhow::anyhow!("Blad wywolania {}(): {e}", adapter.export_on_start())
+            })?;
+            if result != 0 {
+                bail!("{}() zwrocil blad: {}", adapter.export_on_start(), result);
+            }
+        }
+
+        Ok(AddonInstance {
+            addon_id: addon_id.to_string(),
+            instance_id,
+            user_id,
+            store,
+            instance,
+            language_adapter: adapter,
+        })
+    }
+
+    /// Górny limit instancji workerów per addon. Z manifestu `[runtime].max_concurrency`
+    /// (jeśli >0), inaczej `min(8, liczba_rdzeni)`. Limit bounduje pamięć puli;
+    /// pod chwilowym burstem powyżej limitu `acquire_instance` tworzy efemeryczne
+    /// instancje (dropowane przy zwrocie), więc nigdy nie blokuje na twardo.
+    fn pool_cap(&self, manifest: &AddonManifest) -> usize {
+        manifest
+            .runtime_overrides
+            .as_ref()
+            .and_then(|rt| rt.max_concurrency)
+            .filter(|n| *n > 0)
+            .map(|n| n as usize)
+            .unwrap_or_else(|| num_cpus::get().clamp(1, 8))
+    }
+
+    /// Wypożycza gotowy worker dla wywołania user-facing (call_tool/panel_open).
+    /// Kolejność: (1) wolny worker z puli (pomijając instancje serwisowe),
+    /// (2) budowa nowego do `pool_cap`, (3) krótkie oczekiwanie na zwrot,
+    /// (4) fallback: efemeryczny worker ponad limit. Zwraca `(instancja,
+    /// ephemeral)`; `release_instance` dropuje efemeryczne, a resztę oddaje do
+    /// puli. Zastępuje dawny 3-sekundowy busy-loop, który padał „zajęty".
+    fn acquire_instance(
+        &self,
+        addon_id: &str,
+        user_id: Option<String>,
+    ) -> Result<(AddonInstance, bool)> {
+        // (1) wolny, nie-serwisowy worker z puli.
+        if let Some(inst) = self.take_idle_instance(addon_id, &user_id) {
+            return Ok((inst, false));
+        }
+
+        let module = self.get_or_compile_module(addon_id)?;
+        let manifest = self.load_addon_manifest(addon_id)?;
+        let permissions = self.load_addon_permissions(addon_id)?;
+        let cap = self.pool_cap(&manifest);
+        // On-demand workery dziedziczą org instancji głównej (start_addon), żeby
+        // scope-keyed storage trafiał do właściwego najemcy.
+        let org_id = self.instance_org_id(addon_id);
+
+        // (2) rośnij do limitu.
+        {
+            let mut totals = self.instance_total.lock();
+            let n = totals.entry(addon_id.to_string()).or_insert(0);
+            if *n < cap {
+                *n += 1;
+                drop(totals);
+                return match self.build_ready_instance(
+                    addon_id,
+                    user_id.clone(),
+                    org_id.clone(),
+                    &module,
+                    manifest,
+                    permissions,
+                ) {
+                    Ok(inst) => Ok((inst, false)),
+                    Err(e) => {
+                        let mut t = self.instance_total.lock();
+                        let c = t.entry(addon_id.to_string()).or_insert(0);
+                        *c = c.saturating_sub(1);
+                        Err(e)
+                    }
+                };
+            }
+        }
+
+        // (3) przy limicie — krótkie oczekiwanie aż ktoś zwróci worker.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Some(inst) = self.take_idle_instance(addon_id, &user_id) {
+                return Ok((inst, false));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // (4) burst fallback — efemeryczny worker ponad limit (drop przy zwrocie).
+        let inst =
+            self.build_ready_instance(addon_id, user_id, org_id, &module, manifest, permissions)?;
+        Ok((inst, true))
+    }
+
+    /// Bierze wolny, nie-serwisowy worker z puli i ustawia tożsamość user na czas
+    /// wywołania (org zostaje — worker zna swojego najemcę z budowy). `None` gdy
+    /// brak wolnego workera nie-serwisowego.
+    fn take_idle_instance(
+        &self,
+        addon_id: &str,
+        user_id: &Option<String>,
+    ) -> Option<AddonInstance> {
+        // Kolejność locków: ZAWSZE instances przed service_instance_ids (ta sama
+        // co w stop_addon) — inaczej groziłoby zakleszczenie.
+        let mut map = self.instances.lock();
+        let list = map.get_mut(addon_id)?;
+        let pos = {
+            let svc = self.service_instance_ids.lock();
+            list.iter().position(|i| !svc.contains(&i.instance_id))?
+        };
+        let mut inst = list.remove(pos);
+        if user_id.is_some() {
+            inst.store.data_mut().user_id = user_id.clone();
+            inst.user_id = user_id.clone();
+        }
+        Some(inst)
+    }
+
+    /// Zwraca wypożyczony worker. Efemeryczny (burst ponad limit) jest dropowany
+    /// i zmniejsza licznik; zwykły wraca do puli do ponownego użycia.
+    fn release_instance(&self, addon_id: &str, instance: AddonInstance, ephemeral: bool) {
+        if ephemeral {
+            let mut t = self.instance_total.lock();
+            let c = t.entry(addon_id.to_string()).or_insert(0);
+            *c = c.saturating_sub(1);
+            return;
+        }
+        self.instances
+            .lock()
+            .entry(addon_id.to_string())
+            .or_default()
+            .push(instance);
+    }
+
     /// Uruchamia addon — tworzy instancje WASM, zwraca instance_id.
     ///
     /// F2 P1.b — `org_id` scopes the instance to its owning tenant. `None`
@@ -1337,103 +1607,29 @@ impl AddonManager {
         let manifest = self.load_addon_manifest(addon_id)?;
         let dt_db = t0.elapsed();
 
-        let rt_id = manifest
-            .runtime
-            .clone()
-            .unwrap_or_else(|| "wasmtime".to_string());
-        let instance_id = uuid::Uuid::new_v4().to_string();
-
-        let is_system_call = user_id.is_none();
-        let state = AddonState {
-            addon_id: addon_id.to_string(),
-            instance_id: instance_id.clone(),
-            user_id: user_id.clone(),
-            org_id: org_id.clone(),
-            db: self.db.clone(),
+        // Buduj w pełni zainicjalizowaną instancję główną przez wspólny builder
+        // (ta sama ścieżka co workery puli — instancje są wymienne).
+        let addon_instance = self.build_ready_instance(
+            addon_id,
+            user_id.clone(),
+            org_id.clone(),
+            &module,
+            manifest,
             permissions,
-            event_bus: self.event_bus.clone(),
-            permission_checker: self.permission_checker.clone(),
-            fuel_consumed: 0,
-            is_system_call,
-            rate_limiter: None,
-            net_manager: Arc::new(Mutex::new(
-                host_functions::network::NetworkConnectionManager::new(),
-            )),
-            settings_cipher: self.settings_cipher.clone(),
-            manifest: Arc::new(manifest),
-            memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
-            router: self.router.read().clone(),
-            oauth_refresh_guard: self.oauth_refresh_guard.clone(),
-            ui_panels: Some(self.ui_panels.clone()),
-            #[cfg(not(any(target_os = "ios", target_os = "android")))]
-            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
-            #[cfg(any(target_os = "ios", target_os = "android"))]
-            store_limits: wasmi::StoreLimitsBuilder::new()
-                .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
-                .trap_on_grow_failure(true)
-                .instances(10)
-                .memories(1)
-                .tables(10)
-                .build(),
-        };
-
-        let t0 = std::time::Instant::now();
-        let mut store = runtime::create_store(&self.engine, state)?;
-        let mut linker = runtime::create_linker(&self.engine);
-        host_functions::register_host_functions(&mut linker)?;
-        let instance = runtime::instantiate(&linker, &mut store, &module)?;
-        let dt_instantiate = t0.elapsed();
-
-        // Resolve language adapter from manifest runtime field
-        let adapter =
-            runtime::adapter_for_runtime(&rt_id).unwrap_or_else(|| Box::new(runtime::RustAdapter));
-
-        // .NET NativeAOT / CPython need _start or _initialize to bootstrap
-        // their managed runtime (GC, interpreter) before any lifecycle call.
-        if adapter.needs_wasi_start() {
-            let init_fuel = adapter.init_fuel_budget();
-            if init_fuel > 0 {
-                runtime::refuel_store(&mut store, init_fuel)?;
-            }
-            let wasi_start = instance
-                .get_typed_func::<(), ()>(&mut store, "_start")
-                .ok()
-                .or_else(|| {
-                    instance
-                        .get_typed_func::<(), ()>(&mut store, "_initialize")
-                        .ok()
-                });
-            if let Some(f) = wasi_start {
-                f.call(&mut store, ())
-                    .map_err(|e| anyhow::anyhow!("WASI _start/_initialize failed: {e}"))?;
-            }
-            // Refuel to default budget after init consumed its share
-            runtime::refuel_store(&mut store, DEFAULT_FUEL_LIMIT)?;
-        }
-
-        // Lifecycle on_start (export name depends on source language)
-        let t0 = std::time::Instant::now();
-        if let Some(on_start) = instance
-            .get_typed_func::<(), i32>(&mut store, adapter.export_on_start())
-            .ok()
-        {
-            let result = on_start.call(&mut store, ()).map_err(|e| {
-                anyhow::anyhow!("Blad wywolania {}(): {e}", adapter.export_on_start())
-            })?;
-            if result != 0 {
-                bail!("{}() zwrocil blad: {}", adapter.export_on_start(), result);
-            }
-        }
-        let dt_on_start = t0.elapsed();
+        )?;
+        let instance_id = addon_instance.instance_id.clone();
 
         info!(
-            "start_addon '{}' timing: compile={:?} db={:?} instantiate={:?} on_start={:?} total={:?}",
-            addon_id, dt_compile, dt_db, dt_instantiate, dt_on_start, t_total.elapsed()
+            "start_addon '{}' timing: compile={:?} db={:?} total={:?}",
+            addon_id,
+            dt_compile,
+            dt_db,
+            t_total.elapsed()
         );
 
         // Zaktualizuj status instancji w DB
         {
-            let conn = self.db.lock().unwrap();
+            let conn = self.db.write().unwrap();
             conn.execute(
                 "INSERT INTO addon_instances (addon_id, instance_id, instance_name, status, created_by, started_at) \
                  VALUES (?1, ?2, ?3, 'running', ?4, datetime('now'))",
@@ -1441,14 +1637,12 @@ impl AddonManager {
             ).map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac instancji w DB: {e}"))?;
         }
 
-        let addon_instance = AddonInstance {
-            addon_id: addon_id.to_string(),
-            instance_id: instance_id.clone(),
-            user_id: user_id.clone(),
-            store,
-            instance,
-            language_adapter: adapter,
-        };
+        // Policz instancję główną w limicie puli (idle w mapie + wypożyczone).
+        *self
+            .instance_total
+            .lock()
+            .entry(addon_id.to_string())
+            .or_insert(0) += 1;
 
         // Dodaj do mapy instancji
         self.instances
@@ -1564,7 +1758,7 @@ impl AddonManager {
         info!("Toggle is_enabled dla addonu '{}' -> {}", addon_id, enabled);
 
         {
-            let conn = self.db.lock().unwrap();
+            let conn = self.db.write().unwrap();
             conn.execute(
                 "UPDATE addons SET is_enabled = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
                 rusqlite::params![enabled as i64, addon_id],
@@ -1624,9 +1818,11 @@ impl AddonManager {
         self.service_tasks
             .lock()
             .insert(instance_id.clone(), token.clone());
+        // Rezerwuj tę instancję dla pętli serwisowej — user-calls (call_tool/
+        // call_panel_open) jej nie wezmą, więc tick i obsługa żądań się nie biją.
+        self.service_instance_ids.lock().insert(instance_id.clone());
 
         let manager_instances = self.instances.clone();
-        let engine = self.engine.clone();
         let event_bus = self.event_bus.clone();
         let addon_id_for_log = addon_id.clone();
         let instance_id_for_log = instance_id.clone();
@@ -1656,7 +1852,6 @@ impl AddonManager {
                         let res = tokio::task::block_in_place(|| {
                             Self::call_tick_static(
                                 &manager_instances,
-                                &engine,
                                 &addon_id_for_log,
                                 &instance_id_for_log,
                                 fuel_per_tick,
@@ -1693,7 +1888,6 @@ impl AddonManager {
     /// tasku — przekazujemy Arc'i pól bezposrednio.
     fn call_tick_static(
         instances_map: &Arc<Mutex<HashMap<String, Vec<AddonInstance>>>>,
-        engine: &runtime::WasmEngine,
         addon_id: &str,
         instance_id: &str,
         fuel_per_tick: u64,
@@ -1731,26 +1925,14 @@ impl AddonManager {
             return Err(anyhow::anyhow!("refuel_store: {e}"));
         }
 
-        // Per-call epoch deadline: store trapuje po 1 increment counter.
-        // Watchdog (jesli timeout_ms set) zwiększa counter raz po `t` ms.
-        // UWAGA: wasmtime epoch jest engine-global — trap dotyczy wszystkich
-        // stores z deadline ≤ current. Per-store isolated cancellation
-        // wymaga epoch_deadline_callback (follow-up).
-        // Epoch-based time cancellation jest wasmtime-only (Desktop/Router).
-        // Mobile (wasmi) nie ma epoch — limit zasobow idzie przez fuel
-        // (refuel_store powyzej), wiec watchdog jest pomijany.
+        // Per-call epoch deadline: store wytrapuje po `timeout_ms` liczonych od
+        // teraz, niezaleznie od innych instancji — steady epoch ticker (jeden
+        // watek per silnik, patrz create_engine) bije epoke, a kazdy store ma
+        // WLASNY wzgledny deadline. Brak watka-per-call i brak cross-trapu
+        // miedzy addonami. Epoch jest wasmtime-only; mobile (wasmi) idzie przez
+        // fuel (refuel_store powyzej), wiec na nim deadline jest pomijany.
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        addon_instance.store.set_epoch_deadline(1);
-
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        let watchdog = timeout_ms.map(|t| {
-            let engine = engine.clone();
-            let dur = std::time::Duration::from_millis(t);
-            std::thread::spawn(move || {
-                std::thread::sleep(dur);
-                engine.increment_epoch();
-            })
-        });
+        runtime::set_call_epoch_deadline(&mut addon_instance.store, timeout_ms);
 
         // Lifecycle on_tick (export name from language adapter)
         let tick_export = addon_instance.language_adapter.export_on_tick();
@@ -1770,17 +1952,10 @@ impl AddonManager {
             Ok(())
         })();
 
-        // Watchdog cleanup — niezaleznie od wyniku ticka, watek detached
-        // i tak sie skonczy po sleep. Drop nie blokuje na join.
+        // Reset epoch deadline — store wraca do mapy i moze byc uzyty przez
+        // handle_event lub call_tool; bez wlasnego limitu nie wytrapuje.
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        drop(watchdog);
-
-        // Reset epoch deadline — store wraca do mapy i moze byc uzyty
-        // przez handle_event lub call_tool. Set_epoch_deadline jest DELTA,
-        // wiec u64::MAX/4 zachowuje sie jak "nigdy nie wytrap" (current+
-        // delta nie osiagniete normalnymi incrementami).
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        addon_instance.store.set_epoch_deadline(u64::MAX / 4);
+        runtime::clear_call_epoch_deadline(&mut addon_instance.store);
 
         // Wloz z powrotem nawet przy bledzie — pojedyncza nieudana tura nie
         // zabija service (np. transient error w dispatch'u host_function).
@@ -1804,94 +1979,83 @@ impl AddonManager {
         epoch: u64,
         user_id: Option<String>,
     ) -> Result<bool> {
-        // Extract instance from map (brief lock)
-        let mut addon_instance = {
-            let mut instances = self.instances.lock();
-            let list = instances
-                .get_mut(addon_id)
-                .ok_or_else(|| anyhow::anyhow!("no running instance for '{}'", addon_id))?;
-            if list.is_empty() {
-                bail!("no running instance for '{}'", addon_id);
-            }
-            list.remove(0)
-        };
+        // Wypożycz worker z puli (rośnie do limitu, bez 3s busy-loopa). Instancja
+        // serwisowa jest pomijana, więc panel nie kłóci się z on_tick.
+        let (mut addon_instance, ephemeral) = self.acquire_instance(addon_id, user_id)?;
 
-        // Set user context on instance
-        addon_instance.store.data_mut().user_id = user_id;
+        // Cała praca WASM w domknięciu, żeby worker został ZWRÓCONY na każdej
+        // ścieżce (błąd też) — inaczej pula by się kurczyła / licznik przeciekał.
+        let result = (|| -> Result<bool> {
+            runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT)?;
 
-        // Refuel before calling
-        runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT)?;
-
-        let export_name = addon_instance.language_adapter.export_on_panel_open();
-        let has_export = addon_instance
-            .instance
-            .get_typed_func::<(i32, i32, i64), i32>(&mut addon_instance.store, export_name)
-            .is_ok();
-
-        if has_export {
-            let on_panel_open = addon_instance
+            let export_name = addon_instance.language_adapter.export_on_panel_open();
+            let has_export = addon_instance
                 .instance
-                .get_typed_func::<(i32, i32, i64), i32>(&mut addon_instance.store, export_name)?;
+                .get_typed_func::<(i32, i32, i64), i32>(&mut addon_instance.store, export_name)
+                .is_ok();
 
-            // Allocate guest memory for panel_id string
-            let alloc_fn = addon_instance
-                .instance
-                .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
-                .map_err(|e| anyhow::anyhow!("alloc export missing: {e}"))?;
+            if has_export {
+                let on_panel_open = addon_instance
+                    .instance
+                    .get_typed_func::<(i32, i32, i64), i32>(
+                        &mut addon_instance.store,
+                        export_name,
+                    )?;
 
-            let panel_id_bytes = panel_id.as_bytes();
-            let ptr = alloc_fn.call(&mut addon_instance.store, panel_id_bytes.len() as i32)?;
-            if ptr < 0 {
-                bail!("alloc returned invalid pointer for panel_id");
-            }
+                // Allocate guest memory for panel_id string
+                let alloc_fn = addon_instance
+                    .instance
+                    .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
+                    .map_err(|e| anyhow::anyhow!("alloc export missing: {e}"))?;
 
-            // Copy panel_id into guest memory
-            if let Some(memory) = addon_instance
-                .instance
-                .get_memory(&mut addon_instance.store, "memory")
-            {
-                let mem = memory.data_mut(&mut addon_instance.store);
-                let end = match (ptr as usize).checked_add(panel_id_bytes.len()) {
-                    Some(e) if e <= mem.len() => e,
-                    _ => {
-                        bail!("panel_id buffer exceeds guest memory");
-                    }
-                };
-                mem[ptr as usize..end].copy_from_slice(panel_id_bytes);
-            }
+                let panel_id_bytes = panel_id.as_bytes();
+                let ptr = alloc_fn.call(&mut addon_instance.store, panel_id_bytes.len() as i32)?;
+                if ptr < 0 {
+                    bail!("alloc returned invalid pointer for panel_id");
+                }
 
-            let result = on_panel_open.call(
-                &mut addon_instance.store,
-                (ptr, panel_id_bytes.len() as i32, epoch as i64),
-            )?;
+                // Copy panel_id into guest memory
+                if let Some(memory) = addon_instance
+                    .instance
+                    .get_memory(&mut addon_instance.store, "memory")
+                {
+                    let mem = memory.data_mut(&mut addon_instance.store);
+                    let end = match (ptr as usize).checked_add(panel_id_bytes.len()) {
+                        Some(e) if e <= mem.len() => e,
+                        _ => {
+                            bail!("panel_id buffer exceeds guest memory");
+                        }
+                    };
+                    mem[ptr as usize..end].copy_from_slice(panel_id_bytes);
+                }
 
-            // Dealloc
-            if let Ok(dealloc_fn) = addon_instance
-                .instance
-                .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
-            {
-                let _ = dealloc_fn.call(
+                let call_result = on_panel_open.call(
                     &mut addon_instance.store,
-                    (ptr, panel_id_bytes.len() as i32),
-                );
+                    (ptr, panel_id_bytes.len() as i32, epoch as i64),
+                )?;
+
+                // Dealloc
+                if let Ok(dealloc_fn) = addon_instance
+                    .instance
+                    .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
+                {
+                    let _ = dealloc_fn
+                        .call(&mut addon_instance.store, (ptr, panel_id_bytes.len() as i32));
+                }
+
+                if call_result != 0 {
+                    warn!(
+                        "on_panel_open('{}', '{}') returned error: {}",
+                        addon_id, panel_id, call_result
+                    );
+                }
             }
 
-            if result != 0 {
-                warn!(
-                    "on_panel_open('{}', '{}') returned error: {}",
-                    addon_id, panel_id, result
-                );
-            }
-        }
+            Ok(has_export)
+        })();
 
-        // Return instance to map
-        self.instances
-            .lock()
-            .entry(addon_id.to_string())
-            .or_default()
-            .push(addon_instance);
-
-        Ok(has_export)
+        self.release_instance(addon_id, addon_instance, ephemeral);
+        result
     }
 
     /// Zatrzymuje instancje addonu
@@ -1902,9 +2066,15 @@ impl AddonManager {
         // Token wyzwala `select` w petli, ktora wychodzi cleanly bez
         // szarpania trzymanej instancji — po cancel mozemy bezpiecznie
         // wyciagnac instancje z mapy ponizej.
-        if let Some(token) = self.service_tasks.lock().remove(instance_id) {
-            token.cancel();
-        }
+        let had_service_token =
+            if let Some(token) = self.service_tasks.lock().remove(instance_id) {
+                token.cancel();
+                true
+            } else {
+                false
+            };
+        // Zdejmij rezerwację instancji serwisowej (no-op dla workerów puli).
+        self.service_instance_ids.lock().remove(instance_id);
 
         // P2 race fix (codex review): tick loop moze byc IN-FLIGHT, ze
         // wyciagnal juz instancje z mapy w call_tick_static. Cancel tokenu
@@ -1930,6 +2100,12 @@ impl AddonManager {
                     if let Some((aid, p)) = found {
                         break (instances, aid, p);
                     }
+                }
+                // Nie w mapie. Tylko instancja serwisowa może być IN-FLIGHT w
+                // ticku (call_tick_static ją wyjął) — wtedy czekamy do 5s na
+                // powrót. Worker/nieznana instancja: nic do zatrzymania → Ok.
+                if !had_service_token {
+                    return Ok(());
                 }
                 attempt += 1;
                 if attempt > 50 {
@@ -1980,7 +2156,7 @@ impl AddonManager {
 
         // Zaktualizuj status w DB
         {
-            let conn = self.db.lock().unwrap();
+            let conn = self.db.write().unwrap();
             conn.execute(
                 "UPDATE addon_instances SET status = 'stopped', stopped_at = datetime('now') WHERE instance_id = ?1",
                 rusqlite::params![instance_id],
@@ -1998,6 +2174,40 @@ impl AddonManager {
             }),
             timestamp: chrono::Utc::now(),
         });
+
+        // Opróżnij workery puli tego addonu (POMIJAJĄC instancje serwisowe —
+        // tych nie wolno wyrwać spod działającego ticka). Workery są wymienne,
+        // stan trwały siedzi w scope-keyed storage, nie w pamięci WASM. Zamknij
+        // ich połączenia i wywołaj on_stop (best-effort). Licznik puli ustaw na
+        // liczbę zachowanych instancji serwisowych.
+        if let Some(list) = instances.get_mut(&addon_id) {
+            let svc = self.service_instance_ids.lock();
+            let mut keep = Vec::new();
+            let mut drained = Vec::new();
+            for inst in list.drain(..) {
+                if svc.contains(&inst.instance_id) {
+                    keep.push(inst);
+                } else {
+                    drained.push(inst);
+                }
+            }
+            let keep_len = keep.len();
+            *list = keep;
+            drop(svc);
+            for mut w in drained {
+                w.store.data().net_manager.clone().lock().close_all();
+                let se = w.language_adapter.export_on_stop();
+                if let Ok(f) = w.instance.get_typed_func::<(), i32>(&mut w.store, se) {
+                    let _ = f.call(&mut w.store, ());
+                }
+            }
+            let mut totals = self.instance_total.lock();
+            if keep_len == 0 {
+                totals.remove(&addon_id);
+            } else {
+                totals.insert(addon_id.clone(), keep_len);
+            }
+        }
 
         // Usun pusta liste jesli brak instancji
         let no_instances_left = instances.get(&addon_id).map_or(true, |v| v.is_empty());
@@ -2071,42 +2281,16 @@ impl AddonManager {
             }
         }
 
-        // K4: Wez instancje z mapy pod lockiem (krotko). Single-instance addons
-        // share the one instance with the service-tick loop (call_tick_static),
-        // which removes it from the pool for the duration of on_tick. A tool call
-        // that lands mid-tick would otherwise see an empty pool and fail; wait
-        // briefly for the tick to return the instance instead. Bounded so a
-        // genuinely dead/never-started addon still surfaces an error promptly.
-        let acquire_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut addon_instance = loop {
-            {
-                let mut instances = self.instances.lock();
-                let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
-                    anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id)
-                })?;
-                if !addon_instances.is_empty() {
-                    // Wyjmij pierwsza instancje — lock jest zwalniany natychmiast
-                    break addon_instances.remove(0);
-                }
-            }
-            if std::time::Instant::now() >= acquire_deadline {
-                bail!("Brak dostepnych instancji addonu '{}' (zajety)", addon_id);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        // Write lock zwolniony — inne watki moga operowac na mapie
+        // Wypożycz worker z puli — rośnie do limitu, pomija instancję serwisową,
+        // bez dawnego 3s busy-loopa, który padał „zajęty" gdy tick trzymał
+        // jedyną instancję. `ephemeral` = worker burstowy (drop przy zwrocie).
+        let (mut addon_instance, ephemeral) =
+            self.acquire_instance(addon_id, Some(user_id.to_string()))?;
 
-        // Refuel przed wywolaniem — store jest wspoldzielony z service tickami,
-        // ktore RESETUJA fuel do malego budzetu ticka (refuel_store ustawia,
-        // nie dodaje). Bez refuelu kazdy call_tool po ticku startuje z
-        // resztka ~5M i moze wytrapic w polowie wykonania (losowy backtrace).
+        // Refuel przed wywolaniem — workery są reużywane, więc każde wywołanie
+        // dostaje świeży budżet (refuel_store ustawia, nie dodaje).
         if let Err(e) = runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT) {
-            self.instances
-                .lock()
-                .entry(addon_id.to_string())
-                .or_default()
-                .push(addon_instance);
+            self.release_instance(addon_id, addon_instance, ephemeral);
             return Err(anyhow::anyhow!("refuel_store: {e}"));
         }
 
@@ -2271,14 +2455,8 @@ impl AddonManager {
             Ok(result)
         })();
 
-        // K4: Wloz instancje z powrotem do mapy
-        {
-            let mut instances = self.instances.lock();
-            instances
-                .entry(addon_id.to_string())
-                .or_default()
-                .push(addon_instance);
-        }
+        // Zwróć worker do puli (lub zdropuj, jeśli burstowy ponad limit).
+        self.release_instance(addon_id, addon_instance, ephemeral);
 
         // Loguj do audit
         self.log_audit(addon_id, user_id, "tool.call", Some(tool_name), None);
@@ -2375,30 +2553,20 @@ impl AddonManager {
             .set_fuel(fuel_budget)
             .map_err(|e| anyhow::anyhow!("set_fuel({}): {e}", fuel_budget))?;
 
-        // Per-call epoch deadline: store trapuje po 1 increment counter.
-        // UWAGA: wasmtime epoch jest engine-global — increment_epoch
-        // trapuje WSZYSTKIE stores z deadline ≤ current. Per-store
-        // isolated cancellation wymaga epoch_deadline_callback z
-        // per-store atomic flag; odlozone jako follow-up.
-        // Epoch = wasmtime-only; mobile (wasmi) idzie przez fuel.
+        // Per-call epoch deadline: store wytrapuje po pozostalym czasie do
+        // `deadline`, niezaleznie od innych instancji (steady epoch ticker
+        // bije epoke, store ma wlasny wzgledny deadline — brak cross-trapu i
+        // watka-per-call). Epoch = wasmtime-only; mobile idzie przez fuel.
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        store.set_epoch_deadline(1);
+        {
+            let timeout_ms = deadline.map(|d| {
+                d.saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u64
+            });
+            runtime::set_call_epoch_deadline(&mut store, timeout_ms);
+        }
 
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        let watchdog = deadline.map(|d| {
-            let engine = self.engine.clone();
-            std::thread::spawn(move || {
-                let now = std::time::Instant::now();
-                if d > now {
-                    std::thread::sleep(d - now);
-                }
-                engine.increment_epoch();
-            })
-        });
-
-        let mut linker = runtime::create_linker(&self.engine);
-        host_functions::register_host_functions(&mut linker)?;
-        let instance = runtime::instantiate(&linker, &mut store, &module)?;
+        let instance = runtime::instantiate(&self.linker, &mut store, &module)?;
 
         // Language adapter for correct export names
         let block_adapter = runtime::adapter_for_runtime(&block_rt_id)
@@ -2529,13 +2697,10 @@ impl AddonManager {
             Ok(mem_data[out_ptr as usize..result_end].to_vec())
         })();
 
-        // Watchdog cleanup — niezaleznie od wyniku (wasmtime-only).
+        // Reset epoch deadline — store jest efemeryczny (dropowany po bloku),
+        // ale czyscimy dla spojnosci i bezpieczenstwa ewentualnego reuzycia.
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        if let Some(handle) = watchdog {
-            // Nie joinujemy — watek i tak sie skonczy po sleep+increment_epoch.
-            // Drop join handle = detach.
-            drop(handle);
-        }
+        runtime::clear_call_epoch_deadline(&mut store);
 
         // Loguj do audit. Pusty user_id = system call (None mapuje na "").
         self.log_audit(
@@ -2727,7 +2892,7 @@ impl AddonManager {
 
     /// Laduje manifest addonu z DB (z kolumny manifest_json)
     fn load_addon_manifest(&self, addon_id: &str) -> Result<AddonManifest> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.read().unwrap();
         let manifest_content: String = conn
             .query_row(
                 "SELECT manifest_json FROM addons WHERE addon_id = ?1",
@@ -2750,7 +2915,7 @@ impl AddonManager {
     /// (addon_id, version) gdy kolumny puste (defensywnie; backfill v60 wypelnia
     /// istniejace wiersze, a install ustawia je dla nowych).
     fn addon_package_ref(&self, addon_id: &str) -> Result<(String, String)> {
-        let conn = self.db.lock().unwrap();
+        let conn = self.db.read().unwrap();
         let (pkg, ver, version): (String, String, String) = conn
             .query_row(
                 "SELECT package_id, package_version, version FROM addons WHERE addon_id = ?1",
@@ -2824,7 +2989,7 @@ impl AddonManager {
         };
         let action_hash = fnv1a_hash(action);
 
-        if let Ok(conn) = self.db.lock() {
+        if let Ok(conn) = self.db.write() {
             let _ = conn.execute(
                 "INSERT INTO audit_log (user_id, addon_id, action, resource_id, result, error_message, action_hash) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2837,7 +3002,7 @@ impl AddonManager {
     /// `model_alias_owners`. Used by start/stop lifecycle paths so the
     /// activate/deactivate logic is generic across addons.
     fn aliases_owned_by_addon(&self, addon_id: &str) -> Vec<String> {
-        let conn = match self.db.lock() {
+        let conn = match self.db.read() {
             Ok(c) => c,
             Err(e) => {
                 warn!("aliases_owned_by_addon: db lock: {}", e);

@@ -551,7 +551,7 @@ mod tests {
         // Ensure user exists for permission checks via FK.
         let user_id = "00000000-0000-0000-0000-000000000042".to_string();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash) \
                  VALUES (?1, 'u' || ?1, 'x')",
@@ -583,7 +583,7 @@ mod tests {
         let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
         let user_id = "00000000-0000-0000-0000-000000000007".to_string();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash) \
                  VALUES (?1, 'u' || ?1, 'x')",
@@ -648,7 +648,7 @@ mod tests {
         // No account seeded for this user.
         let user_id = "00000000-0000-0000-0000-000000000033".to_string();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash) \
                  VALUES (?1, 'u' || ?1, 'x')",

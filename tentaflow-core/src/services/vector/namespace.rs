@@ -368,7 +368,7 @@ impl NamespaceManager {
     /// Read one reserved per-addon config value from `addon_config`. Returns
     /// `None` if absent or empty.
     fn addon_cfg(&self, addon_id: &str, key: &str) -> Option<String> {
-        let conn = self.pool.lock().ok()?;
+        let conn = self.pool.read().ok()?;
         conn.query_row(
             "SELECT value FROM addon_config WHERE addon_id = ?1 AND key = ?2",
             rusqlite::params![addon_id, key],
@@ -387,7 +387,7 @@ impl NamespaceManager {
         // (=> default zvec) od obecnej, niepoprawnej wartosci (=> blad). Puste/
         // whitespace traktujemy jak brak (zvec).
         let raw: Option<String> = {
-            let conn = match self.pool.lock() {
+            let conn = match self.pool.read() {
                 Ok(c) => c,
                 Err(_) => return Ok(VectorBackendConfig::default()),
             };
@@ -577,7 +577,7 @@ impl NamespaceManager {
             return None;
         }
         let id: i64 = sr.service_id.parse().ok()?;
-        let conn = self.pool.lock().ok()?;
+        let conn = self.pool.read().ok()?;
         let services = crate::services_repo::services::list_all(&conn).ok()?;
         services
             .into_iter()
@@ -785,7 +785,7 @@ impl NamespaceManager {
 
         let conn = self
             .pool
-            .lock()
+            .write()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| VectorError::Db(e.to_string()))?;
@@ -834,7 +834,7 @@ impl NamespaceManager {
     fn check_namespace_quota(&self, org_id: &str, addon_id: &str) -> Result<()> {
         let conn = self
             .pool
-            .lock()
+            .read()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let count: i64 = conn
             .query_row(
@@ -863,7 +863,7 @@ impl NamespaceManager {
     ) -> Result<Option<(u32, Metric, PathBuf, Vec<FieldSpec>, bool)>> {
         let conn = self
             .pool
-            .lock()
+            .read()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let row = conn
             .query_row(
@@ -913,7 +913,7 @@ impl NamespaceManager {
     ) -> Result<()> {
         let conn = self
             .pool
-            .lock()
+            .write()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         conn.execute(
@@ -948,7 +948,7 @@ impl NamespaceManager {
     ) -> Result<()> {
         let conn = self
             .pool
-            .lock()
+            .write()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         conn.execute(
@@ -1036,7 +1036,7 @@ impl NamespaceManager {
     ) -> Result<()> {
         let conn = self
             .pool
-            .lock()
+            .write()
             .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         conn.execute(
@@ -1072,7 +1072,7 @@ impl NamespaceManager {
         let path = {
             let conn = self
                 .pool
-                .lock()
+                .write()
                 .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
             let path: Option<String> = conn
                 .query_row(
@@ -1117,7 +1117,7 @@ impl NamespaceManager {
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     const ORG_A: &str = "org-a";
@@ -1126,7 +1126,7 @@ mod tests {
     fn in_memory_db_with_v27() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn mgr() -> (TempDir, NamespaceManager) {
@@ -1199,7 +1199,7 @@ mod tests {
         be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
         be.save().unwrap();
         let file_path = {
-            let conn = mgr.pool.lock().unwrap();
+            let conn = mgr.pool.read().unwrap();
             let p: String = conn
                 .query_row(
                     "SELECT file_path FROM addon_vector_namespaces \
@@ -1215,7 +1215,7 @@ mod tests {
         mgr.delete_namespace(ORG_A, "addon_a", "faces").unwrap();
         assert!(!file_path.exists());
         let row: Option<i64> = {
-            let conn = mgr.pool.lock().unwrap();
+            let conn = mgr.pool.read().unwrap();
             conn.query_row(
                 "SELECT 1 FROM addon_vector_namespaces \
                  WHERE addon_id='addon_a' AND namespace='faces' AND org_id='org-a'",
@@ -1370,7 +1370,7 @@ mod tests {
             .unwrap();
 
             // The schema must round-trip through the DB column.
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             let fields_json: String = conn
                 .query_row(
                     "SELECT fields_json FROM addon_vector_namespaces \
@@ -1453,7 +1453,7 @@ mod tests {
 
         // fields_json now reflects the new schema.
         {
-            let conn = mgr.pool.lock().unwrap();
+            let conn = mgr.pool.read().unwrap();
             let json: String = conn
                 .query_row(
                     "SELECT fields_json FROM addon_vector_namespaces \
@@ -1586,7 +1586,7 @@ mod tests {
         )
         .unwrap();
         {
-            let conn = mgr.pool.lock().unwrap();
+            let conn = mgr.pool.write().unwrap();
             conn.execute(
                 "UPDATE addon_vector_namespaces SET count = ?1 \
                  WHERE addon_id = 'addon_a' AND org_id = 'org-a'",

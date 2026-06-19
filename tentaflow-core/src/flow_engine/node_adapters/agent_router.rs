@@ -348,7 +348,7 @@ mod tests {
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     #[allow(clippy::too_many_arguments)]

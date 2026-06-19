@@ -151,7 +151,7 @@ fn make_state(db: DbPool, addon_id: &str, permissions: Vec<String>) -> AddonStat
 // -----------------------------------------------------------------------------
 
 fn count_audit_action(db: &DbPool, addon_id: &str, action_like: &str) -> i64 {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM audit_log WHERE addon_id = ?1 AND action LIKE ?2",
         rusqlite::params![addon_id, action_like],
@@ -167,7 +167,7 @@ fn count_audit_exact(
     result: &str,
     risk_class: &str,
 ) -> i64 {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM audit_log \
          WHERE addon_id = ?1 AND action = ?2 AND result = ?3 AND risk_class = ?4",

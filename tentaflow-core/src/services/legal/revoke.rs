@@ -95,7 +95,7 @@ pub async fn revoke_async(
     now_ms: i64,
 ) -> Result<(), RevokeError> {
     tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|_| {
+        let conn = db.write().map_err(|_| {
             RevokeError::Db(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
                 Some("db pool mutex poisoned".to_string()),

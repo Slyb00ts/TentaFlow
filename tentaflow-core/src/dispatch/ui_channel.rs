@@ -14,6 +14,21 @@ use tentaflow_sdk_spec::{UiPayload, UiTag};
 
 use super::HandlerContext;
 
+/// Runs a blocking section (synchronous WASM addon call) without starving the
+/// async runtime. On a multi-threaded tokio worker it yields via
+/// `block_in_place` — other tasks migrate to a replacement worker, so one cold
+/// addon start / `on_panel_open` no longer parks a worker and stalls unrelated
+/// requests. Off-runtime (unit tests) or on a current-thread runtime it runs
+/// inline (block_in_place would panic there).
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Extracts the `user_accounts` UUID from the session (raw 16-byte form).
 fn extract_user_id(ctx: &HandlerContext) -> Option<String> {
     match &ctx.session {
@@ -124,21 +139,38 @@ fn handle_panel_open(
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
         let user_id = extract_user_id(ctx);
 
-        if addon_mgr.has_running_instance(&panel_open.addon_id) {
-            // Addon already running — call on_panel_open on existing instance.
-            // If the addon doesn't export on_panel_open (legacy), fall back
-            // to stop+start.
-            let has_handler = addon_mgr
-                .call_panel_open(
-                    &panel_open.addon_id,
-                    &panel_open.panel_id,
-                    epoch,
-                    user_id.clone(),
-                )
-                .unwrap_or(false);
+        // WASM lifecycle (cold start + on_panel_open) is CPU-bound and runs
+        // synchronously; off-load it from the async worker so concurrent panel
+        // opens / other requests are not starved while it runs.
+        run_blocking(|| -> Result<(), ProtocolError> {
+            if addon_mgr.has_running_instance(&panel_open.addon_id) {
+                // Addon already running — call on_panel_open on existing instance.
+                // If the addon doesn't export on_panel_open (legacy), fall back
+                // to stop+start.
+                let has_handler = addon_mgr
+                    .call_panel_open(
+                        &panel_open.addon_id,
+                        &panel_open.panel_id,
+                        epoch,
+                        user_id.clone(),
+                    )
+                    .unwrap_or(false);
 
-            if !has_handler {
-                let _ = addon_mgr.stop_addon(&panel_open.addon_id);
+                if !has_handler {
+                    let _ = addon_mgr.stop_addon(&panel_open.addon_id);
+                    addon_mgr
+                        .start_addon(&panel_open.addon_id, user_id.clone(), None)
+                        .map_err(|e| {
+                            let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                            sl.lock()
+                                .close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                            ProtocolError::internal(format!(
+                                "failed to start addon '{}': {e}",
+                                panel_open.addon_id
+                            ))
+                        })?;
+                }
+            } else {
                 addon_mgr
                     .start_addon(&panel_open.addon_id, user_id.clone(), None)
                     .map_err(|e| {
@@ -151,19 +183,8 @@ fn handle_panel_open(
                         ))
                     })?;
             }
-        } else {
-            addon_mgr
-                .start_addon(&panel_open.addon_id, user_id.clone(), None)
-                .map_err(|e| {
-                    let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
-                    sl.lock()
-                        .close_panel(&panel_open.addon_id, &panel_open.panel_id);
-                    ProtocolError::internal(format!(
-                        "failed to start addon '{}': {e}",
-                        panel_open.addon_id
-                    ))
-                })?;
-        }
+            Ok(())
+        })?;
     }
 
     // Track which connection is serving this addon+user panel so host
@@ -349,7 +370,11 @@ fn handle_action(
     let params_json = cbor_map_to_json(&action.params);
     tracing::info!(tool = %tool_name, params = %params_json, "UI action calling addon tool");
 
-    let status = match addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, &user_id) {
+    // call_tool runs the addon's WASM synchronously — off-load from the async
+    // worker so a slow tool doesn't stall other requests on this runtime.
+    let call_result =
+        run_blocking(|| addon_mgr.call_tool(&action.addon_id, &tool_name, params_json, &user_id));
+    let status = match call_result {
         Ok(result) => {
             tracing::info!(result = %result, "UI action tool returned");
             tentaflow_sdk_spec::protocol::ui::action::ActionStatus::Ok

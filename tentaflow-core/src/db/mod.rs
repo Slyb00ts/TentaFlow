@@ -10,13 +10,101 @@ pub mod repository;
 pub mod seed;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use parking_lot::{Mutex, MutexGuard};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{Connection, OpenFlags};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tracing::info;
 
-/// Pool polaczen SQLite (single-writer, multi-reader)
-pub type DbPool = Arc<Mutex<Connection>>;
+/// Uchwyt do bazy SQLite współdzielony przez cały runtime.
+pub type DbPool = Arc<Db>;
+
+/// Błąd dostępu do bazy. Implementuje `Display`/`Error`, więc dotychczasowe
+/// `.map_err(|e| anyhow!("...: {e}"))` przy `db.read()/db.write()` działają bez zmian.
+#[derive(Debug)]
+pub enum DbError {
+    /// Pula odczytu nie wydała połączenia w `connection_timeout` (wyczerpana / I/O).
+    Pool(r2d2::Error),
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbError::Pool(e) => write!(f, "db read pool: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DbError {}
+
+/// Warstwa dostępu do SQLite rozdzielająca odczyty od zapisów.
+///
+/// SQLite w trybie WAL pozwala na wielu równoległych czytelników i JEDNEGO
+/// pisarza. Dawniej cały runtime dzielił jedno `Mutex<Connection>`, więc każdy
+/// odczyt serializował się za niezwiązanym zapisem. Tu:
+/// - `read()` wydaje połączenie z puli r2d2 (`query_only`) — odczyty idą równolegle,
+/// - `write()` bierze jedyne połączenie pisarza spod `Mutex` — zapisy serializują się
+///   między sobą (nieuniknione w SQLite), ale NIE blokują odczytów.
+///
+/// Bazy in-memory (testy) nie mają puli: każde `:memory:` to osobna pusta baza,
+/// więc `read()` spada wtedy na połączenie pisarza.
+#[derive(Debug)]
+pub struct Db {
+    writer: Mutex<Connection>,
+    read_pool: Option<r2d2::Pool<SqliteConnectionManager>>,
+}
+
+/// Wynik `Db::read()` — połączenie z puli albo (dla in-memory) uchwyt pisarza.
+/// Dereferencuje do `Connection`, więc kod wołający używa go jak dawnego guarda.
+pub enum ReadGuard<'a> {
+    Pooled(r2d2::PooledConnection<SqliteConnectionManager>),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl Deref for ReadGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            ReadGuard::Pooled(c) => c,
+            ReadGuard::Writer(c) => c,
+        }
+    }
+}
+
+impl DerefMut for ReadGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            ReadGuard::Pooled(c) => c,
+            ReadGuard::Writer(c) => c,
+        }
+    }
+}
+
+impl Db {
+    /// Wydaje połączenie do odczytu (pula r2d2; in-memory → pisarz).
+    pub fn read(&self) -> std::result::Result<ReadGuard<'_>, DbError> {
+        match &self.read_pool {
+            Some(pool) => pool.get().map(ReadGuard::Pooled).map_err(DbError::Pool),
+            None => Ok(ReadGuard::Writer(self.writer.lock())),
+        }
+    }
+
+    /// Bierze jedyne połączenie pisarza. Zapisy serializują się tutaj, nie na odczytach.
+    /// Zwraca `Result` dla zgodności wzorców wołających (`?`, `.map_err`); nigdy nie błądzi.
+    pub fn write(&self) -> std::result::Result<MutexGuard<'_, Connection>, DbError> {
+        Ok(self.writer.lock())
+    }
+
+    /// Konstruktor dla testów / baz in-memory: jedno połączenie, bez puli odczytu.
+    pub fn from_connection(conn: Connection) -> Self {
+        Db {
+            writer: Mutex::new(conn),
+            read_pool: None,
+        }
+    }
+}
 
 /// Globalny uchwyt do poola — ustawiony w `init()`. Pozwala modulom ktore nie
 /// dostaja DbPool przez argumenty (np. transcript_store wolany z reverse_request)
@@ -37,12 +125,24 @@ pub fn global_pool() -> Option<DbPool> {
 /// bazy i obciąż WAL. Wolac przy shutdown zeby nie zostawiac niesfl ushowanych
 /// zmian (wazne szczegolnie po SIGKILL).
 pub fn checkpoint_wal(pool: &DbPool) -> Result<()> {
-    let conn = pool
-        .lock()
-        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    let conn = pool.write()?;
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
     conn.pragma_update(None, "optimize", "0x10002")?;
     info!("WAL checkpoint + optimize wykonane");
+    Ok(())
+}
+
+/// Pragmy ustawiane na KAŻDYM połączeniu w puli odczytu. `query_only=ON` gwarantuje,
+/// że pula nigdy nie zapisuje (zapisy idą wyłącznie przez `Db::write()`); `journal_mode`
+/// jest atrybutem pliku (ustawiony przez pisarza), tu dbamy o per-connection busy_timeout
+/// i foreign_keys, by odczyty zachowywały się spójnie.
+fn init_read_connection(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -65536)?;
+    conn.pragma_update(None, "mmap_size", 268435456_i64)?;
     Ok(())
 }
 
@@ -106,7 +206,22 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // Seed domyslnych danych
     seed::seed_defaults(&conn)?;
 
-    let pool = Arc::new(Mutex::new(conn));
+    // Pula odczytu — osobne połączenia do tego samego pliku. WAL pozwala im czytać
+    // równolegle z pisarzem. Rozmiar skalowany do liczby rdzeni (min 4), żeby równoległe
+    // żądania nie ustawiały się w kolejce po jedno połączenie odczytu.
+    let read_size = (num_cpus::get() as u32 * 2).max(4);
+    let manager = SqliteConnectionManager::file(db_path)
+        .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_init(init_read_connection);
+    let read_pool = r2d2::Pool::builder()
+        .max_size(read_size)
+        .connection_timeout(std::time::Duration::from_secs(5))
+        .build(manager)?;
+
+    let pool = Arc::new(Db {
+        writer: Mutex::new(conn),
+        read_pool: Some(read_pool),
+    });
     set_global_pool(pool.clone());
 
     // F1c P5 chunk B — install the flow scheduler singleton with the same

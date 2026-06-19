@@ -280,7 +280,7 @@ pub fn handle_legal_url(
         );
     }
 
-    let conn_guard = match pool.lock() {
+    let conn_guard = match pool.read() {
         Ok(g) => g,
         Err(_) => {
             return audit_and_return(
@@ -499,7 +499,7 @@ fn write_audit_row(
         "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
-    let Ok(conn) = pool.lock() else { return };
+    let Ok(conn) = pool.write() else { return };
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let resource_type = Some("legal_document");
     let resource_id = Some(doc_id);

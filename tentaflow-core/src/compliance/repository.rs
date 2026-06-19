@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn nowa_organizacja_dostaje_domyslne_polityki_compliance() {
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(db()));
+        let pool = std::sync::Arc::new(crate::db::Db::from_connection(db()));
         let org = crate::services::org::repo::create_organization(
             &pool,
             "Druga organizacja",
@@ -819,7 +819,7 @@ mod tests {
             None,
         )
         .expect("organizacja");
-        let conn = pool.lock().expect("db lock");
+        let conn = pool.read().expect("db read");
         let categories = list_data_categories(&conn, &org.org_id).expect("kategorie");
         let policy =
             resolve_retention_policy(&conn, &org.org_id, RetentionScopeKind::AiAudit, None)

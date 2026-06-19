@@ -233,7 +233,7 @@ fn apply_single_migration(
 ) -> Result<ApplyOutcome, AbiError> {
     // 1. Sprawdz w core DB czy ta migracja juz byla applied.
     let prior: Option<(String, String)> = {
-        let conn = core_db.lock().map_err(|_| AbiError::Operation)?;
+        let conn = core_db.read().map_err(|_| AbiError::Operation)?;
         conn.query_row(
             "SELECT migration_hash, status FROM addon_migrations_applied \
              WHERE addon_id = ?1 AND migration_name = ?2",
@@ -315,7 +315,7 @@ fn apply_single_migration(
         Err(e) => ("failed", Some(e.as_str())),
     };
     {
-        let conn = core_db.lock().map_err(|_| AbiError::Operation)?;
+        let conn = core_db.write().map_err(|_| AbiError::Operation)?;
         conn.execute(
             "INSERT INTO addon_migrations_applied \
              (addon_id, migration_name, migration_hash, applied_in_addon_version, \
@@ -551,7 +551,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(n, 1);
-            let conn = core_db.lock().unwrap();
+            let conn = core_db.read().unwrap();
             let (hash, status): (String, String) = conn
                 .query_row(
                     "SELECT migration_hash, status FROM addon_migrations_applied \
@@ -686,7 +686,7 @@ mod tests {
                 &core_db,
                 "org-default",
             );
-            let conn = core_db.lock().unwrap();
+            let conn = core_db.read().unwrap();
             let status: String = conn
                 .query_row(
                     "SELECT status FROM addon_migrations_applied WHERE addon_id=?1 AND migration_name=?2",

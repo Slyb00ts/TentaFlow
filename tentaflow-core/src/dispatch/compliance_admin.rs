@@ -191,7 +191,7 @@ fn list_data_categories_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let categories = list_data_categories(&conn, &org.org_id)
         .map_err(|e| db_error("categories", e))?
@@ -208,7 +208,7 @@ fn list_retention_policies_v1(ctx: &HandlerContext) -> Result<MessageBody, Proto
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let policies = list_retention_policies(&conn, &org.org_id)
         .map_err(|e| db_error("retention", e))?
@@ -229,7 +229,7 @@ fn list_ai_events_v1(
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let events = list_ai_events(&conn, &org.org_id, &repo_filter)
         .map_err(|e| db_error("ai_events", e))?

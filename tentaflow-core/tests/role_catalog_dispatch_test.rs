@@ -528,7 +528,7 @@ async fn test_dispatch_role_catalog_audit_log_created_entry() {
     .await;
     let detail = expect_create(resp);
 
-    let conn = state.db.lock().expect("db mutex");
+    let conn = state.db.read().expect("db mutex");
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_log \

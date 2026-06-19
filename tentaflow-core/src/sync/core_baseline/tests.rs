@@ -32,7 +32,7 @@ const JOINER_LOCAL_NODE: &str = "joiner-local-node";
 fn new_pool() -> DbPool {
     let pool = db::init(std::path::Path::new(":memory:")).expect("init test DB");
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         for table in [
             "node_user_assignments",
             "user_identity_keys",
@@ -76,7 +76,7 @@ fn epoch(counter: u64, origin: &str) -> BaselineEpoch {
 /// tywny. Czysci najpierw seedowane wiersze nieuzywane w tescie, by asercje byly
 /// jednoznaczne.
 fn seed_org(pool: &DbPool, org_id: &str, slug: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO organizations \
             (org_id, name, slug, status, created_at) \
@@ -87,7 +87,7 @@ fn seed_org(pool: &DbPool, org_id: &str, slug: &str) {
 }
 
 fn seed_role(pool: &DbPool, role_id: &str, name: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO roles (role_id, name, permissions_json, created_at) \
          VALUES (?1, ?2, '[]', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
@@ -97,7 +97,7 @@ fn seed_role(pool: &DbPool, role_id: &str, name: &str) {
 }
 
 fn seed_user(pool: &DbPool, id: &str, username: &str, email: Option<&str>) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO user_accounts \
             (id, username, password_hash, display_name, email, is_active, is_admin, role) \
@@ -108,7 +108,7 @@ fn seed_user(pool: &DbPool, id: &str, username: &str, email: Option<&str>) {
 }
 
 fn seed_membership(pool: &DbPool, org_id: &str, user_id: &str, role_id: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     // org_memberships.role_id ma FK na roles(role_id) — zapewniamy istnienie roli.
     conn.execute(
         "INSERT OR IGNORE INTO roles (role_id, name, permissions_json, created_at) \
@@ -126,7 +126,7 @@ fn seed_membership(pool: &DbPool, org_id: &str, user_id: &str, role_id: &str) {
 }
 
 fn seed_flow(pool: &DbPool, id: &str, name: &str, model: Option<&str>) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO flows \
             (id, name, flow_json, status, is_default, published_model_name) \
@@ -137,7 +137,7 @@ fn seed_flow(pool: &DbPool, id: &str, name: &str, model: Option<&str>) {
 }
 
 fn seed_admin_user(pool: &DbPool, id: &str, username: &str, email: Option<&str>) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO user_accounts \
             (id, username, password_hash, display_name, email, is_active, is_admin, role) \
@@ -150,7 +150,7 @@ fn seed_admin_user(pool: &DbPool, id: &str, username: &str, email: Option<&str>)
 /// Seeduje role z jawnym permissions_json (np. `["org.admin"]` dla
 /// uprzywilejowanej, `[]` dla zwyklej).
 fn seed_role_perms(pool: &DbPool, role_id: &str, name: &str, perms_json: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO roles (role_id, name, permissions_json, created_at) \
          VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
@@ -160,7 +160,7 @@ fn seed_role_perms(pool: &DbPool, role_id: &str, name: &str, perms_json: &str) {
 }
 
 fn seed_sync_node(pool: &DbPool, node_id: &str, display: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO sync_nodes (node_id, public_key, display_name, trust_status) \
          VALUES (?1, ?1, ?2, 'trusted')",
@@ -170,7 +170,7 @@ fn seed_sync_node(pool: &DbPool, node_id: &str, display: &str) {
 }
 
 fn seed_explicit_share(pool: &DbPool, org_id: &str, subject_id: &str, granted_by: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO sync_explicit_shares \
             (org_id, addon_id, resource_type, resource_id, subject_type, subject_id, action, granted_by) \
@@ -181,7 +181,7 @@ fn seed_explicit_share(pool: &DbPool, org_id: &str, subject_id: &str, granted_by
 }
 
 fn seed_identity_key(pool: &DbPool, key_id: &str, user_id: &str, public_key: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO user_identity_keys \
             (key_id, user_id, key_type, public_key, purpose, status) \
@@ -192,7 +192,7 @@ fn seed_identity_key(pool: &DbPool, key_id: &str, user_id: &str, public_key: &st
 }
 
 fn seed_node_owner(pool: &DbPool, node_id: &str, owner_user_id: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO sync_nodes (node_id, public_key, display_name, trust_status, owner_user_id) \
          VALUES (?1, ?1, ?1, 'trusted', ?2)",
@@ -202,7 +202,7 @@ fn seed_node_owner(pool: &DbPool, node_id: &str, owner_user_id: &str) {
 }
 
 fn identity_key_count(pool: &DbPool, user_id: &str) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM user_identity_keys WHERE user_id = ?1",
         params![user_id],
@@ -212,7 +212,7 @@ fn identity_key_count(pool: &DbPool, user_id: &str) -> i64 {
 }
 
 fn node_owner_of(pool: &DbPool, node_id: &str) -> Option<String> {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT owner_user_id FROM sync_nodes WHERE node_id = ?1",
         params![node_id],
@@ -224,7 +224,7 @@ fn node_owner_of(pool: &DbPool, node_id: &str) -> Option<String> {
 }
 
 fn share_granted_by(pool: &DbPool, subject_id: &str) -> Option<String> {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT granted_by FROM sync_explicit_shares WHERE subject_id = ?1 LIMIT 1",
         params![subject_id],
@@ -236,14 +236,14 @@ fn share_granted_by(pool: &DbPool, subject_id: &str) -> Option<String> {
 }
 
 fn foreign_key_violations(pool: &DbPool) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
     let rows = stmt.query_map([], |_| Ok(())).unwrap();
     rows.count() as i64
 }
 
 fn set_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str, value: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     let enc = cipher.encrypt(value).unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
@@ -253,7 +253,7 @@ fn set_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str, value: &str) {
 }
 
 fn get_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str) -> Option<String> {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let raw: Option<String> = conn
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -267,7 +267,7 @@ fn get_secret(pool: &DbPool, cipher: &SettingsCipher, key: &str) -> Option<Strin
 }
 
 fn node_exists(pool: &DbPool, node_id: &str) -> bool {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT 1 FROM sync_nodes WHERE node_id = ?1",
         params![node_id],
@@ -279,7 +279,7 @@ fn node_exists(pool: &DbPool, node_id: &str) -> bool {
 }
 
 fn explicit_share_count(pool: &DbPool, org_id: &str, subject_id: &str) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM sync_explicit_shares WHERE org_id = ?1 AND subject_id = ?2",
         params![org_id, subject_id],
@@ -289,7 +289,7 @@ fn explicit_share_count(pool: &DbPool, org_id: &str, subject_id: &str) -> i64 {
 }
 
 fn user_exists(pool: &DbPool, id: &str) -> bool {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT 1 FROM user_accounts WHERE id = ?1",
         params![id],
@@ -301,7 +301,7 @@ fn user_exists(pool: &DbPool, id: &str) -> bool {
 }
 
 fn username_of(pool: &DbPool, id: &str) -> Option<String> {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT username FROM user_accounts WHERE id = ?1",
         params![id],
@@ -312,7 +312,7 @@ fn username_of(pool: &DbPool, id: &str) -> Option<String> {
 }
 
 fn membership_org(pool: &DbPool, user_id: &str) -> Option<String> {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT org_id FROM org_memberships WHERE user_id = ?1",
         params![user_id],
@@ -323,7 +323,7 @@ fn membership_org(pool: &DbPool, user_id: &str) -> Option<String> {
 }
 
 fn count_flows_named(pool: &DbPool, name: &str) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM flows WHERE name = ?1",
         params![name],
@@ -602,7 +602,7 @@ fn import_merges_roles_without_duplicates() {
     let snap = donor_snapshot(&donor, 5);
     import(&joiner, &snap, "donor-node").unwrap();
 
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM roles WHERE role_id = 'role-shared'",
@@ -723,7 +723,7 @@ fn import_joiner_belongs_to_donor_org_after() {
     import(&joiner, &snap, "donor-node").unwrap();
 
     // Zadnego czlonkostwa w org joinera nie powinno juz byc.
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let foreign: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM org_memberships WHERE org_id <> 'org-donor'",
@@ -754,7 +754,7 @@ fn import_both_have_version_2_flow_no_unique_error_both_kept() {
     assert_eq!(count_flows_named(&joiner, "version 2"), 2);
 
     // Dawca zachowuje published_model_name, joiner ma unpublish (NULL).
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let donor_model: Option<String> = conn
         .query_row(
             "SELECT published_model_name FROM flows WHERE id = 'f-donor'",
@@ -878,7 +878,7 @@ fn multi_org_donor_snapshot_is_rejected() {
     let err = import(&joiner, &snap, "donor-node").expect_err("multi-org donor must be rejected");
     assert!(format!("{err}").contains("single-org donor"));
     // Joiner nietkniety — jego org dalej istnieje.
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM organizations WHERE org_id = 'org-joiner'",
@@ -918,7 +918,7 @@ fn import_brings_donor_explicit_shares_and_node_assignments() {
     seed_sync_node(&donor, "donor-node-1", "D1");
     seed_explicit_share(&donor, "org-donor", "u-donor", "u-donor");
     {
-        let conn = donor.lock().unwrap();
+        let conn = donor.write().unwrap();
         conn.execute(
             "INSERT INTO node_user_assignments (node_id, user_id, assignment_mode, created_by) \
              VALUES ('donor-node-1', 'u-donor', 'primary', 'u-donor')",
@@ -934,7 +934,7 @@ fn import_brings_donor_explicit_shares_and_node_assignments() {
     // Explicit share dawcy obecny po imporcie i zremapowany do org dawcy.
     assert_eq!(explicit_share_count(&joiner, "org-donor", "u-donor"), 1);
     // node_user_assignment dawcy obecny.
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM node_user_assignments WHERE node_id = 'donor-node-1' AND user_id = 'u-donor'",
@@ -1047,7 +1047,7 @@ fn import_new_user_never_gets_privileged_role() {
     import(&joiner, &snap, "donor-node").unwrap();
 
     // Nowy user dostal NIEUPRZYWILEJOWANA role (viewer), nigdy admina.
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     let role_id: String = conn
         .query_row(
             "SELECT role_id FROM org_memberships WHERE user_id = 'u-joiner'",
@@ -1084,7 +1084,7 @@ fn import_sync_policy_same_logical_key_donor_wins() {
     // seed migracji) — FK sync_policies.org_id -> organizations wymaga istnienia.
     seed_org(&joiner, "org-donor", "donor");
     {
-        let c = donor.lock().unwrap();
+        let c = donor.write().unwrap();
         c.execute(
             "INSERT INTO sync_policies (policy_id, org_id, addon_id, resource_type, resource_id, mode) \
              VALUES ('pol-donor', 'org-donor', 'core', 'rt', 'rid', 'local_only')",
@@ -1093,7 +1093,7 @@ fn import_sync_policy_same_logical_key_donor_wins() {
         .unwrap();
     }
     {
-        let c = joiner.lock().unwrap();
+        let c = joiner.write().unwrap();
         c.execute(
             "INSERT INTO sync_policies (policy_id, org_id, addon_id, resource_type, resource_id, mode) \
              VALUES ('pol-joiner', 'org-donor', 'core', 'rt', 'rid', 'ephemeral')",
@@ -1106,7 +1106,7 @@ fn import_sync_policy_same_logical_key_donor_wins() {
     // Brak abort mimo kolizji UNIQUE(org,addon,type,id).
     import(&joiner, &snap, "donor-node").unwrap();
 
-    let conn = joiner.lock().unwrap();
+    let conn = joiner.read().unwrap();
     // Wiersz joinera o tym samym kluczu logicznym usuniety (donor-wins).
     let joiner_pol: i64 = conn
         .query_row(
@@ -1454,7 +1454,7 @@ fn import_max_length_base_collision_terminates_with_unique_value() {
 /// datetime modifier (e.g. "-11 minutes") or a raw literal, to simulate an
 /// adopt state armed long ago by a counterpart that never came back.
 fn set_adopt_state_updated_at(pool: &DbPool, value_sql: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     let changed = conn
         .execute(
             &format!("UPDATE settings SET updated_at = {value_sql} WHERE key = ?1"),

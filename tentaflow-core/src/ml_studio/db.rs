@@ -7,7 +7,7 @@
 // identity always comes from the request `HandlerContext`, never from a join.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -39,8 +39,8 @@ pub fn checkpoint_wal() -> Result<()> {
         return Ok(());
     };
     let conn = pool
-        .lock()
-        .map_err(|e| anyhow::anyhow!("ml_studio pool lock poisoned: {}", e))?;
+        .write()
+        .map_err(|e| anyhow::anyhow!("ml_studio pool write: {}", e))?;
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
     info!("WAL checkpoint ML Studio wykonany");
     Ok(())
@@ -74,7 +74,7 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
 
     run_migrations(&conn)?;
 
-    let pool = Arc::new(Mutex::new(conn));
+    let pool = Arc::new(crate::db::Db::from_connection(conn));
     let _ = ML_STUDIO_POOL.set(pool.clone());
     info!("Baza ML Studio zainicjalizowana pomyslnie");
     Ok(pool)

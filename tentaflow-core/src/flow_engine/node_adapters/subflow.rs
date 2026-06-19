@@ -216,18 +216,18 @@ mod tests {
     use crate::flow_engine::node_adapter::AdapterRegistry;
     use crate::flow_engine::subflow_runner::SubflowRunner;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     /// Inserts a flow with a fixed id (create_flow mints random UUIDs; tests
     /// need a known id to reference as a subflow body).
     fn insert_flow(pool: &DbPool, id: &str, name: &str, flow_json: &str, status: &str) {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO flows (id, name, service_type, flow_json, status, is_default) \
              VALUES (?1, ?2, NULL, ?3, ?4, 0)",
@@ -321,7 +321,7 @@ mod tests {
             "active",
         );
         let parent_exec_id = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "INSERT INTO flow_executions (flow_id, status) VALUES \
                  ('bbbbbbbb-0000-0000-0000-000000000001', 'running')",
@@ -348,7 +348,7 @@ mod tests {
             .await
             .expect("execute");
 
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let recorded: Option<i64> = conn
             .query_row(
                 "SELECT parent_execution_id FROM flow_executions \

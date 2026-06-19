@@ -96,8 +96,8 @@ impl ModelResidency {
         let svc = {
             let conn = self
                 .db
-                .lock()
-                .map_err(|_| anyhow::anyhow!("model_residency: db pool poisoned"))?;
+                .read()
+                .map_err(|e| anyhow::anyhow!("model_residency: db read: {e}"))?;
             let model = models::get_by_name(&conn, model_name)?
                 .ok_or_else(|| anyhow::anyhow!("model_residency: nieznany model '{model_name}'"))?;
             services::get(&conn, model.service_id)?.ok_or_else(|| {

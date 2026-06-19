@@ -345,12 +345,11 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::models::SkillParams;
-    use std::sync::Mutex;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn seed_skill(pool: &DbPool, id: &str, name: &str) {

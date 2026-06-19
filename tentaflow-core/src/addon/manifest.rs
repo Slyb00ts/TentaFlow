@@ -87,6 +87,14 @@ pub struct StorageConfig {
     /// Tryb szyfrowania storage: "none" lub "at-rest". Default "none".
     #[serde(default = "default_encryption")]
     pub encryption: String,
+
+    /// Zakres izolacji KV: "org" (współdzielony przez wszystkich użytkowników
+    /// organizacji — np. TentaVision: kamery/detekcje są wspólne) lub "user"
+    /// (osobny storage per użytkownik). Default "org". Klucz storage liczony jest
+    /// z tego zakresu, NIEZALEŻNIE od instancji WASM, więc pula wielu instancji
+    /// obsługujących ten sam zakres widzi te same dane.
+    #[serde(default = "default_storage_scope")]
+    pub scope: String,
 }
 
 impl Default for StorageConfig {
@@ -98,7 +106,16 @@ impl Default for StorageConfig {
             sql_dialect: default_sql_dialect(),
             migrations_dir: default_migrations_dir(),
             encryption: default_encryption(),
+            scope: default_storage_scope(),
         }
+    }
+}
+
+impl StorageConfig {
+    /// `true` gdy storage ma być izolowany per użytkownik (`scope = "user"`).
+    /// W przeciwnym razie storage jest współdzielony w obrębie organizacji.
+    pub fn is_user_scoped(&self) -> bool {
+        self.scope == "user"
     }
 }
 
@@ -113,6 +130,9 @@ fn default_migrations_dir() -> String {
 }
 fn default_encryption() -> String {
     "none".to_string()
+}
+fn default_storage_scope() -> String {
+    "org".to_string()
 }
 
 // =============================================================================
@@ -681,6 +701,12 @@ fn validate_storage(cfg: &StorageConfig) -> Result<()> {
             "storage.encryption '{}' is invalid (allowed: {:?})",
             cfg.encryption,
             STORAGE_ENCRYPTION_MODES
+        );
+    }
+    if !matches!(cfg.scope.as_str(), "org" | "user") {
+        bail!(
+            "storage.scope '{}' is invalid (allowed: \"org\", \"user\")",
+            cfg.scope
         );
     }
     if cfg.sql {

@@ -252,7 +252,7 @@ pub fn emit_op_audit(
     org_id: Option<&str>,
 ) {
     let action = format!("flow.op.{op_name}.{outcome}");
-    let conn = match db.lock() {
+    let conn = match db.write() {
         Ok(c) => c,
         Err(_) => return,
     };

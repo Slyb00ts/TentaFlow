@@ -385,7 +385,7 @@ fn make_state(db: &DbPool, addon_id: &str, permissions: Vec<String>) -> AddonSta
 }
 
 fn read_camera_add_audit(db: &DbPool, addon_id: &str) -> Vec<(String, String, Option<String>)> {
-    let conn = db.lock().expect("lock db");
+    let conn = db.read().expect("lock db");
     let mut stmt = conn
         .prepare(
             "SELECT action, result, error_message \

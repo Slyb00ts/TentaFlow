@@ -390,8 +390,8 @@ impl Supervisor {
         let pinned =
             tokio::task::spawn_blocking(move || -> Result<Vec<ServiceRow>, SupervisorError> {
                 let conn = db
-                    .lock()
-                    .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+                    .read()
+                    .map_err(|e| SupervisorError::Database(format!("db read: {}", e)))?;
                 services_repo::list_pinned(&conn)
                     .map_err(|e| SupervisorError::Database(e.to_string()))
             })
@@ -660,8 +660,8 @@ impl Supervisor {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db
-                .lock()
-                .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+                .read()
+                .map_err(|e| SupervisorError::Database(format!("db read: {}", e)))?;
             services_repo::list_supervised(&conn)
                 .map_err(|e| SupervisorError::Database(e.to_string()))
         })
@@ -674,8 +674,8 @@ impl Supervisor {
         let err_owned = err.map(|s| s.to_string());
         let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+                .write()
+                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_status(&conn, id, status)?;
             if let Some(msg) = err_owned {
                 services_repo::update_health(&conn, id, false, Some(&msg))?;
@@ -690,8 +690,8 @@ impl Supervisor {
         let err_owned = err.map(|s| s.to_string());
         let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+                .write()
+                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_health(&conn, id, ok, err_owned.as_deref())?;
             Ok(())
         })
@@ -702,8 +702,8 @@ impl Supervisor {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db
-                .lock()
-                .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+                .read()
+                .map_err(|e| SupervisorError::Database(format!("db read: {}", e)))?;
             crate::services_repo::models::count_for_service(&conn, service_id)
                 .map_err(|e| SupervisorError::Database(e.to_string()))
         })
@@ -719,8 +719,8 @@ impl Supervisor {
         let url = runtime.endpoint_url.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db
-                .lock()
-                .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+                .write()
+                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
             Ok(())
         })
@@ -732,7 +732,7 @@ impl Supervisor {
     async fn increment_restart(&self, id: i64) {
         let db = self.db.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = db.lock() {
+            if let Ok(conn) = db.write() {
                 let _ = services_repo::increment_restart(&conn, id);
             }
         })
@@ -743,8 +743,8 @@ impl Supervisor {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> Result<ServicesSnapshot, SupervisorError> {
             let conn = db
-                .lock()
-                .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+                .read()
+                .map_err(|e| SupervisorError::Database(format!("db read: {}", e)))?;
             let rows = services_repo::list_supervised(&conn)
                 .map_err(|e| SupervisorError::Database(e.to_string()))?;
 
@@ -1207,8 +1207,8 @@ async fn update_runtime_detached(
     let url = runtime.endpoint_url.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+            .write()
+            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
         Ok(())
     })
@@ -1235,7 +1235,7 @@ pub(crate) fn external_provider_creds(
     service_id: i64,
 ) -> Option<crate::services::handles_cache::ExternalProviderCreds> {
     let row = {
-        let conn = db.lock().ok()?;
+        let conn = db.read().ok()?;
         crate::services_repo::services::get(&conn, service_id).ok()??
     };
     let parsed: serde_json::Value = serde_json::from_str(&row.config_json).ok()?;
@@ -1317,8 +1317,8 @@ async fn clear_runtime_detached(db: &DbPool, id: i64) {
     let db = db.clone();
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+            .write()
+            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         let n = conn.execute(
             "UPDATE services SET runtime_pid = NULL, endpoint_url = NULL, \
              updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -1340,8 +1340,8 @@ async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
     let msg_owned = msg.map(|s| s.to_string());
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+            .write()
+            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_progress_message(&conn, id, msg_owned.as_deref())?;
         Ok(())
     })
@@ -1353,8 +1353,8 @@ async fn update_status_detached(db: &DbPool, id: i64, status: ServiceStatus, err
     let err_owned = err.map(|s| s.to_string());
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let conn = db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("pool poisoned: {}", e))?;
+            .write()
+            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_status(&conn, id, status)?;
         if let Some(msg) = err_owned {
             services_repo::update_health(&conn, id, false, Some(&msg))?;
@@ -1512,13 +1512,13 @@ fn parse_backend_meta(config_json: &str) -> BackendMeta {
 mod tests {
     use super::*;
     use crate::services_repo::services::{DeployMethod, NewService};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     fn open_db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(StdMutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn ports_for_test(lo: u16, hi: u16) -> Arc<PortAllocator> {
@@ -1614,7 +1614,7 @@ mod tests {
         // at a closed port, so respawn() will also fail because the manifest
         // is not in the global registry.
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -1644,7 +1644,7 @@ mod tests {
         // time it must flip to permanently `failed` and stop trying.
         for _ in 0..3 {
             let svc = {
-                let conn = db.lock().unwrap();
+                let conn = db.read().unwrap();
                 services_repo::get(&conn, id).unwrap().unwrap()
             };
             sup.apply_health(&svc, HealthStatus::Failed("test".into()), true)
@@ -1660,7 +1660,7 @@ mod tests {
         }
 
         let final_status = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Failed);
@@ -1682,7 +1682,7 @@ mod tests {
         );
 
         let (alive, stopped) = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             let a = services_repo::insert(
                 &conn,
                 &NewService {
@@ -1737,7 +1737,7 @@ mod tests {
         );
 
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -1764,7 +1764,7 @@ mod tests {
         };
 
         let svc = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             services_repo::get(&conn, id).unwrap().unwrap()
         };
         sup.apply_health(&svc, HealthStatus::Failed("blip".into()), false)
@@ -1857,7 +1857,7 @@ mod tests {
         );
 
         let svc_id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             let id = services_repo::insert(
                 &conn,
                 &NewService {
@@ -1930,7 +1930,7 @@ mod tests {
         // must still try (and flip the row to Failed) — proving the pinned
         // path was exercised.
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             let id = services_repo::insert(
                 &conn,
                 &NewService {
@@ -1974,7 +1974,7 @@ mod tests {
         let deadline = Instant::now() + timeout;
         loop {
             let status = {
-                let conn = db.lock().unwrap();
+                let conn = db.read().unwrap();
                 services_repo::get(&conn, id).unwrap().unwrap().status
             };
             if matches!(status, ServiceStatus::Running | ServiceStatus::Failed) {
@@ -2003,7 +2003,7 @@ mod tests {
         );
 
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -2033,7 +2033,7 @@ mod tests {
 
         // Paused pinned must NOT have been touched — status stays Stopped.
         let row = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             services_repo::get(&conn, id).unwrap().unwrap()
         };
         assert_eq!(row.status, ServiceStatus::Stopped);
@@ -2056,7 +2056,7 @@ mod tests {
         );
 
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -2086,7 +2086,7 @@ mod tests {
 
         // Already-Running pinned must be left alone — no respawn attempt.
         let final_status = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Running);
@@ -2119,7 +2119,7 @@ mod tests {
         let (sup, registry, cache) = build_supervisor_with_registry(db.clone());
 
         let svc_id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -2160,7 +2160,7 @@ mod tests {
         let (sup, _registry, cache) = build_supervisor_with_registry(db.clone());
 
         let svc_id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::insert(
                 &conn,
                 &NewService {
@@ -2191,7 +2191,7 @@ mod tests {
 
         // Delete the row and reconcile again — handle must be dropped.
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             services_repo::delete(&conn, svc_id).unwrap();
         }
         sup.reconcile_handles().await;

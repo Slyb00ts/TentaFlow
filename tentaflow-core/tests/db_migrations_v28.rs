@@ -18,7 +18,7 @@ fn open() -> (TempDir, tentaflow_core::db::DbPool) {
 #[test]
 fn migration_v28_creates_both_tables() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let n_claims: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='policy_claims'",
@@ -40,7 +40,7 @@ fn migration_v28_creates_both_tables() {
 #[test]
 fn migration_v28_recorded_in_migrations() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let exists: i64 = conn
         .query_row(
             "SELECT count(*) FROM _migrations WHERE version=28",
@@ -62,7 +62,7 @@ fn migration_v28_idempotent_reopen() {
 #[test]
 fn signatures_pk_rejects_duplicate_role_user() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT INTO policy_claims (claim_id, claim_type, label, valid_from, valid_until, issued_by_user, created_at) \
          VALUES ('c1','dpia','t','2026-01-01T00:00:00Z','2027-01-01T00:00:00Z','admin','2026-01-01T00:00:00Z')",
@@ -86,7 +86,7 @@ fn signatures_pk_rejects_duplicate_role_user() {
 #[test]
 fn cascade_delete_claim_removes_signatures() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT INTO policy_claims (claim_id, claim_type, label, valid_from, valid_until, issued_by_user, created_at) \
          VALUES ('c1','dpia','t','2026-01-01T00:00:00Z','2027-01-01T00:00:00Z','admin','2026-01-01T00:00:00Z')",
@@ -114,7 +114,7 @@ fn cascade_delete_claim_removes_signatures() {
 #[test]
 fn indexes_present() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let idx_type: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_policy_claims_type'",

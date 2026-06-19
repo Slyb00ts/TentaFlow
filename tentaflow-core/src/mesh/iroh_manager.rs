@@ -3093,7 +3093,6 @@ mod tie_break_tests {
     use crate::crypto::SettingsCipher;
     use crate::mesh::security::MeshSecurity;
     use iroh::endpoint::Connection;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     /// In-memory DbPool z minimalnymi tabelami ktorych wymaga `MeshSecurity::new`.
@@ -3131,7 +3130,7 @@ mod tie_break_tests {
             );",
         )
         .expect("create tables");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn test_cipher() -> Arc<SettingsCipher> {

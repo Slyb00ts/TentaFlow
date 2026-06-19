@@ -460,7 +460,7 @@ mod owner {
     fn local_service_endpoint(db: &DbPool, service_id: &str) -> Option<String> {
         use crate::services_repo::services::ServiceStatus;
         let id: i64 = service_id.parse().ok()?;
-        let conn = db.lock().ok()?;
+        let conn = db.read().ok()?;
         let services = crate::services_repo::services::list_all(&conn).ok()?;
         services
             .into_iter()

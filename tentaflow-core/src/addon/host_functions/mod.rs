@@ -690,9 +690,9 @@ pub fn audit_log_with_risk(
     error_message: Option<&str>,
 ) {
     let action_hash = fnv1a_hash(action);
-    if let Ok(conn) = state.db.lock() {
+    if let Ok(conn) = state.db.write() {
         // F1b P4 (DoD-15) — extend each row with a Merkle hash linked to the
-        // previous row's hash. The shared `DbPool` Mutex serializes us against
+        // previous row's hash. The single writer connection serializes us against
         // every other writer, so the SELECT(latest hash) + INSERT pair is
         // atomic without an explicit transaction. Pre-bind the timestamp the
         // same way SQLite's `datetime('now')` default would render it
@@ -812,7 +812,7 @@ fn tool_register(
     let addon_id = state.addon_id.clone();
 
     // Zapisz narzedzie w DB
-    if let Ok(conn) = state.db.lock() {
+    if let Ok(conn) = state.db.write() {
         let tool_name = tool_def.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let description = tool_def
             .get("description")

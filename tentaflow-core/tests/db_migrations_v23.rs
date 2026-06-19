@@ -50,7 +50,7 @@ fn insert_camera(conn: &Connection, camera_id: &str, vendor: &str) -> rusqlite::
 #[test]
 fn v23_migration_preserves_fake_file_rows() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     insert_camera(&conn, "cam-fake-1", "fake_file").expect("insert fake_file row");
 
@@ -67,7 +67,7 @@ fn v23_migration_preserves_fake_file_rows() {
 #[test]
 fn v23_migration_allows_rtsp_vendor() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     insert_camera(&conn, "cam-rtsp-1", "rtsp").expect("rtsp vendor must be accepted after v23");
 
@@ -84,7 +84,7 @@ fn v23_migration_allows_rtsp_vendor() {
 #[test]
 fn v23_migration_allows_onvif_vendor() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     insert_camera(&conn, "cam-onvif-1", "onvif").expect("onvif vendor must be accepted after v23");
 
@@ -101,7 +101,7 @@ fn v23_migration_allows_onvif_vendor() {
 #[test]
 fn v23_migration_rejects_unsupported_vendor() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     let err = insert_camera(&conn, "cam-bad-1", "foo")
         .expect_err("unsupported vendor must trip CHECK constraint");
@@ -115,7 +115,7 @@ fn v23_migration_rejects_unsupported_vendor() {
 #[test]
 fn v23_migration_recreates_indexes() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
 
     for idx in &[
         "idx_cameras_camera_id_active",
@@ -132,7 +132,7 @@ fn v23_migration_recreates_indexes() {
 #[test]
 fn v23_migration_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
 
     let exists: i64 = conn
         .query_row(

@@ -3123,7 +3123,7 @@ fn apply_kv_operation(db: &DbPool, operation: &SyncOperation) -> LedgerResult<us
     observe_core_hlc(&operation.body.hlc_timestamp);
 
     let mut conn = db
-        .lock()
+        .write()
         .map_err(|e| SyncLedgerError::Runtime(format!("Blad blokady bazy: {e}")))?;
     let tx = conn
         .transaction()
@@ -3528,7 +3528,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
     use std::time::Duration;
 
     struct RuntimeHarness {
@@ -3539,13 +3538,13 @@ mod tests {
     fn make_db() -> DbPool {
         let conn = Connection::open_in_memory().expect("open db");
         migrations::run(&conn).expect("run migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn make_db_at(path: &Path) -> DbPool {
         let conn = Connection::open(path).expect("open persistent db");
         migrations::run(&conn).expect("run migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn make_security(db: DbPool, key_seed: u8) -> Arc<MeshSecurity> {
@@ -4026,7 +4025,7 @@ mod tests {
     /// because `__tentaflow_core_sync_captures.actor_user_id` is FK-bound to
     /// `user_accounts(id)`. The in-memory ledger path skips this SQL constraint.
     fn seed_actor_user(db: &DbPool, actor_id: &str) {
-        let conn = db.lock().expect("db");
+        let conn = db.write().expect("db");
         conn.execute(
             "INSERT INTO user_accounts (id, username, password_hash) VALUES (?1, ?1, 'h')",
             rusqlite::params![actor_id],
@@ -4037,7 +4036,7 @@ mod tests {
     /// Inserts a live `flows` row so a baseline reset has current state to
     /// re-seed from. The capture journal is intentionally left untouched.
     fn seed_flow_row(db: &DbPool, id: &str, name: &str) {
-        let conn = db.lock().expect("db");
+        let conn = db.write().expect("db");
         conn.execute(
             "INSERT INTO flows (id, name, is_default, flow_json, status) \
              VALUES (?1, ?2, 0, '{\"nodes\":[]}', 'active')",
@@ -4377,7 +4376,7 @@ mod tests {
             let source = make_runtime(27);
             let receiver = make_runtime(28);
             {
-                let conn = receiver.runtime.db.lock().expect("db lock");
+                let conn = receiver.runtime.db.write().expect("db lock");
                 conn.execute(
                     "INSERT INTO flows (id, name, flow_json, status) VALUES (43, 'Local Flow', '{\"nodes\":[]}', 'draft')",
                     [],
@@ -4436,7 +4435,7 @@ mod tests {
             )
             .expect("set shared secret");
             let capture_id = {
-                let conn = source.runtime.db.lock().expect("db lock");
+                let conn = source.runtime.db.read().expect("db lock");
                 conn.query_row(
                     "SELECT capture_id FROM __tentaflow_core_sync_captures \
                      WHERE resource_type = 'core.shared_setting_secret' AND resource_id = 'hf_token' \
@@ -4447,7 +4446,7 @@ mod tests {
                 .expect("capture id")
             };
             let capture = {
-                let conn = source.runtime.db.lock().expect("db lock");
+                let conn = source.runtime.db.read().expect("db lock");
                 crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
                     .expect("load capture")
                     .expect("capture")
@@ -5006,7 +5005,7 @@ mod tests {
             let stored: Vec<u8> = receiver
                 .runtime
                 .db
-                .lock()
+                .read()
                 .expect("db lock")
                 .query_row(
                     "SELECT storage_value FROM addon_storage \
@@ -5047,7 +5046,7 @@ mod tests {
                 &receiver.runtime.local_node_id,
             );
             {
-                let conn = receiver.runtime.db.lock().expect("db lock");
+                let conn = receiver.runtime.db.write().expect("db lock");
                 conn.execute(
                     "INSERT INTO addon_storage \
                      (addon_id, instance_id, storage_key, storage_value, value_size_bytes) \
@@ -5082,7 +5081,7 @@ mod tests {
             let count: i64 = receiver
                 .runtime
                 .db
-                .lock()
+                .read()
                 .expect("db lock")
                 .query_row(
                     "SELECT COUNT(*) FROM addon_storage \
@@ -5250,7 +5249,7 @@ mod tests {
     /// Minimal installed-instance row so `installed_addon_ids_for_package` and the
     /// `core.addon_instance` target resolution see the package as installed.
     fn seed_installed_addon(db: &DbPool, package_id: &str, version: &str, addon_id: &str) {
-        let conn = db.lock().expect("db");
+        let conn = db.write().expect("db");
         conn.execute(
             "INSERT INTO addons (addon_id, name, version, package_id, package_version) \
              VALUES (?1, ?1, ?2, ?3, ?2)",
@@ -5281,7 +5280,7 @@ mod tests {
             None,
         );
         {
-            let conn = runtime.db.lock().expect("db");
+            let conn = runtime.db.write().expect("db");
             crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)
                 .expect("record capture row");
         }
@@ -8016,7 +8015,7 @@ mod tests {
         let stored: Vec<u8> = receiver
             .runtime
             .db
-            .lock()
+            .read()
             .expect("db lock")
             .query_row(
                 "SELECT storage_value FROM addon_storage \
@@ -8520,7 +8519,7 @@ mod tests {
             .runtime
             .handle_ack_payload(&receiver.local_node_id, ack_for(&receiver, operation_ids))
             .expect("ack after restart");
-        let conn = receiver.db.lock().expect("db");
+        let conn = receiver.db.read().expect("db");
         let name: String = conn
             .query_row("SELECT name FROM flows WHERE id = '9101'", [], |row| {
                 row.get(0)
@@ -8972,7 +8971,7 @@ mod tests {
             push,
         )
         .await;
-        let conn = receiver_c.runtime.db.lock().expect("db");
+        let conn = receiver_c.runtime.db.read().expect("db");
         let name: String = conn
             .query_row("SELECT name FROM flows WHERE id = '9701'", [], |row| {
                 row.get(0)
@@ -9178,7 +9177,7 @@ mod tests {
             push,
         )
         .await;
-        let conn = receiver.runtime.db.lock().expect("db");
+        let conn = receiver.runtime.db.read().expect("db");
         let username: String = conn
             .query_row(
                 "SELECT username FROM user_accounts WHERE id = '10101'",
@@ -9349,7 +9348,7 @@ mod tests {
             seed_flow_row(&node.runtime.db, "flow-b", "Beta");
             seed_flow_row(&node.runtime.db, "flow-c", "Gamma");
             {
-                let conn = node.runtime.db.lock().expect("db");
+                let conn = node.runtime.db.write().expect("db");
                 let tx = conn.unchecked_transaction().expect("tx");
                 // Several historical capture rows for flow-a with zeroed HLCs,
                 // exactly what survives the v54 ALTER.
@@ -9496,7 +9495,7 @@ mod tests {
             // transaction a real `repository::create_flow` would use when it
             // calls `record_core_capture_tx`. No op, no outbox yet.
             {
-                let conn = node.runtime.db.lock().expect("db");
+                let conn = node.runtime.db.write().expect("db");
                 let tx = conn.unchecked_transaction().expect("tx");
                 crate::sync::core_capture::record_core_write_capture(
                     &tx,
@@ -9510,7 +9509,7 @@ mod tests {
             // The migrations seed other default core captures (org, roles); we
             // assert only on flow-online, the resource this regression covers.
             let flow_status_before: String = {
-                let conn = node.runtime.db.lock().expect("db");
+                let conn = node.runtime.db.read().expect("db");
                 conn.query_row(
                     "SELECT status FROM __tentaflow_core_sync_captures \
                      WHERE resource_type = 'core.flow' AND resource_id = 'flow-online'",
@@ -9584,7 +9583,7 @@ mod tests {
 
             // The flow's journal row is no longer pending — it is now ledgered.
             let flow_status_after: String = {
-                let conn = node.runtime.db.lock().expect("db");
+                let conn = node.runtime.db.read().expect("db");
                 conn.query_row(
                     "SELECT status FROM __tentaflow_core_sync_captures \
                      WHERE resource_type = 'core.flow' AND resource_id = 'flow-online'",
@@ -9978,7 +9977,7 @@ mod tests {
 
     fn api_key_active(db: &DbPool, uid: &str) -> Option<bool> {
         use rusqlite::OptionalExtension;
-        db.lock()
+        db.read()
             .expect("db lock")
             .query_row(
                 "SELECT is_active FROM api_keys WHERE uid = ?1",
@@ -9991,7 +9990,7 @@ mod tests {
 
     fn perm_level(db: &DbPool) -> Option<String> {
         use rusqlite::OptionalExtension;
-        db.lock()
+        db.read()
             .expect("db lock")
             .query_row(
                 "SELECT access_level FROM resource_permissions \
@@ -10060,7 +10059,7 @@ mod tests {
                 .expect("first apply");
 
             // B stamps last_used_at locally (simulating a verify on B).
-            db_b.lock()
+            db_b.write()
                 .unwrap()
                 .execute(
                     "UPDATE api_keys SET last_used_at = '2026-01-01T00:00:00Z' WHERE uid = 'uid-2'",
@@ -10078,7 +10077,7 @@ mod tests {
 
             use rusqlite::OptionalExtension;
             let last_used: Option<String> = db_b
-                .lock()
+                .read()
                 .unwrap()
                 .query_row(
                     "SELECT last_used_at FROM api_keys WHERE uid = 'uid-2'",
@@ -10203,7 +10202,7 @@ mod tests {
 
     fn kv_value(db: &DbPool, addon_id: &str, instance_id: &str, key: &str) -> Option<Vec<u8>> {
         use rusqlite::OptionalExtension;
-        db.lock()
+        db.read()
             .expect("db lock")
             .query_row(
                 "SELECT storage_value FROM addon_storage \
@@ -10705,7 +10704,7 @@ mod tests {
     /// must be identical everywhere and equal the highest-HLC writer's name.
     fn read_org_name(node: &ConvergenceNode, org_id: &str) -> Option<String> {
         use rusqlite::OptionalExtension;
-        let conn = node.runtime.db.lock().expect("db lock");
+        let conn = node.runtime.db.read().expect("db lock");
         conn.query_row(
             "SELECT name FROM organizations WHERE org_id = ?1",
             rusqlite::params![org_id],

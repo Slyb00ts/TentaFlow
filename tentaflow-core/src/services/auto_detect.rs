@@ -78,8 +78,8 @@ pub async fn auto_register_ollama(
     //    natural primary key for an external row — at most one per engine.
     let already = {
         let conn = db
-            .lock()
-            .map_err(|e| anyhow::anyhow!("services pool lock poisoned: {}", e))?;
+            .read()
+            .map_err(|e| anyhow::anyhow!("services db read: {}", e))?;
         services_repo::list_all(&conn)?
             .into_iter()
             .any(|s| s.engine_id == "ollama" && s.deploy_method == DeployMethod::External)

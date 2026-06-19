@@ -101,7 +101,7 @@ const NODE_ORG_ID: &str = "org-default";
 fn fresh_node_pool() -> DbPool {
     let pool = db::init(std::path::Path::new(":memory:")).expect("init test DB");
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         for table in [
             "node_user_assignments",
             "user_identity_keys",
@@ -149,7 +149,7 @@ fn fresh_node_pool() -> DbPool {
 /// `MeshSecurity::is_trusted` returns true without firing policy side-effects
 /// that depend on a default org wiped by `fresh_node_pool`.
 fn insert_trusted_node(pool: &DbPool, node_id: &str, public_key_hex: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO trusted_nodes \
             (node_id, public_key, hostname, approved_by, approved_at, is_active) \
@@ -188,7 +188,7 @@ fn donor_security_below(
         let donor_node_id = probe.ed25519_public_key_hex();
         drop(probe);
         if donor_node_id >= joiner_node_id.to_string() {
-            let conn = donor_pool.lock().unwrap();
+            let conn = donor_pool.write().unwrap();
             conn.execute(
                 "DELETE FROM settings WHERE key IN ('node_private_key', 'node_x25519_private_key')",
                 [],
@@ -252,12 +252,12 @@ async fn run_pairing(
 }
 
 fn count(pool: &DbPool, sql: &str) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
 fn exists(pool: &DbPool, sql: &str) -> bool {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
@@ -332,7 +332,7 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
     // System role shared by exact id on both nodes (deterministic seed). After
     // adopt it must NOT be duplicated — same role_id collapses on upsert.
     {
-        let conn = donor_pool.lock().unwrap();
+        let conn = donor_pool.write().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO roles (role_id, name, permissions_json, created_at) \
              VALUES ('role-admin', 'admin', '[\"org.read\"]', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
@@ -341,7 +341,7 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
         .unwrap();
     }
     {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.write().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO roles (role_id, name, permissions_json, created_at) \
              VALUES ('role-admin', 'admin', '[\"org.read\"]', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
@@ -361,7 +361,7 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
     )
     .unwrap();
     {
-        let conn = donor_pool.lock().unwrap();
+        let conn = donor_pool.write().unwrap();
         conn.execute(
             "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
              VALUES (?1, ?2, 'role-user', strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'seed')",
@@ -378,7 +378,7 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
     )
     .unwrap();
     {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.write().unwrap();
         conn.execute(
             "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
              VALUES (?1, ?2, 'role-user', strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'seed')",
@@ -447,7 +447,7 @@ async fn e2e_pairing_adopt_merges_into_single_org_no_role_duplication() {
         "joiner user-created account survived adopt"
     );
     let joiner_user_org: String = {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.read().unwrap();
         conn.query_row(
             "SELECT org_id FROM org_memberships WHERE user_id = ?1",
             rusqlite::params![joiner_user],
@@ -533,7 +533,7 @@ async fn e2e_both_nodes_published_version2_flow_no_unique_error_after_adopt() {
 
     // Collision policy: donor keeps the published model name, joiner is unpublished.
     let donor_model: Option<String> = {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.read().unwrap();
         conn.query_row(
             "SELECT published_model_name FROM flows WHERE id = ?1",
             rusqlite::params![donor_flow],
@@ -542,7 +542,7 @@ async fn e2e_both_nodes_published_version2_flow_no_unique_error_after_adopt() {
         .unwrap()
     };
     let joiner_model: Option<String> = {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.read().unwrap();
         conn.query_row(
             "SELECT published_model_name FROM flows WHERE id = ?1",
             rusqlite::params![joiner_flow],

@@ -118,7 +118,7 @@ pub fn create_with_slug(
 /// column does not grow without bound on long-running builds.
 pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
     let conn = db
-        .lock()
+        .write()
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
     let current: Option<String> = conn
         .query_row(
@@ -156,7 +156,7 @@ pub fn append_log_line(db: &DbPool, slug: &str, line: &str) -> Result<()> {
 /// not known on the wire.
 pub fn get_by_slug(db: &DbPool, slug: &str) -> Result<Option<DeploymentRow>> {
     let conn = db
-        .lock()
+        .read()
         .map_err(|e| anyhow!("pool lock poisoned: {}", e))?;
     let sql = format!("SELECT {} FROM deployments WHERE deploy_id = ?1", COLS);
     Ok(conn
@@ -238,13 +238,13 @@ pub fn list_resumable(conn: &Connection) -> Result<Vec<DeploymentRow>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn open_db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn insert_service(conn: &Connection) -> i64 {
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn slug_unique_constraint() {
         let db = open_db();
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         let service_id = insert_service(&conn);
         create_with_slug(
             &conn, "vllm", "docker", "abc123", "node-a", service_id, "{}",
@@ -278,7 +278,7 @@ mod tests {
     fn append_log_line_persists() {
         let db = open_db();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             let service_id = insert_service(&conn);
             create_with_slug(
                 &conn, "vllm", "docker", "slug-aa", "node-a", service_id, "{}",
@@ -302,7 +302,7 @@ mod tests {
     fn get_by_slug_roundtrip() {
         let db = open_db();
         let id = {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             let service_id = insert_service(&conn);
             create_with_slug(
                 &conn, "ollama", "external", "slug-bb", "node-a", service_id, "{}",

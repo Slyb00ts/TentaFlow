@@ -169,7 +169,7 @@ async fn legal_documents_list_v1(
 
     let rows = tokio::task::spawn_blocking(move || -> Result<_, ProtocolError> {
         let conn = db
-            .lock()
+            .read()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         list_by_org(&conn, &org_id, include_revoked).map_err(|e| {
             tracing::warn!("legal_documents_list_v1 db error: {e}");
@@ -231,7 +231,7 @@ async fn legal_document_generate_v1(
     };
 
     let output = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|_| {
+        let conn = db.write().map_err(|_| {
             RodoGenerationError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "db pool poisoned",
@@ -266,7 +266,7 @@ async fn legal_document_generate_v1(
     let org_id_for_stash = org_id.clone();
     let nonce_for_stash = url.nonce.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = pool.lock() {
+        if let Ok(conn) = pool.write() {
             let _ = crate::db::legal_documents::set_signed_url_ref(
                 &conn,
                 &doc_id_for_stash,

@@ -93,7 +93,7 @@ pub fn event_subscribe(
 
     // Zapisz subskrypcje w DB
     {
-        match caller.data().db.lock() {
+        match caller.data().db.write() {
             Ok(conn) => {
                 let filter_str = _filter.as_ref().map(|f| f.to_string());
                 let _ = conn.execute(

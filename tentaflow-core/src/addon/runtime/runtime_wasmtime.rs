@@ -5,7 +5,7 @@
 // =============================================================================
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use wasmtime::{Config, OptLevel};
 
 use crate::addon::{AddonState, DEFAULT_FUEL_LIMIT, DEFAULT_MEMORY_LIMIT_BYTES};
@@ -78,9 +78,54 @@ pub fn create_engine() -> Result<WasmEngine> {
     let engine = WasmEngine::new(&config)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
 
-    info!("Silnik Wasmtime utworzony (fuel metering + epoch interruption)");
+    // Steady epoch ticker: jeden detached watek bije epoke co EPOCH_TICK_MS.
+    // Dzieki temu KAZDE wywolanie ustawia WLASNY wzgledny deadline
+    // (`set_epoch_deadline(ticks)`) i trapuje wylacznie po swoim czasie —
+    // koniec z dawnym wzorcem "watek-per-call wola increment_epoch raz", ktory
+    // trapowal WSZYSTKIE instancje z deadline ≤ current (cross-trap miedzy
+    // niezwiazanymi addonami). Ticker zyje do konca procesu (Engine to Arc;
+    // klon w watku utrzymuje go przy zyciu — to celowe, jeden silnik = jeden
+    // ticker).
+    let ticker_engine = engine.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("wasm-epoch-ticker".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(EPOCH_TICK_MS));
+            ticker_engine.increment_epoch();
+        })
+    {
+        warn!("nie udalo sie wystartowac epoch tickera: {e} — timeouty WASM nieaktywne");
+    }
+
+    info!("Silnik Wasmtime utworzony (fuel metering + epoch interruption, ticker {EPOCH_TICK_MS}ms)");
 
     Ok(engine)
+}
+
+/// Rozdzielczosc steady epoch tickera (ms). Per-call deadline jest zaokraglany
+/// w gore do wielokrotnosci tej wartosci, wiec to dolna granica precyzji timeoutu.
+pub const EPOCH_TICK_MS: u64 = 10;
+
+/// Przelicza timeout w ms na liczbe ticków epoki (delta dla `set_epoch_deadline`),
+/// zaokraglajac w gore, min 1 — deadline 0 trapilby natychmiast.
+pub fn epoch_ticks_for_timeout(timeout_ms: u64) -> u64 {
+    timeout_ms.div_ceil(EPOCH_TICK_MS).max(1)
+}
+
+/// Ustawia per-call deadline epoki na store. `Some(ms)` → store wytrapuje po
+/// ~ms (liczone od teraz, niezaleznie od innych instancji). `None` → "nigdy"
+/// (dlugozyjace instancje nie sa trapowane gdy nie maja wlasnego limitu).
+pub fn set_call_epoch_deadline(store: &mut WasmStore<AddonState>, timeout_ms: Option<u64>) {
+    match timeout_ms {
+        Some(ms) => store.set_epoch_deadline(epoch_ticks_for_timeout(ms)),
+        None => store.set_epoch_deadline(u64::MAX / 4),
+    }
+}
+
+/// Czysci per-call deadline (po zakonczeniu wywolania) — store wraca do "nigdy",
+/// wiec moze byc bezpiecznie reuzyty / oddany do puli bez ryzyka trapu.
+pub fn clear_call_epoch_deadline(store: &mut WasmStore<AddonState>) {
+    store.set_epoch_deadline(u64::MAX / 4);
 }
 
 // =============================================================================

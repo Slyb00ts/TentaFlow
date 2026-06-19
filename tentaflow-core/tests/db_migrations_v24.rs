@@ -34,7 +34,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 #[test]
 fn test_v24_adds_source_node_id_column() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     assert!(
         column_exists(&conn, "frame_pickup_log", "source_node_id"),
         "frame_pickup_log must have source_node_id after v24"
@@ -44,7 +44,7 @@ fn test_v24_adds_source_node_id_column() {
 #[test]
 fn test_v24_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 24",
@@ -58,7 +58,7 @@ fn test_v24_recorded_in_meta() {
 #[test]
 fn test_v24_accepts_null_and_non_null_source() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     // NULL source — local-key verify path.
     conn.execute(
@@ -120,7 +120,7 @@ fn test_v24_idempotent_when_column_exists() {
     let _pool = db::init(&path).expect("first init");
     // Second init re-opens the same file — should be a no-op.
     let pool2 = db::init(&path).expect("second init must not fail");
-    let conn = pool2.lock().expect("lock");
+    let conn = pool2.read().expect("read");
     assert!(
         column_exists(&conn, "frame_pickup_log", "source_node_id"),
         "column must still exist after idempotent re-init"

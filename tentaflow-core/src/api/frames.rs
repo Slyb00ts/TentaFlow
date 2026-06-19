@@ -233,7 +233,7 @@ fn audit_and_return(
         "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
-    if let Ok(conn) = pool.lock() {
+    if let Ok(conn) = pool.write() {
         // FrameUrl access has no addon identity at the HTTP layer (HMAC-only
         // auth), so addon_id stays NULL. Risk class B matches host-fn
         // `frame_url_v1` issuance.

@@ -177,7 +177,7 @@ pub fn host_net_connect(
     // 4. Sprawdz zatwierdzenie reguly w DB
     let approved = {
         let addon_id = caller.data().addon_id.clone();
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => conn
                 .query_row(
                     "SELECT approved FROM addon_network_rules \
@@ -463,7 +463,7 @@ pub fn host_net_send(
     // Sprawdz approved w DB — jesli regula cofnieta, zamknij polaczenie
     {
         let addon_id = caller.data().addon_id.clone();
-        let approved = match caller.data().db.lock() {
+        let approved = match caller.data().db.read() {
             Ok(conn) => conn
                 .query_row(
                     "SELECT approved FROM addon_network_rules WHERE addon_id = ?1 AND rule_id = ?2",
@@ -621,7 +621,7 @@ pub fn host_net_recv(
 
     {
         let addon_id = caller.data().addon_id.clone();
-        let approved = match caller.data().db.lock() {
+        let approved = match caller.data().db.read() {
             Ok(conn) => conn
                 .query_row(
                     "SELECT approved FROM addon_network_rules WHERE addon_id = ?1 AND rule_id = ?2",

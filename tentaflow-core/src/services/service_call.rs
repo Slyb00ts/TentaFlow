@@ -103,7 +103,7 @@ pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// the AddonState semantics (system calls without user_id skip the resolve).
 pub async fn dispatch(
     req: ServiceCallRequest,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &DbPool,
     service_manager: Option<&Arc<ServiceManager>>,
     permission_checker: Option<&PermissionChecker>,
     permissions: &[String],
@@ -580,7 +580,7 @@ fn emit_audit_full(
     result: &str,
     error_message: Option<&str>,
 ) {
-    let Ok(conn) = db.lock() else {
+    let Ok(conn) = db.write() else {
         return;
     };
     emit_audit_inner(
@@ -675,7 +675,7 @@ fn log_alias_call(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
-    let Ok(conn) = db.lock() else {
+    let Ok(conn) = db.write() else {
         return;
     };
     let alias_id: Option<i64> = conn

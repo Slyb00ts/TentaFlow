@@ -14,7 +14,7 @@
 // the rest of the binary owns. The supervisor's first-tick contract is
 // covered by its own unit tests (`services::supervisor::tests`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 use serde_json::json;
@@ -39,7 +39,7 @@ fn test_db() -> db::DbPool {
     conn.execute_batch("PRAGMA foreign_keys=ON;")
         .expect("enable FK");
     db::migrations::run(&conn).expect("run migrations");
-    Arc::new(Mutex::new(conn))
+    Arc::new(db::Db::from_connection(conn))
 }
 
 // Deterministyczny cipher dla `deploy()` — testy nie zapisuja sekretu HF, wiec
@@ -180,7 +180,7 @@ async fn deploy_embedded_persists_to_services_and_model_registry() {
     let sid = outcome.endpoint.handle.id;
     assert!(sid > 0);
 
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     let row = services_repo::get(&conn, sid)
         .unwrap()
         .expect("services row");
@@ -235,11 +235,11 @@ async fn delete_service_cascades_to_model_registry() {
     let sid = outcome.endpoint.handle.id;
 
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         services_repo::delete(&conn, sid).unwrap();
     }
 
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     assert!(
         services_repo::get(&conn, sid).unwrap().is_none(),
         "service row removed"
@@ -333,7 +333,7 @@ async fn external_deploy_rejects_manifest_without_external_section() {
     );
 
     // The audit row must reflect the failure.
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     let (status, _err): (String, Option<String>) = conn
         .query_row(
             "SELECT status, error_text FROM deployments \

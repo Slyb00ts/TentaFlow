@@ -284,7 +284,7 @@ fn log_pickup(
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
     let result = outcome.log_result();
-    if let Ok(conn) = db.lock() {
+    if let Ok(conn) = db.write() {
         let _ = conn.execute(
             "INSERT INTO frame_pickup_log \
                  (raw_frame_ref, service_id, caller_addon_id, request_id, \

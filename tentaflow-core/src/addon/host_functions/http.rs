@@ -507,7 +507,7 @@ fn approved_destination_match(
 }
 
 fn network_rule_approved(state: &AddonState, rule_id: &str, rule_host: &str, port: u16) -> bool {
-    match state.db.lock() {
+    match state.db.read() {
         Ok(conn) => {
             conn.query_row(
                 "SELECT approved FROM addon_network_rules \
@@ -592,7 +592,7 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
 /// Sprawdza HTTP rate limit addonu przez DB (fallback gdy brak in-memory rate limiter).
 /// CR-008: Fail-closed — w razie bledu DB blokujemy request zamiast go przepuszczac.
 fn check_http_rate_limit(state: &AddonState) -> bool {
-    match state.db.lock() {
+    match state.db.read() {
         Ok(conn) => {
             // Pobierz limit
             let limit: i64 = conn.query_row(
@@ -806,7 +806,7 @@ mod tests {
         );
 
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "INSERT INTO addon_network_rules \
                  (addon_id, rule_id, protocol, host, port, description, required, approved) \
@@ -819,7 +819,7 @@ mod tests {
         assert!(approved_destination_match(&state, "example.com", 443).is_none());
 
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "UPDATE addon_network_rules SET approved = 1 \
                  WHERE addon_id = ?1 AND rule_id = 'example-https'",
@@ -866,7 +866,7 @@ mod tests {
         );
 
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "INSERT INTO addon_network_rules \
                  (addon_id, rule_id, protocol, host, port, description, required, approved) \
@@ -913,7 +913,7 @@ mod tests {
         );
 
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "INSERT INTO addon_network_rules \
                  (addon_id, rule_id, protocol, host, port, description, required, approved) \
@@ -932,7 +932,7 @@ mod tests {
         assert!(!is_safe_url("https://192.168.11.122/mcp"));
 
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "INSERT INTO addon_network_rules \
                  (addon_id, rule_id, protocol, host, port, description, required, approved) \

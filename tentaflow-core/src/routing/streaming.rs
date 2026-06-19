@@ -932,12 +932,12 @@ mod compliance_stream_tests {
     use crate::db::migrations;
     use futures::StreamExt;
     use rusqlite::{params, Connection};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> crate::db::DbPool {
         let conn = Connection::open_in_memory().expect("baza testowa");
         migrations::run(&conn).expect("migracje");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn chunk(text: &str, usage: Option<Usage>) -> ChatCompletionChunk {
@@ -1021,7 +1021,7 @@ mod compliance_stream_tests {
             .is_some()
         {}
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let response_payload: String = conn
             .query_row(
                 "SELECT content_text FROM compliance_ai_payloads WHERE event_id = ?1 AND payload_kind = 'response'",

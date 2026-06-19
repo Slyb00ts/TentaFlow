@@ -601,7 +601,7 @@ pub fn meeting_action_item_status_update(
     // resolve_owned_session_id po meeting_key. Jesli item nie istnieje -> 404
     // (zgodne z update zwracajacym 0 rows).
     let session_id = {
-        let conn = ctx.state.db.lock().unwrap();
+        let conn = ctx.state.db.read().unwrap();
         conn.query_row::<i64, _, _>(
             "SELECT session_id FROM meeting_action_items WHERE id = ?1",
             rusqlite::params![r.item_id],
@@ -612,7 +612,7 @@ pub fn meeting_action_item_status_update(
     let session_id = session_id
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "action item not found"))?;
     let meeting_key: String = {
-        let conn = ctx.state.db.lock().unwrap();
+        let conn = ctx.state.db.read().unwrap();
         conn.query_row(
             "SELECT meeting_key FROM meeting_sessions WHERE id = ?1",
             rusqlite::params![session_id],
@@ -799,7 +799,7 @@ mod tests {
         let sid = repo_tx::get_or_create_session(&state.db, key, Some("u"), Some("Stand-up 22.04"))
             .expect("create session");
         {
-            let conn = state.db.lock().unwrap();
+            let conn = state.db.write().unwrap();
             conn.execute(
                 "UPDATE meeting_sessions SET owner_user_id = ?1, started_at = '2024-04-23 14:22:00' WHERE id = ?2",
                 rusqlite::params![test_uuid(owner), sid],

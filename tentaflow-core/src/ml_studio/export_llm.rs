@@ -162,8 +162,8 @@ fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
     let conn = pool
-        .lock()
-        .map_err(|_| anyhow::anyhow!("core db pool poisoned"))?;
+        .read()
+        .map_err(|_| anyhow::anyhow!("core db read"))?;
     let svcs = services_repo::services::list_by_category(&conn, "training", Some("ml-training"))?;
     let svc = svcs.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!("Serwis ml-training niedostępny — uruchom go w Serwisach")

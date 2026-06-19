@@ -652,16 +652,16 @@ mod tests {
     use crate::flow_engine::node_adapter::AdapterRegistry;
     use crate::flow_engine::subflow_runner::SubflowRunner;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn insert_flow(pool: &DbPool, id: &str, name: &str, flow_json: &str, status: &str) {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO flows (id, name, service_type, flow_json, status, is_default) \
              VALUES (?1, ?2, NULL, ?3, ?4, 0)",
@@ -817,7 +817,7 @@ mod tests {
         // Light-mode body runs must NOT insert a flow_executions row per
         // iteration — 8 iterations leave the table empty (§3.5 block 1).
         let rows: i64 = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r.get(0))
                 .unwrap()
         };

@@ -178,7 +178,7 @@ where
 {
     let captures = {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
         load_pending_core_captures(&conn, limit)?
     };
@@ -187,7 +187,7 @@ where
         match record(capture.clone()) {
             Ok(Some(op_id)) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_core_capture_status(
                     &mut conn,
@@ -201,7 +201,7 @@ where
             Ok(None) => break,
             Err(e) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_core_capture_status(
                     &mut conn,
@@ -223,7 +223,7 @@ where
 /// the write history. Returns the number of rows removed.
 pub fn clear_core_capture_journal(pool: &crate::db::DbPool) -> Result<usize> {
     let conn = pool
-        .lock()
+        .write()
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
     let removed = conn.execute("DELETE FROM __tentaflow_core_sync_captures", [])?;
     Ok(removed)
@@ -339,7 +339,7 @@ mod tests {
     fn migration_creates_core_capture_table() {
         let dir = tempdir().expect("tempdir");
         let db = db::init(&dir.path().join("core.db")).expect("db init");
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
@@ -356,7 +356,7 @@ mod tests {
     fn record_core_capture_round_trips_binary_fields() {
         let dir = tempdir().expect("tempdir");
         let db = db::init(&dir.path().join("core.db")).expect("db init");
-        let mut conn = db.lock().expect("db lock");
+        let mut conn = db.write().expect("db lock");
         let tx = conn.transaction().expect("begin tx");
         // `actor_user_id` is FK-bound to `user_accounts(id)`, so the referenced
         // user must exist before the capture row is inserted.

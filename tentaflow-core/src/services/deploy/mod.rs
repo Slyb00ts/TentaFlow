@@ -136,7 +136,7 @@ impl LogSink {
     }
 
     fn persist_progress(&self, phase: &str, pct: u32, message: Option<&str>) {
-        if let Ok(conn) = self.db.lock() {
+        if let Ok(conn) = self.db.write() {
             let _ = deployments_repo::set_progress(
                 &conn,
                 &self.slug,
@@ -614,7 +614,7 @@ pub async fn stop_all_supervised(
     db: &crate::db::DbPool,
     ports: Arc<PortAllocator>,
 ) -> Vec<(i64, String)> {
-    let services = match db.lock() {
+    let services = match db.read() {
         Ok(conn) => crate::services_repo::services::list_supervised(&conn).unwrap_or_default(),
         Err(_) => return vec![],
     };
@@ -802,15 +802,15 @@ fn is_listener_gone(port: u16) -> bool {
 
 // ----- DB helpers -----------------------------------------------------------
 
-/// Runs a closure inside a single SQLite transaction held under the pool's
-/// mutex. Commits on Ok, rolls back on Err.
+/// Runs a closure inside a single SQLite transaction on the pool's writer
+/// connection. Commits on Ok, rolls back on Err.
 pub(crate) fn with_tx<F, T>(db: &DbPool, f: F) -> DeployResult<T>
 where
     F: FnOnce(&Transaction<'_>) -> DeployResult<T>,
 {
     let mut conn = db
-        .lock()
-        .map_err(|e| DeployError::Database(format!("pool lock poisoned: {}", e)))?;
+        .write()
+        .map_err(|e| DeployError::Database(format!("db write: {}", e)))?;
     let tx = conn
         .transaction()
         .map_err(|e| DeployError::Database(format!("begin tx: {}", e)))?;
@@ -834,7 +834,7 @@ fn mark_service_deploy_failed(
     message: &str,
     interrupted: bool,
 ) {
-    if let Ok(conn) = db.lock() {
+    if let Ok(conn) = db.write() {
         let status = if interrupted {
             ServiceStatus::Interrupted
         } else {
@@ -2538,11 +2538,11 @@ mod tests {
     }
 
     fn open_db() -> DbPool {
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn make_job(
@@ -2641,7 +2641,7 @@ mod tests {
         // Plant a colliding alias before the deploy. The dummy manifest's
         // preset id is "preset-a", so that becomes the planned model name.
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO model_aliases (alias, target_model, is_active) \
                  VALUES (?1, ?2, 1)",
@@ -2678,7 +2678,7 @@ mod tests {
 
         // Audit row was created and marked failed — paper trail must
         // exist even when the deploy is rejected pre-strategy.
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let (status, error_text): (String, Option<String>) = conn
             .query_row(
                 "SELECT status, error_message FROM deployments WHERE engine_id = 'emb-collide'",
@@ -2716,7 +2716,7 @@ mod tests {
         assert!(outcome.endpoint.handle.id > 0);
         assert_eq!(outcome.endpoint.transport, Transport::Embedded);
         // model_registry row was created with the service_id linked
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM model_registry WHERE service_id = ?1",
@@ -2750,7 +2750,7 @@ mod tests {
         .expect("seed deploy succeeds");
 
         let count_before: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
                 .unwrap()
         };
@@ -2775,7 +2775,7 @@ mod tests {
         assert!(matches!(err, DeployError::Manifest(_)));
 
         let count_after: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row("SELECT COUNT(*) FROM services", [], |r| r.get(0))
                 .unwrap()
         };
@@ -2916,7 +2916,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let svc_config: String = conn
             .query_row(
                 "SELECT config_json FROM services WHERE id = ?1",
@@ -2977,7 +2977,7 @@ mod tests {
         assert!(res.is_err(), "deploy should fail when binary path invalid");
 
         // deployments row exists with status=failed.
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let (status, err): (String, Option<String>) = conn
             .query_row(
                 "SELECT status, error_message FROM deployments WHERE engine_id = 'bin-err' ORDER BY id DESC LIMIT 1",

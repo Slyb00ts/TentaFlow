@@ -44,7 +44,7 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 #[test]
 fn v32_creates_organizations_with_default_org() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let n_org: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='organizations'",
@@ -68,7 +68,7 @@ fn v32_creates_organizations_with_default_org() {
 #[test]
 fn v32_seeds_5_standard_roles() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let count: i64 = conn
         .query_row("SELECT count(*) FROM roles", [], |r| r.get(0))
         .unwrap();
@@ -104,7 +104,7 @@ fn v32_backfills_existing_rows_to_default_org() {
     // is the only reliable way to inject a NULL row given that the migration
     // chain runs unconditionally on first open.
     let pool = db::init(&path).expect("init");
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT INTO audit_log (action, severity, org_id) VALUES (?1, 'info', NULL)",
         params!["pre-v32-event"],
@@ -176,7 +176,7 @@ fn v32_idempotent_on_re_run() {
     // second `init` reopens the connection).
     drop(_pool1);
     let pool2 = db::init(&path).expect("second init noop");
-    let conn = pool2.lock().unwrap();
+    let conn = pool2.read().unwrap();
 
     let n_default: i64 = conn
         .query_row(
@@ -205,7 +205,7 @@ fn v32_idempotent_on_re_run() {
 #[test]
 fn v32_adds_indexes() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     for table in &[
         "users",
         "addons",
@@ -229,7 +229,7 @@ fn v32_adds_indexes() {
 #[test]
 fn v32_recorded_in_migrations_ledger() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let exists: i64 = conn
         .query_row(
             "SELECT count(*) FROM _migrations WHERE version=32",

@@ -14,7 +14,7 @@ use super::models::{
 /// project the user is not a member of is invisible here.
 pub fn list_projects(user_id: &str) -> Result<Vec<ProjectSummary>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
@@ -56,7 +56,7 @@ pub fn create_project(
 
     let project_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO projects \
@@ -89,7 +89,7 @@ pub fn create_project(
 /// non-member cannot probe a project's existence by id.
 pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSummary>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     conn.query_row(
         "SELECT p.project_id, p.name, p.description, p.project_type, p.status, \
                 p.owner_user_id, p.org_id, p.created_at, p.updated_at, \
@@ -113,7 +113,7 @@ pub fn get_project(user_id: &str, project_id: &str) -> Result<Option<ProjectSumm
 /// role always grants the access tied to that role.
 pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     conn.query_row(
         "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
         params![project_id, user_id],
@@ -127,7 +127,7 @@ pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
 /// authorization is enforced here; callers gate visibility.
 pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT project_id, user_id, role, status, invited_by, created_at \
          FROM project_members \
@@ -152,7 +152,7 @@ pub fn resolve_display_names(
     let Some(core) = crate::db::global_pool() else {
         return out;
     };
-    let Ok(conn) = core.lock() else {
+    let Ok(conn) = core.read() else {
         return out;
     };
     for id in user_ids {
@@ -193,7 +193,7 @@ pub fn invite_member(
     }
 
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     require_owner(&conn, project_id, inviter_user_id)?;
 
     let existing: Option<String> = conn
@@ -237,7 +237,7 @@ pub fn remove_member(
     target_user_id: &str,
 ) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     require_owner(&conn, project_id, requester_user_id)?;
 
     let target_role = conn
@@ -271,7 +271,7 @@ pub fn set_member_role(
         .ok_or_else(|| anyhow::anyhow!("role must be 'editor' or 'viewer'"))?;
 
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     require_owner(&conn, project_id, requester_user_id)?;
 
     let target_role = conn
@@ -368,7 +368,7 @@ pub fn create_dataset(
 
     let dataset_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     require_member(&conn, project_id, user_id)?;
     conn.execute(
         "INSERT INTO datasets \
@@ -397,7 +397,7 @@ pub fn create_dataset(
 /// Lists datasets of a project, newest first. Authorization by membership.
 pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     require_member(&conn, project_id, user_id)?;
     let mut stmt = conn.prepare(
         "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
@@ -413,7 +413,7 @@ pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
 /// its project, so a non-member cannot probe dataset ids.
 pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let dataset: Option<Dataset> = conn
         .query_row(
             "SELECT dataset_id, project_id, name, kind, row_count, column_count, profile_json, created_at \
@@ -437,7 +437,7 @@ pub fn get_dataset(user_id: &str, dataset_id: &str) -> Result<Option<Dataset>> {
 /// `raw_data` migration). The bytes feed tabular training.
 pub fn get_dataset_raw(user_id: &str, dataset_id: &str) -> Result<Vec<u8>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let row: Option<(String, Option<Vec<u8>>)> = conn
         .query_row(
             "SELECT project_id, raw_data FROM datasets WHERE dataset_id = ?1",
@@ -473,7 +473,7 @@ pub fn record_training_result(
     let run_id = uuid::Uuid::new_v4().to_string();
     let model_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO models \
@@ -505,7 +505,7 @@ pub fn record_training_result(
 pub fn create_training_run(project_id: &str, config_json: &str) -> Result<String> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "INSERT INTO training_runs (run_id, project_id, status, config_json, started_at) \
          VALUES (?1, ?2, 'running', ?3, datetime('now'))",
@@ -518,7 +518,7 @@ pub fn create_training_run(project_id: &str, config_json: &str) -> Result<String
 /// `succeeded`/`failed`), ustawia także `finished_at`, bo run się zakończył.
 pub fn update_training_run_status(run_id: &str, status: &str) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     if status == "running" {
         conn.execute(
             "UPDATE training_runs SET status = ?2 WHERE run_id = ?1",
@@ -539,7 +539,7 @@ pub fn update_training_run_status(run_id: &str, status: &str) -> Result<()> {
 /// metadana runu, a config_json jest jego workiem na metadane.
 pub fn set_training_run_error(run_id: &str, error: &str) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "UPDATE training_runs SET config_json = json_set(config_json, '$.error', ?2) \
          WHERE run_id = ?1",
@@ -551,7 +551,7 @@ pub fn set_training_run_error(run_id: &str, error: &str) -> Result<()> {
 /// Wiąże run z wytrenowanym modelem (po sukcesie treningu).
 pub fn set_training_run_model(run_id: &str, model_id: &str) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "UPDATE training_runs SET model_id = ?2 WHERE run_id = ?1",
         params![run_id, model_id],
@@ -563,7 +563,7 @@ pub fn set_training_run_model(run_id: &str, model_id: &str) -> Result<()> {
 /// danego kroku. Wołane na żywo z taska w tle przy każdym statusie z serwisu.
 pub fn record_training_metric(run_id: &str, step: i64, key: &str, value: f64) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "INSERT INTO metrics_history (run_id, step, metric_key, metric_value) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -585,7 +585,7 @@ pub fn insert_model(
 ) -> Result<String> {
     let model_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "INSERT INTO models \
              (model_id, project_id, name, framework, base_model, metrics_json, status) \
@@ -612,7 +612,7 @@ pub struct ModelRow {
 /// dostęp przez `project_id` (członkostwo w projekcie). Zwraca `None` gdy brak.
 pub fn get_model(model_id: &str) -> Result<Option<ModelRow>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let row = conn
         .query_row(
             "SELECT model_id, project_id, name, framework, base_model, metrics_json, status \
@@ -638,7 +638,7 @@ pub fn get_model(model_id: &str) -> Result<Option<ModelRow>> {
 /// stanu (`export_status`/`gguf_path`/...) wmergowanego w istniejący JSON metryk.
 pub fn update_model_metrics(model_id: &str, metrics_json: &str) -> Result<()> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     conn.execute(
         "UPDATE models SET metrics_json = ?1 WHERE model_id = ?2",
         params![metrics_json, model_id],
@@ -661,7 +661,7 @@ pub struct TrainingRunRow {
 /// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
 pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let row = conn
         .query_row(
             "SELECT run_id, project_id, model_id, status, config_json, started_at, finished_at \
@@ -689,7 +689,7 @@ pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
 /// metryka dla danego kroku zostaje `None`.
 pub fn loss_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT step, metric_key, metric_value FROM metrics_history \
          WHERE run_id = ?1 AND metric_key IN ('train_loss', 'eval_loss') \
@@ -727,7 +727,7 @@ pub fn loss_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<
 /// metryk recognition (`train_loss` + `map50`).
 pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option<f64>)>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT step, metric_key, metric_value FROM metrics_history \
          WHERE run_id = ?1 AND metric_key IN ('train_loss', 'map50') \
@@ -761,7 +761,7 @@ pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option
 /// Returns the number of registered models for a project.
 pub fn count_models_per_project(project_id: &str) -> Result<u32> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM models WHERE project_id = ?1",
         params![project_id],
@@ -799,8 +799,8 @@ fn validate_grant_subject(
             let core = crate::db::global_pool()
                 .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
             let core_conn = core
-                .lock()
-                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+                .read()
+                .map_err(|e| anyhow::anyhow!("core db read: {e}"))?;
             let exists = core_conn
                 .query_row(
                     "SELECT 1 FROM user_accounts WHERE id = ?1",
@@ -817,8 +817,8 @@ fn validate_grant_subject(
             let core = crate::db::global_pool()
                 .ok_or_else(|| anyhow::anyhow!("core directory unavailable"))?;
             let core_conn = core
-                .lock()
-                .map_err(|e| anyhow::anyhow!("core db lock: {e}"))?;
+                .read()
+                .map_err(|e| anyhow::anyhow!("core db read: {e}"))?;
             let exists = core_conn
                 .query_row(
                     "SELECT 1 FROM user_groups WHERE id = ?1",
@@ -867,7 +867,7 @@ pub fn create_grant(
 
     let grant_id = uuid::Uuid::new_v4().to_string();
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     validate_grant_subject(&conn, subject_kind, subject_id)?;
     conn.execute(
         "INSERT INTO resource_grants \
@@ -898,7 +898,7 @@ pub fn create_grant(
 /// gate visibility by project membership.
 pub fn list_training_runs(project_id: &str) -> Result<Vec<TrainingRunSummary>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT run_id, model_id, status, config_json, started_at, finished_at \
          FROM training_runs WHERE project_id = ?1 \
@@ -913,7 +913,7 @@ pub fn list_training_runs(project_id: &str) -> Result<Vec<TrainingRunSummary>> {
 /// gate visibility by project membership.
 pub fn list_models(project_id: &str) -> Result<Vec<ModelSummary>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT model_id, name, framework, base_model, status, metrics_json, created_at \
          FROM models WHERE project_id = ?1 \
@@ -951,7 +951,7 @@ fn read_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelSummary> {
 /// scoping. Caller gates visibility (admin-only).
 pub fn list_grants() -> Result<Vec<ResourceGrant>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
          FROM resource_grants ORDER BY created_at DESC, grant_id",
@@ -964,7 +964,7 @@ pub fn list_grants() -> Result<Vec<ResourceGrant>> {
 /// Lists grants targeting one specific subject (`kind`/`id`), newest first.
 pub fn list_grants_for_subject(kind: &str, id: &str) -> Result<Vec<ResourceGrant>> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT grant_id, subject_kind, subject_id, node_id, resource_kind, resource_ref, quota, granted_by, created_at \
          FROM resource_grants WHERE subject_kind = ?1 AND subject_id = ?2 \
@@ -983,7 +983,7 @@ pub fn list_grants_for_project(project_id: &str) -> Result<Vec<ResourceGrant>> {
 /// Removes a grant by id. Returns `true` when a row was deleted.
 pub fn revoke_grant(grant_id: &str) -> Result<bool> {
     let pool = super::db::pool()?;
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
     let affected = conn.execute(
         "DELETE FROM resource_grants WHERE grant_id = ?1",
         params![grant_id],

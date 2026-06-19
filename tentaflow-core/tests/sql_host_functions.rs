@@ -256,7 +256,7 @@ fn migration_idempotent_reapply_skipped() {
     assert_eq!(n2, 0, "drugi run nie aplikuje");
 
     // Wpis w core DB widoczny ze status success.
-    let conn = core.lock().unwrap();
+    let conn = core.read().unwrap();
     let (status, hash): (String, String) = conn
         .query_row(
             "SELECT status, migration_hash FROM addon_migrations_applied WHERE addon_id='sql-idem'",
@@ -478,7 +478,7 @@ fn uninstall_clears_addon_migrations_applied() {
 
     // Sanity: wpis istnieje.
     {
-        let conn = core.lock().unwrap();
+        let conn = core.read().unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM addon_migrations_applied WHERE addon_id='re-install'",
@@ -492,7 +492,7 @@ fn uninstall_clears_addon_migrations_applied() {
     // Aby uninstall przeszedl, musi istniec wpis w `addons` — dorzucamy go
     // explicite (apply_migrations samo nie rejestruje addona).
     {
-        let conn = core.lock().unwrap();
+        let conn = core.write().unwrap();
         conn.execute(
             "INSERT INTO addons (addon_id, name, version, manifest_json) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params!["re-install", "Re Install", "0.1.0", "{}"],
@@ -503,7 +503,7 @@ fn uninstall_clears_addon_migrations_applied() {
     tentaflow_core::addon::lifecycle::uninstall("re-install", &core).unwrap();
 
     {
-        let conn = core.lock().unwrap();
+        let conn = core.read().unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM addon_migrations_applied WHERE addon_id='re-install'",

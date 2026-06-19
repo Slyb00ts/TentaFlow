@@ -482,7 +482,7 @@ mod tests {
         // fresh DB read would now reject. The cache hit on the second call
         // must replay the original allow.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE policy_claims SET claim_type = ?1 WHERE claim_id = 'c1'",
                 rusqlite::params!["consent"],
@@ -529,7 +529,7 @@ mod tests {
         // org-a's cached allow stays; org-b must still go to the DB and see
         // the revocation.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE policy_claims SET revoked_at = '2026-02-01T00:00:00Z', \
                   revoked_reason = 'oob' WHERE claim_id = 'c1'",

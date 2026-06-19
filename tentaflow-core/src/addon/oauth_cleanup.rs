@@ -57,7 +57,7 @@ mod tests {
 
         // Insert one expired row (ttl=0 is clamped, we inject directly).
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO oauth_pending_states \
                  (state, user_id, addon_id, provider_id, mode, code_verifier, redirect_after, expires_at) \
@@ -76,7 +76,7 @@ mod tests {
         assert_eq!(removed, 1, "exactly one expired row must be removed");
 
         // Fresh row still present.
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let remaining: i64 = conn
             .query_row("SELECT COUNT(*) FROM oauth_pending_states", [], |row| {
                 row.get(0)

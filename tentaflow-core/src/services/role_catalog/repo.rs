@@ -217,7 +217,7 @@ const SELECT_COLUMNS: &str = "id, org_id, slug, kind, name_translations, \
 /// Zwraca `NoActiveLocales` gdy lista jest pusta — adminowi nie wolno tworzyc
 /// rol bez chocby jednego jezyka platformy.
 pub fn list_active_locale_codes(pool: &DbPool, org_id: &str) -> Result<Vec<String>> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.read().map_err(map_db)?;
     let mut stmt = conn
         .prepare(
             "SELECT code FROM platform_locales \
@@ -244,7 +244,7 @@ pub fn list_active_locale_codes(pool: &DbPool, org_id: &str) -> Result<Vec<Strin
 /// `NoActiveLocales` gdy lista jest pusta — analogicznie do
 /// `list_active_locale_codes`.
 pub fn list_active_locales(pool: &DbPool, org_id: &str) -> Result<Vec<PlatformLocale>> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.read().map_err(map_db)?;
     let mut stmt = conn
         .prepare(
             "SELECT id, org_id, code, display_name, is_default, is_active \
@@ -277,7 +277,7 @@ pub fn list_active_locales(pool: &DbPool, org_id: &str) -> Result<Vec<PlatformLo
 
 /// Pobiera role po `(org_id, id)`. Zwraca `NotFound` gdy brak.
 pub fn get_role(pool: &DbPool, org_id: &str, id: &str) -> Result<Role> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.read().map_err(map_db)?;
     let sql = format!("SELECT {SELECT_COLUMNS} FROM role_catalog WHERE org_id = ?1 AND id = ?2",);
     let row = conn
         .query_row(&sql, params![org_id, id], row_to_role)
@@ -291,7 +291,7 @@ pub fn get_role(pool: &DbPool, org_id: &str, id: &str) -> Result<Role> {
 
 /// Pobiera role po `(org_id, slug)`. Zwraca `NotFound` gdy brak.
 pub fn get_role_by_slug(pool: &DbPool, org_id: &str, slug: &str) -> Result<Role> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.read().map_err(map_db)?;
     let sql = format!("SELECT {SELECT_COLUMNS} FROM role_catalog WHERE org_id = ?1 AND slug = ?2",);
     let row = conn
         .query_row(&sql, params![org_id, slug], row_to_role)
@@ -311,7 +311,7 @@ pub fn get_role_by_slug(pool: &DbPool, org_id: &str, slug: &str) -> Result<Role>
 /// admin UI z paroma setkami rol; dla wiekszych zbiorow czesc tekstowa
 /// powinna byc przeniesiona do FTS5 w osobnej iteracji.
 pub fn list_roles(pool: &DbPool, org_id: &str, filter: RoleListFilter) -> Result<Vec<Role>> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.read().map_err(map_db)?;
 
     let mut where_sql = String::from("WHERE org_id = ?1");
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org_id.to_string())];
@@ -397,7 +397,7 @@ pub fn create_role(pool: &DbPool, actor_user_id: &str, input: RoleCreateInput) -
     validate_icon(input.icon.as_deref())?;
     validate_color_hint(input.color_hint.as_deref())?;
 
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.write().map_err(map_db)?;
 
     let exists: Option<i64> = conn
         .query_row(
@@ -543,7 +543,7 @@ pub fn update_role(
     );
 
     {
-        let conn = pool.lock().map_err(map_db)?;
+        let conn = pool.write().map_err(map_db)?;
         let params_dyn: Vec<&dyn rusqlite::ToSql> = binds
             .iter()
             .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -566,7 +566,7 @@ pub fn update_role(
 pub fn deactivate_role(pool: &DbPool, actor_user_id: &str, org_id: &str, id: &str) -> Result<()> {
     let now = now_utc();
     let affected = {
-        let conn = pool.lock().map_err(map_db)?;
+        let conn = pool.write().map_err(map_db)?;
         conn.execute(
             "UPDATE role_catalog SET is_active = 0, updated_at = ?1 \
              WHERE org_id = ?2 AND id = ?3 AND is_active = 1",

@@ -64,7 +64,7 @@ fn do_alias_get(
 ) -> Result<AliasInfoOut, AbiError> {
     enforce_payload_size(alias_id.len(), PayloadKind::SqlCombined)?;
     validate_alias_id(alias_id).map_err(|_| AbiError::Operation)?;
-    let conn = db.lock().map_err(|_| AbiError::Operation)?;
+    let conn = db.read().map_err(|_| AbiError::Operation)?;
     let row: Option<AliasCoreRow> = conn
         .query_row(
             "SELECT a.id, a.alias, a.target_model, a.fallback_targets, a.strategy, a.is_active, \
@@ -184,7 +184,7 @@ fn build_alias_info(
 // =============================================================================
 
 fn do_alias_list_owned(db: &DbPool, caller_addon_id: &str) -> Result<Vec<AliasInfoOut>, AbiError> {
-    let conn = db.lock().map_err(|_| AbiError::Operation)?;
+    let conn = db.read().map_err(|_| AbiError::Operation)?;
     let mut stmt = conn
         .prepare(
             "SELECT a.id, a.alias, a.target_model, a.fallback_targets, a.strategy, a.is_active, \

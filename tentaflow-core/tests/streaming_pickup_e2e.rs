@@ -81,7 +81,7 @@ fn mk_frame(camera_id: &str, width: u32, height: u32, payload: Vec<u8>) -> Store
 }
 
 fn frame_pickup_log_count(db: &DbPool, result_kind: &str) -> i64 {
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db lock");
     conn.query_row(
         "SELECT COUNT(*) FROM frame_pickup_log WHERE result = ?1",
         rusqlite::params![result_kind],

@@ -18,7 +18,7 @@
 #![cfg(feature = "camera")]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use parking_lot::Mutex as ParkingMutex;
 use tentaflow_core::addon::event_bus::EventBus;
@@ -46,7 +46,7 @@ fn create_test_db() -> db::DbPool {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .expect("pragmas");
     db::migrations::run(&conn).expect("migrations");
-    Arc::new(Mutex::new(conn))
+    Arc::new(db::Db::from_connection(conn))
 }
 
 fn load_wasm() -> Option<Vec<u8>> {
@@ -189,7 +189,7 @@ struct AuditEntry {
 }
 
 fn fetch_audit_entries(db: &db::DbPool, action_prefix: &str) -> Vec<AuditEntry> {
-    let conn = db.lock().expect("lock db");
+    let conn = db.read().expect("read db");
     let mut stmt = conn
         .prepare(
             "SELECT action, resource_id, result, error_message, risk_class \

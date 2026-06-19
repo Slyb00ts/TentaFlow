@@ -1189,7 +1189,7 @@ async fn handle_child_command(
         }
         ["READ_FLOW_HLC"] => {
             let conn = db
-                .lock()
+                .read()
                 .map_err(|error| anyhow::anyhow!("db lock failed: {error}"))?;
             let hlc = conn
                 .query_row(
@@ -1801,7 +1801,7 @@ fn local_materialize_flow(
     name: &str,
 ) -> anyhow::Result<()> {
     let conn = db
-        .lock()
+        .write()
         .map_err(|error| anyhow::anyhow!("db lock failed: {error}"))?;
     conn.execute(
         "INSERT INTO flows (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
@@ -2290,7 +2290,7 @@ async fn wait_for_sql_conflict() -> anyhow::Result<()> {
 
 fn core_suite_status(db: &tentaflow_core::db::DbPool) -> anyhow::Result<String> {
     let conn = db
-        .lock()
+        .read()
         .map_err(|error| anyhow::anyhow!("db lock failed: {error}"))?;
     let org_name = conn
         .query_row(

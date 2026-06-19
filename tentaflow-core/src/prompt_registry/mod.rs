@@ -183,7 +183,7 @@ impl PromptRegistry {
 
     /// Laduje prompty z bazy danych do rejestru
     pub fn load_from_db(&mut self, pool: &crate::db::DbPool) {
-        let conn = match pool.lock() {
+        let conn = match pool.read() {
             Ok(c) => c,
             Err(e) => {
                 warn!("Nie mozna uzyskac polaczenia z DB dla promptow: {}", e);

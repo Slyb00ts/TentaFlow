@@ -1,7 +1,9 @@
 // =============================================================================
 // Plik: addon/host_functions/storage.rs
 // Opis: Host functions Storage API — sandboxowany key-value store per addon.
-//       Kazdy addon widzi tylko swoje dane, izolacja przez addon_id + instance_id.
+//       Kazdy addon widzi tylko swoje dane, izolacja przez addon_id + klucz
+//       zakresu (org lub org+user, patrz AddonState::storage_scope_key) trzymany
+//       w kolumnie `instance_id`. Klucz jest niezalezny od instancji WASM.
 // Uprawnienia: "storage" (get/set/delete/list). Fail-closed — brak uprawnienia
 //              blokuje dostep do storage zanim dotknie DB. Scoping per addon_id
 //              jest wymuszony przez zapytania SQL.
@@ -79,7 +81,10 @@ pub fn storage_get(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let instance_id = caller.data().instance_id.clone();
+    // Storage scope key (org- or user-scoped, per manifest) — NOT the WASM
+    // instance id. Carried through the `instance_id`-named DB column / proxy
+    // field so multiple pooled instances of the same scope share storage.
+    let instance_id = caller.data().storage_scope_key();
     let org_id = caller
         .data()
         .org_id
@@ -126,9 +131,9 @@ pub fn storage_get(
 
     // Pobierz z DB
     let value: Option<Vec<u8>> = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => {
-                // VULN-037: Strict per-instance isolation — bez fallback na instance_id IS NULL
+                // Strict scope isolation — exact (addon_id, scope_key) match, bez fallbacku
                 conn.query_row(
                     "SELECT storage_value FROM addon_storage \
                      WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
@@ -239,7 +244,10 @@ pub fn storage_set(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let instance_id = caller.data().instance_id.clone();
+    // Storage scope key (org- or user-scoped, per manifest) — NOT the WASM
+    // instance id. Carried through the `instance_id`-named DB column / proxy
+    // field so multiple pooled instances of the same scope share storage.
+    let instance_id = caller.data().storage_scope_key();
     let org_id = caller
         .data()
         .org_id
@@ -288,7 +296,7 @@ pub fn storage_set(
 
     // Sprawdz limit storage
     let within_limit = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => {
                 // Pobierz aktualny rozmiar storage addonu
                 let current_size: i64 = conn.query_row(
@@ -336,7 +344,7 @@ pub fn storage_set(
 
     // CR-009: Sprawdz limit liczby kluczy per addon
     let key_count_ok = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => {
                 let count: i64 = conn
                     .query_row(
@@ -377,7 +385,7 @@ pub fn storage_set(
 
     // Zapisz w DB (INSERT OR REPLACE)
     let result = {
-        match caller.data().db.lock() {
+        match caller.data().db.write() {
             Ok(mut conn) => {
                 let tx = match conn.transaction() {
                     Ok(tx) => tx,
@@ -467,7 +475,10 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let instance_id = caller.data().instance_id.clone();
+    // Storage scope key (org- or user-scoped, per manifest) — NOT the WASM
+    // instance id. Carried through the `instance_id`-named DB column / proxy
+    // field so multiple pooled instances of the same scope share storage.
+    let instance_id = caller.data().storage_scope_key();
     let org_id = caller
         .data()
         .org_id
@@ -520,7 +531,7 @@ pub fn storage_delete(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_
     );
 
     let result = {
-        match caller.data().db.lock() {
+        match caller.data().db.write() {
             Ok(mut conn) => {
                 let tx = match conn.transaction() {
                     Ok(tx) => tx,
@@ -644,7 +655,10 @@ pub fn storage_list(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let instance_id = caller.data().instance_id.clone();
+    // Storage scope key (org- or user-scoped, per manifest) — NOT the WASM
+    // instance id. Carried through the `instance_id`-named DB column / proxy
+    // field so multiple pooled instances of the same scope share storage.
+    let instance_id = caller.data().storage_scope_key();
     let org_id = caller
         .data()
         .org_id
@@ -693,7 +707,7 @@ pub fn storage_list(
     }
 
     let keys: Vec<String> = {
-        let conn = match caller.data().db.lock() {
+        let conn = match caller.data().db.read() {
             Ok(c) => c,
             Err(_) => return ABI_ERR_OPERATION,
         };

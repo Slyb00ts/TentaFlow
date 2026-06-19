@@ -5,7 +5,7 @@
 //       the full ChatMessage structure (tool_calls, tool_call_id, name,
 //       multimodal parts) that the old in-memory text cache used to drop, and
 //       survives restarts. DB work runs on a blocking pool thread because the
-//       rusqlite connection behind `DbPool` is a blocking Mutex<Connection>.
+//       rusqlite connection behind `DbPool` uses blocking locks.
 // =============================================================================
 
 use anyhow::{anyhow, Result};
@@ -147,7 +147,7 @@ mod tests {
             .await
             .unwrap();
         {
-            let conn = store.db.lock().unwrap();
+            let conn = store.db.write().unwrap();
             let affected = conn
                 .execute(
                     "INSERT OR IGNORE INTO conversation_messages
@@ -186,7 +186,7 @@ mod tests {
         // The queryable pointer columns are filled and the full Parts content
         // still round-trips through `recent`.
         let (payload_ref, payload_kind): (Option<String>, Option<String>) = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             conn.query_row(
                 "SELECT payload_ref, payload_kind FROM conversation_messages WHERE session_id='s'",
                 [],

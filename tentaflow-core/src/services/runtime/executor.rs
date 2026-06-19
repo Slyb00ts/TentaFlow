@@ -772,7 +772,7 @@ impl ModelRuntimeExecutor {
             return ToolCallModeLookup::NoOverride;
         };
         tokio::task::spawn_blocking(move || {
-            let Ok(conn) = db.lock() else {
+            let Ok(conn) = db.read() else {
                 return ToolCallModeLookup::Failed;
             };
             let svc = match crate::services_repo::services::get(&conn, service_id) {

@@ -18,7 +18,7 @@ fn open() -> (TempDir, tentaflow_core::db::DbPool) {
 #[test]
 fn migrations_v40_v41_recorded() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let v40: i64 = conn
         .query_row(
             "SELECT count(*) FROM _migrations WHERE version = 40",
@@ -40,7 +40,7 @@ fn migrations_v40_v41_recorded() {
 #[test]
 fn platform_locales_seed_pl_and_en() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
 
     let count: i64 = conn
         .query_row(
@@ -73,7 +73,7 @@ fn platform_locales_seed_pl_and_en() {
 #[test]
 fn role_catalog_seeds_14_roles_with_pl_en_translations() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
 
     let count: i64 = conn
         .query_row(
@@ -151,7 +151,7 @@ fn role_catalog_seeds_14_roles_with_pl_en_translations() {
 #[test]
 fn role_catalog_contains_expected_slugs() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let mut stmt = conn
         .prepare("SELECT slug FROM role_catalog WHERE org_id = 'org-default' ORDER BY slug")
         .unwrap();
@@ -190,7 +190,7 @@ fn role_catalog_contains_expected_slugs() {
 #[test]
 fn role_catalog_unique_slug_per_org_enforced() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
 
     // Probujemy zduplikowac slug — UNIQUE (org_id, slug) musi to zablokowac.
     let res = conn.execute(
@@ -208,7 +208,7 @@ fn role_catalog_unique_slug_per_org_enforced() {
 #[test]
 fn platform_locales_one_default_per_org_enforced() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
 
     // Proba dodania drugiego is_default = 1 dla tej samej organizacji.
     let res = conn.execute(
@@ -225,7 +225,7 @@ fn platform_locales_one_default_per_org_enforced() {
 #[test]
 fn role_catalog_check_kind_enforced() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
 
     let res = conn.execute(
         "INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description_translations) \
@@ -239,7 +239,7 @@ fn role_catalog_check_kind_enforced() {
 #[test]
 fn role_catalog_json_valid_enforced() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
 
     let res = conn.execute(
         "INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description_translations) \
@@ -253,7 +253,7 @@ fn role_catalog_json_valid_enforced() {
 #[test]
 fn role_catalog_is_manager_flags() {
     let (_d, pool) = open();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
 
     // Wg specyfikacji: sales_lead, section_director, sales_director, ceo
     // sa managerami; reszta nie.

@@ -127,8 +127,8 @@ pub fn verify_ui_component_bundle(
 /// signature module owns its single source of "is this key trusted?").
 pub fn is_publisher_trusted(pool: &DbPool, key_b64: &str) -> Result<bool, SignatureError> {
     let conn = pool
-        .lock()
-        .map_err(|e| SignatureError::TrustStoreError(format!("lock poisoned: {e}")))?;
+        .read()
+        .map_err(|e| SignatureError::TrustStoreError(format!("db read: {e}")))?;
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM trusted_publishers WHERE key_b64 = ?1",
@@ -150,7 +150,7 @@ pub fn truncate_pk_for_audit(pk_b64: &str) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     // Deterministic key derivation for tests — XOR a counter into a fixed
@@ -168,11 +168,11 @@ mod tests {
     fn make_pool() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("open mem");
         crate::db::migrations::run(&conn).expect("migrate");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn trust(pool: &DbPool, pk_b64: &str) {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO trusted_publishers (key_b64, label, added_at) VALUES (?1, 'test', '2026-01-01T00:00:00Z')",
             rusqlite::params![pk_b64],

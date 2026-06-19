@@ -39,7 +39,7 @@ fn index_exists(conn: &Connection, name: &str) -> bool {
 #[test]
 fn migrations_v8_v12_tables_created() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
 
     for tbl in &[
         "model_alias_owners",
@@ -55,7 +55,7 @@ fn migrations_v8_v12_tables_created() {
 #[test]
 fn migrations_v8_v12_indexes_created() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
 
     for idx in &[
         "idx_alias_owners_addon",
@@ -77,7 +77,7 @@ fn migrations_v8_v12_indexes_created() {
 #[test]
 fn migrations_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
 
     let count: i64 = conn
         .query_row(
@@ -95,14 +95,14 @@ fn migrations_idempotent_second_init_noop() {
     let path = dir.path().join("test.db");
     let pool1 = db::init(&path).expect("first init");
     let v_first: i64 = pool1
-        .lock()
+        .read()
         .unwrap()
         .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
         .expect("max v");
     drop(pool1);
 
     let pool2 = db::init(&path).expect("second init");
-    let conn = pool2.lock().unwrap();
+    let conn = pool2.read().unwrap();
     let v_second: i64 = conn
         .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
         .expect("max v");
@@ -117,7 +117,7 @@ fn migrations_idempotent_second_init_noop() {
 #[test]
 fn alias_calls_check_constraint_rejects_invalid_result() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model) VALUES ('a1', 'm1')",
         [],
@@ -150,7 +150,7 @@ fn alias_calls_check_constraint_rejects_invalid_result() {
 #[test]
 fn model_alias_owners_check_constraint_rejects_invalid_type() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model) VALUES ('a2', 'm2')",
         [],
@@ -180,7 +180,7 @@ fn model_alias_owners_check_constraint_rejects_invalid_type() {
 #[test]
 fn fk_cascade_delete_alias_clears_owners_and_calls() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model) VALUES ('a3', 'm3')",
         [],
@@ -230,7 +230,7 @@ fn fk_cascade_delete_alias_clears_owners_and_calls() {
 #[test]
 fn addon_migrations_applied_primary_key_idempotent() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
 
     conn.execute(
         "INSERT INTO addon_migrations_applied \
@@ -259,7 +259,7 @@ fn migration_v13_backfills_teams_bot_owner() {
     // aliases and re-apply v13 — the backfill must reinsert them.
     let (_dir, pool) = open_db();
     {
-        let conn = pool.lock().expect("lock");
+        let conn = pool.write().expect("write");
         for alias in &[
             "teams-stt",
             "teams-tts",
@@ -300,7 +300,7 @@ fn migration_v13_backfills_teams_bot_owner() {
 #[test]
 fn migration_v13_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 13",

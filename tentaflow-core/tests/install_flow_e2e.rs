@@ -89,12 +89,12 @@ fn uses_model(id: &str, required: bool, reason: &str) -> UsesModelSpec {
 }
 
 fn count_no_params(db: &DbPool, sql: &str) -> i64 {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
 }
 
 fn grant_status(db: &DbPool, addon_id: &str, alias_target_name: &str) -> Option<String> {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     conn.query_row(
         "SELECT grant_status FROM addon_uses_alias \
          WHERE addon_id = ?1 AND alias_target_name = ?2",
@@ -147,7 +147,7 @@ async fn owner_install_writes_alias_owner_and_visibility_rows() {
 
     // model_alias_visibility: public + restricted.
     let visibilities: Vec<(String, String)> = {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT ma.alias, mv.visibility \
@@ -465,7 +465,7 @@ async fn uses_model_pending_for_unknown_model() {
     .unwrap();
 
     let status: String = {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         conn.query_row(
             "SELECT grant_status FROM addon_uses_model \
              WHERE addon_id = 'model-consumer' AND model_target_name = 'unknown-model-xyz'",

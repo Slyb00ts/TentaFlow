@@ -172,7 +172,7 @@ fn audit_log_carries_org_id_from_addon_state() {
         None,
     );
 
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let mut stmt = conn
         .prepare("SELECT resource_id, org_id FROM audit_log WHERE action = 'test.action' ORDER BY id ASC")
         .unwrap();
@@ -203,7 +203,7 @@ fn audit_log_defaults_org_to_default_when_state_unset() {
         "ok",
         None,
     );
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let org_id: Option<String> = conn
         .query_row(
             "SELECT org_id FROM audit_log WHERE resource_id = 'boot-1'",

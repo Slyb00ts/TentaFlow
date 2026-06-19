@@ -38,7 +38,7 @@ fn fresh_chain_verifies_clean() {
         .expect("write audit row");
     }
 
-    let conn = pool.lock().expect("db lock");
+    let conn = pool.read().expect("db read");
     let report = verify_chain(&conn).expect("verify ok");
     assert_eq!(report.total, 5, "report: {:?}", report);
     assert_eq!(report.chained_ok, 5, "report: {:?}", report);
@@ -85,7 +85,7 @@ fn tampering_action_is_detected() {
     .unwrap();
 
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE audit_log SET action = 'evil' WHERE id = ?1",
             params![2i64],
@@ -93,7 +93,7 @@ fn tampering_action_is_detected() {
         .unwrap();
     }
 
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let report = verify_chain(&conn).expect("verify ok");
     assert!(!report.is_clean());
     assert!(
@@ -115,12 +115,12 @@ fn deleting_middle_row_breaks_prev_hash() {
     log_audit(&pool, Some("3"), Some("a"), "a3", None, None, None, None).unwrap();
 
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute("DELETE FROM audit_log WHERE id = ?1", params![2i64])
             .unwrap();
     }
 
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let report = verify_chain(&conn).expect("verify ok");
     assert!(!report.is_clean());
     assert!(
@@ -140,7 +140,7 @@ fn raw_bypass_insert_after_chain_start_is_tamper() {
     log_audit(&pool, Some("1"), Some("a"), "first", None, None, None, None).unwrap();
 
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         // Direct raw INSERT bypassing `log_audit` — leaves prev_hash/hash NULL.
         conn.execute(
             "INSERT INTO audit_log (action, risk_class) VALUES ('snuck_in', 'unclassified')",
@@ -149,7 +149,7 @@ fn raw_bypass_insert_after_chain_start_is_tamper() {
         .unwrap();
     }
 
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let report = verify_chain(&conn).expect("verify ok");
     assert!(!report.is_clean());
     assert!(report
