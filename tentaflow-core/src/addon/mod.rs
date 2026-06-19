@@ -1232,9 +1232,14 @@ impl AddonManager {
     fn purge_addon_state(&self, addon_id: &str) {
         let store = state_store::AddonStateStore::global();
         store.drop_addon(addon_id);
-        // L1: the addon is being removed — drop every instance's latest LiDAR
-        // frame slot too, matching the state shard's purge-on-uninstall lifecycle.
-        crate::addon::host_functions::lidar::LidarLatest::global().clear_addon(addon_id);
+        // L1: the addon is being removed — drop its latest LiDAR frame slot too
+        // (keyed by addon_id == robot_id), matching the state shard's
+        // best-effort purge-on-uninstall lifecycle above. Like `drop_addon`, this
+        // is best-effort: on a force-uninstall while a service tick is still alive,
+        // a later `lidar_publish_v1` can transiently recreate the slot (the hub
+        // analog of the state store re-resolving a fresh, orphaned shard). It is
+        // bounded — at most one latest-wins frame (≤4 MiB) until the tick dies.
+        crate::services::lidar_hub::LidarStreamHub::global().remove(addon_id);
         if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
             warn!(
                 "addon state: purge on uninstall failed for '{}': {}",
@@ -2259,12 +2264,6 @@ impl AddonManager {
         // Pobierz instancje
         let mut addon_instance = instances.get_mut(&addon_id).unwrap().remove(pos);
 
-        // L1: this specific instance is being torn down — drop its latest LiDAR
-        // frame slot so a stopped/restarted instance does not leave its last
-        // canonical frame retained forever. Keyed by (addon_id, instance_id) so
-        // sibling instances (e.g. other robots of the same addon) are untouched.
-        crate::addon::host_functions::lidar::LidarLatest::global().remove(&addon_id, instance_id);
-
         // VULN-046: Jawnie zamknij polaczenia sieciowe przed drop instancji
         {
             let net_mgr = addon_instance.store.data().net_manager.clone();
@@ -2358,6 +2357,12 @@ impl AddonManager {
         // Deactivate aliases when the last instance of any addon is gone.
         if no_instances_left {
             self.deactivate_aliases_owned_by_addon(&addon_id);
+
+            // L2: the addon's LAST instance is gone — drop its latest LiDAR frame
+            // slot (keyed by addon_id == robot_id). Doing this here, not per-
+            // instance, is the correct granularity: a single pooled-worker stop
+            // must NOT wipe a slot the still-live service instance keeps feeding.
+            crate::services::lidar_hub::LidarStreamHub::global().remove(&addon_id);
 
             // A2: the addon is fully stopped — flush any durable writes that
             // have not yet hit the periodic flush so a stop+exit before the next
