@@ -11,6 +11,7 @@
 import base64
 import io
 import os
+import threading
 
 import numpy as np
 import torch
@@ -43,12 +44,27 @@ def _require_cuda() -> None:
         )
 
 
-def _ensure_pipeline() -> NemotronOCR:
-    if _state["pipeline"] is None:
+_LOAD_LOCK = threading.Lock()
+
+
+def _ensure_pipeline() -> None:
+    if _state["pipeline"] is not None:
+        return
+    with _LOAD_LOCK:
+        if _state["pipeline"] is not None:
+            return
         _require_cuda()
         # model_dir=None => pipeline sam pobiera checkpointy z HF Hub i cachuje.
         _state["pipeline"] = NemotronOCR(model_dir=None)
-    return _state["pipeline"]
+
+
+# Ladowanie w WATKU TLA przy starcie — synchroniczne ladowanie w handlerze
+# blokowaloby event-loop, /health przestawal odpowiadac i supervisor Core
+# restartowal proces w petli. W tle /health odpowiada od razu, /ocr zwraca 503
+# do czasu gotowosci.
+@app.on_event("startup")
+def _start_background_load() -> None:
+    threading.Thread(target=_ensure_pipeline, name="model-load", daemon=True).start()
 
 
 def _decode_image(raw: bytes) -> Image.Image:
@@ -59,7 +75,9 @@ def _decode_image(raw: bytes) -> Image.Image:
 
 
 def _run_ocr(image: Image.Image) -> dict:
-    pipeline = _ensure_pipeline()
+    if _state["pipeline"] is None:
+        raise HTTPException(status_code=503, detail="Model jeszcze sie laduje, sprobuj za chwile.")
+    pipeline = _state["pipeline"]
     # Pipeline nie przyjmuje PIL.Image — wspiera NumPy (H, W, C), wiec konwertujemy.
     predictions = pipeline(np.asarray(image), merge_level=MERGE_LEVEL, visualize=False)
     # Pipeline zwraca liste dictow regionow. Skladamy plaski tekst z pola "text"

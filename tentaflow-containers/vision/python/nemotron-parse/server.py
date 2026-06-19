@@ -10,6 +10,7 @@
 import base64
 import io
 import os
+import threading
 
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -43,17 +44,32 @@ def _require_cuda() -> None:
         )
 
 
+_LOAD_LOCK = threading.Lock()
+
+
 def _ensure_model() -> None:
     if _state["model"] is not None:
         return
-    _require_cuda()
-    model = AutoModel.from_pretrained(
-        MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
-    ).to("cuda").eval()
-    _state["model"] = model
-    _state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_ID)
-    _state["processor"] = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-    _state["gen"] = GenerationConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    with _LOAD_LOCK:
+        if _state["model"] is not None:
+            return
+        _require_cuda()
+        model = AutoModel.from_pretrained(
+            MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
+        ).to("cuda").eval()
+        _state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_ID)
+        _state["processor"] = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        _state["gen"] = GenerationConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+        _state["model"] = model
+
+
+# Model ladowany w WATKU TLA przy starcie — synchroniczne ladowanie w handlerze
+# blokowaloby event-loop uvicorna, przez co /health przestawal odpowiadac i
+# supervisor Core ubijal+restartowal proces w petli (zwlaszcza dla wiekszych
+# modeli). W tle /health odpowiada od razu, a /parse zwraca 503 do czasu gotowosci.
+@app.on_event("startup")
+def _start_background_load() -> None:
+    threading.Thread(target=_ensure_model, name="model-load", daemon=True).start()
 
 
 def _decode_image(raw: bytes) -> Image.Image:
@@ -64,7 +80,8 @@ def _decode_image(raw: bytes) -> Image.Image:
 
 
 def _run_parse(image: Image.Image) -> dict:
-    _ensure_model()
+    if _state["model"] is None:
+        raise HTTPException(status_code=503, detail="Model jeszcze sie laduje, sprobuj za chwile.")
     model = _state["model"]
     tokenizer = _state["tokenizer"]
     processor = _state["processor"]
