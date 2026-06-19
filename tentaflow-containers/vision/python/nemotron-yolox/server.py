@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files
 from yolox.exp import get_exp
 
 # Rozmiar wejscia YOLOX dla detektorow dokumentowych NeMo Retriever.
@@ -41,13 +41,14 @@ def _wymagaj_gpu() -> torch.device:
 
 
 def _znajdz_checkpoint(repo: str) -> str:
-    """Pobiera plik .pth z repozytorium HF (pierwszy pasujacy wzorzec wag)."""
-    for nazwa in ("model.pth", "yolox.pth", "weights.pth", "pytorch_model.pth"):
-        try:
-            return hf_hub_download(repo_id=repo, filename=nazwa)
-        except Exception:
-            continue
-    raise FileNotFoundError(f"Nie znaleziono pliku wag .pth w repozytorium {repo}")
+    """Pobiera plik .pth z repozytorium HF. Wagi modeli NeMo Retriever leza w
+    podkatalogu (np. `nemotron_page_elements_v3/weights.pth`), wiec listujemy
+    pliki repo i bierzemy pierwszy *.pth zamiast zgadywac nazwy top-level."""
+    pliki = list_repo_files(repo)
+    kandydaci = [f for f in pliki if f.endswith(".pth")]
+    if not kandydaci:
+        raise FileNotFoundError(f"Nie znaleziono pliku wag .pth w repozytorium {repo}")
+    return hf_hub_download(repo_id=repo, filename=kandydaci[0])
 
 
 def _liczba_klas(state_dict: dict) -> int:
@@ -67,7 +68,9 @@ def _zbuduj_model(repo: str, device: torch.device) -> torch.nn.Module:
     yolox-l, nalezy wybrac exp_name na podstawie ksztaltow wag (depth/width).
     """
     sciezka_pth = _znajdz_checkpoint(repo)
-    checkpoint = torch.load(sciezka_pth, map_location="cpu")
+    # weights_only=False bo checkpointy NVIDIA zawieraja obiekty numpy; zrodlo
+    # zaufane (oficjalne repo HF). torch 2.6+ domyslnie ma weights_only=True.
+    checkpoint = torch.load(sciezka_pth, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("model", checkpoint)
 
     liczba_klas = _liczba_klas(state_dict)
