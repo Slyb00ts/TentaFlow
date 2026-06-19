@@ -190,7 +190,11 @@ def _postprocess(wyjscie: np.ndarray, skala: float) -> list[dict]:
 
 
 DEVICE = _wymagaj_gpu()
-MODEL_REPO = os.environ["MODEL_REPO"]
+# Docker mapuje MODEL->MODEL_REPO w entrypoincie; native (python-bundle) nie ma
+# entrypointu i Core wstrzykuje tylko MODEL — czytamy MODEL_REPO z fallbackiem.
+MODEL_REPO = os.environ.get("MODEL_REPO") or os.environ.get("MODEL")
+if not MODEL_REPO:
+    raise RuntimeError("Brak env MODEL_REPO/MODEL — nie wiadomo ktore repo modelu zaladowac.")
 MODEL = _zbuduj_model(MODEL_REPO, DEVICE)
 
 app = FastAPI(title="nemotron-yolox")
