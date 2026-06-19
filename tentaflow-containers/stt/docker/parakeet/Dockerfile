@@ -20,8 +20,12 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
       torch>=2.11 torchaudio \
       --index-url https://download.pytorch.org/whl/cu130 \
  && pip install --no-cache-dir \
-      "nemo_toolkit[asr]" \
-      fastapi uvicorn python-multipart soundfile
+      "nemo_toolkit[asr]==2.6.2" \
+      fastapi uvicorn python-multipart soundfile \
+ && pip install --no-cache-dir --force-reinstall --no-deps "lhotse==1.33.0"
+
+# NeMo 2.6.2 pinuje lhotse==1.31.1, ktora pada na torch 2.11 (torch usunelo
+# Sampler.__init__ -> object.__init__ dostaje data_source). 1.33.0 to naprawia.
 
 COPY tentaflow-containers/stt/docker/parakeet/server.py /app/server.py
 COPY tentaflow-containers/stt/docker/parakeet/entrypoint.sh /app/entrypoint.sh

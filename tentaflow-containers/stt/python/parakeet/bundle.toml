@@ -27,9 +27,14 @@ backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
 # Pinned na 2.6.2 (Feb 2026) — wspiera Parakeet-TDT-0.6B-v3 multilingual.
 extras = ["torch==2.11.0", "torchaudio==2.11.0", "nemo_toolkit[asr]==2.6.2"]
+# NeMo 2.6.2 pinuje lhotse==1.31.1, ktora pada na torch 2.11 (torch usunelo
+# Sampler.__init__ -> lhotse `super().__init__(data_source=None)` trafia w
+# object.__init__). lhotse 1.33.0 to naprawia i nadal dziala z NeMo 2.6.2.
+force_pins = ["lhotse==1.33.0"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
 extras = ["torch==2.11.0", "torchaudio==2.11.0", "nemo_toolkit[asr]==2.6.2"]
+force_pins = ["lhotse==1.33.0"]
 install_hint = "experimental"
