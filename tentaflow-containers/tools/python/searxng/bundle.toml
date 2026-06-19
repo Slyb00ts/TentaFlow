@@ -11,6 +11,9 @@ python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/searxng/searxng.git"
 git_ref = "master"
+# setup.py importuje searx.version (-> msgspec) przy buildzie; instaluj
+# requirements.txt repo przed editable i buduj bez izolacji.
+editable_no_build_isolation = true
 
 [launch]
 command = "python"

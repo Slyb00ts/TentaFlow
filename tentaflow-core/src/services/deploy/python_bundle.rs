@@ -424,6 +424,9 @@ impl DeployStrategy for PythonBundleDeploy {
             readiness_urls: vec![
                 format!("http://127.0.0.1:{}/v1/models", port),
                 format!("http://127.0.0.1:{}/health", port),
+                // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
+                // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
+                format!("http://127.0.0.1:{}/healthz", port),
             ],
             status_report_interval: Duration::from_secs(30),
             log_sink: self.log_sink.clone(),

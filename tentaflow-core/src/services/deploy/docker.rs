@@ -1147,6 +1147,9 @@ impl DeployStrategy for DockerDeploy {
             readiness_urls: vec![
                 format!("http://127.0.0.1:{}/v1/models", host_http),
                 format!("http://127.0.0.1:{}/health", host_http),
+                // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
+                // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
+                format!("http://127.0.0.1:{}/healthz", host_http),
             ],
             status_report_interval: std::time::Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
