@@ -1232,6 +1232,9 @@ impl AddonManager {
     fn purge_addon_state(&self, addon_id: &str) {
         let store = state_store::AddonStateStore::global();
         store.drop_addon(addon_id);
+        // L1: the addon is being removed — drop every instance's latest LiDAR
+        // frame slot too, matching the state shard's purge-on-uninstall lifecycle.
+        crate::addon::host_functions::lidar::LidarLatest::global().clear_addon(addon_id);
         if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
             warn!(
                 "addon state: purge on uninstall failed for '{}': {}",
@@ -2255,6 +2258,12 @@ impl AddonManager {
 
         // Pobierz instancje
         let mut addon_instance = instances.get_mut(&addon_id).unwrap().remove(pos);
+
+        // L1: this specific instance is being torn down — drop its latest LiDAR
+        // frame slot so a stopped/restarted instance does not leave its last
+        // canonical frame retained forever. Keyed by (addon_id, instance_id) so
+        // sibling instances (e.g. other robots of the same addon) are untouched.
+        crate::addon::host_functions::lidar::LidarLatest::global().remove(&addon_id, instance_id);
 
         // VULN-046: Jawnie zamknij polaczenia sieciowe przed drop instancji
         {

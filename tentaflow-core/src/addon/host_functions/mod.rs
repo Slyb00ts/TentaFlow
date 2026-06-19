@@ -18,6 +18,7 @@ pub mod flow;
 pub mod gate;
 pub mod http;
 pub mod image;
+pub mod lidar;
 pub mod llm;
 pub mod log;
 pub mod network;
@@ -557,6 +558,9 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "robot_dispatch_v1", robot::robot_dispatch_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja robot_dispatch_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "lidar_publish_v1", lidar::lidar_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja lidar_publish_v1: {e}"))?;
     }
 
     Ok(())
