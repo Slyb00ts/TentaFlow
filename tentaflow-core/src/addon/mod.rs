@@ -24,6 +24,7 @@ pub mod rate_limiter;
 pub mod runtime;
 pub mod sdk_version;
 pub mod signature;
+pub mod state_flusher;
 pub mod state_store;
 pub mod storage_sql;
 pub mod storage_sql_exec;
@@ -600,6 +601,15 @@ pub struct AddonManager {
     /// Liczba ŻYWYCH instancji per addon (idle w puli + wypożyczone). Limit
     /// wzrostu puli — patrz `pool_cap`. Reset w stop_addon/disable.
     instance_total: Arc<Mutex<HashMap<String, usize>>>,
+    /// Cancels the write-behind state flusher (A2). Spawned once in `new`,
+    /// cancelled in `shutdown` so the flusher does its final drain and exits
+    /// cleanly — mirrors how `service_tasks` tokens are cancelled on shutdown.
+    state_flusher_shutdown: tokio_util::sync::CancellationToken,
+    /// JoinHandle of the spawned flusher task. `await_state_flusher_drain`
+    /// awaits it after cancel so graceful shutdown does NOT exit before the
+    /// final drain persists all dirty durable state (bounded by a timeout so a
+    /// stuck DB can never hang shutdown).
+    state_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl crate::sync::runtime::AddonSyncReconciler for AddonManager {
@@ -662,6 +672,17 @@ impl AddonManager {
         // Uruchom background refresh co 5 minut
         permission_checker.start_background_refresh();
 
+        // A2: spawn the write-behind state flusher once. It drains the shared
+        // `AddonStateStore` Durable tier into the `addon_state` SQLite table on
+        // a fixed cadence and does a final drain when cancelled in `shutdown`.
+        let state_flusher_shutdown = tokio_util::sync::CancellationToken::new();
+        let state_flusher_handle = state_flusher::spawn_flusher(
+            db.clone(),
+            state_store::AddonStateStore::global(),
+            state_flusher::DEFAULT_FLUSH_INTERVAL,
+            state_flusher_shutdown.clone(),
+        );
+
         info!("AddonManager zainicjalizowany");
 
         Ok(Self {
@@ -682,6 +703,8 @@ impl AddonManager {
             addon_op_locks: Arc::new(Mutex::new(HashMap::new())),
             service_instance_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             instance_total: Arc::new(Mutex::new(HashMap::new())),
+            state_flusher_shutdown,
+            state_flusher_handle: Mutex::new(Some(state_flusher_handle)),
         })
     }
 
@@ -726,6 +749,13 @@ impl AddonManager {
             info!("AddonManager: anulowano {} service tick loops", task_count);
         }
 
+        // 1b. Cancel the write-behind state flusher — it runs ONE final drain
+        //     of pending durable writes into SQLite before exiting. The drain is
+        //     AWAITED separately by `await_state_flusher_drain` (the caller must
+        //     run it from an async context) so the process does not exit before
+        //     the final flush completes and loses pending durable state.
+        self.state_flusher_shutdown.cancel();
+
         // 2. Zamknij dispatcher event_bus — drop sender, blocking_recv
         //    zwroci None, spawn_blocking task wychodzi. To uwalnia ostatni
         //    Arc<AddonManager> trzymany w tasku.
@@ -744,6 +774,29 @@ impl AddonManager {
                 "AddonManager: rozwalonio {} addon instances",
                 instance_count
             );
+        }
+    }
+
+    /// Await the write-behind flusher's final drain after `shutdown()` cancelled
+    /// it. Guarantees that, once this returns `Ok`, all durable state dirty at
+    /// cancel time has been persisted (or the failure surfaced in logs). Bounded
+    /// by `timeout` so a stuck DB writer can never hang process shutdown — on
+    /// timeout the handle is dropped (the task is detached) and `Err` is
+    /// returned. Idempotent: a second call (no handle left) is a no-op `Ok`.
+    pub async fn await_state_flusher_drain(&self, timeout: std::time::Duration) -> Result<()> {
+        let handle = self.state_flusher_handle.lock().take();
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(join_err)) => {
+                Err(anyhow::anyhow!("state flusher task join failed: {join_err}"))
+            }
+            Err(_) => Err(anyhow::anyhow!(
+                "state flusher final drain timed out after {:?} — pending durable writes may be unflushed",
+                timeout
+            )),
         }
     }
 
@@ -1146,6 +1199,10 @@ impl AddonManager {
         self.unregister_addon_runtime(addon_id);
         lifecycle::uninstall(addon_id, &self.db)?;
         self.event_bus.unsubscribe_all(addon_id);
+        // A2: an uninstalled addon's persisted state must not survive — drop the
+        // RAM shard and purge the SQLite rows. Done after lifecycle teardown so a
+        // failed uninstall never strands an addon with no state.
+        self.purge_addon_state(addon_id);
         info!("Addon '{}' odinstalowany pomyslnie", addon_id);
         Ok(())
     }
@@ -1161,8 +1218,26 @@ impl AddonManager {
         self.unregister_addon_runtime(addon_id);
         lifecycle::uninstall_instance(addon_id, &self.db)?;
         self.event_bus.unsubscribe_all(addon_id);
+        // A2: instance data is its own — drop its RAM shard and purge its rows.
+        self.purge_addon_state(addon_id);
         info!("Instancja '{}' odinstalowana", addon_id);
         Ok(())
+    }
+
+    /// A2 uninstall cleanup: drop the in-RAM state shard (any unflushed durable
+    /// writes are intentionally discarded — the addon is being removed) and
+    /// purge its persisted rows from SQLite. Best-effort: a purge failure is
+    /// logged, not fatal, so it never blocks uninstall (orphaned rows are inert
+    /// and a reinstall under the same id reloads them, which is acceptable).
+    fn purge_addon_state(&self, addon_id: &str) {
+        let store = state_store::AddonStateStore::global();
+        store.drop_addon(addon_id);
+        if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
+            warn!(
+                "addon state: purge on uninstall failed for '{}': {}",
+                addon_id, e
+            );
+        }
     }
 
     /// Zdejmuje z pamieci managera wszystkie runtime'owe artefakty addonu:
@@ -1626,6 +1701,42 @@ impl AddonManager {
         let permissions = self.load_addon_permissions(addon_id)?;
         let manifest = self.load_addon_manifest(addon_id)?;
         let dt_db = t0.elapsed();
+
+        // A2: seed the shared in-RAM Durable state from SQLite BEFORE on_start
+        // runs (inside build_ready_instance), so the addon observes its
+        // persisted state. The store is per-addon shared RAM keyed by addon_id;
+        // the load-once guard makes the seed idempotent so a second instance
+        // start of the same addon does not reload/clobber live state. A genuine
+        // DB ERROR FAILS start: running on phantom-empty state would let on_start
+        // overwrite/invalidate persisted durable data (an empty store is Ok with
+        // 0 rows, which is fine — only a real read failure aborts start).
+        let outcome = state_flusher::load_addon(
+            &self.db,
+            state_store::AddonStateStore::global(),
+            addon_id,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "addon '{}' start aborted: cannot load persisted durable state: {}",
+                addon_id,
+                e
+            )
+        })?;
+        if !outcome.already_loaded
+            && (outcome.loaded > 0
+                || outcome.skipped_quota > 0
+                || outcome.skipped_value_too_large > 0
+                || outcome.skipped_present > 0)
+        {
+            info!(
+                "addon state: loaded {} durable entr(ies) for '{}' (skipped: {} oversized, {} over-quota, {} already-present)",
+                outcome.loaded,
+                addon_id,
+                outcome.skipped_value_too_large,
+                outcome.skipped_quota,
+                outcome.skipped_present
+            );
+        }
 
         // Buduj w pełni zainicjalizowaną instancję główną przez wspólny builder
         // (ta sama ścieżka co workery puli — instancje są wymienne).
@@ -2238,6 +2349,21 @@ impl AddonManager {
         // Deactivate aliases when the last instance of any addon is gone.
         if no_instances_left {
             self.deactivate_aliases_owned_by_addon(&addon_id);
+
+            // A2: the addon is fully stopped — flush any durable writes that
+            // have not yet hit the periodic flush so a stop+exit before the next
+            // tick does not lose them. The in-RAM shard is intentionally kept
+            // (cheap; a restart re-seeds it) — only uninstall drops + purges it.
+            if let Err(e) = state_flusher::flush_addon(
+                &self.db,
+                state_store::AddonStateStore::global(),
+                &addon_id,
+            ) {
+                warn!(
+                    "addon state: flush on stop failed for '{}': {} — periodic flusher will retry",
+                    addon_id, e
+                );
+            }
         }
 
         info!("Instancja '{}' zatrzymana", instance_id);

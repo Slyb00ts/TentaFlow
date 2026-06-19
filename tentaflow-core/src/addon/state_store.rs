@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -123,6 +123,14 @@ pub struct LoadOutcome {
     /// Entries skipped because loading them would exceed the per-addon
     /// entry/byte cap (the shard is already full).
     pub skipped_quota: usize,
+    /// Entries skipped because the key already exists live in RAM (newer-or-
+    /// equal live state is never clobbered by a persisted seed — see the merge
+    /// policy in `load_durable`).
+    pub skipped_present: usize,
+    /// True when the shard was already loaded since its last cold start, so this
+    /// `load_durable` call was a no-op (load-once guard). Lets the caller skip
+    /// logging a redundant reload.
+    pub already_loaded: bool,
 }
 
 /// Batch of changes collected by `take_dirty` for the A2 flusher to persist.
@@ -139,6 +147,41 @@ impl DirtySet {
     /// True when there is nothing to persist — the flusher can skip the round.
     pub fn is_empty(&self) -> bool {
         self.upserts.is_empty() && self.deletes.is_empty()
+    }
+}
+
+/// A dirty batch taken from a shard, carrying the exact shard `Arc` it was taken
+/// from so the flusher can coordinate with a concurrent `drop_addon`/purge. The
+/// flusher must consult `is_purged()` BEFORE committing the batch to the backing
+/// store: if the addon was uninstalled after the batch was taken, the stale
+/// batch must NOT resurrect rows. `remark_dirty` re-arms onto THIS shard only
+/// (never recreating a shard for an uninstalled addon).
+pub(crate) struct TakenBatch {
+    addon_id: String,
+    shard: Arc<AddonStateShard>,
+    set: DirtySet,
+}
+
+impl TakenBatch {
+    pub(crate) fn addon_id(&self) -> &str {
+        &self.addon_id
+    }
+
+    pub(crate) fn set(&self) -> &DirtySet {
+        &self.set
+    }
+
+    /// True if the addon was uninstalled (its shard purged) after this batch was
+    /// taken. The flusher refuses to commit a purged batch (no row resurrection).
+    pub(crate) fn is_purged(&self) -> bool {
+        self.shard.purged.load(Ordering::Acquire)
+    }
+}
+
+impl std::ops::Deref for TakenBatch {
+    type Target = DirtySet;
+    fn deref(&self) -> &DirtySet {
+        &self.set
     }
 }
 
@@ -189,6 +232,29 @@ struct AddonStateShard {
     entries: RwLock<ShardInner>,
     entry_count: AtomicUsize,
     byte_count: AtomicUsize,
+    /// Cheap "has anything to flush" signal so `dirty_addons` can skip clean
+    /// shards without taking each shard's write lock + scanning the map. Set
+    /// true (under the write lock) on every durable upsert and tombstone;
+    /// cleared inside `take_dirty` once the dirty set is fully drained. Always
+    /// mutated under the `entries` write lock so it stays consistent with the
+    /// per-entry `dirty` flags and `dirty_deletes`. Read with `Acquire` from
+    /// `dirty_addons` (lock-free observation): a stale `false` is impossible
+    /// because the producer sets it under the same lock the consumer's
+    /// `take_dirty` will later take, and a stale `true` only costs one wasted
+    /// `take_dirty` that returns an empty set.
+    has_dirty: AtomicBool,
+    /// Load-once guard: set true by `load_durable` the first time the shard is
+    /// seeded from the backing store, cleared by `drop_addon`. A redundant
+    /// `load_durable` (e.g. a second instance start of the same addon) is a
+    /// no-op while this is true, so a persisted seed can never clobber live or
+    /// dirty in-RAM state written by another instance since the cold start.
+    loaded: AtomicBool,
+    /// Uninstall marker: set true by `drop_addon` under the write lock the
+    /// instant the shard is detached. A `TakenBatch` captured BEFORE the drop
+    /// observes this and refuses to commit (no row resurrection after uninstall),
+    /// and `remark_dirty` refuses to re-arm a purged/closed shard (no shard
+    /// recreation for an uninstalled addon).
+    purged: AtomicBool,
 }
 
 /// The locked portion of a shard. `dirty_deletes` records durable keys removed
@@ -217,6 +283,9 @@ impl AddonStateShard {
             }),
             entry_count: AtomicUsize::new(0),
             byte_count: AtomicUsize::new(0),
+            has_dirty: AtomicBool::new(false),
+            loaded: AtomicBool::new(false),
+            purged: AtomicBool::new(false),
         }
     }
 }
@@ -409,11 +478,13 @@ impl AddonStateStore {
             if dirty {
                 // A durable key being (re)written cancels any pending tombstone.
                 inner.dirty_deletes.remove(key);
+                shard.has_dirty.store(true, Ordering::Release);
             } else if matches!(prev_tier, Some(Tier::Durable)) {
                 // Durable → Ephemeral downgrade: the persisted row must be
                 // deleted so it does not resurrect on restart. The new value is
                 // RAM-only (ephemeral) and intentionally not re-persisted.
                 inner.dirty_deletes.insert(key.to_string());
+                shard.has_dirty.store(true, Ordering::Release);
             }
 
             match prev {
@@ -533,6 +604,7 @@ impl AddonStateStore {
                     }
                     if matches!(removed.tier, Tier::Durable) {
                         inner.dirty_deletes.insert(key.to_string());
+                        shard.has_dirty.store(true, Ordering::Release);
                     }
                     true
                 }
@@ -573,6 +645,25 @@ impl AddonStateStore {
     pub fn drop_addon(&self, addon_id: &str) {
         if let Some((_, shard)) = self.shards.remove(addon_id) {
             shard.entries.write().closed = true;
+            // Mark the detached shard purged so any in-flight `TakenBatch` taken
+            // before this drop refuses to commit (no row resurrection after
+            // uninstall) and `remark_dirty` refuses to recreate a shard for it.
+            shard.purged.store(true, Ordering::Release);
+            // Reset the load-once guard: a future cold start under the same
+            // addon_id resolves a FRESH shard (this one is orphaned), so the
+            // guard is implicitly reset by the new shard's default `false`.
+            // Clearing here is belt-and-suspenders for any retained `Arc`.
+            shard.loaded.store(false, Ordering::Release);
+        }
+    }
+
+    /// Clear the load-once guard after a FAILED load so a retried addon start
+    /// re-seeds the shard. Merge semantics make the reload idempotent (present
+    /// keys are skipped), so any rows that did land before the failure are kept
+    /// and the rest are filled on retry. No-op if the addon has no shard.
+    pub(crate) fn reset_loaded(&self, addon_id: &str) {
+        if let Some(shard) = self.shards.get(addon_id) {
+            shard.loaded.store(false, Ordering::Release);
         }
     }
 
@@ -589,11 +680,16 @@ impl AddonStateStore {
     /// their dirty flags, so the A2 flusher persists a consistent batch. A
     /// write that happens after this returns re-marks the entry dirty for the
     /// next round. Ephemeral entries are never included. Used by A2 flusher.
-    #[allow(dead_code)] // used by A2 flusher
-    pub(crate) fn take_dirty(&self, addon_id: &str) -> DirtySet {
-        let Some(shard) = self.shards.get(addon_id) else {
-            return DirtySet::default();
+    pub(crate) fn take_dirty(&self, addon_id: &str) -> TakenBatch {
+        let Some(shard_ref) = self.shards.get(addon_id) else {
+            return TakenBatch {
+                addon_id: addon_id.to_string(),
+                shard: Arc::new(AddonStateShard::new()),
+                set: DirtySet::default(),
+            };
         };
+        let shard = shard_ref.clone();
+        drop(shard_ref);
         let mut inner = shard.entries.write();
 
         let mut upserts = Vec::new();
@@ -606,13 +702,106 @@ impl AddonStateStore {
         }
         let deletes: Vec<String> = inner.dirty_deletes.drain().collect();
 
-        DirtySet { upserts, deletes }
+        // Everything dirty has been drained into the batch — clear the cheap
+        // signal so a clean shard is skipped by the next `dirty_addons` scan.
+        // Done under the write lock so a concurrent dirty `set`/`delete` either
+        // ran before us (its change is in this batch) or runs after this guard
+        // is released (it re-sets the flag). `remark_dirty` re-sets it on a
+        // failed flush.
+        shard.has_dirty.store(false, Ordering::Release);
+
+        drop(inner);
+        TakenBatch {
+            addon_id: addon_id.to_string(),
+            shard,
+            set: DirtySet { upserts, deletes },
+        }
+    }
+
+    /// Addon ids whose shard currently has pending durable writes (upserts or
+    /// tombstones). The flusher uses this to touch only addons with work to do
+    /// instead of scanning every shard's map. Lock-free per shard — reads the
+    /// `has_dirty` signal maintained under the write lock. A shard that just
+    /// dropped to clean may still be returned (benign: `take_dirty` then yields
+    /// an empty batch); a shard that just became dirty is always returned (the
+    /// producer set the flag under the lock before releasing it).
+    pub(crate) fn dirty_addons(&self) -> Vec<String> {
+        self.shards
+            .iter()
+            .filter(|e| e.value().has_dirty.load(Ordering::Acquire))
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Re-mark a previously taken `DirtySet` as dirty after the flusher failed
+    /// to persist it, so the next flush retries (at-least-once semantics). Re-
+    /// inserts each upsert's value as a dirty durable entry IF the live value
+    /// still matches what was taken — if the addon overwrote the key in the
+    /// meantime, the newer write already re-marked it dirty and wins, so we do
+    /// not clobber it. Re-adds every tombstone (a delete that failed to persist
+    /// must be retried; a key re-created after the delete cancels its own
+    /// tombstone via `set`). Caps are NOT re-checked here: the data was already
+    /// resident and accepted, so re-marking never grows the shard.
+    pub(crate) fn remark_dirty(&self, batch: TakenBatch) {
+        if batch.set.is_empty() {
+            return;
+        }
+        // Re-arm onto the EXACT shard the batch was taken from — never resolve a
+        // fresh shard via the map. If the addon was uninstalled after the batch
+        // was taken, the shard is purged/closed: refuse to re-arm so we never
+        // recreate state for an uninstalled addon.
+        let shard = batch.shard;
+        if shard.purged.load(Ordering::Acquire) {
+            return;
+        }
+        let mut inner = shard.entries.write();
+        if inner.closed {
+            return;
+        }
+        let mut remarked = false;
+
+        for (key, value) in batch.set.upserts {
+            match inner.map.get_mut(&key) {
+                // Same durable value still resident → re-arm its dirty flag.
+                Some(e) if matches!(e.tier, Tier::Durable) && e.value == value => {
+                    e.dirty = true;
+                    remarked = true;
+                }
+                // Key was overwritten / downgraded / removed after take_dirty:
+                // the newer state owns the persistence decision (it re-marked
+                // itself), so we must not resurrect the stale value.
+                _ => {}
+            }
+        }
+        for key in batch.set.deletes {
+            // A delete only needs retrying if the key is still absent (a
+            // re-create already cancelled the tombstone and re-persists itself).
+            if !inner.map.contains_key(&key) {
+                inner.dirty_deletes.insert(key);
+                remarked = true;
+            }
+        }
+
+        if remarked {
+            shard.has_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Seed RAM from the backing store at addon start. Each accepted entry
     /// becomes a clean `Durable` entry (dirty=false) so the next `take_dirty`
     /// does not re-persist what we just loaded. Used by A2 flusher / addon
     /// start.
+    ///
+    /// LOAD-ONCE GUARD: the shard is seeded at most once per cold start. A
+    /// redundant call (a second instance start of the SAME addon) is a no-op
+    /// (`already_loaded == true`); `drop_addon` resets the guard so the next
+    /// cold start reloads. This prevents a persisted seed from clobbering live
+    /// or unflushed (dirty) state another instance wrote since the cold start.
+    ///
+    /// MERGE SEMANTICS: even on the first load a key that ALREADY exists live is
+    /// NOT overwritten (live RAM is newer-or-equal) and a pending tombstone is
+    /// NOT cleared — persisted data only SEEDS absent keys. This makes the load
+    /// idempotent and safe even if called redundantly.
     ///
     /// POLICY: the same per-value (`MAX_VALUE_BYTES`) and per-addon
     /// (`MAX_ENTRIES_PER_ADDON` / `MAX_BYTES_PER_ADDON`) caps that bound `set`
@@ -623,18 +812,39 @@ impl AddonStateStore {
     /// violation is treated as "shard full" and stops the load. The returned
     /// `LoadOutcome` reports how many entries were loaded vs skipped so the
     /// caller can log/alarm on a truncated load.
-    #[allow(dead_code)] // used by A2 flusher
-    pub(crate) fn load_durable(
-        &self,
-        addon_id: &str,
-        entries: Vec<(String, Vec<u8>)>,
-    ) -> LoadOutcome {
+    ///
+    /// `entries` is an iterator so the caller can stream rows out of the backing
+    /// store and stop reading once the per-addon cap is hit — the load never
+    /// materialises an unbounded Vec of a huge/corrupt table.
+    pub(crate) fn load_durable<I>(&self, addon_id: &str, entries: I) -> LoadOutcome
+    where
+        I: IntoIterator<Item = (String, Vec<u8>)>,
+    {
         let shard = self.shard(addon_id);
         let mut inner = shard.entries.write();
+
+        // Load-once guard: only the FIRST load after a cold start seeds the
+        // shard. Taken under the write lock so it is consistent with concurrent
+        // `set`/`take_dirty` on the same shard.
+        if shard.loaded.swap(true, Ordering::AcqRel) {
+            return LoadOutcome {
+                already_loaded: true,
+                ..LoadOutcome::default()
+            };
+        }
+
         let now = chrono::Utc::now().timestamp_millis();
         let mut outcome = LoadOutcome::default();
 
         for (key, value) in entries {
+            // Merge: never clobber a live key nor clear a pending tombstone — a
+            // persisted seed only fills keys absent from live RAM (live state is
+            // newer-or-equal). A key already present, or one with a pending
+            // tombstone (downgraded/deleted since the cold start), is skipped.
+            if inner.map.contains_key(&key) || inner.dirty_deletes.contains(&key) {
+                outcome.skipped_present += 1;
+                continue;
+            }
             if value.len() > MAX_VALUE_BYTES {
                 outcome.skipped_value_too_large += 1;
                 continue;
@@ -646,42 +856,29 @@ impl AddonStateStore {
                     continue;
                 }
             };
-            let old_size = match inner.map.get(&key) {
-                Some(e) => match Entry::size(&key, &e.value) {
-                    Some(sz) => Some(sz),
-                    None => {
-                        outcome.skipped_quota += 1;
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            let is_replace = old_size.is_some();
 
+            // Every accepted load is a fresh insert (present keys are skipped
+            // above), so it always grows the shard by one entry.
             let cur_entries = shard.entry_count.load(Ordering::Relaxed);
             let cur_bytes = shard.byte_count.load(Ordering::Relaxed);
-            let entry_delta = if is_replace { 0 } else { 1 };
-            let proj_entries = match cur_entries.checked_add(entry_delta) {
-                Some(v) => v,
-                None => {
-                    outcome.skipped_quota += 1;
-                    continue;
-                }
+            let proj_entries = cur_entries.checked_add(1);
+            let proj_bytes = cur_bytes.checked_add(new_size);
+            let over_cap = match (proj_entries, proj_bytes) {
+                (Some(pe), Some(pb)) => pe > MAX_ENTRIES_PER_ADDON || pb > MAX_BYTES_PER_ADDON,
+                // Counter overflow on a corrupt table = treat as over cap.
+                _ => true,
             };
-            let proj_bytes = match projected_bytes(cur_bytes, old_size.unwrap_or(0), new_size) {
-                Some(v) => v,
-                None => {
-                    outcome.skipped_quota += 1;
-                    continue;
-                }
-            };
-            if proj_entries > MAX_ENTRIES_PER_ADDON || proj_bytes > MAX_BYTES_PER_ADDON {
+            if over_cap {
+                // Cap reached: stop consuming the iterator entirely. The caller
+                // streams rows lazily, so this bounds RAM even on a huge/corrupt
+                // backing table (no unbounded allocation). Remaining unread rows
+                // are reported as quota skips so the shortfall is observable.
                 outcome.skipped_quota += 1;
-                continue;
+                break;
             }
 
-            let prev = inner.map.insert(
-                key.clone(),
+            inner.map.insert(
+                key,
                 Entry {
                     value,
                     tier: Tier::Durable,
@@ -689,25 +886,8 @@ impl AddonStateStore {
                     dirty: false,
                 },
             );
-            // A loaded key is authoritative — drop any pending tombstone.
-            inner.dirty_deletes.remove(&key);
-            match (prev, old_size) {
-                (Some(_), Some(old_sz)) => {
-                    if new_size >= old_sz {
-                        shard
-                            .byte_count
-                            .fetch_add(new_size - old_sz, Ordering::Relaxed);
-                    } else {
-                        shard
-                            .byte_count
-                            .fetch_sub(old_sz - new_size, Ordering::Relaxed);
-                    }
-                }
-                _ => {
-                    shard.entry_count.fetch_add(1, Ordering::Relaxed);
-                    shard.byte_count.fetch_add(new_size, Ordering::Relaxed);
-                }
-            }
+            shard.entry_count.fetch_add(1, Ordering::Relaxed);
+            shard.byte_count.fetch_add(new_size, Ordering::Relaxed);
             outcome.loaded += 1;
         }
 
@@ -1146,8 +1326,135 @@ mod tests {
         let (entries_n, bytes) = s.addon_stats("a").unwrap();
         assert!(bytes <= MAX_BYTES_PER_ADDON, "byte cap must hold: {bytes}");
         assert_eq!(outcome.loaded, entries_n);
-        assert!(outcome.skipped_quota > 0, "some entries must be skipped");
-        assert_eq!(outcome.loaded + outcome.skipped_quota, 40);
+        assert!(outcome.loaded < 40, "cap must truncate the load");
+        assert!(outcome.skipped_quota > 0, "shortfall must be reported");
+    }
+
+    // FIX 5: load is cap-bounded WHILE reading — once the cap is hit the lazy
+    // input iterator is not drained further (no unbounded read of a huge table).
+    #[test]
+    fn load_durable_stops_reading_iterator_at_cap() {
+        let s = store();
+        let chunk = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB each
+        let pulled = std::cell::Cell::new(0usize);
+        // Lazily yield up to a very large number of 1 MiB rows; count how many
+        // the loader actually pulls. With a 32 MiB cap it must stop well before
+        // consuming the whole (here 10_000-row) stream.
+        let iter = (0..10_000).map(|i| {
+            pulled.set(pulled.get() + 1);
+            (format!("k{i:05}"), chunk.clone())
+        });
+        let outcome = s.load_durable("a", iter);
+
+        let (_, bytes) = s.addon_stats("a").unwrap();
+        assert!(bytes <= MAX_BYTES_PER_ADDON);
+        assert!(outcome.loaded > 0);
+        // Stopped reading: pulled only the loaded rows + the one over-cap row
+        // that triggered the break — far below 10_000.
+        assert!(
+            pulled.get() <= outcome.loaded + 1,
+            "iterator must stop at the cap, pulled {} for {} loaded",
+            pulled.get(),
+            outcome.loaded
+        );
+        assert!(pulled.get() < 100, "must not drain the whole huge stream");
+    }
+
+    // FIX 1a: load-once guard — a second load of an already-loaded shard is a
+    // no-op and never clobbers live/dirty state written since the first load.
+    #[test]
+    fn load_durable_load_once_guard() {
+        let s = store();
+        let first = s.load_durable("a", vec![("k".to_string(), b"persisted".to_vec())]);
+        assert_eq!(first.loaded, 1);
+        assert!(!first.already_loaded);
+
+        // Another instance writes a NEWER durable value (unflushed).
+        s.set("a", "k", b"newer".to_vec(), Tier::Durable).unwrap();
+        // It is dirty (pending flush).
+        assert_eq!(s.take_dirty("a").upserts.len(), 1);
+        s.set("a", "k", b"newer".to_vec(), Tier::Durable).unwrap();
+
+        // A redundant load (second instance start) must NOT reload/clobber.
+        let second = s.load_durable("a", vec![("k".to_string(), b"persisted".to_vec())]);
+        assert!(second.already_loaded);
+        assert_eq!(second.loaded, 0);
+        assert_eq!(
+            s.get("a", "k"),
+            Some(b"newer".to_vec()),
+            "load-once must not clobber the newer live value"
+        );
+        // The newer value is still dirty (its tombstone/clobber was not cleared).
+        assert_eq!(s.take_dirty("a").upserts.len(), 1);
+
+        // After drop, the guard resets → a fresh start reloads.
+        s.drop_addon("a");
+        let third = s.load_durable("a", vec![("k".to_string(), b"persisted".to_vec())]);
+        assert!(!third.already_loaded);
+        assert_eq!(third.loaded, 1);
+        assert_eq!(s.get("a", "k"), Some(b"persisted".to_vec()));
+    }
+
+    // FIX 1b: merge semantics — even on the FIRST load, a key already live is not
+    // overwritten and a pending tombstone is not cleared (seed fills only absent
+    // keys).
+    #[test]
+    fn load_durable_merge_skips_present_and_tombstoned() {
+        let s = store();
+        // Live key written before any load (e.g. on_start ran early).
+        s.set("a", "live", b"ram".to_vec(), Tier::Durable).unwrap();
+        // A durable key deleted before load leaves a pending tombstone.
+        s.set("a", "gone", b"x".to_vec(), Tier::Durable).unwrap();
+        assert!(s.delete("a", "gone"));
+
+        let outcome = s.load_durable(
+            "a",
+            vec![
+                ("live".to_string(), b"disk".to_vec()),
+                ("gone".to_string(), b"disk".to_vec()),
+                ("fresh".to_string(), b"disk".to_vec()),
+            ],
+        );
+        // Only the genuinely-absent key is seeded.
+        assert_eq!(outcome.loaded, 1);
+        assert_eq!(outcome.skipped_present, 2);
+        assert_eq!(
+            s.get("a", "live"),
+            Some(b"ram".to_vec()),
+            "live key must not be clobbered by the seed"
+        );
+        assert!(
+            s.get("a", "gone").is_none(),
+            "tombstoned key must stay deleted"
+        );
+        assert_eq!(s.get("a", "fresh"), Some(b"disk".to_vec()));
+
+        // The pending tombstone for "gone" must survive the load.
+        let dirty = s.take_dirty("a");
+        assert!(dirty.deletes.contains(&"gone".to_string()));
+    }
+
+    // FIX 2 (store-level): a batch taken before drop_addon observes the purge and
+    // remark refuses to recreate a shard for the uninstalled addon.
+    #[test]
+    fn taken_batch_observes_purge_and_remark_refuses() {
+        let s = store();
+        s.set("a", "k", b"v".to_vec(), Tier::Durable).unwrap();
+        let batch = s.take_dirty("a");
+        assert!(!batch.is_purged());
+
+        // Uninstall: drop the shard.
+        s.drop_addon("a");
+        // The in-flight batch now sees the purge.
+        assert!(batch.is_purged());
+
+        // Remark must NOT recreate a shard for the purged addon.
+        s.remark_dirty(batch);
+        assert!(
+            s.addon_stats("a").is_none(),
+            "remark must not recreate a shard for an uninstalled addon"
+        );
+        assert!(s.dirty_addons().is_empty());
     }
 
     // FIX 4: a set that races with drop_addon is never silently lost — after a

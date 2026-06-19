@@ -457,8 +457,31 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "roles_add_robot_permissions",
             MigrationStep::Rust(roles_add_robot_permissions),
         ),
+        (
+            84,
+            "addon_state_table",
+            MigrationStep::Sql(ADDON_STATE_TABLE),
+        ),
     ]
 }
+
+// Write-behind backing store for the in-RAM `AddonStateStore` Durable tier
+// (A2). The store serves Durable entries from RAM and the periodic flusher
+// persists them here so a restart recovers them; Ephemeral entries are never
+// written. `value` is the opaque addon-owned blob. `updated_at` is the
+// host-side last-write millis used as the last-write-wins marker. Node-local
+// (not sync-replicated): each node owns its addons' state. The PK already
+// indexes `addon_id` as a prefix, so per-addon load/purge scans are covered
+// without a separate index.
+const ADDON_STATE_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS addon_state (
+    addon_id   TEXT NOT NULL,
+    state_key  TEXT NOT NULL,
+    value      BLOB NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (addon_id, state_key)
+);
+"#;
 
 // Cross-addon camera access grants. A camera is owned by one addon
 // (`cameras.owner_addon_id`); a grant lets ANOTHER addon read/view it without
