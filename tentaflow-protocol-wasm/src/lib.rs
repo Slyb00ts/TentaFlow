@@ -8098,7 +8098,88 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
                 None => set(obj, "note", JsValue::NULL),
             }
         }
+        P::LidarFrameRequest(req) => {
+            set(obj, "variant", "RobotLidarFrameRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+            set(obj, "sinceSeq", req.since_seq.into());
+            set(obj, "since_seq", req.since_seq.into());
+        }
+        P::LidarFrameResponse(resp) => {
+            set(obj, "variant", "RobotLidarFrameResponse".into());
+            decode_lidar_frame_response(obj, resp.frame);
+        }
     }
+}
+
+/// Project a `RobotLidarFrameResponse.frame` into the JS shape the dashboard
+/// LiDAR consumer (L2) and the wgpu renderer (L4) expect. When present, the
+/// canonical L1 frame is parsed via the single source-of-truth header decoder
+/// (`tentaflow_sdk_spec::LidarFrameHeader::decode_header`) so the 36-byte layout
+/// is never duplicated here. We expose both the parsed scalar fields and the raw
+/// bytes: L2 reads `frameSeq`/`pointCount` for freshness, L4 uploads `points`
+/// (the packed f32 XYZ body as a Float32Array) / `raw` (the full frame) to the
+/// GPU. A malformed/short frame is treated as no frame (`hasFrame: false`)
+/// rather than fabricating a partial cloud.
+fn decode_lidar_frame_response(obj: &js_sys::Object, frame: Option<Vec<u8>>) {
+    use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_HEADER_LEN};
+    let parsed = frame
+        .as_ref()
+        .and_then(|bytes| LidarFrameHeader::decode_header(bytes).map(|h| (bytes, h)));
+    let Some((bytes, header)) = parsed else {
+        set(obj, "hasFrame", false.into());
+        return;
+    };
+    // A frame is only "present" if the FULL declared body is actually here. An
+    // unknown layout / overflowing `point_count` (`body_len() == None`) or a
+    // short read (buffer ends before the declared frame) is treated as NO frame
+    // rather than fabricating a clamped, mismatched cloud — `pointCount` must
+    // always equal `points.length / layout`. Attacker-controlled bytes can only
+    // reach the `{hasFrame:false}` path here; no `unwrap`/panic.
+    let Some(body_len) = header.body_len() else {
+        set(obj, "hasFrame", false.into());
+        return;
+    };
+    let frame_end = LIDAR_HEADER_LEN + body_len;
+    if bytes.len() < frame_end {
+        set(obj, "hasFrame", false.into());
+        return;
+    }
+    set(obj, "hasFrame", true.into());
+    set(obj, "frameSeq", header.frame_seq.into());
+    set(obj, "frame_seq", header.frame_seq.into());
+    set(obj, "pointCount", header.point_count.into());
+    set(obj, "point_count", header.point_count.into());
+    set(obj, "layout", header.layout.into());
+    set(obj, "resolution", header.resolution.into());
+    let origin = js_sys::Array::new();
+    for v in &header.origin {
+        origin.push(&JsValue::from(*v as f64));
+    }
+    set(obj, "origin", origin.into());
+    set(obj, "timestampUs", (header.timestamp_us as f64).into());
+    set(obj, "timestamp_us", (header.timestamp_us as f64).into());
+    // Raw bytes: EXACTLY the declared frame (header + declared body), trimming
+    // any trailing garbage past `frame_end` so callers never see bytes beyond
+    // the validated frame.
+    set(obj, "raw", js_sys::Uint8Array::from(&bytes[..frame_end]).into());
+    // Packed f32 body as a Float32Array, built from EXACTLY the declared body
+    // range. `body_len` is a validated multiple of the layout stride (f32 * N),
+    // so `points.length == point_count * layout` always holds.
+    let body = &bytes[LIDAR_HEADER_LEN..frame_end];
+    let float_count = (body_len / 4) as u32;
+    let floats = js_sys::Float32Array::new_with_length(float_count);
+    for i in 0..float_count as usize {
+        let off = i * 4;
+        let v = f32::from_le_bytes([
+            body[off],
+            body[off + 1],
+            body[off + 2],
+            body[off + 3],
+        ]);
+        floats.set_index(i as u32, v);
+    }
+    set(obj, "points", floats.into());
 }
 
 fn ml_studio_summary_to_js(s: &tentaflow_protocol::MlStudioProjectSummary) -> js_sys::Object {
@@ -14038,6 +14119,25 @@ pub fn encode_robot_camera_share_request(
         RobotCameraShareRequest {
             robot_id,
             camera_id,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(LidarFrameRequest) — on-demand pull of the latest
+/// canonical LiDAR frame for a robot (L2). The client passes the `frame_seq` it
+/// last rendered as `since_seq`; Core replies with bytes only when the hub holds
+/// something newer (latest-wins poll, no per-frame queue).
+#[wasm_bindgen(js_name = encodeRobotLidarFrameRequest)]
+pub fn encode_robot_lidar_frame_request(
+    robot_id: String,
+    since_seq: u32,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotLidarFrameRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::LidarFrameRequest(
+        RobotLidarFrameRequest {
+            robot_id,
+            since_seq,
         },
     )))
     .map_err(|e| JsError::new(&e))

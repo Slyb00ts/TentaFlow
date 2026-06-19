@@ -4803,6 +4803,27 @@ export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw, p1, p2, 
 }
 
 /**
+ * MessageBody::RobotsBody(LidarFrameRequest) — on-demand pull of the latest
+ * canonical LiDAR frame for a robot (L2). The client passes the `frame_seq` it
+ * last rendered as `since_seq`; Core replies with bytes only when the hub holds
+ * something newer (latest-wins poll, no per-frame queue).
+ * @param {string} robot_id
+ * @param {number} since_seq
+ * @returns {Uint8Array}
+ */
+export function encodeRobotLidarFrameRequest(robot_id, since_seq) {
+    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRobotLidarFrameRequest(ptr0, len0, since_seq);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::RobotsBody(ListRequest) — org-scoped robot list.
  * @returns {Uint8Array}
  */
@@ -6247,6 +6268,10 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(arg0 >>> 0);
             return ret;
         },
+        __wbg_new_with_length_d360e1480e55002f: function(arg0) {
+            const ret = new Float32Array(arg0 >>> 0);
+            return ret;
+        },
         __wbg_node_84ea875411254db1: function(arg0) {
             const ret = arg0.node;
             return ret;
@@ -6281,6 +6306,9 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_set_b0d9dc239ecdb765: function(arg0, arg1, arg2) {
             arg0.set(getArrayU8FromWasm0(arg1, arg2));
+        },
+        __wbg_set_index_1eb382b1c5bf3e20: function(arg0, arg1, arg2) {
+            arg0[arg1 >>> 0] = arg2;
         },
         __wbg_stack_3b0d974bbf31e44f: function(arg0, arg1) {
             const ret = arg1.stack;
