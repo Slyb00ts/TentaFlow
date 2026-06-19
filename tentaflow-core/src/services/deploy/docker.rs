@@ -383,6 +383,66 @@ fn resolve_gpu_count(manifest_gpus: Option<&str>) -> Option<i64> {
     }
 }
 
+/// Wybór GPU dla kontenera. `Devices` przekazuje konkretne indeksy kart, dzieki
+/// czemu `nvidia-smi -L` w kontenerze widzi tylko je i auto-tensor-parallel w
+/// entrypoincie liczy sie poprawnie zamiast brac wszystkie karty hosta.
+#[cfg(feature = "docker")]
+enum GpuSelection {
+    None,
+    Count(i64),
+    Devices(Vec<String>),
+}
+
+/// Wybor GPU pochodzi z kreatora deploy (`gpu_select_mode` + `gpu_ids` w
+/// config_json), bo to operator decyduje ktore karty dostaje kontener. Manifest
+/// sluzy tylko jako fallback, gdy kreator nie przeslal wyboru — np. serwisy
+/// CPU-only (searxng) nie pokazuja kroku GPU i ida sciezka manifestu.
+#[cfg(feature = "docker")]
+fn resolve_gpu_selection(
+    user_config: &serde_json::Value,
+    manifest_gpus: Option<&str>,
+) -> GpuSelection {
+    match user_config.get("gpu_select_mode").and_then(|v| v.as_str()) {
+        Some("none") => GpuSelection::None,
+        Some("all") => GpuSelection::Count(-1),
+        Some("specific") => {
+            let ids: Vec<String> = user_config
+                .get("gpu_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            // Kreator moze przeslac indeksy jako liczby lub stringi.
+                            if let Some(n) = v.as_u64() {
+                                Some(n.to_string())
+                            } else {
+                                v.as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                gpu_count_to_selection(resolve_gpu_count(manifest_gpus))
+            } else {
+                GpuSelection::Devices(ids)
+            }
+        }
+        _ => gpu_count_to_selection(resolve_gpu_count(manifest_gpus)),
+    }
+}
+
+#[cfg(feature = "docker")]
+fn gpu_count_to_selection(count: Option<i64>) -> GpuSelection {
+    match count {
+        Some(c) => GpuSelection::Count(c),
+        None => GpuSelection::None,
+    }
+}
+
 #[cfg(feature = "docker")]
 mod backend {
     use super::*;
@@ -616,7 +676,7 @@ mod backend {
         cmd: &[String], // dolaczane do ENTRYPOINT jako "$@" (argv silnika)
         binds: &[(PathBuf, String, bool)],
         labels: &HashMap<String, String>,
-        gpu_count: Option<i64>, // Some(-1)=all GPUs, Some(n)=n GPUs, None=no GPU
+        gpu: GpuSelection,
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed: Vec<String> = Vec::new();
@@ -648,15 +708,23 @@ mod backend {
         // `["gpu"]` capability is what the CLI sends for `--gpus`, letting Docker
         // pick the NVIDIA device-request driver (named `nvidia` runtime is not
         // registered on this host, but the device-request path works).
-        let device_requests = gpu_count.map(|count| {
-            vec![DeviceRequest {
+        let device_requests = match gpu {
+            GpuSelection::None => None,
+            GpuSelection::Count(count) => Some(vec![DeviceRequest {
                 driver: None,
                 count: Some(count),
                 device_ids: None,
                 capabilities: Some(vec![vec!["gpu".to_string()]]),
                 options: None,
-            }]
-        });
+            }]),
+            GpuSelection::Devices(ids) => Some(vec![DeviceRequest {
+                driver: None,
+                count: None,
+                device_ids: Some(ids),
+                capabilities: Some(vec![vec!["gpu".to_string()]]),
+                options: None,
+            }]),
+        };
 
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
@@ -976,7 +1044,8 @@ impl DeployStrategy for DockerDeploy {
             ),
         ];
 
-        let gpu_count = resolve_gpu_count(
+        let gpu = resolve_gpu_selection(
+            &self.user_config,
             self.manifest
                 .deploy
                 .docker
@@ -984,16 +1053,15 @@ impl DeployStrategy for DockerDeploy {
                 .and_then(|d| d.gpus.as_deref()),
         );
         if let Some(s) = &self.log_sink {
-            match gpu_count {
-                Some(c) => s.info(&format!(
-                    "[docker] GPU passthrough: {}",
-                    if c < 0 {
-                        "all".to_string()
-                    } else {
-                        c.to_string()
-                    }
-                )),
-                None => s.info("[docker] GPU passthrough: none (CPU)"),
+            match &gpu {
+                GpuSelection::None => s.info("[docker] GPU passthrough: none (CPU)"),
+                GpuSelection::Count(c) if *c < 0 => s.info("[docker] GPU passthrough: all"),
+                GpuSelection::Count(c) => {
+                    s.info(&format!("[docker] GPU passthrough: count={}", c))
+                }
+                GpuSelection::Devices(ids) => {
+                    s.info(&format!("[docker] GPU passthrough: devices=[{}]", ids.join(",")))
+                }
             }
         }
 
@@ -1006,7 +1074,7 @@ impl DeployStrategy for DockerDeploy {
             &engine_args,
             &binds,
             &labels,
-            gpu_count,
+            gpu,
         )
         .await?;
 
