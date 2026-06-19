@@ -393,6 +393,7 @@ fn resolve_gpu_count(manifest_gpus: Option<&str>) -> Option<i64> {
 /// czemu `nvidia-smi -L` w kontenerze widzi tylko je i auto-tensor-parallel w
 /// entrypoincie liczy sie poprawnie zamiast brac wszystkie karty hosta.
 #[cfg(feature = "docker")]
+#[derive(Debug, Clone, PartialEq)]
 enum GpuSelection {
     None,
     Count(i64),
@@ -1325,6 +1326,56 @@ fn vllm_docker_baseline_args(engine_id: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // ---- GPU selection / passthrough resolution (direct-http migration) ----
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn resolve_gpu_count_explicit_values() {
+        assert_eq!(resolve_gpu_count(Some("all")), Some(-1));
+        assert_eq!(resolve_gpu_count(Some("2")), Some(2));
+        assert_eq!(resolve_gpu_count(Some("none")), None);
+        assert_eq!(resolve_gpu_count(Some("0")), None);
+        assert_eq!(resolve_gpu_count(Some("")), None);
+        // Garbage parses to no GPU rather than panicking.
+        assert_eq!(resolve_gpu_count(Some("abc")), None);
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn resolve_gpu_selection_honors_wizard_mode() {
+        // Explicit "none" overrides any host default.
+        assert!(matches!(
+            resolve_gpu_selection(&serde_json::json!({"gpu_select_mode": "none"}), Some("all")),
+            GpuSelection::None
+        ));
+        // "all" → every GPU.
+        assert!(matches!(
+            resolve_gpu_selection(&serde_json::json!({"gpu_select_mode": "all"}), None),
+            GpuSelection::Count(-1)
+        ));
+        // "specific" with ids (numbers or strings) → device list.
+        match resolve_gpu_selection(
+            &serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": [0, "3"]}),
+            None,
+        ) {
+            GpuSelection::Devices(ids) => assert_eq!(ids, vec!["0".to_string(), "3".to_string()]),
+            other => panic!("expected Devices, got {:?}", other),
+        }
+        // "specific" with empty ids → falls back to manifest gpus.
+        assert!(matches!(
+            resolve_gpu_selection(
+                &serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": []}),
+                Some("all")
+            ),
+            GpuSelection::Count(-1)
+        ));
+        // Manifest gpus="none" with no wizard mode → no GPU.
+        assert!(matches!(
+            resolve_gpu_selection(&serde_json::json!({}), Some("none")),
+            GpuSelection::None
+        ));
+    }
 
     fn skeleton_manifest(id: &str) -> ServiceManifest {
         use crate::services::manifest::{

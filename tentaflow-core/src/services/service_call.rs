@@ -486,7 +486,14 @@ async fn dispatch_to_service(
 
     let quic_client = match quic_client {
         Some(c) => c,
-        None => return Err(DispatchErr::NotFound),
+        None => {
+            // No QUIC sidecar — direct-http engines (the standard since the
+            // sidecar removal). Reach the service over HTTP via its BackendClient.
+            if let Some(http) = service_manager.find_http_backend_for_model(service_name) {
+                return dispatch_http(&http, service_name, request_json).await;
+            }
+            return Err(DispatchErr::NotFound);
+        }
     };
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -540,6 +547,48 @@ async fn dispatch_to_service(
             "result_type": format!("{:?}", std::mem::discriminant(&model_response.result)),
         }),
     };
+    serde_json::to_string(&response).map_err(|e| DispatchErr::Other(format!("serialize: {e}")))
+}
+
+/// Direct-http dispatch (no sidecar): wraps the addon's `request_json` as a chat
+/// user message and calls the engine's OpenAI `/chat/completions` via the live
+/// `BackendClient`, mirroring the QUIC path's Completion semantics. Returns the
+/// same `{status, text, model, finish_reason}` shape.
+async fn dispatch_http(
+    client: &crate::services::backend::client::BackendClient,
+    service_name: &str,
+    request_json: &str,
+) -> Result<String, DispatchErr> {
+    use crate::api::openai::types::{ChatCompletionRequest, MessageContent};
+
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": service_name,
+        "messages": [{"role": "user", "content": request_json}],
+    }))
+    .map_err(|e| DispatchErr::Other(format!("build chat request: {e}")))?;
+
+    let resp = client
+        .chat_completion(req)
+        .await
+        .map_err(|e| DispatchErr::Other(format!("http: {e}")))?;
+
+    let text = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_ref())
+        .map(|mc| match mc {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(_) => String::new(),
+        })
+        .unwrap_or_default();
+    let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
+
+    let response = serde_json::json!({
+        "status": "ok",
+        "text": text,
+        "model": resp.model,
+        "finish_reason": finish_reason,
+    });
     serde_json::to_string(&response).map_err(|e| DispatchErr::Other(format!("serialize: {e}")))
 }
 
