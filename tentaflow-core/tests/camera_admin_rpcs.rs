@@ -142,7 +142,7 @@ fn ctx_with_perms(state: Arc<AppState>, perms: &[&str]) -> HandlerContext {
 }
 
 fn count_cameras_for_org(state: &AppState, org_id: &str) -> i64 {
-    let conn = state.db.lock().expect("db mutex");
+    let conn = state.db.read().expect("db mutex");
     conn.query_row(
         "SELECT COUNT(*) FROM cameras WHERE org_id = ?1",
         rusqlite::params![org_id],
@@ -152,7 +152,7 @@ fn count_cameras_for_org(state: &AppState, org_id: &str) -> i64 {
 }
 
 fn last_audit_for_action(state: &AppState, action: &str) -> Option<(Option<String>, String)> {
-    let conn = state.db.lock().expect("db mutex");
+    let conn = state.db.read().expect("db mutex");
     conn.query_row(
         "SELECT COALESCE(resource, resource_id), \
                 COALESCE(result, '') || ' ' || COALESCE(details, '') \

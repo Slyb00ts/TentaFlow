@@ -334,7 +334,7 @@ impl UiAuditWriter {
 
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let conn = match db.lock() {
+        let conn = match db.write() {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("ui_audit: failed to lock db: {e}");

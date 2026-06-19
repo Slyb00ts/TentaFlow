@@ -263,7 +263,7 @@ impl AuditLogger {
         let count = entries.len();
         debug!("Flush {} wpisow audytowych do bazy", count);
 
-        let conn = match self.db.lock() {
+        let conn = match self.db.write() {
             Ok(c) => c,
             Err(e) => {
                 error!(
@@ -391,7 +391,7 @@ impl AuditLogger {
 
         let conn = self
             .db
-            .lock()
+            .write()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         let deleted = conn.execute(
@@ -412,7 +412,7 @@ impl AuditLogger {
     ) -> anyhow::Result<Vec<AuditEntry>> {
         let conn = self
             .db
-            .lock()
+            .read()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         // Buduj zapytanie dynamicznie z filtrami
@@ -487,7 +487,7 @@ impl AuditLogger {
     pub fn count(&self, filters: &AuditFilters) -> anyhow::Result<u64> {
         let conn = self
             .db
-            .lock()
+            .read()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         let mut sql = String::from("SELECT COUNT(*) FROM audit_log WHERE 1=1");

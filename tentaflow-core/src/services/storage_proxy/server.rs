@@ -360,7 +360,7 @@ fn kv_get(
     key: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let conn = db
-        .lock()
+        .read()
         .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
     let value = conn
         .query_row(
@@ -391,7 +391,7 @@ fn kv_set(
         actor_user_id,
     );
     let mut conn = db
-        .lock()
+        .write()
         .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
     let tx = conn.transaction()?;
     let rows = tx.execute(
@@ -423,7 +423,7 @@ fn kv_delete(
         actor_user_id,
     );
     let mut conn = db
-        .lock()
+        .write()
         .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
     let tx = conn.transaction()?;
     let rows = tx.execute(
@@ -443,7 +443,7 @@ fn kv_list(
     prefix: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let conn = db
-        .lock()
+        .read()
         .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
     let keys = if let Some(prefix) = prefix {
         let like_pattern = format!("{prefix}%");
@@ -597,7 +597,7 @@ fn blob_put_chunk(
     );
     {
         let conn = db
-            .lock()
+            .write()
             .map_err(|e| anyhow::anyhow!("storage proxy blob db lock: {e}"))?;
         crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)?;
     }

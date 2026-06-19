@@ -620,7 +620,7 @@ fn install_core(
         .unwrap_or_default();
 
     // 5-9. Zarejestruj w DB (w jednej transakcji)
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
 
     conn.execute("BEGIN TRANSACTION", [])?;
 
@@ -787,7 +787,7 @@ pub(crate) fn materialize_addon_derived_state(
     package_dir: &Path,
 ) -> Result<()> {
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         upsert_addon_resource_limits(&conn, manifest)?;
         upsert_addon_network_rules(&conn, manifest)?;
     }
@@ -1100,7 +1100,7 @@ fn capture_addon_package_blob(
             None,
         );
         {
-            let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+            let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
             crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)?;
         }
         crate::sync::blob_capture::ledger_blob_capture_now(db, &capture)
@@ -1371,7 +1371,7 @@ pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) 
 /// 2. Usun z tabel powiazanych (addon_permissions, addon_secrets, addon_resource_limits, addon_config)
 /// 3. Usun z addons
 pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
 
     // Sprawdz czy addon istnieje
     let exists: bool = conn
@@ -1633,7 +1633,7 @@ fn upgrade_core(
     let new_skill_md = std::fs::read_to_string(new_dir.join("SKILL.md")).ok();
 
     let old_version: String = {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         conn.query_row(
             "SELECT version FROM addons WHERE addon_id = ?1",
             rusqlite::params![addon_id],
@@ -1657,7 +1657,7 @@ fn upgrade_core(
             .map(|p| p.bundle_hash)
             .unwrap_or_default();
 
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
     conn.execute("BEGIN TRANSACTION", [])?;
 
     info!(
@@ -2606,6 +2606,11 @@ fn parse_storage_section(
             .and_then(|v| v.as_str())
             .unwrap_or("none")
             .to_string(),
+        scope: tbl
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("org")
+            .to_string(),
     };
     Ok(Some(cfg))
 }
@@ -2828,7 +2833,7 @@ fn reconcile_vector_namespaces(db: &DbPool, manifest: &AddonManifest) {
             .collect();
 
         let orgs: Vec<String> = {
-            let conn = match db.lock() {
+            let conn = match db.read() {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -3560,7 +3565,7 @@ runtime = "wasmtime"
     }
 
     fn write_trusted_publisher(db: &crate::db::DbPool, key_b64: &str) {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT INTO trusted_publishers (key_b64, label, added_at) VALUES (?1, 'test', '2026-01-01T00:00:00Z')",
             rusqlite::params![key_b64],
@@ -3930,7 +3935,7 @@ slot = "sidebar"
         assert_eq!(skill.tags_json, r#"["from-package"]"#);
 
         let count_skill_captures = || -> i64 {
-            let conn = db.lock().expect("db lock");
+            let conn = db.read().expect("db lock");
             conn.query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures WHERE resource_type = 'core.skill'",
                 [],

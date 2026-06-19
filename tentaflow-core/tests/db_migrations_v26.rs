@@ -34,7 +34,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 #[test]
 fn v26_creates_trusted_publishers_table_with_expected_columns() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     for col in ["key_b64", "label", "added_at", "added_by_user", "contact"] {
         assert!(
             column_exists(&conn, "trusted_publishers", col),
@@ -46,7 +46,7 @@ fn v26_creates_trusted_publishers_table_with_expected_columns() {
 #[test]
 fn v26_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 26",
@@ -60,7 +60,7 @@ fn v26_recorded_in_meta() {
 #[test]
 fn v26_trust_store_is_empty_by_default() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM trusted_publishers", [], |r| r.get(0))
         .expect("count");
@@ -73,7 +73,7 @@ fn v26_trust_store_is_empty_by_default() {
 #[test]
 fn v26_supports_insert_and_unique_constraint() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     let pk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     conn.execute(
         "INSERT INTO trusted_publishers (key_b64, label, added_at) VALUES (?1, ?2, ?3)",
@@ -93,7 +93,7 @@ fn v26_idempotent_on_reopen() {
     let path = dir.path().join("test.db");
     let _ = db::init(&path).expect("first init");
     let pool2 = db::init(&path).expect("second init must not fail");
-    let conn = pool2.lock().expect("lock");
+    let conn = pool2.read().expect("read");
     let v26_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 26",

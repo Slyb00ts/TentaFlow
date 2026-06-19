@@ -35,7 +35,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 #[test]
 fn v27_creates_addon_vector_namespaces_table_with_expected_columns() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     for col in [
         "addon_id",
         "namespace",
@@ -56,7 +56,7 @@ fn v27_creates_addon_vector_namespaces_table_with_expected_columns() {
 #[test]
 fn v27_recorded_in_meta() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 27",
@@ -70,7 +70,7 @@ fn v27_recorded_in_meta() {
 #[test]
 fn v27_supports_insert_and_primary_key_constraint() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     conn.execute(
         "INSERT INTO addon_vector_namespaces \
          (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at) \
@@ -107,7 +107,7 @@ fn v27_supports_insert_and_primary_key_constraint() {
 #[test]
 fn v27_metric_check_constraint_rejects_invalid_value() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     let res = conn.execute(
         "INSERT INTO addon_vector_namespaces \
          (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at) \
@@ -127,7 +127,7 @@ fn v27_metric_check_constraint_rejects_invalid_value() {
 #[test]
 fn v27_dim_check_constraint_rejects_out_of_range() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     let res = conn.execute(
         "INSERT INTO addon_vector_namespaces \
          (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at) \
@@ -147,7 +147,7 @@ fn v27_dim_check_constraint_rejects_out_of_range() {
 #[test]
 fn v27_cross_addon_same_namespace_name_is_allowed() {
     let (_dir, pool) = open_db();
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("write");
     conn.execute(
         "INSERT INTO addon_vector_namespaces \
          (addon_id, namespace, dim, metric, count, file_path, created_at, updated_at) \
@@ -170,7 +170,7 @@ fn v27_idempotent_on_reopen() {
     let path = dir.path().join("test.db");
     let _ = db::init(&path).expect("first init");
     let pool2 = db::init(&path).expect("second init must not fail");
-    let conn = pool2.lock().expect("lock");
+    let conn = pool2.read().expect("read");
     let v27_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM _migrations WHERE version = 27",

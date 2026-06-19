@@ -92,7 +92,7 @@ impl AiGateway {
         user: Option<&UserContext>,
         context: Option<&AiGatewayContext>,
     ) -> Result<AiEventHandle> {
-        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let org_id = resolve_org_id(&conn, user, context)?;
         let request_id = uuid::Uuid::new_v4().to_string();
         // A session/root event with no inbound correlation key anchors the turn:
@@ -150,7 +150,7 @@ impl AiGateway {
         agent_run_id: &str,
         execution: &ToolExecution<'_>,
     ) -> Result<Option<String>> {
-        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let Some(event_id) =
             super::repository::latest_ai_event_id_for_run(&conn, agent_run_id)?
         else {
@@ -198,7 +198,7 @@ impl AiEventHandle {
     /// tool returns — pairs the model-issued call id with the real status,
     /// output hash and timing. Returns the row's UUID `tool_call_id`.
     pub fn record_tool_execution(&self, execution: &ToolExecution<'_>) -> Result<String> {
-        let conn = self.db.lock().map_err(|_| anyhow!("DB lock poisoned"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("DB lock poisoned"))?;
         let started_at = execution
             .started_at
             .format("%Y-%m-%dT%H:%M:%SZ")
@@ -224,7 +224,7 @@ impl AiEventHandle {
     }
 
     pub fn finish_success(&self, response: &ChatCompletionResponse) -> Result<()> {
-        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let response_text = chat_response_text(response);
         add_ai_payload(
             &conn,
@@ -269,7 +269,7 @@ impl AiEventHandle {
     }
 
     pub fn finish_failed(&self, error_message: &str) -> Result<()> {
-        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let audit_log_id =
             insert_ai_audit_row(&conn, &self.event_id, "error", Some(error_message))?;
         finish_ai_event(
@@ -287,7 +287,7 @@ impl AiEventHandle {
         usage: Option<&Usage>,
         tool_calls: &[ToolCall],
     ) -> Result<()> {
-        let conn = self.db.lock().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         add_ai_payload(
             &conn,
             &NewAiPayload {
@@ -457,12 +457,12 @@ mod tests {
     use super::*;
     use crate::api::openai::types::{Choice, Message, Usage};
     use crate::db::migrations;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = Connection::open_in_memory().expect("baza testowa");
         migrations::run(&conn).expect("migracje");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
         };
         handle.finish_success(&response).expect("finish event");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let status: String = conn
             .query_row(
                 "SELECT status FROM compliance_ai_events WHERE event_id = ?1",
@@ -592,7 +592,7 @@ mod tests {
             .finish_stream_success("odpowiedź ze streamu", Some(&usage), &[])
             .expect("finish stream event");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let response_payload: String = conn
             .query_row(
                 "SELECT content_text FROM compliance_ai_payloads WHERE event_id = ?1 AND payload_kind = 'response'",
@@ -678,7 +678,7 @@ mod tests {
             })
             .expect("record failed execution");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let (llm_id, addon_id, input_hash, output_hash, status, row_started_at, finished_at): (
             String,
             String,
@@ -792,7 +792,7 @@ mod tests {
         // Scope the read lock so it is released before the next gateway call —
         // record_run_tool_execution re-acquires the same Mutex.
         {
-            let conn = db.lock().expect("db lock");
+            let conn = db.read().expect("db lock");
             let event_id: String = conn
                 .query_row(
                     "SELECT event_id FROM compliance_ai_tool_calls WHERE llm_tool_call_id = 'call-x'",
@@ -872,7 +872,7 @@ mod tests {
             "two distinct events"
         );
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let session_corr: String = conn
             .query_row(
                 "SELECT correlation_id FROM compliance_ai_events WHERE event_id = ?1",

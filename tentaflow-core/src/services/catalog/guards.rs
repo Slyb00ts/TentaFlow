@@ -145,7 +145,7 @@ fn published_flow_owner(pool: &DbPool, name: &str) -> Result<Option<String>, Gua
     // already-active flow. The collision is reported now, not later.
     let lookup = || -> Result<Option<String>> {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("db pool lock poisoned"))?;
         let mut stmt =
             conn.prepare_cached("SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1")?;
@@ -163,18 +163,18 @@ fn published_flow_owner(pool: &DbPool, name: &str) -> Result<Option<String>, Gua
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn fresh_db() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).unwrap();
         crate::db::seed::seed_defaults(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn publish_seeded_llm_flow(pool: &DbPool, name: &str) {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE flows SET published_model_name = ?1 WHERE name = 'Default Chat'",
             rusqlite::params![name],
@@ -183,7 +183,7 @@ mod tests {
     }
 
     fn seed_test_alias(pool: &DbPool, alias: &str, target: &str) -> i64 {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO model_aliases (alias, target_model, is_active) VALUES (?1, ?2, 1)",
             rusqlite::params![alias, target],
@@ -252,7 +252,7 @@ mod tests {
         let pool = fresh_db();
         publish_seeded_llm_flow(&pool, "chat-pl");
         let flow_id = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             conn.query_row(
                 "SELECT id FROM flows WHERE name = 'Default Chat'",
                 [],
@@ -297,7 +297,7 @@ mod tests {
         // Mark the seeded LLM flow as draft *and* publishing under the
         // requested name — that is the regression case.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl', status = 'draft' \
                  WHERE name = 'Default Chat'",

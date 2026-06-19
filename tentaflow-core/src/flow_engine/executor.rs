@@ -2295,7 +2295,7 @@ mod chain_integration_tests {
         // `execute_streaming` writes a `flow_executions` row FK-bound to `flows(id)`;
         // seed the flow these tests compile under id "0" so the log write succeeds.
         {
-            let conn = pool.lock().expect("db lock");
+            let conn = pool.write().expect("db lock");
             conn.execute(
                 "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
                 [],
@@ -2847,7 +2847,7 @@ mod concurrent_executor_tests {
         // `execute_blocking` writes a `flow_executions` row FK-bound to `flows(id)`;
         // seed the flow these tests compile under id "0" so the log write succeeds.
         {
-            let conn = pool.lock().expect("db lock");
+            let conn = pool.write().expect("db lock");
             conn.execute(
                 "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
                 [],
@@ -3494,16 +3494,16 @@ mod harness_streaming_tests {
     use async_trait::async_trait;
     use futures::stream::{BoxStream, StreamExt};
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn insert_flow(pool: &DbPool, id: &str, json: &str) {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO flows (id, name, service_type, flow_json, status, is_default) \
              VALUES (?1, ?2, NULL, ?3, 'active', 0)",
@@ -3856,7 +3856,7 @@ mod loop_region_tests {
     fn db() -> DbPool {
         let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
         {
-            let conn = pool.lock().expect("db lock");
+            let conn = pool.write().expect("db lock");
             conn.execute(
                 "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
                 [],

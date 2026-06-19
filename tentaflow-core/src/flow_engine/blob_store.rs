@@ -95,7 +95,7 @@ impl FileBlobStore {
             None,
         );
         {
-            let conn = db.lock().map_err(|e| anyhow!("blob sync db lock: {e}"))?;
+            let conn = db.write().map_err(|e| anyhow!("blob sync db lock: {e}"))?;
             crate::sync::blob_capture::record_blob_write_capture(&conn, &capture)?;
         }
         crate::sync::blob_capture::ledger_blob_capture_now(db, &capture)?;

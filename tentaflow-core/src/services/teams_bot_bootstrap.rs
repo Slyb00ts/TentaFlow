@@ -67,13 +67,13 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn setup_pool() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     #[tokio::test]

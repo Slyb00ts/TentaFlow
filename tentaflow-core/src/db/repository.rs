@@ -9,9 +9,9 @@ use anyhow::Result;
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 
-/// Pozyskuje polaczenie z puli (lock na Mutex)
-fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    pool.lock()
+/// Pozyskuje polaczenie z puli (writer pod pelne read+write).
+fn acquire(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
+    pool.write()
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))
 }
 
@@ -19,7 +19,7 @@ fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connecti
 /// snapshot/import inside a single externally-managed transaction.
 pub fn acquire_for_baseline(
     pool: &DbPool,
-) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
     acquire(pool)
 }
 
@@ -53,7 +53,7 @@ mod core_sync_repository_tests {
     }
 
     fn capture_id_for_resource_str(db: &DbPool, resource_type: &str, resource_id: &str) -> String {
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         conn.query_row(
             "SELECT capture_id FROM __tentaflow_core_sync_captures \
              WHERE resource_type = ?1 AND resource_id = ?2 \
@@ -70,7 +70,7 @@ mod core_sync_repository_tests {
         resource_id: &str,
         action: &str,
     ) -> String {
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         conn.query_row(
             "SELECT capture_id FROM __tentaflow_core_sync_captures \
              WHERE resource_type = ?1 AND resource_id = ?2 AND action = ?3 \
@@ -99,7 +99,7 @@ mod core_sync_repository_tests {
         let id =
             create_flow(&db, &flow_params("Flow A", r#"{"nodes":[]}"#, None)).expect("create flow");
         let capture_id = capture_id_for_resource_str(&db, "core.flow", &id);
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
@@ -125,7 +125,7 @@ mod core_sync_repository_tests {
             None,
         )
         .expect("update flow");
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let flow_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
@@ -170,7 +170,7 @@ mod core_sync_repository_tests {
         )
         .expect("create user");
         let capture_id = capture_id_for_resource_str(&db, "core.user_account", &user_id);
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
@@ -196,7 +196,7 @@ mod core_sync_repository_tests {
         .expect("create user");
         update_user_account_password(&db, &user_id, "new-secret-hash").expect("update password");
         let capture_id = capture_id_for_action(&db, "core.user_account", &user_id, "update");
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
@@ -219,7 +219,7 @@ mod core_sync_repository_tests {
         add_user_to_group(&db, &group_id, &user_id).expect("add member");
         let resource_id = group_member_resource_id(&group_id, &user_id);
         let capture_id = capture_id_for_resource_str(&db, "core.group_member", &resource_id);
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
@@ -6012,7 +6012,7 @@ mod skills_repository_tests {
     #[test]
     fn migration_creates_skills_tables_with_constraints() {
         let db = setup_db();
-        let conn = db.lock().expect("db lock");
+        let conn = db.write().expect("db lock");
         for table in ["skills", "skill_files"] {
             let n: i64 = conn
                 .query_row(
@@ -6263,7 +6263,7 @@ mod skills_repository_tests {
         // Usage stats are node-local runtime data (the skill_view consumer
         // bumps them); seed them directly to prove upserts leave them alone.
         {
-            let conn = db.lock().expect("db lock");
+            let conn = db.write().expect("db lock");
             conn.execute(
                 "UPDATE skills SET use_count = 2, last_used_at = datetime('now') WHERE id = ?1",
                 rusqlite::params![id],
@@ -6290,7 +6290,7 @@ mod skills_repository_tests {
         .expect("files");
         delete_skill(&db, &id).expect("delete");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let count_ops = |resource_type: &str, action: &str| -> i64 {
             conn.query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
@@ -6949,7 +6949,7 @@ mod agents_repository_tests {
     #[test]
     fn migration_creates_agent_tables_with_constraints() {
         let db = setup_db();
-        let conn = db.lock().expect("db lock");
+        let conn = db.write().expect("db lock");
         for table in ["agents", "agent_runs"] {
             let n: i64 = conn
                 .query_row(
@@ -6989,7 +6989,7 @@ mod agents_repository_tests {
         let db = setup_db();
         // Seed materializes a system `general` agent (§3.8); this test asserts
         // exact list counts over agents IT creates, so start from a clean table.
-        db.lock()
+        db.write()
             .unwrap()
             .execute("DELETE FROM agents", [])
             .expect("clear seeded agents");
@@ -7339,7 +7339,7 @@ mod agents_repository_tests {
         )
         .expect("status");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let count_ops = |resource_type: &str, action: &str| -> i64 {
             conn.query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
@@ -11374,7 +11374,7 @@ pub mod transcripts {
         meeting_url: Option<&str>,
         title: Option<&str>,
     ) -> Result<i64> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
@@ -11441,7 +11441,7 @@ pub mod transcripts {
         session_id: i64,
         entry: &crate::routing::transcript_store::TranscriptEntry,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO meeting_transcripts
              (session_id, timestamp_ms, speaker, profile_id, confidence, is_enrolled, text, model)
@@ -11474,7 +11474,7 @@ pub mod transcripts {
     /// Uzywane przez handlery (summaries/action-items/export), ktore nie moga
     /// tworzyc sesji — w odroznieniu od `get_or_create_session`.
     pub fn session_id_by_meeting_key(pool: &DbPool, meeting_key: &str) -> Result<Option<i64>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let id: rusqlite::Result<i64> = conn.query_row(
             "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
             rusqlite::params![meeting_key],
@@ -11491,7 +11491,7 @@ pub mod transcripts {
         pool: &DbPool,
         meeting_key: &str,
     ) -> Result<Option<Option<String>>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let row: rusqlite::Result<Option<String>> = conn.query_row(
             "SELECT owner_user_id FROM meeting_sessions WHERE meeting_key = ?1",
             rusqlite::params![meeting_key],
@@ -11506,7 +11506,7 @@ pub mod transcripts {
 
     /// Lista sesji posortowana po last_activity_at malejaco. Opcjonalny filtr po owner_user_id.
     pub fn list_sessions(pool: &DbPool, owner_user_id: Option<&str>) -> Result<Vec<SessionRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let sql_all = format!(
             "SELECT {} FROM meeting_sessions s ORDER BY s.last_activity_at DESC",
             SESSION_COLS
@@ -11536,7 +11536,7 @@ pub mod transcripts {
         pool: &DbPool,
         owner_user_id: &str,
     ) -> Result<Option<SessionRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let sql = format!(
             "SELECT {} FROM meeting_sessions s \
              WHERE s.owner_user_id = ?1 AND s.status IN ('joining','active','leaving') \
@@ -11551,7 +11551,7 @@ pub mod transcripts {
 
     /// Wszystkie wpisy transkrypcji dla sesji w kolejnosci chronologicznej.
     pub fn list_transcripts(pool: &DbPool, session_id: i64) -> Result<Vec<TranscriptRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, timestamp_ms, speaker, profile_id, confidence,
                     is_enrolled, text, model
@@ -11577,7 +11577,7 @@ pub mod transcripts {
 
     /// Pobiera pojedyncza sesje po id.
     pub fn get_session(pool: &DbPool, id: i64) -> Result<Option<SessionRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let sql = format!(
             "SELECT {} FROM meeting_sessions s WHERE s.id = ?1",
             SESSION_COLS
@@ -11608,7 +11608,7 @@ pub mod transcripts {
         platform: &str,
         owner_user_id: Option<&str>,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions
              SET status = 'joining',
@@ -11645,7 +11645,7 @@ pub mod transcripts {
         platform: &str,
         owner_user_id: Option<&str>,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions
              SET status = 'joining',
@@ -11673,7 +11673,7 @@ pub mod transcripts {
     }
 
     pub fn set_session_status(pool: &DbPool, id: i64, status: &str) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions SET status = ?2, last_activity_at = datetime('now')
              WHERE id = ?1",
@@ -11696,7 +11696,7 @@ pub mod transcripts {
         details: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions
              SET lifecycle_stage = ?2,
@@ -11726,7 +11726,7 @@ pub mod transcripts {
         enrolled_speakers: Option<i64>,
         total_participants: Option<i64>,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions
              SET backend_stt_model = ?2,
@@ -11753,7 +11753,7 @@ pub mod transcripts {
     }
 
     pub fn mark_session_ended(pool: &DbPool, id: i64) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE meeting_sessions SET status = 'ended', ended_at = datetime('now'),
                  last_activity_at = datetime('now'),
@@ -11768,7 +11768,7 @@ pub mod transcripts {
     /// Sesje oznaczone 'active'/'joining' po crashu (zostaly po unclean shutdown).
     /// Caller powinien je zwolnic (stop container jesli istnieje, release ports, mark ended).
     pub fn list_stale_sessions(pool: &DbPool) -> Result<Vec<SessionRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let sql = format!(
             "SELECT {} FROM meeting_sessions s \
              WHERE s.status IN ('joining','active','leaving')",
@@ -11786,7 +11786,7 @@ pub mod transcripts {
     /// Atomowo rezerwuje port danego rodzaju. Zwraca true jesli nowy wpis wstawiono,
     /// false jesli port byl juz zajęty (wywolanie powinno probowac kolejny).
     pub fn try_reserve_port(pool: &DbPool, port: u16, kind: &str, session_id: i64) -> Result<bool> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let changed = conn.execute(
             "INSERT OR IGNORE INTO meeting_port_allocations (port, kind, session_id)
              VALUES (?1, ?2, ?3)",
@@ -11796,7 +11796,7 @@ pub mod transcripts {
     }
 
     pub fn release_session_ports(pool: &DbPool, session_id: i64) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "DELETE FROM meeting_port_allocations WHERE session_id = ?1",
             rusqlite::params![session_id],
@@ -11805,7 +11805,7 @@ pub mod transcripts {
     }
 
     pub fn list_reserved_ports(pool: &DbPool, kind: &str) -> Result<Vec<u16>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt =
             conn.prepare_cached("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
         let rows = stmt.query_map(rusqlite::params![kind], |row| {
@@ -11820,7 +11820,7 @@ pub mod transcripts {
     // =========================================================================
 
     pub fn get_user_setting(pool: &DbPool, user_id: &str, key: &str) -> Result<Option<String>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let val = conn
             .query_row(
                 "SELECT value FROM meeting_settings WHERE user_id = ?1 AND key = ?2",
@@ -11832,7 +11832,7 @@ pub mod transcripts {
     }
 
     pub fn list_user_settings(pool: &DbPool, user_id: &str) -> Result<Vec<(String, String)>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT key, value FROM meeting_settings WHERE user_id = ?1 ORDER BY key ASC",
         )?;
@@ -11843,7 +11843,7 @@ pub mod transcripts {
     }
 
     pub fn set_user_setting(pool: &DbPool, user_id: &str, key: &str, value: &str) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO meeting_settings (user_id, key, value, updated_at)
              VALUES (?1, ?2, ?3, datetime('now'))
@@ -11882,7 +11882,7 @@ pub mod transcripts {
         summary_text: &str,
         model: &str,
     ) -> Result<i64> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO meeting_summaries (session_id, decisions_text, summary_text, model)
              VALUES (?1, ?2, ?3, ?4)",
@@ -11896,7 +11896,7 @@ pub mod transcripts {
         session_id: i64,
         limit: u32,
     ) -> Result<Vec<DbMeetingSummary>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT id, session_id, created_at, decisions_text, summary_text, model
              FROM meeting_summaries
@@ -11927,7 +11927,7 @@ pub mod transcripts {
         deadline: Option<&str>,
     ) -> Result<i64> {
         let hash = action_item_content_hash(owner, task);
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO meeting_action_items
                 (session_id, owner, task, deadline, content_hash)
@@ -11951,7 +11951,7 @@ pub mod transcripts {
         session_id: i64,
         status_filter: Option<&str>,
     ) -> Result<Vec<DbMeetingActionItem>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DbMeetingActionItem> {
             Ok(DbMeetingActionItem {
                 id: row.get(0)?,
@@ -11994,7 +11994,7 @@ pub mod transcripts {
 
     /// Zmienia status action itemu. Zwraca true jesli wiersz istnial.
     pub fn update_action_item_status(pool: &DbPool, id: i64, status: &str) -> Result<bool> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let affected = conn.execute(
             "UPDATE meeting_action_items
              SET status = ?1, updated_at = datetime('now')
@@ -14545,7 +14545,7 @@ mod alias_resolve_tests {
         )
         .expect("create alias");
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let row: (String, Option<String>) = conn
             .query_row(
                 "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
@@ -14570,7 +14570,7 @@ mod alias_resolve_tests {
         )
         .expect("create alias");
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let row: (String, Option<String>) = conn
             .query_row(
                 "SELECT owner_type, owner_id FROM model_alias_owners WHERE alias_id = ?1",
@@ -14641,7 +14641,7 @@ mod alias_resolve_tests {
         )
         .expect("create alias");
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let (change_type, addon): (String, Option<String>) = conn
             .query_row(
                 "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
@@ -14679,7 +14679,7 @@ mod alias_resolve_tests {
         .unwrap();
         assert_ne!(id1, id2);
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let owned: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM model_alias_owners WHERE owner_id = 'vendor-x'",
@@ -14707,7 +14707,7 @@ mod alias_resolve_tests {
         .unwrap();
         set_model_alias_active_audited(&db, "persist-alias", false, Some("persist-addon")).unwrap();
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let (active, owner): (i64, String) = conn
             .query_row(
                 "SELECT m.is_active, o.owner_id FROM model_aliases m \
@@ -14736,7 +14736,7 @@ mod alias_resolve_tests {
         set_model_alias_active_audited(&db, "deact-alias", false, Some("admin-tool"))
             .expect("deactivate");
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let (ct, addon): (String, Option<String>) = conn
             .query_row(
                 "SELECT change_type, changed_by_addon_id FROM model_alias_changes \
@@ -14766,7 +14766,7 @@ mod alias_resolve_tests {
         .unwrap();
 
         let original_created_at: String = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT created_at FROM model_alias_owners \
                  WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
@@ -14792,7 +14792,7 @@ mod alias_resolve_tests {
         .unwrap();
 
         let after_created_at: String = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT created_at FROM model_alias_owners \
                  WHERE alias_id = (SELECT id FROM model_aliases WHERE alias = 'persist-ts')",
@@ -14940,7 +14940,7 @@ mod alias_resolve_tests {
         )
         .expect("addon-a seed");
         let audit_before: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
                 [],
@@ -14953,7 +14953,7 @@ mod alias_resolve_tests {
         // Batch install for addon-b: alias-1 succeeds, alias-2 ('shared-name')
         // conflicts → we drop the tx without commit.
         {
-            let mut conn = db.lock().unwrap();
+            let mut conn = db.write().unwrap();
             let tx = conn.transaction().expect("tx");
             create_or_reactivate_model_alias_within_tx(
                 &tx,
@@ -14980,7 +14980,7 @@ mod alias_resolve_tests {
 
         // First alias must not exist (rollback).
         let leftover_alias: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT COUNT(*) FROM model_aliases WHERE alias = 'addon-b-first'",
                 [],
@@ -14997,7 +14997,7 @@ mod alias_resolve_tests {
         // alias-1 was rolled back too. This is the critical invariant
         // the external-tx fix protects.
         let audit_after: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT COUNT(*) FROM model_alias_changes WHERE changed_by_addon_id = 'addon-b'",
                 [],
@@ -16094,7 +16094,7 @@ mod permission_and_oauth_tests {
     fn test_list_addons_includes_icon_size_and_category() {
         let db = setup_db();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO addons (addon_id, name, version, description, author, platforms, \
                  manifest_json, is_enabled, is_system, category, icon, runtime, wasm_size_bytes) \
@@ -16119,7 +16119,7 @@ mod permission_and_oauth_tests {
     #[test]
     fn test_migration_43_adds_ui_metadata_columns() {
         let db = setup_db();
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let mut stmt = conn.prepare_cached("PRAGMA table_info(addons)").unwrap();
         let cols: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))
@@ -16391,7 +16391,7 @@ pub mod deployments {
         phase: &str,
         progress_pct: u32,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE deployments SET status = ?2, phase = ?3, progress_pct = ?4, updated_at = CURRENT_TIMESTAMP WHERE deploy_id = ?1",
             params![deploy_id, status, phase, progress_pct as i64],
@@ -16400,7 +16400,7 @@ pub mod deployments {
     }
 
     pub fn set_image_tag(pool: &DbPool, deploy_id: &str, image_tag: &str) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE deployments SET image_tag = ?2 WHERE deploy_id = ?1",
             params![deploy_id, image_tag],
@@ -16409,7 +16409,7 @@ pub mod deployments {
     }
 
     pub fn set_container_name(pool: &DbPool, deploy_id: &str, name: &str) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE deployments SET container_name = ?2 WHERE deploy_id = ?1",
             params![deploy_id, name],
@@ -16423,7 +16423,7 @@ pub mod deployments {
         final_status: &str,
         error_message: Option<&str>,
     ) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE deployments SET status = ?2, finished_at = datetime('now'),
                  progress_pct = CASE WHEN ?2 = 'success' THEN 100 ELSE progress_pct END,
@@ -16438,7 +16438,7 @@ pub mod deployments {
     /// Przy wielu równoległych deployach transakcja SQLite serializuje zapisy,
     /// więc nie musimy dodatkowego locka.
     pub fn append_log_line(pool: &DbPool, deploy_id: &str, line: &str) -> Result<()> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let current: String = conn
             .query_row(
                 "SELECT log_tail FROM deployments WHERE deploy_id = ?1",
@@ -16461,7 +16461,7 @@ pub mod deployments {
     }
 
     pub fn get(pool: &DbPool, deploy_id: &str) -> Result<Option<DeploymentRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let sql = format!("SELECT {} FROM deployments WHERE deploy_id = ?1", COLS);
         let row = conn
             .query_row(&sql, params![deploy_id], row_to_deployment)
@@ -16478,7 +16478,7 @@ pub mod deployments {
         user_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<DeploymentRow>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut where_clauses = Vec::new();
         let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(eid) = engine_id {
@@ -16513,7 +16513,7 @@ pub mod deployments {
 
     /// Deployy niedokończone przez shutdown zostają widoczne jako interrupted.
     pub fn reset_stale(pool: &DbPool) -> Result<u32> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let n = conn.execute(
             "UPDATE deployments
              SET status = 'interrupted',
@@ -16566,7 +16566,7 @@ pub mod resource_permissions {
         access_level: &str,
     ) -> Result<()> {
         let conn = pool
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
         let tx = conn.unchecked_transaction()?;
         set_tx(
@@ -16644,7 +16644,7 @@ pub mod resource_permissions {
         subject_id: &str,
     ) -> Result<()> {
         let conn = pool
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
         let tx = conn.unchecked_transaction()?;
         clear_tx(&tx, resource_type, resource_id, subject_type, subject_id)?;
@@ -16699,7 +16699,7 @@ pub mod resource_permissions {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<Vec<ResourcePermission>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
              FROM resource_permissions
@@ -16725,7 +16725,7 @@ pub mod resource_permissions {
     /// show how many resources a general key explicitly allows/denies.
     pub fn count_for_subject(pool: &DbPool, subject_type: &str, subject_id: &str) -> Result<u32> {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM resource_permissions WHERE subject_type = ?1 AND subject_id = ?2",
@@ -16741,7 +16741,7 @@ pub mod resource_permissions {
         subject_type: &str,
         subject_id: &str,
     ) -> Result<Vec<ResourcePermission>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
              FROM resource_permissions
@@ -16784,7 +16784,7 @@ pub mod resource_permissions {
         }
 
         let conn = pool
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
         // 2. + 3. User-level override. Only "no matching row" collapses to
@@ -16879,7 +16879,7 @@ pub mod resource_permissions {
         subject_id: &str,
     ) -> Result<bool> {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
         let mut stmt = conn.prepare_cached(
             "SELECT access_level FROM resource_permissions
@@ -16946,7 +16946,7 @@ pub mod mesh_topology {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut conn = pool.lock().unwrap();
+        let mut conn = pool.write().unwrap();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -16995,7 +16995,7 @@ pub mod mesh_topology {
     }
 
     pub fn list_all(pool: &DbPool) -> Result<Vec<TopologySnapshot>> {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT node_id, hostname, platform, os_info, connected_to, direct_addrs,
                     port, last_epoch, last_seen_ms
@@ -17024,7 +17024,7 @@ pub mod mesh_topology {
     /// Czyści wpisy starsze niz 7 dni. Wolane przy starcie.
     pub fn cleanup_stale(pool: &DbPool, now_ms: i64) -> Result<u32> {
         let cutoff = now_ms - 7 * 24 * 60 * 60 * 1000;
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         let n = conn.execute(
             "DELETE FROM mesh_topology WHERE last_seen_ms < ?1",
             rusqlite::params![cutoff],
@@ -17450,7 +17450,7 @@ mod meeting_summary_action_items_tests {
     #[test]
     fn migration_53_drops_old_summaries_creates_new_tables() {
         let db = setup_db();
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         // Stara tabela musi byc skasowana migracja 53.
         let old: i64 = conn
             .query_row(
@@ -17522,7 +17522,7 @@ mod meeting_summary_action_items_tests {
         let sid = mk_session(&db, "owned");
         // Ustawiamy owner_user_id bezposrednio — testujemy tylko reader.
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "UPDATE meeting_sessions SET owner_user_id = '42' WHERE id = ?1",
                 rusqlite::params![sid],
@@ -17604,7 +17604,7 @@ mod meeting_summary_action_items_tests {
         insert_meeting_summary(&db, sid, "d", "s", "m").unwrap();
         upsert_meeting_action_item(&db, sid, "G", "t", None).unwrap();
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             // SQLite wymaga wlaczonego PRAGMA foreign_keys per-connection — init
             // to robi globalnie przez set_pragmas, ale sprawdzamy tu eksplicytnie.
             conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
@@ -17641,7 +17641,7 @@ mod settings_to_peer_hints_migration_tests {
         // db::init runs the migration once on a clean schema; expect zero
         // peer rows at this point.
         let n0: i64 = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
                 .unwrap()
         };
@@ -17653,7 +17653,7 @@ mod settings_to_peer_hints_migration_tests {
         let node_hex = "abcd1234".repeat(8);
         let value = r#"{"node_id":"abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234","public_key_hex":"","hostname":"foo","addresses":["127.0.0.1:7777"],"relay_url":"https://relay.example.com"}"#;
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2)",
                 rusqlite::params![format!("trusted_contact:{}", node_hex), value],
@@ -17668,7 +17668,7 @@ mod settings_to_peer_hints_migration_tests {
         // peer_persisted row via INSERT OR IGNORE.
         let _ = created;
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let persisted_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
             .unwrap();
@@ -17700,7 +17700,7 @@ mod settings_to_peer_hints_migration_tests {
 
         // Idempotency: a second run must not duplicate rows.
         let _ = migrate_settings_trusted_contacts_to_peer_hints(&db).unwrap();
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let persisted_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
             .unwrap();
@@ -17721,7 +17721,7 @@ mod settings_to_peer_hints_migration_tests {
             node_hex, public_key_hex
         );
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2)",
                 rusqlite::params![format!("pending_contact:{}", node_hex), value],
@@ -17731,7 +17731,7 @@ mod settings_to_peer_hints_migration_tests {
 
         let _ = migrate_settings_trusted_contacts_to_peer_hints(&db).unwrap();
 
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let trust_state: i64 = conn
             .query_row("SELECT trust_state FROM peer_persisted", [], |r| r.get(0))
             .unwrap();
@@ -19053,7 +19053,7 @@ mod chunk_c_visibility_consumer_tests {
         visibility: &str,
         consumers: &[&str],
     ) -> i64 {
-        let mut conn = pool.lock().expect("lock");
+        let mut conn = pool.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let alias_id = create_or_reactivate_model_alias_within_tx(
             &tx,
@@ -19095,7 +19095,7 @@ mod chunk_c_visibility_consumer_tests {
     /// use this to model a consumer addon that has gone through the
     /// install/reconcile flow against an already-existing alias.
     fn seed_uses_alias(pool: &DbPool, addon_id: &str, alias_name: &str, grant_status: &str) {
-        let conn = pool.lock().expect("lock");
+        let conn = pool.write().expect("lock");
         conn.execute(
             "INSERT INTO addon_uses_alias \
                 (addon_id, alias_target_name, required, reason, grant_status, \
@@ -19213,7 +19213,7 @@ mod chunk_c_visibility_consumer_tests {
         .expect_err("denial");
         let _ = err.downcast::<AliasPermissionDenied>().expect("denied");
 
-        let conn = db.lock().expect("lock");
+        let conn = db.read().expect("lock");
         let (caller, method, request_id, result, error_code): (
             String,
             Option<String>,
@@ -19257,7 +19257,7 @@ mod chunk_c_visibility_consumer_tests {
         let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &["b", "c"]);
         {
             // Admin grant for "d" — must survive.
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO model_alias_consumers \
                     (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
@@ -19267,7 +19267,7 @@ mod chunk_c_visibility_consumer_tests {
             .unwrap();
         }
         let revoked = {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             let revoked =
                 revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &["b".to_string()])
@@ -19277,7 +19277,7 @@ mod chunk_c_visibility_consumer_tests {
         };
         assert_eq!(revoked, vec!["c".to_string()]);
 
-        let conn = db.lock().expect("lock");
+        let conn = db.read().expect("lock");
         let remaining: Vec<String> = conn
             .prepare("SELECT consumer_addon_id FROM model_alias_consumers WHERE alias_id = ?1 ORDER BY consumer_addon_id")
             .unwrap()
@@ -19291,7 +19291,7 @@ mod chunk_c_visibility_consumer_tests {
     #[test]
     fn uses_alias_pending_when_owner_not_installed_yet() {
         let db = make_db();
-        let mut conn = db.lock().expect("lock");
+        let mut conn = db.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let status = upsert_uses_alias_within_tx(
             &tx,
@@ -19311,7 +19311,7 @@ mod chunk_c_visibility_consumer_tests {
         // alias as `public`; reconciliation flips the row to auto_granted.
         let db = make_db();
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             let status =
                 upsert_uses_alias_within_tx(&tx, "consumer-y", "later-alias", false, "telemetry")
@@ -19325,7 +19325,7 @@ mod chunk_c_visibility_consumer_tests {
 
         // Reconcile.
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             let transitions =
                 reconcile_uses_alias_for_alias_within_tx(&tx, "later-alias").expect("reconcile");
@@ -19340,7 +19340,7 @@ mod chunk_c_visibility_consumer_tests {
         }
 
         // Audit row exists with risk_class=A and result=reconciled.
-        let conn = db.lock().expect("lock");
+        let conn = db.read().expect("lock");
         let (risk, result): (String, String) = conn
             .query_row(
                 "SELECT risk_class, result FROM audit_log \
@@ -19359,14 +19359,14 @@ mod chunk_c_visibility_consumer_tests {
     fn reconcile_flips_pending_to_denied_on_private_install() {
         let db = make_db();
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             upsert_uses_alias_within_tx(&tx, "consumer-z", "guarded", false, "ad-hoc")
                 .expect("upsert");
             tx.commit().expect("commit");
         }
         seed_owned_alias(&db, "guarded", "addon-owner", "private", &[]);
-        let mut conn = db.lock().expect("lock");
+        let mut conn = db.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let transitions =
             reconcile_uses_alias_for_alias_within_tx(&tx, "guarded").expect("reconcile");
@@ -19379,7 +19379,7 @@ mod chunk_c_visibility_consumer_tests {
     fn reconcile_restricted_grants_only_whitelisted_consumer() {
         let db = make_db();
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             upsert_uses_alias_within_tx(&tx, "addon-friend", "shared", false, "ok").expect("a");
             upsert_uses_alias_within_tx(&tx, "addon-stranger", "shared", false, "ok").expect("b");
@@ -19392,7 +19392,7 @@ mod chunk_c_visibility_consumer_tests {
             "restricted",
             &["addon-friend"],
         );
-        let mut conn = db.lock().expect("lock");
+        let mut conn = db.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let transitions =
             reconcile_uses_alias_for_alias_within_tx(&tx, "shared").expect("reconcile");
@@ -19417,7 +19417,7 @@ mod chunk_c_visibility_consumer_tests {
     #[test]
     fn uses_model_pending_for_unknown_model_default_restricted() {
         let db = make_db();
-        let mut conn = db.lock().expect("lock");
+        let mut conn = db.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let status =
             upsert_uses_model_within_tx(&tx, "addon-x", "yolo-v8", false, "vision pipeline")
@@ -19432,7 +19432,7 @@ mod chunk_c_visibility_consumer_tests {
     fn uses_model_public_visibility_auto_grants() {
         let db = make_db();
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO model_visibility (model_id, visibility, updated_at) \
                  VALUES (?1, 'public', strftime('%s','now'))",
@@ -19440,7 +19440,7 @@ mod chunk_c_visibility_consumer_tests {
             )
             .expect("seed");
         }
-        let mut conn = db.lock().expect("lock");
+        let mut conn = db.write().expect("lock");
         let tx = conn.transaction().expect("tx");
         let status =
             upsert_uses_model_within_tx(&tx, "addon-x", "llama-3", false, "chat").expect("upsert");
@@ -19454,7 +19454,7 @@ mod chunk_c_visibility_consumer_tests {
         // on the same connection must be a no-op (every Chunk C migration
         // is keyed in `_migrations`).
         let db = make_db();
-        let conn = db.lock().expect("lock");
+        let conn = db.write().expect("lock");
         crate::db::migrations::run(&conn).expect("second run must not error");
         let (visibility, consumers, uses_alias, uses_model): (i64, i64, i64, i64) = conn
             .query_row(
@@ -19480,7 +19480,7 @@ mod chunk_c_visibility_consumer_tests {
         alias_id: i64,
         consumer: &str,
     ) -> (Option<i64>, i64, Option<i64>) {
-        let conn = pool.lock().expect("lock");
+        let conn = pool.read().expect("lock");
         conn.query_row(
             "SELECT granted_by_user_id, granted_at, revoked_at \
              FROM model_alias_consumers \
@@ -19499,7 +19499,7 @@ mod chunk_c_visibility_consumer_tests {
         let db = make_db();
         let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             // Simulate admin grant via the same helper, with explicit user id.
             add_alias_consumer_within_tx(&tx, alias_id, "addon-b", Some(42)).expect("admin grant");
@@ -19511,7 +19511,7 @@ mod chunk_c_visibility_consumer_tests {
         // Manifest reinstall path: granted_by_user_id = None for the same
         // (alias_id, consumer) pair.
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
                 .expect("manifest reassert");
@@ -19532,7 +19532,7 @@ mod chunk_c_visibility_consumer_tests {
         // Reinstall with B dropped from allowed_consumers must keep the
         // admin row (revoke_obsolete only deletes granted_by_user_id IS NULL).
         let revoked = {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             let revoked =
                 revoke_obsolete_manifest_consumers_within_tx(&tx, alias_id, &[]).expect("revoke");
@@ -19556,7 +19556,7 @@ mod chunk_c_visibility_consumer_tests {
         let db = make_db();
         let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
         let original_revoked_at: i64 = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO model_alias_consumers \
                     (alias_id, consumer_addon_id, granted_by_user_id, granted_at, revoked_at) \
@@ -19574,7 +19574,7 @@ mod chunk_c_visibility_consumer_tests {
         };
 
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
                 .expect("manifest reassert");
@@ -19599,7 +19599,7 @@ mod chunk_c_visibility_consumer_tests {
         let alias_id = seed_owned_alias(&db, "shared", "addon-owner", "restricted", &[]);
         // Initial manifest grant.
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None).expect("manifest grant");
             tx.commit().expect("commit");
@@ -19607,7 +19607,7 @@ mod chunk_c_visibility_consumer_tests {
         // Mark it revoked (simulates an out-of-band revoke path; the manifest
         // grant has no admin user_id so reactivation should be allowed).
         {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "UPDATE model_alias_consumers SET revoked_at = strftime('%s','now') \
                  WHERE alias_id = ?1 AND consumer_addon_id = 'addon-b'",
@@ -19621,7 +19621,7 @@ mod chunk_c_visibility_consumer_tests {
 
         // Manifest reinstall must clear revoked_at.
         {
-            let mut conn = db.lock().expect("lock");
+            let mut conn = db.write().expect("lock");
             let tx = conn.transaction().expect("tx");
             add_alias_consumer_within_tx(&tx, alias_id, "addon-b", None)
                 .expect("manifest reassert");
@@ -19639,7 +19639,7 @@ mod chunk_c_visibility_consumer_tests {
     fn sync_identity_registry_maps_node_to_user() {
         let db = make_db();
         let user_id = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000001', 'jan', 'hash', 'Jan', 'jan@example.com')",
@@ -19675,7 +19675,7 @@ mod chunk_c_visibility_consumer_tests {
     fn user_identity_key_revoke_removes_key_from_active_list() {
         let db = make_db();
         let user_id = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000002', 'ewa', 'hash', 'Ewa', 'ewa@example.com')",
@@ -19698,7 +19698,7 @@ mod chunk_c_visibility_consumer_tests {
     fn sync_permission_allows_owner_and_denies_unrelated_user() {
         let db = make_db();
         let (owner_id, other_id) = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000003', 'owner', 'hash', 'Owner', 'owner@example.com')",
@@ -19757,7 +19757,7 @@ mod chunk_c_visibility_consumer_tests {
     fn sync_permission_explicit_share_can_be_revoked() {
         let db = make_db();
         let user_id = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000005', 'shared', 'hash', 'Shared', 'shared@example.com')",
@@ -19821,7 +19821,7 @@ mod chunk_c_visibility_consumer_tests {
     fn sync_permission_node_receives_resource_for_assigned_user() {
         let db = make_db();
         let user_id = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000101', 'node-user', 'hash', 'Node User', 'node-user@example.com')",
@@ -19927,7 +19927,7 @@ mod chunk_c_visibility_consumer_tests {
     fn sync_policy_replicated_by_permission_returns_allowed_node() {
         let db = make_db();
         let user_id = {
-            let conn = db.lock().expect("lock");
+            let conn = db.write().expect("lock");
             conn.execute(
                 "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
                  VALUES ('00000000-0000-0000-0000-000000000102', 'sync-target', 'hash', 'Sync Target', 'sync-target@example.com')",

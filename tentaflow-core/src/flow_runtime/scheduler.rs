@@ -27,7 +27,7 @@
 //       status='cancelled'.
 //
 // `flow_invocations` writes are wrapped in `spawn_blocking` because
-// `DbPool = Arc<std::sync::Mutex<Connection>>` and rusqlite is sync.
+// `DbPool` (the `Db` writer connection) and rusqlite are sync.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -283,7 +283,7 @@ impl FlowScheduler {
         let started_at_owned = started_at.clone();
         let insert_res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = db
-                .lock()
+                .write()
                 .map_err(|e| anyhow!("db pool poisoned: {e}"))?;
             conn.execute(
                 "INSERT INTO flow_invocations \
@@ -399,7 +399,7 @@ impl FlowScheduler {
         let addon = addon_id.to_string();
         let row = tokio::task::spawn_blocking(move || -> Result<InvocationStatus, InvokeError> {
             let conn = db
-                .lock()
+                .read()
                 .map_err(|e| InvokeError::Db(format!("pool poisoned: {e}")))?;
             conn.query_row(
                 "SELECT id, status, started_at, finished_at, operators_completed, \
@@ -509,7 +509,7 @@ impl FlowScheduler {
             .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
             .to_string();
         let _ = tokio::task::spawn_blocking(move || {
-            let conn = match db.lock() {
+            let conn = match db.write() {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -577,7 +577,7 @@ impl FlowScheduler {
             .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
             .to_string();
         let _ = tokio::task::spawn_blocking(move || {
-            let conn = match db.lock() {
+            let conn = match db.write() {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -647,7 +647,7 @@ impl FlowScheduler {
             .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
             .to_string();
         let _ = tokio::task::spawn_blocking(move || {
-            let conn = match db.lock() {
+            let conn = match db.write() {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -834,7 +834,7 @@ impl FlowScheduler {
         let result_toml_for_db = result_toml.clone();
         let finished_at_for_db = finished_at.clone();
         let update_join = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = db.lock().map_err(|e| anyhow!("pool poisoned: {e}"))?;
+            let conn = db.write().map_err(|e| anyhow!("pool poisoned: {e}"))?;
             conn.execute(
                 "UPDATE flow_invocations \
                  SET status = ?1, finished_at = ?2, operators_completed = ?3, \
@@ -931,7 +931,7 @@ async fn load_declared_permissions(db: &DbPool, addon_id: &str) -> Vec<String> {
     let pool = db.clone();
     let addon = addon_id.to_string();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-        let conn = pool.lock().map_err(|e| anyhow!("db pool poisoned: {e}"))?;
+        let conn = pool.read().map_err(|e| anyhow!("db pool poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT permission_type FROM addon_declared_permissions WHERE addon_id = ?1",
         )?;

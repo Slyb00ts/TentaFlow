@@ -27,7 +27,7 @@ fn insert_audit_row(
     resource_id: &str,
     details: &str,
 ) -> Result<()> {
-    let conn = pool.lock().map_err(map_db)?;
+    let conn = pool.write().map_err(map_db)?;
     let timestamp = now_db_timestamp();
     let resource_type = Some("role");
     let result = Some("success");

@@ -202,14 +202,14 @@ mod tests {
     use crate::db::{migrations, DbPool};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use crate::flow_engine::progress_broker::ProgressBroker;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     /// Completes instantly with a fixed result so a waited child settles to

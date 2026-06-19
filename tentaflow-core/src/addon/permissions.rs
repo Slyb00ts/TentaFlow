@@ -163,7 +163,7 @@ impl PermissionChecker {
     /// Zaladuj WSZYSTKIE uprawnienia z DB do cache.
     /// Wywolywane przy starcie i co 5 minut w tle.
     pub fn refresh_all(&self) {
-        let conn = match self.db.lock() {
+        let conn = match self.db.read() {
             Ok(c) => c,
             Err(e) => {
                 warn!("refresh_all: nie mozna zablokowac DB: {}", e);
@@ -191,7 +191,7 @@ impl PermissionChecker {
     /// Odswierz uprawnienia jednego addonu.
     /// Wywolywane natychmiast po zmianie z UI.
     pub fn refresh_addon(&self, addon_id: &str) {
-        let conn = match self.db.lock() {
+        let conn = match self.db.read() {
             Ok(c) => c,
             Err(e) => {
                 warn!("refresh_addon: nie mozna zablokowac DB: {}", e);
@@ -219,7 +219,7 @@ impl PermissionChecker {
     /// Odswierz liste adminow.
     /// Wywolywane po zmianie przynaleznosci do grup.
     pub fn refresh_admins(&self) {
-        let conn = match self.db.lock() {
+        let conn = match self.db.read() {
             Ok(c) => c,
             Err(e) => {
                 warn!("refresh_admins: nie mozna zablokowac DB: {}", e);
@@ -582,7 +582,7 @@ mod tests {
     /// Wstawia uzytkownika do bazy testowej, zwraca user_id (UUID)
     fn insert_test_user(db: &DbPool, username: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT INTO user_accounts (id, username, password_hash, display_name) VALUES (?1, ?2, 'hash', ?2)",
             rusqlite::params![id, username],
@@ -593,7 +593,7 @@ mod tests {
     /// Tworzy grupe i zwraca group_id (UUID)
     fn insert_test_group(db: &DbPool, name: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO user_groups (id, name, description) VALUES (?1, ?2, ?2)",
             rusqlite::params![id, name],
@@ -609,7 +609,7 @@ mod tests {
 
     /// Dodaje uzytkownika do grupy
     fn add_user_to_group(db: &DbPool, group_id: &str, user_id: &str) {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO group_members (group_id, user_id) VALUES (?1, ?2)",
             rusqlite::params![group_id, user_id],
@@ -627,7 +627,7 @@ mod tests {
         permission_id: &str,
         grant_mode: &str,
     ) {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         let granted = if grant_mode == "allow" { 1 } else { 0 };
         conn.execute(
             "INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id, granted, grant_mode) \
@@ -653,7 +653,7 @@ mod tests {
 
     /// Ustawia default addona w tabeli addon_permission_defaults.
     fn set_permission_default(db: &DbPool, addon_id: &str, permission_id: &str, grant_mode: &str) {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
              VALUES (?1, ?2, ?3) \
@@ -675,7 +675,7 @@ mod tests {
         granted: i32,
         grant_mode: &str,
     ) {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id, granted, grant_mode) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -797,7 +797,7 @@ mod tests {
 
         // Grupa "admins" jest tworzona przez seed — pobierz jej ID
         let admins_group_id = {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             conn.query_row(
                 "SELECT id FROM user_groups WHERE name = 'admins'",
                 [],
@@ -937,7 +937,7 @@ platforms = []
         // Arrange — dodaj dane powiazane (uprawnienia, config) zeby sprawdzic czyszczenie
         set_permission(&db, "test-lifecycle", "user", "1", "chat_read", true);
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute(
                 "INSERT OR IGNORE INTO addon_config (addon_id, key, value) VALUES ('test-lifecycle', 'test_key', 'test_val')",
                 [],
@@ -958,7 +958,7 @@ platforms = []
 
         // Assert — powiazane dane wyczyszczone
         {
-            let conn = db.lock().unwrap();
+            let conn = db.read().unwrap();
             let perm_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM addon_permissions WHERE addon_id = 'test-lifecycle'",
@@ -1050,7 +1050,7 @@ platforms = []
 
     /// Pomocnik: pobiera ID grupy 'admins' utworzonej przez seed.
     fn admins_group_id(db: &DbPool) -> String {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         conn.query_row(
             "SELECT id FROM user_groups WHERE name = 'admins'",
             [],

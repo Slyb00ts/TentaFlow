@@ -898,7 +898,7 @@ pub fn model_detail_request(
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let row = crate::services_repo::models::list_alive(&conn)
         .map_err(db_err)?
@@ -960,7 +960,7 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         let conn = ctx
             .state
             .db
-            .lock()
+            .read()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         let row = crate::services_repo::models::list_alive(&conn)
             .map_err(db_err)?
@@ -976,7 +976,7 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
     }
@@ -8664,7 +8664,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
     let local_node_id = ctx.state.local_node_id.as_ref();
@@ -8810,7 +8810,7 @@ fn fetch_service_row(
     let conn = ctx
         .state
         .db
-        .lock()
+        .read()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     let row = crate::services_repo::services::get(&conn, service_id)
         .map_err(db_err)?
@@ -8863,7 +8863,7 @@ pub async fn service_delete(
     let conn = ctx
         .state
         .db
-        .lock()
+        .write()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
     drop(conn);
@@ -8935,7 +8935,7 @@ pub async fn service_pin(
     let conn = ctx
         .state
         .db
-        .lock()
+        .write()
         .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
     crate::services_repo::services::set_pinned(&conn, payload.service_id, payload.pinned)
         .map_err(db_err)?;
@@ -9015,7 +9015,7 @@ pub async fn service_pause(
                 let conn = ctx
                     .state
                     .db
-                    .lock()
+                    .write()
                     .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
                 crate::services_repo::services::update_status(
                     &conn,
@@ -9040,7 +9040,7 @@ pub async fn service_pause(
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::set_paused(&conn, payload.service_id, payload.paused)
             .map_err(db_err)?;
@@ -9127,7 +9127,7 @@ pub async fn service_start(
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::set_paused(&conn, payload.service_id, false)
             .map_err(db_err)?;
@@ -9137,7 +9137,7 @@ pub async fn service_start(
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::update_status(
             &conn,
@@ -9163,7 +9163,7 @@ pub async fn service_start(
             let conn = ctx
                 .state
                 .db
-                .lock()
+                .write()
                 .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
             crate::services_repo::services::update_runtime(
                 &conn,
@@ -9187,7 +9187,7 @@ pub async fn service_start(
             let conn = ctx
                 .state
                 .db
-                .lock()
+                .write()
                 .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
             let _ = crate::services_repo::services::update_status(
                 &conn,
@@ -9332,7 +9332,7 @@ pub async fn service_update(
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::update_config_json(
             &conn,
@@ -9374,7 +9374,7 @@ pub async fn service_update(
                 let conn = ctx
                     .state
                     .db
-                    .lock()
+                    .write()
                     .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
                 let _ = crate::services_repo::services::update_status(
                     &conn,
@@ -9402,7 +9402,7 @@ pub async fn service_update(
                 .await
                 {
                     Ok(handle) => {
-                        if let Ok(conn) = db.lock() {
+                        if let Ok(conn) = db.write() {
                             let _ = crate::services_repo::services::update_runtime(
                                 &conn,
                                 svc_id,
@@ -9425,7 +9425,7 @@ pub async fn service_update(
                     }
                     Err(e) => {
                         let msg = format!("respawn after update: {}", e);
-                        if let Ok(conn) = db.lock() {
+                        if let Ok(conn) = db.write() {
                             let _ = crate::services_repo::services::update_status(
                                 &conn,
                                 svc_id,
@@ -9594,7 +9594,7 @@ pub async fn service_model_catalog(
         let conn = ctx
             .state
             .db
-            .lock()
+            .read()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::models::list_for_service(&conn, payload.service_id)
             .map_err(db_err)?
@@ -9673,7 +9673,7 @@ pub async fn service_model_selection(
         let conn = ctx
             .state
             .db
-            .lock()
+            .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         if let Err(e) =
             crate::services_repo::models::replace_selection(&conn, payload.service_id, &selected)

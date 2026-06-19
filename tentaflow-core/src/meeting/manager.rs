@@ -33,10 +33,10 @@ enum BotBackend {
 fn detect_backend(db: &DbPool) -> BotBackend {
     use crate::services_repo::services::{self as services_repo, DeployMethod};
 
-    let conn = match db.lock() {
+    let conn = match db.read() {
         Ok(c) => c,
         Err(e) => {
-            warn!("detect_backend: pool poisoned ({}), fallback Docker", e);
+            warn!("detect_backend: db read failed ({}), fallback Docker", e);
             return BotBackend::Docker;
         }
     };
@@ -185,7 +185,7 @@ impl MeetingManager {
 
         // Przypisz owner_user_id od razu (get_or_create nie przyjmuje go).
         if let Some(uid) = req.owner_user_id.as_deref() {
-            let conn = self.db.lock().unwrap();
+            let conn = self.db.write().unwrap();
             let _ = conn.execute(
                 "UPDATE meeting_sessions SET owner_user_id = ?2 WHERE id = ?1",
                 rusqlite::params![session_id, uid],
@@ -273,7 +273,7 @@ impl MeetingManager {
 
                 match container::spawn(&spawn_req).await {
                     Ok(outcome) => {
-                        let conn = self.db.lock().unwrap();
+                        let conn = self.db.write().unwrap();
                         let _ = conn.execute(
                             "UPDATE meeting_sessions SET container_id = ?2 WHERE id = ?1",
                             rusqlite::params![session_id, outcome.container_id],
@@ -525,7 +525,7 @@ mod tests {
     use crate::db::DbPool;
     use crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn make_req(
         stt: Option<&str>,
@@ -585,7 +585,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     // Symuluje scenariusz spawn-time: user ręcznie skasował alias między uruchomieniami.
@@ -600,7 +600,7 @@ mod tests {
             .is_some());
 
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             let deleted = conn
                 .execute(
                     "DELETE FROM model_aliases WHERE alias = ?1",

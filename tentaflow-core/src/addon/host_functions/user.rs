@@ -65,7 +65,7 @@ pub fn user_get_current(
 
     // Pobierz dane uzytkownika z DB
     let user_json = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => {
                 // Pobierz uzytkownika
                 let user_data: Option<(String, Option<String>, Option<String>)> = conn

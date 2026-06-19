@@ -91,7 +91,7 @@ async fn invoke_writes_running_then_completed_to_db() {
     assert!(status.result_toml.as_ref().unwrap().contains("records"));
 
     // DB row mirrors the returned status.
-    let conn = db.lock().expect("pool");
+    let conn = db.read().expect("pool");
     let (db_status, finished_at): (String, Option<String>) = conn
         .query_row(
             "SELECT status, finished_at FROM flow_invocations WHERE id = ?1",
@@ -274,7 +274,7 @@ async fn backpressure_drop_emits_audit_on_finalize() {
         .expect("invoke");
     assert_eq!(st.status, "completed");
 
-    let conn = db.lock().expect("pool");
+    let conn = db.read().expect("pool");
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_log \
@@ -406,7 +406,7 @@ async fn concurrency_cap_emits_denied_audit_row() {
         let _ = h.await;
     }
 
-    let conn = db.lock().expect("pool");
+    let conn = db.read().expect("pool");
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_log \

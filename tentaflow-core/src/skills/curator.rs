@@ -853,7 +853,7 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::models::SkillParams;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
@@ -868,7 +868,7 @@ mod tests {
             [],
         )
         .expect("seed actor");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn seed_skill(pool: &DbPool, id: &str, name: &str, source: &str, desc: &str) {

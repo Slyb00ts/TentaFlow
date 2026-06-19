@@ -123,7 +123,7 @@ pub fn ledger_kv_capture_now(pool: &crate::db::DbPool, capture: &KvWriteCapture)
     match super::runtime::record_kv_capture(capture.clone()) {
         Ok(Some(record)) => {
             let mut conn = pool
-                .lock()
+                .write()
                 .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
             mark_kv_capture_status(
                 &mut conn,
@@ -136,7 +136,7 @@ pub fn ledger_kv_capture_now(pool: &crate::db::DbPool, capture: &KvWriteCapture)
         Ok(None) => {}
         Err(e) => {
             let mut conn = pool
-                .lock()
+                .write()
                 .map_err(|lock| anyhow::anyhow!("Blad blokady bazy: {}", lock))?;
             mark_kv_capture_status(
                 &mut conn,
@@ -153,7 +153,7 @@ pub fn ledger_kv_capture_now(pool: &crate::db::DbPool, capture: &KvWriteCapture)
 pub fn drain_pending_kv_captures(pool: &crate::db::DbPool, limit: usize) -> Result<usize> {
     let captures = {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
         load_pending_kv_captures(&conn, limit)?
     };
@@ -162,7 +162,7 @@ pub fn drain_pending_kv_captures(pool: &crate::db::DbPool, limit: usize) -> Resu
         match super::runtime::record_kv_capture(capture.clone()) {
             Ok(Some(record)) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_kv_capture_status(
                     &mut conn,
@@ -176,7 +176,7 @@ pub fn drain_pending_kv_captures(pool: &crate::db::DbPool, limit: usize) -> Resu
             Ok(None) => break,
             Err(e) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_kv_capture_status(
                     &mut conn,
@@ -290,7 +290,7 @@ mod tests {
     fn migration_creates_kv_capture_table() {
         let dir = tempdir().expect("tempdir");
         let db = db::init(&dir.path().join("core.db")).expect("db init");
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
@@ -307,7 +307,7 @@ mod tests {
     fn record_kv_capture_round_trips_binary_value() {
         let dir = tempdir().expect("tempdir");
         let db = db::init(&dir.path().join("core.db")).expect("db init");
-        let mut conn = db.lock().expect("db lock");
+        let mut conn = db.write().expect("db lock");
         // actor_user_id has an FK to user_accounts(id); seed the referenced row.
         conn.execute(
             "INSERT INTO user_accounts (id, username, password_hash) VALUES ('1','test-user','x')",

@@ -126,7 +126,7 @@ mod tests {
     use crate::db::{migrations, DbPool};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use crate::flow_engine::progress_broker::ProgressBroker;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
@@ -134,7 +134,7 @@ mod tests {
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     /// Runner gated on a watch flag so a spawned child stays active (queued/

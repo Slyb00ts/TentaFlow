@@ -985,8 +985,8 @@ pub fn ml_studio_tabular_train(
                 let conn = ctx
                     .state
                     .db
-                    .lock()
-                    .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+                    .read()
+                    .map_err(|_| ProtocolError::internal("db read"))?;
                 let svcs = services_repo::services::list_by_category(
                     &conn,
                     "training",

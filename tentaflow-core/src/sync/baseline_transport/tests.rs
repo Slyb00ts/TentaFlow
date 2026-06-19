@@ -90,7 +90,7 @@ fn test_cipher() -> Arc<SettingsCipher> {
 fn new_pool() -> DbPool {
     let pool = db::init(std::path::Path::new(":memory:")).expect("init test DB");
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         for table in [
             "node_user_assignments",
             "user_identity_keys",
@@ -115,7 +115,7 @@ fn new_pool() -> DbPool {
 }
 
 fn seed_donor_org(pool: &DbPool) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO organizations \
             (org_id, name, slug, status, created_at) \
@@ -154,7 +154,7 @@ fn seed_donor_org(pool: &DbPool) {
 
 /// Joiner z wlasna org + userem o INNYM emailu (zostanie dolaczony do org dawcy).
 fn seed_joiner_org(pool: &DbPool) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO organizations \
             (org_id, name, slug, status, created_at) \
@@ -189,7 +189,7 @@ fn seed_joiner_org(pool: &DbPool) {
 /// przez `new_pool`). `MeshSecurity::new` wczyta ten wiersz do mapy trusted, wiec
 /// `is_trusted` zwroci true bez side-effectow naruszajacych FK fixture'a.
 fn insert_trusted_node(pool: &DbPool, node_id: &str, public_key_hex: &str) {
-    let conn = pool.lock().unwrap();
+    let conn = pool.write().unwrap();
     conn.execute(
         "INSERT OR REPLACE INTO trusted_nodes \
             (node_id, public_key, hostname, approved_by, approved_at, is_active) \
@@ -295,7 +295,7 @@ async fn happy_path_joiner_and_donor_reach_completed() {
 
     // Joiner ma teraz org dawcy.
     {
-        let conn = joiner_pool.lock().unwrap();
+        let conn = joiner_pool.read().unwrap();
         let has_donor_org: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM organizations WHERE org_id = 'org-donor')",
@@ -532,7 +532,7 @@ async fn joiner_aborts_on_ack_role_mismatch() {
     );
 
     // Joiner NIE zaimportowal — wlasna org nietknieta, brak org dawcy.
-    let conn = joiner_pool.lock().unwrap();
+    let conn = joiner_pool.read().unwrap();
     let has_joiner_org: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM organizations WHERE org_id = 'org-joiner')",
@@ -689,7 +689,7 @@ async fn joiner_rejects_header_over_hard_cap_without_buffering() {
     );
 
     // Joiner imported nothing — own org untouched, donor org absent.
-    let conn = joiner_pool.lock().unwrap();
+    let conn = joiner_pool.read().unwrap();
     let has_joiner_org: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM organizations WHERE org_id = 'org-joiner')",

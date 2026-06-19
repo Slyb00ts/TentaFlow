@@ -70,7 +70,7 @@ pub fn secret_get(
 
     // Pobierz zaszyfrowany sekret z DB
     let secret_data: Option<(Vec<u8>, Vec<u8>)> = {
-        match caller.data().db.lock() {
+        match caller.data().db.read() {
             Ok(conn) => {
                 // Probuj sekret per-user, potem globalny
                 conn.query_row(
@@ -243,7 +243,7 @@ pub fn secret_set(
 
     // Zapisz w DB
     let result = {
-        match caller.data().db.lock() {
+        match caller.data().db.write() {
             Ok(conn) => conn.execute(
                 "INSERT OR REPLACE INTO addon_secrets \
                      (addon_id, user_id, secret_key, encrypted_value, nonce, updated_at) \

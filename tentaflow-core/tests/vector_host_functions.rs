@@ -261,7 +261,7 @@ fn e2e_delete_namespace_clears_db_and_file() {
         .expect("delete");
 
     // DB row gone.
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM addon_vector_namespaces WHERE addon_id='addon_a' AND namespace='scratch'",
@@ -333,7 +333,7 @@ fn search_on_nonexistent_namespace_via_manager_returns_not_found_no_mutation() {
     assert!(matches!(res, Err(VectorError::NamespaceNotFound { .. })));
 
     // The DB row must not have been created as a side effect.
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM addon_vector_namespaces WHERE addon_id = 'addon_a'",
@@ -378,7 +378,7 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
     )
     .unwrap();
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "UPDATE addon_vector_namespaces SET count = ?1 WHERE addon_id = 'addon_a'",
             params![MAX_VECTORS_PER_ADDON as i64],

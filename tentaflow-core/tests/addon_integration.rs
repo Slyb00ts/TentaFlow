@@ -6,6 +6,7 @@
 // =============================================================================
 
 use std::path::Path;
+// `Mutex` stays for the `ADDON_WASM_FILE_LOCK` file-serialization guard (non-DB).
 use std::sync::{Arc, Mutex};
 
 use parking_lot::Mutex as ParkingMutex;
@@ -59,7 +60,7 @@ fn create_test_db() -> db::DbPool {
     // addon_wasm, addon_tools, addon_declared_permissions, audit_log z pelnym zestawem kolumn)
     db::migrations::run(&conn).expect("Blad uruchamiania migracji");
 
-    Arc::new(Mutex::new(conn))
+    Arc::new(db::Db::from_connection(conn))
 }
 
 /// Wczytuje bajty WASM test addonu z dysku
@@ -331,7 +332,7 @@ fn addon_tool_storage() {
 
     // Dodaj limity zasobow (wymagane przez storage_set)
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
@@ -554,7 +555,7 @@ fn addon_lifecycle_full() {
 
     // 2. Sprawdz czy addon jest w DB
     {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'sdk-showcase'",
@@ -567,7 +568,7 @@ fn addon_lifecycle_full() {
 
     // 3. Dodaj uprawnienia i limity do DB (wymagane przez host functions)
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO addon_declared_permissions (addon_id, permission_type) VALUES ('sdk-showcase', 'storage')",
             [],
@@ -642,7 +643,7 @@ fn addon_lifecycle_full() {
 
     // 9. Sprawdz cleanup w DB
     {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = 'sdk-showcase'",
@@ -915,7 +916,7 @@ fn malicious_storage_isolation() {
 
     // Dodaj limity zasobow dla obu addonow
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
@@ -958,7 +959,7 @@ fn malicious_storage_isolation() {
 
     // Sprawdz ze dane sa w DB pod addon_id="sdk-showcase"
     {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM addon_storage WHERE addon_id = 'sdk-showcase' AND storage_key = 'secret_data'",
             [],
@@ -1301,7 +1302,7 @@ fn malicious_cross_addon_storage() {
 
     // Dodaj limity zasobow dla obu addonow
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
@@ -1323,7 +1324,7 @@ fn malicious_cross_addon_storage() {
     // 1. Symuluj addon "teams" zapisujacy dane w swoim storage
     // Wstawiamy recznie do DB z addon_id="teams" — bo nie mamy WASM teams
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT INTO addon_storage \
              (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
@@ -1367,7 +1368,7 @@ fn malicious_cross_addon_storage() {
 
     // 3. Sprawdz ze dane teams nadal sa w DB (nie zostaly uszkodzone)
     {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let teams_data: String = conn
             .query_row(
                 "SELECT CAST(storage_value AS TEXT) FROM addon_storage \
@@ -1393,7 +1394,7 @@ fn malicious_bad_pointers() {
 
     // Dodaj limity zasobow
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \

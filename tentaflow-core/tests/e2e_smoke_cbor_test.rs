@@ -6,7 +6,7 @@
 // =============================================================================
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use parking_lot::Mutex as ParkingMutex;
 use tentaflow_core::addon::event_bus::EventBus;
@@ -34,7 +34,7 @@ fn create_test_db() -> db::DbPool {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         .expect("pragmas");
     db::migrations::run(&conn).expect("migrations");
-    Arc::new(Mutex::new(conn))
+    Arc::new(tentaflow_core::db::Db::from_connection(conn))
 }
 
 fn load_e2e_smoke_wasm() -> Vec<u8> {
@@ -460,7 +460,7 @@ fn panel_reopen_resets_state_revision() {
 
     // With a concrete user_id the system-call permission bypass does not
     // apply — grant the "ui" permission as an addon default.
-    db.lock()
+    db.write()
         .unwrap()
         .execute(
             "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \

@@ -1182,7 +1182,7 @@ mod tests {
         persist_meeting_event(&db, event).expect("persist should create session");
 
         // Sesja powinna istniec w meeting_sessions po call.
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let cnt: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM meeting_sessions WHERE meeting_key = ?1",
@@ -1309,7 +1309,7 @@ mod tests {
         // utworzyłby nowe id. Jeśli używa cache, drugi insert poleci na stare id
         // i FK error potwierdzi cache hit.
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
             conn.execute(
                 "DELETE FROM meeting_sessions WHERE id = ?1",
@@ -1360,7 +1360,7 @@ mod tests {
         // Kasujemy sesję i invalidujemy cache — kolejny event musi utworzyć nowy
         // wpis w meeting_sessions z nowym id i odświeżyć cache.
         {
-            let conn = db.lock().unwrap();
+            let conn = db.write().unwrap();
             conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
             conn.execute(
                 "DELETE FROM meeting_sessions WHERE id = ?1",

@@ -260,7 +260,7 @@ async fn trigger_conflict_via_double_alias_owner() {
     // are acceptable (the production policy is debated). Verify the owner
     // didn't flip.
     if res.is_ok() {
-        let conn = db.lock().unwrap();
+        let conn = db.read().unwrap();
         let owners: Vec<String> = conn
             .prepare(
                 "SELECT owner_id FROM model_alias_owners mo \

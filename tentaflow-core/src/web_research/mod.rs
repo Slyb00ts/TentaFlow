@@ -96,7 +96,7 @@ fn resolve_local_service_endpoint(
     engine_id: &str,
     display_name: &str,
 ) -> Result<String> {
-    let conn = db.lock().map_err(|_| {
+    let conn = db.read().map_err(|_| {
         WebResearchError::SearchProvider("services database lock failed".to_string())
     })?;
     let services = services_repo::list_all(&conn)

@@ -692,7 +692,7 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::migrations::run(&conn).unwrap();
         crate::db::seed::seed_defaults(&conn).unwrap();
-        Arc::new(std::sync::Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     #[test]
@@ -754,7 +754,7 @@ mod tests {
         let pool = fresh_db();
         // Mark the seeded LLM flow as published under "chat-pl".
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl' \
                  WHERE name = 'Default Chat'",
@@ -831,7 +831,7 @@ mod tests {
         let pool = fresh_db();
         // Seed an alias to collide with the local service model below.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "INSERT INTO model_aliases (alias, target_model, is_active) \
                  VALUES ('test-alias', 'embeddings-gemma', 1)",
@@ -1063,7 +1063,7 @@ mod tests {
         // Manually publish the seeded LLM flow but mark it draft so it
         // doesn't show up in advertised_entries.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE flows SET published_model_name = 'chat-pl', status = 'draft' \
                  WHERE name = 'Default Chat'",
@@ -1087,7 +1087,7 @@ mod tests {
         // Seed an alias and publish the LLM flow under the same id so they
         // collide on the catalog id space.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "INSERT INTO model_aliases (alias, target_model, is_active) \
                  VALUES ('test-alias', 'embeddings-gemma', 1)",
@@ -1327,7 +1327,7 @@ mod tests {
     fn every_seeded_node_type_has_modality_decision() {
         use std::collections::BTreeSet;
         let pool = fresh_db();
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let mut stmt = conn
             .prepare("SELECT node_type FROM flow_node_templates")
             .unwrap();

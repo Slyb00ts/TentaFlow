@@ -72,7 +72,7 @@ async fn visibility_set_and_grant_reconcile_round_trip() {
 
     // Seed a consumer-side declaration so reconciliation has something to flip.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.write().unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         tentaflow_core::db::repository::upsert_uses_model_within_tx(
             &tx, "addon-a", "m1", true, "needs it",
@@ -135,7 +135,7 @@ async fn addon_access_view_and_decision() {
     let ctx = admin_ctx(state.clone());
 
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.write().unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         tentaflow_core::db::repository::upsert_uses_model_within_tx(
             &tx, "addon-b", "m2", true, "needs it",

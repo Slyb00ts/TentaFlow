@@ -62,7 +62,7 @@ fn make_db() -> DbPool {
 }
 
 fn audit_log_count(db: &DbPool, action: &str, result: &str) -> i64 {
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db read");
     conn.query_row(
         "SELECT COUNT(*) FROM audit_log WHERE action = ?1 AND result = ?2",
         rusqlite::params![action, result],
@@ -464,7 +464,7 @@ async fn test_e2e_recording_url_purged_returns_404() {
     // Soft-delete directly via SQL — bypassing the host-fn purge path so the
     // test stays focused on the HTTP layer's NotFound branch.
     {
-        let conn = env.db.lock().expect("db lock");
+        let conn = env.db.write().expect("db write");
         conn.execute(
             "UPDATE recordings SET purged_at = strftime('%s','now') WHERE ref = ?1",
             rusqlite::params![rec_ref],
@@ -725,7 +725,7 @@ async fn test_e2e_recording_url_missing_file_returns_404() {
         save_and_register(&env, "addon-miss", "cam_e2e_miss").await;
     // Delete the file on disk; DB row is still there.
     {
-        let conn = env.db.lock().expect("db lock");
+        let conn = env.db.read().expect("db read");
         let file_path: String = conn
             .query_row(
                 "SELECT file_path FROM recordings WHERE ref = ?1",
@@ -754,7 +754,7 @@ async fn test_e2e_recording_url_file_size_mismatch_returns_500() {
         save_and_register(&env, "addon-int", "cam_e2e_int").await;
     // Bump the DB-recorded size so it disagrees with on-disk reality.
     {
-        let conn = env.db.lock().expect("db lock");
+        let conn = env.db.write().expect("db write");
         conn.execute(
             "UPDATE recordings SET file_size_bytes = file_size_bytes + 999 WHERE ref = ?1",
             rusqlite::params![rec_ref],
@@ -829,7 +829,7 @@ async fn test_path_traversal_via_db_corruption_rejected() {
 
     // Overwrite the file_path with /etc/passwd — outside the recordings base.
     {
-        let conn = env.db.lock().expect("db lock");
+        let conn = env.db.write().expect("db write");
         conn.execute(
             "UPDATE recordings SET file_path = '/etc/passwd' WHERE ref = ?1",
             rusqlite::params![rec_ref],

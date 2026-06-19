@@ -141,7 +141,7 @@ pub fn build_local_snapshot(
     db: &crate::db::DbPool,
     local_node_id: &str,
 ) -> Result<Vec<ServiceInfo>> {
-    let conn = db.lock().map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let rows = services_repo::services::list_all(&conn)?;
     let mut out = Vec::with_capacity(rows.len());
     for svc in rows {
@@ -158,7 +158,7 @@ pub fn build_one(
     service_id: i64,
     local_node_id: &str,
 ) -> Result<Option<ServiceInfo>> {
-    let conn = db.lock().map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
     let svc = match services_repo::services::get(&conn, service_id)? {
         Some(s) => s,
         None => return Ok(None),

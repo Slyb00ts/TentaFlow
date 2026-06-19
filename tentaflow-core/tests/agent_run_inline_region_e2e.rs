@@ -280,7 +280,7 @@ fn seed_skill(pool: &DbPool, id: &str, name: &str) {
 }
 
 fn count_conversation_rows(pool: &DbPool, session: &str) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM conversation_messages WHERE session_id = ?1",
         rusqlite::params![session],
@@ -290,7 +290,7 @@ fn count_conversation_rows(pool: &DbPool, session: &str) -> i64 {
 }
 
 fn count_flow_executions(pool: &DbPool) -> i64 {
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r.get(0))
         .unwrap()
 }

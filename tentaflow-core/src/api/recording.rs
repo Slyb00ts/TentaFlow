@@ -507,7 +507,7 @@ fn audit_recording_file_access(
         "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
-    if let Ok(conn) = pool.lock() {
+    if let Ok(conn) = pool.write() {
         let _ = conn.execute(
             "INSERT INTO audit_log \
                 (timestamp, user_id, addon_id, action, resource_type, resource_id, \
@@ -560,7 +560,7 @@ fn audit_and_return(
         "user_agent": ctx.user_agent.map(truncate_ua).unwrap_or_default(),
     })
     .to_string();
-    if let Ok(conn) = pool.lock() {
+    if let Ok(conn) = pool.write() {
         let _ = conn.execute(
             "INSERT INTO audit_log \
                 (timestamp, user_id, addon_id, action, resource_type, resource_id, \

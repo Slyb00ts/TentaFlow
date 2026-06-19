@@ -246,7 +246,8 @@ mod llamacpp_prompt_mode {
 
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory DB");
         tentaflow_core::db::migrations::run(&conn).expect("migrations");
-        let pool: tentaflow_core::db::DbPool = Arc::new(std::sync::Mutex::new(conn));
+        let pool: tentaflow_core::db::DbPool =
+            Arc::new(tentaflow_core::db::Db::from_connection(conn));
 
         let registry = MeshServicesRegistry::new();
         registry.replace_local(NODE_ID.to_string(), vec![service_info()]);

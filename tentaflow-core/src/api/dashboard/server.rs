@@ -587,7 +587,7 @@ fn build_rate_limit_response(
             "global": global,
         })
         .to_string();
-        if let Ok(conn) = db.lock() {
+        if let Ok(conn) = db.write() {
             let _ = conn.execute(
                 "INSERT INTO audit_log \
                     (timestamp, user_id, addon_id, action, resource_type, resource_id, \

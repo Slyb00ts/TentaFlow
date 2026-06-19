@@ -564,7 +564,7 @@ async fn predict_alias_revoked_midstream_skips_remaining() {
     let recs = extract_records(s.result_toml.as_deref().unwrap());
     assert!(recs.is_empty(), "expected 0 sink records, got {recs:?}");
     // Verify the audit row carries the per-record alias_check_failed action.
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_log WHERE action = 'flow.op.predict.alias_check_failed'",
@@ -715,7 +715,7 @@ async fn sink_ui_notify_requires_events_permission() {
     // denies and Sink audits the error. Skip policy keeps the flow running
     // so it still completes.
     assert_eq!(s.status, "completed");
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_log WHERE action = 'event.publish' AND result = 'denied'",
@@ -843,7 +843,7 @@ fn mk_meta(camera_id: &str) -> crate::services::frame_storage::FrameMetadata {
 
 #[cfg(feature = "camera")]
 fn count_audit_rows(db: &DbPool, addon_id: &str, action_like: &str) -> i64 {
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db lock");
     conn.query_row(
         "SELECT COUNT(*) FROM audit_log WHERE addon_id = ?1 AND action LIKE ?2",
         rusqlite::params![addon_id, action_like],

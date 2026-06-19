@@ -358,7 +358,7 @@ fn test_multi_tenant_isolation() {
     // services::org (ktora wymagalaby szerszego scope'u). Multi-tenant
     // isolation tutaj weryfikujemy po stronie role_catalog.
     {
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
         conn.execute(
             "INSERT INTO organizations (org_id, name, slug, status, created_at) \
              VALUES ('org-foo', 'Foo', 'foo', 'active', '2026-01-01T00:00:00Z')",
@@ -418,7 +418,7 @@ fn test_multi_tenant_isolation() {
 fn test_audit_log_create() {
     let (_d, pool) = open();
     let before_count: i64 = {
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         conn.query_row(
             "SELECT count(*) FROM audit_log WHERE action = 'role_catalog.created'",
             [],
@@ -427,7 +427,7 @@ fn test_audit_log_create() {
         .unwrap()
     };
     let role = create_role(&pool, ACTOR, minimal_input("audit_create")).unwrap();
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let after_count: i64 = conn
         .query_row(
             "SELECT count(*) FROM audit_log WHERE action = 'role_catalog.created'",
@@ -473,7 +473,7 @@ fn test_audit_log_chain_integrity() {
     let _r2 = create_role(&pool, ACTOR, minimal_input("chain_2")).unwrap();
     let _r3 = create_role(&pool, ACTOR, minimal_input("chain_3")).unwrap();
 
-    let conn = pool.lock().unwrap();
+    let conn = pool.read().unwrap();
     let mut stmt = conn
         .prepare(
             "SELECT id, prev_hash, hash FROM audit_log \

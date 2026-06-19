@@ -106,7 +106,7 @@ pub fn ledger_blob_capture_now(pool: &crate::db::DbPool, capture: &BlobWriteCapt
     match super::runtime::record_blob_capture(capture.clone()) {
         Ok(Some(record)) => {
             let mut conn = pool
-                .lock()
+                .write()
                 .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
             mark_blob_capture_status(
                 &mut conn,
@@ -119,7 +119,7 @@ pub fn ledger_blob_capture_now(pool: &crate::db::DbPool, capture: &BlobWriteCapt
         Ok(None) => {}
         Err(e) => {
             let mut conn = pool
-                .lock()
+                .write()
                 .map_err(|lock| anyhow::anyhow!("Blad blokady bazy: {}", lock))?;
             mark_blob_capture_status(
                 &mut conn,
@@ -136,7 +136,7 @@ pub fn ledger_blob_capture_now(pool: &crate::db::DbPool, capture: &BlobWriteCapt
 pub fn drain_pending_blob_captures(pool: &crate::db::DbPool, limit: usize) -> Result<usize> {
     let captures = {
         let conn = pool
-            .lock()
+            .read()
             .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
         load_pending_blob_captures(&conn, limit)?
     };
@@ -145,7 +145,7 @@ pub fn drain_pending_blob_captures(pool: &crate::db::DbPool, limit: usize) -> Re
         match super::runtime::record_blob_capture(capture.clone()) {
             Ok(Some(record)) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_blob_capture_status(
                     &mut conn,
@@ -159,7 +159,7 @@ pub fn drain_pending_blob_captures(pool: &crate::db::DbPool, limit: usize) -> Re
             Ok(None) => break,
             Err(e) => {
                 let mut conn = pool
-                    .lock()
+                    .write()
                     .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))?;
                 mark_blob_capture_status(
                     &mut conn,

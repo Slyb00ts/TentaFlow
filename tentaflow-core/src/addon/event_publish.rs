@@ -138,7 +138,7 @@ fn emit_audit(
     result: &str,
     error_message: Option<&str>,
 ) {
-    let Ok(conn) = db.lock() else {
+    let Ok(conn) = db.write() else {
         return;
     };
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();

@@ -504,7 +504,7 @@ async fn test_get_stream_oversized_rejected_before_read() {
     // Forge the DB row's file_size_bytes to 7 MiB — base64 expands to >9 MiB
     // which exceeds the ServiceCall 8 MiB cap.
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         let n = conn
             .execute(
                 "UPDATE recordings SET file_size_bytes = ?1 WHERE ref = ?2",
@@ -549,7 +549,7 @@ async fn test_purge_io_error_returns_error_no_db_soft_delete() {
     std::fs::write(&bogus_parent, b"x").unwrap();
     let bogus_target = bogus_parent.join("never.png");
     {
-        let conn = db.lock().unwrap();
+        let conn = db.write().unwrap();
         let n = conn
             .execute(
                 "UPDATE recordings SET file_path = ?1 WHERE ref = ?2",

@@ -578,12 +578,11 @@ mod tests {
     use crate::flow_engine::dispatchers::LlmResponse;
     use crate::flow_engine::envelope::{ChatMessage, FinishReason, TokenUsage};
     use rusqlite::Connection;
-    use std::sync::Mutex;
 
     fn audit_db() -> DbPool {
         let conn = Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn dispatcher_with_db(db: DbPool) -> LlmDispatcherImpl {
@@ -603,7 +602,7 @@ mod tests {
         // The run principal is a real account (compliance_ai_events.user_id FKs
         // user_accounts) — seed it, like production where the flow's user_id is
         // a logged-in user.
-        db.lock()
+        db.write()
             .unwrap()
             .execute(
                 "INSERT INTO user_accounts (id, username, password_hash) \
@@ -642,7 +641,7 @@ mod tests {
         let chat_response = llm_response_to_chat_response(&response, &api_req.model);
         event.finish_success(&chat_response).expect("finish event");
 
-        let conn = db.lock().expect("db lock");
+        let conn = db.read().expect("db lock");
         let (status, agent_id, agent_run_id, flow_node_id, model, correlation_id): (
             String,
             Option<String>,

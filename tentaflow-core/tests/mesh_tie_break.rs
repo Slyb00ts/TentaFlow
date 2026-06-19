@@ -12,7 +12,7 @@
 //     -- --nocapture --test-threads=1
 // =============================================================================
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tentaflow_core::crypto::SettingsCipher;
@@ -55,7 +55,7 @@ fn setup_test_db() -> DbPool {
         );",
     )
     .expect("create tables");
-    Arc::new(Mutex::new(conn))
+    Arc::new(tentaflow_core::db::Db::from_connection(conn))
 }
 
 fn test_cipher() -> Arc<SettingsCipher> {

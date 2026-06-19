@@ -89,7 +89,7 @@ fn build_addon_dir(
 }
 
 fn count_audit(pool: &DbPool, addon_id: &str, action: &str) -> i64 {
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     conn.query_row(
         "SELECT COUNT(*) FROM audit_log WHERE addon_id = ?1 AND action = ?2",
         rusqlite::params![addon_id, action],
@@ -111,7 +111,7 @@ fn install_succeeds_with_trusted_publisher_and_valid_signature() {
 
     install(addon.path(), &pool).expect("install must succeed");
 
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM addons WHERE addon_id = 'ok-addon'",
@@ -149,7 +149,7 @@ fn install_rejected_when_signature_is_invalid() {
         "unexpected error: {msg}"
     );
 
-    let conn = pool.lock().expect("lock");
+    let conn = pool.read().expect("read");
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM addons WHERE addon_id = 'bad-sig-addon'",

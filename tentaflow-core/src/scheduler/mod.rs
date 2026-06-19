@@ -98,7 +98,7 @@ pub fn start(db: DbPool, addon_manager: Option<Arc<AddonManager>>) {
 }
 
 pub fn list_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
@@ -113,7 +113,7 @@ pub fn list_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
 
 pub fn list_runs(db: &DbPool, job_id: &str, limit: i64) -> Result<Vec<ScheduledRun>> {
     let limit = limit.clamp(1, 200);
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT id, job_id, status, scheduled_for, started_at, finished_at, result_json, error \
          FROM scheduled_runs WHERE job_id = ?1 ORDER BY scheduled_for DESC LIMIT ?2",
@@ -124,7 +124,7 @@ pub fn list_runs(db: &DbPool, job_id: &str, limit: i64) -> Result<Vec<ScheduledR
 }
 
 pub fn list_addon_actions(db: &DbPool) -> Result<Vec<SchedulerAction>> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT addon_id, manifest_json FROM addons WHERE is_enabled = 1 ORDER BY name, addon_id",
     )?;
@@ -183,7 +183,7 @@ pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<S
         .unwrap_or_else(|| json!({"max_attempts":1,"backoff_seconds":60}).to_string());
     let concurrency_policy = req.concurrency_policy.unwrap_or_else(|| "skip".to_string());
 
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute(
         "INSERT INTO scheduled_jobs \
              (id, name, enabled, target_type, target_addon_id, target_action_id, payload_json, \
@@ -220,7 +220,7 @@ pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<S
 }
 
 pub fn delete_job(db: &DbPool, job_id: &str) -> Result<()> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute("DELETE FROM scheduled_jobs WHERE id = ?1", params![job_id])?;
     Ok(())
 }
@@ -373,7 +373,7 @@ fn validate_job_request(req: &UpsertJobRequest) -> Result<()> {
 }
 
 fn ensure_target_action_exists(db: &DbPool, addon_id: &str, action_id: &str) -> Result<()> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let manifest_raw: Option<String> = conn
         .query_row(
             "SELECT manifest_json FROM addons WHERE addon_id = ?1 AND is_enabled = 1",
@@ -454,7 +454,7 @@ fn next_daily_cron(expr: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
 
 fn due_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
     let now = Utc::now().to_rfc3339();
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
@@ -470,7 +470,7 @@ fn due_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
 }
 
 fn get_job(db: &DbPool, job_id: &str) -> Result<Option<ScheduledJob>> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.query_row(
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
@@ -485,7 +485,7 @@ fn get_job(db: &DbPool, job_id: &str) -> Result<Option<ScheduledJob>> {
 }
 
 fn get_run(db: &DbPool, run_id: &str) -> Result<Option<ScheduledRun>> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.query_row(
         "SELECT id, job_id, status, scheduled_for, started_at, finished_at, result_json, error \
          FROM scheduled_runs WHERE id = ?1",
@@ -497,7 +497,7 @@ fn get_run(db: &DbPool, run_id: &str) -> Result<Option<ScheduledRun>> {
 }
 
 fn has_running_run(db: &DbPool, job_id: &str) -> Result<bool> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM scheduled_runs WHERE job_id = ?1 AND status = 'running')",
         params![job_id],
@@ -513,7 +513,7 @@ fn insert_run(
     scheduled_for: DateTime<Utc>,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute(
         "INSERT INTO scheduled_runs (id, job_id, status, scheduled_for) VALUES (?1, ?2, ?3, ?4)",
         params![id, job_id, status, scheduled_for.to_rfc3339()],
@@ -522,7 +522,7 @@ fn insert_run(
 }
 
 fn mark_run_started(db: &DbPool, run_id: &str) -> Result<()> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute(
         "UPDATE scheduled_runs SET status = 'running', started_at = ?1 WHERE id = ?2",
         params![Utc::now().to_rfc3339(), run_id],
@@ -537,7 +537,7 @@ fn finish_run(
     result_json: Option<&str>,
     error: Option<&str>,
 ) -> Result<()> {
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute(
         "UPDATE scheduled_runs \
          SET status = ?1, finished_at = ?2, result_json = ?3, error = ?4 \
@@ -557,7 +557,7 @@ fn bump_next_run(db: &DbPool, job: &ScheduledJob) -> Result<()> {
             Utc::now(),
         )?)
     };
-    let conn = db.lock().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+    let conn = db.write().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
     conn.execute(
         "UPDATE scheduled_jobs SET next_run_at = ?1, updated_at = datetime('now') WHERE id = ?2",
         params![next, job.id],
@@ -610,7 +610,7 @@ mod tests {
     }
 
     fn install_eureka_metadata(db: &DbPool) {
-        let conn = db.lock().expect("db lock");
+        let conn = db.write().expect("db lock");
         conn.execute(
             "INSERT INTO addons (addon_id, name, version, manifest_json, platforms, is_enabled) \
              VALUES ('eureka', 'Eureka MF', '1.0.0', ?1, 'linux,macos,windows', 1)",

@@ -45,7 +45,7 @@ fn install_addon_alias(db: &DbPool, addon_id: &str, alias: &str, target: &str) {
 }
 
 fn fetch_alias_row(db: &DbPool, alias: &str) -> Option<(i64, String, i64)> {
-    let conn = db.lock().unwrap();
+    let conn = db.read().unwrap();
     conn.query_row(
         "SELECT id, target_model, is_active FROM model_aliases WHERE alias = ?1",
         rusqlite::params![alias],
@@ -68,7 +68,7 @@ fn insert_alias_call(
     fallback_used: bool,
     ts: i64,
 ) {
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
     conn.execute(
         "INSERT INTO alias_calls \
          (alias_id, alias_name, target_used, fallback_used, result, ts) \
@@ -299,7 +299,7 @@ fn alias_get_payload_too_large_rejected() {
 /// Writes a `[[uses_alias]]` declaration row directly. Mirrors what the install
 /// path produces in `addon_uses_alias`.
 fn insert_uses_alias(db: &DbPool, addon_id: &str, alias: &str, status: &str, required: bool) {
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
     conn.execute(
         "INSERT INTO addon_uses_alias \
             (addon_id, alias_target_name, required, reason, grant_status, created_at) \
@@ -310,7 +310,7 @@ fn insert_uses_alias(db: &DbPool, addon_id: &str, alias: &str, status: &str, req
 }
 
 fn set_alias_methods(db: &DbPool, alias: &str, methods: &[&str]) {
-    let conn = db.lock().unwrap();
+    let conn = db.write().unwrap();
     let json = serde_json::to_string(methods).unwrap();
     conn.execute(
         "UPDATE model_aliases SET methods = ?1 WHERE alias = ?2",

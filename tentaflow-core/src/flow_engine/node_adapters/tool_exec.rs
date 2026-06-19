@@ -661,12 +661,12 @@ mod tests {
     use crate::flow_engine::envelope::{ChatMessage, ChatMessageContent};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn service(pool: DbPool) -> AgentServiceSlot {

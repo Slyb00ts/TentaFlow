@@ -77,7 +77,7 @@ fn map_db<E: std::fmt::Display>(e: E) -> PolicyError {
 
 pub fn insert_claim(pool: &DbPool, claim: &NewClaim) -> Result<()> {
     let conn = pool
-        .lock()
+        .write()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.execute(
         "INSERT INTO policy_claims (claim_id, claim_type, label, subject, scope, document_uri, \
@@ -104,7 +104,7 @@ pub fn insert_claim(pool: &DbPool, claim: &NewClaim) -> Result<()> {
 
 pub fn insert_signature(pool: &DbPool, sig: &NewSignature) -> Result<()> {
     let conn = pool
-        .lock()
+        .write()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.execute(
         "INSERT INTO policy_claim_signatures (claim_id, signer_role, signer_user, signed_at, signature_b64) \
@@ -128,7 +128,7 @@ pub fn delete_signature(
     signer_user: &str,
 ) -> Result<bool> {
     let conn = pool
-        .lock()
+        .write()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let n = conn
         .execute(
@@ -141,7 +141,7 @@ pub fn delete_signature(
 
 pub fn get_claim(pool: &DbPool, claim_id: &str) -> Result<Option<ClaimRow>> {
     let conn = pool
-        .lock()
+        .read()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     conn.query_row(
         "SELECT claim_id, claim_type, label, subject, scope, document_uri, scope_addon_id, \
@@ -174,7 +174,7 @@ pub fn get_claim(pool: &DbPool, claim_id: &str) -> Result<Option<ClaimRow>> {
 
 pub fn list_signatures(pool: &DbPool, claim_id: &str) -> Result<Vec<ClaimSignatureRow>> {
     let conn = pool
-        .lock()
+        .read()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare(
@@ -202,7 +202,7 @@ pub fn list_signatures(pool: &DbPool, claim_id: &str) -> Result<Vec<ClaimSignatu
 
 pub fn list_claims(pool: &DbPool, filter: &ListFilter) -> Result<Vec<ClaimRow>> {
     let conn = pool
-        .lock()
+        .read()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     // Build query dynamically — kept simple (one optional WHERE clause per
     // filter field). For active_only we filter post-fetch when no `now_utc`
@@ -272,7 +272,7 @@ pub fn list_claims(pool: &DbPool, filter: &ListFilter) -> Result<Vec<ClaimRow>> 
 
 pub fn revoke_claim(pool: &DbPool, claim_id: &str, reason: &str, revoked_at: &str) -> Result<bool> {
     let conn = pool
-        .lock()
+        .write()
         .map_err(|e| PolicyError::DbError(e.to_string()))?;
     let n = conn
         .execute(

@@ -1158,7 +1158,7 @@ mod tests {
         use std::sync::Arc;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
         let (status, service_type, flow_json): (String, String, String) = conn
             .query_row(
                 "SELECT status, service_type, flow_json FROM flows WHERE id = ?1",
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn fresh_db_has_only_transcription_summarization_prompts() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM prompts", [], |r| r.get(0))
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
@@ -1315,7 +1315,7 @@ mod tests {
     #[test]
     fn fresh_db_seeds_general_agent() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let (id, routable, enabled, flow_id, tools): (String, i64, i64, Option<String>, String) =
             conn.query_row(
@@ -1342,7 +1342,7 @@ mod tests {
     #[test]
     fn reseed_is_idempotent_for_harness_and_agent() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
 
         // Ponowny pelny seed (jak kolejny start procesu).
         super::seed_defaults(&conn).expect("ponowny seed nie moze sie wywrocic");
@@ -1369,7 +1369,7 @@ mod tests {
     #[test]
     fn reseed_after_rename_does_not_collide() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.write().unwrap();
 
         // Uzytkownik zmienia nazwe domyslnego flow.
         conn.execute(
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn seeded_admin_user_account_id_is_a_valid_uuid() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         // id admina w user_accounts musi byc poprawnym UUID-em.
         let admin_id: String = conn
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn seeded_admin_has_org_membership() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let (org_id, role_id): (String, String) = conn
             .query_row(
@@ -1476,7 +1476,7 @@ mod tests {
     #[test]
     fn legacy_users_table_is_dropped() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let exists: i64 = conn
             .query_row(
@@ -1533,7 +1533,7 @@ mod tests {
         let registry = build_registry_for_test();
 
         let flow_jsons: Vec<(String, String)> = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             let mut stmt = conn.prepare("SELECT name, flow_json FROM flows").unwrap();
             let rows: Vec<(String, String)> = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -1564,7 +1564,7 @@ mod tests {
         let registry = build_registry_for_test();
 
         let rows: Vec<(String, String)> = {
-            let conn = pool.lock().unwrap();
+            let conn = pool.read().unwrap();
             let mut stmt = conn
                 .prepare("SELECT id, flow_json FROM flows WHERE id = ?1")
                 .unwrap();
@@ -1645,7 +1645,7 @@ mod tests {
         use crate::flow_engine::node_adapters::compact_context::SUMMARY_SYSTEM_PROMPT;
 
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
-        let conn = pool.lock().unwrap();
+        let conn = pool.read().unwrap();
 
         let default_cfg = |node_type: &str| -> serde_json::Value {
             let raw: String = conn

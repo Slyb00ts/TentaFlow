@@ -37,7 +37,7 @@ pub fn purge_expired_agent_runtime(pool: &DbPool) -> anyhow::Result<(usize, usiz
         let is_default = org_id == DEFAULT_ORG_ID;
         let retention_days = {
             let conn = pool
-                .lock()
+                .read()
                 .map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
             match resolve_retention_policy(&conn, org_id, RetentionScopeKind::AgentRuns, None) {
                 Ok(policy) => policy.retention_days,
@@ -73,7 +73,7 @@ pub fn purge_expired_agent_runtime(pool: &DbPool) -> anyhow::Result<(usize, usiz
 /// the stored `finished_at`/`created_at` values.
 fn sqlite_cutoff(pool: &DbPool, expr: &str) -> anyhow::Result<String> {
     let conn = pool
-        .lock()
+        .read()
         .map_err(|_| anyhow::anyhow!("db pool poisoned"))?;
     let value: String = conn.query_row(&format!("SELECT {expr}"), [], |row| row.get(0))?;
     Ok(value)
@@ -110,12 +110,12 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::models::{AgentParams, AgentRunStatusUpdate, NewAgentMailboxEntry, NewAgentRun};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         migrations::run(&conn).expect("migrations");
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn seed_agent(pool: &DbPool, id: &str) {
@@ -178,7 +178,7 @@ mod tests {
             .expect("log");
         // Backdate finished_at to land before/after the cutoff deterministically.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE agent_runs SET finished_at = datetime('now', ?2), \
                  created_at = datetime('now', ?2) WHERE id = ?1",
@@ -200,7 +200,7 @@ mod tests {
         .expect("enqueue mailbox");
         // Backdate the mailbox row to match the run so the purge picks it up.
         {
-            let conn = pool.lock().unwrap();
+            let conn = pool.write().unwrap();
             conn.execute(
                 "UPDATE agent_mailbox SET created_at = datetime('now', ?2) WHERE id = ?1",
                 rusqlite::params![mailbox_id, format!("-{days_ago} days")],

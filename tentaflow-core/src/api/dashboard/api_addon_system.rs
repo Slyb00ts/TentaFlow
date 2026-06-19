@@ -35,7 +35,7 @@ fn get_addon_config_map(
     addon_id: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
     let conn = pool
-        .lock()
+        .read()
         .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
     let mut stmt = conn
         .prepare("SELECT key, value FROM addon_config WHERE addon_id = ?1")

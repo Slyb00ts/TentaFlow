@@ -954,12 +954,11 @@ pub fn retrust(security: &Arc<MeshSecurity>, node_id: &str) -> Result<(), AdminE
 mod baseline_adopt_admin_tests {
     use super::*;
     use crate::sync::core_baseline::{load_adopt_state, BaselinePhase, BaselineRole};
-    use std::sync::Mutex;
 
     fn setup_test_db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn test_cipher() -> Arc<crate::crypto::SettingsCipher> {

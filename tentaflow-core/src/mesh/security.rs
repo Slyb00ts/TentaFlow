@@ -655,7 +655,6 @@ impl MeshSecurity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     fn setup_test_db() -> DbPool {
         // Run the real migrations: `add_trusted_node` now materialises trusted
@@ -663,7 +662,7 @@ mod tests {
         // partial schema would miss those tables.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn test_settings_cipher() -> Arc<crate::crypto::SettingsCipher> {

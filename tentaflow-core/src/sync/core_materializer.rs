@@ -67,7 +67,7 @@ pub fn apply_core_operation(
 
     let lww_tracked = is_lww_tracked(descriptor.kind);
     let mut conn = pool
-        .lock()
+        .write()
         .map_err(|e| SyncLedgerError::Runtime(format!("Blad blokady bazy: {e}")))?;
     let tx = conn
         .transaction()

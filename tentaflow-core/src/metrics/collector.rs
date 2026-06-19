@@ -81,7 +81,7 @@ impl MetricsCollector {
                     }
                     _ = tick.tick() => {
                         if let Some(ref db) = db_for_stats {
-                            if let Ok(conn) = db.lock() {
+                            if let Ok(conn) = db.read() {
                                 if let Ok(svcs) = crate::services_repo::services::list_alive(&conn) {
                                     metrics_stats.set_active_services(svcs.len() as u64);
                                 }

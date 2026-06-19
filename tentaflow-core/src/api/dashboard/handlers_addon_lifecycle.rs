@@ -1918,7 +1918,7 @@ fn capture_addon_instance_sync(db: &crate::db::DbPool, addon_id: &str) {
 /// serwis jest osiagalny (ten sam node), wiec reachable = running+endpoint.
 fn discover_local_milvus_services(db: &crate::db::DbPool) -> Vec<AddonMilvusService> {
     use crate::services_repo::services::ServiceStatus;
-    let conn = match db.lock() {
+    let conn = match db.read() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };

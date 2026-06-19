@@ -901,7 +901,7 @@ impl MeshCommandExecutor {
             None => return CommandResponse::fail("service action context not configured"),
         };
         let svc = {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.read() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -917,7 +917,7 @@ impl MeshCommandExecutor {
         let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
         // Scoped lock: drop the MutexGuard before awaiting again.
         {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.write() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -935,7 +935,7 @@ impl MeshCommandExecutor {
             None => return CommandResponse::fail("service action context not configured"),
         };
         {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.write() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -976,7 +976,7 @@ impl MeshCommandExecutor {
         };
 
         let svc = {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.read() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -1041,7 +1041,7 @@ impl MeshCommandExecutor {
         };
 
         {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.write() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -1078,7 +1078,7 @@ impl MeshCommandExecutor {
                 tracing::warn!(service_id, "service_update_remote: stop failed: {}", e);
             }
             {
-                let conn = match actions.db.lock() {
+                let conn = match actions.db.write() {
                     Ok(c) => c,
                     Err(_) => return CommandResponse::fail("db pool poisoned"),
                 };
@@ -1107,7 +1107,7 @@ impl MeshCommandExecutor {
                 .await
                 {
                     Ok(handle) => {
-                        if let Ok(conn) = db.lock() {
+                        if let Ok(conn) = db.write() {
                             let _ = crate::services_repo::services::update_runtime(
                                 &conn,
                                 service_id,
@@ -1125,7 +1125,7 @@ impl MeshCommandExecutor {
                     }
                     Err(e) => {
                         let msg = format!("respawn after update_remote: {}", e);
-                        if let Ok(conn) = db.lock() {
+                        if let Ok(conn) = db.write() {
                             let _ = crate::services_repo::services::update_status(
                                 &conn,
                                 service_id,
@@ -1157,7 +1157,7 @@ impl MeshCommandExecutor {
         // and clear runtime metadata so health checks don't keep flapping.
         if paused {
             let svc = {
-                let conn = match actions.db.lock() {
+                let conn = match actions.db.read() {
                     Ok(c) => c,
                     Err(_) => return CommandResponse::fail("db pool poisoned"),
                 };
@@ -1183,7 +1183,7 @@ impl MeshCommandExecutor {
                 {
                     return CommandResponse::fail(e.to_string());
                 }
-                let conn = match actions.db.lock() {
+                let conn = match actions.db.write() {
                     Ok(c) => c,
                     Err(_) => return CommandResponse::fail("db pool poisoned"),
                 };
@@ -1203,7 +1203,7 @@ impl MeshCommandExecutor {
         }
 
         {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.write() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -1221,7 +1221,7 @@ impl MeshCommandExecutor {
             None => return CommandResponse::fail("service action context not configured"),
         };
         let svc = {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.read() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -1246,7 +1246,7 @@ impl MeshCommandExecutor {
 
         // Clear pause + flip to Starting before respawn.
         {
-            let conn = match actions.db.lock() {
+            let conn = match actions.db.write() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
@@ -1278,7 +1278,7 @@ impl MeshCommandExecutor {
 
         let result = match respawn {
             Ok(handle) => {
-                let conn = match actions.db.lock() {
+                let conn = match actions.db.write() {
                     Ok(c) => c,
                     Err(_) => return CommandResponse::fail("db pool poisoned"),
                 };
@@ -1303,7 +1303,7 @@ impl MeshCommandExecutor {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if let Ok(conn) = actions.db.lock() {
+                if let Ok(conn) = actions.db.write() {
                     let _ = crate::services_repo::services::update_status(
                         &conn,
                         service_id,
@@ -2478,7 +2478,6 @@ mod tests {
     }
 
     fn create_test_db() -> crate::db::DbPool {
-        use std::sync::Mutex;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
@@ -2508,6 +2507,6 @@ mod tests {
             ",
         )
         .unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 }

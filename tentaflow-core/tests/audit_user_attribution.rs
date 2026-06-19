@@ -80,7 +80,7 @@ fn make_state(
 /// from the auth layer after a real user exists; this fixture mirrors that
 /// invariant inside the in-memory test DB.
 fn ensure_user(db: &DbPool, id: &str, username: &str) {
-    let conn = db.lock().expect("db lock");
+    let conn = db.write().expect("db write");
     conn.execute(
         "INSERT INTO user_accounts (id, username, password_hash, display_name) \
          VALUES (?1, ?2, 'x', ?2)",
@@ -94,7 +94,7 @@ fn ensure_user(db: &DbPool, id: &str, username: &str) {
 /// (rather than is_system_call=true). Without this the dispatcher rejects
 /// with AbiError::Permission because no per-user grant exists.
 fn grant_flow_invoke_default(db: &DbPool, addon_id: &str) {
-    let conn = db.lock().expect("db lock");
+    let conn = db.write().expect("db write");
     conn.execute(
         "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
          VALUES (?1, ?2, 'allow')",
@@ -168,7 +168,7 @@ async fn flow_invoke_records_actor_user_id() {
     };
 
     // SELECT actor_user_id FROM flow_invocations WHERE id = ?
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db read");
     let recorded: Option<String> = conn
         .query_row(
             "SELECT actor_user_id FROM flow_invocations WHERE id = ?1",
@@ -214,7 +214,7 @@ async fn flow_invoke_system_call_records_null_user_id() {
         flow_api::DispatchOutcome::Err(e) => panic!("dispatch must succeed, got Err({:?})", e),
     };
 
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db read");
     let recorded: Option<String> = conn
         .query_row(
             "SELECT actor_user_id FROM flow_invocations WHERE id = ?1",
@@ -259,7 +259,7 @@ async fn audit_log_with_risk_carries_actor_user_id() {
         None,
     );
 
-    let conn = db.lock().expect("db lock");
+    let conn = db.read().expect("db read");
     let recorded: Option<String> = conn
         .query_row(
             "SELECT user_id FROM audit_log \

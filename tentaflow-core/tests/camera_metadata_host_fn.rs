@@ -275,7 +275,7 @@ fn migration_v36_seeds_camera_metadata_on_org_operator() {
     let db = make_db();
     // After db::init the migration chain has run, so org_admin and
     // org_operator must both carry camera.metadata.
-    let conn = db.lock().expect("acquire db");
+    let conn = db.read().expect("acquire db");
     let admin_perms: String = conn
         .query_row(
             "SELECT permissions_json FROM roles WHERE name = 'org_admin'",
@@ -304,7 +304,7 @@ fn migration_v36_seeds_camera_metadata_on_org_operator() {
 #[test]
 fn migration_v36_does_not_grant_camera_metadata_to_viewer() {
     let db = make_db();
-    let conn = db.lock().expect("acquire db");
+    let conn = db.read().expect("acquire db");
     let viewer_perms: String = conn
         .query_row(
             "SELECT permissions_json FROM roles WHERE name = 'org_viewer'",
@@ -328,7 +328,7 @@ fn migration_v36_idempotent_when_camera_metadata_already_present() {
     // (`:memory:` is per-connection); instead we directly call the public
     // migration runner against the existing connection. Each migration
     // is recorded in `_migrations`, so the second run must be a no-op.
-    let conn = db.lock().expect("acquire db");
+    let conn = db.write().expect("acquire db");
     tentaflow_core::db::migrations::run(&*conn).expect("re-run must succeed");
     // permissions still contain camera.metadata exactly once.
     let operator_perms: String = conn

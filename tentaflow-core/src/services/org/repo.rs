@@ -172,7 +172,7 @@ pub fn create_organization(
     retention_policy_json: Option<&str>,
     _created_by_user_id: Option<&str>,
 ) -> Result<Organization> {
-    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.write().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
     let org_id = uuid::Uuid::new_v4().to_string();
     let created_at = now_utc();
@@ -236,7 +236,7 @@ pub fn create_organization(
 }
 
 pub fn get_organization(pool: &DbPool, org_id: &str) -> Result<Option<Organization>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     conn.query_row(
         "SELECT org_id, name, slug, contact_email, dpo_contact, retention_policy_json, \
                 status, created_at \
@@ -260,7 +260,7 @@ pub fn get_organization(pool: &DbPool, org_id: &str) -> Result<Option<Organizati
 }
 
 pub fn list_organizations(pool: &DbPool, status_filter: Option<&str>) -> Result<Vec<Organization>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     let (sql, has_filter) = match status_filter {
         Some(_) => (
             "SELECT org_id, name, slug, contact_email, dpo_contact, retention_policy_json, \
@@ -301,7 +301,7 @@ pub fn list_organizations(pool: &DbPool, status_filter: Option<&str>) -> Result<
 }
 
 pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Result<bool> {
-    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.write().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
 
     let mut sets: Vec<String> = Vec::new();
@@ -377,7 +377,7 @@ pub fn update_organization(pool: &DbPool, org_id: &str, patch: &OrgPatch) -> Res
 }
 
 pub fn delete_organization(pool: &DbPool, org_id: &str) -> Result<bool> {
-    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.write().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
     let n = tx
         .execute(
@@ -415,7 +415,7 @@ pub fn add_membership(
     role_id: &str,
     granted_by: &str,
 ) -> Result<bool> {
-    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.write().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
     // Validate the foreign references before INSERT so we can surface
     // structured errors instead of bare FK constraint failures.
@@ -477,7 +477,7 @@ pub fn add_membership(
 }
 
 pub fn remove_membership(pool: &DbPool, org_id: &str, user_id: &str) -> Result<bool> {
-    let mut conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let mut conn = pool.write().map_err(|e| OrgError::DbError(e.to_string()))?;
     let tx = conn.transaction().map_err(map_db)?;
     let n = tx
         .execute(
@@ -513,7 +513,7 @@ pub fn list_memberships_for_user(
     pool: &DbPool,
     user_id: &str,
 ) -> Result<Vec<(Organization, Role)>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare(
             "SELECT o.org_id, o.name, o.slug, o.contact_email, o.dpo_contact, \
@@ -561,7 +561,7 @@ pub fn list_memberships_for_user(
 }
 
 pub fn list_memberships_for_org(pool: &DbPool, org_id: &str) -> Result<Vec<(String, Role)>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare(
             "SELECT m.user_id, r.role_id, r.name, r.permissions_json \
@@ -597,7 +597,7 @@ pub fn list_memberships_for_org(pool: &DbPool, org_id: &str) -> Result<Vec<(Stri
 }
 
 pub fn get_user_role_in_org(pool: &DbPool, user_id: &str, org_id: &str) -> Result<Option<Role>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     let row = conn
         .query_row(
             "SELECT r.role_id, r.name, r.permissions_json \
@@ -625,7 +625,7 @@ pub fn get_user_role_in_org(pool: &DbPool, user_id: &str, org_id: &str) -> Resul
 }
 
 pub fn list_roles(pool: &DbPool) -> Result<Vec<Role>> {
-    let conn = pool.lock().map_err(|e| OrgError::DbError(e.to_string()))?;
+    let conn = pool.read().map_err(|e| OrgError::DbError(e.to_string()))?;
     let mut stmt = conn
         .prepare("SELECT role_id, name, permissions_json FROM roles ORDER BY name ASC")
         .map_err(map_db)?;
@@ -683,7 +683,7 @@ mod tests {
     }
 
     fn capture_id_for_resource(pool: &DbPool, resource_type: &str, resource_id: &str) -> String {
-        let conn = pool.lock().expect("lock");
+        let conn = pool.read().expect("read");
         conn.query_row(
             "SELECT capture_id FROM __tentaflow_core_sync_captures \
              WHERE resource_type = ?1 AND resource_id = ?2 \
@@ -821,7 +821,7 @@ mod tests {
         )
         .unwrap();
         let capture_id = capture_id_for_resource(&pool, "core.organization", &org.org_id);
-        let conn = pool.lock().expect("lock");
+        let conn = pool.read().expect("read");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");
@@ -846,7 +846,7 @@ mod tests {
         add_membership(&pool, &org.org_id, "user-2", &role.role_id, "admin").unwrap();
         let resource_id = org_membership_resource_id(&org.org_id, "user-2");
         let capture_id = capture_id_for_resource(&pool, "core.org_membership", &resource_id);
-        let conn = pool.lock().expect("lock");
+        let conn = pool.read().expect("read");
         let capture = load_core_write_capture(&conn, &capture_id)
             .expect("load capture")
             .expect("capture");

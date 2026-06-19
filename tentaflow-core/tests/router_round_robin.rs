@@ -183,7 +183,7 @@ fn first_available_does_not_rotate() {
 #[test]
 fn migration_v33_accepts_round_robin_value() {
     let pool = tentaflow_core::db::init(Path::new(":memory:")).expect("test db");
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("lock");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) \
          VALUES (?1, ?2, 1, NULL, ?3)",
@@ -204,7 +204,7 @@ fn migration_v33_accepts_round_robin_value() {
 #[test]
 fn migration_v33_accepts_first_available_value() {
     let pool = tentaflow_core::db::init(Path::new(":memory:")).expect("test db");
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("lock");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) \
          VALUES (?1, ?2, 1, NULL, ?3)",
@@ -216,7 +216,7 @@ fn migration_v33_accepts_first_available_value() {
 #[test]
 fn migration_v33_rejects_unknown_strategy_value() {
     let pool = tentaflow_core::db::init(Path::new(":memory:")).expect("test db");
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("lock");
     let res = conn.execute(
         "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) \
          VALUES (?1, ?2, 1, NULL, ?3)",
@@ -232,7 +232,7 @@ fn migration_v33_rejects_unknown_strategy_value() {
 #[test]
 fn migration_v33_default_strategy_remains_first_available() {
     let pool = tentaflow_core::db::init(Path::new(":memory:")).expect("test db");
-    let conn = pool.lock().expect("lock");
+    let conn = pool.write().expect("lock");
     conn.execute(
         "INSERT INTO model_aliases (alias, target_model) VALUES (?1, ?2)",
         rusqlite::params!["default-alias", "target-q"],

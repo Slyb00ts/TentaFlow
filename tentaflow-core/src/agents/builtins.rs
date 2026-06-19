@@ -403,7 +403,7 @@ mod tests {
         // The async builtins must refuse the synchronous path.
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         crate::db::migrations::run(&conn).expect("migrations");
-        let pool: DbPool = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let pool: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let err =
             execute_core_tool(&pool, "core.agent_spawn", &serde_json::json!({})).unwrap_err();
         assert!(err.to_string().contains("async"), "{err}");
