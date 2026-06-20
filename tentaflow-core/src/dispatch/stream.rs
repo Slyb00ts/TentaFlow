@@ -30,6 +30,12 @@ use crate::services::stream_hub::{StreamHub, StreamHubError};
 const CAMERA_PREFIX: &str = "camera:";
 /// Permission required for `camera:` stream ids.
 const PERM_CAMERA_READ: &str = "camera.read";
+/// Stream-id prefix for a robot's pushed LiDAR point cloud (`lidar:<robot_id>`).
+const LIDAR_PREFIX: &str = "lidar:";
+/// Permission required for `lidar:` stream ids. Reuses the SAME read grant the L2
+/// fetch path (`RobotLidarFrameRequest`) and `RobotAction::LidarFrame` require, so
+/// push + fetch share one gate — there is no separate `lidar.read`.
+const PERM_ROBOT_TELEMETRY: &str = "robot.telemetry";
 
 /// Hard ceiling on concurrent stream subscriptions per authenticated user.
 /// Beyond this the handler rejects with `QuotaExceeded` so a runaway client
@@ -404,14 +410,94 @@ fn register_remote_camera_relay(
     Some(hub_key)
 }
 
+/// Idempotently register a `LocalLidarStreamSource` factory under the bare hub
+/// key `lidar:<robot_id>` for a LOCAL robot. Re-registering the same key is
+/// idempotent (latest wins) and never tears down an already-active source; the
+/// factory captures the robot id and builds a fresh source on the next cold
+/// subscribe via the hub's per-stream creation lock.
+fn register_local_lidar_source(robot_id: &str) -> String {
+    let hub_key = format!("{}{}", LIDAR_PREFIX, robot_id);
+    let robot_id = robot_id.to_string();
+    let factory = Box::new(move || {
+        let source =
+            crate::services::lidar_push::LocalLidarStreamSource::new(robot_id.clone());
+        Ok(source as Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
+    });
+    let _ = StreamHub::global().register_factory(hub_key.clone(), factory);
+    hub_key
+}
+
+/// Authorize a `lidar:<robot_id>` subscribe and resolve the StreamHub key.
+/// Mirrors `robots_lidar_frame`: requires org + `robot.telemetry`, resolves the
+/// robot in the CALLER'S org via the mesh registry (org scoping at the
+/// consumption layer), and masks unknown-in-org as NotFound so existence in
+/// another tenant is never leaked. A LOCAL robot lazily registers a push source;
+/// a REMOTE robot is an explicit not-yet seam (L3b).
+///
+/// The resolved hub key is the bare `lidar:<robot_id>`. That is collision-safe
+/// because the addon-install id is globally unique with a single owner org
+/// (minted in `addon::lifecycle::unique_instance_id` as `{package_id}-{uuid}`,
+/// and a robot row is single-org), so org-scoping the resolution here — not the
+/// hub key — is sufficient. See the `LidarStreamHub` header for the full invariant.
+fn enforce_lidar_subscribe(
+    ctx: &HandlerContext,
+    robot_id: &str,
+) -> Result<String, ProtocolError> {
+    if robot_id.is_empty() {
+        return Err(ProtocolError::bad_request("stream_id missing robot id"));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    if !org.has(PERM_ROBOT_TELEMETRY) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry permission required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+    // Resolve the robot in the caller's org (org scoping enforced here, like the
+    // list / fetch handlers). The mesh registry holds robots from ALL orgs.
+    let robot = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .find(|r| r.org_id == org.org_id && r.robot_id == robot_id)
+        .ok_or_else(|| {
+            // Unknown-in-org: never leak existence across org boundaries.
+            ProtocolError::not_found(format!("stream_not_registered: {}{}", LIDAR_PREFIX, robot_id))
+        })?;
+
+    if robot.node_id != local_node_id {
+        // L3b: cross-node lidar relay — the frame lives in the OWNING node's hub
+        // and there is no cross-node push wired yet. The PUBLIC response is the
+        // exact same NotFound as unknown-in-org so a caller with `robot.telemetry`
+        // cannot distinguish "remote robot exists" from "no such robot" — leaking
+        // that would expose mesh topology / feature-support state. The client
+        // falls back to / keeps using the L2 fetch path.
+        tracing::debug!(
+            robot_id = %robot_id,
+            "lidar push subscribe for remote robot denied (cross-node relay is L3b)"
+        );
+        return Err(ProtocolError::not_found(format!(
+            "stream_not_registered: {}{}",
+            LIDAR_PREFIX, robot_id
+        )));
+    }
+
+    Ok(register_local_lidar_source(robot_id))
+}
+
 /// Authorize a subscribe and resolve the INTERNAL StreamHub key to subscribe
 /// under. For local cameras (and the no-camera build) this is the bare public
 /// `stream_id`; for a remote relay it is the org/owner-scoped key returned by
-/// `register_remote_camera_relay`.
+/// `register_remote_camera_relay`. `lidar:` ids resolve via `enforce_lidar_subscribe`.
 fn enforce_subscribe_permission(
     ctx: &HandlerContext,
     stream_id: &str,
 ) -> Result<String, ProtocolError> {
+    if let Some(rest) = stream_id.strip_prefix(LIDAR_PREFIX) {
+        return enforce_lidar_subscribe(ctx, rest);
+    }
     if let Some(rest) = stream_id.strip_prefix(CAMERA_PREFIX) {
         if rest.is_empty() {
             return Err(ProtocolError::bad_request("stream_id missing camera id"));
@@ -782,6 +868,169 @@ mod tests {
         assert_ne!(key, remote_relay_hub_key("cam-x", "node-A", "org-2"));
         // The bare local key (what a local camera uses) never collides.
         assert_ne!(key, format!("{}{}", CAMERA_PREFIX, "cam-x"));
+    }
+
+    /// Seed one robot owned by `node_id` in org `org-1` into the global mesh
+    /// registry so `enforce_lidar_subscribe` can resolve it. Replaces that node's
+    /// entry so concurrent tests on distinct nodes stay isolated.
+    fn seed_robot(robot_id: &str, node_id: &str) {
+        let robot = crate::mesh::robot_dispatch::AdvertisedRobot {
+            robot_id: robot_id.to_string(),
+            package_id: "go2".to_string(),
+            kind: Some("quadruped".to_string()),
+            node_id: node_id.to_string(),
+            org_id: "org-1".to_string(),
+            camera_id: None,
+            status: "online".to_string(),
+            battery_percent: None,
+            rtt_ms: None,
+            capabilities: Vec::new(),
+            actions_meta: Vec::new(),
+            telemetry: None,
+            lidar: None,
+        };
+        crate::mesh::robot_dispatch::global().replace_node(node_id, vec![robot]);
+    }
+
+    /// A local robot in the caller's org with `robot.telemetry` resolves to the
+    /// bare `lidar:<robot_id>` hub key and the subscribe streams a frame.
+    #[tokio::test]
+    async fn lidar_local_robot_subscribe_streams_frame() {
+        let robot_id = "go2-stream-local";
+        // `AppState::for_test()` sets local_node_id = "test-node"; seed the robot
+        // under that node so it resolves as LOCAL without mutating the Arc<str>.
+        let local_node = "test-node";
+        seed_robot(robot_id, local_node);
+        let frame = {
+            use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_LAYOUT_XYZ};
+            let h = LidarFrameHeader {
+                version: LIDAR_FRAME_VERSION,
+                layout: LIDAR_LAYOUT_XYZ,
+                point_count: 1,
+                frame_seq: 1,
+                timestamp_us: 1,
+                resolution: 0.05,
+                origin: [0.0, 0.0, 0.0],
+            };
+            let mut buf = h.encode_header().to_vec();
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+            buf.extend_from_slice(&2.0f32.to_le_bytes());
+            buf.extend_from_slice(&3.0f32.to_le_bytes());
+            Bytes::from(buf)
+        };
+        crate::services::lidar_hub::LidarStreamHub::global().publish(robot_id, 1, frame.clone());
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1101, None);
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
+                stream_id: format!("lidar:{}", robot_id),
+            }));
+        let mut ctx = ctx_with_camera_read(1101);
+        ctx.org_context = Some(test_org_context("lidar-user", PERM_ROBOT_TELEMETRY));
+        let h = find_stream_handler("StreamSubscribeRequest").unwrap();
+        (h.handler_fn)(req, ctx, sub);
+
+        // SubscribeResponse: lidar has its latest frame as the init segment.
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::Chunk(MessageBody::StreamBody(
+                StreamPayload::SubscribeResponse(resp),
+            )) => {
+                assert_eq!(resp.stream_id, format!("lidar:{}", robot_id));
+                assert_eq!(resp.mime_type, "application/octet-stream");
+                assert!(resp.has_init_segment);
+            }
+            other => panic!("expected SubscribeResponse, got {:?}", other),
+        }
+        // Init frame carries the seeded latest canonical frame.
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::Chunk(MessageBody::StreamBody(StreamPayload::Frame(f))) => {
+                assert!(f.is_init);
+                assert_eq!(f.data, frame.to_vec());
+            }
+            other => panic!("expected init Frame, got {:?}", other),
+        }
+        crate::services::lidar_hub::LidarStreamHub::global().remove(robot_id);
+    }
+
+    /// A remote robot (owned by another node) is an explicit L3b seam: the gate
+    /// denies with NotFound (`stream_not_registered`), it never silently stubs.
+    #[tokio::test]
+    async fn lidar_remote_robot_denied_not_found() {
+        let robot_id = "go2-stream-remote";
+        seed_robot(robot_id, "some-other-owner-node");
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1102, None);
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
+                stream_id: format!("lidar:{}", robot_id),
+            }));
+        let mut ctx = ctx_with_camera_read(1102);
+        // for_test() local_node_id = "test-node" ≠ the seeded owner → remote path.
+        ctx.org_context = Some(test_org_context("lidar-user", PERM_ROBOT_TELEMETRY));
+        let h = find_stream_handler("StreamSubscribeRequest").unwrap();
+        (h.handler_fn)(req, ctx, sub);
+
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::End(Some(MessageBody::Error(e))) => {
+                assert_eq!(e.code, ProtocolErrorCode::NotFound);
+                assert!(e.message.contains("stream_not_registered"));
+            }
+            other => panic!("expected End(Error NotFound), got {:?}", other),
+        }
+    }
+
+    /// `lidar:` without `robot.telemetry` is denied (PolicyDenied), reusing the
+    /// same grant as the L2 fetch path — never a separate `lidar.read`.
+    #[tokio::test]
+    async fn lidar_subscribe_rejects_missing_telemetry_perm() {
+        let robot_id = "go2-stream-perm";
+        seed_robot(robot_id, "perm-node");
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1103, None);
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
+                stream_id: format!("lidar:{}", robot_id),
+            }));
+        let mut ctx = ctx_with_camera_read(1103);
+        // Org WITHOUT robot.telemetry (perm check precedes robot resolution).
+        ctx.org_context = Some(test_org_context("lidar-noperm", "some.other.perm"));
+        let h = find_stream_handler("StreamSubscribeRequest").unwrap();
+        (h.handler_fn)(req, ctx, sub);
+
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::End(Some(MessageBody::Error(e))) => {
+                assert_eq!(e.code, ProtocolErrorCode::PolicyDenied);
+                assert!(e.message.contains("robot.telemetry"));
+            }
+            other => panic!("expected End(Error PolicyDenied), got {:?}", other),
+        }
+    }
+
+    /// An unknown robot id in the caller's org is masked as NotFound — never
+    /// PolicyDenied or a leak that the id exists in another tenant.
+    #[tokio::test]
+    async fn lidar_unknown_robot_masked_not_found() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1104, None);
+        let req =
+            MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
+                stream_id: "lidar:go2-never-advertised-xyz".to_string(),
+            }));
+        let mut ctx = ctx_with_camera_read(1104);
+        ctx.org_context = Some(test_org_context("lidar-user", PERM_ROBOT_TELEMETRY));
+        let h = find_stream_handler("StreamSubscribeRequest").unwrap();
+        (h.handler_fn)(req, ctx, sub);
+
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::End(Some(MessageBody::Error(e))) => {
+                assert_eq!(e.code, ProtocolErrorCode::NotFound);
+                assert!(e.message.contains("stream_not_registered"));
+            }
+            other => panic!("expected End(Error NotFound), got {:?}", other),
+        }
     }
 
     #[tokio::test]

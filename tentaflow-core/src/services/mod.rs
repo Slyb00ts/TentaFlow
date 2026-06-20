@@ -33,6 +33,7 @@ pub mod handles_cache;
 pub mod key_storage;
 pub mod legal;
 pub mod lidar_hub;
+pub mod lidar_push;
 pub mod lifecycle;
 pub mod mesh_keys;
 pub mod mesh_registry;
