@@ -767,6 +767,29 @@ async fn run_server(args: Args) -> Result<()> {
                         )).await;
                         }
 
+                        // Owner-side live LiDAR relay: a trusted observer node opens
+                        // a bi-stream for `lidar:<robot_id>`; we subscribe to the
+                        // local StreamHub and pump canonical frames back. Registered
+                        // UNCONDITIONALLY (unlike the camera relay) because the LiDAR
+                        // pipeline (`services::lidar_push`/`lidar_hub`) is not behind
+                        // the `camera` feature — robots may carry LiDAR without a
+                        // camera. The closure captures this node's mesh id for the
+                        // owner-side org gate.
+                        let lidar_relay_node_id = mesh_mgr.node_id();
+                        mesh_mgr.set_lidar_stream_handler(std::sync::Arc::new(
+                            move |payload: Vec<u8>, tx: tokio::sync::mpsc::Sender<Vec<u8>>| {
+                                let local_node_id = lidar_relay_node_id.clone();
+                                Box::pin(async move {
+                                    tentaflow_core::services::lidar_relay::server::handle(
+                                        payload,
+                                        tx,
+                                        local_node_id,
+                                    )
+                                    .await;
+                                })
+                            },
+                        )).await;
+
                         if let Some(port_allocator) = services_port_allocator.clone() {
                             if let Some(executor) = mesh_mgr.command_executor().await {
                                 executor
