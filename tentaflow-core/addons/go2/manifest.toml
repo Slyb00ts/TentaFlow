@@ -31,7 +31,11 @@ sort_order = 60
 # answered promptly; telemetry/publish is throttled inside on_tick.
 [service]
 enabled = true
-tick_interval_ms = 200
+# 100ms = sweet spot for LiDAR: the Go2 firmware publishes the voxel map at only
+# ~6-7 Hz (measured), so a 100ms tick captures every frame; 50ms gave NO higher
+# rate (robot-capped) and just doubles idle-tick overhead. 200ms under-sampled
+# to ~5 Hz. Raw >7 Hz would need the DDS point cloud (root/EDU), not WebRTC.
+tick_interval_ms = 100
 # Default per-tick fuel (5M) is too low for the LiDAR voxel decode: a real Go2
 # frame is ~32k occupied points, and decoding the bitfield into the packed
 # canonical buffer on the tick exceeds 5M WASM instructions → "out of fuel" trap
