@@ -4,23 +4,26 @@
 # =============================================================================
 
 # Build-args sterowane przez Core (deploy.docker.arch_variants per arch GPU).
-# Defaulty = Blackwell/cu130 (sm_103/B300). Baza CUDA 13 devel zawiera ptxas z
-# CUDA 13 (sm_103a). Na Ampere/Ada Core nadpisuje CUDA_IMAGE/TORCH_INDEX na cu124
-# i ustawia SGL_KERNEL_BUILD_ARCH, bo prebuilt sgl-kernel (>=0.3.16) ma kernele
-# TYLKO dla sm90/sm100 — na sm80/86/89 trzeba przebudowac sgl-kernel ze zrodel.
+# Defaulty = Blackwell/cu130 (sm_103/B300): prebuilt sgl-kernel ma kernele sm90/sm100.
+# Ampere/Ada (sm80/86/89): prebuilt cu130 sgl-kernel NIE ma tych arch. Wg docs
+# sglang (docs.sglang.io/.../install) dla CUDA 12 instaluje sie torch cu129 +
+# sgl-kernel z WLASNEGO indeksu sglang (docs.sglang.ai/whl/cu129/), ktory pokrywa
+# sm75+ (czyli Ampere). Core nadpisuje wtedy CUDA_IMAGE/TORCH_INDEX na cu12 i
+# ustawia SGL_KERNEL_INDEX — bez kompilacji ze zrodel.
 ARG CUDA_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG SGLANG_VERSION=0.5.13
-# Pusty = uzyj prebuilt sgl-kernel (Hopper/Blackwell). Ustawiony (np. "8.0;8.6")
-# = przebuduj sgl-kernel ze zrodel pod te architektury (Ampere/Ada).
-ARG SGL_KERNEL_BUILD_ARCH=
+# Pusty = zostaw prebuilt sgl-kernel z sglang[all] (Hopper/Blackwell, cu130).
+# Ustawiony (np. https://docs.sglang.ai/whl/cu129/) = force-reinstall prebuilt
+# sgl-kernel z indeksu sglang pod CUDA 12 (Ampere/Ada, sm75+).
+ARG SGL_KERNEL_INDEX=
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
 ARG SGLANG_VERSION
-ARG SGL_KERNEL_BUILD_ARCH
+ARG SGL_KERNEL_INDEX
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv python3-dev git curl ca-certificates build-essential \
-      gcc g++ libnuma1 cmake ninja-build \
+      python3 python3-pip python3-venv python3-dev git curl ca-certificates \
+      gcc g++ libnuma1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/sglang-venv
@@ -33,16 +36,11 @@ RUN pip install --no-cache-dir \
       torch torchvision \
     && pip install --no-cache-dir "sglang[all]==${SGLANG_VERSION}"
 
-# Ampere/Ada: przebuduj DOKLADNIE te wersje sgl-kernel co pinuje sglang, ale ze
-# zrodel pod wskazana architekture (prebuilt nie ma sm80/86/89). Blackwell/Hopper
-# pomijaja ten krok (SGL_KERNEL_BUILD_ARCH puste) i zostaja na prebuilt.
-RUN if [ -n "${SGL_KERNEL_BUILD_ARCH}" ]; then \
-      KV=$(pip show sgl-kernel | awk '/^Version:/{print $2}') ; \
-      echo "[build] rebuilding sgl-kernel==$KV from source for arch ${SGL_KERNEL_BUILD_ARCH}" ; \
-      pip install --no-cache-dir setuptools wheel scikit-build-core ; \
-      TORCH_CUDA_ARCH_LIST="${SGL_KERNEL_BUILD_ARCH}" CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
-        pip install --no-cache-dir --no-binary sgl-kernel --no-build-isolation \
-          --force-reinstall --no-deps "sgl-kernel==$KV" ; \
+# Ampere/Ada: podmien sgl-kernel na prebuilt z indeksu sglang pod CUDA 12 (pokrywa
+# sm75+). Blackwell/Hopper: SGL_KERNEL_INDEX puste → zostaje cu130 sgl-kernel.
+RUN if [ -n "${SGL_KERNEL_INDEX}" ]; then \
+      echo "[build] reinstalling prebuilt sgl-kernel from ${SGL_KERNEL_INDEX} (Ampere/Ada sm75+)" ; \
+      pip install --no-cache-dir --force-reinstall --no-deps sgl-kernel --index-url "${SGL_KERNEL_INDEX}" ; \
     fi
 
 # Obejscie buga "ptxas fatal: sm_103a not defined": Triton dolaczony do torch ma stary ptxas.
