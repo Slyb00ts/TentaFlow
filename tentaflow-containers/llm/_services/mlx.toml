@@ -30,7 +30,7 @@ kind = "int"
 default = 0
 # min = 0 bo 0 to sentinel "natywny kontekst / bez capa" (zgodny z GenerateParams
 # i runtime guardem). Wizard wysyla 0 gdy budzet nie zostal skonfigurowany.
-range = { min = 0.0, max = 131072.0, step = 512.0 }
+range = { min = 0.0, max = 262144.0, step = 512.0 }
 bindings = [ { when = "native_embedded", type = "mlx_field", field = "max_context_tokens", request_override = false } ]
 
 [[parameter]]
