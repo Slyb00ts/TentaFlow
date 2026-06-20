@@ -86,6 +86,23 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
+        // Apple Vision OCR (`apple-ocr`) nie jest tract `LoadedEngine` ani
+        // camera-CV bundlem — to systemowy silnik bez modelu na dysku. Deploy
+        // rejestruje go jako globalny in-process OCR runner (set_ocr_runner),
+        // analogicznie do apple-tts ladowanego do shared_tts_manager. Brak
+        // libMLXBridge.dylib zglasza blad tutaj, zanim usluga bedzie RUNNING.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if engine_id == "apple-ocr" {
+            tokio::task::spawn_blocking(crate::vision::apple_ocr::register_as_ocr_runner)
+                .await
+                .map_err(|e| DeployError::Other(format!("apple-ocr register task: {e}")))?
+                .map_err(|e| DeployError::Other(format!("load embedded OCR 'apple-ocr': {e:#}")))?;
+            if let Some(s) = &self.log_sink {
+                s.info("[vision] apple-ocr registered as in-process OCR runner");
+            }
+            return Ok(());
+        }
+
         let kind = crate::vision::VisionEngineKind::from_id(&engine_id).ok_or_else(|| {
             DeployError::Manifest(format!(
                 "vision engine '{}' is not registered in runtime",
@@ -698,6 +715,10 @@ impl DeployStrategy for EmbeddedDeploy {
     async fn rollback(&self, _prepared: PreparedDeploy) -> DeployResult<()> {
         for key in &self.registered_vision_keys {
             crate::vision::unregister_engine(key);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.manifest.engine.id == "apple-ocr" {
+            crate::vision::apple_ocr::unregister_as_ocr_runner();
         }
         Ok(())
     }
