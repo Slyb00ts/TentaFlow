@@ -46,6 +46,13 @@ pub mod ocr_plate;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod apple_ocr;
 
+// PaddleOCR PP-OCRv5 (det -> cls -> rec) przez tract-onnx — embedded OCR runner
+// dla nie-Apple (Linux/Windows). Ten sam trait OcrRunner co apple-ocr; pure tract
+// (jak reszta vision), wiec kompiluje sie w domyslnym buildzie bez feature flag.
+// Na macOS/iOS OCR pokrywa apple_ocr (Vision), wiec tam modulu nie wlaczamy.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub mod onnx_ocr;
+
 pub mod hsemotion;
 pub mod movenet;
 pub mod scrfd;
