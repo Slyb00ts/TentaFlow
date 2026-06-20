@@ -1,6 +1,7 @@
 // ============ File: types.rs — service manifest TOML deserialisation types ============
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Full manifest for a single engine, including its deploy modes and model presets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,7 +399,7 @@ pub struct DeploySection {
 }
 
 /// `[deploy.docker]` section for Docker deployment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DockerDeploy {
     #[serde(default)]
     pub context_path: Option<String>,
@@ -425,6 +426,26 @@ pub struct DockerDeploy {
     /// just run without it).
     #[serde(default)]
     pub gpus: Option<String>,
+    /// Docker build-args wspolne dla kazdej architektury GPU. Sparametryzowany
+    /// Dockerfile czyta je przez `ARG` (np. `CUDA_IMAGE`, `TORCH_INDEX`,
+    /// `PKG_VERSION`, `TORCH_CUDA_ARCH_LIST`). Scalane z `arch_variants[arch]`
+    /// (arch wygrywa) przy buildzie.
+    #[serde(default)]
+    pub default_build_args: HashMap<String, String>,
+    /// Macierz build-args per arch-tag GPU (`cuda-ampere`/`-ada`/`-hopper`/
+    /// `-blackwell`/`-spark`/`rocm`...). `docker.rs` wybiera wpis pasujacy do
+    /// `GpuSnapshot::cuda_arch_tag()` hosta i scala go z `default_build_args`.
+    /// Tag obrazu dostaje sufiks arch, wiec obrazy roznych arch nie koliduja.
+    #[serde(default)]
+    pub arch_variants: HashMap<String, DockerArchVariant>,
+}
+
+/// Build-args specyficzne dla jednej architektury GPU (sekcja
+/// `[deploy.docker.arch_variants.<arch-tag>]` w manifescie).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DockerArchVariant {
+    #[serde(default)]
+    pub build_args: HashMap<String, String>,
 }
 
 /// Transport variant declared by `[deploy.docker].transport`. The build-time

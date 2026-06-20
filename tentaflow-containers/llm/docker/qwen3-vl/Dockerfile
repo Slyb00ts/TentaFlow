@@ -7,10 +7,24 @@
 # =============================================================================
 
 # --- vLLM z PyPI ---
-# CUDA 13.0 + cudnn runtime — vLLM 0.23.0 wymaga PyTorch 2.11 + cu130. Runtime
-# variant (nie devel) bo nie kompilujemy z source — wheels z PyPI maja prebuilt
-# extensions (vllm, xformers, flashinfer).
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
+# Build-args sterowane przez Core (deploy.docker per arch GPU); defaulty = cu130.
+# torch cu130 ma fat wheels (sm80..sm120), wiec ten sam obraz dziala na
+# Ampere/Ada/Hopper/Blackwell. Runtime variant (nie devel) bo nie kompilujemy ze
+# zrodel — wheels z PyPI maja prebuilt extensions (vllm, xformers, flashinfer).
+ARG CUDA_IMAGE=nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+ARG VLLM_INDEX=https://wheels.vllm.ai/nightly/cu130
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG VLLM_VERSION=0.23.0
+FROM ${CUDA_IMAGE}
+ARG TORCH_INDEX
+ARG VLLM_INDEX
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG VLLM_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev curl ca-certificates \
       gcc g++ \
@@ -20,15 +34,14 @@ RUN python3 -m venv /opt/vllm-venv
 ENV PATH="/opt/vllm-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
-# vLLM 0.23.0 + torch 2.11 z cu130 index. torch idzie z pytorch.org (PyPI ma
-# wariant CPU). vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny
-# wheel PyPI to cu129, dlatego bierzemy go z indeksu nightly cu130 vLLM.
+# vLLM + torch z indeksow CUDA wybranych przez build-args. torch idzie z
+# pytorch.org (PyPI ma wariant CPU); vLLM z wlasnego indeksu (cu130 dla B300).
 RUN pip install --no-cache-dir \
-      --extra-index-url https://download.pytorch.org/whl/cu130 \
-      torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+      --extra-index-url ${TORCH_INDEX} \
+      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
     && pip install --no-cache-dir \
-      --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
-      vllm==0.23.0
+      --extra-index-url ${VLLM_INDEX} \
+      vllm==${VLLM_VERSION}
 
 # hf CLI do pobierania zrodel safetensors z HF.
 # hf_transfer = szybsze rownolegle pobieranie.

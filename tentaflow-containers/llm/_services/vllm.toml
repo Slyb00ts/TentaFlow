@@ -25,6 +25,18 @@ context_path = "llm/docker/vllm"
 platforms = ["linux", "windows"]
 transport = "direct-http"
 
+# Hardware-aware build. torch cu130 ma fat wheels (sm80..sm120), wiec ten sam
+# obraz dziala na Ampere/Ada/Hopper/Blackwell — default_build_args wystarcza,
+# Core taguje obraz per arch (vllm:0.23.0-cuda-ampere itd.). Spark ma osobny
+# silnik (vllm-spark, build ze zrodel pod sm_121a).
+[deploy.docker.default_build_args]
+CUDA_IMAGE = "nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
+TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+TORCH_VERSION = "2.11.0"
+TORCHVISION_VERSION = "0.26.0"
+TORCHAUDIO_VERSION = "2.11.0"
+VLLM_VERSION = "0.23.0"
+
 [deploy.native]
 platforms = ["linux", "windows"]
 runtime = "python-bundle"

@@ -57,6 +57,7 @@ fn docker_deploy(context_path: &str, platforms: Vec<TargetOs>) -> DockerDeploy {
         download_size_mb: None,
         transport: Some(DockerTransport::SidecarQuic),
         gpus: None,
+        ..Default::default()
     }
 }
 
@@ -69,6 +70,7 @@ fn docker_compose_deploy(compose_path: &str, platforms: Vec<TargetOs>) -> Docker
         download_size_mb: None,
         transport: Some(DockerTransport::SidecarQuic),
         gpus: None,
+        ..Default::default()
     }
 }
 
@@ -338,6 +340,7 @@ fn validate_docker_without_context_or_compose_fails() {
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
                 gpus: None,
+                ..Default::default()
             }),
             native: None,
             external: None,
@@ -362,6 +365,7 @@ fn validate_docker_with_context_and_compose_fails() {
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
                 gpus: None,
+                ..Default::default()
             }),
             native: None,
             external: None,
@@ -388,6 +392,7 @@ fn validate_docker_without_transport_fails() {
                 download_size_mb: None,
                 transport: None,
                 gpus: None,
+                ..Default::default()
             }),
             native: None,
             external: None,

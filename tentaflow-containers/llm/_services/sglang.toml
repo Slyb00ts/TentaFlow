@@ -18,6 +18,22 @@ context_path = "llm/docker/sglang"
 platforms = ["linux", "windows"]
 transport = "direct-http"
 
+# Hardware-aware build. Default = Blackwell/Hopper (cu130 + prebuilt sgl-kernel,
+# ktory ma kernele sm90/sm100). torch cu130 dziala tez na Ampere/Ada (fat wheels),
+# ale prebuilt sgl-kernel (>=0.3.16) NIE ma sm80/86/89 — dlatego ampere/ada
+# przebudowuja sgl-kernel ze zrodel pod swoja arch (SGL_KERNEL_BUILD_ARCH). Core
+# taguje obraz per arch (sglang:0.5.13-cuda-ampere itd.).
+[deploy.docker.default_build_args]
+CUDA_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+SGLANG_VERSION = "0.5.13"
+
+[deploy.docker.arch_variants.cuda-ampere]
+build_args = { SGL_KERNEL_BUILD_ARCH = "8.0;8.6" }
+
+[deploy.docker.arch_variants.cuda-ada]
+build_args = { SGL_KERNEL_BUILD_ARCH = "8.9" }
+
 [deploy.native]
 platforms = ["linux", "windows"]
 runtime = "python-bundle"

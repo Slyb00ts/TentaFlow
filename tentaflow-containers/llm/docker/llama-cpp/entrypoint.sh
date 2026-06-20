@@ -7,6 +7,13 @@
 
 set -uo pipefail
 
+# Edytowalna komenda z wizarda (Override): gdy Core ustawi ENGINE_LAUNCH_CMD,
+# odpalamy ja verbatim zamiast budowanej nizej komendy.
+if [ -n "${ENGINE_LAUNCH_CMD:-}" ]; then
+  echo "[entrypoint] ENGINE_LAUNCH_CMD override"
+  exec sh -c "$ENGINE_LAUNCH_CMD"
+fi
+
 MODEL_PATH="${MODEL_PATH:-/data/models/model.gguf}"
 LLAMA_PORT="${PORT:-${LLAMA_PORT:-8080}}"
 

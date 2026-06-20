@@ -101,6 +101,11 @@ export async function openDeployWizard(engineId, opts = {}) {
     // 'api' = pay-per-token API key; 'subscription' = OAuth/ChatGPT-or-Google
     // subscription token (OpenAI Codex / Gemini Code Assist). Only OpenAI+Gemini.
     externalAuthMode: 'api',
+    // Finalna komenda startowa silnika (krok runtime). 'auto' = backend buduje
+    // ja per-dialekt z ustawien Advanced (readonly podglad); 'custom' = user
+    // edytuje caly tekst, ktory leci jako `launch_command_override` w config_json.
+    launchCommandMode: 'auto',
+    launchCommandText: '',
     // Subscription OAuth: set once the browser login completes on the node.
     oauthFlowId: null,
     oauthAccount: null,
@@ -719,6 +724,10 @@ async function fetchVllmRecommendation(overrides = {}) {
   // backend cicho spadalby na vLLM math i raportowal fałszywy budzet.
   if (isLlamaCppEngine()) body.engine = 'llama-cpp';
   else if (isMlxEngine()) body.engine = 'mlx';
+  else body.engine = engineId();
+  // Metoda deployu rozstrzyga baze komendy w podgladzie (`launch_command`):
+  // docker = `vllm serve`, native = `python -m vllm.entrypoints...`.
+  if (selection.deployMethod) body.deploy_method = selection.deployMethod;
   // llama.cpp/GGUF: repo nie ma config.json, wiec backend liczy VRAM z metadanych
   // wybranego pliku .gguf. Bez sciezki pliku backend nie ma czego odczytac.
   // Wysylamy pole tylko gdy plik jest wybrany — pusty string oznaczalby dla
@@ -1813,6 +1822,33 @@ function renderStepRuntime() {
     ${renderExternalCredsFields()}
     ${portField}
     ${extra}
+    ${renderLaunchCommandPanel()}
+  `;
+}
+
+// Podglad i edycja finalnej komendy startowej silnika. Backend (launch_dialect)
+// buduje ja per-dialekt z ustawien Advanced i zwraca jako `launch_command`.
+// 'auto' = readonly podglad; 'custom' = caly tekst edytowalny → leci verbatim
+// jako `launch_command_override` (ENGINE_LAUNCH_CMD). Tylko docker/native dla
+// silnikow LLM (komenda dostepna); cloud/external nie maja lokalnej komendy.
+function renderLaunchCommandPanel() {
+  if (selection.deployMethod !== 'docker' && selection.deployMethod !== 'native') return '';
+  const rec = advancedRecommendation;
+  const autoCmd = (rec && !rec.error && rec.launch_command) ? rec.launch_command : '';
+  const mode = selection.launchCommandMode || 'auto';
+  if (!autoCmd && mode !== 'custom') return '';
+  const value = mode === 'custom' ? (selection.launchCommandText || autoCmd) : autoCmd;
+  return `
+    <div class="form-group">
+      <label>Komenda startowa silnika</label>
+      <tf-segmented id="edw-launch-mode" value="${escapeAttr(mode)}" size="sm">
+        <option value="auto" variant="neutral">Auto</option>
+        <option value="custom" variant="accent">Własna</option>
+      </tf-segmented>
+      <tf-textarea id="edw-launch-cmd" rows="4" ${mode === 'auto' ? 'disabled' : ''}
+        value="${escapeAttr(value)}"></tf-textarea>
+      <span class="form-hint">Placeholdery <code>$MODEL</code>/<code>$PORT</code> rozwija powłoka przy starcie. W trybie „Własna" cała komenda leci verbatim.</span>
+    </div>
   `;
 }
 
@@ -2267,6 +2303,28 @@ function bindStepRuntimeInputs() {
     });
   }
   document.getElementById('edw-oauth-login')?.addEventListener('click', startOauthLogin);
+
+  // Komenda startowa: Auto/Własna + edytowalny tekst. Przelaczamy disabled
+  // i prefill bez pelnego re-renderu kroku (lokalna manipulacja DOM).
+  const launchSeg = document.getElementById('edw-launch-mode');
+  launchSeg?.addEventListener('change', (e) => {
+    const mode = e.detail?.value === 'custom' ? 'custom' : 'auto';
+    selection.launchCommandMode = mode;
+    const ta = document.getElementById('edw-launch-cmd');
+    const autoCmd = (advancedRecommendation && !advancedRecommendation.error
+      && advancedRecommendation.launch_command) || '';
+    if (mode === 'custom') {
+      if (!selection.launchCommandText) selection.launchCommandText = autoCmd;
+      if (ta) { ta.removeAttribute('disabled'); ta.value = selection.launchCommandText; }
+    } else if (ta) {
+      ta.setAttribute('disabled', '');
+      ta.value = autoCmd;
+    }
+  });
+  const launchTa = document.getElementById('edw-launch-cmd');
+  launchTa?.addEventListener('input', (e) => {
+    selection.launchCommandText = String(e.detail?.value ?? launchTa.value);
+  });
 }
 
 // Subscription browser-OAuth: ask the node to start a login, open the provider's
@@ -2590,6 +2648,14 @@ async function startDeploy() {
       ? selection.advanced.gpu_memory_utilization
       : null,
     vllm_args: vllmArgs,
+    // Edytowalna komenda startowa (tryb „Własna"): caly tekst leci verbatim do
+    // backendu jako ENGINE_LAUNCH_CMD (docker entrypoint / native spawn przez
+    // `sh -c`), z pominieciem budowanych argow. Auto → undefined (backend
+    // buduje komende sam z vllm_args/dialektu).
+    launch_command_override: (selection.launchCommandMode === 'custom'
+      && selection.launchCommandText && selection.launchCommandText.trim())
+      ? selection.launchCommandText.trim()
+      : undefined,
     // Engine env from the matched vLLM recipe (e.g. VLLM_USE_FLASHINFER_MOE_FP4
     // on Blackwell). Backend (`apply_engine_env`) injects these into the engine
     // process env on both native and docker paths. Empty/missing = nothing extra.

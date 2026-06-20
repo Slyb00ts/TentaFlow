@@ -34,13 +34,10 @@ context_path = "vision/docker/paddle-ocr"
 platforms = ["linux", "windows"]
 transport = "direct-http"
 
-[[model_preset]]
-id = "pp-ocrv5-server"
-display_name = "PP-OCRv5 (det server + rec mobile)"
-repo = "PaddlePaddle/PP-OCRv5_server_det"
-recommended = true
-
+# Tylko PaddleOCR-VL: server.py laduje model przez transformers. Klasyczne
+# PP-OCRv5 (paddlepaddle, nie transformers) NIE jest tu obslugiwane.
 [[model_preset]]
 id = "paddleocr-vl"
 display_name = "PaddleOCR-VL"
 repo = "PaddlePaddle/PaddleOCR-VL"
+recommended = true

@@ -91,6 +91,62 @@ pub enum GpuBackend {
     Cpu,
 }
 
+/// Mapuje compute capability NVIDIA (`"8.6"`, `"9.0"`, `"10.0"`...) na tag
+/// architektury uzywany do wyboru wariantu builda (docker `arch_variants` +
+/// native `install_variants`). Nieznane CC → ogolny `cuda`.
+fn cuda_arch_tag_from_cc(cc: &str) -> &'static str {
+    let major = cc.split('.').next().unwrap_or("");
+    match cc {
+        "9.0" => "cuda-hopper",
+        "8.9" => "cuda-ada",
+        "8.0" | "8.6" | "8.7" => "cuda-ampere",
+        "7.5" => "cuda-turing",
+        "7.0" | "7.2" => "cuda-volta",
+        _ => match major {
+            // sm_100 (B200/B300) i sm_120 (RTX 50xx, consumer Blackwell). Spark
+            // (sm_121, GB10) jest przechwytywany wczesniej przez `is_dgx_spark`.
+            "10" | "11" | "12" => "cuda-blackwell",
+            "9" => "cuda-hopper",
+            "8" => "cuda-ampere",
+            "7" => "cuda-turing",
+            _ => "cuda",
+        },
+    }
+}
+
+impl GpuSnapshot {
+    /// Tag architektury GPU do wyboru wariantu builda silnika. Dla CUDA zwraca
+    /// arch-specyficzny tag (`cuda-ampere`/`-ada`/`-hopper`/`-blackwell`/`-spark`)
+    /// liczony z compute capability karty o najwiekszym VRAM; dla pozostalych
+    /// backendow `rocm`/`metal`/`xpu`/`cpu`. To samo zrodlo prawdy dla docker
+    /// (`arch_variants`) i native (`install_variants`).
+    pub fn cuda_arch_tag(&self) -> String {
+        match self.preferred_backend {
+            GpuBackend::Rocm => "rocm".to_string(),
+            GpuBackend::Metal => "metal".to_string(),
+            GpuBackend::Xpu => "xpu".to_string(),
+            GpuBackend::Cpu => "cpu".to_string(),
+            GpuBackend::Cuda => {
+                // Spark (GB10, sm_121a) wymaga buildu ze zrodel — osobny tag,
+                // niezalezny od compute capability (PyPI cap sie na sm_120).
+                if self.is_dgx_spark {
+                    return "cuda-spark".to_string();
+                }
+                // Karta o najwiekszym VRAM rozstrzyga (jak preferred_backend).
+                let cc = self
+                    .nvidia
+                    .iter()
+                    .max_by_key(|g| g.vram_mb)
+                    .and_then(|g| g.compute_capability.as_deref());
+                match cc {
+                    Some(cc) => cuda_arch_tag_from_cc(cc).to_string(),
+                    None => "cuda".to_string(),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AmdGpu {
     pub index: u32,
@@ -689,6 +745,72 @@ fn engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap_with(cc: &str, vram_mb: u64) -> GpuSnapshot {
+        GpuSnapshot {
+            nvidia: vec![NvidiaGpu {
+                index: 0,
+                name: "test".into(),
+                vram_mb,
+                compute_capability: Some(cc.into()),
+                driver_version: None,
+                cuda_version: None,
+            }],
+            preferred_backend: GpuBackend::Cuda,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cuda_arch_tag_maps_compute_caps() {
+        assert_eq!(snap_with("8.6", 24576).cuda_arch_tag(), "cuda-ampere");
+        assert_eq!(snap_with("8.0", 81920).cuda_arch_tag(), "cuda-ampere");
+        assert_eq!(snap_with("8.9", 24576).cuda_arch_tag(), "cuda-ada");
+        assert_eq!(snap_with("9.0", 81920).cuda_arch_tag(), "cuda-hopper");
+        assert_eq!(snap_with("10.0", 196608).cuda_arch_tag(), "cuda-blackwell");
+        assert_eq!(snap_with("12.0", 32768).cuda_arch_tag(), "cuda-blackwell");
+        assert_eq!(snap_with("7.5", 8192).cuda_arch_tag(), "cuda-turing");
+    }
+
+    #[test]
+    fn cuda_arch_tag_picks_highest_vram_card() {
+        let mut s = snap_with("8.6", 24576);
+        s.nvidia.push(NvidiaGpu {
+            index: 1,
+            name: "big".into(),
+            vram_mb: 81920,
+            compute_capability: Some("9.0".into()),
+            driver_version: None,
+            cuda_version: None,
+        });
+        assert_eq!(s.cuda_arch_tag(), "cuda-hopper");
+    }
+
+    #[test]
+    fn cuda_arch_tag_spark_and_non_cuda() {
+        let mut spark = snap_with("12.1", 131072);
+        spark.is_dgx_spark = true;
+        assert_eq!(spark.cuda_arch_tag(), "cuda-spark");
+
+        let rocm = GpuSnapshot {
+            preferred_backend: GpuBackend::Rocm,
+            ..Default::default()
+        };
+        assert_eq!(rocm.cuda_arch_tag(), "rocm");
+
+        let cpu = GpuSnapshot::default();
+        assert_eq!(cpu.cuda_arch_tag(), "cpu");
+    }
+
+    #[test]
+    fn cuda_arch_tag_unknown_cc_falls_back_to_cuda() {
+        let s = GpuSnapshot {
+            nvidia: vec![],
+            preferred_backend: GpuBackend::Cuda,
+            ..Default::default()
+        };
+        assert_eq!(s.cuda_arch_tag(), "cuda");
+    }
 
     #[test]
     fn collect_runs_without_panic() {
