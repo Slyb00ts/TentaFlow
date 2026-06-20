@@ -15,14 +15,25 @@ WORKDIR /build/whisper.cpp
 # Jawna lista architektur GPU - GGML nie ma sm_103 w domyslnej liscie.
 # 103-real = B300, 100-real = B200; pozostale (Turing/Ampere/Ada/Hopper/Blackwell
 # consumer) dla kompatybilnosci wstecz z innymi GPU.
+# libggml-cuda uzywa CUDA Driver API (VMM: cuMemMap/cuDeviceGetAttribute), wiec
+# link MUSI dociagnac stub `libcuda` z lib64/stubs (w obrazie -devel). Bez tego
+# `undefined reference to cuMemMap...` przy linkowaniu whisper-server. W runtime
+# realny libcuda dostarcza NVIDIA Container Toolkit. LIBRARY_PATH = stubs dla ld.
+ENV LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}"
+# BUILD_SHARED_LIBS=OFF: whisper-server linkowany statycznie z whisper/ggml, bo
+# finalny obraz kopiuje TYLKO binarke (bez libwhisper.so/libggml*.so). libcuda
+# zostaje dynamiczny (dostarcza go NVIDIA Container Toolkit w runtime).
 RUN cmake -B build -DGGML_CUDA=ON -DWHISPER_SERVER=ON -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real" \
+      -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
     && cmake --build build --target whisper-server -j"$(nproc)" \
     && strip build/bin/whisper-server
 
 FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04
+# libgomp1: whisper-server (statyczny) dynamicznie linkuje OpenMP (libgomp.so.1).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl \
+      ca-certificates curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=whisper-builder /build/whisper.cpp/build/bin/whisper-server /usr/local/bin/whisper-server
 COPY tentaflow-containers/stt/docker/whisper/entrypoint.sh /app/entrypoint.sh
