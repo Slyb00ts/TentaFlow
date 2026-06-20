@@ -2118,24 +2118,6 @@ pub struct RobotCameraShareResponse {
     pub note: Option<String>,
 }
 
-/// On-demand pull of the latest canonical LiDAR frame for a robot (L2). The
-/// client polls cheaply: it passes the `frame_seq` it last rendered as
-/// `since_seq`; Core returns the bytes only if the hub holds something newer,
-/// else `frame: None` (nothing to do). Latest-wins, no per-frame queue.
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct RobotLidarFrameRequest {
-    pub robot_id: String,
-    pub since_seq: u32,
-}
-
-/// Response carrying the canonical L1 frame bytes (`LidarFrameHeader` + packed
-/// f32) when the hub has a frame newer than the request's `since_seq`; `None`
-/// when there is nothing newer (the client keeps its current cloud and polls).
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct RobotLidarFrameResponse {
-    pub frame: Option<Vec<u8>>,
-}
-
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum RobotsPayload {
     ListRequest(RobotsListRequest),
@@ -2144,8 +2126,6 @@ pub enum RobotsPayload {
     ControlResponse(RobotControlResponse),
     CameraShareRequest(RobotCameraShareRequest),
     CameraShareResponse(RobotCameraShareResponse),
-    LidarFrameRequest(RobotLidarFrameRequest),
-    LidarFrameResponse(RobotLidarFrameResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

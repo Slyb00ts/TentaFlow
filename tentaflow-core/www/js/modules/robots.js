@@ -17,6 +17,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { decodeLidarFrame } from '/js/protocol/codec.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-badge.js';
@@ -33,23 +34,30 @@ import '/js/components/tf-video-stream.js';
 // and online/offline transitions appear without a manual reload.
 const REFRESH_INTERVAL_MS = 4000;
 
-// Fast on-demand LiDAR pull. The hub publishes the canonical frame at ~5 fps, so
-// a 150 ms poll is cheap: most calls return hasFrame:false (latest-wins, no
-// per-frame queue) and only a changed frame_seq carries bytes back. This is the
-// live data-path consumer that proves L1→L2 end to end (no 3D render here).
-const LIDAR_POLL_INTERVAL_MS = 150;
-
+// Real-time LiDAR PUSH: each robot's canonical frame stream is subscribed via the
+// generic StreamHub rails (`streamId = "lidar:<robotId>"`), the SAME path camera
+// video uses. The server pushes every canonical L1 frame as a StreamFrame whose
+// `data` is the raw frame bytes; we decode it with the sdk-spec header decoder.
+// This is the live data-path consumer that proves L1→L3a end to end (no 3D render
+// here — raw/points are stashed for L4).
+//
 // Sliding window for the measured frame rate. Wide enough to smooth the ~5 fps
 // arrival jitter, short enough to react quickly when streaming stops.
 const LIDAR_FPS_WINDOW_MS = 2000;
 
 // A frame older than this reads as "stale" — at 5 fps a healthy stream lands a
-// new frame every ~200 ms, so 1.5 s without one means the source went quiet.
+// new frame every ~200 ms, so 1.5 s without one means the source went quiet. A
+// periodic staleness sweep flips the badge even when frames simply stop arriving.
 const LIDAR_STALE_AFTER_MS = 1500;
 
-// Back-off after a transport error so a flapping connection isn't hammered every
-// 150 ms; the next attempt waits at least this long.
-const LIDAR_ERROR_BACKOFF_MS = 2000;
+// Cadence of the freshness sweep that re-renders each active card so the badge
+// can flip to "nieaktualne" when frames stop (no push would otherwise re-render).
+const LIDAR_STALE_SWEEP_MS = 500;
+
+// After the server ends a lidar stream because the subscriber lagged, wait this
+// long before a single re-subscribe so the UI doesn't flap. We do NOT spin: only
+// a `subscriber_lagged` end triggers one retry; any other end leaves it stale.
+const LIDAR_RESUBSCRIBE_DELAY_MS = 1000;
 
 // Locomotion magnitude (m/s) for the directional pad, matching the go2 driver's
 // own move buttons. The owner re-clamps to its safety cap regardless.
@@ -108,12 +116,16 @@ let cardEls = new Map();
 // Per-robot live LiDAR state, keyed by robotId. An entry exists ONLY while that
 // robot's LiDAR row is on screen AND enabled AND the robot is online — it's added
 // by updateLidar() and removed the moment any of those stops holding (toggle off,
-// card gone, robot offline) so no interval keeps polling a dead source.
-// Shape: { lastSeq, frameTimes:number[], lastPointCount, lastFrameAtMs,
-//          inFlight, nextAllowedAtMs }.
+// card gone, robot offline) so no subscription stays open on a dead source. Each
+// start has a matching close; teardown closes all (no leaked subscriptions).
+// Shape: { unsub:fn|null, closed:bool, resubTimer:number|null,
+//          frameTimes:number[], lastPointCount, lastFrameAtMs,
+//          lastRaw:Uint8Array|null, lastPoints:Float32Array|null }.
 let lidarLive = new Map();
-// Single shared fast timer driving every active robot's pull. Started lazily when
-// the first robot becomes active, stopped when the set empties or on unmount.
+// Single shared slow timer that re-renders every active card so the freshness
+// badge flips to "nieaktualne" when frames stop arriving. NOT a poll — it carries
+// no network traffic. Started lazily when the first robot subscribes, stopped when
+// the set empties or on unmount.
 let lidarTimer = null;
 
 const RobotsScreen = {
@@ -275,7 +287,7 @@ function renderError(list, err) {
   if (!list) return;
   // The error empty-state replaces the grid contents; drop stale card refs so a
   // later successful poll rebuilds every card from scratch. No cards remain on
-  // screen, so no robot can be an active LiDAR source — stop the fast loop.
+  // screen, so no robot can be an active LiDAR source — close every subscription.
   cardEls = new Map();
   stopLidarLoop();
   list.innerHTML = '';
@@ -301,7 +313,7 @@ function renderList() {
   if (!robots.length) {
     host.innerHTML = '';
     cardEls = new Map();
-    // No robots on screen → no LiDAR sources; stop the fast loop.
+    // No robots on screen → no LiDAR sources; close every subscription.
     stopLidarLoop();
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'cpu');
@@ -788,16 +800,17 @@ function updateTelemetry(el, r) {
 
 // Renders the LiDAR row IN PLACE inside [data-field="lidar"]: an enable/disable
 // toggle (routed to go2.lidar_on/off via the standard control path) plus a LIVE
-// status (point count, measured FPS, freshness) fed by the fast binary pull loop.
+// status (point count, measured FPS, freshness) fed by the real-time PUSH stream.
 // NO 3D canvas/renderer here — this is the data-path surface only. The container
 // sits below the telemetry panel and is never the video node, so the live
 // <tf-video-stream> is untouched. The toggle + status nodes are built once and
 // then updated in place each poll so a click handler is never lost.
 //
-// This also OWNS the live-loop lifecycle: a robot is registered for fast polling
-// only while its row is visible AND LiDAR is enabled AND the robot is online; any
-// of those dropping unregisters it (and stops the shared timer when none remain),
-// so no interval ever polls a disabled / gone / offline source.
+// This also OWNS the subscription lifecycle: a robot is subscribed to its PUSH
+// stream only while its row is visible AND LiDAR is enabled AND the robot is
+// online; any of those dropping closes the subscription (and stops the shared
+// staleness sweep when none remain), so no stream stays open on a disabled / gone
+// / offline source.
 function updateLidar(el, r) {
   const host = el.querySelector('[data-field="lidar"]');
   if (!host) return;
@@ -845,8 +858,8 @@ function updateLidar(el, r) {
     else toggle.removeAttribute('disabled');
   }
 
-  // Register / unregister the fast live pull. We only pull when the source can
-  // actually produce frames; otherwise the static status text (below) is enough.
+  // Open / close the real-time PUSH subscription. We only subscribe when the
+  // source can actually produce frames; otherwise the static text (below) suffices.
   if (enabled && !offline) {
     startRobotLidar(id);
   } else {
@@ -858,9 +871,9 @@ function updateLidar(el, r) {
   renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution });
 }
 
-// Writes the LiDAR status text + freshness badge. Called from updateLidar() (poll
-// cadence) and from the fast loop (per live frame) so the live numbers refresh at
-// frame rate, not only every 4 s.
+// Writes the LiDAR status text + freshness badge. Called from updateLidar() (4 s
+// list cadence) and from the PUSH handler (per live frame) so the live numbers
+// refresh at frame rate, not only every 4 s.
 function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution }) {
   const status = host.querySelector('[data-lidar-status]');
   const fresh = host.querySelector('[data-lidar-fresh]');
@@ -932,31 +945,165 @@ function computeLidarFps(live) {
   return ((times.length - 1) * 1000) / spanMs;
 }
 
-// Registers a robot for fast live polling (idempotent) and ensures the shared
-// timer is running. Does NOT reset an existing entry, so an in-progress FPS window
-// survives a 4 s list refresh.
+// Opens the real-time PUSH subscription for a robot (idempotent) and ensures the
+// shared staleness sweep is running. Does NOT reset an existing entry, so an
+// in-progress FPS window survives a 4 s list refresh. The subscription uses the
+// generic StreamHub rails (the SAME call shape tf-video-stream uses); every frame
+// arrives as a StreamFrame whose `data` is the raw canonical L1 bytes.
 function startRobotLidar(id) {
   if (!id) return;
-  if (!lidarLive.has(id)) {
-    lidarLive.set(id, {
-      lastSeq: 0,
-      frameTimes: [],
-      lastPointCount: 0,
-      lastFrameAtMs: 0,
-      inFlight: false,
-      nextAllowedAtMs: 0,
-    });
-  }
+  if (lidarLive.has(id)) return;
+  const live = {
+    unsub: null,
+    closed: false,
+    resubTimer: null,
+    // One re-subscribe per live session. A fresh start (this object) resets it;
+    // once consumed we never re-arm, so sustained lag can't spin a 1 s retry loop.
+    resubUsed: false,
+    frameTimes: [],
+    lastPointCount: 0,
+    lastFrameAtMs: 0,
+    lastRaw: null,
+    lastPoints: null,
+  };
+  lidarLive.set(id, live);
   if (lidarTimer == null) {
-    lidarTimer = window.setInterval(pollLidarOnce, LIDAR_POLL_INTERVAL_MS);
+    lidarTimer = window.setInterval(sweepLidarStaleness, LIDAR_STALE_SWEEP_MS);
   }
+  openLidarSubscription(id, live);
 }
 
-// Unregisters a robot from live polling and stops the shared timer once no robot
-// remains active. Called on toggle-off, robot offline, card removal and unmount.
+// Subscribes to `lidar:<id>` and wires the per-frame / end / error handlers.
+// Mirrors tf-video-stream's deferred-unsub guard: if the robot is torn down while
+// ApiBinary.subscribe is still resolving, the late-resolved unsub is fired at once
+// so no subscription leaks.
+function openLidarSubscription(id, live) {
+  const pending = { disposed: false };
+  live.unsub = () => {
+    pending.disposed = true;
+  };
+  ApiBinary.subscribe(
+    'streamSubscribeRequest',
+    { streamId: `lidar:${id}` },
+    {
+      onChunk: (body) => onLidarChunk(id, live, body),
+      onEnd: (body) => onLidarEnd(id, live, body),
+      onError: (err) => onLidarError(id, live, err),
+    },
+  )
+    .then((unsub) => {
+      if (pending.disposed || !lidarLive.has(id) || lidarLive.get(id) !== live) {
+        try { unsub(); } catch { /* ignore */ }
+        return;
+      }
+      live.unsub = () => {
+        try { unsub(); } catch (e) { console.warn('[robots] lidar unsub threw:', e); }
+      };
+    })
+    .catch((err) => {
+      console.warn('[robots] lidar subscribe failed:', err?.message ?? err);
+    });
+}
+
+// A pushed frame: decode the RAW canonical bytes via the sdk-spec header decoder.
+// hasFrame:false (malformed/short) is ignored. On a real frame we update the live
+// point count, the FPS sliding window and the freshness timestamp, stash raw/points
+// for L4 (not rendered here), then re-render just this card.
+function onLidarChunk(id, live, body) {
+  if (!body || typeof body !== 'object') return;
+  // The StreamHub also pushes a StreamSubscribeResponse handshake (mime_type);
+  // only StreamFrame carries point-cloud bytes.
+  if (body.variant !== 'StreamFrame') return;
+  const data = body.data;
+  if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
+  // The current live entry may have been torn down/replaced while this chunk was
+  // in flight — drop it rather than resurrect a dead source.
+  if (lidarLive.get(id) !== live) return;
+  let f;
+  try {
+    f = decodeLidarFrame(data);
+  } catch (e) {
+    console.warn('[robots] lidar decode failed:', e?.message ?? e);
+    return;
+  }
+  if (!f || !(f.hasFrame ?? f.has_frame)) return;
+  live.lastPointCount = Number(f.pointCount ?? f.point_count ?? 0);
+  live.lastFrameAtMs = performance.now();
+  live.frameTimes.push(live.lastFrameAtMs);
+  // Bound the window buffer so a long-lived stream can't grow it unbounded.
+  const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
+  while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
+  // Stash the raw frame + packed points for the L4 wgpu renderer (not drawn yet).
+  live.lastRaw = f.raw ?? null;
+  live.lastPoints = f.points ?? null;
+  refreshLidarCard(id);
+}
+
+// Stream ended. A `subscriber_lagged` end means the server dropped us because we
+// fell behind — re-subscribe ONCE per live session after a short backoff (mirrors
+// tf-video-stream). Under sustained lag the server keeps ending the (re)stream;
+// `resubUsed` makes the retry genuinely one-shot so we don't schedule a new 1 s
+// resubscribe on every lagged end forever. After the single retry is spent the
+// badge just goes stale until the user re-enables (a fresh session resets the
+// flag). Any other end (source unregistered, our own close) leaves it stale too.
+function onLidarEnd(id, live, body) {
+  if (lidarLive.get(id) !== live) return;
+  const reason = String(body?.reason ?? '');
+  // Our own close already dropped the entry; nothing to do.
+  if (reason === 'client_request') return;
+  if (reason === 'subscriber_lagged') {
+    if (live.resubTimer != null) return;
+    if (live.resubUsed) return;
+    live.resubUsed = true;
+    live.resubTimer = window.setTimeout(() => {
+      live.resubTimer = null;
+      if (lidarLive.get(id) !== live) return;
+      openLidarSubscription(id, live);
+    }, LIDAR_RESUBSCRIBE_DELAY_MS);
+    return;
+  }
+  // Source unregistered / unknown end: stop pumping, let freshness go stale.
+  live.unsub = null;
+}
+
+function onLidarError(id, live, err) {
+  if (lidarLive.get(id) !== live) return;
+  console.warn('[robots] lidar stream error:', err?.message ?? err);
+  // Leave the badge to go stale; the user can re-enable. No aggressive retry.
+}
+
+// Closes a robot's PUSH subscription, drops its live state and stops the shared
+// staleness sweep once no robot remains active. Called on toggle-off, robot
+// offline, card removal, panel close and unmount — every start has a matching
+// close here, so no subscription is ever leaked.
 function stopRobotLidar(id) {
-  if (id) lidarLive.delete(id);
+  if (id) {
+    const live = lidarLive.get(id);
+    if (live) {
+      closeLidarSubscription(id, live);
+      lidarLive.delete(id);
+    }
+  }
   if (lidarLive.size === 0) stopLidarLoop();
+}
+
+// Tears down a single live entry: cancels a pending re-subscribe and fires the
+// subscription handle. That handle (from ApiBinary.subscribe) drops the local
+// listener AND emits a StreamCloseRequest on the ORIGINAL subscribe correlation
+// id, which is the only id the server's close handler can cancel by — so this is
+// what actually frees the server-side slot + frame pump. The handle is set even
+// while ApiBinary.subscribe is still resolving (it flips `pending.disposed`), so
+// a teardown that races an in-flight subscribe still closes once it resolves.
+function closeLidarSubscription(id, live) {
+  live.closed = true;
+  if (live.resubTimer != null) {
+    window.clearTimeout(live.resubTimer);
+    live.resubTimer = null;
+  }
+  if (live.unsub) {
+    try { live.unsub(); } catch { /* ignore */ }
+    live.unsub = null;
+  }
 }
 
 function stopLidarLoop() {
@@ -964,57 +1111,24 @@ function stopLidarLoop() {
     window.clearInterval(lidarTimer);
     lidarTimer = null;
   }
+  // Close every still-open subscription before clearing, so unmount/error paths
+  // that call stopLidarLoop directly never leak a stream.
+  for (const [id, live] of lidarLive) closeLidarSubscription(id, live);
   lidarLive.clear();
 }
 
-// One tick of the shared fast loop: for every active robot, pull the latest frame
-// since the last seq we saw. hasFrame:false is the common (cheap) return and must
-// not throw or churn; a transport error backs that robot off so a flapping link
-// isn't hammered. Each robot's request is independent — one failing doesn't stall
-// the others, and the slow 4 s list refresh is never blocked.
-function pollLidarOnce() {
-  const now = performance.now();
+// One tick of the shared staleness sweep: re-render every active card so the
+// freshness badge flips to "nieaktualne" even when frames simply STOP arriving (no
+// push would otherwise re-render). Carries no network traffic.
+function sweepLidarStaleness() {
   for (const [id, live] of lidarLive) {
-    // Refresh the badge every tick so the freshness indicator flips to "stale"
-    // even when frames STOP arriving (no pull success would otherwise re-render).
     if (live.lastFrameAtMs) refreshLidarCard(id);
-    if (live.inFlight || now < live.nextAllowedAtMs) continue;
-    live.inFlight = true;
-    pullLidarFrame(id, live);
-  }
-}
-
-async function pullLidarFrame(id, live) {
-  try {
-    const resp = await ApiBinary.one('robotLidarFrameRequest', { robotId: id, sinceSeq: live.lastSeq });
-    // The robot may have been unregistered (toggle off / offline / card gone)
-    // while this request was in flight — drop the result rather than resurrect it.
-    if (!lidarLive.has(id)) return;
-    const hasFrame = resp.hasFrame ?? resp.has_frame;
-    if (hasFrame) {
-      const seq = resp.frameSeq ?? resp.frame_seq ?? live.lastSeq;
-      const points = Number(resp.pointCount ?? resp.point_count ?? 0);
-      live.lastSeq = Number(seq) >>> 0;
-      live.lastPointCount = points;
-      live.lastFrameAtMs = performance.now();
-      live.frameTimes.push(live.lastFrameAtMs);
-      // Bound the window buffer so a long-lived stream can't grow it unbounded.
-      const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
-      while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
-      refreshLidarCard(id);
-    }
-  } catch {
-    // Transport / decode failure: don't spam, just back this robot off. The list
-    // refresh keeps the toggle/offline state authoritative regardless.
-    if (lidarLive.has(id)) live.nextAllowedAtMs = performance.now() + LIDAR_ERROR_BACKOFF_MS;
-  } finally {
-    if (lidarLive.has(id)) live.inFlight = false;
   }
 }
 
 // Re-renders just one robot's LiDAR status from its current live state, without a
-// full list refresh — driven by the fast loop on each new frame and by a periodic
-// staleness sweep so the freshness badge flips even when frames stop arriving.
+// full list refresh — driven by the PUSH handler on each new frame and by a
+// periodic staleness sweep so the freshness badge flips even when frames stop.
 function refreshLidarCard(id) {
   const el = cardEls.get(id);
   if (!el) return;
@@ -1044,9 +1158,9 @@ async function handleLidarToggle(id, on, toggle) {
       vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
     });
     if (resp.ok) {
-      // React to the action RESULT immediately so the live loop reflects the new
-      // state without waiting for (or depending on) the 4 s list refresh: stop
-      // polling a now-disabled source at once; start polling only AFTER a
+      // React to the action RESULT immediately so the live state reflects the new
+      // setting without waiting for (or depending on) the 4 s list refresh: close
+      // the subscription on a now-disabled source at once; open one only AFTER a
       // confirmed enable. Also patch the local snapshot row so the toggle/status
       // stay consistent until the next authoritative refresh.
       const r = robots.find((x) => robotId(x) === id);

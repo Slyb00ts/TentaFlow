@@ -233,6 +233,21 @@ export function decodeEnvelope(bytes) {
 }
 
 /**
+ * Decode the RAW canonical LiDAR frame bytes pushed in a `StreamFrame.data`
+ * (L3a real-time PUSH stream `streamId = "lidar:<robot_id>"`) into the JS frame
+ * projection. Reuses the sdk-spec header layout via `lidar_frame_to_js`; a
+ * malformed/short frame returns `{hasFrame: false}` (no panic).
+ * @param {Uint8Array} bytes
+ * @returns {any}
+ */
+export function decodeLidarFrame(bytes) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeLidarFrame(ptr0, len0);
+    return ret;
+}
+
+/**
  * Dekoduje CBOR-zakodowany MessageBody na JS object.
  * Dla znanych variantow zwraca obiekt z polem `variant`, a dla nieznanego
  * variantu `{ variant: "Unknown" }`.
@@ -4800,27 +4815,6 @@ export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw, p1, p2, 
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
-}
-
-/**
- * MessageBody::RobotsBody(LidarFrameRequest) — on-demand pull of the latest
- * canonical LiDAR frame for a robot (L2). The client passes the `frame_seq` it
- * last rendered as `since_seq`; Core replies with bytes only when the hub holds
- * something newer (latest-wins poll, no per-frame queue).
- * @param {string} robot_id
- * @param {number} since_seq
- * @returns {Uint8Array}
- */
-export function encodeRobotLidarFrameRequest(robot_id, since_seq) {
-    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeRobotLidarFrameRequest(ptr0, len0, since_seq);
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v2;
 }
 
 /**

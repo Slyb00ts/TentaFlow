@@ -32,9 +32,9 @@ const CAMERA_PREFIX: &str = "camera:";
 const PERM_CAMERA_READ: &str = "camera.read";
 /// Stream-id prefix for a robot's pushed LiDAR point cloud (`lidar:<robot_id>`).
 const LIDAR_PREFIX: &str = "lidar:";
-/// Permission required for `lidar:` stream ids. Reuses the SAME read grant the L2
-/// fetch path (`RobotLidarFrameRequest`) and `RobotAction::LidarFrame` require, so
-/// push + fetch share one gate — there is no separate `lidar.read`.
+/// Permission required for `lidar:` stream ids. Reuses the SAME read grant the
+/// `RobotAction::LidarFrame` capability requires, so the pushed point cloud is
+/// gated exactly like the small lidar status — there is no separate `lidar.read`.
 const PERM_ROBOT_TELEMETRY: &str = "robot.telemetry";
 
 /// Hard ceiling on concurrent stream subscriptions per authenticated user.
@@ -428,7 +428,7 @@ fn register_local_lidar_source(robot_id: &str) -> String {
 }
 
 /// Authorize a `lidar:<robot_id>` subscribe and resolve the StreamHub key.
-/// Mirrors `robots_lidar_frame`: requires org + `robot.telemetry`, resolves the
+/// Requires org + `robot.telemetry`, resolves the
 /// robot in the CALLER'S org via the mesh registry (org scoping at the
 /// consumption layer), and masks unknown-in-org as NotFound so existence in
 /// another tenant is never leaked. A LOCAL robot lazily registers a push source;
