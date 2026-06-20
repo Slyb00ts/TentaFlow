@@ -560,6 +560,9 @@ async fn run_server(args: Args) -> Result<()> {
         let sched = tentaflow_core::flow_runtime::scheduler::FlowScheduler::global();
         sched.set_service_manager(router.service_manager().clone());
         sched.set_event_bus(addon_manager.event_bus().clone());
+        if let Some(executor) = router.executor() {
+            sched.set_executor(executor);
+        }
     }
     tentaflow_core::addon::event_publish::init_global(addon_manager.event_bus().clone());
 
