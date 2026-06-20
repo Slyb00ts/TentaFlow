@@ -427,6 +427,8 @@ impl DeployStrategy for PythonBundleDeploy {
                 // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
                 // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
                 format!("http://127.0.0.1:{}/healthz", port),
+                // ComfyUI nie ma /health ani /v1/models — gotowosc po /system_stats.
+                format!("http://127.0.0.1:{}/system_stats", port),
             ],
             status_report_interval: Duration::from_secs(30),
             log_sink: self.log_sink.clone(),

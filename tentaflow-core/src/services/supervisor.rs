@@ -1396,7 +1396,7 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
                 // Fallback: /v1/models nieobecne — probuj /health, potem /healthz
                 // (konwencja k8s, np. SearXNG / kokoro wystawiaja /healthz).
                 let mut last = HealthStatus::Degraded(format!("http {}", status));
-                for path in ["/health", "/healthz"] {
+                for path in ["/health", "/healthz", "/system_stats"] {
                     match client.get(&format!("{}{}", trimmed, path)).send().await {
                         Ok(r2) if r2.status().is_success() => return HealthStatus::Ok,
                         Ok(r2) => last = HealthStatus::Degraded(format!("http {}", r2.status())),
