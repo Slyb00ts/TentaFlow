@@ -1150,6 +1150,8 @@ impl DeployStrategy for DockerDeploy {
                 // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
                 // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
                 format!("http://127.0.0.1:{}/healthz", host_http),
+                // ComfyUI nie ma /health ani /v1/models — gotowosc po /system_stats.
+                format!("http://127.0.0.1:{}/system_stats", host_http),
             ],
             status_report_interval: std::time::Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
