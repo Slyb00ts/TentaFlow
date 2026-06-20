@@ -59,6 +59,14 @@ use permissions::PermissionChecker;
 /// 0.5–2 sek scisle limitu CPU per wywolanie — wciaz tanio dla DoS-guard.
 const DEFAULT_FUEL_LIMIT: u64 = 200_000_000;
 
+/// Domyslny budzet paliwa na pojedynczy service-tick (gdy manifest nie ustawia
+/// `tick_fuel_budget`). 50M — fuel to NIE jest glowny anti-hang (tym jest
+/// `tick_timeout_ms` przez epoch watchdog); fuel-out tylko przerywa biezacy tick
+/// i refueluje nastepny. Realna praca per-tick (np. dekodowanie ~32k punktow
+/// LiDAR, parsowanie, krypto) latwo przekracza dawne 5M i trapowala CICHO (bez
+/// panic-hooka). 50M to ~kilka ms — wciaz mocno ograniczone dla 200ms ticka.
+const DEFAULT_TICK_FUEL_BUDGET: u64 = 50_000_000;
+
 /// Domyslny limit pamieci WASM w bajtach (256 MB)
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -296,8 +304,12 @@ pub struct AddonServiceSection {
     /// instance daje wlasciwosc trzymania stanu miedzy eventami).
     #[serde(default)]
     pub tick_interval_ms: Option<u64>,
-    /// Budzet paliwa na pojedynczy tick. Default 5M instrukcji — wystarczy
-    /// na typowy poll/aggregation, blokuje runaway loop w guest.
+    /// Budzet paliwa na pojedynczy tick. `None` = `DEFAULT_TICK_FUEL_BUDGET`.
+    /// Fuel to NIE jest glowny anti-hang (tym jest `tick_timeout_ms` przez
+    /// epoch watchdog) — fuel-out tylko przerywa BIEZACY tick i refueluje
+    /// nastepny, wiec moze byc hojny. Domyslnie 50M, bo realna praca per-tick
+    /// (dekodowanie danych/parsowanie/krypto) latwo przekracza kilka M, a
+    /// fuel-out trapuje BEZ panic-hooka (cichy, mylacy crash).
     #[serde(default)]
     pub tick_fuel_budget: Option<u64>,
     /// Hard deadline na pojedynczy tick w ms. Watchdog thread po wygasnieciu
@@ -1813,7 +1825,7 @@ impl AddonManager {
                 if service.enabled {
                     if let Some(interval_ms) = service.tick_interval_ms {
                         if interval_ms > 0 {
-                            let fuel = service.tick_fuel_budget.unwrap_or(5_000_000);
+                            let fuel = service.tick_fuel_budget.unwrap_or(DEFAULT_TICK_FUEL_BUDGET);
                             let timeout_ms = service.tick_timeout_ms;
                             self.spawn_service_tick_loop(
                                 addon_id.to_string(),
