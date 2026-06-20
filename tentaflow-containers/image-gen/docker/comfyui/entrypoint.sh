@@ -8,7 +8,10 @@
 
 set -uo pipefail
 
-PORT="${COMFY_PORT:-8188}"
+# Core wstrzykuje PORT = wewnetrzny port kontenera, na ktory mapuje host-port.
+# ComfyUI MUSI bindowac wlasnie ten port (nie domyslne 8188), inaczej host-mapping
+# trafia w pustke i readiness/health probe sie nie laczy.
+PORT="${PORT:-${COMFY_PORT:-8188}}"
 cd /opt/ComfyUI
 
 echo "[entrypoint] start comfy na 0.0.0.0:$PORT"
