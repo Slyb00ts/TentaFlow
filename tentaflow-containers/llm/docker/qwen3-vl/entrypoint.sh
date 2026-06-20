@@ -10,6 +10,13 @@
 
 set -uo pipefail
 
+# Edytowalna komenda z wizarda (Override): gdy Core ustawi ENGINE_LAUNCH_CMD,
+# odpalamy ja verbatim zamiast budowanej nizej komendy.
+if [ -n "${ENGINE_LAUNCH_CMD:-}" ]; then
+  echo "[entrypoint] ENGINE_LAUNCH_CMD override"
+  exec sh -c "$ENGINE_LAUNCH_CMD"
+fi
+
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen3-VL-30B-A3B-Instruct'}"
 VLLM_PORT="${PORT:-${VLLM_PORT:-8000}}"
 

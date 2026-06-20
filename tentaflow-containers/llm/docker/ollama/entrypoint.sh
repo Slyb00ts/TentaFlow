@@ -8,6 +8,13 @@
 
 set -uo pipefail
 
+# Edytowalna komenda z wizarda (Override): gdy Core ustawi ENGINE_LAUNCH_CMD,
+# odpalamy ja verbatim zamiast budowanej nizej komendy.
+if [ -n "${ENGINE_LAUNCH_CMD:-}" ]; then
+  echo "[entrypoint] ENGINE_LAUNCH_CMD override"
+  exec sh -c "$ENGINE_LAUNCH_CMD"
+fi
+
 OLLAMA_PORT="${PORT:-${OLLAMA_PORT:-11434}}"
 # ollama nie ma flag --host/--port; bind ustawia OLLAMA_HOST.
 export OLLAMA_HOST="0.0.0.0:${OLLAMA_PORT}"
