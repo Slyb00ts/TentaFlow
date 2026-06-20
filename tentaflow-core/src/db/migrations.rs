@@ -462,7 +462,54 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_state_table",
             MigrationStep::Sql(ADDON_STATE_TABLE),
         ),
+        (
+            85,
+            "addon_graph_collections",
+            MigrationStep::Rust(create_addon_graph_collections),
+        ),
     ]
+}
+
+/// v85 — rejestr kolekcji grafowych CozoDB (services/graph) + kolumny limitów
+/// grafu w `addon_resource_limits`. Tabela `addon_graph_collections` lustro
+/// `addon_vector_namespaces`, ale PK MUSI zawierać `org_id` (poprawka codex
+/// pkt 3): ten sam `addon_id` w dwóch organizacjach to fizycznie osobne grafy.
+/// Kolumny limitów (`graph_nodes_max`/`graph_edges_max`, poprawka codex pkt 9)
+/// dodawane idempotentnie — `document_storage_mb` zostaje na slice document.
+/// CHECK na `engine` dopuszcza `('mem','sled','rocksdb')`: wasm32 wstawia
+/// `engine='mem'` (sled nie kompiluje się w przeglądarce), więc 'mem' musi być
+/// legalny (runda 2 codex bug #2).
+fn create_addon_graph_collections(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS addon_graph_collections (
+    org_id TEXT NOT NULL,
+    addon_id TEXT NOT NULL,
+    collection TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    engine TEXT NOT NULL CHECK(engine IN ('mem', 'sled', 'rocksdb')),
+    node_count INTEGER NOT NULL DEFAULT 0,
+    edge_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, addon_id, collection)
+);
+CREATE INDEX IF NOT EXISTS idx_addon_graph_collections_addon
+    ON addon_graph_collections(org_id, addon_id);
+"#,
+    )?;
+
+    if !column_exists(conn, "addon_resource_limits", "graph_nodes_max")? {
+        conn.execute_batch(
+            "ALTER TABLE addon_resource_limits ADD COLUMN graph_nodes_max INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !column_exists(conn, "addon_resource_limits", "graph_edges_max")? {
+        conn.execute_batch(
+            "ALTER TABLE addon_resource_limits ADD COLUMN graph_edges_max INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 // Write-behind backing store for the in-RAM `AddonStateStore` Durable tier

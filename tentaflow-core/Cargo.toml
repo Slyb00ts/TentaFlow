@@ -65,6 +65,25 @@ gpu-metal = ["inference-llamacpp"]
 # The embedded zvec engine itself is NOT a feature — it is a mandatory dependency
 # on every platform (see below), so this only gates the optional Milvus client.
 vector-milvus = ["dep:milvus-sdk-rust"]
+# CozoDB embedded graph engine (services/graph). Opt-in — NOT in the default
+# set. Native (server/desktop/mobile) persistent backend is `sled` (pure-Rust
+# embedded KV, zero native deps and — crucially — no `links="sqlite3"` collision
+# with our bundled `rusqlite`; cozo's own sqlite backend can't coexist with
+# rusqlite, see services/graph/backend.rs). sled is marked *Experimental* in Cozo
+# and is NOT a wasm backend — on wasm32 the engine uses `mem` only (sled pulls
+# fs2/libc/mmap, which don't compile to wasm; browser persistence is deferred).
+# `mem` is always available (tests + wasm). `graph-rocksdb` adds the RocksDB
+# backend for large server graphs (pulls C++); its absence is NOT an error — the
+# engine falls back to sled on native, `mem` on wasm. NOTE: Cozo ignores the sled
+# `options` string, so sled's 1 GiB default cache per DB can't be tuned through
+# Cozo; GraphManager bounds memory by capping concurrently-open handles (LRU).
+# `graph` only activates the optional `cozo` dependency; the persistent backend
+# (`storage-sled`) is pulled per-TARGET below, NOT by this feature — wasm32 gets
+# cozo WITHOUT sled (mem-only), every other target gets sled. Forcing
+# `cozo/storage-sled` here would break wasm builds (sled pulls fs2/libc/mmap)
+# (runda 2 codex bug #1).
+graph = ["dep:cozo"]
+graph-rocksdb = ["graph", "cozo/storage-rocksdb"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -342,6 +361,20 @@ wgpu = "29.0.3"
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 wasmi = "1.0.9"
+
+# Embedded graph database (services/graph) — only pulled in by the `graph`
+# feature (`optional = true` + `dep:cozo`). The persistent `sled` backend is
+# gated PER-TARGET (runda 2 codex bug #1): every non-wasm target gets
+# `storage-sled` (pure-Rust embedded KV, no `links="sqlite3"` collision with our
+# bundled rusqlite); wasm32 gets cozo WITHOUT sled (mem-only — sled pulls
+# fs2/libc/mmap which don't compile to wasm). `graph-algo` enables the built-in
+# PageRank/community algorithms on both. RocksDB stays an additive opt-in via the
+# `graph-rocksdb` feature (server only, non-wasm).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cozo = { version = "0.7.6", default-features = false, features = ["graph-algo", "storage-sled"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cozo = { version = "0.7.6", default-features = false, features = ["graph-algo"], optional = true }
 
 [build-dependencies]
 rcgen = "0.14.7"
