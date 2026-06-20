@@ -4574,7 +4574,16 @@ pub async fn deploy_vllm_recommend(
     let mut recommended_env: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut recipe_applied: Option<String> = None;
-    let recommended_vllm_args = match engine {
+    // Dialekt CLI rozstrzygany z surowej etykiety silnika (NIE z DeployEngine —
+    // sglang dzieli fizyke VRAM z vLLM, ale ma wlasne nazwy flag). Gdy dialekt
+    // to sglang, generujemy argumenty sglang zamiast vLLM (inaczej kontener
+    // odrzuca `--max-model-len` i pada na starcie).
+    use crate::deploy::launch_dialect::{self, Dialect, DeployMethod};
+    let dialect = launch_dialect::dialect_for(eng_norm.as_deref().unwrap_or("vllm"));
+    let recommended_vllm_args = if dialect == Dialect::Sglang {
+        launch_dialect::build_args(Dialect::Sglang, &spec, &applied_input).join(" ")
+    } else {
+        match engine {
         DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
         DeployEngine::Vllm => {
             let mut base = build_vllm_args_string(&spec, &applied_input);
@@ -4620,6 +4629,24 @@ pub async fn deploy_vllm_recommend(
             applied_input.max_model_len,
             applied_input.max_num_seqs.max(1) * applied_input.max_model_len
         ),
+        }
+    };
+
+    // Podglad finalnej komendy: baza per-dialekt+metoda + dokladnie te same
+    // argumenty co `recommended_vllm_args` (dla vLLM zawieraja juz flagi recipe).
+    let deploy_method = DeployMethod::parse(payload.deploy_method.as_deref());
+    let launch_command = {
+        let base = launch_dialect::base_command_string(
+            eng_norm.as_deref().unwrap_or("vllm"),
+            deploy_method,
+        );
+        if base.is_empty() {
+            String::new()
+        } else if recommended_vllm_args.trim().is_empty() {
+            base
+        } else {
+            format!("{base} {recommended_vllm_args}")
+        }
     };
 
     let estimated_params = spec.estimated_params() as f64 / 1_000_000_000.0;
@@ -4717,6 +4744,7 @@ pub async fn deploy_vllm_recommend(
             at_limit,
             recommended_env,
             recipe_applied,
+            launch_command,
         },
     ))
 }

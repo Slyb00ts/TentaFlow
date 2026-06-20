@@ -1587,6 +1587,7 @@ mod apply_parameters_deploy_tests {
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
                 gpus: None,
+                ..Default::default()
             }),
             native: None,
             external: None,
@@ -1868,6 +1869,7 @@ mod hf_token_gate_tests {
                 download_size_mb: None,
                 transport: Some(DockerTransport::SidecarQuic),
                 gpus: None,
+                ..Default::default()
             }),
             native: None,
             external: None,

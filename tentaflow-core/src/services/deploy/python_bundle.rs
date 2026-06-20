@@ -28,9 +28,6 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
-fn is_vllm_python_bundle_engine(engine_id: &str) -> bool {
-    matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal")
-}
 
 /// Wstrzykuje `HF_TOKEN` do env procesu silnika z tokenu rozwiazanego per-node
 /// w `deploy()` (secure setting), NIGDY z `user_config` — sekret nie moze trafic
@@ -45,22 +42,31 @@ fn apply_hf_token_env(hf_token: Option<&str>, env: &mut HashMap<String, String>)
     }
 }
 
-fn apply_vllm_user_args(
+/// Strojone argi z wizarda (pole `vllm_args`, niezaleznie od silnika) trafiaja
+/// do env-key w NATYWNYM dialekcie silnika: vLLM→`VLLM_ARGS`, sglang→`SGLANG_ARGS`.
+/// `build_engine_args` shlex-splituje ten klucz do argv. Silniki bez strojonych
+/// flag (llama.cpp / mlx / tts / stt) maja wlasny runner i sa pomijane.
+fn apply_engine_user_args(
     engine_id: &str,
     user_config: &serde_json::Value,
     env: &mut HashMap<String, String>,
 ) {
-    if !is_vllm_python_bundle_engine(engine_id) {
-        return;
-    }
-    if let Some(raw_args) = user_config
+    let raw_args = match user_config
         .get("vllm_args")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        env.insert("VLLM_ARGS".into(), raw_args.to_string());
-    }
+        Some(r) => r,
+        None => return,
+    };
+    use crate::deploy::launch_dialect::{dialect_for, Dialect};
+    let key = match dialect_for(engine_id) {
+        Dialect::Vllm => "VLLM_ARGS",
+        Dialect::Sglang => "SGLANG_ARGS",
+        _ => return,
+    };
+    env.insert(key.into(), raw_args.to_string());
 }
 
 /// Tracked state for rollback: the spawned engine's PID. The venv dir is
@@ -246,7 +252,19 @@ impl DeployStrategy for PythonBundleDeploy {
             None
         };
         apply_hf_token_env(hf_token_for_env, &mut env);
-        apply_vllm_user_args(&engine_id, &self.user_config, &mut env);
+        apply_engine_user_args(&engine_id, &self.user_config, &mut env);
+        // Edytowalna komenda z wizarda (Override): spawn_engine wykrywa
+        // ENGINE_LAUNCH_CMD i odpala je verbatim przez `sh -c` (placeholdery
+        // $MODEL/$PORT rozwija powloka z env), pomijajac komende bundle.toml.
+        if let Some(cmd) = self
+            .user_config
+            .get("launch_command_override")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            env.insert("ENGINE_LAUNCH_CMD".into(), cmd.to_string());
+        }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
 
@@ -578,14 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn vllm_spark_is_vllm_python_bundle_engine() {
-        assert!(is_vllm_python_bundle_engine("vllm"));
-        assert!(is_vllm_python_bundle_engine("vllm-spark"));
-        assert!(is_vllm_python_bundle_engine("vllm-metal"));
-        assert!(!is_vllm_python_bundle_engine("qwen-asr"));
-    }
-
-    #[test]
     fn only_cuda_vllm_engines_get_gpu_memory_utilization() {
         assert!(is_cuda_vllm_engine("vllm"));
         assert!(is_cuda_vllm_engine("vllm-spark"));
@@ -621,28 +631,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_vllm_user_args_sets_env_for_vllm_spark() {
-        let mut env = HashMap::new();
-        let config = serde_json::json!({
-            "vllm_args": "--max-model-len 8192 --gpu-memory-utilization 0.70"
-        });
-
-        apply_vllm_user_args("vllm-spark", &config, &mut env);
-
-        assert_eq!(
-            env.get("VLLM_ARGS").map(String::as_str),
-            Some("--max-model-len 8192 --gpu-memory-utilization 0.70")
-        );
-    }
-
-    #[test]
-    fn apply_vllm_user_args_sets_env_for_vllm_metal() {
+    fn apply_engine_user_args_sets_vllm_args_for_vllm_metal() {
         let mut env = HashMap::new();
         let config = serde_json::json!({
             "vllm_args": "--max-model-len 4096"
         });
 
-        apply_vllm_user_args("vllm-metal", &config, &mut env);
+        apply_engine_user_args("vllm-metal", &config, &mut env);
 
         assert_eq!(
             env.get("VLLM_ARGS").map(String::as_str),
@@ -651,15 +646,32 @@ mod tests {
     }
 
     #[test]
-    fn apply_vllm_user_args_ignores_non_vllm_engines() {
+    fn apply_engine_user_args_sets_sglang_args_for_sglang() {
+        let mut env = HashMap::new();
+        let config = serde_json::json!({
+            "vllm_args": "--context-length 8192 --mem-fraction-static 0.85"
+        });
+
+        apply_engine_user_args("sglang", &config, &mut env);
+
+        assert_eq!(
+            env.get("SGLANG_ARGS").map(String::as_str),
+            Some("--context-length 8192 --mem-fraction-static 0.85")
+        );
+        assert!(!env.contains_key("VLLM_ARGS"));
+    }
+
+    #[test]
+    fn apply_engine_user_args_ignores_non_dialect_engines() {
         let mut env = HashMap::new();
         let config = serde_json::json!({
             "vllm_args": "--gpu-memory-utilization 0.70"
         });
 
-        apply_vllm_user_args("qwen-asr", &config, &mut env);
+        apply_engine_user_args("qwen-asr", &config, &mut env);
 
         assert!(!env.contains_key("VLLM_ARGS"));
+        assert!(!env.contains_key("SGLANG_ARGS"));
     }
 
     // Cover the missing-bundle-path failure path; doesn't need python.

@@ -3901,6 +3901,10 @@ pub struct DeployVllmRecommendRequest {
     /// modelu puli KV. None → handler wylicza default z max_model_len.
     #[serde(default)]
     pub max_num_batched_tokens: Option<u64>,
+    /// Metoda deployu (`docker` / `native`) — rozstrzyga baze komendy w
+    /// podgladzie (`launch_command`). None → docker. Wire-additive.
+    #[serde(default)]
+    pub deploy_method: Option<String>,
 }
 
 #[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
@@ -3986,6 +3990,12 @@ pub struct DeployVllmRecommendResponse {
     /// when no recipe matched.
     #[serde(default)]
     pub recipe_applied: Option<String>,
+    /// Pelna finalna komenda startowa silnika (baza + argumenty) w jego natywnym
+    /// dialekcie, z placeholderami env (`$MODEL`/`$PORT`). Wizard pokazuje ja jako
+    /// edytowalny podglad; edycja leci z powrotem jako `launch_command_override`
+    /// w config_json. Pusta dla silnikow bez strojonych argumentow. Wire-additive.
+    #[serde(default)]
+    pub launch_command: String,
 }
 
 // =============================================================================

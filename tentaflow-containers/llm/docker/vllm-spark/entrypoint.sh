@@ -8,6 +8,13 @@
 
 set -uo pipefail
 
+# Edytowalna komenda z wizarda (Override): gdy Core ustawi ENGINE_LAUNCH_CMD,
+# odpalamy ja verbatim zamiast budowanej nizej komendy.
+if [ -n "${ENGINE_LAUNCH_CMD:-}" ]; then
+  echo "[entrypoint] ENGINE_LAUNCH_CMD override"
+  exec sh -c "$ENGINE_LAUNCH_CMD"
+fi
+
 # Spark-specific runtime env. Te same wartosci sa w bundle.toml [launch.env]
 # dla deploy.native — duplikujemy tu zeby docker dzialal niezaleznie od bundla.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.1a}"

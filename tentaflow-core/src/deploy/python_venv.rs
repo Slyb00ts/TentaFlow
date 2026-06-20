@@ -302,7 +302,7 @@ pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEn
 
     let detected = crate::system_check::collect();
     let backend_name = install_variant_tag(&detected.gpu);
-    let variant = pick_install_variant(&spec.install_variants, backend_name)?;
+    let variant = pick_install_variant(&spec.install_variants, &backend_name)?;
     log(&format!(
         "bootstrap: engine={} backend={}",
         engine, backend_name
@@ -356,7 +356,7 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
     // Wykryj backend (CUDA/ROCm/Metal/XPU) i wybierz odpowiedni variant.
     let detected = crate::system_check::collect();
     let backend_name = install_variant_tag(&detected.gpu);
-    let variant = pick_install_variant(&spec.install_variants, backend_name)?;
+    let variant = pick_install_variant(&spec.install_variants, &backend_name)?;
     log(&format!(
         "wariant instalacji: engine={} backend={}",
         req.engine, backend_name
@@ -1370,33 +1370,22 @@ fn patch_pyproject_if_needed(pkg_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn backend_to_str(b: &crate::system_check::GpuBackend) -> &'static str {
-    use crate::system_check::GpuBackend::*;
-    match b {
-        Cuda => "cuda",
-        Rocm => "rocm",
-        Xpu => "xpu",
-        Metal => "metal",
-        Cpu => "cpu",
-    }
-}
-
 /// Tag wariantu installu uwzgledniajacy DGX Spark. Dla zwyklych hostow
-/// zwraca to samo co `backend_to_str`. Dla Sparka (sm_121a) zwraca
+/// zwraca arch-tag CUDA z compute capability. Dla Sparka (sm_121a) zwraca
 /// `"cuda-spark"` — bundle moze zadeklarowac osobny wariant z innym
 /// `extra_index` (nightly aarch64 wheels) i innymi env (TORCH_CUDA_ARCH_LIST).
-fn install_variant_tag(gpu: &crate::system_check::GpuSnapshot) -> &'static str {
-    if gpu.is_dgx_spark && matches!(gpu.preferred_backend, crate::system_check::GpuBackend::Cuda) {
-        "cuda-spark"
-    } else {
-        backend_to_str(&gpu.preferred_backend)
-    }
+/// Tag wariantu instalacji = arch-tag GPU (`cuda-ampere`/`-ada`/`-hopper`/
+/// `-blackwell`/`-spark` lub `rocm`/`metal`/`xpu`/`cpu`). Jedno zrodlo prawdy z
+/// docker (`GpuSnapshot::cuda_arch_tag`).
+fn install_variant_tag(gpu: &crate::system_check::GpuSnapshot) -> String {
+    gpu.cuda_arch_tag()
 }
 
-/// Wybiera wariant instalacji pasujacy do backendu. Jesli brak wariantu
-/// dla danego backendu — dla `cuda-spark` probujemy `cuda` jako fallback
-/// (zachowanie BC dla bundli ktore nie deklaruja jeszcze wariantu Spark);
-/// dla innych: pierwszy dostepny + ostrzezenie.
+/// Wybiera wariant instalacji pasujacy do arch-tagu GPU. Lancuch fallbacku dla
+/// tagow CUDA: dokladny arch (`cuda-ampere`) → ogolny `cuda` → pierwszy wariant
+/// CUDA → pierwszy jakikolwiek (+ ostrzezenie). Dzieki temu bundle deklarujacy
+/// tylko ogolny `cuda` (PyPI fat wheels) dziala na kazdej karcie, a bundle z
+/// per-arch wariantami (np. sglang) dostaje dokladne dopasowanie.
 fn pick_install_variant<'a>(
     variants: &'a [InstallVariant],
     backend: &str,
@@ -1407,15 +1396,25 @@ fn pick_install_variant<'a>(
     if let Some(v) = variants.iter().find(|v| v.backend == backend) {
         return Ok(Some(v));
     }
-    if backend == "cuda-spark" {
+    // Tagi CUDA degraduja do ogolnego 'cuda', potem do dowolnego wariantu CUDA.
+    if backend.starts_with("cuda") {
         if let Some(v) = variants.iter().find(|v| v.backend == "cuda") {
             tracing::warn!(
-                "bundle nie ma wariantu 'cuda-spark' — fallback na 'cuda' (PyPI wheels moga sypac sie na sm_121)"
+                "bundle nie ma wariantu '{}' — fallback na ogolny 'cuda'",
+                backend
+            );
+            return Ok(Some(v));
+        }
+        if let Some(v) = variants.iter().find(|v| v.backend.starts_with("cuda")) {
+            tracing::warn!(
+                "bundle nie ma wariantu '{}' ani 'cuda' — fallback na '{}'",
+                backend,
+                v.backend
             );
             return Ok(Some(v));
         }
     }
-    // Fallback: spytaj pierwsze dostepne, ale ostrzez
+    // Fallback: pierwsze dostepne, ale ostrzez.
     tracing::warn!(
         "brak wariantu dla backendu '{}', uzywam '{}' jako fallback",
         backend,
@@ -1933,10 +1932,29 @@ fn spawn_engine(
     let exe = venv_bin(venv, &spec.launch.command);
     let bundle_dir = venv.join("app");
 
-    let mut cmd = build_engine_command(&exe);
-    for arg in build_engine_args(spec, &req.env, &req.extra_args, &bundle_dir, venv) {
-        cmd.arg(arg);
-    }
+    // Override z wizarda: gdy user nadpisal komende tekstowo, odpalamy ja
+    // verbatim przez `sh -c` zamiast komendy z bundle.toml. Placeholdery
+    // $MODEL/$PORT/$SERVED_MODEL_NAME rozwija powloka z env ustawionego nizej,
+    // a venv/bin jest na poczatku PATH, wiec `python`/`vllm` celuja w venv.
+    let launch_override = req
+        .env
+        .get("ENGINE_LAUNCH_CMD")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let mut cmd = if let Some(override_cmd) = launch_override {
+        if let Some(log) = log {
+            log("[native] launch_command_override aktywny (sh -c)");
+        }
+        let mut c = build_engine_command(Path::new("sh"));
+        c.arg("-c").arg(override_cmd);
+        c
+    } else {
+        let mut c = build_engine_command(&exe);
+        for arg in build_engine_args(spec, &req.env, &req.extra_args, &bundle_dir, venv) {
+            c.arg(arg);
+        }
+        c
+    };
     for (k, v) in &req.env {
         // Klucze arg-carrier sa juz skonsumowane do argv przez build_engine_args
         // wyzej; nie wolno ich przekazac do env procesu silnika (vLLM warnuje
@@ -2961,6 +2979,46 @@ mod tests {
         // Fallback gdy brak pasujacego
         let v = pick_install_variant(&variants, "xpu").unwrap().unwrap();
         assert_eq!(v.backend, "cuda"); // pierwszy jako fallback
+    }
+
+    #[test]
+    fn pick_variant_cuda_arch_fallback_chain() {
+        let mk = |backend: &str| InstallVariant {
+            backend: backend.into(),
+            extra_index: None,
+            extras: vec![],
+            extras_no_build_isolation: vec![],
+            extras_no_build_isolation_no_deps: vec![],
+            install_hint: None,
+            env: HashMap::new(),
+            force_pins: vec![],
+        };
+        // Per-arch wariant ma pierwszenstwo.
+        let with_arch = vec![mk("cuda"), mk("cuda-ampere")];
+        assert_eq!(
+            pick_install_variant(&with_arch, "cuda-ampere")
+                .unwrap()
+                .unwrap()
+                .backend,
+            "cuda-ampere"
+        );
+        // Brak per-arch → degraduje do ogolnego 'cuda'.
+        let generic_only = vec![mk("cuda"), mk("rocm")];
+        assert_eq!(
+            pick_install_variant(&generic_only, "cuda-ampere")
+                .unwrap()
+                .unwrap()
+                .backend,
+            "cuda"
+        );
+        // Spark tez degraduje do 'cuda'.
+        assert_eq!(
+            pick_install_variant(&generic_only, "cuda-spark")
+                .unwrap()
+                .unwrap()
+                .backend,
+            "cuda"
+        );
     }
 
     #[test]

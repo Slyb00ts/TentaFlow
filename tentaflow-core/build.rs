@@ -729,6 +729,7 @@ fn pack_container_contexts(out_dir: &Path) {
 
 mod services_manifest_build {
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ServiceManifest {
@@ -933,6 +934,19 @@ mod services_manifest_build {
         /// the field is missing.
         #[serde(default)]
         pub transport: Option<DockerTransport>,
+        /// Build-args wspolne dla kazdej arch GPU + macierz per arch-tag —
+        /// mirror runtime `DockerDeploy`. Musza tu byc, inaczej build.rs gubi
+        /// te pola przy parsowaniu TOML → JSON (serde ignoruje nieznane).
+        #[serde(default)]
+        pub default_build_args: HashMap<String, String>,
+        #[serde(default)]
+        pub arch_variants: HashMap<String, DockerArchVariant>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct DockerArchVariant {
+        #[serde(default)]
+        pub build_args: HashMap<String, String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
