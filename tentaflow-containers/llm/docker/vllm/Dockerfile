@@ -5,10 +5,11 @@
 # =============================================================================
 
 # --- vLLM z PyPI ---
-# CUDA 13.0 + cudnn runtime — vLLM 0.23.0 wymaga PyTorch 2.11 + cu130.
-# Runtime variant (nie devel) bo nie kompilujemy z source — wheels z PyPI maja
-# prebuilt extensions (vllm, xformers, flashinfer).
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
+# CUDA 13.0 + cudnn DEVEL (nie runtime) — flashinfer JIT-kompiluje kernele
+# (sampler + autotune cudagraph) przez nvcc przy starcie; runtime image nie ma
+# nvcc -> crash. Devel daje nvcc, dzieki czemu dzialaja CUDA graphs + flashinfer
+# (pelna wydajnosc) bez --enforce-eager. JIT cache'owany na hoscie (VLLM_CACHE).
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev curl ca-certificates \
       gcc g++ \
@@ -31,10 +32,6 @@ RUN pip install --no-cache-dir llmcompressor "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
     QUANT_SCRIPT=/app/quantize_nvfp4.py
 
-# Obraz -runtime nie ma nvcc, a flashinfer JIT-kompiluje kernel samplingu przez
-# ninja+nvcc przy starcie -> crash (exit 127). Wylaczamy flashinfer sampler;
-# vLLM uzywa natywnego samplera PyTorch (atencja idzie FLASH_ATTN, bez JIT).
-ENV VLLM_USE_FLASHINFER_SAMPLER=0
 COPY tentaflow-containers/llm/docker/vllm/entrypoint.sh /app/entrypoint.sh
 COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
 COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
