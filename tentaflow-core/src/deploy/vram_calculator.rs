@@ -1974,7 +1974,11 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
     parts.push("--max-num-seqs".into());
     parts.push(input.max_num_seqs.to_string());
     parts.push("--max-num-batched-tokens".into());
-    parts.push(input.max_model_len.max(8192).to_string());
+    // CAP, nie max: rownanie batched-tokens = max_model_len (np. 262144 dla
+    // Qwen3.5) sprawia, ze profiling vLLM robi forward na pelnym kontekscie ->
+    // ~22GB aktywacji -> CUDA OOM nawet dla malego modelu. Chunked prefill
+    // (wlaczony nizej) obsluguje dlugi kontekst w kawalkach <= tej wartosci.
+    parts.push(input.max_model_len.min(8192).to_string());
 
     // chunked prefill TYLKO dla nie-multimodal: vllm dla VL modeli (Gemma 4,
     // Qwen 2.5 VL itp.) Forcuje --disable_chunked_mm_input wewnetrznie i
