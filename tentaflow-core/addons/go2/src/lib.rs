@@ -1028,16 +1028,25 @@ fn decode_voxel_to_canonical(
         let n_slice = i % 0x800;
         let y = (n_slice / 0x10) as f32;
         let x_base = ((n_slice % 0x10) * 8) as f32;
+        // y/z are constant for this byte; only x varies per set bit. Precompute
+        // world y/z ONCE per byte (not per bit), and emit each point as a single
+        // 12-byte write (ONE extend per point instead of three). A real frame is
+        // ~32k points, so cutting the per-point WASM instruction/extend count is
+        // what keeps the decode under the service-tick fuel budget.
+        let yw = (y * res + origin[1]).to_le_bytes();
+        let zw = (z * res + origin[2]).to_le_bytes();
         // Bit-scan: only set bits do work. The Go2 grid is MSB-first along x
         // (bit 0 == 0x80), so reverse the trailing-zero index to recover x.
         let mut bits = byte;
         while bits != 0 {
             let b = bits.trailing_zeros();
             bits &= bits - 1;
-            let x = x_base + (7 - b) as f32;
-            out.extend_from_slice(&(x * res + origin[0]).to_le_bytes());
-            out.extend_from_slice(&(y * res + origin[1]).to_le_bytes());
-            out.extend_from_slice(&(z * res + origin[2]).to_le_bytes());
+            let xw = ((x_base + (7 - b) as f32) * res + origin[0]).to_le_bytes();
+            let mut pt = [0u8; 12];
+            pt[0..4].copy_from_slice(&xw);
+            pt[4..8].copy_from_slice(&yw);
+            pt[8..12].copy_from_slice(&zw);
+            out.extend_from_slice(&pt);
         }
     }
     Some(out)
