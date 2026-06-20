@@ -43,13 +43,29 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   esac
 fi
 
-# --enforce-eager: obraz -runtime nie ma nvcc, a domyslny tryb VLLM_COMPILE
-# (cudagraph + flashinfer autotune) JIT-kompiluje kernele przez nvcc -> crash.
-# Eager pomija cudagraph/JIT (kosztem nieco nizszej przepustowosci, ale dziala
-# bez kompilatora CUDA). Dodajemy tylko gdy user sam nie podal trybu.
-HAS_EAGER=0
-for _a in "${ENGINE_ARGS[@]}"; do case "$_a" in --enforce-eager|--no-enforce-eager) HAS_EAGER=1 ;; esac; done
-[[ "$HAS_EAGER" -eq 0 ]] && ENGINE_ARGS+=(--enforce-eager)
+# --max-num-batched-tokens: wizard/recommender potrafi ustawic je = max_model_len
+# (np. 262144 dla Qwen3.5), a profiling robi forward na takim batchu -> ~22GB
+# aktywacji -> CUDA OOM niezaleznie od gpu-memory-utilization. Chunked prefill
+# (wlaczony) obsluguje dlugi kontekst w kawalkach, wiec KLAMPUJEMY do <=4096:
+# nadpisujemy istniejaca wartosc gdy jest wieksza, albo dodajemy gdy jej brak.
+MNBT_CAP=4096
+_new_args=()
+_skip=0
+_had_mnbt=0
+for _a in "${ENGINE_ARGS[@]}"; do
+  if [[ "$_skip" -eq 1 ]]; then _skip=0; continue; fi
+  case "$_a" in
+    --max-num-batched-tokens)
+      _had_mnbt=1; _skip=1
+      _new_args+=(--max-num-batched-tokens "$MNBT_CAP") ;;
+    --max-num-batched-tokens=*)
+      _had_mnbt=1
+      _new_args+=("--max-num-batched-tokens=$MNBT_CAP") ;;
+    *) _new_args+=("$_a") ;;
+  esac
+done
+[[ "$_had_mnbt" -eq 0 ]] && _new_args+=(--max-num-batched-tokens "$MNBT_CAP")
+ENGINE_ARGS=("${_new_args[@]}")
 
 echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \
