@@ -427,6 +427,93 @@ fn register_local_lidar_source(robot_id: &str) -> String {
     hub_key
 }
 
+/// Build the INTERNAL StreamHub key for a remote LiDAR relay. Scoped by owner node
+/// + org so a remote relay can never collide with a local `lidar:<robot_id>`
+/// source or with another owner's relay for the same robot id. Mirrors the camera
+/// relay's `remote_relay_hub_key` scheme (`<prefix><id>@<owner>#<org>`). The
+/// client never sees this key — it only ever sends/receives the public
+/// `lidar:<robot_id>` stream id.
+fn remote_lidar_relay_hub_key(robot_id: &str, owner_node: &str, org_id: &str) -> String {
+    format!("{}{}@{}#{}", LIDAR_PREFIX, robot_id, owner_node, org_id)
+}
+
+/// Resolve the trusted mesh node that owns `robot_id` (a robot not local to this
+/// node) when its advertised tenant matches `caller_org_id`; `None` otherwise.
+/// Mirror of `camera_admin::remote_camera_owner` but keyed on `robot_id` rather
+/// than `camera_id` (the LiDAR relay is per-robot, not per-camera). The registry
+/// only holds robots announced by trust-paired peers, so a hit implies a trusted
+/// owner — but trust + `robot.telemetry` alone do not scope tenants, so the org
+/// match is REQUIRED to stop a node in org-A reading an org-B robot's LiDAR.
+/// `robot_id` is globally unique with a single owner so 2+ distinct owners should
+/// never occur, but — like the camera path — we fail CLOSED on ambiguity rather
+/// than silently routing to whichever owner the registry iteration yields first.
+fn remote_lidar_owner(local_node_id: &str, caller_org_id: &str, robot_id: &str) -> Option<String> {
+    let mut owners: Vec<String> = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .filter(|r| {
+            r.node_id != local_node_id && r.robot_id == robot_id && r.org_id == caller_org_id
+        })
+        .map(|r| r.node_id)
+        .collect();
+    owners.sort();
+    owners.dedup();
+    match owners.as_slice() {
+        [only] => Some(only.clone()),
+        [] => None,
+        // Ambiguous: 2+ trusted nodes (same org) advertise this robot id. Fail
+        // closed, but log so it is diagnosable — count only, never echo any
+        // tenant-probe data beyond the robot_id the caller already supplied.
+        many => {
+            tracing::warn!(
+                event = "ambiguous_remote_lidar_owner",
+                robot_id = %robot_id,
+                owner_count = many.len(),
+                "multiple trusted nodes advertise the same robot id; refusing to pick one"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve a trusted remote owner for `robot_id` (a robot not local to this node)
+/// and, if found, idempotently register a `RemoteLidarStreamSource` factory under
+/// the org/owner-scoped internal hub key. Returns `Some(hub_key)` when a relay is
+/// available (owner resolved + mesh present), so the caller may subscribe under
+/// that key; `None` means deny (unknown robot, no mesh, cross-tenant) — the caller
+/// then masks it as the same NotFound an unknown robot gets, leaking no topology.
+///
+/// The org-scope gate lives in `remote_lidar_owner` (advertised robot org ==
+/// caller org). The owner node independently re-verifies this before serving
+/// (`lidar_relay::server::robot_owned_by_node`) — defence in depth.
+fn register_remote_lidar_relay(
+    ctx: &HandlerContext,
+    org: &crate::services::rbac::OrgContext,
+    robot_id: &str,
+    owner_node: &str,
+) -> Option<String> {
+    let iroh = ctx.state.quic_mesh.as_ref()?;
+
+    // Register a factory under the scoped key; re-registering the same key is
+    // idempotent (latest wins) and does not tear down an already-active relay.
+    let hub_key = remote_lidar_relay_hub_key(robot_id, owner_node, &org.org_id);
+    let iroh = Arc::clone(iroh);
+    let owner_node = owner_node.to_string();
+    let robot_id = robot_id.to_string();
+    let org_id = org.org_id.clone();
+    let factory = Box::new(move || {
+        let source = crate::services::lidar_relay::source::RemoteLidarStreamSource::new(
+            Arc::clone(&iroh),
+            owner_node.clone(),
+            robot_id.clone(),
+            org_id.clone(),
+        );
+        Ok(source as Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
+    });
+    let _ = StreamHub::global().register_factory(hub_key.clone(), factory);
+    Some(hub_key)
+}
+
 /// Authorize a `lidar:<robot_id>` subscribe and resolve the StreamHub key.
 /// Requires org + `robot.telemetry`, resolves the
 /// robot in the CALLER'S org via the mesh registry (org scoping at the
@@ -468,20 +555,34 @@ fn enforce_lidar_subscribe(
         })?;
 
     if robot.node_id != local_node_id {
-        // L3b: cross-node lidar relay — the frame lives in the OWNING node's hub
-        // and there is no cross-node push wired yet. The PUBLIC response is the
-        // exact same NotFound as unknown-in-org so a caller with `robot.telemetry`
-        // cannot distinguish "remote robot exists" from "no such robot" — leaking
-        // that would expose mesh topology / feature-support state. The client
-        // falls back to / keeps using the L2 fetch path.
-        tracing::debug!(
-            robot_id = %robot_id,
-            "lidar push subscribe for remote robot denied (cross-node relay is L3b)"
-        );
-        return Err(ProtocolError::not_found(format!(
-            "stream_not_registered: {}{}",
-            LIDAR_PREFIX, robot_id
-        )));
+        // Cross-node LiDAR relay: the frame lives in the OWNING node's hub. Resolve
+        // the trusted owner (org match), lazily register a `RemoteLidarStreamSource`
+        // under the org/owner-scoped internal hub key and subscribe under THAT key.
+        // Org scope is enforced here (remote_lidar_owner requires advertised org ==
+        // caller org) AND on the owner side (it re-verifies it advertises the robot
+        // in this org). If the owner cannot be resolved (no mesh, untrusted,
+        // cross-tenant) the PUBLIC response is the EXACT same NotFound as
+        // unknown-in-org so a caller cannot distinguish "remote robot exists" from
+        // "no such robot" — leaking that would expose mesh topology.
+        return match remote_lidar_owner(&local_node_id, &org.org_id, robot_id) {
+            Some(owner_node) => match register_remote_lidar_relay(ctx, org, robot_id, &owner_node) {
+                Some(hub_key) => Ok(hub_key),
+                None => Err(ProtocolError::not_found(format!(
+                    "stream_not_registered: {}{}",
+                    LIDAR_PREFIX, robot_id
+                ))),
+            },
+            None => {
+                tracing::debug!(
+                    robot_id = %robot_id,
+                    "lidar subscribe for remote robot denied (no trusted owner in org)"
+                );
+                Err(ProtocolError::not_found(format!(
+                    "stream_not_registered: {}{}",
+                    LIDAR_PREFIX, robot_id
+                )))
+            }
+        };
     }
 
     Ok(register_local_lidar_source(robot_id))
@@ -953,8 +1054,10 @@ mod tests {
         crate::services::lidar_hub::LidarStreamHub::global().remove(robot_id);
     }
 
-    /// A remote robot (owned by another node) is an explicit L3b seam: the gate
-    /// denies with NotFound (`stream_not_registered`), it never silently stubs.
+    /// A remote robot (owned by another node) routes through the cross-node relay
+    /// seam. With no mesh handle in `AppState::for_test()` the relay cannot be
+    /// registered, so the gate masks it as the SAME NotFound an unknown robot gets
+    /// (`stream_not_registered`) — proving no topology is leaked and it never stubs.
     #[tokio::test]
     async fn lidar_remote_robot_denied_not_found() {
         let robot_id = "go2-stream-remote";

@@ -927,6 +927,13 @@ pub const MESH_MSG_ROBOTS_UPDATE: u8 = 0x51;
 /// NOT a UFP/2 channel kind — it never travels as a UFP/2 unicast envelope, so
 /// the channel-kind range is untouched (see `ufp2/discriminators.rs`).
 pub const MESH_MSG_CAMERA_STREAM_SUBSCRIBE: u8 = 0x52;
+/// Live LiDAR relay subscribe — raw bi-stream discriminator, mirror of
+/// `MESH_MSG_CAMERA_STREAM_SUBSCRIBE`. The observer (B) opens a QUIC bi-stream to
+/// the owner (A), writes `[0x53][u32 id_len][robot_id][CBOR LidarStreamSubscribePayload]`,
+/// then reads a `[u32 len][CBOR LidarStreamFrame]` loop until the stream closes.
+/// Like the camera relay this is NOT a UFP/2 channel kind — it never travels as a
+/// UFP/2 unicast envelope, so the channel-kind range is untouched.
+pub const MESH_MSG_LIDAR_STREAM_SUBSCRIBE: u8 = 0x53;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
@@ -950,6 +957,27 @@ pub struct CameraStreamSubscribePayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CameraStreamFrame {
     pub is_init: bool,
+    pub data: Vec<u8>,
+}
+
+/// Observer→owner subscribe request body for the live LiDAR relay bi-stream.
+/// `robot_id` is the globally-unique addon-install id (== `addon_id`, single owner
+/// org); `org_id` is the caller's tenant. Both ends enforce org scope: the
+/// observer resolves the owner via `remote_lidar_owner` (org match) and the owner
+/// re-verifies the robot is advertised by itself in this org before serving.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct LidarStreamSubscribePayload {
+    pub robot_id: String,
+    pub org_id: String,
+}
+
+/// One frame on the LiDAR relay bi-stream. Carries the raw canonical L1 frame
+/// bytes (36-byte little-endian `LidarFrameHeader` + packed f32). Unlike the
+/// camera relay there is NO `is_init` flag: LiDAR frames are self-describing, so
+/// every frame is a complete, independently renderable point cloud and the
+/// observer simply treats the latest received frame as its dynamic init segment.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct LidarStreamFrame {
     pub data: Vec<u8>,
 }
 
