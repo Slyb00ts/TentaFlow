@@ -27,6 +27,8 @@ pub mod deploy;
 pub mod detection_bus;
 pub mod frame_proxy;
 pub mod frame_storage;
+#[cfg(feature = "graph")]
+pub mod graph;
 #[cfg(feature = "camera")]
 pub mod gstreamer_runtime;
 pub mod handles_cache;
@@ -75,6 +77,8 @@ static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock:
 static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
+#[cfg(feature = "graph")]
+static GRAPH_MANAGER: OnceLock<Arc<graph::GraphManager>> = OnceLock::new();
 
 /// Returns the process-wide vector namespace manager, initializing it lazily
 /// on first call. The DB pool is bound on first init — subsequent calls
@@ -83,6 +87,15 @@ pub fn vector_namespace_manager(
     pool: &crate::db::DbPool,
 ) -> &'static Arc<vector::NamespaceManager> {
     VECTOR_NAMESPACE_MANAGER.get_or_init(|| Arc::new(vector::NamespaceManager::new(pool.clone())))
+}
+
+/// Zwraca proces-szeroki rejestr kolekcji grafowych (CozoDB), inicjalizowany
+/// leniwie przy pierwszym wywołaniu. Pula DB jest wiązana na pierwszym init —
+/// kolejne wywołania ignorują argument (jeden współdzielony katalog w procesie),
+/// dokładnie jak `vector_namespace_manager`.
+#[cfg(feature = "graph")]
+pub fn graph_manager(pool: &crate::db::DbPool) -> &'static Arc<graph::GraphManager> {
+    GRAPH_MANAGER.get_or_init(|| Arc::new(graph::GraphManager::new(pool.clone())))
 }
 
 pub fn frame_storage() -> &'static Arc<frame_storage::FrameStorage> {

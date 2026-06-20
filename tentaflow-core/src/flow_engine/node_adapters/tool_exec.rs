@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn truncate_middle_out_keeps_head_and_tail() {
-        let s = "A".repeat(100) + &"B".repeat(100);
+        let s = "A".repeat(100) + "B".repeat(100).as_str();
         let out = ToolExecNodeAdapter::truncate_middle_out(s, 40);
         assert!(out.chars().count() <= 40);
         assert!(out.starts_with('A'));

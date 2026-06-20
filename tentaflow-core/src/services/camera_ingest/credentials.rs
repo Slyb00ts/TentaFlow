@@ -442,7 +442,7 @@ mod tests {
     fn encrypt_rejects_oversize_plaintext() {
         let td = TempDir::new().unwrap();
         let c = fresh_cipher(&td);
-        let pt = "u:".to_string() + &"x".repeat(MAX_PLAINTEXT_LEN);
+        let pt = "u:".to_string() + "x".repeat(MAX_PLAINTEXT_LEN).as_str();
         let err = c.encrypt(&pt).unwrap_err();
         assert!(matches!(err, CredentialsError::PlaintextTooLong(_)));
     }

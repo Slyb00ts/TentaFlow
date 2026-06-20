@@ -139,7 +139,7 @@ pub fn validate_addon_id(id: &str) -> Result<()> {
 /// production but the default seed (`org-default`) and tempdir-based tests
 /// use hyphenated lowercase strings; accept both as long as the charset
 /// stays path-safe.
-fn validate_org_id(id: &str) -> Result<()> {
+pub fn validate_org_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 64 {
         return Err(VectorError::InvalidNamespaceName(id.to_string()));
     }
