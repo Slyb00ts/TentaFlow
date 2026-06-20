@@ -2106,7 +2106,10 @@ pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
         return None;
     }
     let free_ratio = free_mib as f64 / total_mib as f64;
-    let ratio = (0.94 * free_ratio).min(0.92);
+    // Cap 0.85 (nie 0.92): vLLM przy profilowaniu pamieci (zwlaszcza duzy
+    // max_model_len) przekracza ustawiony budzet o kilka % i alokuje peaki
+    // aktywacji ponad KV-cache; przy 0.92 brakowalo ~1.5GB zapasu -> CUDA OOM.
+    let ratio = (0.94 * free_ratio).min(0.85);
     if ratio < 0.10 {
         return Some(ratio);
     }
