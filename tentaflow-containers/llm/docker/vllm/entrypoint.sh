@@ -7,6 +7,14 @@
 
 set -uo pipefail
 
+# Edytowalna komenda z wizarda (Override): gdy Core ustawi ENGINE_LAUNCH_CMD,
+# odpalamy ja verbatim — placeholdery $MODEL/$PORT/$SERVED_MODEL_NAME rozwija
+# powloka z env kontenera — zamiast budowanej nizej komendy.
+if [ -n "${ENGINE_LAUNCH_CMD:-}" ]; then
+  echo "[entrypoint] ENGINE_LAUNCH_CMD override"
+  exec sh -c "$ENGINE_LAUNCH_CMD"
+fi
+
 MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
 VLLM_PORT="${PORT:-${VLLM_PORT:-8000}}"
 
@@ -42,6 +50,30 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
     *) ENGINE_ARGS+=(--tensor-parallel-size "$GPU_COUNT") ;;
   esac
 fi
+
+# --max-num-batched-tokens: wizard/recommender potrafi ustawic je = max_model_len
+# (np. 262144 dla Qwen3.5), a profiling robi forward na takim batchu -> ~22GB
+# aktywacji -> CUDA OOM niezaleznie od gpu-memory-utilization. Chunked prefill
+# (wlaczony) obsluguje dlugi kontekst w kawalkach, wiec KLAMPUJEMY do <=4096:
+# nadpisujemy istniejaca wartosc gdy jest wieksza, albo dodajemy gdy jej brak.
+MNBT_CAP=4096
+_new_args=()
+_skip=0
+_had_mnbt=0
+for _a in "${ENGINE_ARGS[@]}"; do
+  if [[ "$_skip" -eq 1 ]]; then _skip=0; continue; fi
+  case "$_a" in
+    --max-num-batched-tokens)
+      _had_mnbt=1; _skip=1
+      _new_args+=(--max-num-batched-tokens "$MNBT_CAP") ;;
+    --max-num-batched-tokens=*)
+      _had_mnbt=1
+      _new_args+=("--max-num-batched-tokens=$MNBT_CAP") ;;
+    *) _new_args+=("$_a") ;;
+  esac
+done
+[[ "$_had_mnbt" -eq 0 ]] && _new_args+=(--max-num-batched-tokens "$MNBT_CAP")
+ENGINE_ARGS=("${_new_args[@]}")
 
 echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \

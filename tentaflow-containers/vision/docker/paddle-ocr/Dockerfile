@@ -15,11 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3.12 -m venv /opt/ocr-venv
 ENV PATH="/opt/ocr-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
+# transformers==4.55.0 (wersja z config.json PaddleOCR-VL; server.py shimuje
+# create_causal_mask). torchvision/protobuf/einops wymagane przez zdalny kod modelu.
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
-      torch==2.11.0 \
+      torch==2.11.0 torchvision \
     && pip install --no-cache-dir \
-      transformers==4.49.0 accelerate==1.4.0 sentencepiece==0.2.0 \
+      transformers==4.55.0 accelerate==1.4.0 sentencepiece==0.2.0 protobuf einops \
       pillow==11.1.0 fastapi==0.115.6 uvicorn==0.34.0 python-multipart
 
 COPY tentaflow-containers/vision/python/paddle-ocr/server.py /app/server.py

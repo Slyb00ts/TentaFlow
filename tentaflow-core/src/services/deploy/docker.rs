@@ -548,6 +548,7 @@ mod backend {
         context: &Path,
         dockerfile_rel: &str,
         tag: &str,
+        build_args: Option<std::collections::HashMap<String, String>>,
         log: Option<&LogSink>,
     ) -> DeployResult<()> {
         use futures::StreamExt;
@@ -572,6 +573,7 @@ mod backend {
             dockerfile: dockerfile_rel.to_string(),
             t: Some(tag.to_string()),
             rm: true,
+            buildargs: build_args,
             ..Default::default()
         };
 
@@ -861,19 +863,54 @@ impl DeployStrategy for DockerDeploy {
                 )
             })?;
         let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
-        let image_tag = format!(
-            "tentaflow/{}:{}",
-            self.manifest.engine.id, self.manifest.engine.version
-        );
+
+        // Hardware-aware build: wykryj arch-tag GPU hosta i wybierz build-args
+        // (CUDA base / torch index / wersja pakietu / arch list) z manifestu.
+        // default_build_args + arch_variants[arch] (arch wygrywa). Gdy silnik
+        // deklaruje `arch_variants`, tag obrazu dostaje sufiks arch, zeby obrazy
+        // pod rozne karty (np. sglang Ampere vs Blackwell) nie kolidowaly w
+        // cache "build only when missing".
+        let arch_tag = crate::system_check::collect().gpu.cuda_arch_tag();
+        let mut build_args: std::collections::HashMap<String, String> =
+            docker_section.default_build_args.clone();
+        if let Some(variant) = docker_section.arch_variants.get(&arch_tag) {
+            for (k, v) in &variant.build_args {
+                build_args.insert(k.clone(), v.clone());
+            }
+        }
+        // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
+        // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
+        // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
+        // tagu (brak niepotrzebnych przebudow).
+        let arch_aware =
+            !docker_section.arch_variants.is_empty() || !docker_section.default_build_args.is_empty();
+        let image_tag = if arch_aware {
+            format!(
+                "tentaflow/{}:{}-{}",
+                self.manifest.engine.id, self.manifest.engine.version, arch_tag
+            )
+        } else {
+            format!(
+                "tentaflow/{}:{}",
+                self.manifest.engine.id, self.manifest.engine.version
+            )
+        };
+        let build_args = if build_args.is_empty() {
+            None
+        } else {
+            Some(build_args)
+        };
 
         // Build only when missing — repeated deploys reuse the cached image.
         if !backend::image_exists(&docker, &image_tag).await? {
             if let Some(s) = &self.log_sink {
                 s.info(&format!(
-                    "[docker] building image {} from {} (dockerfile {})",
+                    "[docker] building image {} from {} (dockerfile {}, arch {}, build_args {})",
                     image_tag,
                     bundle_root.display(),
-                    dockerfile_rel
+                    dockerfile_rel,
+                    arch_tag,
+                    build_args.as_ref().map(|m| m.len()).unwrap_or(0)
                 ));
             }
             backend::build_image_from_context(
@@ -881,6 +918,7 @@ impl DeployStrategy for DockerDeploy {
                 &bundle_root,
                 &dockerfile_rel,
                 &image_tag,
+                build_args,
                 self.log_sink.as_ref(),
             )
             .await?;
@@ -953,6 +991,21 @@ impl DeployStrategy for DockerDeploy {
         if let Some(served) = super::resolve_served_model_name(&self.manifest, &self.user_config) {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
+        // Edytowalna komenda z wizarda (Override): entrypoint wykrywa
+        // ENGINE_LAUNCH_CMD i odpala je verbatim przez `sh -c` (placeholdery
+        // $MODEL/$PORT rozwija powloka z env powyzej), pomijajac budowane argi.
+        let launch_override = self
+            .user_config
+            .get("launch_command_override")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if let Some(cmd) = launch_override {
+            env.insert("ENGINE_LAUNCH_CMD".into(), cmd.to_string());
+            if let Some(s) = &self.log_sink {
+                s.info("[docker] launch_command_override aktywny (ENGINE_LAUNCH_CMD)");
+            }
+        }
         // Argumenty CLI silnika budowane jako strukturalny Vec<String> i
         // przekazywane do kontenera jako bollard `Cmd` (array) → entrypoint
         // odbiera je jako `"$@"`. Nie ma round-tripu przez stringowy VLLM_ARGS
@@ -964,7 +1017,9 @@ impl DeployStrategy for DockerDeploy {
         // argv. Bez tego kontener startuje vLLM z pelnokontekstowymi defaultami
         // (brak --max-model-len / --max-num-batched-tokens) → OOM. Baseline idzie
         // PRZED user/spec/gpu, wiec dedup_cli_args_last_wins pozwala je nadpisac.
-        engine_args.extend(vllm_docker_baseline_args(&self.manifest.engine.id));
+        engine_args.extend(crate::deploy::launch_dialect::docker_baseline_args(
+            &self.manifest.engine.id,
+        ));
         // User-typed `vllm_args` (wizard Advanced) — user sam cytuje, wiec
         // shlex split jest poprawny dla niego (np. JSON w single-quotes).
         if let Some(raw_args) = self
@@ -1150,6 +1205,8 @@ impl DeployStrategy for DockerDeploy {
                 // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
                 // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
                 format!("http://127.0.0.1:{}/healthz", host_http),
+                // ComfyUI nie ma /health ani /v1/models — gotowosc po /system_stats.
+                format!("http://127.0.0.1:{}/system_stats", host_http),
             ],
             status_report_interval: std::time::Duration::from_secs(30),
             log_sink: self.log_sink.clone(),
@@ -1297,34 +1354,6 @@ impl DeployStrategy for DockerDeploy {
     }
 }
 
-/// Baseline argv dla silnikow vLLM przy deployu docker. Native bierze te same
-/// flagi z bundle.toml `[launch] args`; docker bundle.toml nie ma, wiec
-/// odtwarzamy je tu jako single source of truth Rust-side. Dotyczy WYLACZNIE
-/// rodziny vLLM (vllm / vllm-spark / vllm-metal) — sglang / llama.cpp / trt
-/// maja inny zestaw flag i nie dostaja tego baseline. `--enable-flashinfer-autotune`
-/// jest w baseline; dla vllm-spark `prepare` dorzuca pozniej
-/// `--no-enable-flashinfer-autotune`, ktore wygrywa przez dedup last-wins.
-#[cfg(feature = "docker")]
-fn vllm_docker_baseline_args(engine_id: &str) -> Vec<String> {
-    if !matches!(engine_id, "vllm" | "vllm-spark" | "vllm-metal") {
-        return Vec::new();
-    }
-    [
-        "--dtype",
-        "auto",
-        "--max-model-len",
-        "8192",
-        "--max-num-batched-tokens",
-        "8192",
-        "--enable-prefix-caching",
-        "--enable-chunked-prefill",
-        "--enable-flashinfer-autotune",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,6 +1445,7 @@ mod tests {
                     download_size_mb: None,
                     transport: Some(DockerTransport::SidecarQuic),
                     gpus: None,
+                    ..Default::default()
                 }),
                 native: None,
                 external: None,
@@ -1466,7 +1496,7 @@ mod tests {
     #[cfg(feature = "docker")]
     #[test]
     fn docker_baseline_seeded_for_vllm() {
-        let base = vllm_docker_baseline_args("vllm");
+        let base = crate::deploy::launch_dialect::docker_baseline_args("vllm");
         let args = crate::deploy::python_venv::dedup_cli_args_last_wins(base);
         let joined = args.join(" ");
         assert!(joined.contains("--dtype auto"), "got: {joined}");
@@ -1486,7 +1516,7 @@ mod tests {
     #[cfg(feature = "docker")]
     #[test]
     fn docker_spark_disables_flashinfer_autotune_after_dedup() {
-        let mut base = vllm_docker_baseline_args("vllm-spark");
+        let mut base = crate::deploy::launch_dialect::docker_baseline_args("vllm-spark");
         // Symuluj normalizacje z prepare (engine_args.push po user/spec/gpu).
         base.push("--no-enable-flashinfer-autotune".to_string());
         let args = crate::deploy::python_venv::dedup_cli_args_last_wins(base);
@@ -1504,10 +1534,15 @@ mod tests {
     #[cfg(feature = "docker")]
     #[test]
     fn docker_baseline_empty_for_non_vllm() {
-        assert!(vllm_docker_baseline_args("sglang").is_empty());
-        assert!(vllm_docker_baseline_args("llama-cpp").is_empty());
-        assert!(vllm_docker_baseline_args("trt-llm").is_empty());
-        assert!(!vllm_docker_baseline_args("vllm-metal").is_empty());
+        use crate::deploy::launch_dialect::docker_baseline_args;
+        // sglang ma teraz wlasny baseline (dialekt sglang), nie vLLM-owy.
+        let sglang = docker_baseline_args("sglang").join(" ");
+        assert!(sglang.contains("--mem-fraction-static"), "got: {sglang}");
+        assert!(!sglang.contains("--max-model-len"), "got: {sglang}");
+        // llama.cpp / trt-llm — bez Rust-side baseline (entrypoint/runner wlasny).
+        assert!(docker_baseline_args("llama-cpp").is_empty());
+        assert!(docker_baseline_args("trt-llm").is_empty());
+        assert!(!docker_baseline_args("vllm-metal").is_empty());
     }
 
     /// Live docker test — gated on a running daemon. Skipped silently when

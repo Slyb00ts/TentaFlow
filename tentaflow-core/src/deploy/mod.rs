@@ -17,5 +17,6 @@ pub mod process_ctl;
 pub mod python_venv;
 
 pub use bundle::extract_to;
+pub mod launch_dialect;
 pub mod vllm_recipes;
 pub mod vram_calculator;

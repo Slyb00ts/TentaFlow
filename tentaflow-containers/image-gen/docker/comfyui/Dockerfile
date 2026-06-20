@@ -27,6 +27,6 @@ COPY tentaflow-containers/image-gen/docker/comfyui/entrypoint.sh /app/entrypoint
 RUN chmod +x /app/entrypoint.sh
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${COMFY_PORT:-8188}/system_stats" || exit 1
+    CMD curl -fsS "http://127.0.0.1:${PORT:-${COMFY_PORT:-8188}}/system_stats" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
