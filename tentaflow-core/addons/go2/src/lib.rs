@@ -214,6 +214,37 @@ mod log {
     }
 }
 
+/// Sub-millisecond clocks for pipeline timing. The addon targets `wasm32-wasip1`
+/// and both the wasmtime (desktop) and wasmi (mobile) hosts back WASI
+/// `clock_time_get` for clock_id 0 (realtime) and 1 (monotonic), so `std::time`
+/// works here with real precision — no extra host-fn is needed just to measure.
+/// `wall_micros` stamps the canonical frame header so the browser can compute a
+/// true end-to-end latency; `mono_micros` measures stage durations (immune to
+/// wall-clock steps).
+mod clock {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    /// Wall-clock microseconds since the Unix epoch. Used to stamp the canonical
+    /// frame header (`timestamp_us`) so the browser, on the same machine for the
+    /// local case, can subtract its own wall clock for an end-to-end delta.
+    pub fn wall_micros() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Monotonic microseconds from a process-static reference Instant. Only valid
+    /// for measuring intervals/durations within this process (never compared
+    /// across machines), so it never goes backwards under NTP adjustments.
+    pub fn mono_micros() -> i64 {
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = EPOCH.get_or_init(Instant::now);
+        epoch.elapsed().as_micros() as i64
+    }
+}
+
 fn read_string(ptr: i32, len: i32) -> String {
     if ptr <= 0 || len <= 0 {
         return String::new();
@@ -765,6 +796,10 @@ const LIDAR_MAX_POINTS: usize = 300_000;
 // the card without writing on every decoded voxel frame; availability/enabled
 // transitions bypass this and persist immediately.
 const LIDAR_STATUS_REFRESH_SECS: i64 = 1;
+// Rate-limit for the per-frame pipeline timing log line. At a typical ~5 Hz voxel
+// stream this emits roughly one concise timing line every ~2 s, enough to watch
+// live without flooding the log on the hot drain path.
+const LIDAR_TIMING_LOG_EVERY: u64 = 10;
 
 /// Latest decoded LiDAR frame plus the on/off intent. Only the MOST RECENT frame
 /// is kept (the voxel map is a stream); a new frame overwrites the prior one so
@@ -804,6 +839,15 @@ struct LidarState {
     // Size of the last compressed payload received (bytes), for diagnostics even
     // when a frame failed to decode.
     last_payload_bytes: usize,
+    // --- Pipeline timing (always-on, rate-limited in logs) ---
+    // Monotonic µs of the previous voxel-frame arrival, to derive the WebRTC
+    // inter-arrival interval (and thus the robot's effective send Hz). Zero until
+    // the first frame establishes a baseline (no interval logged for frame #1).
+    last_voxel_arrival_us: i64,
+    // Counter of ingested voxel frames, used to rate-limit the timing log line so
+    // a multi-Hz stream emits roughly one timing line per LIDAR_TIMING_LOG_EVERY
+    // frames instead of one per frame.
+    timing_log_counter: u64,
 }
 
 std::thread_local! {
@@ -1032,8 +1076,20 @@ fn ingest_voxel_map(raw: &[u8]) {
     let Some((data, compressed)) = parse_voxel_frame(raw) else {
         return;
     };
-    LIDAR.with(|cell| {
-        cell.borrow_mut().last_payload_bytes = compressed.len();
+    // Stage 1: WebRTC voxel-frame cadence. Snapshot the arrival instant and the
+    // delta from the previous voxel frame (0 for the very first one). Monotonic,
+    // so an NTP step can't produce a bogus negative interval.
+    let arrival_us = clock::mono_micros();
+    let webrtc_interval_us = LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.last_payload_bytes = compressed.len();
+        let delta = if l.last_voxel_arrival_us > 0 {
+            arrival_us - l.last_voxel_arrival_us
+        } else {
+            0
+        };
+        l.last_voxel_arrival_us = arrival_us;
+        delta
     });
     let resolution = data.get("resolution").and_then(JsonValue::as_f64);
     let origin = parse_origin3(data.get("origin"));
@@ -1062,6 +1118,10 @@ fn ingest_voxel_map(raw: &[u8]) {
         log::warn("go2 lidar: src_size out of bounds — frame skipped");
         return;
     }
+    // Stage 2: addon decode duration starts here (LZ4-decompress + the bit-scan
+    // canonical decode below). Monotonic so it measures pure CPU work, immune to
+    // any wall-clock adjustment mid-frame.
+    let decode_start_us = clock::mono_micros();
     let mut decompressed = vec![0u8; src_size];
     let n = match lz4_flex::block::decompress_into(compressed, &mut decompressed) {
         Ok(n) => n,
@@ -1108,19 +1168,52 @@ fn ingest_voxel_map(raw: &[u8]) {
     // Decode the bitfield DIRECTLY into the canonical packed-f32 frame and publish
     // it to the host (one preallocated buffer, one WASM->host copy, zero JSON) so
     // the L2 stream hub / renderer get vendor-agnostic points. Only when LiDAR is
-    // enabled and the grid actually has occupied voxels. db::now_secs has 1s
-    // granularity here; scale to the canonical us field (no sub-second source on
-    // the drain path). A frame above LIDAR_MAX_POINTS is dropped + logged.
+    // enabled and the grid actually has occupied voxels. A frame above
+    // LIDAR_MAX_POINTS is dropped + logged.
+    //
+    // The header `timestamp_us` is the REAL wall-clock microsecond of decode time
+    // (WASI realtime clock), not the old second-granularity `now*1e6` — the
+    // browser subtracts its own wall clock from this to get end-to-end latency, so
+    // sub-millisecond precision is required (1 s granularity would make every
+    // latency look like 0–1000 ms of pure rounding noise).
+    let mut decode_us: i64 = 0;
+    let mut publish_us: i64 = 0;
+    let mut published_bytes: usize = 0;
     if enabled && point_count > 0 {
         match decode_voxel_to_canonical(
             &decompressed[..n],
             resolution_f32,
             [origin[0] as f32, origin[1] as f32, origin[2] as f32],
             frame_seq as u32,
-            now.saturating_mul(1_000_000),
+            clock::wall_micros(),
         ) {
-            Some(frame) => publish_lidar_frame(&frame),
+            Some(frame) => {
+                // Stage 2 end: decode duration covers LZ4 + canonical bit-scan.
+                decode_us = clock::mono_micros() - decode_start_us;
+                published_bytes = frame.len();
+                // Stage 3: publish duration — the WASM->host copy into the hub.
+                let publish_start_us = clock::mono_micros();
+                publish_lidar_frame(&frame);
+                publish_us = clock::mono_micros() - publish_start_us;
+            }
             None => log::warn("go2 lidar: frame exceeds LIDAR_MAX_POINTS — not published"),
+        }
+        // Rate-limited timing line: one concise summary per LIDAR_TIMING_LOG_EVERY
+        // frames so a multi-Hz stream doesn't flood the log. Covers stages 1–3.
+        let should_log = LIDAR.with(|cell| {
+            let mut l = cell.borrow_mut();
+            l.timing_log_counter = l.timing_log_counter.wrapping_add(1);
+            l.timing_log_counter % LIDAR_TIMING_LOG_EVERY == 0
+        });
+        if should_log && decode_us > 0 {
+            log::info(&alloc::format!(
+                "lidar timing: webrtc_interval={}ms decode={}us publish={}us points={} bytes={}",
+                webrtc_interval_us / 1000,
+                decode_us,
+                publish_us,
+                point_count,
+                published_bytes,
+            ));
         }
     }
     // Persist the SMALL status (metadata only) so any worker's go2.status /
@@ -1509,6 +1602,7 @@ fn do_connect() -> JsonValue {
         keepalive_text: Some(protocol::HEARTBEAT_TEXT.into()),
         keepalive_interval_ms: 1000,
         keepalive_marker: Some(protocol::HEARTBEAT_MARKER.into()),
+        peer_ipv4: Some(ip.clone()),
     };
     let out: WebRtcConnectOutput = match call_cbor_in_out(&connect_in, webrtc_connect_v1) {
         Ok(o) => o,
