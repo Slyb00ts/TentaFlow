@@ -33,6 +33,13 @@ pub struct RouteMetadata {
     /// Node that ran the request end-to-end (`local_node_id` for in-process,
     /// peer node id for forwarded calls).
     pub served_by_node: Option<String>,
+    /// REAL model name of the winning `ResolvedExecutionTarget` (the model
+    /// that actually served the request), NOT the requested alias. Filled
+    /// from `ResolvedExecutionTarget::requested_model()` of the candidate the
+    /// failover loop landed on — for MeshForward the wire response echoes the
+    /// alias as `model`, so audit telemetry (alias_calls.target_used) must
+    /// read this field instead of the response body.
+    pub served_model: Option<String>,
     /// `embedded` / `http` / `quic` / `mesh_forward` / `flow_engine` —
     /// matches existing `routing::RouteMetadata` strings so the OpenAI
     /// response shape stays stable.

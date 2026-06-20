@@ -47,6 +47,12 @@ pub struct ResolveOutcome {
     /// Strategy declared on the alias chain root; `FirstAvailable` for
     /// direct (non-alias) lookups. Forwarded to `strategy::rank`.
     pub strategy: Strategy,
+    /// `true` gdy root `requested_model` to faktyczny wpis `Alias` w katalogu.
+    /// Sterowanie `alias_fallback_total{alias}`: metryka liczy się WYŁĄCZNIE
+    /// dla aliasów. Zwykły model z wieloma instancjami też ma failover między
+    /// kandydatami, ale jego nazwa nie jest aliasem i nie może zaśmiecać
+    /// etykiety aliasowej (tanio — flaga z resolvera, bez zapytania DB w pętli).
+    pub requested_is_alias: bool,
 }
 
 #[derive(Debug, Error)]
@@ -160,6 +166,7 @@ impl AliasResolver {
             CatalogEntryKind::Alias { strategy, .. } => *strategy,
             _ => Strategy::FirstAvailable,
         };
+        let requested_is_alias = matches!(entry.kind, CatalogEntryKind::Alias { .. });
 
         let mut candidates = Vec::new();
         let mut dropped_no_live = false;
@@ -181,6 +188,7 @@ impl AliasResolver {
         Ok(ResolveOutcome {
             candidates,
             strategy,
+            requested_is_alias,
         })
     }
 
@@ -449,6 +457,117 @@ mod tests {
         AliasResolver::new_with_static_id(Arc::new(LiveHandlesCache::new()), local.to_string())
     }
 
+    /// Resolver z wstrzykniętym EMBEDDED handle dla `(local, service_id)` — w
+    /// teście dowodzi, że embedded model (in-process, BEZ `endpoint_url`) jest
+    /// żywym kandydatem, a nie odrzucany za brak endpointu (regresja, którą miał
+    /// usunięty równoległy resolver A1).
+    fn resolver_with_embedded(local: &str, service_id: i64, model: &str) -> AliasResolver {
+        let handles = Arc::new(LiveHandlesCache::new());
+        handles.insert(
+            local.to_string(),
+            service_id,
+            crate::services::handles_cache::BackendHandle::Embedded {
+                model_name: model.to_string(),
+                node_id: local.to_string(),
+                engine_id: "test-engine".to_string(),
+            },
+        );
+        AliasResolver::new_with_static_id(handles, local.to_string())
+    }
+
+    fn service_entry_with_service_id(
+        id: &str,
+        node: &str,
+        service_id: i64,
+        surfaces: Vec<ServiceSurface>,
+    ) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            kind: CatalogEntryKind::ServiceModel {
+                instances: vec![ModelInstance {
+                    node_id: node.to_string(),
+                    node_hostname: None,
+                    service_id,
+                    status: "running".into(),
+                    backend: Some("emb".into()),
+                    size_mb: None,
+                    loaded: true,
+                    input_modalities: vec![],
+                    output_modalities: vec![],
+                }],
+            },
+            service_surfaces: surfaces,
+            input_modalities: vec![],
+            output_modalities: vec![],
+            diagnostic: None,
+        }
+    }
+
+    /// Alias primary = serwis na PEERZE (kandydat mesh-forward, pozycja 0),
+    /// fallback = lokalny serwis EMBEDDED (pozycja 1). Resolver MUSI wystawić
+    /// oba kandydaty z embedded fallbackiem jako żywym `Local` — to jest cel
+    /// A1 serwer→telefon: gdy zdalny primary padnie przy dispatchu, executor
+    /// schodzi na embedded model in-process, którego ta ścieżka NIE odrzuca za
+    /// brak `endpoint_url`.
+    #[test]
+    fn alias_falls_back_to_embedded_local_target() {
+        let primary = service_entry("big-model", "peer-a", vec![ServiceSurface::Chat], vec![], vec![]);
+        let fallback =
+            service_entry_with_service_id("small-model", "local", 9, vec![ServiceSurface::Chat]);
+        let alias_entry = alias(
+            "rag-llm",
+            "big-model",
+            &["small-model"],
+            Strategy::FirstAvailable,
+        );
+        let snap = snapshot(vec![primary, fallback, alias_entry]);
+        let resolver = resolver_with_embedded("local", 9, "small-model");
+        let mut ctx = ExecutionContext::new(None);
+
+        let outcome = resolver
+            .resolve(&chat_request("rag-llm"), &snap, &mut ctx)
+            .expect("alias must resolve with mesh primary + embedded fallback");
+
+        // Root to faktyczny alias — metryka aliasowa wolna do liczenia.
+        assert!(outcome.requested_is_alias);
+        // Primary mesh-forward na pozycji 0, embedded local na pozycji 1.
+        assert_eq!(outcome.candidates.len(), 2);
+        assert!(matches!(
+            outcome.candidates[0],
+            ResolvedExecutionTarget::MeshForward { .. }
+        ));
+        match &outcome.candidates[1] {
+            ResolvedExecutionTarget::Local {
+                model_name, handle, ..
+            } => {
+                assert_eq!(model_name, "small-model");
+                assert_eq!(handle.endpoint_signature(), "embedded:test-engine:small-model");
+            }
+            other => panic!("expected embedded Local fallback, got {:?}", other),
+        }
+    }
+
+    /// Wariant „serwer padł": w katalogu jest TYLKO embedded fallback (zdalny
+    /// primary zniknął z mesh). Embedded musi być jedynym, żywym kandydatem —
+    /// nie `NoLiveInstance`. Dowodzi, że brak `endpoint_url` ≠ niedostępność.
+    #[test]
+    fn embedded_only_target_is_live_not_rejected() {
+        let fallback =
+            service_entry_with_service_id("small-model", "local", 9, vec![ServiceSurface::Chat]);
+        let snap = snapshot(vec![fallback]);
+        let resolver = resolver_with_embedded("local", 9, "small-model");
+        let mut ctx = ExecutionContext::new(None);
+
+        let outcome = resolver
+            .resolve(&chat_request("small-model"), &snap, &mut ctx)
+            .expect("embedded local must be a live candidate, not rejected");
+        assert_eq!(outcome.candidates.len(), 1);
+        assert!(matches!(
+            outcome.candidates[0],
+            ResolvedExecutionTarget::Local { .. }
+        ));
+    }
+
     fn chat_request<'a>(model: &'a str) -> ResolveRequest<'a> {
         ResolveRequest {
             requested_model: model,
@@ -481,6 +600,9 @@ mod tests {
             .resolve(&chat_request("m"), &snap, &mut ctx)
             .unwrap();
         assert_eq!(outcome.candidates.len(), 1);
+        // Bezposredni model (nie alias) — `requested_is_alias` musi byc false,
+        // zeby jego failover NIE inkrementowal `alias_fallback_total`.
+        assert!(!outcome.requested_is_alias);
         assert!(matches!(
             outcome.candidates[0],
             ResolvedExecutionTarget::MeshForward { .. }

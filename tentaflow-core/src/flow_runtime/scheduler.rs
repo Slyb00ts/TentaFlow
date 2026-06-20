@@ -135,6 +135,12 @@ pub struct FlowScheduler {
     /// Late-bound after AddonManager owns the canonical EventBus. Sink
     /// operators emitting events publish here; tests may leave this `None`.
     event_bus: PlMutex<Option<Arc<EventBus>>>,
+    /// Late-bound `ModelRuntimeExecutor` (A1 §0.4). Predict-by-alias routes
+    /// through it for availability-aware failover (embedded/local/remote)
+    /// — the same path `/v1` uses. `None` until `set_executor`; Predict then
+    /// keeps the legacy dispatch-by-name behavior.
+    executor:
+        PlMutex<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>,
 }
 
 static GLOBAL: OnceLock<Arc<FlowScheduler>> = OnceLock::new();
@@ -169,6 +175,7 @@ impl FlowScheduler {
             in_flight: PlMutex::new(HashMap::new()),
             service_manager: PlMutex::new(None),
             event_bus: PlMutex::new(None),
+            executor: PlMutex::new(None),
         }
     }
 
@@ -215,6 +222,16 @@ impl FlowScheduler {
         *self.event_bus.lock() = Some(bus);
     }
 
+    /// Late-bind the runtime executor (same lifecycle as `set_service_manager`).
+    /// Wired once from boot after `Router::new` so Predict-by-alias reaches the
+    /// availability-aware failover path.
+    pub fn set_executor(
+        &self,
+        executor: Arc<crate::services::runtime::executor::ModelRuntimeExecutor>,
+    ) {
+        *self.executor.lock() = Some(executor);
+    }
+
     /// Snapshot of the service manager handle. `None` until `set_service_manager`
     /// is called — operators raising side effects against it must surface a
     /// clean `Internal` error in that case.
@@ -225,6 +242,14 @@ impl FlowScheduler {
     /// Snapshot of the event bus handle (same semantics as `service_manager`).
     pub fn event_bus(&self) -> Option<Arc<EventBus>> {
         self.event_bus.lock().clone()
+    }
+
+    /// Snapshot of the runtime executor handle (same semantics as
+    /// `service_manager`). `None` until `set_executor`.
+    pub fn executor(
+        &self,
+    ) -> Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>> {
+        self.executor.lock().clone()
     }
 
     /// Installs the process-wide singleton. First caller wins; subsequent
@@ -749,6 +774,7 @@ impl FlowScheduler {
                 permissions: permissions.clone(),
                 permission_checker: permission_checker.clone(),
                 service_manager: self.service_manager(),
+                executor: self.executor(),
                 event_bus: self.event_bus(),
                 sink_outputs: sink_outputs.clone(),
                 org_id: org_id.clone(),

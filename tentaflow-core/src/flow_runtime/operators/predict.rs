@@ -185,10 +185,12 @@ pub async fn run(
                 };
                 let started = Instant::now();
                 let sm_ref = ctx.service_manager.as_ref();
+                let executor_ref = ctx.executor.as_ref();
                 let call_fut = dispatch(
                     req,
                     &ctx.db,
                     sm_ref,
+                    executor_ref,
                     Some(&ctx.permission_checker),
                     &ctx.permissions,
                 );

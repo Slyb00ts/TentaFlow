@@ -5,6 +5,7 @@
 // transport (local handle / mesh forward / flow_engine).
 // =============================================================================
 
+pub mod alias_metrics;
 pub mod circuit_breaker;
 pub mod context;
 pub mod executor;

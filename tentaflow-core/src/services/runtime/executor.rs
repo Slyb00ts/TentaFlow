@@ -232,8 +232,15 @@ impl ModelRuntimeExecutor {
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => {
@@ -327,8 +334,15 @@ impl ModelRuntimeExecutor {
                         "chat stream dispatch routed"
                     );
                     ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
                     return Ok(stream);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
@@ -1195,8 +1209,15 @@ impl ModelRuntimeExecutor {
             {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
@@ -1481,8 +1502,15 @@ impl ModelRuntimeExecutor {
             {
                 Ok(result) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
                     return Ok(result);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
@@ -2344,6 +2372,38 @@ fn extract_completion_usage(
     }
 }
 
+/// Jeden wspolny punkt liczenia fallbacku aliasu. `attempts` to numer proby,
+/// na ktorej dispatch sie powiodl (1 = primary). Gdy > 1, primary realnie padl
+/// i request zszedl na kandydata o pozycji `attempts - 1` — logujemy `warn!`
+/// tu, zeby /v1, flow i addon (wszystkie idace przez ten executor) raportowaly
+/// fallback przez ten sam mechanizm (anti-cicha-degradacja).
+///
+/// `requested_is_alias` (tania flaga z resolvera, bez zapytania DB w petli)
+/// bramkuje metryke `alias_fallback_total{alias}`: liczymy ja WYLACZNIE gdy
+/// `requested_model` to faktyczny alias. Zwykly model z wieloma instancjami
+/// tez failuje miedzy kandydatami, ale jego nazwa nie jest aliasem — liczenie
+/// go pod etykieta aliasowa zaszumialoby metryke. Nie-aliasowy fallback nadal
+/// dostaje `warn!` (widocznosc degradacji), tylko bez inkrementu metryki.
+fn note_fallback(
+    requested_model: &str,
+    requested_is_alias: bool,
+    attempts: usize,
+    target_tag: &'static str,
+) {
+    if attempts > 1 {
+        if requested_is_alias {
+            crate::services::runtime::alias_metrics::record_alias_fallback(requested_model);
+        }
+        tracing::warn!(
+            model = %requested_model,
+            is_alias = requested_is_alias,
+            chain_position = attempts - 1,
+            target_kind = target_tag,
+            "primary niedostepny — zszedlem na fallback"
+        );
+    }
+}
+
 fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
     match target {
         ResolvedExecutionTarget::Local { handle, .. } => match handle {
@@ -2404,6 +2464,36 @@ mod tests {
         .aborts_fallback_chain());
         assert!(!ExecutorError::Internal("z".into()).aborts_fallback_chain());
         assert!(!ExecutorError::FlowEmptyResult { model: "m".into() }.aborts_fallback_chain());
+    }
+
+    /// `note_fallback` bramkuje metryke `alias_fallback_total{model}` flaga
+    /// `requested_is_alias`: aliasowy fallback liczy sie raz, nie-aliasowy
+    /// (zwykly model z wieloma instancjami) NIE inkrementuje metryki aliasowej.
+    /// Primary trafiony (attempts=1) nigdy nie liczy fallbacku.
+    #[test]
+    fn note_fallback_only_counts_real_aliases() {
+        use crate::services::runtime::alias_metrics::alias_fallback_count;
+
+        let alias = "note-fallback-alias-test";
+        let plain = "note-fallback-plain-model-test";
+
+        // Primary trafiony — zaden fallback, zero inkrementu nawet dla aliasu.
+        note_fallback(alias, true, 1, "embedded");
+        assert_eq!(alias_fallback_count(alias), 0);
+
+        // Aliasowy fallback (pozycja 1) liczy sie raz.
+        note_fallback(alias, true, 2, "mesh_forward");
+        assert_eq!(alias_fallback_count(alias), 1);
+
+        // Nie-aliasowy fallback (zwykly model z wieloma kandydatami) NIE
+        // inkrementuje metryki aliasowej — etykieta zostaje czysta.
+        note_fallback(plain, false, 2, "http");
+        note_fallback(plain, false, 3, "embedded");
+        assert_eq!(alias_fallback_count(plain), 0);
+
+        // Kolejny aliasowy fallback inkrementuje dalej (do 2).
+        note_fallback(alias, true, 3, "http");
+        assert_eq!(alias_fallback_count(alias), 2);
     }
 
     // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without

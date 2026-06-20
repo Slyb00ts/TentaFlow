@@ -76,6 +76,7 @@ pub fn service_request(
     let permission_checker = state.permission_checker.clone();
     let permissions = state.permissions.clone();
     let service_manager = state.router.as_ref().map(|r| r.service_manager().clone());
+    let executor = state.router.as_ref().and_then(|r| r.executor());
 
     let outcome = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -83,6 +84,7 @@ pub fn service_request(
                 req,
                 &db,
                 service_manager.as_ref(),
+                executor.as_ref(),
                 Some(&permission_checker),
                 &permissions,
             )

@@ -101,10 +101,12 @@ pub const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// `permission_checker` may be `None` only when `caller.is_system_call` is
 /// `true` AND the addon was already vetted by a higher layer; this matches
 /// the AddonState semantics (system calls without user_id skip the resolve).
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     req: ServiceCallRequest,
     db: &DbPool,
     service_manager: Option<&Arc<ServiceManager>>,
+    executor: Option<&Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
     permission_checker: Option<&PermissionChecker>,
     permissions: &[String],
 ) -> Result<ServiceCallResponse, ServiceCallError> {
@@ -172,7 +174,7 @@ pub async fn dispatch(
     }
 
     // ---- alias gate (F1a §6.6) ----
-    {
+    let alias_row = {
         match crate::db::repository::resolve_model_alias_for_addon(
             db,
             &service_name,
@@ -194,7 +196,7 @@ pub async fn dispatch(
                     service: service_name,
                 });
             }
-            Ok(_) => {}
+            Ok(row) => row,
             Err(e) => {
                 if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>()
                     .is_some()
@@ -219,6 +221,126 @@ pub async fn dispatch(
                 return Err(ServiceCallError::Internal(format!("alias_gate: {e}")));
             }
         }
+    };
+
+    // ---- alias failover (A1 §0.4) ----
+    // Gdy `service_name` jest aktywnym aliasem ORAZ mamy `ModelRuntimeExecutor`,
+    // dispatch idzie przez TĘ SAMĄ ścieżkę co `/v1` i flow: `AliasResolver`
+    // rozwiązuje alias na `ResolvedExecutionTarget` (embedded/local/remote-node),
+    // a pętla failoveru w executorze próbuje kandydatów [target_model] +
+    // fallbacks w kolejności, schodząc na pierwszy DOSTĘPNY — w tym do modelu
+    // EMBEDDED na telefonie (brak endpoint_url nie jest niedostępnością) i z
+    // mesh-forwardem gdy właściciel modelu to inny węzeł. Bez executora (boot/
+    // test DB-less) degradujemy do legacy dispatchu po nazwie aliasu poniżej.
+    if let (Some(_), Some(executor)) = (&alias_row, executor) {
+        let started = Instant::now();
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None);
+        let routed = route_alias_via_executor(
+            executor,
+            &service_name,
+            &req.payload_json,
+            &mut exec_ctx,
+        )
+        .await;
+        let duration_ms = started.elapsed().as_millis() as i64;
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        return match routed {
+            Ok(routed) => {
+                log_alias_call(
+                    db,
+                    &req.caller,
+                    &service_name,
+                    Some(&AliasCallRoute {
+                        target_used: resolved_target_used(
+                            exec_ctx.route_metadata.served_model.as_deref(),
+                            &routed.target_model,
+                        ),
+                        target_node_id: exec_ctx.route_metadata.served_by_node.as_deref(),
+                        chain_position: exec_ctx.route_metadata.fallbacks_tried as i64,
+                        fallback_used: exec_ctx.route_metadata.fallbacks_tried > 0,
+                    }),
+                    &request_id,
+                    duration_ms,
+                    req.payload_json.len() as i64,
+                    routed.response_json.len() as i64,
+                    None,
+                    "ok",
+                    None,
+                );
+                emit_audit(
+                    db,
+                    &req.caller,
+                    "service.request",
+                    Some("alias"),
+                    Some(&service_name),
+                    "ok",
+                    None,
+                );
+                Ok(ServiceCallResponse {
+                    response_json: routed.response_json,
+                    duration_ms,
+                    frame_ref: None,
+                    request_id,
+                })
+            }
+            Err(AliasRouteError::NoTarget(msg)) => {
+                log_alias_call(
+                    db,
+                    &req.caller,
+                    &service_name,
+                    None,
+                    &request_id,
+                    duration_ms,
+                    req.payload_json.len() as i64,
+                    0,
+                    None,
+                    "no_target",
+                    Some(&msg),
+                );
+                emit_audit(
+                    db,
+                    &req.caller,
+                    "service.request",
+                    Some("alias"),
+                    Some(&service_name),
+                    "error",
+                    Some("alias_no_target_available"),
+                );
+                Err(ServiceCallError::NotFound {
+                    service: service_name,
+                })
+            }
+            Err(AliasRouteError::Dispatch(msg)) => {
+                error!(
+                    "service_call: alias '{}' dispatch error: {}",
+                    service_name, msg
+                );
+                log_alias_call(
+                    db,
+                    &req.caller,
+                    &service_name,
+                    None,
+                    &request_id,
+                    duration_ms,
+                    req.payload_json.len() as i64,
+                    0,
+                    None,
+                    "error",
+                    Some(&msg),
+                );
+                emit_audit(
+                    db,
+                    &req.caller,
+                    "service.request",
+                    Some("alias"),
+                    Some(&service_name),
+                    "error",
+                    Some(&msg),
+                );
+                Err(ServiceCallError::Internal(msg))
+            }
+        };
     }
 
     let service_manager = match service_manager {
@@ -272,6 +394,7 @@ pub async fn dispatch(
                 db,
                 &req.caller,
                 &service_name,
+                None,
                 &request_id,
                 duration_ms,
                 effective_payload.len() as i64,
@@ -302,6 +425,7 @@ pub async fn dispatch(
                 db,
                 &req.caller,
                 &service_name,
+                None,
                 &request_id,
                 duration_ms,
                 effective_payload.len() as i64,
@@ -334,6 +458,7 @@ pub async fn dispatch(
                 db,
                 &req.caller,
                 &service_name,
+                None,
                 &request_id,
                 duration_ms,
                 effective_payload.len() as i64,
@@ -367,6 +492,7 @@ pub async fn dispatch(
                 db,
                 &req.caller,
                 &service_name,
+                None,
                 &request_id,
                 duration_ms,
                 effective_payload.len() as i64,
@@ -592,6 +718,155 @@ async fn dispatch_http(
     serde_json::to_string(&response).map_err(|e| DispatchErr::Other(format!("serialize: {e}")))
 }
 
+/// Wynik routingu aliasu przez `ModelRuntimeExecutor`. `target_model` to model,
+/// na którym dispatch realnie wylądował (primary albo fallback — telemetria
+/// pozycji w `ExecutionContext.route_metadata`).
+struct AliasRouteResult {
+    response_json: String,
+    target_model: String,
+}
+
+/// Błąd routingu aliasu przez executor — rozdzielony, żeby `dispatch` mapowało
+/// "żaden target niedostępny" na `NotFound` (jak legacy `DispatchErr::NotFound`),
+/// a realny błąd backendu na `Internal`.
+enum AliasRouteError {
+    NoTarget(String),
+    Dispatch(String),
+}
+
+/// Routuje addonowy `service_request` celujący w alias przez TĘ SAMĄ ścieżkę co
+/// `/v1`/flow: `ModelRuntimeExecutor`. Najpierw próbuje powierzchni chat
+/// (`execute_chat`), a gdy resolver odrzuci ją jako capability-mismatch — alias
+/// serwuje embeddingi, więc schodzi na `execute_embeddings`. Failover po
+/// kandydatach (primary + fallbacks, w tym EMBEDDED na telefonie) i metryka
+/// fallbacku dzieją się WEWNĄTRZ executora; tu tylko mapujemy payload addona
+/// (surowy JSON) na request OpenAI i odpowiedź z powrotem na kształt
+/// `{status, text|embeddings, model}` którego oczekuje SDK addona.
+async fn route_alias_via_executor(
+    executor: &Arc<crate::services::runtime::executor::ModelRuntimeExecutor>,
+    alias: &str,
+    payload_json: &str,
+    exec_ctx: &mut crate::services::runtime::context::ExecutionContext,
+) -> Result<AliasRouteResult, AliasRouteError> {
+    use crate::api::openai::types::{ChatCompletionRequest, EmbeddingRequest, MessageContent};
+    use crate::services::runtime::executor::ExecutorError;
+    use crate::services::runtime::resolver::ResolveError;
+
+    // Chat: payload addona jako pojedyncza wiadomość user (lustro
+    // `dispatch_to_service`/`dispatch_http` — semantyka Completion zachowana).
+    let chat_req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": alias,
+        "messages": [{"role": "user", "content": payload_json}],
+    }))
+    .map_err(|e| AliasRouteError::Dispatch(format!("build chat request: {e}")))?;
+
+    match executor.execute_chat(chat_req, exec_ctx).await {
+        Ok(resp) => {
+            let text = resp
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .map(|mc| match mc {
+                    MessageContent::Text(s) => s.clone(),
+                    MessageContent::Parts(_) => String::new(),
+                })
+                .unwrap_or_default();
+            let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
+            let body = serde_json::json!({
+                "status": "ok",
+                "text": text,
+                "model": resp.model,
+                "finish_reason": finish_reason,
+            });
+            let response_json = serde_json::to_string(&body)
+                .map_err(|e| AliasRouteError::Dispatch(format!("serialize: {e}")))?;
+            return Ok(AliasRouteResult {
+                response_json,
+                target_model: resp.model,
+            });
+        }
+        // Alias nie serwuje powierzchni chat — spróbuj embeddingów. Pozostałe
+        // błędy resolvera (np. zła konfiguracja primary) propagujemy.
+        Err(ExecutorError::Resolve(ResolveError::CapabilityUnsupported { .. })) => {}
+        Err(ExecutorError::Resolve(
+            ResolveError::NoLiveInstance(_) | ResolveError::UnknownModel(_),
+        )) => {
+            return Err(AliasRouteError::NoTarget(
+                "alias_no_target_available".to_string(),
+            ));
+        }
+        Err(ExecutorError::AllCandidatesFailed { last_error, .. }) => {
+            return Err(AliasRouteError::Dispatch(last_error));
+        }
+        Err(e) => return Err(AliasRouteError::Dispatch(e.to_string())),
+    }
+
+    // Embeddings: input z pola `input` payloadu (string lub lista) — gdy brak,
+    // cały payload traktujemy jako pojedynczy tekst do osadzenia.
+    let input = embeddings_input_from_payload(payload_json);
+    let emb_req = EmbeddingRequest {
+        model: alias.to_string(),
+        input,
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+    };
+    match executor.execute_embeddings(emb_req, exec_ctx).await {
+        Ok(resp) => {
+            let embeddings: Vec<&Vec<f32>> = resp.data.iter().map(|d| &d.embedding).collect();
+            let body = serde_json::json!({
+                "status": "ok",
+                "model": resp.model,
+                "embeddings": embeddings,
+            });
+            let response_json = serde_json::to_string(&body)
+                .map_err(|e| AliasRouteError::Dispatch(format!("serialize: {e}")))?;
+            Ok(AliasRouteResult {
+                response_json,
+                target_model: resp.model,
+            })
+        }
+        Err(ExecutorError::Resolve(
+            ResolveError::NoLiveInstance(_)
+            | ResolveError::UnknownModel(_)
+            | ResolveError::CapabilityUnsupported { .. },
+        )) => Err(AliasRouteError::NoTarget(
+            "alias_no_target_available".to_string(),
+        )),
+        Err(ExecutorError::AllCandidatesFailed { last_error, .. }) => {
+            Err(AliasRouteError::Dispatch(last_error))
+        }
+        Err(e) => Err(AliasRouteError::Dispatch(e.to_string())),
+    }
+}
+
+/// Wyciąga input embeddingów z payloadu addona. Akceptuje `{"input": "..."}`,
+/// `{"input": ["..."]}`, gołego stringa JSON i fallback: cały payload jako
+/// jeden tekst (addon mógł wysłać surowy tekst bez obudowy).
+fn embeddings_input_from_payload(payload_json: &str) -> crate::api::openai::types::EmbeddingInput {
+    use crate::api::openai::types::EmbeddingInput;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload_json) {
+        if let Some(field) = value.get("input") {
+            if let Some(s) = field.as_str() {
+                return EmbeddingInput::Single(s.to_string());
+            }
+            if let Some(arr) = field.as_array() {
+                let texts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if !texts.is_empty() {
+                    return EmbeddingInput::Multiple(texts);
+                }
+            }
+        }
+        if let Some(s) = value.as_str() {
+            return EmbeddingInput::Single(s.to_string());
+        }
+    }
+    EmbeddingInput::Single(payload_json.to_string())
+}
+
 // =============================================================================
 // Audit helpers — write directly to DB so callers without an AddonState can
 // emit the same chain as the WASM host wrapper.
@@ -707,11 +982,35 @@ fn emit_audit_inner(
     );
 }
 
+/// Realny target rozwiązany przez `ModelRuntimeExecutor` dla wiersza
+/// `alias_calls`. Wypełnia kolumny `target_used`/`target_node_id`/`service_id`/
+/// `fallback_used`/`fallback_chain_position` wartościami z istniejącej ścieżki
+/// failoveru zamiast twardych 0/NULL. `None` (executor niewpięty / dispatch
+/// padł przed wyborem targetu) → kolumny pozostają nieznane.
+struct AliasCallRoute<'a> {
+    target_used: &'a str,
+    target_node_id: Option<&'a str>,
+    chain_position: i64,
+    fallback_used: bool,
+}
+
+/// Wybiera realny `target_used` dla wiersza `alias_calls`. Pierwszenstwo ma
+/// `served_model` z metadanych zwycieskiego `ResolvedExecutionTarget` (realny
+/// model_name kandydata, na ktorym dispatch wyladowal), a NIE `model` z body
+/// odpowiedzi: dla zdalnego `MeshForward` peer echo'uje alias jako `model`,
+/// wiec body niesie alias, nie realny target. Fallback na `body_model` tylko
+/// gdy metadane sa puste (dispatch padl przed wyborem targetu) — wtedy i tak
+/// nie ma failoveru do zaudytowania.
+fn resolved_target_used<'a>(served_model: Option<&'a str>, body_model: &'a str) -> &'a str {
+    served_model.unwrap_or(body_model)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_alias_call(
     db: &DbPool,
     caller: &CallerContext,
     service_name: &str,
+    route: Option<&AliasCallRoute<'_>>,
     request_id: &str,
     duration_ms: i64,
     payload_bytes: i64,
@@ -738,27 +1037,277 @@ fn log_alias_call(
         return;
     };
     let _ = frame_ref; // reserved for richer logging when schema gets a column
+
+    // A1 §0.4: realne wartości z rozwiązanego targetu zamiast twardych 0/NULL.
+    // Bez `route` (executor niewpięty / dispatch padł przed wyborem) logujemy
+    // nazwę aliasu jako target i pozycję 0 — failover się nie odbył, więc to
+    // nie jest cicha degradacja. `service_id` z lokalnego ownera targetu (gdy
+    // znany); remote/embedded nie ma lokalnego id i zostaje NULL.
+    let target_used = route.map(|r| r.target_used).unwrap_or(service_name);
+    let target_node_id: Option<&str> = route.and_then(|r| r.target_node_id);
+    let chain_position: i64 = route.map(|r| r.chain_position).unwrap_or(0);
+    let fallback_used: i64 = route.map(|r| i64::from(r.fallback_used)).unwrap_or(0);
+
     let _ = conn.execute(
         "INSERT INTO alias_calls \
              (alias_id, alias_name, method, target_used, target_node_id, service_id, \
               caller_addon_id, caller_user_id, request_id, duration_ms, payload_bytes, \
               response_bytes, fallback_used, fallback_chain_position, result, error_code, ts) \
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, NULL, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             alias_id,
             service_name,
             "service.request",
-            service_name,
-            service_name,
+            target_used,
+            target_node_id,
             caller.addon_id,
             caller.user_id,
             request_id,
             duration_ms,
             payload_bytes,
             response_bytes,
+            fallback_used,
+            chain_position,
             result,
             error_code,
             ts,
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::openai::types::EmbeddingInput;
+
+    fn make_db() -> DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("in-memory db")
+    }
+
+    /// Buduje executor z PUSTYM katalogiem (żaden model się nie rozwiązuje).
+    /// Mirror `executor::tests::dummy_executor` — używany do dowodu, że alias
+    /// idzie przez TĘ ścieżkę, a brak kandydata mapuje się na `no_target`.
+    fn empty_executor() -> Arc<crate::services::runtime::executor::ModelRuntimeExecutor> {
+        use crate::services::handles_cache::LiveHandlesCache;
+        use crate::services::runtime::executor::ModelRuntimeExecutor;
+        use crate::services::runtime::resolver::AliasResolver;
+        let catalog = Arc::new(crate::services::catalog::CatalogProvider::new());
+        let handles = Arc::new(LiveHandlesCache::new());
+        let resolver = Arc::new(AliasResolver::new_with_static_id(
+            handles,
+            "local-node".to_string(),
+        ));
+        let local_inference = Arc::new(crate::inference::local::LocalInferenceHandler::new(
+            crate::inference::shared_inference_manager(),
+        ));
+        Arc::new(ModelRuntimeExecutor::new(
+            catalog,
+            resolver,
+            None,
+            local_inference,
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            Arc::new(parking_lot::RwLock::new(None)),
+            None,
+        ))
+    }
+
+    fn system_caller(addon_id: &str) -> CallerContext {
+        CallerContext {
+            addon_id: addon_id.to_string(),
+            user_id: None,
+            instance_id: None,
+            is_system_call: true,
+            org_id: None,
+        }
+    }
+
+    #[test]
+    fn embeddings_input_single_string_field() {
+        let input = embeddings_input_from_payload(r#"{"input":"hello"}"#);
+        assert!(matches!(input, EmbeddingInput::Single(s) if s == "hello"));
+    }
+
+    #[test]
+    fn embeddings_input_array_field() {
+        let input = embeddings_input_from_payload(r#"{"input":["a","b"]}"#);
+        match input {
+            EmbeddingInput::Multiple(v) => assert_eq!(v, vec!["a", "b"]),
+            other => panic!("expected Multiple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn embeddings_input_falls_back_to_whole_payload() {
+        // Brak pola `input` i nie-string JSON → cały payload jako jeden tekst.
+        let input = embeddings_input_from_payload(r#"{"other":1}"#);
+        assert!(matches!(input, EmbeddingInput::Single(s) if s == r#"{"other":1}"#));
+    }
+
+    /// Addonowy alias bez żadnego dostępnego targetu (pusty katalog executora)
+    /// → routing przez executor zwraca `NotFound`, a `alias_calls` dostaje
+    /// wiersz `no_target`. Dowodzi, że alias idzie PRZEZ executor (nie
+    /// dispatch-by-name), a diagnostyka braku targetu jest sensowna.
+    #[tokio::test]
+    async fn addon_alias_no_target_routes_through_executor_and_logs() {
+        let db = make_db();
+        crate::db::repository::create_or_reactivate_model_alias_with_active(
+            &db,
+            "rag-llm",
+            "big-model",
+            "first_available",
+            "addon",
+            Some("rag-addon"),
+            true,
+        )
+        .expect("install alias");
+
+        let executor = empty_executor();
+        let req = ServiceCallRequest {
+            caller: system_caller("rag-addon"),
+            service_name: "rag-llm".to_string(),
+            payload_json: r#"{"input":"czesc"}"#.to_string(),
+            timeout_ms: 0,
+            alias_required: true,
+        };
+        let err = dispatch(
+            req,
+            &db,
+            None,
+            Some(&executor),
+            None,
+            &["service".to_string()],
+        )
+        .await
+        .expect_err("no available target → NotFound");
+        assert!(matches!(err, ServiceCallError::NotFound { .. }));
+
+        // Wiersz alias_calls zapisany z wynikiem no_target.
+        let conn = db.write().unwrap();
+        let (result, fallback_used): (String, i64) = conn
+            .query_row(
+                "SELECT result, fallback_used FROM alias_calls WHERE alias_name = ?1",
+                rusqlite::params!["rag-llm"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("alias_calls row written");
+        assert_eq!(result, "no_target");
+        assert_eq!(fallback_used, 0);
+    }
+
+    /// `log_alias_call` z realnym `AliasCallRoute` (fallback na pozycji 2)
+    /// zapisuje `fallback_used=1` + pozycję + realny `target_used`/`node_id`
+    /// zamiast twardych 0/NULL.
+    #[test]
+    fn log_alias_call_persists_real_fallback_fields() {
+        let db = make_db();
+        crate::db::repository::create_or_reactivate_model_alias_with_active(
+            &db,
+            "rag-emb",
+            "primary-emb",
+            "first_available",
+            "addon",
+            Some("rag-addon"),
+            true,
+        )
+        .expect("install alias");
+
+        let route = AliasCallRoute {
+            target_used: "tiny-emb",
+            target_node_id: Some("phone-node"),
+            chain_position: 2,
+            fallback_used: true,
+        };
+        log_alias_call(
+            &db,
+            &system_caller("rag-addon"),
+            "rag-emb",
+            Some(&route),
+            "req-1",
+            12,
+            5,
+            7,
+            None,
+            "ok",
+            None,
+        );
+
+        let conn = db.write().unwrap();
+        let (target_used, node_id, fallback_used, position): (String, Option<String>, i64, i64) =
+            conn.query_row(
+                "SELECT target_used, target_node_id, fallback_used, fallback_chain_position \
+                 FROM alias_calls WHERE alias_name = ?1",
+                rusqlite::params!["rag-emb"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("alias_calls row");
+        assert_eq!(target_used, "tiny-emb");
+        assert_eq!(node_id.as_deref(), Some("phone-node"));
+        assert_eq!(fallback_used, 1);
+        assert_eq!(position, 2);
+    }
+
+    /// Bez `route` (executor niewpięty) `log_alias_call` loguje nazwę aliasu
+    /// jako target i pozycję 0 — failover się nie odbył, brak cichej degradacji.
+    #[test]
+    fn log_alias_call_without_route_defaults_to_alias_name() {
+        let db = make_db();
+        crate::db::repository::create_or_reactivate_model_alias_with_active(
+            &db,
+            "rag-plain",
+            "model-x",
+            "first_available",
+            "addon",
+            Some("rag-addon"),
+            true,
+        )
+        .expect("install alias");
+
+        log_alias_call(
+            &db,
+            &system_caller("rag-addon"),
+            "rag-plain",
+            None,
+            "req-2",
+            1,
+            1,
+            1,
+            None,
+            "ok",
+            None,
+        );
+
+        let conn = db.write().unwrap();
+        let (target_used, fallback_used, position): (String, i64, i64) = conn
+            .query_row(
+                "SELECT target_used, fallback_used, fallback_chain_position \
+                 FROM alias_calls WHERE alias_name = ?1",
+                rusqlite::params!["rag-plain"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("alias_calls row");
+        assert_eq!(target_used, "rag-plain");
+        assert_eq!(fallback_used, 0);
+        assert_eq!(position, 0);
+    }
+
+    /// Bug 1: zdalny (MeshForward) fallback. `served_model` z metadanych
+    /// rozwiazanej sciezki niesie REALNY model targetu, a body odpowiedzi
+    /// echo'uje alias — `target_used` musi pochodzic z metadanych, nie z body.
+    #[test]
+    fn resolved_target_used_prefers_served_model_over_body_alias() {
+        // Peer odeslal alias jako `model` (MeshForward echo), ale metadane
+        // zwycieskiego targetu znaja realny model_name — logujemy realny.
+        assert_eq!(
+            resolved_target_used(Some("tiny-emb-on-peer"), "rag-emb-alias"),
+            "tiny-emb-on-peer"
+        );
+        // Brak metadanych (dispatch padl przed wyborem) → fallback na body.
+        assert_eq!(resolved_target_used(None, "rag-emb-alias"), "rag-emb-alias");
+        // Local/Embedded: metadane i body sie zgadzaja — realny model.
+        assert_eq!(
+            resolved_target_used(Some("small-model"), "small-model"),
+            "small-model"
+        );
+    }
 }

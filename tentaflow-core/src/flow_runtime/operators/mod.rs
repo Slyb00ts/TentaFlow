@@ -63,6 +63,10 @@ pub struct OperatorContext {
     pub permissions: Vec<String>,
     pub permission_checker: Arc<PermissionChecker>,
     pub service_manager: Option<Arc<ServiceManager>>,
+    /// Late-bound `ModelRuntimeExecutor` (A1 §0.4). Predict routes alias calls
+    /// through it for availability-aware failover (embedded/local/remote).
+    /// `None` keeps the legacy dispatch-by-name path.
+    pub executor: Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>,
     pub event_bus: Option<Arc<EventBus>>,
     /// Shared collector for Sink kind="invocation_result". The scheduler
     /// owns the Vec; every Sink task appends into it.
