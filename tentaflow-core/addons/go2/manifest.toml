@@ -32,6 +32,13 @@ sort_order = 60
 [service]
 enabled = true
 tick_interval_ms = 200
+# Default per-tick fuel (5M) is too low for the LiDAR voxel decode: a real Go2
+# frame is ~32k occupied points, and decoding the bitfield into the packed
+# canonical buffer on the tick exceeds 5M WASM instructions → "out of fuel" trap
+# (kills the tick — telemetry survives via crash-isolation, but lidar never
+# publishes). 50M is generous headroom and still a hard anti-runaway bound
+# (a tick is a few ms even at this budget).
+tick_fuel_budget = 50000000
 
 # LAN signaling to the robot (con_notify / con_ing). `${ip}` is a per-install
 # placeholder: at install time the entered `ip` connection_param is substituted
