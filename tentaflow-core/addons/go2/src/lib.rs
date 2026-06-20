@@ -212,6 +212,14 @@ mod log {
     pub fn warn(m: &str) {
         unsafe { log_warn(m.as_ptr() as i32, m.len() as i32); }
     }
+    /// Error-level host log. The host exposes only info/warn import symbols, so
+    /// error routes through `log_warn` with an explicit `ERROR` prefix — there is
+    /// no separate error import to add. Used by the panic hook to make a future
+    /// trap loud and unmistakable.
+    pub fn error(m: &str) {
+        let line = alloc::format!("ERROR {m}");
+        unsafe { log_warn(line.as_ptr() as i32, line.len() as i32); }
+    }
 }
 
 /// Sub-millisecond clocks for pipeline timing. The addon targets `wasm32-wasip1`
@@ -800,6 +808,11 @@ const LIDAR_STATUS_REFRESH_SECS: i64 = 1;
 // stream this emits roughly one concise timing line every ~2 s, enough to watch
 // live without flooding the log on the hot drain path.
 const LIDAR_TIMING_LOG_EVERY: u64 = 10;
+// Rate-limit for the per-frame decode-sizing diagnostic line. The FIRST voxel
+// frame of a session always logs (counter starts at 0), then one line every
+// LIDAR_DIAG_LOG_EVERY frames so the 5Hz stream is not flooded while still
+// surfacing src_size / decompressed length / point_count on real data.
+const LIDAR_DIAG_LOG_EVERY: u64 = 25;
 
 /// Latest decoded LiDAR frame plus the on/off intent. Only the MOST RECENT frame
 /// is kept (the voxel map is a stream); a new frame overwrites the prior one so
@@ -848,10 +861,19 @@ struct LidarState {
     // a multi-Hz stream emits roughly one timing line per LIDAR_TIMING_LOG_EVERY
     // frames instead of one per frame.
     timing_log_counter: u64,
+    // Counter of voxel frames seen by the diagnostic line (decode sizing inputs).
+    // First frame always logs; thereafter rate-limited by LIDAR_DIAG_LOG_EVERY so
+    // we can confirm src_size / decompressed length / point_count on real data
+    // without flooding the 5Hz stream.
+    diag_log_counter: u64,
 }
 
 std::thread_local! {
     static LIDAR: core::cell::RefCell<LidarState> = core::cell::RefCell::new(LidarState::default());
+    // One-shot guard so parse_voxel_frame logs the matched JSON framing offset and
+    // declared src_size EXACTLY ONCE per worker, confirming the (2,0) auto-detect
+    // picked the correct boundary on real firmware without flooding the stream.
+    static VOXEL_FRAMING_LOGGED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
@@ -977,7 +999,25 @@ fn decode_voxel_to_canonical(
         resolution,
         origin,
     };
-    let mut out: Vec<u8> = Vec::with_capacity(LIDAR_HEADER_LEN + point_count * 3 * 4);
+    // Exact preallocation with checked arithmetic so a pathological count can
+    // never overflow usize and panic the allocation size. point_count is already
+    // capped at LIDAR_MAX_POINTS above, so the checked path always succeeds here;
+    // the saturating fallback is a defensive belt-and-braces (still a finite,
+    // bounded reserve — never a panic). The body is `point_count * 3 * 4` bytes
+    // (3 f32 per point, XYZ layout).
+    let body_cap = point_count
+        .checked_mul(3)
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(LIDAR_HEADER_LEN))
+        .unwrap_or(LIDAR_HEADER_LEN);
+    // Fallible reserve instead of with_capacity: under panic = abort an oversized
+    // or garbage allocation request would call handle_alloc_error and KILL the
+    // process (no panic to catch). try_reserve_exact returns Err on failure so we
+    // drop the frame (caller logs) instead of aborting the connection.
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(body_cap).is_err() {
+        return None;
+    }
     out.extend_from_slice(&header.encode_header());
     let res = resolution;
     for (i, &byte) in decompressed.iter().enumerate() {
@@ -1008,57 +1048,89 @@ fn decode_voxel_to_canonical(
 /// place points against a fabricated origin).
 fn parse_origin3(v: Option<&JsonValue>) -> Option<[f64; 3]> {
     let arr = v.and_then(JsonValue::as_array)?;
-    if arr.len() < 3 {
-        return None;
-    }
-    Some([arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?])
+    // get(..) instead of indexing: a JSON origin array shorter than 3 returns
+    // None rather than panicking (panic = abort would drop the link).
+    Some([
+        arr.get(0)?.as_f64()?,
+        arr.get(1)?.as_f64()?,
+        arr.get(2)?.as_f64()?,
+    ])
 }
 
 /// Parse the two binary data-channel framings the Go2 uses for an inbound voxel
-/// map (matches upstream `deal_array_buffer`):
-///   - LiDAR framing: leading `<HH>` == (2,0); then at +4 a `<I>` json length,
-///     JSON at [8..8+len], compressed bytes after.
-///   - normal framing: `<H>` json length at 0, JSON at [4..4+len], compressed
-///     bytes after.
+/// map (upstream `deal_array_buffer`):
+///   - LiDAR framing: leading `<HH>` == (2,0); then a `<I>` (u32 LE) JSON length;
+///     the `len`-byte JSON object follows, then the LZ4-compressed bitfield. The
+///     JSON starts either immediately after the length (raw[8]) or after a 4-byte
+///     pad (raw[12]) depending on firmware. We AUTO-DETECT by trying both and
+///     keeping the one that parses as the voxel topic — the JSON is exactly `len`
+///     bytes, so each candidate boundary is unambiguous to validate, and the
+///     compressed tail follows it. This avoids a fragile hard-coded offset (an
+///     off-by-4 there silently yields zero points / a broken decode).
+///   - normal framing: `<H>` JSON length at 0, JSON at [4..4+len], compressed after.
 /// Returns `(data_json, compressed_bytes)` where `data_json` is the inner `data`
 /// object carrying `{resolution, origin, src_size}`. `None` if the frame is too
-/// short, the JSON is invalid, or the topic is not the voxel map.
+/// short, the JSON is invalid, or the topic is not the voxel map. Every read is
+/// bounds-checked via `get(..)`: a short/truncated/oddly-framed real frame can
+/// NEVER panic the decode path (panic = abort would drop the whole connection).
 fn parse_voxel_frame(raw: &[u8]) -> Option<(JsonValue, &[u8])> {
-    if raw.len() < 4 {
-        return None;
-    }
-    let h1 = u16::from_le_bytes([raw[0], raw[1]]);
-    let h2 = u16::from_le_bytes([raw[2], raw[3]]);
-    let (json_bytes, compressed): (&[u8], &[u8]) = if h1 == 2 && h2 == 0 {
-        // LiDAR framing: skip the 4-byte (2,0) header, then a u32 length at +0.
-        let body = &raw[4..];
-        if body.len() < 8 {
-            return None;
+    let header = raw.get(0..4)?;
+    let h1 = u16::from_le_bytes([header[0], header[1]]);
+    let h2 = u16::from_le_bytes([header[2], header[3]]);
+    if h1 == 2 && h2 == 0 {
+        // LiDAR framing: u32 JSON length right after the (2,0) header.
+        let len_bytes = raw.get(4..8)?;
+        let len =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        // The JSON object is exactly `len` bytes; firmware places it at raw[8] or
+        // raw[12]. Try both and accept the one that parses to the voxel topic.
+        for json_start in [8usize, 12usize] {
+            let Some(json_end) = json_start.checked_add(len) else {
+                continue;
+            };
+            let Some(json) = raw.get(json_start..json_end) else {
+                continue;
+            };
+            let Ok(env) = serde_json::from_slice::<JsonValue>(json) else {
+                continue;
+            };
+            if env.get("topic").and_then(JsonValue::as_str) != Some(LIDAR_TOPIC) {
+                continue;
+            }
+            let compressed = raw.get(json_end..)?;
+            let data = env.get("data")?.clone();
+            // One-shot: confirm WHICH json_start matched and the declared src_size on
+            // real firmware. An off-by-4 in this auto-detect silently yields a broken
+            // decode, so logging the empirically-chosen boundary once pins it down.
+            VOXEL_FRAMING_LOGGED.with(|logged| {
+                if !logged.get() {
+                    logged.set(true);
+                    let src_size = data.get("src_size").and_then(JsonValue::as_u64);
+                    log::info(&alloc::format!(
+                        "go2 lidar framing: json_start={} declared_len={} src_size={:?}",
+                        json_start,
+                        len,
+                        src_size,
+                    ));
+                }
+            });
+            return Some((data, compressed));
         }
-        let len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-        let json_end = 8usize.checked_add(len)?;
-        if body.len() < json_end {
-            return None;
-        }
-        (&body[8..json_end], &body[json_end..])
+        None
     } else {
-        // Normal framing: u16 length at 0, JSON at [4..4+len].
-        let len = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+        // Normal framing: u16 JSON length at 0, JSON at [4..4+len].
+        let len = u16::from_le_bytes([header[0], header[1]]) as usize;
         let json_end = 4usize.checked_add(len)?;
-        if raw.len() < json_end {
+        let json = raw.get(4..json_end)?;
+        let envelope: JsonValue = serde_json::from_slice(json).ok()?;
+        // EXACT match: only the voxel-map topic decodes into the voxel frame.
+        if envelope.get("topic").and_then(JsonValue::as_str) != Some(LIDAR_TOPIC) {
             return None;
         }
-        (&raw[4..json_end], &raw[json_end..])
-    };
-    let envelope: JsonValue = serde_json::from_slice(json_bytes).ok()?;
-    let topic = envelope.get("topic").and_then(JsonValue::as_str).unwrap_or("");
-    // EXACT match: only the voxel-map topic decodes into the voxel frame. An
-    // unrelated utlidar binary message must never enter the LZ4 decode path.
-    if topic != LIDAR_TOPIC {
-        return None;
+        let compressed = raw.get(json_end..)?;
+        let data = envelope.get("data")?.clone();
+        Some((data, compressed))
     }
-    let data = envelope.get("data")?.clone();
-    Some((data, compressed))
 }
 
 /// Ingest one inbound binary voxel-map frame: parse the framing, LZ4-decompress to
@@ -1137,9 +1209,38 @@ fn ingest_voxel_map(raw: &[u8]) {
         log::warn("go2 lidar: decompressed length != src_size — frame skipped");
         return;
     }
+    // Clamp the valid-byte length to the buffer even though `n == src_size ==
+    // decompressed.len()` here: a bogus `n` from the decompressor can NEVER
+    // produce an out-of-bounds slice (panic = abort would drop the link).
+    let n = n.min(decompressed.len());
+    let grid = match decompressed.get(..n) {
+        Some(g) => g,
+        None => return,
+    };
     let resolution_f32 = resolution as f32;
     // Cheap popcount first so the canonical buffer below can be exact-preallocated.
-    let point_count = count_voxel_points(&decompressed[..n]);
+    let point_count = count_voxel_points(grid);
+    // Rate-limited decode-sizing diagnostic: surfaces the exact inputs that drive
+    // the canonical buffer allocation. A garbage-huge point_count here (vs the real
+    // Go2 ~30k-42k) means the framing/decompress is wrong (bad src_size or a
+    // misaligned compressed tail), which is the root cause of the allocation abort.
+    let should_diag = LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        let first = l.diag_log_counter == 0;
+        let due = l.diag_log_counter % LIDAR_DIAG_LOG_EVERY == 0;
+        l.diag_log_counter = l.diag_log_counter.wrapping_add(1);
+        first || due
+    });
+    if should_diag {
+        log::info(&alloc::format!(
+            "go2 lidar diag: src_size={} decompressed_n={} compressed_len={} point_count={} resolution={}",
+            src_size,
+            n,
+            compressed.len(),
+            point_count,
+            resolution,
+        ));
+    }
     let now = db::now_secs();
     let (should_persist, frame_seq, enabled) = LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
@@ -1181,7 +1282,7 @@ fn ingest_voxel_map(raw: &[u8]) {
     let mut published_bytes: usize = 0;
     if enabled && point_count > 0 {
         match decode_voxel_to_canonical(
-            &decompressed[..n],
+            grid,
             resolution_f32,
             [origin[0] as f32, origin[1] as f32, origin[2] as f32],
             frame_seq as u32,
@@ -1911,6 +2012,16 @@ fn tick() {
             }
             let mut battery = robot.battery_pct;
             let mut got_telemetry = false;
+            // The single latest binary (voxel) frame is copied OUT of the scratch
+            // here and ingested AFTER the DECODE_BUF borrow is released. This is the
+            // connection-saving invariant: ingest_voxel_map -> decode can abort the
+            // process on a garbage allocation (panic = abort, no unwinding); if that
+            // ran while DECODE_BUF was borrowed, the borrow guard would leak and
+            // EVERY later tick would abort at borrow_mut ("already borrowed"),
+            // stalling telemetry until the 12s watchdog tore down the link. By
+            // owning a small Vec copy we never hold the scratch across the fallible
+            // decode, so at worst one tick is lost and telemetry resumes next tick.
+            let mut voxel_payload: Option<Vec<u8>> = None;
             DECODE_BUF.with(|cell| {
                 let mut dec = cell.borrow_mut();
                 // Index of the LAST binary frame drained this tick. The voxel map is
@@ -1921,7 +2032,7 @@ fn tick() {
                     .messages
                     .iter()
                     .rposition(|m| !m.is_text);
-                for (idx, msg) in drained.messages.iter().enumerate() {
+                for msg in drained.messages.iter() {
                     let src = msg.data_b64.as_bytes();
                     // base64 decodes to at most 3/4 of the input length; size the
                     // scratch to the source length (an upper bound) so the slice
@@ -1939,9 +2050,10 @@ fn tick() {
                     // binary framing's JSON header by parse_voxel_frame. Only the
                     // latest binary frame is ingested; earlier ones are superseded.
                     if !msg.is_text {
-                        if Some(idx) == last_binary {
-                            ingest_voxel_map(raw);
-                        }
+                        // Defer the (single) voxel decode until AFTER the whole
+                        // drain has been scanned for telemetry below: the lidar
+                        // path must never run before the watchdog-feeding lowstate
+                        // is recorded, so a lidar issue cannot stall the link.
                         continue;
                     }
                     // Only lowstate carries battery; gate on the topic substring,
@@ -1960,12 +2072,34 @@ fn tick() {
                         ingest_sportmodestate(raw);
                     }
                 }
+                // Telemetry watchdog FIRST: record real lowstate receipt before any
+                // lidar work this drain, so the link's liveness is updated regardless
+                // of a (possibly malformed) voxel frame in the same drain.
+                if got_telemetry {
+                    let _ = db::record_lowstate(battery);
+                }
+                // Decode the single latest binary frame from base64 into the scratch
+                // and COPY the bytes into an owned Vec. ingest is intentionally NOT
+                // called here: it runs after this closure ends (see voxel_payload).
+                if let Some(idx) = last_binary {
+                    if let Some(msg) = drained.messages.get(idx) {
+                        let src = msg.data_b64.as_bytes();
+                        if dec.len() < src.len() {
+                            dec.resize(src.len(), 0);
+                        }
+                        if let Ok(n) = B64.decode_slice(src, &mut dec[..]) {
+                            if let Some(raw) = dec.get(..n) {
+                                voxel_payload = Some(raw.to_vec());
+                            }
+                        }
+                    }
+                }
             });
-            // Liveness: advance last_telemetry EVERY tick a lowstate actually
-            // arrived (not throttled), so the watchdog tracks real receipt
-            // regardless of which tick the throttled publish lands on.
-            if got_telemetry {
-                let _ = db::record_lowstate(battery);
+            // DECODE_BUF borrow is released. Ingest the latest voxel frame now: an
+            // allocation/decode abort here can no longer leak the scratch borrow and
+            // cascade into a permanent per-tick abort. Telemetry is already recorded.
+            if let Some(payload) = voxel_payload {
+                ingest_voxel_map(&payload);
             }
             // Throttle RTT poll + publish + telemetry DB persist to ~1s (every 5
             // ticks @200ms) so the high-rate stream never hammers SQLite. The
@@ -2437,9 +2571,54 @@ pub extern "C" fn on_install() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
+    install_panic_hook();
     ensure_robot_from_config();
     bridge_legacy_lidar_intent();
+    seed_lidar_disabled_on_fresh_session();
     0
+}
+
+/// Install a panic hook that logs the panic LOCATION (file:line:col) and message
+/// through the host log fn BEFORE the process aborts. The addon is built with
+/// `panic = abort` on wasm32-wasip1 (so `catch_unwind` is impossible), but the
+/// hook still runs before the abort, and the panic location string survives
+/// `strip = true`. This is the primary diagnostic for the steady-state tick trap:
+/// a future panic prints e.g.
+///   `go2 PANIC at src/lib.rs:1234:5: index out of bounds: len 80000 but index 80001`
+/// Idempotent across re-starts (set_hook simply replaces the prior hook).
+fn install_panic_hook() {
+    std::panic::set_hook(std::boxed::Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| alloc::format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        log::error(&alloc::format!("go2 PANIC at {location}: {message}"));
+    }));
+}
+
+/// Default the persistent LiDAR enable INTENT to OFF at the start of a FRESH
+/// session so a reconnect comes up with telemetry + camera only (no voxel
+/// stream). The voxel decoder runs on arbitrary real sensor data; defaulting the
+/// stream off isolates the connect + telemetry path from the decoder on bring-up,
+/// and a known-bad decoder can never auto-stream on reconnect — the operator must
+/// explicitly re-enable LiDAR via the GUI toggle after telemetry is confirmed.
+///
+/// This writes the durable intent UNCONDITIONALLY to OFF on every start. It runs
+/// AFTER `bridge_legacy_lidar_intent` (the one-time legacy upgrade) deliberately:
+/// a clean bring-up must win over a possibly-ON persisted/legacy value. To
+/// re-enable, toggle from the GUI (writes the durable intent back to ON), which
+/// then survives reconnects until the next process start. Reversible: removing
+/// this call restores "intent persists across starts".
+fn seed_lidar_disabled_on_fresh_session() {
+    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![0u8]) {
+        log::warn(&alloc::format!("go2: lidar default-off seed failed: {e}"));
+    }
 }
 
 /// One-time, idempotent upgrade bridge for the LiDAR enable INTENT. The intent
@@ -2688,6 +2867,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_voxel_to_canonical_large_count_uses_fallible_reserve() {
+        // A dense grid at (just under) the cap drives the largest allocation the
+        // decoder will ever attempt. try_reserve_exact must succeed and produce a
+        // full frame — proving the fallible-reserve path does not regress the happy
+        // case and never aborts on a legitimately large (but bounded) point count.
+        let bytes = (LIDAR_MAX_POINTS / 8) - 1;
+        let grid = vec![0xFFu8; bytes];
+        let count = count_voxel_points(&grid);
+        assert!(count <= LIDAR_MAX_POINTS);
+        let frame = decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0)
+            .expect("at-cap frame must decode, not abort");
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + count * 3 * 4);
+    }
+
+    #[test]
     fn count_voxel_points_sums_set_bits() {
         // Synthetic bitfield: count_voxel_points must equal the total set bits.
         let buf = [0x00u8, 0xFF, 0x80, 0x01, 0b1010_1010, 0x00];
@@ -2733,6 +2927,140 @@ mod tests {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 1, "malformed frames do not bump frame_seq");
             assert_eq!(l.point_count, 1, "prior counted points retained");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    /// Build a "LiDAR-framing" voxel-map binary message: leading `<HH>` == (2,0),
+    /// then a `<u32 json_len>` at +4, the JSON envelope at [8..8+len], compressed
+    /// grid after. Mirrors the real Go2 LiDAR data-channel framing.
+    fn build_lidar_frame(grid: &[u8], resolution: f64, origin: [f64; 3]) -> Vec<u8> {
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": resolution, "origin": origin, "src_size": grid.len() },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(grid);
+        let mut out = Vec::new();
+        out.extend_from_slice(&2u16.to_le_bytes()); // raw[0..2] h1 == 2
+        out.extend_from_slice(&0u16.to_le_bytes()); // raw[2..4] h2 == 0
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes()); // raw[4..8] json len
+        out.extend_from_slice(json_bytes); // raw[8..8+len] JSON
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn parse_voxel_frame_handles_truncated_and_short_inputs() {
+        // Every length that is too short to hold the framing header / declared JSON
+        // must return None, never panic. Covers empty, sub-4-byte, a LiDAR header
+        // with no json-length, and a header declaring more JSON than is present.
+        assert!(parse_voxel_frame(&[]).is_none());
+        assert!(parse_voxel_frame(&[0]).is_none());
+        assert!(parse_voxel_frame(&[2, 0, 0]).is_none());
+        assert!(parse_voxel_frame(&[2, 0, 0, 0]).is_none()); // (2,0) header, no u32 len
+        assert!(parse_voxel_frame(&[2, 0, 0, 0, 0xFF]).is_none()); // partial u32 len
+        // LiDAR framing whose declared json_len overruns the buffer.
+        let mut overrun = Vec::new();
+        overrun.extend_from_slice(&2u16.to_le_bytes());
+        overrun.extend_from_slice(&0u16.to_le_bytes());
+        overrun.extend_from_slice(&1000u32.to_le_bytes()); // claim 1000 JSON bytes
+        overrun.extend_from_slice(b"{}"); // but only 2 present
+        assert!(parse_voxel_frame(&overrun).is_none());
+        // Normal framing whose declared u16 len overruns the buffer.
+        let mut overrun2 = Vec::new();
+        overrun2.extend_from_slice(&500u16.to_le_bytes());
+        overrun2.extend_from_slice(&[0u8, 0u8]);
+        overrun2.extend_from_slice(b"{}");
+        assert!(parse_voxel_frame(&overrun2).is_none());
+    }
+
+    #[test]
+    fn parse_voxel_frame_accepts_real_lidar_framing() {
+        // The (2,0)+u32-len LiDAR framing must parse to the voxel data + compressed
+        // tail, proving the bounds-safe rewrite still matches the real wire format.
+        let grid = vec![0x81u8, 0x00];
+        let frame = build_lidar_frame(&grid, 0.05, [1.0, 2.0, 3.0]);
+        let (data, compressed) = parse_voxel_frame(&frame).expect("parses lidar framing");
+        assert_eq!(data.get("src_size").and_then(JsonValue::as_u64), Some(2));
+        assert_eq!(
+            compressed,
+            lz4_flex::block::compress(&grid).as_slice(),
+            "compressed tail recovered intact"
+        );
+    }
+
+    #[test]
+    fn parse_voxel_frame_autodetects_4byte_padded_framing() {
+        // Some firmware places a 4-byte pad between the u32 length and the JSON, so
+        // the JSON starts at raw[12] instead of raw[8]. parse_voxel_frame must
+        // auto-detect this variant and recover the same data + compressed tail.
+        let grid = vec![0x81u8, 0x00];
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": 0.05, "origin": [1.0, 2.0, 3.0], "src_size": grid.len() },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(&grid);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes()); // raw[0..2] h1 == 2
+        frame.extend_from_slice(&0u16.to_le_bytes()); // raw[2..4] h2 == 0
+        frame.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes()); // raw[4..8] len
+        frame.extend_from_slice(&[0u8; 4]); // raw[8..12] 4-byte pad
+        frame.extend_from_slice(json_bytes); // raw[12..12+len] JSON
+        frame.extend_from_slice(&compressed);
+        let (data, tail) = parse_voxel_frame(&frame).expect("auto-detects padded framing");
+        assert_eq!(data.get("src_size").and_then(JsonValue::as_u64), Some(2));
+        assert_eq!(tail, compressed.as_slice(), "compressed tail recovered intact");
+    }
+
+    #[test]
+    fn ingest_oversized_src_size_does_not_panic_or_decode() {
+        // A frame whose JSON declares src_size beyond the grid bound must be skipped
+        // (no decode, no state change) and MUST NOT panic. Build a valid framing but
+        // override src_size to exceed LIDAR_GRID_BYTES.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0xFFu8, 0x0F];
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": 0.05, "origin": [0.0, 0.0, 0.0], "src_size": LIDAR_GRID_BYTES + 1 },
+        })
+        .to_string();
+        let compressed = lz4_flex::block::compress(&grid);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(json.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&[0u8, 0u8]);
+        frame.extend_from_slice(json.as_bytes());
+        frame.extend_from_slice(&compressed);
+        ingest_voxel_map(&frame); // must not panic
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "oversized src_size frame never decoded");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn ingest_truncated_compressed_tail_does_not_panic() {
+        // A valid framing + topic but a corrupt/short LZ4 tail must be skipped
+        // (decompress fails or length mismatches) without panicking.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0xFFu8, 0x0F, 0x01, 0x80];
+        let mut frame = build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]);
+        // Lop off the last few bytes of the compressed tail to corrupt it.
+        frame.truncate(frame.len().saturating_sub(2));
+        ingest_voxel_map(&frame); // must not panic
+        LIDAR.with(|cell| {
+            assert_eq!(cell.borrow().frame_seq, 0, "corrupt tail never decoded");
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
