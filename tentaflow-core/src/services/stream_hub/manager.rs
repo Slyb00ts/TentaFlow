@@ -90,16 +90,35 @@ impl StreamHub {
         self: &Arc<Self>,
         stream_id: &str,
     ) -> Result<SubscriptionHandle, StreamHubError> {
-        // Fast path: source already active — just bump the counter.
-        if let Some(entry) = self.active.read().get(stream_id).cloned() {
+        // Fast path: source already active — just bump the counter. Clone the
+        // entry out of the lock and drop the read guard before any `.await`: a
+        // dynamic-init source's `init_segment().await` must not hold the
+        // (non-Send) `parking_lot` guard across the suspension point.
+        let active_entry = self.active.read().get(stream_id).cloned();
+        if let Some(entry) = active_entry {
             // A terminally-failed source (no broadcaster) must not hand out a
             // hung receiver: drop it so the next cold subscribe rebuilds it.
             if let Some(broadcaster) = entry.source.chunk_broadcaster() {
                 entry.subscribers.fetch_add(1, Ordering::AcqRel);
+                // Construct the RAII token IMMEDIATELY after the increment, before
+                // the dynamic-init `.await` below. If the subscribe future is
+                // cancelled (client disconnects) or the dynamic init hangs and the
+                // caller times out, the token's Drop still runs and decrements the
+                // count — without this ordering the increment would leak and pin
+                // the source alive forever. The camera (default `dynamic_init`)
+                // path has no await, so this reorder is behaviorally a no-op there.
+                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
                 let receiver = broadcaster.subscribe();
                 let mime = entry.source.mime_type().to_string();
-                let init = entry.init_segment.clone();
-                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
+                // Latest-wins sources self-describe per subscriber: fetch a fresh
+                // init so a late joiner gets the CURRENT frame even if publishing
+                // has paused. Cache-once codec-preamble sources reuse the cached
+                // init unchanged (camera fMP4 etc.).
+                let init = if entry.source.dynamic_init() {
+                    entry.source.init_segment().await
+                } else {
+                    entry.init_segment.clone()
+                };
                 return Ok(SubscriptionHandle::new(
                     stream_id.to_string(),
                     mime,
@@ -116,16 +135,30 @@ impl StreamHub {
         // racing cold subscribe waits here and then takes the fast path below —
         // no discarded loser source, no spurious DetachMp4Branch.
         let create_lock = self.creation_lock(stream_id);
-        let _create_guard = create_lock.lock().await;
+        let create_guard = create_lock.lock().await;
 
         // Re-check under the creation lock — a racer may have just published it.
-        if let Some(entry) = self.active.read().get(stream_id).cloned() {
+        // Same lock-drop-before-await discipline as the fast path.
+        let active_entry = self.active.read().get(stream_id).cloned();
+        if let Some(entry) = active_entry {
             if let Some(broadcaster) = entry.source.chunk_broadcaster() {
                 entry.subscribers.fetch_add(1, Ordering::AcqRel);
+                // RAII covers the dynamic-init await (see fast path); reorder is a
+                // no-op for the camera default-init path.
+                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
                 let receiver = broadcaster.subscribe();
                 let mime = entry.source.mime_type().to_string();
-                let init = entry.init_segment.clone();
-                let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
+                // The active entry already exists, so the creation lock has done
+                // its job (serializing source CREATION). Release it BEFORE the
+                // per-subscriber dynamic-init fetch so subscribers queued behind
+                // cold creation are not serialized behind one subscriber's slow or
+                // hung init. Keep it held only on the actual cold CREATE branch.
+                drop(create_guard);
+                let init = if entry.source.dynamic_init() {
+                    entry.source.init_segment().await
+                } else {
+                    entry.init_segment.clone()
+                };
                 return Ok(SubscriptionHandle::new(
                     stream_id.to_string(),
                     mime,

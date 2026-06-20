@@ -41,6 +41,20 @@ pub trait BinaryStreamSource: Send + Sync {
     /// chunk on the broadcast channel is self-contained (e.g. MJPEG frames).
     async fn init_segment(&self) -> Option<Bytes>;
 
+    /// Whether each new subscriber needs a FRESH `init_segment()` rather than the
+    /// value cached when the source was first created.
+    ///
+    /// Default `false` = cache-once: correct for codec-preamble streams (fMP4
+    /// `ftyp+moov`) where the init never changes for the life of the source.
+    /// `true` = latest-wins self-describing streams (LiDAR push) whose "init" is
+    /// the current frame: an already-active source created before the first frame
+    /// cached `None`, and a late subscriber attaches to the broadcast AFTER the
+    /// last frame, so without a fresh init it would render blank until the next
+    /// publish — which may never come if publishing has paused.
+    fn dynamic_init(&self) -> bool {
+        false
+    }
+
     /// Broadcast sender the source pushes media chunks into. The hub hands
     /// out fresh receivers via `Sender::subscribe()` on every subscribe call.
     ///

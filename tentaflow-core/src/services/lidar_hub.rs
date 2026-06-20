@@ -12,6 +12,17 @@
 //          publishing WASM INSTANCE id is deliberately NOT part of the key: a
 //          robot's frame must survive pooled-worker churn / restart and be found
 //          by a consumer that only knows the robot_id, never the runtime UUID.
+//
+//          INVARIANT (why a bare robot_id key cannot collide across orgs): the
+//          addon-install id is globally unique with a single owner org. It is
+//          minted in `addon::lifecycle::unique_instance_id` as
+//          `{package_id}-{uuidv4[..8]}` with a DB-uniqueness retry, and a robot
+//          row is single-org. So `robot_id == addon_id` never names two different
+//          robots in different tenants; the publish host-fn (which only has the
+//          caller's `addon_id`, not its org) can key by the bare id safely, and
+//          org-scoping at the consumption layer (`enforce_lidar_subscribe`) is
+//          sufficient. Do NOT add org to the key — it is redundant for an
+//          invariant that already holds and the publisher has no org to thread.
 // =============================================================================
 
 use std::sync::OnceLock;
