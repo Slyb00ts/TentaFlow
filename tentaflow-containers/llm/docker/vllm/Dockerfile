@@ -31,6 +31,10 @@ RUN pip install --no-cache-dir llmcompressor "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
     QUANT_SCRIPT=/app/quantize_nvfp4.py
 
+# Obraz -runtime nie ma nvcc, a flashinfer JIT-kompiluje kernel samplingu przez
+# ninja+nvcc przy starcie -> crash (exit 127). Wylaczamy flashinfer sampler;
+# vLLM uzywa natywnego samplera PyTorch (atencja idzie FLASH_ATTN, bez JIT).
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
 COPY tentaflow-containers/llm/docker/vllm/entrypoint.sh /app/entrypoint.sh
 COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
 COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh

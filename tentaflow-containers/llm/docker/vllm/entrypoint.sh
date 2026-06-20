@@ -43,6 +43,14 @@ if [[ "$HAS_PARALLEL" -eq 0 ]]; then
   esac
 fi
 
+# --enforce-eager: obraz -runtime nie ma nvcc, a domyslny tryb VLLM_COMPILE
+# (cudagraph + flashinfer autotune) JIT-kompiluje kernele przez nvcc -> crash.
+# Eager pomija cudagraph/JIT (kosztem nieco nizszej przepustowosci, ale dziala
+# bez kompilatora CUDA). Dodajemy tylko gdy user sam nie podal trybu.
+HAS_EAGER=0
+for _a in "${ENGINE_ARGS[@]}"; do case "$_a" in --enforce-eager|--no-enforce-eager) HAS_EAGER=1 ;; esac; done
+[[ "$HAS_EAGER" -eq 0 ]] && ENGINE_ARGS+=(--enforce-eager)
+
 echo "[entrypoint] vllm serve $MODEL na 0.0.0.0:$VLLM_PORT (${#ENGINE_ARGS[@]} args)"
 exec vllm serve "$MODEL" \
   --host 0.0.0.0 \
