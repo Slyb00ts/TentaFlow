@@ -12,7 +12,9 @@ engine = "paddle-ocr"
 description = "PaddleOCR-VL przez transformers (GPU CUDA/ROCm, zgodny z B300)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "transformers==4.49.0"
+# 4.55.0 = wersja z config.json PaddleOCR-VL (nowsze maja niezgodne API masek/ROPE,
+# starsze nie maja use_kernel_forward_from_hub). server.py shimuje create_causal_mask.
+pypi_package = "transformers==4.55.0"
 
 [launch]
 command = "uvicorn"
@@ -29,10 +31,10 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+extras = ["torch==2.11.0", "torchvision", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "protobuf", "einops", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
 
 # Wariant ROCm: torch z kanalu rocm7.0 dla GPU AMD.
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.11.0", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
+extras = ["torch==2.11.0", "torchvision", "pillow==11.1.0", "accelerate==1.4.0", "sentencepiece==0.2.0", "protobuf", "einops", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart"]
