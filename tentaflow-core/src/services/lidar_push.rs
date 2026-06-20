@@ -6,8 +6,8 @@
 // robot + watch notify) into a pushed binary stream on the generic StreamHub
 // rails — the SAME path camera video uses. A browser subscribes to
 // `lidar:<robot_id>` via the generic `StreamSubscribeRequest` handler and
-// receives each canonical L1 frame as a `StreamFrame`, replacing the old 150ms
-// on-demand poll (`RobotLidarFrameRequest`).
+// receives each canonical L1 frame as a `StreamFrame` — the real-time PUSH path
+// that replaced the former on-demand poll.
 //
 // LiDAR frames are self-describing (36-byte `LidarFrameHeader` + packed f32), so
 // there is no fMP4-style codec preamble: `init_segment` carries the CURRENT

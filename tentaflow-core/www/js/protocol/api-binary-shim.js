@@ -124,7 +124,7 @@ export const ApiBinary = {
     const codec = await import('./codec.js');
     const frame = codec.encode[kind](correlationId, payload, sequence);
 
-    const unsubscribe = client.subscribe(correlationId, ({ envelope, body }) => {
+    const removeListener = client.subscribe(correlationId, ({ envelope, body }) => {
       if (envelope.isError) {
         onError?.(body);
       } else if (envelope.isStreamEnd) {
@@ -135,7 +135,32 @@ export const ApiBinary = {
     });
 
     client._send(frame);
-    return unsubscribe;
+
+    // The returned unsubscribe drops the local listener AND emits a
+    // StreamCloseRequest on the SAME correlation id as this subscribe. The
+    // server's stream-close handler cancels the subscription by the close
+    // frame's correlation id (dispatch/stream.rs), so the close MUST reuse the
+    // original id — going through ApiBinary.action would mint a fresh id and the
+    // server would keep the subscription (slot + frame pump) alive until socket
+    // EOF. Best-effort: a stream payload carries `streamId`, but the server keys
+    // cancellation purely on correlation id, so an empty id here is fine.
+    let closed = false;
+    return () => {
+      removeListener();
+      if (closed) return;
+      closed = true;
+      try {
+        const closeSeq = client.takeSequence();
+        const closeFrame = codec.encode.streamCloseRequest(
+          correlationId,
+          { streamId: payload?.streamId ?? payload?.stream_id ?? '' },
+          closeSeq,
+        );
+        client._send(closeFrame);
+      } catch (e) {
+        console.warn('[api-binary] stream close emit failed:', e?.message ?? e);
+      }
+    };
   },
 
   /**
