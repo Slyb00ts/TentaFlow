@@ -15,7 +15,16 @@ CBOR I/O, audit na każdej ścieżce wyjścia, zero stubów. Nadrzędny plan: `R
   cold-create vs delete, MAX_OPEN_GRAPHS (4 mobile / 16 serwer) z realnym zamykaniem przy eviction.
   Nie commitowane (czeka na decyzję PM). Drobny nit codex: `remove_if` cleanup bierze shard-then-slot
   — brak przeciwnej żywej ścieżki, do pilnowania przy przyszłych zmianach.
-- Następne: A1 (0.4 fallback aliasów), B1 (0.2 graph host functions nad tym serwisem) — patrz kolejność.
+- **Slice A1 = 0.4 fallback aliasów: ZROBIONE, codex GO** (po 1 NO-GO + GO-WITH-CHANGES). Kluczowa
+  korekta: NIE budować równoległego resolvera — addonowy `service_request` przepuszczony przez ISTNIEJĄCY
+  `ModelRuntimeExecutor`/`AliasResolver` (failover po kandydatach, embedded-accepted, mesh-forward,
+  dispatch po tożsamości). Metryka `alias_fallback_total{alias}` + warn w jednym punkcie pętli failoveru
+  (liczy /v1+flow+addon, tylko aliasy). `log_alias_call` z realnym `target_used`/`fallback_used`/pozycją
+  z `route_metadata.served_model`. Usunięty błędny `alias_resolver.rs`. 40 testów w dotkniętych modułach.
+- **Dług pre-existing (NIE A1, do osobnej naprawy):** testy `db::repository::alias_resolve_tests` (i pokrewne)
+  failują `no such table: model_alias_{owners,changes,aliases}` — testowy harness DB nie aplikuje migracji
+  tych tabel (migracje istnieją, np. `model_alias_changes` migrations.rs:3998). A1 nie dotyka `db/`/migracji.
+- Następne: B1 (0.2 graph host functions nad serwisem grafu z A2) — patrz kolejność.
 
 ## Spike CozoDB — wynik: GO (potwierdzone realnym uruchomieniem)
 
@@ -183,6 +192,39 @@ Codex zweryfikował projekt wobec realnego kodu. Przed implementacją zastosowa�
 
 Kolejność uwzględnia poprawki: do Fazy A/B dołożyć migracje kolumn (pkt 9) i poprawny PK (pkt 3)
 PRZED host fns; sandbox Datalog (pkt 1-2) jest częścią 0.2, nie dodatkiem.
+
+## KOREKTA A1 (NO-GO codex — reuse istniejącego resolvera, NIE budować równoległego)
+
+Repo MA JUŻ availability-aware failover aliasów: `tentaflow-core/src/services/runtime/resolver.rs`
+(`AliasResolver`, zwraca dispatchowalny `ResolvedExecutionTarget` z tożsamością embedded/local/remote-node
++ capability + status) używany przez `runtime/executor.rs` (`execute_chat`/`execute_embeddings` z pętlą
+po kandydatach `fallback_targets`). `/v1` (`routing/chat.rs`,`routing/embeddings.rs`) i flow
+(`flow_engine/dispatchers_impl/{llm,embeddings}_impl.rs`) failują przez TĘ ścieżkę. Realna luka: addonowy
+`service_call.rs::service_request` rozwiązywał alias tylko jako bramkę i dispatchował SUROWĄ NAZWĘ.
+
+BŁĄD pierwszej implementacji A1: dodano RÓWNOLEGŁY `services/alias_resolver.rs` — który (a) odrzuca
+serwisy embedded (wymaga `endpoint_url` — model in-process na telefonie go nie ma → łamie cel serwer→telefon),
+(b) gubi `node_id`/`service_id` przy dispatchu (fallback trafia do innego właściciela modelu),
+(c) dubluje i rozjeżdża się z istniejącym resolverem (status/capability/identity), (d) split-probe
+race (is_available z histerezy true, locate current false). Narusza „sprawdź istniejące przed pisaniem
+nowych".
+
+POPRAWNY KIERUNEK (rework A1):
+1. **USUNĄĆ `services/alias_resolver.rs`** (cały równoległy resolver + cache histereza + invalidacja —
+   zbędne: istniejąca ścieżka failuje na kandydatach w momencie dispatchu, brak nieświeżego cache).
+2. **Przepuścić `service_call.rs::service_request` przez istniejący `AliasResolver`/`ModelRuntimeExecutor`**:
+   dla aliasu llm/embeddings rozwiąż na `ResolvedExecutionTarget` (embedded/local/remote) i dispatchuj
+   PO TEJ TOŻSAMOŚCI (mesh-forward/embedded), nie po nazwie modelu. To daje addonom ten sam failover co
+   /v1+flow, z obsługą embedded i właściwego węzła.
+3. **`log_alias_call`** wypełnia realne `fallback_used`/`fallback_chain_position`/`target_used`/`service_id`/
+   `target_node_id` z `ResolvedExecutionTarget` istniejącej ścieżki (nie z równoległego resolvera).
+4. Metryka `alias_fallback_total{alias}` + `warn!` przy fallbacku — dopiąć do ISTNIEJĄCEJ ścieżki failoveru
+   (jeden punkt liczenia dla /v1+flow+addon), nie osobno.
+5. Jeśli `service_request` obejmuje metody spoza executor (tts/stt/inne) — dla nich reuse tej samej
+   `AliasResolver` do rozwiązania targetu i dispatch po tożsamości; nie wprowadzać drugiej definicji „available".
+
+Cel akceptacji: addonowy alias z fallbackiem do modelu EMBEDDED (telefon) realnie failuje na embedded,
+dispatch trafia we właściwy backend/węzeł, log pokazuje realny użyty target. Zero drugiego resolvera.
 
 ## MACIERZ BACKENDÓW COZO (rozstrzygnięte po implementacji A2)
 
