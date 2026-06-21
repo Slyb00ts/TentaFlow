@@ -257,9 +257,10 @@ async fn send_pairing_bootstrap(
     if !all_keys.is_empty() {
         let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
             .iter()
-            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+            .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                 node_id: nid.clone(),
                 public_key_hex: pk.clone(),
+                approved_at: approved_at.clone(),
             })
             .collect();
         let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
@@ -1021,7 +1022,7 @@ mod baseline_adopt_admin_tests {
         let other_db = setup_test_db();
         let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
         security
-            .add_trusted_key(donor, &other.public_key_hex(), "donor-host")
+            .add_trusted_key(donor, &other.public_key_hex(), "donor-host", None)
             .unwrap();
         security
     }
@@ -1067,12 +1068,12 @@ mod baseline_adopt_admin_tests {
         let other_db = setup_test_db();
         let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
         security
-            .add_trusted_key("donor-a", &other.public_key_hex(), "a")
+            .add_trusted_key("donor-a", &other.public_key_hex(), "a", None)
             .unwrap();
         let other_db2 = setup_test_db();
         let other2 = MeshSecurity::new(other_db2, test_cipher()).unwrap();
         security
-            .add_trusted_key("donor-b", &other2.public_key_hex(), "b")
+            .add_trusted_key("donor-b", &other2.public_key_hex(), "b", None)
             .unwrap();
 
         admin_start_baseline_adopt(&db, &security, "local-node", "donor-a", &None)

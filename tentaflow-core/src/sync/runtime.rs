@@ -3865,6 +3865,7 @@ mod tests {
                 &receiver.local_node_id,
                 &receiver.signer.security.public_key_hex(),
                 "receiver",
+                None,
             )
             .expect("source trusts receiver");
         receiver
@@ -3874,6 +3875,7 @@ mod tests {
                 &source.local_node_id,
                 &source.signer.security.public_key_hex(),
                 "source",
+                None,
             )
             .expect("receiver trusts source");
     }
@@ -4253,6 +4255,7 @@ mod tests {
                     &receiver.runtime.local_node_id,
                     &receiver.runtime.signer.security.public_key_hex(),
                     "receiver",
+                    None,
                 )
                 .expect("trust receiver");
 

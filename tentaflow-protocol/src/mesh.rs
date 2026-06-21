@@ -1011,6 +1011,12 @@ pub struct KeyRotationResponsePayload {
 pub struct TrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at` (the time the key was FIRST locally paired on the
+    /// origin node), carried so a mirror re-add does not reset the trust-expiry TTL
+    /// clock to "now". Empty when received from an un-upgraded peer (serde default),
+    /// in which case the receiver falls back to its own current time.
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 /// Minimal payload dla `MESH_MSG_HELLO` — tylko hostname + platform + OS.
@@ -1159,6 +1165,11 @@ pub struct PairingFirstContactRequest {
 pub struct PairingTrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at`, same purpose as `TrustedKeyEntry::approved_at`:
+    /// a key propagated during first-contact pairing must not reset the receiver's
+    /// trust-expiry TTL clock. Empty from un-upgraded peers (serde default).
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]

@@ -9307,13 +9307,25 @@ pub fn add_trusted_node(
     public_key_hex: &str,
     hostname: &str,
     approved_by: &str,
+    approved_at: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
-        rusqlite::params![node_id, public_key_hex, hostname, approved_by],
-    )?;
+    // `approved_at` is the trust-expiry TTL anchor. A real local pairing passes `None`
+    // and we stamp `now`. A mirror re-add (TrustedKeysSync / first-contact propagation)
+    // passes the ORIGIN's `approved_at`, so a long-dead identity keeps its old timestamp
+    // and is pruned again next cycle instead of resurrecting with a fresh clock.
+    match approved_at.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(at) => conn.execute(
+            "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            rusqlite::params![node_id, public_key_hex, hostname, approved_by, at],
+        )?,
+        None => conn.execute(
+            "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
+            rusqlite::params![node_id, public_key_hex, hostname, approved_by],
+        )?,
+    };
     drop(conn);
     ensure_default_core_sync_policies(pool)?;
     ensure_trusted_nodes_in_sync_identity(pool)?;
@@ -20047,6 +20059,7 @@ mod chunk_c_visibility_consumer_tests {
             "pub-flow-target",
             "Flow Target",
             "test",
+            None,
         )
         .expect("trusted node");
 
