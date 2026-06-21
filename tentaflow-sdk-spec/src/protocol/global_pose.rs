@@ -24,6 +24,7 @@ pub const POSE_SRC_IMU: u8 = 1 << 2;
 pub const POSE_SRC_GNSS: u8 = 1 << 3;
 pub const POSE_SRC_WIFI: u8 = 1 << 4;
 pub const POSE_SRC_MAP: u8 = 1 << 5; // map-relative relocalization
+pub const POSE_SRC_ODOM: u8 = 1 << 6; // device's own odometry (wheel/leg/fused estimate)
 
 /// Fixed header length (no body).
 pub const GLOBAL_POSE_LEN: usize = 100;
