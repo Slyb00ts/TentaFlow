@@ -358,7 +358,7 @@ async fn run_server(args: Args) -> Result<()> {
         let _writer_handle = writer.spawn();
     }
 
-    for (node_id, public_key_hex) in mesh_security.get_all_trusted_keys() {
+    for (node_id, public_key_hex, _approved_at) in mesh_security.get_all_trusted_keys() {
         if node_id != local_node_id_str {
             mesh_peer_store.ensure_trusted_peer(&node_id, &public_key_hex, "");
         }
