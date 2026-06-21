@@ -200,6 +200,10 @@ async fn run_server(args: Args) -> Result<()> {
 
     info!("Konfiguracja wczytana pomyslnie");
 
+    tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
+        config.token_metrics.enabled,
+    );
+
     // Inicjalizacja bazy danych
     info!("Inicjalizacja bazy danych: {:?}", db_path);
     let db = db::init(&db_path).map_err(|e| {
@@ -654,6 +658,7 @@ async fn run_server(args: Args) -> Result<()> {
                 node_id: node_id.clone(),
                 role: "router".to_string(),
                 mesh_config: mesh_config.clone(),
+                token_metrics: config.token_metrics.clone(),
             };
 
             match start_mesh_pipeline(

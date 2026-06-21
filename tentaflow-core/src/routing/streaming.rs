@@ -659,7 +659,11 @@ impl Router {
         };
 
         let compliance_event = if let Some(db) = self.db.as_ref() {
-            let gateway = AiGateway::new(db.clone(), self.local_node_id());
+            let gateway = AiGateway::new(
+                db.clone(),
+                self.local_node_id(),
+                crate::compliance::ai_gateway::token_quota_enabled(),
+            );
             Some(
                 gateway
                     .start_chat_event(&request, user.as_ref(), compliance_context.as_ref())
@@ -975,7 +979,7 @@ mod compliance_stream_tests {
     #[tokio::test]
     async fn compliance_stream_zapisuje_scalona_odpowiedz() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {

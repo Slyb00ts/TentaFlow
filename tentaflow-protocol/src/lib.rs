@@ -25,6 +25,7 @@ pub mod message_body;
 pub mod pii;
 pub mod profiling;
 pub mod stream;
+pub mod token_usage;
 pub mod types;
 pub mod vision;
 
@@ -665,6 +666,9 @@ pub use profiling::{
 pub use stream::{
     StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
     StreamSubscribeRequest, StreamSubscribeResponse,
+};
+pub use token_usage::{
+    TokenLeaseWire, TokenQuotaUpsertWire, TokenQuotaWire, TokenUsagePayload, TokenUsageSummaryWire,
 };
 pub use types::*;
 pub use vision::{

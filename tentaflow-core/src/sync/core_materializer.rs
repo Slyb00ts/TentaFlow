@@ -41,6 +41,9 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::ComplianceLegalBasis
             | CoreSyncResourceKind::ComplianceRetentionPolicy
             | CoreSyncResourceKind::ComplianceProcessor
+            | CoreSyncResourceKind::TokenUsageDaily
+            | CoreSyncResourceKind::TokenQuota
+            | CoreSyncResourceKind::TokenLease
     )
 }
 
@@ -135,6 +138,9 @@ pub fn apply_core_operation(
             apply_compliance_retention_policy(&tx, operation)?
         }
         CoreSyncResourceKind::ComplianceProcessor => apply_compliance_processor(&tx, operation)?,
+        CoreSyncResourceKind::TokenUsageDaily => apply_token_usage_daily(&tx, operation)?,
+        CoreSyncResourceKind::TokenQuota => apply_token_quota(&tx, operation)?,
+        CoreSyncResourceKind::TokenLease => apply_token_lease(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -1808,6 +1814,133 @@ fn apply_compliance_processor(
             .execute(
                 "DELETE FROM compliance_processors WHERE processor_id = ?1",
                 rusqlite::params![processor_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated `token_usage_daily` row. Counters are single-writer (the
+/// owning node), so the synced cumulative value is authoritative — we replace the
+/// whole counter set. `updated_at` is a node-local watermark and is NOT synced,
+/// so it is omitted: an INSERT keeps the column DEFAULT and an UPDATE leaves the
+/// receiver's own watermark untouched.
+fn apply_token_usage_daily(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO token_usage_daily \
+                 (id, node_id, org_id, user_id, model_id, usage_day, \
+                  prompt_tokens, completion_tokens, total_tokens, request_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 node_id = excluded.node_id, org_id = excluded.org_id, \
+                 user_id = excluded.user_id, model_id = excluded.model_id, \
+                 usage_day = excluded.usage_day, prompt_tokens = excluded.prompt_tokens, \
+                 completion_tokens = excluded.completion_tokens, \
+                 total_tokens = excluded.total_tokens, request_count = excluded.request_count",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "node_id")?,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "user_id")?,
+                    field_string(operation, "model_id")?,
+                    field_string(operation, "usage_day")?,
+                    field_i64_or(operation, "prompt_tokens", 0)?,
+                    field_i64_or(operation, "completion_tokens", 0)?,
+                    field_i64_or(operation, "total_tokens", 0)?,
+                    field_i64_or(operation, "request_count", 0)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM token_usage_daily WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated `token_quota` row. `created_at` is node-local and preserved
+/// on UPSERT (omitted from both the INSERT column list and the conflict update).
+fn apply_token_quota(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO token_quota \
+                 (id, org_id, scope_type, subject_id, model_id, period, max_total_tokens, is_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 org_id = excluded.org_id, scope_type = excluded.scope_type, \
+                 subject_id = excluded.subject_id, model_id = excluded.model_id, \
+                 period = excluded.period, max_total_tokens = excluded.max_total_tokens, \
+                 is_active = excluded.is_active",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "scope_type")?,
+                    field_optional_string(operation, "subject_id")?,
+                    field_optional_string(operation, "model_id")?,
+                    field_string(operation, "period")?,
+                    field_i64_or(operation, "max_total_tokens", 0)?,
+                    field_bool_or(operation, "is_active", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM token_quota WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated `token_lease` row (coordinator-written). `created_at` is
+/// node-local and preserved on UPSERT.
+fn apply_token_lease(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO token_lease \
+                 (id, org_id, quota_id, node_id, period_key, base_used, granted_tokens, \
+                  coordinator_node_id, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 org_id = excluded.org_id, quota_id = excluded.quota_id, \
+                 node_id = excluded.node_id, period_key = excluded.period_key, \
+                 base_used = excluded.base_used, granted_tokens = excluded.granted_tokens, \
+                 coordinator_node_id = excluded.coordinator_node_id, \
+                 expires_at = excluded.expires_at",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "quota_id")?,
+                    field_string(operation, "node_id")?,
+                    field_string(operation, "period_key")?,
+                    field_i64_or(operation, "base_used", 0)?,
+                    field_i64_or(operation, "granted_tokens", 0)?,
+                    field_string(operation, "coordinator_node_id")?,
+                    field_string(operation, "expires_at")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM token_lease WHERE id = ?1",
+                rusqlite::params![id],
             )
             .map_err(sql_error),
     }

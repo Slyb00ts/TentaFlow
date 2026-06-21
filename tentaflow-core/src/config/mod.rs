@@ -73,6 +73,10 @@ pub struct NodeConfig {
     /// Used by the unified services refactor (services_repo + services::deploy/supervisor).
     #[serde(default)]
     pub services_runtime: ServicesRuntimeConfig,
+
+    /// Metryki zuzycia tokenow + egzekwowanie limitow (sekcja `[token_metrics]`).
+    #[serde(default)]
+    pub token_metrics: TokenMetricsConfig,
 }
 
 // =============================================================================
@@ -109,6 +113,64 @@ impl Default for ServicesRuntimeConfig {
             restart_backoff_max_ms: default_services_restart_backoff_max_ms(),
         }
     }
+}
+
+// =============================================================================
+// Konfiguracja metryk tokenow (sekcja [token_metrics])
+// =============================================================================
+
+/// Ustawienia rozliczania tokenow, egzekwowania limitow oraz koordynatora
+/// dzierzaw. Wszystkie pola maja domyslne wartosci, wiec brak sekcji
+/// `[token_metrics]` daje pelna domyslna konfiguracje.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TokenMetricsConfig {
+    /// Czy egzekwowac limity i zliczac zuzycie tokenow.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Interwal flushera capture'ow zuzycia do Sync Ledger (sekundy).
+    #[serde(default = "default_token_flush_secs")]
+    pub flush_secs: u64,
+
+    /// Interwal cyklu koordynatora dzierzaw (sekundy).
+    #[serde(default = "default_token_lease_secs")]
+    pub lease_secs: u64,
+
+    /// TTL pojedynczej dzierzawy tokenow (sekundy).
+    #[serde(default = "default_token_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+
+    /// Minimalna pula tokenow przydzielana w jednej dzierzawie.
+    #[serde(default = "default_token_min_lease")]
+    pub min_lease: i64,
+}
+
+impl Default for TokenMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            flush_secs: default_token_flush_secs(),
+            lease_secs: default_token_lease_secs(),
+            lease_ttl_secs: default_token_lease_ttl_secs(),
+            min_lease: default_token_min_lease(),
+        }
+    }
+}
+
+fn default_token_flush_secs() -> u64 {
+    60
+}
+
+fn default_token_lease_secs() -> u64 {
+    30
+}
+
+fn default_token_lease_ttl_secs() -> u64 {
+    120
+}
+
+fn default_token_min_lease() -> i64 {
+    1000
 }
 
 fn default_services_port_range() -> (u16, u16) {
@@ -927,6 +989,7 @@ impl Default for NodeConfig {
             }),
             inference: None,
             services_runtime: ServicesRuntimeConfig::default(),
+            token_metrics: TokenMetricsConfig::default(),
         }
     }
 }

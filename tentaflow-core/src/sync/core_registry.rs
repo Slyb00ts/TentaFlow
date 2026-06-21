@@ -40,6 +40,9 @@ pub enum CoreSyncResourceKind {
     ComplianceLegalBasis,
     ComplianceRetentionPolicy,
     ComplianceProcessor,
+    TokenUsageDaily,
+    TokenQuota,
+    TokenLease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +397,36 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "compliance",
+    },
+    // Token accounting. `token_usage_daily` is single-writer-per-row (only the
+    // owning node mutates its rows) but still replicates so any node can sum the
+    // mesh-wide usage; quotas and leases are admin/coordinator edited (LWW).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::TokenUsageDaily,
+        table_name: "token_usage_daily",
+        resource_type: "core.token_usage_daily",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tokens",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::TokenQuota,
+        table_name: "token_quota",
+        resource_type: "core.token_quota",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tokens",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::TokenLease,
+        table_name: "token_lease",
+        resource_type: "core.token_lease",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tokens",
     },
 ];
 

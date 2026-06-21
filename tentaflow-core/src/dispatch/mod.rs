@@ -46,6 +46,7 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;
 
@@ -1309,6 +1310,36 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ApiKeyScopeClearRequest { .. } => "ApiKeyScopeClearRequest",
         MessageBody::ApiKeyRotateRequest { .. } => "ApiKeyRotateRequest",
         MessageBody::ApiKeyRotateResponse { .. } => "ApiKeyRotateResponse",
+        MessageBody::TokenUsageBody(p) => match p {
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest { .. } => {
+                "TokenUsageSummaryRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryResponse { .. } => {
+                "TokenUsageSummaryResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasRequest => "TokenListQuotasRequest",
+            tentaflow_protocol::TokenUsagePayload::ListQuotasResponse { .. } => {
+                "TokenListQuotasResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest { .. } => {
+                "TokenUpsertQuotaRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaResponse { .. } => {
+                "TokenUpsertQuotaResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { .. } => {
+                "TokenDeleteQuotaRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaResponse => {
+                "TokenDeleteQuotaResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest => {
+                "TokenCoordinatorStatusRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse { .. } => {
+                "TokenCoordinatorStatusResponse"
+            }
+        },
     }
 }
 

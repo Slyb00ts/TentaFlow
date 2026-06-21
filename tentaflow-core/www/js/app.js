@@ -55,6 +55,7 @@ import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
+import TokenUsageScreen from '/js/modules/token-usage.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
@@ -152,6 +153,7 @@ const ADMIN_NAV = [
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+      { id: 'token-usage', labelKey: 'nav.token_usage', icon: 'trend' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
@@ -515,6 +517,7 @@ async function renderApp() {
   Router.register('flows', FlowsScreen);
   Router.register('flow-builder', FlowBuilderScreen);
   Router.register('scheduler', SchedulerScreen);
+  Router.register('token-usage', TokenUsageScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
