@@ -8,21 +8,25 @@
 
 #![forbid(unsafe_code)]
 
+pub mod frame;
 pub mod graph;
 pub mod lidar;
 pub mod loop_closure;
 pub mod mapping;
 pub mod optimize;
 pub mod pose;
+pub mod service;
 pub mod submap;
 
 pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
     PoseNode, Scene,
 };
+pub use frame::{decode_lidar_frame, DecodedLidar};
 pub use loop_closure::{verify_loop_closure, LoopGate, LoopVerification};
 pub use mapping::{MapStep, MappingFrontend, SealPolicy};
 pub use optimize::{optimize, OptConfig, OptReport};
+pub use service::SlamService;
 pub use lidar::{
     register, voxel_downsample, IcpConfig, IcpResult, LioConfig, LioTracker, TrackResult, VoxelMap,
 };
