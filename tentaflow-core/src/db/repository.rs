@@ -8674,6 +8674,25 @@ fn token_usage_id(
     format!("usage:{node_id}:{org_id}:{user_id}:{model_id}:{usage_day}")
 }
 
+/// Deterministyczne id limitu z krotki scope. Dzieki temu te same logicznie
+/// kwoty (np. dwie utworzone na tym samym/roznych wezlach) kolapsuja do jednego
+/// wiersza (lokalnie i cross-node przez LWW), zamiast duplikowac sie — SQLite
+/// `UNIQUE` traktuje NULL jako rozne, wiec sam constraint by ich nie zlapal.
+/// `*` to sentinel braku podmiotu/modelu (org-scope, brak ograniczenia modelu).
+fn token_quota_id(
+    org_id: &str,
+    scope_type: &str,
+    subject_id: Option<&str>,
+    model_id: Option<&str>,
+    period: &str,
+) -> String {
+    format!(
+        "quota:{org_id}:{scope_type}:{}:{}:{period}",
+        subject_id.unwrap_or("*"),
+        model_id.unwrap_or("*"),
+    )
+}
+
 /// Deterministyczne id dzierzawy (quota, wezel, okres).
 fn token_lease_id(quota_id: &str, node_id: &str, period_key: &str) -> String {
     format!("lease:{quota_id}:{node_id}:{period_key}")
@@ -8875,10 +8894,19 @@ pub fn token_quota_changed_fields(
 pub fn create_token_quota(pool: &DbPool, params: &NewTokenQuota<'_>) -> Result<String> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = token_quota_id(
+        params.org_id,
+        params.scope_type,
+        params.subject_id,
+        params.model_id,
+        params.period,
+    );
+    // Upsert po deterministycznym id: ponowne utworzenie tej samej kwoty
+    // aktualizuje limit/aktywność zamiast tworzyć duplikat.
     tx.execute(
         "INSERT INTO token_quota (id, org_id, scope_type, subject_id, model_id, period, max_total_tokens, is_active) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(id) DO UPDATE SET max_total_tokens = excluded.max_total_tokens, is_active = excluded.is_active",
         rusqlite::params![
             id,
             params.org_id,
