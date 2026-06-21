@@ -876,6 +876,76 @@ std::thread_local! {
     // declared src_size EXACTLY ONCE per worker, confirming the (2,0) auto-detect
     // picked the correct boundary on real firmware without flooding the stream.
     static VOXEL_FRAMING_LOGGED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    // DIAGNOSTIC (R2 / 0e-live probe): distinct WebRTC topics seen this session +
+    // one-shot lowstate-shape dump. Tells us what data is actually available over
+    // WebRTC (joints? position?) so we know whether option-B pose is possible here.
+    static DIAG: core::cell::RefCell<DiagState> =
+        core::cell::RefCell::new(DiagState { topics: alloc::vec::Vec::new(), lowstate_dumped: false });
+}
+
+#[derive(Default)]
+struct DiagState {
+    topics: alloc::vec::Vec<alloc::string::String>,
+    lowstate_dumped: bool,
+}
+
+/// Log each DISTINCT inbound topic exactly once (cap 64) — enumerates what the
+/// robot actually publishes over WebRTC.
+fn diag_note_topic(raw: &[u8]) {
+    let needle = b"\"topic\":\"";
+    let Some(pos) = find_sub(raw, needle, 0) else { return };
+    let start = pos + needle.len();
+    let rest = &raw[start..];
+    let Some(end) = rest.iter().position(|&b| b == b'"') else { return };
+    let Ok(topic) = core::str::from_utf8(&rest[..end]) else { return };
+    DIAG.with(|c| {
+        let mut d = c.borrow_mut();
+        if d.topics.iter().any(|t| t == topic) || d.topics.len() >= 64 {
+            return;
+        }
+        d.topics.push(alloc::string::String::from(topic));
+        log::info(&alloc::format!("go2 DIAG topic seen: {topic}"));
+    });
+}
+
+/// One-shot dump of the lowstate payload shape: which `data` keys exist, the joint
+/// `motor_state[].q` values (R2), and whether any position-like field is present
+/// (0e-live source check). Runs on the first lowstate frame only.
+fn diag_lowstate_dump(data: &JsonValue) {
+    let first = DIAG.with(|c| {
+        let mut d = c.borrow_mut();
+        if d.lowstate_dumped {
+            return false;
+        }
+        d.lowstate_dumped = true;
+        true
+    });
+    if !first {
+        return;
+    }
+    if let Some(obj) = data.as_object() {
+        let keys: alloc::vec::Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        log::info(&alloc::format!("go2 DIAG lowstate data keys: {keys:?}"));
+    }
+    match data.get("motor_state").and_then(JsonValue::as_array) {
+        Some(ms) => {
+            let qs: alloc::vec::Vec<f64> = ms
+                .iter()
+                .take(12)
+                .filter_map(|m| m.get("q").and_then(JsonValue::as_f64))
+                .collect();
+            log::info(&alloc::format!(
+                "go2 DIAG joints: motor_state count={} q[0..12]={qs:?}",
+                ms.len()
+            ));
+        }
+        None => log::info("go2 DIAG joints: NO motor_state in lowstate"),
+    }
+    for k in ["position", "pose", "p", "xyz", "foot_position", "trunk_pose"] {
+        if data.get(k).is_some() {
+            log::info(&alloc::format!("go2 DIAG lowstate HAS position-like field '{k}'"));
+        }
+    }
 }
 
 /// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
@@ -892,6 +962,9 @@ fn lidar_reset_session() {
     });
     let _ = state::delete(state::KEY_TELEMETRY);
     let _ = state::delete(state::KEY_LIDAR_STATUS);
+    // Reset the diagnostic probe so a reconnect re-enumerates topics + re-dumps the
+    // lowstate shape (it is meant to report what THIS session sees).
+    DIAG.with(|cell| *cell.borrow_mut() = DiagState::default());
 }
 
 /// Mirror the connection-status fields the advertise path (and a future host-side
@@ -1510,6 +1583,7 @@ fn ingest_sportmodestate(raw: &[u8]) {
 fn ingest_lowstate_battery(raw: &[u8]) {
     let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else { return; };
     let data = v.get("data").unwrap_or(&v);
+    diag_lowstate_dump(data);
     let bms = data.get("bms_state").or_else(|| data.get("bms"));
     TELEMETRY.with(|cell| {
         let mut t = cell.borrow_mut();
@@ -2087,6 +2161,8 @@ fn tick() {
                         // is recorded, so a lidar issue cannot stall the link.
                         continue;
                     }
+                    // DIAGNOSTIC: enumerate every distinct inbound topic once.
+                    diag_note_topic(raw);
                     // Only lowstate carries battery; gate on the topic substring,
                     // then pull the integer soc with a zero-alloc byte scan. The
                     // richer battery detail (voltage/current/temp) is parsed into
