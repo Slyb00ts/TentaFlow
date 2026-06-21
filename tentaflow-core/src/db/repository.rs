@@ -23004,3 +23004,235 @@ mod api_key_access_v2_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod token_metrics_tests {
+    use super::*;
+    use crate::db::models::{NewTokenQuota, TokenLeaseUpsert};
+    use crate::services::org::DEFAULT_ORG_ID;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    // Minimalny seed userow/grup do testow scope user/group.
+    fn seed_principals(pool: &DbPool) {
+        let conn = acquire(pool).unwrap();
+        for (id, name) in [("u1", "user-one"), ("u2", "user-two")] {
+            conn.execute(
+                "INSERT INTO user_accounts (id, username, password_hash) VALUES (?1, ?2, 'x')",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO user_groups (id, name) VALUES ('g1', 'group-one')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES ('g1', 'u1')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn quota(pool: &DbPool, scope: &str, subject: Option<&str>, model: Option<&str>) -> String {
+        create_token_quota(
+            pool,
+            &NewTokenQuota {
+                org_id: DEFAULT_ORG_ID,
+                scope_type: scope,
+                subject_id: subject,
+                model_id: model,
+                period: "daily",
+                max_total_tokens: 1000,
+                is_active: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn load_quota(pool: &DbPool, id: &str) -> crate::db::models::TokenQuota {
+        list_token_quotas(pool, DEFAULT_ORG_ID)
+            .unwrap()
+            .into_iter()
+            .find(|q| q.id == id)
+            .expect("quota present")
+    }
+
+    #[test]
+    fn bump_is_cumulative_and_per_node_keyed() {
+        let pool = fresh_db();
+        // Ten sam klucz (node,org,user,model,day) kumuluje; rozne nody = rozne wiersze.
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 5).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 20, 10).unwrap();
+        bump_token_usage(&pool, "B", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 50).unwrap();
+
+        let q = load_quota(&pool, &quota(&pool, "user", Some("u1"), None));
+        // global = A(45) + B(150) = 195; node A = 45.
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 195);
+        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 45);
+        assert_eq!(node_usage_for_quota(&pool, "B", &q, "2026-06-21").unwrap(), 150);
+    }
+
+    #[test]
+    fn scope_filters_sum_correctly() {
+        let pool = fresh_db();
+        seed_principals(&pool);
+        // u1 uzywa m1 i m2; u2 uzywa m1.
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m2", "2026-06-21", 30, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u2", "m1", "2026-06-21", 7, 0).unwrap();
+
+        let user_q = load_quota(&pool, &quota(&pool, "user", Some("u1"), None));
+        let group_q = load_quota(&pool, &quota(&pool, "group", Some("g1"), None));
+        let model_q = load_quota(&pool, &quota(&pool, "model", Some("m1"), None));
+        let org_q = load_quota(&pool, &quota(&pool, "org", None, None));
+
+        assert_eq!(global_usage_for_quota(&pool, &user_q, "2026-06-21").unwrap(), 130); // u1: m1+m2
+        assert_eq!(global_usage_for_quota(&pool, &group_q, "2026-06-21").unwrap(), 130); // g1 = {u1}
+        assert_eq!(global_usage_for_quota(&pool, &model_q, "2026-06-21").unwrap(), 107); // m1: u1+u2
+        assert_eq!(global_usage_for_quota(&pool, &org_q, "2026-06-21").unwrap(), 137); // wszystko
+    }
+
+    #[test]
+    fn model_scope_ignores_redundant_model_restriction() {
+        // CR-002: scope='model' z dodatkowym (sprzecznym) model_id nie moze dawac 0.
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 50, 0).unwrap();
+        let q = load_quota(&pool, &quota(&pool, "model", Some("m1"), Some("m2")));
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 50);
+        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 50);
+    }
+
+    #[test]
+    fn monthly_period_sums_across_days() {
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-20", 40, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 60, 0).unwrap();
+        let id = create_token_quota(
+            &pool,
+            &NewTokenQuota {
+                org_id: DEFAULT_ORG_ID,
+                scope_type: "user",
+                subject_id: Some("u1"),
+                model_id: None,
+                period: "monthly",
+                max_total_tokens: 1000,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        let q = load_quota(&pool, &id);
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06").unwrap(), 100);
+        // inny miesiac nie wlicza sie (enforcement podaje klucz pasujacy do okresu)
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-05").unwrap(), 0);
+    }
+
+    #[test]
+    fn applicable_quotas_match_by_scope() {
+        let pool = fresh_db();
+        seed_principals(&pool);
+        let uq = quota(&pool, "user", Some("u1"), None);
+        let gq = quota(&pool, "group", Some("g1"), None);
+        let oq = quota(&pool, "org", None, None);
+        let mq = quota(&pool, "model", Some("m1"), None);
+
+        let for_u1_m1 = applicable_token_quotas(&pool, DEFAULT_ORG_ID, "u1", "m1").unwrap();
+        let ids: Vec<&str> = for_u1_m1.iter().map(|q| q.id.as_str()).collect();
+        assert!(ids.contains(&uq.as_str()), "user quota applies");
+        assert!(ids.contains(&gq.as_str()), "group quota applies (u1 in g1)");
+        assert!(ids.contains(&oq.as_str()), "org quota always applies");
+        assert!(ids.contains(&mq.as_str()), "model quota applies for m1");
+
+        // u2 nie jest w g1; m2 nie pasuje do model quoty.
+        let for_u2_m2 = applicable_token_quotas(&pool, DEFAULT_ORG_ID, "u2", "m2").unwrap();
+        let ids2: Vec<&str> = for_u2_m2.iter().map(|q| q.id.as_str()).collect();
+        assert!(ids2.contains(&oq.as_str()));
+        assert!(!ids2.contains(&uq.as_str()));
+        assert!(!ids2.contains(&gq.as_str()));
+        assert!(!ids2.contains(&mq.as_str()));
+    }
+
+    #[test]
+    fn lease_roundtrips() {
+        let pool = fresh_db();
+        let qid = quota(&pool, "user", Some("u1"), None);
+        upsert_token_lease(
+            &pool,
+            &TokenLeaseUpsert {
+                org_id: DEFAULT_ORG_ID,
+                quota_id: &qid,
+                node_id: "A",
+                period_key: "2026-06-21",
+                base_used: 100,
+                granted_tokens: 500,
+                coordinator_node_id: "A",
+                expires_at: "2026-06-21T12:00:00Z",
+            },
+        )
+        .unwrap();
+        let lease = get_token_lease(&pool, DEFAULT_ORG_ID, &qid, "A", "2026-06-21")
+            .unwrap()
+            .expect("lease present");
+        assert_eq!(lease.base_used, 100);
+        assert_eq!(lease.granted_tokens, 500);
+        // Upsert nadpisuje, nie duplikuje.
+        upsert_token_lease(
+            &pool,
+            &TokenLeaseUpsert {
+                org_id: DEFAULT_ORG_ID,
+                quota_id: &qid,
+                node_id: "A",
+                period_key: "2026-06-21",
+                base_used: 100,
+                granted_tokens: 700,
+                coordinator_node_id: "A",
+                expires_at: "2026-06-21T12:05:00Z",
+            },
+        )
+        .unwrap();
+        assert_eq!(list_token_leases(&pool, DEFAULT_ORG_ID).unwrap().len(), 1);
+        assert_eq!(
+            get_token_lease(&pool, DEFAULT_ORG_ID, &qid, "A", "2026-06-21")
+                .unwrap()
+                .unwrap()
+                .granted_tokens,
+            700
+        );
+    }
+
+    #[test]
+    fn flusher_captures_only_own_node_rows() {
+        // Kluczowa poprawka: flusher publikuje wylacznie wiersze tego noda.
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 0).unwrap();
+        bump_token_usage(&pool, "B", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 0).unwrap();
+        // Nieznany node nie ma wlasnych wierszy → znacznik niezmieniony.
+        assert_eq!(
+            flush_token_usage_captures(&pool, "ZZZ", "").unwrap(),
+            "".to_string()
+        );
+        // Node A ma wiersze → znacznik przesuwa sie poza "".
+        assert_ne!(flush_token_usage_captures(&pool, "A", "").unwrap(), "");
+    }
+
+    #[test]
+    fn usage_summary_groups_by_dimension() {
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u2", "m1", "2026-06-21", 40, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m2", "2026-06-21", 10, 0).unwrap();
+
+        let by_user = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "user").unwrap();
+        let u1 = by_user.iter().find(|r| r.key == "u1").unwrap();
+        assert_eq!(u1.total_tokens, 110);
+        assert_eq!(u1.request_count, 2);
+
+        let by_model = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
+        let m1 = by_model.iter().find(|r| r.key == "m1").unwrap();
+        assert_eq!(m1.total_tokens, 140);
+    }
+}
