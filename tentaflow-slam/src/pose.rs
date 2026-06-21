@@ -5,7 +5,7 @@
 // metric extents where f32 loses millimetre precision.
 // =============================================================================
 
-use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, Matrix3, Translation3, UnitQuaternion, Vector3, Vector6};
 
 /// A rigid SE(3) transform. Composition reads left-to-right as frame chaining:
 /// `a.then(b)` maps a point in A's child frame through A then B.
@@ -75,6 +75,53 @@ impl Pose {
         let angle = self.0.rotation.angle();
         (t, angle)
     }
+
+    /// SE(3) logarithm: the 6-vector `[ρ (translation part); φ (rotation part)]` in
+    /// the Lie algebra se(3) such that `Pose::se3_exp(&self.log()) == self`. Used as
+    /// the pose-graph residual `log(zᵀ·error)`.
+    pub fn log(&self) -> Vector6<f64> {
+        let phi = self.0.rotation.scaled_axis(); // SO(3) log
+        let theta = phi.norm();
+        let t = self.0.translation.vector;
+        let phi_x = skew(phi);
+        // Left-Jacobian inverse V⁻¹ so that ρ = V⁻¹·t.
+        let v_inv = if theta < 1e-8 {
+            Matrix3::identity() - 0.5 * phi_x
+        } else {
+            let half = 0.5 * theta;
+            let coeff = (1.0 - theta * half.cos() / (2.0 * half.sin())) / (theta * theta);
+            Matrix3::identity() - 0.5 * phi_x + coeff * (phi_x * phi_x)
+        };
+        let rho = v_inv * t;
+        Vector6::new(rho.x, rho.y, rho.z, phi.x, phi.y, phi.z)
+    }
+
+    /// SE(3) exponential: map a se(3) tangent `[ρ; φ]` to a `Pose`. Inverse of
+    /// [`Pose::log`]. Used to apply optimizer increments (`exp(δ)·T`).
+    pub fn se3_exp(v: &Vector6<f64>) -> Pose {
+        let rho = Vector3::new(v[0], v[1], v[2]);
+        let phi = Vector3::new(v[3], v[4], v[5]);
+        let theta = phi.norm();
+        let r = UnitQuaternion::from_scaled_axis(phi);
+        let phi_x = skew(phi);
+        // Left Jacobian V so translation = V·ρ.
+        let v_mat = if theta < 1e-8 {
+            Matrix3::identity() + 0.5 * phi_x
+        } else {
+            let t2 = theta * theta;
+            let b = (1.0 - theta.cos()) / t2;
+            let c = (theta - theta.sin()) / (t2 * theta);
+            Matrix3::identity() + b * phi_x + c * (phi_x * phi_x)
+        };
+        let t = v_mat * rho;
+        Pose(Isometry3::from_parts(Translation3::from(t), r))
+    }
+}
+
+/// 3×3 skew-symmetric matrix of `v` (`skew(v)·w = v × w`).
+#[inline]
+fn skew(v: Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
 }
 
 impl Default for Pose {
