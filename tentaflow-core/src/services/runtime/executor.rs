@@ -109,6 +109,42 @@ enum ToolCallModeLookup {
     Failed,
 }
 
+/// RAG E1.2 — żądanie sparsowania obrazu strony dokumentu na markdown+bloki.
+/// Nieść surowe bajty obrazu (`image_bytes`) + ich `mime`; `model` to alias
+/// (domyślnie `rag-parse`) albo konkretna nazwa serwisu vision-parse. Pola
+/// Tożsamość callera trafia do flow-targetu przez `ExecutionContext::user`
+/// (nie przez pola request), więc tu trzymamy tylko payload + `flow_depth`,
+/// który dziedziczy głębokość zagnieżdżenia z caller-flow (guard rekursji).
+#[derive(Debug, Clone)]
+pub struct DocumentParseRequest {
+    pub model: String,
+    pub image_bytes: Vec<u8>,
+    pub mime: String,
+    pub flow_depth: u8,
+}
+
+/// RAG E1.2 — jeden blok layoutu zwrócony przez serwis parsujący. `bbox` to
+/// `[x1, y1, x2, y2]` w pikselach oryginału; `confidence` puste gdy backend go
+/// nie raportuje. `page` 0-bazowy (zawsze 0 dla pojedynczego obrazu).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocBlock {
+    pub page: u32,
+    pub class: String,
+    pub bbox: [f32; 4],
+    pub text: String,
+    pub confidence: Option<f32>,
+}
+
+/// RAG E1.2 — odpowiedź parsera: pełny markdown strony + rozbicie na bloki.
+/// `usage` to opcjonalny licznik tokenów raportowany przez backend (vision
+/// parse services zwykle go nie zwracają → `None`).
+#[derive(Debug, Clone)]
+pub struct DocumentParseResponse {
+    pub markdown: String,
+    pub blocks: Vec<DocBlock>,
+    pub usage: Option<crate::api::openai::types::Usage>,
+}
+
 /// Top-level orchestrator. Holds Arc references to every collaborator;
 /// no state of its own beyond a per-alias `StrategyState` map. The
 /// resolver already owns `LiveHandlesCache` for hydrating Local
@@ -1629,6 +1665,184 @@ impl ModelRuntimeExecutor {
     }
 
     // =========================================================================
+    // RAG E1.2 — Document parse dispatch (vision → markdown + bloki)
+    // =========================================================================
+
+    /// Document-parse dispatch — lustro `execute_rerank`. Resoluje żądany model
+    /// przez `ServiceSurface::Documents` (input Image / output Text), rankuje
+    /// kandydatów per alias-strategy i próbuje każdego aż któryś zadziała. Alias
+    /// `rag-parse` dostaje TEN SAM failover (kandydaci + dostępność +
+    /// `alias_fallback_total` + warn) co rerank — to jeden punkt metryki
+    /// fallbacku; nie ma drugiej ścieżki parsowania.
+    ///
+    /// **ACL po stronie callera** — host fn `doc_parse_v1` bramkuje uprawnienie
+    /// `document.parse` zanim zbuduje request.
+    pub async fn execute_documents(
+        &self,
+        request: DocumentParseRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentParseResponse, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Documents,
+                required_input_modalities: &[InputModality::Image],
+                required_output_modalities: &[OutputModality::Text],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_documents_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "document parse dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target document-parse dispatch. Serwer obsługuje parsowanie przez
+    /// zdalny serwis vision (HTTP `POST /parse`); QUIC sidecar nie ma jeszcze
+    /// wpiętego kanału obrazu, a embedded (telefon, Burn) to gniazdo na
+    /// przyszłość — oba zwracają błąd, więc failover schodzi na zdalny backend
+    /// zamiast blokować architekturę. Flow-target wykonuje documents-surface flow.
+    async fn dispatch_documents_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: DocumentParseRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentParseResponse, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                // Gniazdo embedded (Burn parser na telefonie) — jeszcze nie
+                // zaimplementowane. Internal (nie abort) → pętla failover
+                // schodzi na następnego kandydata (zdalny serwis).
+                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
+                    "embedded document parse TBD".into(),
+                )),
+                BackendHandle::Http(client) => client
+                    .parse_document(&request.model, &request.image_bytes, &request.mime)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                // Obraz przez QUIC nie ma jeszcze wpiętego payloadu — odkładamy
+                // do follow-up. Internal, żeby failover spróbował HTTP/Flow.
+                BackendHandle::Quic(_) => Err(ExecutorError::Internal(
+                    "documents over QUIC TBD".into(),
+                )),
+            },
+            // Mesh-forward obrazu (cross-node parse) to osobny slice — na razie
+            // pending cutover, jak rerank.
+            ResolvedExecutionTarget::MeshForward { .. } => {
+                Err(ExecutorError::TransportPendingCutover("mesh_forward"))
+            }
+            ResolvedExecutionTarget::Flow {
+                flow_id,
+                published_name: _,
+            } => {
+                let dispatcher = self
+                    .flow_dispatcher
+                    .as_ref()
+                    .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+                ctx.enter_flow(flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
+                let blobs = dispatcher.blobs();
+                let (initial, mut meta) =
+                    match document_request_to_initial_envelope(&request, ctx.user.clone(), blobs)
+                        .await
+                    {
+                        Ok(seed) => seed,
+                        Err(e) => {
+                            ctx.leave_flow();
+                            return Err(ExecutorError::Internal(e.to_string()));
+                        }
+                    };
+                // RAG E1.2: re-wejście w flow dziedziczy bieżącą głębokość (po
+                // `enter_flow`), żeby self-referencyjny parse-flow narastał przez
+                // `subflow_depth` zamiast resetować się do 0.
+                meta.flow_depth = ctx.flow_stack.len() as u8;
+                // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
+                meta.addon_id = ctx.addon_id.clone();
+                meta.org_id = ctx.org_id.clone();
+                // Obraz strony wrzucony do BlobStore MUSI być skasowany po
+                // zakończeniu flow (także przy błędzie) — `put` ląduje w trwałym
+                // store (`CompositeBlobStore`), więc bez jawnego `delete` częste
+                // parse-as-flow zostawia osierocone obrazy do grubego GC.
+                let page_blob_ref = match &initial.payload {
+                    crate::flow_engine::envelope::FlowValue::Image { blob_ref, .. } => {
+                        Some(blob_ref.clone())
+                    }
+                    _ => None,
+                };
+                let dispatch_result = dispatcher
+                    .dispatch_by_flow_id(flow_id.clone(), initial, meta)
+                    .await;
+                ctx.leave_flow();
+                if let Some(blob_ref) = page_blob_ref {
+                    if let Err(e) = dispatcher.blobs().delete(&blob_ref).await {
+                        tracing::warn!(error = %e, "document parse: failed to delete page blob after flow");
+                    }
+                }
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                flow_outcome_to_document_response(outcome)
+            }
+        }
+    }
+
+    // =========================================================================
     // R3b.3 — TTS dispatch
     // =========================================================================
 
@@ -2526,6 +2740,139 @@ pub(crate) fn flow_outcome_to_rerank_response(
     Ok(RerankResponse { results })
 }
 
+/// RAG E1.2 — buduje seed envelope + meta dla document-parse-as-flow path.
+/// Obraz (binarny, potencjalnie duży) ląduje w BlobStore jak audio w STT —
+/// payload nosi sentinel `FlowValue::Image{blob_ref}`, adapter parsera pobiera
+/// bajty z `ctx.blobs.get(&blob_ref)`. Nazwa modelu ląduje w `envelope.meta`.
+pub(crate) async fn document_request_to_initial_envelope(
+    request: &DocumentParseRequest,
+    user: Option<crate::auth::acl::UserContext>,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<(
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+)> {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let blob_ref = blobs
+        .put(request.image_bytes.clone(), &request.mime)
+        .await
+        .map_err(|e| anyhow::anyhow!("document parse blob put: {e}"))?;
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Image {
+        blob_ref,
+        mime: request.mime.clone(),
+        dims: None,
+    };
+    env.meta.insert(
+        "parse_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    Ok((env, meta))
+}
+
+/// RAG E1.2 — konwertuje `FlowExecutionOutcome` (parse-as-flow) na
+/// `DocumentParseResponse`. Flow output to `Json{markdown, blocks:[{...}]}` —
+/// czytamy markdown i bloki tak jak z serwisu HTTP. Brakujące `confidence`
+/// dekoduje się do `None`, brakujące `page` do 0.
+pub(crate) fn flow_outcome_to_document_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<DocumentParseResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let json = match &outcome.final_envelope.payload {
+        FlowValue::Json(v) => v.clone(),
+        _ => {
+            return Err(ExecutorError::Internal(
+                "document parse flow returned no Json payload".into(),
+            ))
+        }
+    };
+    let markdown = json
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let blocks = parse_blocks_json(json.get("blocks"));
+    Ok(DocumentParseResponse {
+        markdown,
+        blocks,
+        usage: None,
+    })
+}
+
+/// Wspólny parser bloków z `serde_json` (używany przez ścieżkę HTTP serwisu i
+/// flow-target). Blok bez wymaganych pól (`class`/`text` jako string), ze złym
+/// `bbox` (musi być tablicą dokładnie 4 liczb) lub z `page` poza zakresem u32
+/// jest POMIJANY — nie wchodzi do wyniku jako pusty/uszkodzony wpis. Tolerancja
+/// per-blok: jeden zły blok nie wywala całej odpowiedzi.
+pub(crate) fn parse_blocks_json(blocks: Option<&serde_json::Value>) -> Vec<DocBlock> {
+    let Some(arr) = blocks.and_then(|b| b.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        // Pola wymagane: `class` i `text` MUSZĄ być stringami. Brak/zły typ →
+        // pomiń cały blok (nie wpychaj pustego — to cicha korupcja wyniku).
+        let Some(class) = entry.get("class").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(text) = entry.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // `bbox` musi być tablicą DOKŁADNIE 4 liczb — inaczej pomiń blok
+        // zamiast zerować/ucinać współrzędne.
+        let Some(bbox_arr) = entry.get("bbox").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if bbox_arr.len() != 4 {
+            continue;
+        }
+        let mut bbox = [0.0f32; 4];
+        let mut bbox_ok = true;
+        for (slot, raw) in bbox.iter_mut().zip(bbox_arr.iter()) {
+            match raw.as_f64() {
+                Some(n) => *slot = n as f32,
+                None => {
+                    bbox_ok = false;
+                    break;
+                }
+            }
+        }
+        if !bbox_ok {
+            continue;
+        }
+        // `page`: u64 → u32 przez try_from (zła/za duża wartość → pomiń blok,
+        // NIE owijaj `as u32`). Brak pola dekoduje do 0 (pojedynczy obraz).
+        let page = match entry.get("page") {
+            Some(v) => match v.as_u64() {
+                Some(p) => match u32::try_from(p) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                },
+                None => continue,
+            },
+            None => 0,
+        };
+        let confidence = entry
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .map(|c| c as f32);
+        out.push(DocBlock {
+            page,
+            class: class.to_string(),
+            bbox,
+            text: text.to_string(),
+            confidence,
+        });
+    }
+    out
+}
+
 /// Stage 3d-0b-4: buduje seed envelope + meta dla STT-as-flow path.
 /// Audio bytes lądują w BlobStore (sentinel BlobRef zostaje na payload),
 /// adapter STT pobiera bytes z `ctx.blobs.get(&blob_ref)` w execute().
@@ -3061,6 +3408,157 @@ mod tests {
         assert_eq!(resp.results[0].index, 1);
         assert!((resp.results[0].relevance_score - 0.9).abs() < 1e-6);
         assert_eq!(resp.results[1].index, 0);
+    }
+
+    // RAG E1.2: per-target `dispatch_documents_blocking` tests. Embedded jest
+    // gniazdem (Internal → chain moves on, NIE crash); MeshForward defers do
+    // pending cutover; Flow bez dispatchera surface'uje typed error.
+
+    fn make_doc_request(model: &str) -> DocumentParseRequest {
+        DocumentParseRequest {
+            model: model.to_string(),
+            image_bytes: vec![0x89, 0x50, 0x4e, 0x47],
+            mime: "image/png".into(),
+            flow_depth: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn documents_embedded_is_socket_so_chain_moves_on() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "parse-m".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "parse-m".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_documents_blocking(&target, make_doc_request("parse-m"), &mut ctx)
+            .await
+            .expect_err("embedded document parse is a socket (TBD)");
+        // Internal (nie abort) → failover schodzi na zdalny backend, nie crash.
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(!err.aborts_fallback_chain());
+    }
+
+    #[tokio::test]
+    async fn documents_mesh_forward_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "parse-m".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_documents_blocking(&target, make_doc_request("parse-m"), &mut ctx)
+            .await
+            .expect_err("mesh_forward branch should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    #[tokio::test]
+    async fn documents_flow_without_dispatcher_returns_typed_error() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: "1".to_string(),
+            published_name: "parse-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_documents_blocking(&target, make_doc_request("any"), &mut ctx)
+            .await
+            .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    /// `execute_documents` dla aliasu `rag-parse` na pustym katalogu surface'uje
+    /// błąd resolvera (brak serwisu documents), nie panikuje — to ten sam
+    /// failover-aware resolve co rerank `rag-reranker`.
+    #[tokio::test]
+    async fn execute_documents_unknown_alias_surfaces_resolve_error() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .execute_documents(make_doc_request("rag-parse"), &mut ctx)
+            .await
+            .expect_err("unknown parse alias must error, not panic");
+        assert!(matches!(err, ExecutorError::Resolve(_)));
+    }
+
+    /// Flow parse outcome → `DocumentParseResponse`: czyta markdown + bloki z
+    /// `Json{markdown, blocks}`. Brakujące `confidence`/`page` → None/0.
+    #[test]
+    fn flow_outcome_to_document_maps_markdown_and_blocks() {
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({
+                "markdown": "# Faktura",
+                "blocks": [
+                    { "class": "Title", "bbox": [1.0, 2.0, 3.0, 4.0], "text": "# Faktura", "confidence": 0.9 },
+                    { "class": "Text", "bbox": [1.0, 5.0, 3.0, 8.0], "text": "Kwota" }
+                ]
+            }),
+        ));
+        let resp = flow_outcome_to_document_response(outcome).expect("flow parse maps");
+        assert_eq!(resp.markdown, "# Faktura");
+        assert_eq!(resp.blocks.len(), 2);
+        assert_eq!(resp.blocks[0].class, "Title");
+        assert_eq!(resp.blocks[0].bbox, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(resp.blocks[0].confidence, Some(0.9));
+        assert_eq!(resp.blocks[1].page, 0);
+        assert_eq!(resp.blocks[1].confidence, None);
+    }
+
+    /// `parse_blocks_json` (współdzielony przez ścieżkę HTTP i flow) tolerancyjnie
+    /// dekoduje kształt z serwisu `{markdown, blocks:[{class,bbox,text}]}`.
+    #[test]
+    fn parse_blocks_json_decodes_service_shape() {
+        let v = serde_json::json!([
+            { "class": "Table", "bbox": [0.0, 0.0, 10.0, 10.0], "text": "<table></table>" }
+        ]);
+        let blocks = parse_blocks_json(Some(&v));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].class, "Table");
+        assert_eq!(blocks[0].text, "<table></table>");
+        assert_eq!(blocks[0].bbox, [0.0, 0.0, 10.0, 10.0]);
+        assert!(parse_blocks_json(None).is_empty());
+    }
+
+    /// `parse_blocks_json` POMIJA złe bloki (brak `class`/`text`, `bbox` ≠ 4
+    /// liczby, `page` poza u32), a dobre zostawia — walidacja-i-pomiń zamiast
+    /// cichej korupcji (puste pola / zerowany bbox / zawinięty page).
+    #[test]
+    fn parse_blocks_json_skips_malformed_keeps_valid() {
+        let v = serde_json::json!([
+            // dobry blok
+            { "class": "Text", "bbox": [0.0, 0.0, 1.0, 1.0], "text": "ok", "page": 0 },
+            // brak `class`
+            { "bbox": [0.0, 0.0, 1.0, 1.0], "text": "no class" },
+            // brak `text`
+            { "class": "Text", "bbox": [0.0, 0.0, 1.0, 1.0] },
+            // `bbox` o złej długości (3 elementy)
+            { "class": "Text", "bbox": [0.0, 0.0, 1.0], "text": "short bbox" },
+            // `bbox` z nie-liczbą
+            { "class": "Text", "bbox": [0.0, 0.0, 1.0, "x"], "text": "bad bbox elem" },
+            // `page` poza zakresem u32
+            { "class": "Text", "bbox": [0.0, 0.0, 1.0, 1.0], "text": "huge page", "page": 4294967296u64 },
+            // drugi dobry blok
+            { "class": "Title", "bbox": [2.0, 3.0, 4.0, 5.0], "text": "ok2", "page": 7 },
+        ]);
+        let blocks = parse_blocks_json(Some(&v));
+        assert_eq!(blocks.len(), 2, "tylko 2 poprawne bloki wchodzą do wyniku");
+        assert_eq!(blocks[0].text, "ok");
+        assert_eq!(blocks[0].page, 0);
+        assert_eq!(blocks[1].text, "ok2");
+        assert_eq!(blocks[1].page, 7);
+        assert_eq!(blocks[1].bbox, [2.0, 3.0, 4.0, 5.0]);
     }
 
     fn make_tts_request(model: &str) -> TTSRequest {

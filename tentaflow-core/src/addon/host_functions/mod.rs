@@ -13,6 +13,7 @@ pub mod camera;
 pub mod camera_metadata;
 pub mod cbor_io;
 pub mod config;
+pub mod doc_parse;
 pub mod events;
 pub mod flow;
 pub mod gate;
@@ -333,6 +334,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
     }
+
+    // --- Document parse API (RAG E1.2 — vision OBRAZ → markdown + bloki) ---
+    linker
+        .func_wrap("tentaflow", "doc_parse_v1", doc_parse::doc_parse_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja doc_parse_v1: {e}"))?;
 
     // --- Graph API (RAG 0.2 — embedded CozoDB per-addon per-collection graphs) ---
     #[cfg(feature = "graph")]
