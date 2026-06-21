@@ -77,6 +77,8 @@ impl EngineSink for StreamSink {
             is_final: token.is_final,
             finish_reason,
             error,
+            prompt_tokens: token.prompt_tokens,
+            completion_tokens: token.generated_tokens,
         };
         match self.tx.try_send(core) {
             Ok(()) => SinkStatus::Delivered,

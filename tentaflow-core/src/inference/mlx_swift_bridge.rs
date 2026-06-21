@@ -177,6 +177,9 @@ extern "C" fn rust_token_callback(
         is_final,
         finish_reason: None,
         error: None,
+        // Swift MLX bridge nie wystawia liczników w tym callbacku.
+        prompt_tokens: 0,
+        completion_tokens: 0,
     });
 }
 
@@ -448,6 +451,8 @@ impl InferenceEngine for MlxSwiftEngine {
                     is_final: true,
                     finish_reason: None,
                     error: Some(msg),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
                 });
             }
 

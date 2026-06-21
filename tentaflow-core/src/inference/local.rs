@@ -414,6 +414,20 @@ impl LocalInferenceHandler {
             } else {
                 Some(token.text)
             };
+            // Usage jedzie na tokenie finalnym z realnymi licznikami silnika; tym
+            // chunkiem token accounting (AiGateway) zlicza zużycie. Silniki nie
+            // raportujące liczb (np. MLX) dają 0 → pomijamy, by nie wpisywać zer.
+            let usage = if token.is_final
+                && (token.prompt_tokens > 0 || token.completion_tokens > 0)
+            {
+                Some(Usage {
+                    prompt_tokens: token.prompt_tokens,
+                    completion_tokens: token.completion_tokens,
+                    total_tokens: token.prompt_tokens + token.completion_tokens,
+                })
+            } else {
+                None
+            };
             let chunk = ChatCompletionChunk {
                 id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -437,7 +451,7 @@ impl LocalInferenceHandler {
                 transcribed_text: None,
                 speaker_id: None,
                 speaker_name: None,
-                usage: None,
+                usage,
             };
 
             if chunk_tx.send(chunk).await.is_err() {
