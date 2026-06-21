@@ -456,3 +456,36 @@ transfer can't block a control message:
   crude fallback if priorities are unavailable.
 - Maps onto existing UFP/2 channels: each logical channel = a separate QUIC stream;
   add per-class priority; use datagrams for ephemeral real-time.
+
+---
+
+## 15. Addon-bundled robot model + live joint animation
+
+A device addon CARRIES its own 3D model; the renderer is generic (mirrors "addon
+adapts device → canonical"). So any robot (Go2, other quadruped, arm, drone) ships a
+model + a joint mapping, and the same renderer animates it.
+
+- **Bundled asset**: the addon package gains `model.glb` (glTF — web-native: meshes +
+  materials + a node hierarchy that IS the kinematic tree) + `robot_model.toml` (the
+  **joint manifest**: `joint_name → glTF node + rotation axis + parent`). Packaging
+  (`build.rs`) embeds it alongside `addon.wasm`; it replicates with the addon over the
+  mesh, so every node rendering that robot has the model. `go2_description` URDF→glTF is
+  converted ONCE at packaging, never in runtime.
+- **Canonical `RobotJointState`** (wire type, like `GlobalPose`): timestamp + ordered
+  joint angles (order = the manifest). The addon parses `rt/lf/lowstate`
+  `motor_state[i].q` (Go2 motor order: 0-2 FR, 3-5 FL, 6-8 RR, 9-11 RL) into it.
+- **Renderer (generic)**: load `model.glb` once (cache by content hash) → **forward
+  kinematics**: rotate each joint node by its angle about the manifest axis → place the
+  robot base at its `GlobalPose` (from SLAM) inside the spatial scene. Result: the
+  point-cloud map + the live, joint-synced robot standing where it is localized.
+- **Caveat**: over WebRTC `lowstate` is ~1 Hz → interpolate joint angles in the
+  renderer; Ethernet/DDS gives a faster state (and raw lidar).
+- **Go2 ingestion = option B**: the Go2 `voxel_map_compressed` is its OWN fused map (not
+  raw scans), so we DON'T run our LIO/ICP on it — we trust the device pose
+  (`rt/sportmodestate`) for the robot and ingest its map as scene geometry. Our SLAM
+  crate's LIO/optimizer is for RAW-scan sources (iPhone, raw lidar, Go2-over-Ethernet)
+  and cross-robot mesh fusion. (`SlamService::ingest_with_known_pose`.)
+
+Chunks: R1 `RobotJointState` type + `robot_model.toml` schema; R2 addon go2 lowstate→
+joint stream; R3 package addon with `model.glb` + serve asset; R4 renderer glTF + FK +
+interpolation + base from `GlobalPose`.
