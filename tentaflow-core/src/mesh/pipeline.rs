@@ -423,6 +423,12 @@ pub async fn start_mesh_pipeline(
             );
             spawn_pairing_cleanup(mesh_security.clone());
             spawn_sync_repair_scheduler(quic_mesh.clone(), mesh_security.clone());
+            spawn_trust_expiry_prune(
+                quic_mesh.clone(),
+                mesh_peer_store.clone(),
+                mesh_security.clone(),
+                mesh_config.trust_expiry_days,
+            );
 
             info!("Mesh networking uruchomiony (iroh transport)");
 
@@ -3395,6 +3401,132 @@ fn spawn_pairing_cleanup(mesh_security: Arc<MeshSecurity>) {
             }
         }
     });
+}
+
+/// Parses a SQLite `datetime('now')` timestamp (`YYYY-MM-DD HH:MM:SS`, UTC) or an
+/// RFC3339 string into a UNIX epoch in milliseconds. Used as the activity floor for
+/// trust-expiry: a freshly paired peer that never connected has only `approved_at`,
+/// so it must not be pruned before the TTL elapses since pairing.
+fn approved_at_to_ms(approved_at: &str) -> Option<i64> {
+    let trimmed = approved_at.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.timestamp_millis());
+    }
+    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc().timestamp_millis())
+}
+
+/// Time-based trust expiry. Walks the trusted-node set and auto-removes any peer that
+/// has neither connected nor been (re)paired within `trust_expiry_days`. This self-cleans
+/// dead identities: a wiped/re-provisioned node gets a NEW ed25519 key, so its OLD identity
+/// would otherwise sit `trusted` forever and the mesh would burn reconnect cycles dialing it.
+///
+/// A peer that is currently connected, or whose persisted `last_seen_ms` (last successful
+/// connection, survives restart) is within the TTL, is NEVER pruned — only long-unreachable
+/// identities are removed. `trust_expiry_days == 0` disables the prune entirely.
+fn spawn_trust_expiry_prune(
+    qm: Arc<IrohMeshManager>,
+    peer_store: MeshPeerStore,
+    mesh_security: Arc<MeshSecurity>,
+    trust_expiry_days: u64,
+) {
+    if trust_expiry_days == 0 {
+        info!("trust-expiry prune wylaczony (trust_expiry_days=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let ttl_ms = (trust_expiry_days as i64).saturating_mul(86_400_000);
+        // Daily cadence is far finer than a 30-day TTL, so the check is cheap and a node
+        // crossing the threshold is removed within a day without spamming the DB/log.
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("trust-expiry prune: nie udalo sie odczytac trusted_nodes: {}", e);
+                    continue;
+                }
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            for node in &trusted {
+                // Reachable peers are never candidates — guards against revoking a healthy
+                // node whose persisted last_seen happens to lag (bucketed every 30s).
+                if qm.is_connected(&node.node_id).await {
+                    continue;
+                }
+                let last_seen = crate::db::repository::get_peer_last_seen_ms(
+                    &mesh_security.db,
+                    &node.node_id,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+                // Floor activity at pairing time so a just-paired peer that has not yet
+                // connected is not pruned before the TTL elapses.
+                let approved_ms = approved_at_to_ms(&node.approved_at).unwrap_or(0);
+                let last_activity = last_seen.max(approved_ms);
+                if last_activity == 0 || now_ms.saturating_sub(last_activity) <= ttl_ms {
+                    continue;
+                }
+
+                let idle_days = now_ms.saturating_sub(last_activity) / 86_400_000;
+                info!(
+                    peer = %node.node_id,
+                    idle_days,
+                    "trust-expiry prune: usuwam martwa zaufana tozsamosc (brak polaczenia w oknie TTL)"
+                );
+                let _ = crate::db::repository::log_audit(
+                    &mesh_security.db,
+                    None,
+                    None,
+                    "trust_expired",
+                    None,
+                    Some(&format!(
+                        "Auto-revoke zaufania dla {} — brak polaczenia od {} dni",
+                        node.node_id, idle_days
+                    )),
+                    None,
+                    Some(&node.node_id),
+                );
+                // Drop trusted_nodes row + in-memory keys + rebuild snapshot.
+                if let Err(e) = mesh_security.unpair(&node.node_id) {
+                    warn!(peer = %node.node_id, "trust-expiry prune: unpair nieudany: {}", e);
+                    continue;
+                }
+                // Remove from the sync target set (sync_nodes filtered on trust_status).
+                let _ = crate::db::repository::delete_sync_node(&mesh_security.db, &node.node_id);
+                // Clear persisted contact hints + peer_persisted row, so the reconnect
+                // manager stops dialing the dead identity.
+                let _ = crate::net::iroh::pairing::delete_trusted_contact_hints(
+                    &mesh_security.db,
+                    &node.node_id,
+                );
+                // Forget the in-memory registry entry so liveness/reconnect drop it now.
+                if let Some(registry) = peer_store.registry() {
+                    if let Ok(id_bytes) = hex_to_node_id(&node.node_id) {
+                        registry.forget(&id_bytes);
+                    }
+                }
+                peer_store.remove(&node.node_id);
+            }
+        }
+    });
+}
+
+/// Decodes a hex node_id into the 32-byte key shape the peer registry uses.
+fn hex_to_node_id(node_id_hex: &str) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(node_id_hex, &mut out)
+        .map_err(|e| anyhow::anyhow!("invalid node_id hex: {e}"))?;
+    Ok(out)
 }
 
 fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<MeshSecurity>) {

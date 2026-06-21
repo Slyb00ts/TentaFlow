@@ -9364,6 +9364,40 @@ pub fn remove_trusted_node(pool: &DbPool, node_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Zwraca ostatni utrwalony czas udanego polaczenia (`peer_persisted.last_seen_ms`,
+/// epoka UNIX w ms) dla peera identyfikowanego heksowym node_id. `None` gdy node_id
+/// nie jest poprawnym 32-bajtowym kluczem albo nie ma jeszcze wiersza w `peer_persisted`
+/// (np. peer sparowany, ale nigdy nie polaczony). Uzywane przez prune wygaslego
+/// zaufania — to trwaly sygnal "ostatniego sukcesu", wiec przetrwa restart.
+pub fn get_peer_last_seen_ms(pool: &DbPool, node_id_hex: &str) -> Result<Option<i64>> {
+    let mut id_bytes = [0u8; 32];
+    if hex::decode_to_slice(node_id_hex, &mut id_bytes).is_err() {
+        return Ok(None);
+    }
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT last_seen_ms FROM peer_persisted WHERE node_id = ?1",
+            rusqlite::params![id_bytes.as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Usuwa wiersz tozsamosci sync dla noda, zdejmujac go z zbioru celow synchronizacji
+/// (`list_permission_filtered_sync_targets_*` filtruje po `trust_status='trusted'`).
+/// Wolane przy prune wygaslego zaufania, zeby martwa tozsamosc nie zostawala celem
+/// replikacji. Idempotentne — brak wiersza nie jest bledem.
+pub fn delete_sync_node(pool: &DbPool, node_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM sync_nodes WHERE node_id = ?1",
+        rusqlite::params![node_id],
+    )?;
+    Ok(())
+}
+
 /// Sprawdza czy node jest zaufany
 pub fn is_node_trusted(pool: &DbPool, node_id: &str) -> Result<bool> {
     let conn = acquire(pool)?;
