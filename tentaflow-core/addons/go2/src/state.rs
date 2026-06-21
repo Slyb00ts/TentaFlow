@@ -34,6 +34,11 @@ pub const KEY_STATUS: &str = "live:status";
 /// the old `robot_live.lidar_enabled` column did.
 pub const KEY_LIDAR_ENABLED: &str = "lidar:enabled";
 
+/// Operator CONNECT intent. Durable, DEFAULT-ON (absent ⇒ true): the service tick
+/// auto-connects when offline so a robot comes online by itself; an explicit
+/// disconnect sets it false so it stays down (no auto-reconnect) until reconnected.
+pub const KEY_CONNECT_INTENT: &str = "connect:intent";
+
 #[cfg(not(test))]
 #[link(wasm_import_module = "tentaflow")]
 extern "C" {
