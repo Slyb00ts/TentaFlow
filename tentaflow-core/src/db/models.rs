@@ -620,6 +620,83 @@ pub struct UpdatePiiRule<'a> {
     pub test_examples: Option<&'a str>,
 }
 
+/// Limit zuzycia tokenow (token_quota) - wiersz tabeli.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenQuota {
+    pub id: String,
+    pub org_id: String,
+    pub scope_type: String,
+    pub subject_id: Option<String>,
+    pub model_id: Option<String>,
+    pub period: String,
+    pub max_total_tokens: i64,
+    pub is_active: bool,
+    pub created_at: String,
+}
+
+/// Parametry tworzenia limitu tokenow.
+#[derive(Debug, Clone)]
+pub struct NewTokenQuota<'a> {
+    pub org_id: &'a str,
+    pub scope_type: &'a str,
+    pub subject_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub period: &'a str,
+    pub max_total_tokens: i64,
+    pub is_active: bool,
+}
+
+/// Parametry aktualizacji limitu tokenow.
+#[derive(Debug, Clone)]
+pub struct UpdateTokenQuota<'a> {
+    pub id: &'a str,
+    pub org_id: &'a str,
+    pub scope_type: &'a str,
+    pub subject_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub period: &'a str,
+    pub max_total_tokens: i64,
+    pub is_active: bool,
+}
+
+/// Dzierzawa tokenow (token_lease) - wiersz tabeli.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenLease {
+    pub id: String,
+    pub org_id: String,
+    pub quota_id: String,
+    pub node_id: String,
+    pub period_key: String,
+    pub base_used: i64,
+    pub granted_tokens: i64,
+    pub coordinator_node_id: String,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+/// Wiersz zagregowanego zuzycia tokenow dla GUI (grupowanie po user/model/day).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSummaryRow {
+    pub key: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub request_count: i64,
+}
+
+/// Parametry zapisu (upsert) dzierzawy tokenow przez koordynatora.
+#[derive(Debug, Clone)]
+pub struct TokenLeaseUpsert<'a> {
+    pub org_id: &'a str,
+    pub quota_id: &'a str,
+    pub node_id: &'a str,
+    pub period_key: &'a str,
+    pub base_used: i64,
+    pub granted_tokens: i64,
+    pub coordinator_node_id: &'a str,
+    pub expires_at: &'a str,
+}
+
 /// Parametry aktualizacji wzorca fast path
 #[derive(Debug, Clone)]
 pub struct UpdateFastPathPattern<'a> {

@@ -1588,6 +1588,73 @@ pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeTokenUsageSummaryRequest)]
+pub fn encode_token_usage_summary_request(
+    period: String,
+    period_key: String,
+    group_by: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest {
+            period,
+            period_key,
+            group_by,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenListQuotasRequest)]
+pub fn encode_token_list_quotas_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::ListQuotasRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenUpsertQuotaRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_token_upsert_quota_request(
+    id: Option<String>,
+    scope_type: String,
+    subject_id: Option<String>,
+    model_id: Option<String>,
+    period: String,
+    max_total_tokens: i64,
+    is_active: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest {
+            quota: tentaflow_protocol::TokenQuotaUpsertWire {
+                id,
+                scope_type,
+                subject_id,
+                model_id,
+                period,
+                max_total_tokens,
+                is_active,
+            },
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenDeleteQuotaRequest)]
+pub fn encode_token_delete_quota_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenCoordinatorStatusRequest)]
+pub fn encode_token_coordinator_status_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
 pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -5098,6 +5165,104 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SchedulerJobRunNowResponse".into());
                 set(&obj, "runJson", resp.run_json.clone().into());
                 set(&obj, "run_json", resp.run_json.into());
+            }
+        },
+        MessageBody::TokenUsageBody(payload) => match payload {
+            // Warianty request są obsługiwane tylko po stronie Core — dashboard
+            // ich nie dekoduje, więc mapujemy je na sam znacznik wariantu.
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest { .. } => {
+                set(&obj, "variant", "TokenUsageSummaryRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasRequest => {
+                set(&obj, "variant", "TokenListQuotasRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest { .. } => {
+                set(&obj, "variant", "TokenUpsertQuotaRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { .. } => {
+                set(&obj, "variant", "TokenDeleteQuotaRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest => {
+                set(&obj, "variant", "TokenCoordinatorStatusRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryResponse { rows } => {
+                set(&obj, "variant", "TokenUsageSummaryResponse".into());
+                let arr = js_sys::Array::new();
+                for r in rows {
+                    let item = js_sys::Object::new();
+                    set(&item, "key", r.key.into());
+                    // Liczniki tokenów jako JS Number (f64) — i64 trafiłby do JS
+                    // jako BigInt i psuł arytmetykę/wykresy w dashboardzie.
+                    set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+                    set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+                    set(&item, "completionTokens", (r.completion_tokens as f64).into());
+                    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                    set(&item, "totalTokens", (r.total_tokens as f64).into());
+                    set(&item, "total_tokens", (r.total_tokens as f64).into());
+                    set(&item, "requestCount", (r.request_count as f64).into());
+                    set(&item, "request_count", (r.request_count as f64).into());
+                    arr.push(&item);
+                }
+                set(&obj, "rows", arr.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasResponse { quotas } => {
+                set(&obj, "variant", "TokenListQuotasResponse".into());
+                let arr = js_sys::Array::new();
+                for q in quotas {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", q.id.into());
+                    set(&item, "orgId", q.org_id.clone().into());
+                    set(&item, "org_id", q.org_id.into());
+                    set(&item, "scopeType", q.scope_type.clone().into());
+                    set(&item, "scope_type", q.scope_type.into());
+                    set_optional_string(&item, "subjectId", q.subject_id.clone());
+                    set_optional_string(&item, "subject_id", q.subject_id);
+                    set_optional_string(&item, "modelId", q.model_id.clone());
+                    set_optional_string(&item, "model_id", q.model_id);
+                    set(&item, "period", q.period.into());
+                    set(&item, "maxTotalTokens", (q.max_total_tokens as f64).into());
+                    set(&item, "max_total_tokens", (q.max_total_tokens as f64).into());
+                    set(&item, "isActive", q.is_active.into());
+                    set(&item, "is_active", q.is_active.into());
+                    arr.push(&item);
+                }
+                set(&obj, "quotas", arr.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaResponse { id } => {
+                set(&obj, "variant", "TokenUpsertQuotaResponse".into());
+                set(&obj, "id", id.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaResponse => {
+                set(&obj, "variant", "TokenDeleteQuotaResponse".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse {
+                coordinator_node_id,
+                leases,
+            } => {
+                set(&obj, "variant", "TokenCoordinatorStatusResponse".into());
+                set_optional_string(&obj, "coordinatorNodeId", coordinator_node_id.clone());
+                set_optional_string(&obj, "coordinator_node_id", coordinator_node_id);
+                let arr = js_sys::Array::new();
+                for l in leases {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", l.id.into());
+                    set(&item, "quotaId", l.quota_id.clone().into());
+                    set(&item, "quota_id", l.quota_id.into());
+                    set(&item, "nodeId", l.node_id.clone().into());
+                    set(&item, "node_id", l.node_id.into());
+                    set(&item, "periodKey", l.period_key.clone().into());
+                    set(&item, "period_key", l.period_key.into());
+                    set(&item, "baseUsed", (l.base_used as f64).into());
+                    set(&item, "base_used", (l.base_used as f64).into());
+                    set(&item, "grantedTokens", (l.granted_tokens as f64).into());
+                    set(&item, "granted_tokens", (l.granted_tokens as f64).into());
+                    set(&item, "coordinatorNodeId", l.coordinator_node_id.clone().into());
+                    set(&item, "coordinator_node_id", l.coordinator_node_id.into());
+                    set(&item, "expiresAt", l.expires_at.clone().into());
+                    set(&item, "expires_at", l.expires_at.into());
+                    arr.push(&item);
+                }
+                set(&obj, "leases", arr.into());
             }
         },
         MessageBody::SkillsBody(payload) => match payload {

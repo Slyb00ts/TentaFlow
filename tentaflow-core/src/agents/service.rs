@@ -178,6 +178,7 @@ impl AgentService {
         let gateway = AiGateway::new(
             self.db.clone(),
             crate::mesh::node_info_collector::local_hostname(),
+            crate::compliance::ai_gateway::token_quota_enabled(),
         );
         if let Err(e) = gateway.record_run_tool_execution(agent_run_id, execution) {
             tracing::warn!("agent tool-execution audit failed (skipping): {e}");

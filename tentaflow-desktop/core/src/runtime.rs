@@ -206,6 +206,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
             node_id: node_id.clone(),
             role: "desktop".to_string(),
             mesh_config: config.mesh.as_ref().unwrap().clone(),
+            token_metrics: config.token_metrics.clone(),
         };
 
         match start_mesh_pipeline(

@@ -6549,6 +6549,10 @@ pub enum MessageBody {
     // Appended AFTER the API-key variants so origin's variant indices stay
     // wire-stable across the fleet; RobotsBody takes the new highest index.
     RobotsBody(RobotsPayload),
+    // Token metrics admin: usage summary, quota CRUD, lease coordinator status.
+    // Appended at the END so existing variant indices stay wire-stable across
+    // the fleet (ciborium 0.8 encodes variants by index).
+    TokenUsageBody(crate::token_usage::TokenUsagePayload),
 }
 
 // =============================================================================

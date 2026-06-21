@@ -69,6 +69,8 @@ pub struct MeshPipelineConfig {
     pub role: String,
     /// Konfiguracja mesh z pliku config
     pub mesh_config: MeshConfig,
+    /// Konfiguracja metryk tokenow — bramkuje flushera i koordynatora dzierzaw.
+    pub token_metrics: crate::config::TokenMetricsConfig,
 }
 
 /// Wynik uruchomienia mesh pipeline — trzeba trzymac alive do konca zycia aplikacji
@@ -429,6 +431,28 @@ pub async fn start_mesh_pipeline(
                 mesh_security.clone(),
                 mesh_config.trust_expiry_days,
             );
+
+            if config.token_metrics.enabled {
+                if let Some(ref pool) = db_pool {
+                    spawn_token_usage_flusher(
+                        pool.clone(),
+                        local_node_id.clone(),
+                        config.token_metrics.flush_secs,
+                        background_shutdown.clone(),
+                    );
+                    spawn_token_lease_coordinator(
+                        quic_mesh.clone(),
+                        mesh_security.clone(),
+                        pool.clone(),
+                        local_node_id.clone(),
+                        config.token_metrics.lease_secs,
+                        config.token_metrics.lease_ttl_secs,
+                        background_shutdown.clone(),
+                    );
+                } else {
+                    warn!("token-metrics wlaczone, ale brak db_pool — taski tokenow pominiete");
+                }
+            }
 
             info!("Mesh networking uruchomiony (iroh transport)");
 
@@ -3528,6 +3552,204 @@ fn spawn_trust_expiry_prune(
             }
         }
     });
+}
+
+/// Flusher capture'ow zuzycia tokenow. Co `flush_secs` przepisuje swieze wiersze
+/// `token_usage_daily` (po watermarku) do Sync Ledger. Kazdy wezel flushuje
+/// WLASNE wiersze, wiec task biegnie wszedzie (nie tylko na koordynatorze).
+/// Watermark trzymany lokalnie w pamieci — po restarcie startuje od pustego
+/// (flush jest idempotentny po stronie ledgera).
+fn spawn_token_usage_flusher(
+    pool: crate::db::DbPool,
+    self_node_id: String,
+    flush_secs: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut watermark = String::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(flush_secs.max(1)));
+        interval.tick().await; // pierwszy tick natychmiast — pomin
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("token-usage flusher: shutdown");
+                    return;
+                }
+                _ = interval.tick() => {
+                    match crate::db::repository::flush_token_usage_captures(&pool, &self_node_id, &watermark) {
+                        Ok(new_watermark) => {
+                            debug!(watermark = %new_watermark, "token-usage flusher: flush ok");
+                            watermark = new_watermark;
+                        }
+                        Err(e) => warn!("token-usage flusher: flush nieudany: {}", e),
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Koordynator dzierzaw tokenow. Co `lease_secs` liczy zbior kandydatow
+/// (self + zaufane, osiagalne wezly), a nastepnie dla kazdej organizacji z
+/// aktywnymi limitami wybiera koordynatora metoda HRW (`elect_coordinator`).
+/// Tylko wybrany koordynator danej organizacji zapisuje dzierzawy — pozostale
+/// wezly pomijaja te organizacje. Pula tokenow jest dzielona rowno miedzy
+/// kandydatow; reszta z dzielenia trafia do koordynatora, wiec suma przydzialow
+/// nigdy nie przekracza pozostalego limitu.
+fn spawn_token_lease_coordinator(
+    qm: Arc<IrohMeshManager>,
+    mesh_security: Arc<MeshSecurity>,
+    pool: crate::db::DbPool,
+    self_node_id: String,
+    lease_secs: u64,
+    lease_ttl_secs: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(lease_secs.max(1)));
+        interval.tick().await; // pierwszy tick natychmiast — pomin
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("token-lease coordinator: shutdown");
+                    return;
+                }
+                _ = interval.tick() => {
+                    run_token_lease_coordinator_tick(
+                        &qm,
+                        &mesh_security,
+                        &pool,
+                        &self_node_id,
+                        lease_ttl_secs,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+async fn run_token_lease_coordinator_tick(
+    qm: &Arc<IrohMeshManager>,
+    mesh_security: &Arc<MeshSecurity>,
+    pool: &crate::db::DbPool,
+    self_node_id: &str,
+    lease_ttl_secs: u64,
+) {
+    // Kandydaci: self (zawsze) + zaufane wezly polaczone LUB ostatnio widziane.
+    // Liveness identyczny jak w spawn_trust_expiry_prune: is_connected albo
+    // niezerowy last_seen w peer_persisted.
+    let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("token-lease coordinator: odczyt trusted_nodes nieudany: {}", e);
+            return;
+        }
+    };
+    let mut candidates: Vec<String> = vec![self_node_id.to_string()];
+    for node in &trusted {
+        if node.node_id == self_node_id || candidates.contains(&node.node_id) {
+            continue;
+        }
+        let reachable = qm.is_connected(&node.node_id).await || {
+            crate::db::repository::get_peer_last_seen_ms(&mesh_security.db, &node.node_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                > 0
+        };
+        if reachable {
+            candidates.push(node.node_id.clone());
+        }
+    }
+
+    let quotas = match crate::db::repository::list_all_active_token_quotas(pool) {
+        Ok(q) => q,
+        Err(e) => {
+            warn!("token-lease coordinator: odczyt limitow nieudany: {}", e);
+            return;
+        }
+    };
+
+    // Grupowanie po org_id — koordynator jest wybierany per organizacja.
+    let mut by_org: std::collections::HashMap<String, Vec<crate::db::models::TokenQuota>> =
+        std::collections::HashMap::new();
+    for quota in quotas {
+        by_org.entry(quota.org_id.clone()).or_default().push(quota);
+    }
+
+    let n = candidates.len() as i64;
+    for (org_id, org_quotas) in &by_org {
+        let coordinator = crate::mesh::token_coordinator::elect_coordinator(
+            &format!("token-coord|{org_id}"),
+            &candidates,
+        );
+        if coordinator.as_deref() != Some(self_node_id) {
+            continue;
+        }
+        for quota in org_quotas {
+            let period_key = token_period_key(&quota.period);
+            let global_used =
+                match crate::db::repository::global_usage_for_quota(pool, quota, &period_key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(quota = %quota.id, "token-lease: global_usage nieudany: {}", e);
+                        continue;
+                    }
+                };
+            let remaining = (quota.max_total_tokens - global_used).max(0);
+            let per_node = remaining / n;
+            // Reszta z dzielenia idzie do koordynatora — suma(granted) == remaining,
+            // nigdy ponad limit.
+            let remainder = remaining - per_node * n;
+            let expires_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(lease_ttl_secs as i64))
+            .to_rfc3339();
+
+            for node in &candidates {
+                let base_used = match crate::db::repository::node_usage_for_quota(
+                    pool,
+                    node,
+                    quota,
+                    &period_key,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(quota = %quota.id, node = %node, "token-lease: node_usage nieudany: {}", e);
+                        continue;
+                    }
+                };
+                let granted = if node == self_node_id {
+                    per_node + remainder
+                } else {
+                    per_node
+                };
+                let params = crate::db::models::TokenLeaseUpsert {
+                    org_id: &quota.org_id,
+                    quota_id: &quota.id,
+                    node_id: node,
+                    period_key: &period_key,
+                    base_used,
+                    granted_tokens: granted,
+                    coordinator_node_id: self_node_id,
+                    expires_at: &expires_at,
+                };
+                if let Err(e) = crate::db::repository::upsert_token_lease(pool, &params) {
+                    warn!(quota = %quota.id, node = %node, "token-lease: upsert nieudany: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Klucz okresu dla dzierzawy: dzienny `YYYY-MM-DD`, miesieczny `YYYY-MM`.
+fn token_period_key(period: &str) -> String {
+    let now = chrono::Utc::now();
+    if period == "monthly" {
+        now.format("%Y-%m").to_string()
+    } else {
+        now.format("%Y-%m-%d").to_string()
+    }
 }
 
 /// Decodes a hex node_id into the 32-byte key shape the peer registry uses.

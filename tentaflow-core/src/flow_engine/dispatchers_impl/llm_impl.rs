@@ -87,7 +87,11 @@ impl LlmDispatcherImpl {
         api_req: &ChatCompletionRequest,
     ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
         let db = self.db.as_ref()?;
-        let gateway = AiGateway::new(db.clone(), self.node_id.clone());
+        let gateway = AiGateway::new(
+            db.clone(),
+            self.node_id.clone(),
+            crate::compliance::ai_gateway::token_quota_enabled(),
+        );
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),

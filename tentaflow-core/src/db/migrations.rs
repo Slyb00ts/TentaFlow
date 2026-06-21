@@ -467,8 +467,86 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "pii_rules_uuid_org_v2",
             MigrationStep::RustSelfManaged(pii_rules_uuid_org_v2),
         ),
+        (
+            86,
+            "token_metrics_tables",
+            MigrationStep::Sql(TOKEN_METRICS_SCHEMA),
+        ),
+        (
+            87,
+            "token_metrics_permissions",
+            MigrationStep::Rust(token_metrics_add_permissions),
+        ),
     ]
 }
+
+// v87 — RBAC dla metryk tokenów. Admin/DPO dostają odczyt i zapis, operator
+// oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`.
+fn token_metrics_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["tokens.read", "tokens.write"],
+    )?;
+    roles_add_permissions(
+        conn,
+        &["org_operator", "org_viewer"],
+        &["tokens.read"],
+    )?;
+    Ok(())
+}
+
+// v86 — per-model/per-user/per-group token accounting that rides the Sync Ledger.
+// All three tables use TEXT primary keys (deterministic synthetic or UUID) so the
+// same logical row minted on different nodes never collides under an autoincrement
+// INTEGER. `token_usage_daily` is single-writer-per-row (only the owning node
+// mutates its own rows; the sum across all node rows is the global usage), while
+// quotas and leases are admin/coordinator edited and replicate LWW.
+const TOKEN_METRICS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    id                TEXT PRIMARY KEY,
+    node_id           TEXT NOT NULL,
+    org_id            TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id           TEXT NOT NULL,
+    model_id          TEXT NOT NULL,
+    usage_day         TEXT NOT NULL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    request_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_token_usage_user ON token_usage_daily(org_id, user_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage_daily(org_id, model_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_updated ON token_usage_daily(updated_at);
+
+CREATE TABLE IF NOT EXISTS token_quota (
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    scope_type       TEXT NOT NULL,
+    subject_id       TEXT,
+    model_id         TEXT,
+    period           TEXT NOT NULL,
+    max_total_tokens INTEGER NOT NULL,
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, scope_type, subject_id, model_id, period)
+);
+
+CREATE TABLE IF NOT EXISTS token_lease (
+    id                  TEXT PRIMARY KEY,
+    org_id              TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    quota_id            TEXT NOT NULL,
+    node_id             TEXT NOT NULL,
+    period_key          TEXT NOT NULL,
+    base_used           INTEGER NOT NULL,
+    granted_tokens      INTEGER NOT NULL,
+    coordinator_node_id TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, quota_id, node_id, period_key)
+);
+"#;
 
 // v85 — rebuild pii_rules with a TEXT UUID primary key and an org_id column so
 // it can replicate as a per-org core sync resource. Existing INTEGER rows get a
