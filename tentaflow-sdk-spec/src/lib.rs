@@ -48,7 +48,7 @@ pub use protocol::{
     lidar::{
         LidarFrameHeader, LIDAR_FLAGS_KNOWN, LIDAR_FLAGS_OFFSET, LIDAR_FLAG_LZ4_BODY,
         LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET, LIDAR_LAYOUT_XYZ,
-        LIDAR_LAYOUT_XYZ_I16, LIDAR_LAYOUT_XYZI,
+        LIDAR_LAYOUT_XYZ_I16_PLANAR, LIDAR_LAYOUT_XYZI,
     },
     recording::{
         FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,

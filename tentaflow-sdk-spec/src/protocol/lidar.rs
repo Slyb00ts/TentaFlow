@@ -21,11 +21,18 @@ pub const LIDAR_FRAME_VERSION: u8 = 2;
 pub const LIDAR_LAYOUT_XYZ: u8 = 3;
 /// Layout tag: 4 little-endian f32 per point — interleaved `[x, y, z, intensity]`.
 pub const LIDAR_LAYOUT_XYZI: u8 = 4;
-/// Layout tag: 3 little-endian i16 per point — interleaved grid indices `[ix, iy, iz]`.
-/// Reconstruct world meters as `coord[k] = origin[k] + idx[k] * resolution`. Half
-/// the wire bytes of `XYZ` (6 vs 12 B/point) and LOSSLESS for grid-aligned sources
-/// (voxel maps), where every point already lands on `origin + index * resolution`.
-pub const LIDAR_LAYOUT_XYZ_I16: u8 = 5;
+// Tag 5 is RETIRED: it was a short-lived INTERLEAVED i16 variant `[ix,iy,iz,…]`.
+// Planar got its own tag (6) so any leftover interleaved frame fails closed in the
+// decoder instead of being misread as three planes. Do not reuse value 5.
+//
+/// Layout tag: i16 grid indices in PLANAR order — all `ix` (point_count × i16),
+/// then all `iy`, then all `iz`. Reconstruct world meters as
+/// `coord[k] = origin[k] + idx[k] * resolution`. Half the wire bytes of `XYZ`
+/// (6 vs 12 B/point) and LOSSLESS for grid-aligned sources (voxel maps). Planar
+/// (not interleaved) so each component plane is a long, low-entropy run — `iy`/`iz`
+/// barely change along a scan row — which `LIDAR_FLAG_LZ4_BODY` then compresses far
+/// better than interleaved `[ix,iy,iz,…]` (where fast-varying `ix` breaks the runs).
+pub const LIDAR_LAYOUT_XYZ_I16_PLANAR: u8 = 6;
 
 /// Flags bit: the body bytes are an LZ4 block (compress the body, NOT the header,
 /// so the host can still stamp `host_send_us` and the decoder sizes the inflate
@@ -47,7 +54,7 @@ pub const LIDAR_FLAGS_OFFSET: usize = 2;
 /// ```text
 ///   offset  size  field
 ///        0     1  version        u8   (== LIDAR_FRAME_VERSION)
-///        1     1  layout         u8   (LIDAR_LAYOUT_XYZ=3 | XYZI=4 | XYZ_I16=5)
+///        1     1  layout         u8   (XYZ=3 | XYZI=4 | XYZ_I16_PLANAR=6; 5 retired)
 ///        2     1  flags          u8   (LIDAR_FLAG_LZ4_BODY=0x01)
 ///        3     1  _reserved      u8   (must be 0; keeps point_count 4-aligned)
 ///        4     4  point_count    u32
@@ -100,7 +107,7 @@ impl LidarFrameHeader {
     #[inline]
     pub const fn stride(&self) -> usize {
         match self.layout {
-            LIDAR_LAYOUT_XYZ | LIDAR_LAYOUT_XYZ_I16 => 3,
+            LIDAR_LAYOUT_XYZ | LIDAR_LAYOUT_XYZ_I16_PLANAR => 3,
             LIDAR_LAYOUT_XYZI => 4,
             _ => 0,
         }
@@ -111,7 +118,7 @@ impl LidarFrameHeader {
     #[inline]
     pub const fn component_bytes(&self) -> usize {
         match self.layout {
-            LIDAR_LAYOUT_XYZ_I16 => 2,
+            LIDAR_LAYOUT_XYZ_I16_PLANAR => 2,
             LIDAR_LAYOUT_XYZ | LIDAR_LAYOUT_XYZI => 4,
             _ => 0,
         }
@@ -179,7 +186,7 @@ impl LidarFrameHeader {
         let layout = bytes[1];
         if layout != LIDAR_LAYOUT_XYZ
             && layout != LIDAR_LAYOUT_XYZI
-            && layout != LIDAR_LAYOUT_XYZ_I16
+            && layout != LIDAR_LAYOUT_XYZ_I16_PLANAR
         {
             return None;
         }
@@ -268,10 +275,10 @@ mod tests {
         // Packed-i16 grid body is 6 bytes/point (3 components * 2 bytes), half the
         // f32 XYZ wire size, and the layout decodes back round-trip.
         let mut h = sample_header(10_000);
-        h.layout = LIDAR_LAYOUT_XYZ_I16;
+        h.layout = LIDAR_LAYOUT_XYZ_I16_PLANAR;
         let bytes = h.encode_header();
         let back = LidarFrameHeader::decode_header(&bytes).expect("decode i16");
-        assert_eq!(back.layout, LIDAR_LAYOUT_XYZ_I16);
+        assert_eq!(back.layout, LIDAR_LAYOUT_XYZ_I16_PLANAR);
         assert_eq!(back.stride(), 3);
         assert_eq!(back.component_bytes(), 2);
         assert_eq!(back.body_len(), Some(10_000 * 3 * 2));

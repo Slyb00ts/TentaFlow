@@ -23,7 +23,7 @@ use serde_json::{json, Value as JsonValue};
 use tentaflow_hardware::unitree::go2::protocol;
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::{
-    LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ_I16,
+    LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ_I16_PLANAR,
 };
 use tentaflow_sdk_spec::protocol::ui::{
     actions::Button as ButtonComp,
@@ -1000,7 +1000,7 @@ fn decode_voxel_to_canonical(
         // resolution/origin, so those two fields are now load-bearing, not just
         // informational. Emitting indices is also cheaper per point than the f32
         // multiply-add, easing the service-tick fuel budget.
-        layout: LIDAR_LAYOUT_XYZ_I16,
+        layout: LIDAR_LAYOUT_XYZ_I16_PLANAR,
         // Addon emits an uncompressed body; the host pump applies LZ4 + the flag
         // on the way out, so the metered service tick never pays compression fuel.
         flags: 0,
@@ -1027,15 +1027,26 @@ fn decode_voxel_to_canonical(
     // Fallible reserve instead of with_capacity: under panic = abort an oversized
     // or garbage allocation request would call handle_alloc_error and KILL the
     // process (no panic to catch). try_reserve_exact returns Err on failure so we
-    // drop the frame (caller logs) instead of aborting the connection.
+    // drop the frame (caller logs) instead of aborting the connection. We size the
+    // exact buffer then `resize` (within the reserved capacity, so no reallocation
+    // / abort) because PLANAR emission writes to three disjoint regions by index,
+    // not sequentially.
     let mut out: Vec<u8> = Vec::new();
     if out.try_reserve_exact(body_cap).is_err() {
         return None;
     }
-    out.extend_from_slice(&header.encode_header());
-    // Emit raw grid INDICES as i16 (browser reconstructs `idx * resolution +
-    // origin`). No per-point float math here; the multiply-add moves to the
-    // decoder, which both halves the wire body and trims the service-tick fuel.
+    out.resize(body_cap, 0);
+    out[..LIDAR_HEADER_LEN].copy_from_slice(&header.encode_header());
+    // Emit raw grid INDICES as i16 in PLANAR order: all ix, then all iy, then all
+    // iz. Each plane is a long low-entropy run (iy/iz barely change along a scan
+    // row), so the host's LZ4 pass compresses it far better than interleaved. The
+    // browser reconstructs `idx * resolution + origin`; no per-point float math
+    // here, which also trims the service-tick fuel.
+    let n = point_count;
+    let ix_base = LIDAR_HEADER_LEN;
+    let iy_base = LIDAR_HEADER_LEN + n * 2;
+    let iz_base = LIDAR_HEADER_LEN + n * 4;
+    let mut p = 0usize;
     for (i, &byte) in decompressed.iter().enumerate() {
         if byte == 0 {
             continue;
@@ -1044,8 +1055,7 @@ fn decode_voxel_to_canonical(
         let n_slice = i % 0x800;
         let y = (n_slice / 0x10) as i16;
         let x_base = ((n_slice % 0x10) * 8) as i16;
-        // y/z are constant for this byte; only x varies per set bit. Emit each
-        // point as a single 6-byte write (ONE extend per point).
+        // y/z are constant for this byte; only x varies per set bit.
         let yi = y.to_le_bytes();
         let zi = z.to_le_bytes();
         // Bit-scan: only set bits do work. The Go2 grid is MSB-first along x
@@ -1055,11 +1065,10 @@ fn decode_voxel_to_canonical(
             let b = bits.trailing_zeros();
             bits &= bits - 1;
             let xi = (x_base + (7 - b) as i16).to_le_bytes();
-            let mut pt = [0u8; 6];
-            pt[0..2].copy_from_slice(&xi);
-            pt[2..4].copy_from_slice(&yi);
-            pt[4..6].copy_from_slice(&zi);
-            out.extend_from_slice(&pt);
+            out[ix_base + p * 2..ix_base + p * 2 + 2].copy_from_slice(&xi);
+            out[iy_base + p * 2..iy_base + p * 2 + 2].copy_from_slice(&yi);
+            out[iz_base + p * 2..iz_base + p * 2 + 2].copy_from_slice(&zi);
+            p += 1;
         }
     }
     Some(out)
@@ -2831,18 +2840,20 @@ mod tests {
         assert_eq!(h.resolution, resolution);
         assert_eq!(h.origin, origin);
 
-        // Reconstruct points from the packed i16 grid body (world =
-        // `idx * resolution + origin`, exactly what the browser decoder does) and
-        // compare to the upstream MSB-first decode computed inline as the oracle.
+        // Reconstruct points from the PLANAR i16 grid body (all ix, then all iy,
+        // then all iz; world = `idx * resolution + origin`, exactly what the browser
+        // decoder does) and compare to the upstream MSB-first decode as the oracle.
         let body = &frame[LIDAR_HEADER_LEN..];
+        let ix_base = 0;
+        let iy_base = k * 2;
+        let iz_base = k * 4;
+        let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
         let mut got: Vec<[f32; 3]> = Vec::new();
-        for i in 0..k {
-            let off = i * 3 * 2;
-            let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
+        for p in 0..k {
             got.push([
-                rd(off) * resolution + origin[0],
-                rd(off + 2) * resolution + origin[1],
-                rd(off + 4) * resolution + origin[2],
+                rd(ix_base + p * 2) * resolution + origin[0],
+                rd(iy_base + p * 2) * resolution + origin[1],
+                rd(iz_base + p * 2) * resolution + origin[2],
             ]);
         }
         let res = resolution as f64;

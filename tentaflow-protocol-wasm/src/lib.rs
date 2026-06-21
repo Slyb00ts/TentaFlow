@@ -8192,19 +8192,20 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
     // copy — per-element `set_index` across the wasm/JS boundary was the dominant
     // decode cost. For the packed-i16 grid layout we reconstruct world meters here
     // (`idx * resolution + origin`); for the f32 layouts the body is copied as-is.
-    let floats: Vec<f32> = if header.layout == tentaflow_sdk_spec::LIDAR_LAYOUT_XYZ_I16 {
+    let floats: Vec<f32> = if header.layout == tentaflow_sdk_spec::LIDAR_LAYOUT_XYZ_I16_PLANAR {
+        // Planar i16 grid: all ix, then all iy, then all iz. Reconstruct world
+        // meters as `idx * resolution + origin` into interleaved XYZ for the GPU.
         let n = header.point_count as usize;
         let res = header.resolution;
         let [ox, oy, oz] = header.origin;
+        let iy_base = n * 2;
+        let iz_base = n * 4;
+        let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
         let mut v = Vec::with_capacity(n * 3);
         for p in 0..n {
-            let off = p * 6;
-            let ix = i16::from_le_bytes([body[off], body[off + 1]]) as f32;
-            let iy = i16::from_le_bytes([body[off + 2], body[off + 3]]) as f32;
-            let iz = i16::from_le_bytes([body[off + 4], body[off + 5]]) as f32;
-            v.push(ix * res + ox);
-            v.push(iy * res + oy);
-            v.push(iz * res + oz);
+            v.push(rd(p * 2) * res + ox);
+            v.push(rd(iy_base + p * 2) * res + oy);
+            v.push(rd(iz_base + p * 2) * res + oz);
         }
         v
     } else {
