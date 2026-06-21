@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Robots · Szczegóły (R2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .toolbar h1 { font-size: 19px; font-weight: 800; margin: 0; }
+  .rc-id { color: var(--text-3); font-size: 12px; font-family: ui-monospace, monospace; }
+  .kpi-grid.k4 { grid-template-columns: repeat(4, 1fr); }
+  .actionrow { display: flex; align-items: center; gap: 8px; margin: 16px 0 18px; }
+  .actionrow .ml-auto { margin-left: auto; }
+  .tiles { display: grid; grid-template-columns: 1.35fr 1fr; gap: 14px; margin-top: 14px; }
+  .lidar-tile .video-tile-placeholder { background: radial-gradient(circle at 38% 62%, rgba(239,68,68,.45), transparent 42%), radial-gradient(circle at 66% 36%, rgba(59,130,246,.45), transparent 46%), var(--bg); }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 9px 16px; font-size: 13px; }
+  .kv dt { color: var(--text-3); } .kv dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .ctl-group { margin-bottom: 14px; } .ctl-group:last-child { margin-bottom: 0; }
+  .ctl-group .gl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-bottom: 8px; }
+  .ctl-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toggle-inline { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+  .sw { width: 38px; height: 22px; border-radius: 11px; background: var(--accent-1); position: relative; }
+  .sw::after { content: ""; position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2a8 8 0 0 1-7-4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+  <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M3 9V5a2 2 0 0 1 2-2h4"/><path d="M21 9V5a2 2 0 0 0-2-2h-4"/><path d="M3 15v4a2 2 0 0 0 2 2h4"/><path d="M21 15v4a2 2 0 0 1-2 2h-4"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+  <symbol id="i-gamepad" viewBox="0 0 24 24"><line x1="6" y1="11" x2="10" y2="11"/><line x1="8" y1="9" x2="8" y2="13"/><line x1="15" y1="12" x2="15.01" y2="12"/><line x1="18" y1="10" x2="18.01" y2="10"/><rect x="2" y="6" width="20" height="12" rx="2"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">R2</span>
+    <h2>Szczegóły robota</h2>
+    <div class="desc">Wszystko o jednym robocie: kamera, LiDAR 3D, pełne sterowanie, telemetria, log — w zakładkach.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Applications</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-cpu"/></svg>Roboty<span class="badge">3</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-video"/></svg>TentaVision</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Operator</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="toolbar">
+          <a class="btn btn-ghost btn-sm" href="m01-list.html"><svg class="icon"><use href="#i-back"/></svg>Roboty</a>
+          <h1>Go2 — Salon</h1>
+          <span class="status-pill online">online</span>
+          <span class="rc-id">go2-be69f9b5 · fw 1.1.12</span>
+          <span style="flex:1"></span>
+          <span class="toggle-inline"><span class="sw"></span> połączenie auto</span>
+        </div>
+
+        <div class="kpi-grid k4">
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-activity"/></svg>Bateria</div><div class="value">86 <span class="small">%</span></div><div class="delta">28.1 V · -1.2 A</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-activity"/></svg>RTT</div><div class="value">24 <span class="small">ms</span></div><div class="delta">stabilne</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-activity"/></svg>LiDAR</div><div class="value">7.0 <span class="small">kl/s</span></div><div class="delta">43k pkt · ~3 ms</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-cpu"/></svg>Tryb</div><div class="value" style="font-size:18px;color:var(--success)">Gotowy</div><div class="delta">e-stop zwolniony</div></div>
+        </div>
+
+        <div class="actionrow">
+          <button class="btn btn-danger"><svg class="icon"><use href="#i-stop"/></svg>E-STOP</button>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-play"/></svg>Start / Wstań</button>
+          <button class="btn btn-secondary"><svg class="icon"><use href="#i-moon"/></svg>Połóż się</button>
+          <button class="btn btn-ghost"><svg class="icon"><use href="#i-hand"/></svg>Hello</button>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-dashboard"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-camera"/></svg>Kamera</button>
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>LiDAR 3D</button>
+          <button class="tab"><svg class="icon"><use href="#i-gamepad"/></svg>Sterowanie</button>
+          <button class="tab"><svg class="icon"><use href="#i-list"/></svg>Informacje</button>
+          <button class="tab"><svg class="icon"><use href="#i-terminal"/></svg>Log</button>
+        </div>
+
+        <!-- PRZEGLĄD -->
+        <div class="tiles">
+          <div class="video-tile">
+            <div class="video-tile-overlay-top"><span class="video-tile-title">Kamera</span><span class="video-tile-rec">● na żywo</span></div>
+            <div class="video-tile-placeholder">1280×720</div>
+            <div class="video-tile-overlay-bottom"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-maximize"/></svg></button></div>
+          </div>
+          <div class="video-tile lidar-tile">
+            <div class="video-tile-overlay-top"><span class="video-tile-title">LiDAR — głębia</span><span class="video-tile-rec">● 7 Hz</span></div>
+            <div class="video-tile-placeholder">chmura 43k pkt · czerwony=blisko, niebieski=daleko</div>
+          </div>
+        </div>
+
+        <div class="panels">
+          <div class="section-card">
+            <div class="section-card-head"><h3>Telemetria</h3></div>
+            <dl class="kv">
+              <dt>Orientacja (RPY)</dt><dd>1.2° / -0.4° / 88.7°</dd>
+              <dt>Temperatura</dt><dd>41 °C</dd>
+              <dt>Siła stóp (FL/FR/RL/RR)</dt><dd>42 · 39 · 45 · 41</dd>
+              <dt>Wysokość ciała</dt><dd>0.32 m</dd>
+              <dt>Opóźnienie lidar</dt><dd>host 1 · net 2 · dekod 0.4 ms</dd>
+            </dl>
+          </div>
+          <div class="section-card">
+            <div class="section-card-head"><h3>Szybkie sterowanie</h3></div>
+            <div class="ctl-row">
+              <button class="btn btn-secondary btn-sm">Naprzód</button>
+              <button class="btn btn-secondary btn-sm">Tył</button>
+              <button class="btn btn-secondary btn-sm">Obrót L</button>
+              <button class="btn btn-secondary btn-sm">Obrót P</button>
+              <button class="btn btn-ghost btn-sm">Siad</button>
+              <button class="btn btn-ghost btn-sm">Stań</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- STEROWANIE (zakładka — tu pokazana pod spodem) -->
+        <div class="section-card" style="margin-top:14px">
+          <div class="section-card-head"><h3>Pełne sterowanie</h3><span class="chip accent">zakładka „Sterowanie"</span></div>
+          <div class="ctl-group"><div class="gl">Ruch</div><div class="ctl-row">
+            <button class="btn btn-secondary btn-sm">vx −</button><button class="btn btn-secondary btn-sm">vx +</button>
+            <button class="btn btn-secondary btn-sm">vy −</button><button class="btn btn-secondary btn-sm">vy +</button>
+            <button class="btn btn-secondary btn-sm">obrót −</button><button class="btn btn-secondary btn-sm">obrót +</button>
+            <span class="chip">prędkość: normalna</span>
+          </div></div>
+          <div class="ctl-group"><div class="gl">Pozy</div><div class="ctl-row">
+            <button class="btn btn-ghost btn-sm">Siad</button>
+            <button class="btn btn-ghost btn-sm">Stań</button>
+            <button class="btn btn-ghost btn-sm">Rozciąganie</button>
+            <button class="btn btn-ghost btn-sm">Wysokość ciała…</button>
+            <button class="btn btn-ghost btn-sm">Wysokość kroku…</button>
+          </div></div>
+          <div class="ctl-group"><div class="gl">Akrobacje — wymagają potwierdzenia</div><div class="ctl-row">
+            <button class="btn btn-danger btn-sm">Salto</button>
+            <button class="btn btn-danger btn-sm">Taniec</button>
+            <button class="btn btn-danger btn-sm">Skok</button>
+            <button class="btn btn-danger btn-sm">Łapa</button>
+          </div></div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
