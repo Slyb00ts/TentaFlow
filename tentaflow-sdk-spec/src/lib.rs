@@ -46,8 +46,8 @@ pub use protocol::{
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
     lidar::{
-        LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ,
-        LIDAR_LAYOUT_XYZI,
+        LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET,
+        LIDAR_LAYOUT_XYZ, LIDAR_LAYOUT_XYZ_I16, LIDAR_LAYOUT_XYZI,
     },
     recording::{
         FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,

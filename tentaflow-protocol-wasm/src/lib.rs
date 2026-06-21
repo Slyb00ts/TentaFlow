@@ -8105,12 +8105,13 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
 /// bytes carried verbatim in a `StreamFrame.data` push) into the JS shape the
 /// dashboard LiDAR consumer (L3a freshness) and the wgpu renderer (L4) expect.
 /// The frame is parsed via the single source-of-truth header decoder
-/// (`tentaflow_sdk_spec::LidarFrameHeader::decode_header`) so the 36-byte layout
-/// is never duplicated in JS. The returned object carries both the parsed scalar
-/// fields and the raw/typed-array bodies: L3a reads `frameSeq`/`pointCount` for
-/// freshness, L4 uploads `points` (the packed f32 XYZ body as a Float32Array) /
-/// `raw` (the full frame) to the GPU. A malformed/short frame yields
-/// `{hasFrame: false}` rather than a fabricated partial cloud.
+/// (`tentaflow_sdk_spec::LidarFrameHeader::decode_header`) so the fixed header
+/// layout is never duplicated in JS. The returned object carries both the parsed
+/// scalar fields and the raw/typed-array bodies: L3a reads `frameSeq`/`pointCount`
+/// for freshness, L4 uploads `points` (world-space XYZ as a Float32Array, decoded
+/// from whichever body layout the header declares) / `raw` (the full frame) to the
+/// GPU. A malformed/short frame yields `{hasFrame: false}` rather than a fabricated
+/// partial cloud.
 fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
     use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_HEADER_LEN};
     let obj = js_sys::Object::new();
@@ -8147,27 +8148,49 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
     set(&obj, "origin", origin.into());
     set(&obj, "timestampUs", (header.timestamp_us as f64).into());
     set(&obj, "timestamp_us", (header.timestamp_us as f64).into());
+    set(&obj, "hostSendUs", (header.host_send_us as f64).into());
+    set(&obj, "host_send_us", (header.host_send_us as f64).into());
     // Raw bytes: EXACTLY the declared frame (header + declared body), trimming
     // any trailing garbage past `frame_end` so callers never see bytes beyond
     // the validated frame.
     set(&obj, "raw", js_sys::Uint8Array::from(&bytes[..frame_end]).into());
-    // Packed f32 body as a Float32Array, built from EXACTLY the declared body
-    // range. `body_len` is a validated multiple of the layout stride (f32 * N),
-    // so `points.length == point_count * layout` always holds.
+    // World-space XYZ as a Float32Array (what the renderer uploads). We build a
+    // Rust `Vec<f32>` first and hand it over with a SINGLE bulk `Float32Array::from`
+    // copy — per-element `set_index` across the wasm/JS boundary was the dominant
+    // decode cost. For the packed-i16 grid layout we reconstruct world meters here
+    // (`idx * resolution + origin`); for the f32 layouts the body is copied as-is.
     let body = &bytes[LIDAR_HEADER_LEN..frame_end];
-    let float_count = (body_len / 4) as u32;
-    let floats = js_sys::Float32Array::new_with_length(float_count);
-    for i in 0..float_count as usize {
-        let off = i * 4;
-        let v = f32::from_le_bytes([
-            body[off],
-            body[off + 1],
-            body[off + 2],
-            body[off + 3],
-        ]);
-        floats.set_index(i as u32, v);
-    }
-    set(&obj, "points", floats.into());
+    let floats: Vec<f32> = if header.layout == tentaflow_sdk_spec::LIDAR_LAYOUT_XYZ_I16 {
+        let n = header.point_count as usize;
+        let res = header.resolution;
+        let [ox, oy, oz] = header.origin;
+        let mut v = Vec::with_capacity(n * 3);
+        for p in 0..n {
+            let off = p * 6;
+            let ix = i16::from_le_bytes([body[off], body[off + 1]]) as f32;
+            let iy = i16::from_le_bytes([body[off + 2], body[off + 3]]) as f32;
+            let iz = i16::from_le_bytes([body[off + 4], body[off + 5]]) as f32;
+            v.push(ix * res + ox);
+            v.push(iy * res + oy);
+            v.push(iz * res + oz);
+        }
+        v
+    } else {
+        // f32 layouts (XYZ / XYZI): body is already little-endian f32 scalars.
+        let count = body_len / 4;
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * 4;
+            v.push(f32::from_le_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+            ]));
+        }
+        v
+    };
+    set(&obj, "points", js_sys::Float32Array::from(&floats[..]).into());
     obj.into()
 }
 

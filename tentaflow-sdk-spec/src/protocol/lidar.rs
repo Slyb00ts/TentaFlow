@@ -12,13 +12,20 @@
 // =============================================================================
 
 /// Frame format version. Bump only on an incompatible layout change; a decoder
-/// rejects a header whose version it does not understand.
-pub const LIDAR_FRAME_VERSION: u8 = 1;
+/// rejects a header whose version it does not understand. v2 grew the fixed header
+/// from 36 to 44 bytes (`host_send_us` at offset 20) and added the packed-i16 grid
+/// body layout, so a stale v1 decoder fails closed instead of misreading offsets.
+pub const LIDAR_FRAME_VERSION: u8 = 2;
 
 /// Layout tag: 3 little-endian f32 per point — interleaved `[x, y, z]` (meters).
 pub const LIDAR_LAYOUT_XYZ: u8 = 3;
 /// Layout tag: 4 little-endian f32 per point — interleaved `[x, y, z, intensity]`.
 pub const LIDAR_LAYOUT_XYZI: u8 = 4;
+/// Layout tag: 3 little-endian i16 per point — interleaved grid indices `[ix, iy, iz]`.
+/// Reconstruct world meters as `coord[k] = origin[k] + idx[k] * resolution`. Half
+/// the wire bytes of `XYZ` (6 vs 12 B/point) and LOSSLESS for grid-aligned sources
+/// (voxel maps), where every point already lands on `origin + index * resolution`.
+pub const LIDAR_LAYOUT_XYZ_I16: u8 = 5;
 
 /// Total size in bytes of the fixed frame header. The body (packed f32 points)
 /// begins at exactly this offset.
@@ -31,14 +38,20 @@ pub const LIDAR_LAYOUT_XYZI: u8 = 4;
 ///        2     2  _reserved      u16  (must be 0; keeps point_count 4-aligned)
 ///        4     4  point_count    u32
 ///        8     4  frame_seq      u32
-///       12     8  timestamp_us   i64
-///       20     4  resolution     f32  (meters per voxel/unit; informational)
-///       24     4  origin_x       f32
-///       28     4  origin_y       f32
-///       32     4  origin_z       f32
-///       36          <-- body starts here (point_count * layout f32, interleaved)
+///       12     8  timestamp_us   i64  (addon decode wall-clock µs)
+///       20     8  host_send_us   i64  (host pump-send wall-clock µs; 0 until stamped)
+///       28     4  resolution     f32  (meters per voxel/unit; informational)
+///       32     4  origin_x       f32
+///       36     4  origin_y       f32
+///       40     4  origin_z       f32
+///       44          <-- body starts here (point_count * layout f32, interleaved)
 /// ```
-pub const LIDAR_HEADER_LEN: usize = 36;
+pub const LIDAR_HEADER_LEN: usize = 44;
+
+/// Byte offset of the `host_send_us` i64 field inside the fixed header. The host
+/// pump overwrites these 8 LE bytes in place just before broadcasting, so it must
+/// not hardcode the offset — reuse this constant.
+pub const LIDAR_HOST_SEND_US_OFFSET: usize = 20;
 
 /// Parsed/serializable view of the fixed frame header. `layout` is the f32
 /// stride per point (3 or 4); `point_count * layout * 4` body bytes follow.
@@ -54,6 +67,11 @@ pub struct LidarFrameHeader {
     pub frame_seq: u32,
     /// Capture wall-clock time in microseconds since the Unix epoch.
     pub timestamp_us: i64,
+    /// Host pump send wall-clock time in microseconds since the Unix epoch,
+    /// stamped just before the frame is broadcast over the stream rails. `0` until
+    /// the host stamps it (the addon writes 0; the renderer treats 0 as "unset").
+    /// Lets the browser split end-to-end latency into addon→host vs host→browser.
+    pub host_send_us: i64,
     /// Source grid resolution in meters (informational; points are already in meters).
     pub resolution: f32,
     /// Frame origin in meters `[x, y, z]` (informational; points already include it).
@@ -61,28 +79,41 @@ pub struct LidarFrameHeader {
 }
 
 impl LidarFrameHeader {
-    /// f32 components per point for this header's layout (3 or 4). Returns 0 for
+    /// Scalar components per point for this header's layout (3 or 4). Returns 0 for
     /// an unknown layout tag (the decoder rejects such headers before this).
     #[inline]
     pub const fn stride(&self) -> usize {
         match self.layout {
-            LIDAR_LAYOUT_XYZ => 3,
+            LIDAR_LAYOUT_XYZ | LIDAR_LAYOUT_XYZ_I16 => 3,
             LIDAR_LAYOUT_XYZI => 4,
             _ => 0,
         }
     }
 
-    /// Exact body length in bytes for this header: `point_count * stride * 4`.
-    /// `None` if the layout is unknown or the product overflows `usize`.
+    /// Bytes per scalar component for this layout: f32 layouts = 4, packed-i16
+    /// grid = 2. Returns 0 for an unknown layout tag.
+    #[inline]
+    pub const fn component_bytes(&self) -> usize {
+        match self.layout {
+            LIDAR_LAYOUT_XYZ_I16 => 2,
+            LIDAR_LAYOUT_XYZ | LIDAR_LAYOUT_XYZI => 4,
+            _ => 0,
+        }
+    }
+
+    /// Exact body length in bytes for this header:
+    /// `point_count * stride * component_bytes`. `None` if the layout is unknown
+    /// or the product overflows `usize`.
     #[inline]
     pub fn body_len(&self) -> Option<usize> {
         let stride = self.stride();
-        if stride == 0 {
+        let comp = self.component_bytes();
+        if stride == 0 || comp == 0 {
             return None;
         }
         (self.point_count as usize)
             .checked_mul(stride)
-            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| n.checked_mul(comp))
     }
 
     /// Total frame size in bytes (`LIDAR_HEADER_LEN + body_len`).
@@ -100,10 +131,11 @@ impl LidarFrameHeader {
         buf[4..8].copy_from_slice(&self.point_count.to_le_bytes());
         buf[8..12].copy_from_slice(&self.frame_seq.to_le_bytes());
         buf[12..20].copy_from_slice(&self.timestamp_us.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.resolution.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.origin[0].to_le_bytes());
-        buf[28..32].copy_from_slice(&self.origin[1].to_le_bytes());
-        buf[32..36].copy_from_slice(&self.origin[2].to_le_bytes());
+        buf[20..28].copy_from_slice(&self.host_send_us.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.resolution.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.origin[0].to_le_bytes());
+        buf[36..40].copy_from_slice(&self.origin[1].to_le_bytes());
+        buf[40..44].copy_from_slice(&self.origin[2].to_le_bytes());
         buf
     }
 
@@ -120,7 +152,10 @@ impl LidarFrameHeader {
             return None;
         }
         let layout = bytes[1];
-        if layout != LIDAR_LAYOUT_XYZ && layout != LIDAR_LAYOUT_XYZI {
+        if layout != LIDAR_LAYOUT_XYZ
+            && layout != LIDAR_LAYOUT_XYZI
+            && layout != LIDAR_LAYOUT_XYZ_I16
+        {
             return None;
         }
         if bytes[2] != 0 || bytes[3] != 0 {
@@ -131,11 +166,14 @@ impl LidarFrameHeader {
         let timestamp_us = i64::from_le_bytes([
             bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
         ]);
-        let resolution = f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        let host_send_us = i64::from_le_bytes([
+            bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
+        ]);
+        let resolution = f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
         let origin = [
-            f32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
-            f32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
             f32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+            f32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]),
+            f32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
         ];
         Some(LidarFrameHeader {
             version,
@@ -143,6 +181,7 @@ impl LidarFrameHeader {
             point_count,
             frame_seq,
             timestamp_us,
+            host_send_us,
             resolution,
             origin,
         })
@@ -160,6 +199,7 @@ mod tests {
             point_count,
             frame_seq: 7,
             timestamp_us: 1_700_000_000_000_123,
+            host_send_us: 1_700_000_000_000_456,
             resolution: 0.05,
             origin: [-1.5, 0.0, 2.25],
         }
@@ -167,7 +207,8 @@ mod tests {
 
     #[test]
     fn lidar_header_len_is_fixed() {
-        assert_eq!(LIDAR_HEADER_LEN, 36);
+        assert_eq!(LIDAR_HEADER_LEN, 44);
+        assert_eq!(LIDAR_HOST_SEND_US_OFFSET, 20);
         assert_eq!(sample_header(0).encode_header().len(), LIDAR_HEADER_LEN);
     }
 
@@ -177,9 +218,35 @@ mod tests {
         let bytes = h.encode_header();
         let back = LidarFrameHeader::decode_header(&bytes).expect("decode");
         assert_eq!(back, h);
+        assert_eq!(back.host_send_us, 1_700_000_000_000_456);
+        // The host_send_us i64 sits at its documented offset, little-endian.
+        assert_eq!(
+            i64::from_le_bytes(
+                bytes[LIDAR_HOST_SEND_US_OFFSET..LIDAR_HOST_SEND_US_OFFSET + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            h.host_send_us,
+        );
         assert_eq!(back.stride(), 3);
+        assert_eq!(back.component_bytes(), 4);
         assert_eq!(back.body_len(), Some(42_000 * 3 * 4));
         assert_eq!(back.frame_len(), Some(LIDAR_HEADER_LEN + 42_000 * 3 * 4));
+    }
+
+    #[test]
+    fn lidar_i16_grid_layout_sizing() {
+        // Packed-i16 grid body is 6 bytes/point (3 components * 2 bytes), half the
+        // f32 XYZ wire size, and the layout decodes back round-trip.
+        let mut h = sample_header(10_000);
+        h.layout = LIDAR_LAYOUT_XYZ_I16;
+        let bytes = h.encode_header();
+        let back = LidarFrameHeader::decode_header(&bytes).expect("decode i16");
+        assert_eq!(back.layout, LIDAR_LAYOUT_XYZ_I16);
+        assert_eq!(back.stride(), 3);
+        assert_eq!(back.component_bytes(), 2);
+        assert_eq!(back.body_len(), Some(10_000 * 3 * 2));
+        assert_eq!(back.frame_len(), Some(LIDAR_HEADER_LEN + 10_000 * 3 * 2));
     }
 
     #[test]
@@ -187,9 +254,9 @@ mod tests {
         let h = sample_header(1);
         // Short buffer.
         assert!(LidarFrameHeader::decode_header(&[0u8; 10]).is_none());
-        // Bad version.
+        // Bad version (unknown).
         let mut b = h.encode_header();
-        b[0] = 2;
+        b[0] = 99;
         assert!(LidarFrameHeader::decode_header(&b).is_none());
         // Bad layout.
         let mut b = h.encode_header();
