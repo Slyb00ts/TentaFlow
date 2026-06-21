@@ -492,3 +492,13 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
 - Refinementy query: reranker w flow (potrzebny węzeł reshape vector→reranker), pętla loop (multi-hop).
 - Następne fazy: GUI addona (upload/chat/eksplorator), Etap 2 (GraphRAG: ekstrakcja encji→graf),
   Etap 3 (MemGraphRAG: 3-warstwowa pamięć + multi-agent konflikt).
+
+## B UKOŃCZONE — pełny query-flow (reranker + multi-hop loop)
+- **E2.1 reranker w query-flow** ✅ (codex GO): reranker między vector a combine (tolerancja vector-hits+meta.query),
+  cytaty z rerankowanych, degradacja do vector order gdy reranker padnie (RAG dalej odpowiada).
+- **E2.2 pętla multi-hop** ✅ (codex GO): agentic loop (retrieve→sędzia LLM „starczy?/pod-pytanie"→retrieve→
+  akumuluj→aż starczy lub max 4). `body_flow_engine_id` (loop body = engine_flow per instancja). Subflow
+  `retrieval-round` + outer `query` flow. Akumulacja+dedup (cap 20), cytaty z całej akumulacji, anti-DoS
+  (max iter + cap + next_query cap 1024). loop_block: meta przetrwa między iteracjami, flow_depth NIE narasta.
+- **Query RAG kompletny wg wizji**: flow steruje query→odpowiedź, z pętlą multi-hop. Proste pytanie=1 iter.
+- Zostało: GUI addona; Etap 2 (GraphRAG: ekstrakcja encji→graf, PPR); Etap 3 (MemGraphRAG: 3-warstwowa pamięć).
