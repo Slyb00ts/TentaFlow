@@ -10,7 +10,9 @@
 
 pub mod graph;
 pub mod lidar;
+pub mod loop_closure;
 pub mod mapping;
+pub mod optimize;
 pub mod pose;
 pub mod submap;
 
@@ -18,7 +20,9 @@ pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
     PoseNode, Scene,
 };
+pub use loop_closure::{verify_loop_closure, LoopGate, LoopVerification};
 pub use mapping::{MapStep, MappingFrontend, SealPolicy};
+pub use optimize::{optimize, OptConfig, OptReport};
 pub use lidar::{
     register, voxel_downsample, IcpConfig, IcpResult, LioConfig, LioTracker, TrackResult, VoxelMap,
 };
@@ -53,6 +57,20 @@ mod tests {
         let (dt, da) = id.magnitude();
         assert_relative_eq!(dt, 0.0, epsilon = 1e-9);
         assert_relative_eq!(da, 0.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn se3_exp_log_round_trips() {
+        use nalgebra::Vector6;
+        for v in [
+            Vector6::new(0.3, -0.2, 0.5, 0.1, -0.4, 0.2),
+            Vector6::new(1.0, 2.0, -1.5, 0.0, 0.0, 0.0),  // pure translation
+            Vector6::new(0.0, 0.0, 0.0, 0.7, -0.3, 0.9),  // pure rotation
+            Vector6::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),   // identity
+        ] {
+            let back = Pose::se3_exp(&v).log();
+            assert_relative_eq!((back - v).norm(), 0.0, epsilon = 1e-9);
+        }
     }
 
     #[test]
