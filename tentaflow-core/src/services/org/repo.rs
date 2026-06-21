@@ -194,6 +194,8 @@ pub fn create_organization(
     match res {
         Ok(_) => {
             crate::compliance::repository::ensure_org_defaults(&tx, &org_id).map_err(map_db)?;
+            crate::db::repository::capture_seeded_compliance_defaults(&tx, &org_id)
+                .map_err(map_db)?;
             record_core_capture_tx(
                 &tx,
                 &org_id,

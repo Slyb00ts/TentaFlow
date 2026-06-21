@@ -227,7 +227,8 @@ pub struct DbFlowNodeTemplate {
 /// Regula filtrowania danych osobowych (PII)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbPiiRule {
-    pub id: i64,
+    pub id: String,
+    pub org_id: String,
     pub name: String,
     pub category: String,
     pub pattern: String,
@@ -594,6 +595,7 @@ pub struct FlowNodeTemplateParams<'a> {
 /// Parametry tworzenia reguly PII
 #[derive(Debug, Clone)]
 pub struct NewPiiRule<'a> {
+    pub org_id: &'a str,
     pub name: &'a str,
     pub category: &'a str,
     pub pattern: &'a str,
@@ -606,7 +608,8 @@ pub struct NewPiiRule<'a> {
 /// Parametry aktualizacji reguly PII
 #[derive(Debug, Clone)]
 pub struct UpdatePiiRule<'a> {
-    pub id: i64,
+    pub id: &'a str,
+    pub org_id: &'a str,
     pub name: &'a str,
     pub category: &'a str,
     pub pattern: &'a str,

@@ -33,6 +33,13 @@ pub enum CoreSyncResourceKind {
     AddonConfig,
     ApiKey,
     ResourcePermission,
+    FlowVersion,
+    PiiRule,
+    ComplianceDataCategory,
+    ComplianceProcessingActivity,
+    ComplianceLegalBasis,
+    ComplianceRetentionPolicy,
+    ComplianceProcessor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +323,78 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "permissions",
     },
+    // Append-only Flow Builder version history. Replicated so a flow's snapshot
+    // trail survives on every node; the org is the flow's default org at the
+    // write site. Not LWW: each row has a unique (flow_id, version_num) and is
+    // never edited in place, so concurrent writers never collide on a row.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::FlowVersion,
+        table_name: "flow_versions",
+        resource_type: "core.flow_version",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "flows",
+    },
+    // PII redaction rules (org-scoped after the UUID identity redesign). Admins
+    // may edit the same rule on different nodes concurrently, so it is LWW.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::PiiRule,
+        table_name: "pii_rules",
+        resource_type: "core.pii_rule",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "pii",
+    },
+    // Compliance config (GDPR/RODO catalog). Seeded per-org and editable by
+    // org_admin/dpo on any node, so each table is LWW. Runtime AI-audit event
+    // tables are deliberately NOT here — only the static config replicates.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ComplianceDataCategory,
+        table_name: "compliance_data_categories",
+        resource_type: "core.compliance_data_category",
+        primary_key_column: "category_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "compliance",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ComplianceProcessingActivity,
+        table_name: "compliance_processing_activities",
+        resource_type: "core.compliance_processing_activity",
+        primary_key_column: "activity_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "compliance",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ComplianceLegalBasis,
+        table_name: "compliance_legal_basis",
+        resource_type: "core.compliance_legal_basis",
+        primary_key_column: "legal_basis_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "compliance",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ComplianceRetentionPolicy,
+        table_name: "compliance_retention_policies",
+        resource_type: "core.compliance_retention_policy",
+        primary_key_column: "retention_policy_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "compliance",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ComplianceProcessor,
+        table_name: "compliance_processors",
+        resource_type: "core.compliance_processor",
+        primary_key_column: "processor_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "compliance",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -355,9 +434,12 @@ mod tests {
             descriptor_for_table("flow_model_bindings").map(|descriptor| descriptor.resource_type),
             Some("core.flow_model_binding")
         );
-        // flow_versions are a local-only snapshot history now; they must NOT be
-        // a core sync resource after the UUID identity redesign.
-        assert!(descriptor_for_table("flow_versions").is_none());
+        // flow_versions snapshot history replicates fleet-wide as an append-only
+        // core sync resource (its UUID id is the resource id).
+        assert_eq!(
+            descriptor_for_table("flow_versions").map(|descriptor| descriptor.resource_type),
+            Some("core.flow_version")
+        );
     }
 
     #[test]
