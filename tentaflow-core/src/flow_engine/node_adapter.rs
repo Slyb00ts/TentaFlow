@@ -149,6 +149,15 @@ pub struct ExecutionContext {
     /// `with_root(tempdir)`.
     pub vectors: Arc<crate::services::vector::NamespaceManager>,
 
+    /// RAG E1.1 — rejestr kolekcji grafowych `(org, addon_instance, collection)`.
+    /// `GraphSearchNodeAdapter` uderza w niego z `ctx.addon_id`/`ctx.org_id`,
+    /// dokładnie jak `vectors`. Współdzielony proces-szeroki manager
+    /// (`services::graph_manager`); testy wstrzykują `with_root(tempdir)`. Pod
+    /// `feature = "graph"` — graf jest opt-in (cozo nie w default features), więc
+    /// pole i węzeł graph_search istnieją tylko gdy feature włączone.
+    #[cfg(feature = "graph")]
+    pub graph: Arc<crate::services::graph::GraphManager>,
+
     pub llm: Arc<dyn LlmDispatcher>,
     pub embeddings: Arc<dyn EmbeddingsDispatcher>,
     /// RAG C2 — cross-encoder reranker (/v1/rerank, alias `rag-reranker`).
@@ -727,6 +736,24 @@ pub mod test_support {
         ))
     }
 
+    /// Stub `GraphManager` na izolowanym tempdirze (root pod `TMPDIR`), lustro
+    /// `stub_vectors`. DB in-memory z pełnymi migracjami (tabela
+    /// `addon_graph_collections`). Każde wywołanie daje świeży katalog, więc testy
+    /// nie współdzielą stanu. Katalog NIE jest sprzątany (ephemeralny scratch).
+    #[cfg(feature = "graph")]
+    pub fn stub_graph() -> Arc<crate::services::graph::GraphManager> {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let pool = Arc::new(crate::db::Db::from_connection(conn));
+        let root = std::env::temp_dir().join(format!(
+            "tf-graph-stub-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create stub graph root");
+        Arc::new(crate::services::graph::GraphManager::with_root(pool, root))
+    }
+
     pub fn stub_ctx() -> ExecutionContext {
         ExecutionContext {
             request_id: "test".into(),
@@ -747,6 +774,8 @@ pub mod test_support {
             clock: Arc::new(SystemClock),
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,
             vectors: stub_vectors(),
+            #[cfg(feature = "graph")]
+            graph: stub_graph(),
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),
