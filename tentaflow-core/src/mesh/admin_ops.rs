@@ -150,22 +150,70 @@ fn begin_baseline_adopt_after_confirm(
         let donor_node_id = remote_node_id.to_string();
         let epoch_seen = donor_epoch.counter;
         tokio::spawn(async move {
-            if let Err(e) = qm
-                .pull_baseline_from_donor(&donor_node_id, epoch_seen)
-                .await
-            {
-                warn!(
-                    donor = %donor_node_id,
-                    "baseline adopt: pull failed (peer may be the joiner, or resume at startup): {}",
-                    e
-                );
-            }
+            pull_baseline_with_hint_retry(&qm, &donor_node_id, epoch_seen).await;
         });
     } else {
         warn!(
             peer = %remote_node_id,
             "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
         );
+    }
+}
+
+/// Pulls the donor baseline, retrying with backoff while the donor's contact hints
+/// have not yet been resolved. Right after pairing-confirm the donor's network address
+/// (contact hints) arrives a moment later via NodeInfo/mesh, so an immediate pull often
+/// fails with "no trusted contact hints" even though the donor is reachable seconds later.
+/// We retry SPECIFICALLY that not-yet-resolved case with a bounded backoff (~capped at
+/// roughly a minute), succeeding as soon as the hints land. Any other error (or exhausting
+/// the retries) falls through to the durable `Elected` state, which the startup resume
+/// finishes — so this only shortens the common "hints arrive late" delay, never replaces
+/// the resume fallback.
+async fn pull_baseline_with_hint_retry(
+    qm: &Arc<IrohMeshManager>,
+    donor_node_id: &str,
+    epoch_seen: u64,
+) {
+    // Backoff schedule between attempts: 2s, 4s, 8s, 16s, 16s — ~46s total wall time,
+    // bounded so a genuinely absent donor does not retry forever (startup resume covers it).
+    const BACKOFF_SECS: [u64; 5] = [2, 4, 8, 16, 16];
+    let mut attempt = 0usize;
+    loop {
+        match qm.pull_baseline_from_donor(donor_node_id, epoch_seen).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(
+                        donor = %donor_node_id,
+                        attempt = attempt + 1,
+                        "baseline adopt: pull succeeded after waiting for donor contact hints"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                let waiting_for_hints =
+                    e.to_string().contains("no trusted contact hints for donor");
+                if waiting_for_hints && attempt < BACKOFF_SECS.len() {
+                    let delay = BACKOFF_SECS[attempt];
+                    attempt += 1;
+                    info!(
+                        donor = %donor_node_id,
+                        attempt,
+                        delay_secs = delay,
+                        "baseline adopt: donor contact hints not resolved yet — retrying pull"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+                warn!(
+                    donor = %donor_node_id,
+                    attempts = attempt + 1,
+                    "baseline adopt: pull failed (peer may be the joiner, or resume at startup): {}",
+                    e
+                );
+                return;
+            }
+        }
     }
 }
 

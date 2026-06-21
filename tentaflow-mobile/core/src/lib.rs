@@ -241,6 +241,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             cluster_name: "tentaflow".to_string(),
             iroh_relay_url: "https://use.iroh.network/".to_string(),
             dht_enabled: false,
+            trust_expiry_days: 30,
         }),
         inference: Some(InferenceConfig {
             enabled: true,

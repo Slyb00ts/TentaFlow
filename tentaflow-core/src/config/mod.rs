@@ -187,6 +187,14 @@ pub struct MeshConfig {
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
 
+    /// Liczba dni bezskutecznych prob polaczenia po ktorej zaufany peer jest
+    /// automatycznie odparowywany. Chroni przed "martwymi" tozsamosciami: gdy
+    /// node zostaje wyczyszczony i re-provisionowany dostaje nowy klucz ed25519,
+    /// a stara tozsamosc utknelaby w trusted store i meshu w nieskonczonej petli
+    /// reconnectu. Peer ktory polaczyl sie w tym oknie NIGDY nie jest usuwany.
+    #[serde(default = "default_trust_expiry_days")]
+    pub trust_expiry_days: u64,
+
     /// URL serwera relay iroh uzywanego gdy bezposrednie QUIC hole punching
     /// nie jest mozliwe (NAT, firewall). Pusty string (domyslnie) oznacza
     /// uzycie wbudowanego presetu N0 iroh (4 produkcyjne regiony
@@ -728,6 +736,10 @@ fn default_cluster_name() -> String {
     "tentaflow".to_string()
 }
 
+fn default_trust_expiry_days() -> u64 {
+    30
+}
+
 fn default_models_dir() -> String {
     // Portable layout: shared models cache under <tentaflow_home>/models so
     // every backend (Docker, native venv, in-process) hits the same HF cache.
@@ -911,6 +923,7 @@ impl Default for NodeConfig {
                 peer_timeout_ms: default_peer_timeout_ms(),
                 cluster_name: "tentaflow".to_string(),
                 iroh_relay_url: default_iroh_relay_url(),
+                trust_expiry_days: default_trust_expiry_days(),
             }),
             inference: None,
             services_runtime: ServicesRuntimeConfig::default(),
