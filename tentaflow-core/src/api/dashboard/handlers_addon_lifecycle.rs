@@ -875,6 +875,7 @@ pub fn addon_resources_set(
         gpu_enabled: old.gpu_enabled,
         vram_limit_mb: old.vram_limit_mb,
         storage_limit_mb: payload.storage_mb as i64,
+        document_storage_mb: old.document_storage_mb,
         http_requests_per_min: payload.http_requests_per_min as i64,
         llm_tokens_per_min: payload.llm_tokens_per_min as i64,
         fuel_limit: old.fuel_limit,

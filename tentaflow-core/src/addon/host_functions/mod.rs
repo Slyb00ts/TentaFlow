@@ -14,6 +14,7 @@ pub mod camera_metadata;
 pub mod cbor_io;
 pub mod config;
 pub mod doc_parse;
+pub mod document;
 pub mod events;
 pub mod flow;
 pub mod gate;
@@ -339,6 +340,20 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "doc_parse_v1", doc_parse::doc_parse_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja doc_parse_v1: {e}"))?;
+
+    // --- Document/blob store API (RAG E1.3 — per-instancja upload pliku) ---
+    linker
+        .func_wrap("tentaflow", "document_put_v1", document::document_put_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja document_put_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "document_get_v1", document::document_get_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja document_get_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "document_delete_v1", document::document_delete_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja document_delete_v1: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "document_list_v1", document::document_list_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja document_list_v1: {e}"))?;
 
     // --- Graph API (RAG 0.2 — embedded CozoDB per-addon per-collection graphs) ---
     #[cfg(feature = "graph")]

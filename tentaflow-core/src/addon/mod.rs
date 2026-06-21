@@ -357,6 +357,8 @@ pub struct ResourceRequirements {
     pub storage_total_mb: Option<u64>,
     /// Limit pojedynczej wartosci storage w MB
     pub storage_value_mb: Option<u64>,
+    /// Calkowity limit document/blob store (RAG E1.3) w MB. 0/None = bez limitu.
+    pub document_storage_mb: Option<u64>,
     /// Limit tokenow LLM na minute
     pub llm_tokens_per_minute: Option<u64>,
     /// Limit requestow HTTP na minute

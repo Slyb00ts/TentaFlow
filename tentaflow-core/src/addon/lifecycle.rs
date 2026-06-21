@@ -227,6 +227,9 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
             })?;
         }
     }
+    // RAG E1.3 (Bug 3): skasuj wpis muteksu instancji z document store, żeby mapa
+    // `instance_locks()` nie rosła w nieskończoność dla usuwanych instancji.
+    crate::addon::host_functions::document::forget_instance_lock(org_id, addon_id);
     uninstall(addon_id, db)
 }
 
@@ -743,12 +746,14 @@ fn upsert_addon_resource_limits(
         conn.execute(
             "INSERT OR REPLACE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
-              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min, fuel_limit) \
-             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6)",
+              vram_limit_mb, storage_limit_mb, document_storage_mb, http_requests_per_min, \
+              llm_tokens_per_min, fuel_limit) \
+             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 &manifest.addon_id,
                 res.memory_mb.unwrap_or(0) as i64,
                 res.storage_total_mb.unwrap_or(0) as i64,
+                res.document_storage_mb.unwrap_or(0) as i64,
                 res.http_requests_per_minute.unwrap_or(0) as i64,
                 res.llm_tokens_per_minute.unwrap_or(0) as i64,
                 res.fuel_limit.unwrap_or(0) as i64,
@@ -1737,12 +1742,14 @@ fn upgrade_core(
         conn.execute(
             "INSERT OR REPLACE INTO addon_resource_limits \
              (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
-              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min, fuel_limit) \
-             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6)",
+              vram_limit_mb, storage_limit_mb, document_storage_mb, http_requests_per_min, \
+              llm_tokens_per_min, fuel_limit) \
+             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 addon_id,
                 res.memory_mb.unwrap_or(0) as i64,
                 res.storage_total_mb.unwrap_or(0) as i64,
+                res.document_storage_mb.unwrap_or(0) as i64,
                 res.http_requests_per_minute.unwrap_or(0) as i64,
                 res.llm_tokens_per_minute.unwrap_or(0) as i64,
                 res.fuel_limit.unwrap_or(0) as i64,
@@ -2429,6 +2436,10 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
             .map(|v| v as u64),
         storage_value_mb: res
             .get("storage_value_mb")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64),
+        document_storage_mb: res
+            .get("document_storage_mb")
             .and_then(|v| v.as_integer())
             .map(|v| v as u64),
         llm_tokens_per_minute: res

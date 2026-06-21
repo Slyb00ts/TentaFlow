@@ -392,6 +392,7 @@ tempfile = "3"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 wiremock = "0.6"
 dhat = "0.3"
+filetime = "0.2"
 
 [[bench]]
 name = "noop"
