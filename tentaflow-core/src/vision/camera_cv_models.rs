@@ -100,15 +100,20 @@ pub fn is_camera_cv_engine(engine_id: &str) -> bool {
     BUNDLES.iter().any(|b| b.engine_id == engine_id)
 }
 
-/// PP-OCRv5 (onnx-ocr) bundle: cztery pliki sciagane z `<base_url>/<name>`.
-/// `cls` jest opcjonalny (404 nie przerywa deployu — silnik pomija korekte
-/// kata), `det`/`rec`/`dict` sa wymagane. Te same nazwy plikow co w
-/// `vision/onnx_ocr.rs`.
-const ONNX_OCR_FILES: &[(&str, bool)] = &[
-    ("ppocrv5_det.onnx", true),
-    ("ppocrv5_rec.onnx", true),
-    ("ppocrv5_cls.onnx", false),
-    ("ppocrv5_dict.txt", true),
+/// PP-OCRv5 (onnx-ocr) bundle: `(nazwa, wymagany, opcjonalny_absolutny_url)`.
+/// Gdy `abs_url` = `Some`, plik leci z tego URL-a zamiast `<base_url>/<name>` —
+/// dict PP-OCRv5 trzymamy z kanonicznego repo PaddleOCR (modele det/rec hostuja
+/// repo ONNX bez slownika). `cls` opcjonalny (404 nie przerywa deployu — silnik
+/// pomija korekte kata), `det`/`rec`/`dict` wymagane.
+const ONNX_OCR_FILES: &[(&str, bool, Option<&str>)] = &[
+    ("ppocrv5_det.onnx", true, None),
+    ("ppocrv5_rec.onnx", true, None),
+    ("ppocrv5_cls.onnx", false, None),
+    (
+        "ppocrv5_dict.txt",
+        true,
+        Some("https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt"),
+    ),
 ];
 
 /// Materializuje bundle PP-OCRv5 (onnx-ocr) do `vision_models_dir()`: pobiera
@@ -127,12 +132,15 @@ pub async fn ensure_onnx_ocr_bundle(base_url: &str, log_sink: Option<&LogSink>) 
         ));
     }
 
-    for (name, required) in ONNX_OCR_FILES {
+    for (name, required, abs_url) in ONNX_OCR_FILES {
         let dest = dir.join(name);
         if file_ok(&dest) {
             continue;
         }
-        let url = format!("{}/{}", base, name);
+        let url = match abs_url {
+            Some(u) => (*u).to_string(),
+            None => format!("{}/{}", base, name),
+        };
         if let Some(s) = log_sink {
             s.phase("downloading-vision", &format!("Pobieram {}", name));
         }
