@@ -1682,6 +1682,12 @@ impl ModelRuntimeExecutor {
         request: DocumentParseRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<DocumentParseResponse, ExecutorError> {
+        // RAG E1.4 — PDF wchodzi jako wielostronicowy dokument: rasteryzujemy go
+        // na obrazy stron i każdą stronę parsujemy istniejącą ścieżką vision,
+        // po czym scalamy wyniki (markdown + bloki z poprawnymi numerami stron).
+        if crate::services::document::is_pdf_mime(&request.mime) {
+            return self.execute_documents_pdf(request, ctx).await;
+        }
         let outcome = {
             let snapshot = self.catalog.snapshot();
             let req = ResolveRequest {
@@ -1745,6 +1751,100 @@ impl ModelRuntimeExecutor {
             attempts,
             last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
         })
+    }
+
+    /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium za
+    /// feature `pdf`), parsuje każdą stronę przez `execute_documents` (ten sam
+    /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
+    /// (`merge_page_responses`). Cap stron egzekwowany na poziomie rasteryzera
+    /// ([`MAX_PDF_PAGES`]). Bez feature `pdf` zwraca czytelny błąd zamiast crashu.
+    #[cfg(feature = "pdf")]
+    async fn execute_documents_pdf(
+        &self,
+        request: DocumentParseRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentParseResponse, ExecutorError> {
+        use crate::services::document::{self, DEFAULT_RENDER_DPI, MAX_PDF_PAGES};
+        use crate::services::document::rasterize::{rasterize_pdf_streaming, PageRender, SinkClosed};
+
+        // Bug 1 (agregatowy memory-DoS): NIE materializujemy wszystkich stron
+        // jako RGB/PNG przed parse. Streaming strona-po-stronie: producent
+        // (spawn_blocking) ładuje dokument RAZ pod pdfium-lockiem, renderuje
+        // stronę → PNG → `blocking_send` na kanał o pojemności 2; konsument
+        // (tu, async) odbiera PNG i parsuje POZA pdfium-lockiem. Backpressure
+        // kanału ogranicza szczyt pamięci do ~2 stron, nie O(N).
+        let pdf_bytes = request.image_bytes.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PageRender>(2);
+
+        let producer = tokio::task::spawn_blocking(move || {
+            rasterize_pdf_streaming(&pdf_bytes, DEFAULT_RENDER_DPI, MAX_PDF_PAGES, |page| {
+                // `blocking_send` blokuje wątek producenta gdy kanał pełny —
+                // to właśnie backpressure (producent nie renderuje stron na
+                // zapas). `Err` = konsument zamknął odbiornik → przerwij render.
+                tx.blocking_send(page).map_err(|_| SinkClosed)
+            })
+        });
+
+        // Konsument: parsuje każdą stronę przez `execute_documents` jako obraz
+        // PNG — ta sama ścieżka resolve→rank→failover co dla wejścia obrazowego.
+        // Sekwencyjnie (kanał wydaje strony po kolei), żeby self-referencyjny
+        // parse-flow nie zalał backendu i żeby `flow_depth` był deterministyczny.
+        // Numery stron narastają z `page.index` (0..N), merge je przepisuje.
+        let mut page_responses: Vec<DocumentParseResponse> = Vec::new();
+        let mut parse_err: Option<ExecutorError> = None;
+        while let Some(page) = rx.recv().await {
+            let page_request = DocumentParseRequest {
+                model: request.model.clone(),
+                image_bytes: page.png,
+                mime: "image/png".to_string(),
+                flow_depth: request.flow_depth,
+            };
+            // `Box::pin` — rekurencyjna async fn (execute_documents wywołuje
+            // execute_documents_pdf, który tu woła execute_documents); bez tego
+            // typ future byłby nieskończenie zagnieżdżony.
+            match Box::pin(self.execute_documents(page_request, ctx)).await {
+                Ok(resp) => page_responses.push(resp),
+                Err(e) => {
+                    parse_err = Some(e);
+                    break;
+                }
+            }
+        }
+        // Zamknięcie `rx` (drop po wyjściu z pętli) odblokuje producenta na
+        // `blocking_send` (Closed) — nie zostawiamy wiszącego wątku blocking.
+        drop(rx);
+
+        let rasterize_result = producer
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("rasterize join: {e}")))?;
+
+        // Najpierw raportuj błąd parse strony (failover wewnątrz już wyczerpany),
+        // potem ewentualny błąd rasteryzacji (np. EmptyDocument, PDF uszkodzony).
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
+        let page_count =
+            rasterize_result.map_err(|e| ExecutorError::Internal(format!("PDF rasterize: {e}")))?;
+
+        if page_count == 0 || page_responses.is_empty() {
+            return Err(ExecutorError::Internal("PDF has no renderable pages".into()));
+        }
+
+        Ok(document::merge_page_responses(page_responses))
+    }
+
+    /// Bez feature `pdf` PDF nie jest wspierany — zwracamy czytelny błąd
+    /// (deploy bez pdfium/mobile nie crashuje, tylko odrzuca PDF z jasną
+    /// informacją że trzeba zbudować z `--features pdf`).
+    #[cfg(not(feature = "pdf"))]
+    async fn execute_documents_pdf(
+        &self,
+        _request: DocumentParseRequest,
+        _ctx: &mut ExecutionContext,
+    ) -> Result<DocumentParseResponse, ExecutorError> {
+        Err(ExecutorError::Internal(
+            "PDF parsing requires 'pdf' feature".into(),
+        ))
     }
 
     /// Per-target document-parse dispatch. Serwer obsługuje parsowanie przez
@@ -3477,6 +3577,64 @@ mod tests {
             .await
             .expect_err("flow without dispatcher should be a typed error");
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    /// RAG E1.4 — buduje `DocumentParseRequest` z realnym, minimalnym PDF
+    /// (jedna strona A4) i mime `application/pdf`.
+    #[cfg(feature = "pdf")]
+    fn make_pdf_request(model: &str) -> DocumentParseRequest {
+        let pdf = crate::services::document::rasterize::minimal_pdf(1);
+        DocumentParseRequest {
+            model: model.to_string(),
+            image_bytes: pdf,
+            mime: crate::services::document::PDF_MIME.to_string(),
+            flow_depth: 0,
+        }
+    }
+
+    /// RAG E1.4 — z feature `pdf` mime `application/pdf` wchodzi w ścieżkę
+    /// rasteryzacji (`execute_documents_pdf`): PDF jest renderowany do obrazów,
+    /// a parse per-strona idzie przez resolver. Na pustym katalogu pierwsza
+    /// strona surface'uje `Resolve` (brak serwisu documents) — to dowód, że
+    /// rasteryzacja się powiodła (gdyby pdfium padł, dostalibyśmy `Internal`).
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn execute_documents_pdf_rasterizes_then_resolves_per_page() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .execute_documents(make_pdf_request("rag-parse"), &mut ctx)
+            .await
+            .expect_err("pusty katalog → resolve error po rasteryzacji");
+        assert!(
+            matches!(err, ExecutorError::Resolve(_)),
+            "po udanej rasteryzacji per-strona idzie przez resolver: {err:?}"
+        );
+    }
+
+    /// RAG E1.4 — bez feature `pdf` mime PDF zwraca czytelny `Internal`
+    /// ("PDF parsing requires 'pdf' feature"), NIE crash i NIE resolve.
+    #[cfg(not(feature = "pdf"))]
+    #[tokio::test]
+    async fn execute_documents_pdf_without_feature_returns_readable_error() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let req = DocumentParseRequest {
+            model: "rag-parse".into(),
+            image_bytes: vec![0x25, 0x50, 0x44, 0x46], // "%PDF"
+            mime: crate::services::document::PDF_MIME.to_string(),
+            flow_depth: 0,
+        };
+        let err = exec
+            .execute_documents(req, &mut ctx)
+            .await
+            .expect_err("PDF bez feature musi być błędem");
+        match err {
+            ExecutorError::Internal(msg) => {
+                assert!(msg.contains("'pdf' feature"), "czytelny komunikat: {msg}");
+            }
+            other => panic!("oczekiwano Internal, dostano {other:?}"),
+        }
     }
 
     /// `execute_documents` dla aliasu `rag-parse` na pustym katalogu surface'uje
