@@ -1001,6 +1001,9 @@ fn decode_voxel_to_canonical(
         // informational. Emitting indices is also cheaper per point than the f32
         // multiply-add, easing the service-tick fuel budget.
         layout: LIDAR_LAYOUT_XYZ_I16,
+        // Addon emits an uncompressed body; the host pump applies LZ4 + the flag
+        // on the way out, so the metered service tick never pays compression fuel.
+        flags: 0,
         point_count: point_count as u32,
         frame_seq,
         timestamp_us: ts_us,

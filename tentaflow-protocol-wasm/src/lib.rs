@@ -8129,11 +8129,38 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
         set(&obj, "hasFrame", false.into());
         return obj.into();
     };
-    let frame_end = LIDAR_HEADER_LEN + body_len;
-    if bytes.len() < frame_end {
+    // Cap the inflate target derived from the (untrusted) header. The LZ4 path
+    // allocates `body_len` zeroed bytes BEFORE validating the compressed input, so
+    // a hostile header (huge point_count, tiny body) could otherwise OOM the tab.
+    // 64 MiB covers any real frame (~0.5 MB) with vast headroom; larger = reject.
+    const LIDAR_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+    if body_len > LIDAR_MAX_BODY_BYTES {
         set(&obj, "hasFrame", false.into());
         return obj.into();
     }
+    // Acquire the UNCOMPRESSED body: inflate the LZ4 block when flagged, else take
+    // the declared slice. Either way `body.len() == body_len` afterward; a corrupt
+    // block or short buffer yields `{hasFrame:false}` (never a partial cloud).
+    let inflated;
+    let body: &[u8] = if header.lz4_body() {
+        match lz4_flex::block::decompress(&bytes[LIDAR_HEADER_LEN..], body_len) {
+            Ok(d) if d.len() == body_len => {
+                inflated = d;
+                &inflated
+            }
+            _ => {
+                set(&obj, "hasFrame", false.into());
+                return obj.into();
+            }
+        }
+    } else {
+        let frame_end = LIDAR_HEADER_LEN + body_len;
+        if bytes.len() < frame_end {
+            set(&obj, "hasFrame", false.into());
+            return obj.into();
+        }
+        &bytes[LIDAR_HEADER_LEN..frame_end]
+    };
     set(&obj, "hasFrame", true.into());
     set(&obj, "frameSeq", header.frame_seq.into());
     set(&obj, "frame_seq", header.frame_seq.into());
@@ -8150,16 +8177,21 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
     set(&obj, "timestamp_us", (header.timestamp_us as f64).into());
     set(&obj, "hostSendUs", (header.host_send_us as f64).into());
     set(&obj, "host_send_us", (header.host_send_us as f64).into());
-    // Raw bytes: EXACTLY the declared frame (header + declared body), trimming
-    // any trailing garbage past `frame_end` so callers never see bytes beyond
-    // the validated frame.
-    set(&obj, "raw", js_sys::Uint8Array::from(&bytes[..frame_end]).into());
+    // Raw canonical frame = header + UNCOMPRESSED body. For an LZ4 frame this
+    // reconstructs the inflated canonical bytes so downstream (the L4 GPU upload)
+    // never sees the compressed wire form. The LZ4 flag is CLEARED in the rebuilt
+    // header so `raw` is a self-consistent uncompressed frame — re-decoding it must
+    // not try to inflate an already-inflated body.
+    let mut raw = Vec::with_capacity(LIDAR_HEADER_LEN + body.len());
+    raw.extend_from_slice(&bytes[..LIDAR_HEADER_LEN]);
+    raw.extend_from_slice(body);
+    raw[tentaflow_sdk_spec::LIDAR_FLAGS_OFFSET] &= !tentaflow_sdk_spec::LIDAR_FLAG_LZ4_BODY;
+    set(&obj, "raw", js_sys::Uint8Array::from(&raw[..]).into());
     // World-space XYZ as a Float32Array (what the renderer uploads). We build a
     // Rust `Vec<f32>` first and hand it over with a SINGLE bulk `Float32Array::from`
     // copy — per-element `set_index` across the wasm/JS boundary was the dominant
     // decode cost. For the packed-i16 grid layout we reconstruct world meters here
     // (`idx * resolution + origin`); for the f32 layouts the body is copied as-is.
-    let body = &bytes[LIDAR_HEADER_LEN..frame_end];
     let floats: Vec<f32> = if header.layout == tentaflow_sdk_spec::LIDAR_LAYOUT_XYZ_I16 {
         let n = header.point_count as usize;
         let res = header.resolution;

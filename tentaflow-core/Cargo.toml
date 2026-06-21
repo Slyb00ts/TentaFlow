@@ -93,6 +93,9 @@ async-trait = "0.1.89"
 futures = "0.3.32"
 async-stream = "0.3.6"
 bytes = "1.11"
+# LZ4 block codec for the lidar wire (host-side body compression). Block-only:
+# no std `frame`/io needed, so it also matches the wasm decoder's feature set.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez

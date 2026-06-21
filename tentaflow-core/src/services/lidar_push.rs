@@ -29,32 +29,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tentaflow_sdk_spec::{LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET};
+use tentaflow_sdk_spec::{
+    LIDAR_FLAGS_OFFSET, LIDAR_FLAG_LZ4_BODY, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET,
+};
 use tokio::sync::broadcast;
 
 use crate::services::lidar_hub::LidarStreamHub;
 use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
 
-/// Stamp `host_send_us` (wall-clock µs since the Unix epoch) into the frame's
-/// fixed header just before it is broadcast, so the browser can split end-to-end
-/// latency into addon-decode→host-dispatch vs host-send→browser segments.
+/// Prepare a canonical frame for the wire: LZ4-compress the body (LOSSLESS, on top
+/// of whatever layout the addon used) and stamp `host_send_us` into the fixed
+/// header, just before broadcast. Compression happens HERE, in the native host, so
+/// the metered addon tick never pays for it, and it shrinks the dominant
+/// host→browser hop. The 44-byte header stays uncompressed so this can stamp the
+/// send time and the browser can size the inflate buffer from `point_count`+layout.
 ///
-/// The latest-frame bytes come straight from the hub (the SAME `Bytes` the addon
-/// produced, with `host_send_us == 0`), so we must take an owned copy before
-/// mutating the 8 LE bytes in place — overwriting the shared buffer would corrupt
-/// the hub's retained frame for other subscribers / late joiners. This adds one
-/// per-frame copy of the ~384 KB frame; it is a deliberate, accepted cost for the
-/// latency diagnostic. Frames shorter than the header (should never happen here)
-/// are broadcast unchanged rather than risking an out-of-range write.
-fn stamp_host_send_us(frame: &Bytes) -> Bytes {
+/// Adaptive: only ships compressed when it actually shrinks (sparse/tiny frames
+/// can grow under LZ4), otherwise the body is sent as-is with the flag clear.
+///
+/// The hub hands out the SAME `Bytes` the addon produced (`host_send_us == 0`), so
+/// we always build an owned buffer here — mutating the shared frame in place would
+/// corrupt the hub's retained copy for other subscribers / late joiners. Frames
+/// shorter than the header (should never happen) are passed through unchanged.
+fn prepare_wire_frame(frame: &Bytes) -> Bytes {
     if frame.len() < LIDAR_HEADER_LEN {
         return frame.clone();
+    }
+    let body = &frame[LIDAR_HEADER_LEN..];
+    let compressed = lz4_flex::block::compress(body);
+    let mut buf = Vec::with_capacity(LIDAR_HEADER_LEN + body.len().min(compressed.len()));
+    buf.extend_from_slice(&frame[..LIDAR_HEADER_LEN]);
+    if compressed.len() < body.len() {
+        buf.extend_from_slice(&compressed);
+        buf[LIDAR_FLAGS_OFFSET] |= LIDAR_FLAG_LZ4_BODY;
+    } else {
+        buf.extend_from_slice(body);
     }
     let now_us = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
-    let mut buf = frame.to_vec();
     buf[LIDAR_HOST_SEND_US_OFFSET..LIDAR_HOST_SEND_US_OFFSET + 8]
         .copy_from_slice(&now_us.to_le_bytes());
     Bytes::from(buf)
@@ -159,7 +173,7 @@ async fn spawn_pump(
             let Some(src) = source.upgrade() else {
                 return;
             };
-            src.broadcast(stamp_host_send_us(&frame));
+            src.broadcast(prepare_wire_frame(&frame));
         }
     }
 
@@ -182,7 +196,7 @@ async fn spawn_pump(
         // frame (lag is handled by the broadcast `Lagged` path upstream).
         if let Some(frame) = hub.latest(&robot_id) {
             if !frame.is_empty() {
-                src.broadcast(stamp_host_send_us(&frame));
+                src.broadcast(prepare_wire_frame(&frame));
             }
         }
     }
@@ -207,6 +221,7 @@ impl BinaryStreamSource for LocalLidarStreamSource {
         LidarStreamHub::global()
             .latest(&self.robot_id)
             .filter(|b| !b.is_empty())
+            .map(|b| prepare_wire_frame(&b))
     }
 
     fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
@@ -240,16 +255,37 @@ mod tests {
         LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ,
     };
 
-    /// The packed-f32 body after the fixed header — the part the pump never
-    /// rewrites, so it stays byte-identical to the originally published frame.
-    fn body_after_header(frame: &[u8]) -> &[u8] {
-        &frame[LIDAR_HEADER_LEN..]
+    /// The UNCOMPRESSED body of a wire frame — inflates the LZ4 block when the pump
+    /// chose to compress, so it always matches the originally published body.
+    fn wire_body(frame: &[u8]) -> Vec<u8> {
+        let h = LidarFrameHeader::decode_header(frame).expect("header");
+        let body = &frame[LIDAR_HEADER_LEN..];
+        if h.lz4_body() {
+            lz4_flex::block::decompress(body, h.body_len().unwrap()).expect("inflate")
+        } else {
+            body.to_vec()
+        }
+    }
+
+    #[test]
+    fn prepare_wire_frame_compresses_repetitive_body_losslessly() {
+        // A large, highly repetitive body must compress (flag set) and inflate back
+        // bit-for-bit; the header must round-trip with host_send_us stamped.
+        let pts: Vec<[f32; 3]> = (0..2000).map(|_| [1.0, 2.0, 3.0]).collect();
+        let frame = build_frame(&pts, 9);
+        let wire = prepare_wire_frame(&frame);
+        let h = LidarFrameHeader::decode_header(&wire).expect("header");
+        assert!(h.lz4_body(), "repetitive body must compress");
+        assert!(wire.len() < frame.len(), "compressed frame is smaller");
+        assert!(h.host_send_us > 0, "stamped");
+        assert_eq!(wire_body(&wire), &frame[LIDAR_HEADER_LEN..], "lossless inflate");
     }
 
     fn build_frame(points: &[[f32; 3]], seq: u32) -> Bytes {
         let header = LidarFrameHeader {
             version: LIDAR_FRAME_VERSION,
             layout: LIDAR_LAYOUT_XYZ,
+            flags: 0,
             point_count: points.len() as u32,
             frame_seq: seq,
             timestamp_us: 1_000,
@@ -286,9 +322,14 @@ mod tests {
 
         let source = LocalLidarStreamSource::new(robot_id.to_string());
 
-        // (d) init_segment reflects the current latest frame.
+        // (d) init_segment reflects the current latest frame (body matches; the
+        // header now carries a stamped host_send_us and possibly the LZ4 flag).
         let init = source.init_segment().await.expect("init = latest frame");
-        assert_eq!(&init[..], &seed[..]);
+        assert_eq!(wire_body(&init), wire_body(&seed));
+        assert!(
+            LidarFrameHeader::decode_header(&init).unwrap().host_send_us > 0,
+            "init segment is stamped on the way out"
+        );
 
         // Subscribe to the source's broadcast as the StreamHub would.
         let mut rx = source
@@ -300,7 +341,7 @@ mod tests {
         // stamps `host_send_us` in place, so the broadcast bytes differ from the
         // retained frame ONLY in that field — body + the rest of the header match.
         let got_seed = rx.recv().await.expect("seeded frame");
-        assert_eq!(body_after_header(&got_seed), body_after_header(&seed));
+        assert_eq!(wire_body(&got_seed), wire_body(&seed));
         // (c) round-trips a valid header with the host send time now stamped.
         let h = LidarFrameHeader::decode_header(&got_seed).expect("header decodes");
         assert_eq!(h.frame_seq, 1);
@@ -311,7 +352,7 @@ mod tests {
         let next = build_frame(&[[4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], 2);
         hub.publish(robot_id, 2, next.clone());
         let got_next = rx.recv().await.expect("pushed frame");
-        assert_eq!(body_after_header(&got_next), body_after_header(&next));
+        assert_eq!(wire_body(&got_next), wire_body(&next));
         // (c) round-trips a valid header.
         let h2 = LidarFrameHeader::decode_header(&got_next).expect("header decodes");
         assert_eq!(h2.frame_seq, 2);
@@ -343,7 +384,7 @@ mod tests {
         hub.publish(robot_id, 1, first.clone());
         let got = rx.recv().await.expect("first frame pushed");
         // The pump stamps host_send_us, so only the body is byte-identical.
-        assert_eq!(body_after_header(&got), body_after_header(&first));
+        assert_eq!(wire_body(&got), wire_body(&first));
         let h = LidarFrameHeader::decode_header(&got).expect("header decodes");
         assert!(h.host_send_us > 0, "pump stamps host_send_us");
 
