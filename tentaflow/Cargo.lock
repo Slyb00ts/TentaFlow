@@ -10929,6 +10929,7 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "lru 0.12.5",
+ "lz4_flex 0.11.6",
  "milvus-sdk-rust",
  "minicbor",
  "multer",

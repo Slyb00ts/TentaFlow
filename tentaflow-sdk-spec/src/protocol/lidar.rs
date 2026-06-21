@@ -27,24 +27,38 @@ pub const LIDAR_LAYOUT_XYZI: u8 = 4;
 /// (voxel maps), where every point already lands on `origin + index * resolution`.
 pub const LIDAR_LAYOUT_XYZ_I16: u8 = 5;
 
-/// Total size in bytes of the fixed frame header. The body (packed f32 points)
-/// begins at exactly this offset.
+/// Flags bit: the body bytes are an LZ4 block (compress the body, NOT the header,
+/// so the host can still stamp `host_send_us` and the decoder sizes the inflate
+/// buffer from `point_count`+`layout`). Applied as a universal, LOSSLESS wire
+/// compression on TOP of any layout (f32 or i16). The uncompressed body length is
+/// always `body_len()`; the on-wire body is `bytes[LIDAR_HEADER_LEN..]`.
+pub const LIDAR_FLAG_LZ4_BODY: u8 = 0x01;
+/// Mask of all flag bits the current decoder understands. A header carrying any
+/// bit outside this mask is rejected (fail closed, never misread).
+pub const LIDAR_FLAGS_KNOWN: u8 = LIDAR_FLAG_LZ4_BODY;
+/// Byte offset of the `flags` field inside the fixed header.
+pub const LIDAR_FLAGS_OFFSET: usize = 2;
+
+/// Total size in bytes of the fixed frame header. The body begins at exactly this
+/// offset. When `LIDAR_FLAG_LZ4_BODY` is set the on-wire body is an LZ4 block of
+/// that many decompressed bytes.
 ///
 /// Byte layout (all multi-byte fields little-endian):
 /// ```text
 ///   offset  size  field
 ///        0     1  version        u8   (== LIDAR_FRAME_VERSION)
-///        1     1  layout         u8   (LIDAR_LAYOUT_XYZ=3 | LIDAR_LAYOUT_XYZI=4)
-///        2     2  _reserved      u16  (must be 0; keeps point_count 4-aligned)
+///        1     1  layout         u8   (LIDAR_LAYOUT_XYZ=3 | XYZI=4 | XYZ_I16=5)
+///        2     1  flags          u8   (LIDAR_FLAG_LZ4_BODY=0x01)
+///        3     1  _reserved      u8   (must be 0; keeps point_count 4-aligned)
 ///        4     4  point_count    u32
 ///        8     4  frame_seq      u32
 ///       12     8  timestamp_us   i64  (addon decode wall-clock µs)
 ///       20     8  host_send_us   i64  (host pump-send wall-clock µs; 0 until stamped)
-///       28     4  resolution     f32  (meters per voxel/unit; informational)
+///       28     4  resolution     f32  (meters per voxel/unit)
 ///       32     4  origin_x       f32
 ///       36     4  origin_y       f32
 ///       40     4  origin_z       f32
-///       44          <-- body starts here (point_count * layout f32, interleaved)
+///       44          <-- body starts here (uncompressed: point_count * stride * comp_bytes)
 /// ```
 pub const LIDAR_HEADER_LEN: usize = 44;
 
@@ -61,6 +75,8 @@ pub struct LidarFrameHeader {
     pub version: u8,
     /// f32 components per point: `LIDAR_LAYOUT_XYZ` or `LIDAR_LAYOUT_XYZI`.
     pub layout: u8,
+    /// Bit flags (`LIDAR_FLAG_LZ4_BODY`). `0` for a plain uncompressed body.
+    pub flags: u8,
     /// Number of points packed in the body.
     pub point_count: u32,
     /// Monotonic per-session frame counter (renderer freshness / drop detection).
@@ -101,9 +117,17 @@ impl LidarFrameHeader {
         }
     }
 
-    /// Exact body length in bytes for this header:
+    /// `true` when the on-wire body is an LZ4 block (`body_len()` is the inflated
+    /// size; the compressed bytes are everything after the fixed header).
+    #[inline]
+    pub const fn lz4_body(&self) -> bool {
+        self.flags & LIDAR_FLAG_LZ4_BODY != 0
+    }
+
+    /// Exact UNCOMPRESSED body length in bytes for this header:
     /// `point_count * stride * component_bytes`. `None` if the layout is unknown
-    /// or the product overflows `usize`.
+    /// or the product overflows `usize`. With `LIDAR_FLAG_LZ4_BODY` this is the
+    /// inflate target size, not the on-wire byte count.
     #[inline]
     pub fn body_len(&self) -> Option<usize> {
         let stride = self.stride();
@@ -127,7 +151,8 @@ impl LidarFrameHeader {
         let mut buf = [0u8; LIDAR_HEADER_LEN];
         buf[0] = self.version;
         buf[1] = self.layout;
-        // bytes 2..4 reserved, already zero.
+        buf[LIDAR_FLAGS_OFFSET] = self.flags;
+        // byte 3 reserved, already zero.
         buf[4..8].copy_from_slice(&self.point_count.to_le_bytes());
         buf[8..12].copy_from_slice(&self.frame_seq.to_le_bytes());
         buf[12..20].copy_from_slice(&self.timestamp_us.to_le_bytes());
@@ -158,7 +183,9 @@ impl LidarFrameHeader {
         {
             return None;
         }
-        if bytes[2] != 0 || bytes[3] != 0 {
+        let flags = bytes[LIDAR_FLAGS_OFFSET];
+        // Unknown flag bits or a non-zero reserved byte → reject (fail closed).
+        if flags & !LIDAR_FLAGS_KNOWN != 0 || bytes[3] != 0 {
             return None;
         }
         let point_count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -178,6 +205,7 @@ impl LidarFrameHeader {
         Some(LidarFrameHeader {
             version,
             layout,
+            flags,
             point_count,
             frame_seq,
             timestamp_us,
@@ -196,6 +224,7 @@ mod tests {
         LidarFrameHeader {
             version: LIDAR_FRAME_VERSION,
             layout: LIDAR_LAYOUT_XYZ,
+            flags: 0,
             point_count,
             frame_seq: 7,
             timestamp_us: 1_700_000_000_000_123,
@@ -262,9 +291,18 @@ mod tests {
         let mut b = h.encode_header();
         b[1] = 9;
         assert!(LidarFrameHeader::decode_header(&b).is_none());
-        // Non-zero reserved.
+        // Unknown flag bit (outside LIDAR_FLAGS_KNOWN).
         let mut b = h.encode_header();
-        b[2] = 1;
+        b[LIDAR_FLAGS_OFFSET] = 0x80;
+        assert!(LidarFrameHeader::decode_header(&b).is_none());
+        // A KNOWN flag (LZ4) is accepted and round-trips.
+        let mut b = h.encode_header();
+        b[LIDAR_FLAGS_OFFSET] = LIDAR_FLAG_LZ4_BODY;
+        let back = LidarFrameHeader::decode_header(&b).expect("lz4 flag valid");
+        assert!(back.lz4_body());
+        // Non-zero reserved byte.
+        let mut b = h.encode_header();
+        b[3] = 1;
         assert!(LidarFrameHeader::decode_header(&b).is_none());
     }
 

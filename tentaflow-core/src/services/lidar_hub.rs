@@ -159,6 +159,7 @@ mod tests {
         let header = LidarFrameHeader {
             version: LIDAR_FRAME_VERSION,
             layout: LIDAR_LAYOUT_XYZ,
+            flags: 0,
             point_count: points.len() as u32,
             frame_seq: seq,
             timestamp_us: 123_456,
