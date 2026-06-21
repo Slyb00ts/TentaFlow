@@ -116,3 +116,66 @@ handle_ask seed alias-rewrite. Migracja 003_memgraph.sql. Manifest: [[graph_coll
 scheduled conflict_scan, [[vector_namespace]] entities. rag_graphrag.rs: identify_query_entities
 (weights), alias-rewrite, schema-weight/active. Core TYLKO jeśli D2 wybierze jawny filtr active
 (backend.rs) — preferencja NIE ruszać. Scheduler bez zmian. Brak nowych prymitywów grafu w MVP.
+
+## REWIZJA po niezależnym review codexa (NO-GO→warunkowe GO) — NADRZĘDNA nad §2-§7
+
+Codex (statycznie) wykrył fałszywe założenie krytyczne + 4 realne ryzyka. Poprawki przyjęte
+w całości. Poniższe DECYZJE są nadrzędne nad wcześniejszymi sekcjami tam gdzie kolidują.
+
+### R1. SQLite addona = JEDYNE źródło prawdy. Graf = odtwarzalna materializacja aktywnego widoku.
+Φ/Ψ, statusy schematów, stan faktów, konflikty, aliasy — wyłącznie w SQLite addona. Graf NIE jest
+bazą do skanów decyzyjnych (host-fns celowo ograniczone do upsert/neighbors/pagerank/ppr/delete).
+A_det/A_res/merge czytają i decydują WYŁĄCZNIE z SQLite; graf tylko karmi PPR.
+
+### R2. D2 — ODRZUCONE active-via-tombstone-reuse. Przyjęte: osobna kolekcja `kg_active`.
+Powód NO-GO: `alive=false` to soft-delete globalnie filtrowany w neighbors/PageRank/CSR
+(`backend.rs:521,668`), a `upsert_edge` ZAWSZE ożywia (`alive=true`, `backend.rs:439`) — tombstone
+jako „candidate inactive" koliduje z prawdziwym soft-delete dokumentu i refcountem graph_artifacts.
+DECYZJA: retrieval/PPR działa na **`kg_active`** — kolekcji zawierającej WYŁĄCZNIE fakty
+stable + non-conflict + canonical. Pełny ledger faktów (wraz z candidate/przegranymi/aliasami)
+żyje w SQLite, nie w osobnym pełnym grafie. Zero zmian rdzenia w MVP (D1-D5). `kg` (dzisiejszy)
+zostaje zastąpiony przez `kg_active` materializowany z SQLite — E3.0 przestaje pisać do grafu
+wprost, pisze do SQLite+outbox, materializacja wpisuje do `kg_active`.
+
+### R3. Ingest NIE jest atomowy SQLite↔Cozo → wzorzec OUTBOX (idempotentny).
+W JEDNEJ transakcji SQLite (BEGIN IMMEDIATE): schema_registry, fact_schema, fact_evidence,
+fact_state, graph_outbox. OSOBNY idempotentny krok aplikuje graph_outbox do `kg_active`/`ont`
+(upsert/delete host-fn), po sukcesie znacza `applied`. Retry deterministyczny po `fact_key`/`op_id`.
+Promocja candidate→stable i aktywacja faktów = wpisy do graph_outbox (materializacja dodaje krawędź
+do kg_active). A_det trigger NIE zależy od natychmiastowego upsertu grafu — czyta fact_state z SQLite.
+
+### R4. Scheduler — egzekwowanie org_id + instancji. conflict_scan z monotonicznym fact_seq.
+`scheduler/mod.rs:293` woła `start_addon(addon_id,...,None)` — brak jawnego org_id (host-fns grafu
+biorą org z AddonState z fallbackiem do default org `graph.rs:17`) = ryzyko izolacji multi-tenant.
+conflict_scan MUSI: nieść i egzekwować `org_id` + konkretny `addon_id` instancji; payload
+`{collection_id, since_seq, batch_size}`; blokada per-collection (jeden skan naraz); kursor =
+monotoniczny `fact_seq` (AUTOINCREMENT w fact_state) lub `graph_outbox.id > cursor` — sam kursor
+czasowy NIE wystarcza przy równoległym ingeście. [Scheduler trzeba rozszerzyć o przekazanie org_id
+do scheduled job — to drobna zmiana core w scheduler, w granicach „prymitywu".]
+
+### R5. Entity merge (D5) = logiczna transakcja SQLite + redirect artefaktów, w pełni odwracalna.
+Redirect krawędzi + tombstone alias-node psuje refcount (graph_artifacts referuje stare n_id/src/dst;
+cleanup dokumentu kasowałby nieistniejące klucze) i ukrywa incydentne krawędzie (join z non-tombstone
+node, `backend.rs:597`). DECYZJA: merge to tx SQLite: `entity_aliases(alias_id,canonical_id,status)`,
+`entity_merge_log` (pełny diff starych↔nowych edge-keys), `artifact_redirects(old_key→canonical_key)`
+(graph_artifacts cleanup rozwiązuje redirect), materializacja przez graph_outbox, undo przez
+inverse-outbox. Alias-rewrite seedów to TYLKO retrieval-side ułatwienie, nie mechanizm merge.
+
+### R6. D6 wagi P_init — wymaga rozszerzenia primitywu PPR o seedy ważone.
+`GraphManager::ppr` bierze `Vec<String>` (`collection.rs:730`), adapter zrzuca same id
+(`rag_graphrag.rs:414`) → obecne PPR IGNORUJE wagi seedów (personalizacja uniform po seedach).
+P_init (relevance/log-degree/info-density) wymaga `ppr(Vec<(String,f32)>)` — rozszerzenie primitywu
+grafu w core (legalne: prymityw). Zaplanowane w D6, nie wcześniej.
+
+### R7. Manifest — deklaracje do dodania w D1/D3.
+`[[graph_collection]] name="kg_active"` (i ewentualnie `ont`); tool `conflict_scan`;
+`[[vector_namespace]] entities` (similarity-merge). Obecnie manifest deklaruje tylko `kg`.
+
+### R8. Limity kosztu A_res (D4, twarde): batch cap, token cap, cache TTL, max conflicts/run, audit.
+
+### Zrewidowana kolejność/bramki
+D1 (SQLite-first: migracja 003 + schema_registry/fact_schema/fact_evidence/fact_state/graph_outbox;
+manifest kg_active; ingest pisze SQLite+outbox; materializacja outbox→kg_active; E3.0 przepięte z
+bezpośredniego zapisu kg na outbox) → D2 (Candidate→Stable: τ, promocja przez outbox, kg_active =
+tylko stable) → D3 (A_det async, fact_seq, lock per-collection, org_id) → D4 (A_res LLM+limity R8) →
+D5 (merge wg R5) → D6 (memory-guided + ppr ważone R6). Każdy slice: codex review realnego kodu.
