@@ -1,0 +1,51 @@
+# =============================================================================
+# Plik: onnx-ocr.toml
+# Opis: Manifest serwisu ONNX OCR — klasyczny PaddleOCR PP-OCRv5 (det -> cls ->
+#       rec) uruchamiany in-process przez tract-onnx (pure Rust, ta sama
+#       infrastruktura co reszta silnikow vision). Wbudowany engine (embedded)
+#       dla nie-Apple (Linux/Windows); na macOS/iOS OCR pokrywa apple-ocr
+#       (Vision). Bez kontenera docker i bez bundla python — modele i slownik
+#       znakow sa pobierane deploy-time do vision_models_dir().
+#
+#       Implementacja: tentaflow-core/src/vision/onnx_ocr.rs (OcrRunner).
+#       Deploy rejestruje runner przez set_ocr_runner, wiec VisionDispatcher
+#       (flow `vision_ocr`) i camera-enrich uzywaja go in-process bez
+#       dodatkowego procesu.
+#
+#       UWAGA (do weryfikacji): `[[model_preset]] repo` to URL KATALOGU, z
+#       ktorego pobierane sa pliki ppocrv5_det.onnx, ppocrv5_rec.onnx,
+#       ppocrv5_cls.onnx (opcjonalny) i ppocrv5_dict.txt. Ponizszy URL hostuje
+#       potwierdzone det+rec pod tymi nazwami, ale NIE zawiera cls ani slownika
+#       — wskaz wlasny release-dir (HF/GitHub) z kompletem czterech plikow.
+# =============================================================================
+
+[engine]
+id = "onnx-ocr"
+category = "vision"
+resource_kind = "ai"
+name = "ONNX OCR (PP-OCRv5)"
+description_pl = "Klasyczny PaddleOCR PP-OCRv5 (det/cls/rec) przez tract-onnx, in-process. Embedded OCR dla Linux/Windows — odpowiednik apple-ocr na nie-Apple. Rozpoznaje tekst bez kontenera i bez serwera."
+description_en = "Classic PaddleOCR PP-OCRv5 (det/cls/rec) via tract-onnx, in-process. Embedded OCR for Linux/Windows — the non-Apple counterpart of apple-ocr. Recognizes text with no container and no server."
+homepage = "https://github.com/PaddlePaddle/PaddleOCR"
+license = "Apache-2.0"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "pp-ocrv5"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "embedded"
+# Brak feature_flag — onnx-ocr jest czystym tract-onnx (jak scrfd/hsemotion),
+# zawsze wkompilowany na nie-Apple. Nie wymaga `inference-vision-gpu`.
+
+[[model_preset]]
+id = "ppocrv5-mobile-onnx"
+display_name = "PP-OCRv5 mobile (ONNX)"
+# URL katalogu z plikami bundla (det/rec/cls/dict). Patrz UWAGA w naglowku —
+# ten host ma tylko det+rec; podmien na release-dir z kompletem czterech plikow.
+repo = "https://huggingface.co/ilaylow/PP_OCRv5_mobile_onnx/resolve/main"
+recommended = true

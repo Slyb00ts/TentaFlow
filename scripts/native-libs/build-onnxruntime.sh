@@ -9,7 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PLATFORM="${1:-$(detect_platform)}"
-ONNXRUNTIME_REF="${ONNXRUNTIME_REF:-v1.22.0}"
+# v1.26.0: 1.22.0/1.23.x maja hang w tworzeniu sesji na niektorych grafach (MoveNet,
+# duze modele Supertone) — naprawione w 1.24-1.26. 1.26.0 ma prebuilty dla wszystkich
+# platform (1.27.0 nie ma juz CPU win-x64). Konsument to ort (supertonic); sherpa ma
+# wlasny onnxruntime (xcframework), wiec bump nie dotyka STT.
+ONNXRUNTIME_REF="${ONNXRUNTIME_REF:-v1.26.0}"
 MODE="${ONNXRUNTIME_MODE:-dynamic}"
 prepare_layout "$PLATFORM"
 require_cmd git
@@ -67,6 +71,12 @@ esac
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
 cp -Rf "$UNPACK/include/"* "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
+# Usun stare wersje runtime'u zanim skopiujemy nowa — inaczej po bumpie wersji w
+# lib-dynamic leza dwa pliki (np. libonnxruntime.so.1.22.0 + .1.26.0), a ort
+# load-dynamic (probe w supertonic.rs) wybiera niedeterministycznie.
+rm -f "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/libonnxruntime*.so* \
+      "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/libonnxruntime*.dylib \
+      "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/onnxruntime.dll 2>/dev/null || true
 copy_matching "$UNPACK" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*.so*' -o -name 'libonnxruntime*.dylib' -o -name 'onnxruntime.dll'
 
 append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" "Domyślnie pobierany oficjalny runtime; ustaw ONNXRUNTIME_MODE=static aby budować ze źródeł."
