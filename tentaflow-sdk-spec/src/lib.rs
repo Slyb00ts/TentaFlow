@@ -41,6 +41,7 @@ pub use protocol::{
         RateLimitScope, RateLimitUpdate, RejectReason, Resume, ResumeMode, ResumeStatus,
         ServerLimits, SessionEnd, SessionEndCode,
     },
+    doc_parse::{DocBlock, DocParseInput, DocParseOutput},
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},

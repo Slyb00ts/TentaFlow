@@ -446,7 +446,12 @@ impl BlobStore for CompositeBlobStore {
     }
 
     async fn delete(&self, blob_ref: &BlobRef) -> Result<()> {
-        self.ephemeral.delete(blob_ref).await
+        // `put` zapisuje do `persistent`, więc kasowanie MUSI sięgnąć obu warstw —
+        // inaczej blob wrzucony tą drogą zostaje w trwałym store mimo `delete`
+        // (osierocony obraz strony przy parse-as-flow do grubego GC).
+        let ephemeral = self.ephemeral.delete(blob_ref).await;
+        let persistent = self.persistent.delete(blob_ref).await;
+        ephemeral.and(persistent)
     }
 
     async fn gc(&self, retention: Duration) -> Result<u64> {
@@ -647,6 +652,23 @@ mod tests {
         let removed2 = store.gc(Duration::from_secs(60 * 60)).await.unwrap();
         assert_eq!(removed2, 1);
         assert!(!bin.exists());
+    }
+
+    /// `CompositeBlobStore::put` ląduje w warstwie `persistent`, więc `delete`
+    /// MUSI z niej skasować — inaczej blob (np. obraz strony przy parse-as-flow)
+    /// zostaje osierocony do grubego GC. Test: put → delete → persistent pusty.
+    #[tokio::test]
+    async fn composite_delete_clears_persistent_layer() {
+        let ephemeral = Arc::new(InMemoryBlobStore::new());
+        let persistent = Arc::new(InMemoryBlobStore::new());
+        let store = CompositeBlobStore::new(ephemeral.clone(), persistent.clone());
+
+        let blob = store.put(b"page-image".to_vec(), "image/png").await.unwrap();
+        assert_eq!(persistent.len(), 1, "put zapisuje do persistent");
+
+        store.delete(&blob).await.unwrap();
+        assert_eq!(persistent.len(), 0, "delete kasuje z persistent");
+        assert!(store.get(&blob).await.is_err(), "blob nie do odczytania po delete");
     }
 
     // Minimal recursive iterator to avoid pulling walkdir as a dev-dep just for one test.

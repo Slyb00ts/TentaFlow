@@ -318,6 +318,14 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Document parse API (RAG E1.2) — parsuje OBRAZ strony dokumentu na
+    /// markdown + bloki layoutu przez serwis vision-parse (alias `rag-parse`).
+    /// Wymaga `document.parse`. Wire format: CBOR; obraz jako base64.
+    fn doc_parse_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Graph API (RAG 0.2) — per-addon per-collection embedded CozoDB graphs.
     /// Requires `graph.read` (neighbors/pagerank/ppr) / `graph.write`
     /// (upsert/delete). Wire format is CBOR. The addon only gets host-shaped,
@@ -3281,6 +3289,31 @@ pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
     let bytes = call_sql_with_one_input(vector_delete_v1, &payload)?;
     let resp: tentaflow_sdk_spec::VectorDeleteOutput = decode_cbor(&bytes)?;
     Ok(resp.removed)
+}
+
+// =============================================================================
+// Document parse API wrapper (RAG E1.2)
+// =============================================================================
+
+pub use tentaflow_sdk_spec::{DocBlock, DocParseOutput};
+
+/// Parsuje OBRAZ strony dokumentu (`image` — surowe bajty PNG/JPEG, `mime` —
+/// ich typ) na markdown + bloki layoutu przez serwis vision-parse. `model_alias`
+/// = `None` → domyślny alias `rag-parse` (alias-aware failover jak reranker).
+/// Wymaga `document.parse`. Zwraca pełny markdown strony, bloki ([`DocBlock`])
+/// i `page_count` (zawsze 1 dla pojedynczego obrazu).
+pub fn doc_parse(
+    image: &[u8],
+    mime: &str,
+    model_alias: Option<&str>,
+) -> Result<DocParseOutput, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::DocParseInput {
+        image_b64: base64::engine::general_purpose::STANDARD.encode(image),
+        mime: mime.to_string(),
+        model_alias: model_alias.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(doc_parse_v1, &payload)?;
+    decode_cbor(&bytes)
 }
 
 // =============================================================================

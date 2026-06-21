@@ -63,6 +63,9 @@ pub struct BackendClient {
     /// Pre-built URL dla /rerank (cross-encoder reranking)
     rerank_url: String,
 
+    /// Pre-built URL dla /parse (RAG E1.2 — vision document parse, multipart image)
+    parse_url: String,
+
     /// Typed request-time parameters z `services.config_json` propagowane
     /// przez `LiveHandlesCache`. Backend materializuje je przy kazdym
     /// requestcie:
@@ -80,6 +83,27 @@ pub struct BackendClient {
     /// populated when `request_format == "codex"`; holds the refreshed
     /// access/refresh tokens parsed from the pasted `~/.codex/auth.json`.
     codex_creds: super::codex::CodexCredsCache,
+}
+
+/// Waliduje kształt odpowiedzi serwisu document-parse. `Ok(())` gdy odpowiedź
+/// jest poprawna (ma `markdown` jako string LUB `blocks` jako array i nie niesie
+/// pola `error`). `Err(detail)` gdy odpowiedź jest popsuta — wtedy caller MUSI
+/// zwrócić błąd zamiast cichego pustego sukcesu, żeby failover schodził dalej.
+/// "Walidny pusty wynik" (`{"markdown":"","blocks":[]}`) przechodzi jako Ok.
+fn validate_document_parse_shape(body: &serde_json::Value) -> std::result::Result<(), String> {
+    if body.get("error").is_some() {
+        return Err(body
+            .get("error")
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "error field present".to_string()));
+    }
+    let has_markdown = body.get("markdown").map(|v| v.is_string()).unwrap_or(false);
+    let has_blocks = body.get("blocks").map(|v| v.is_array()).unwrap_or(false);
+    if has_markdown || has_blocks {
+        Ok(())
+    } else {
+        Err("missing markdown(string)/blocks(array)".to_string())
+    }
 }
 
 impl BackendClient {
@@ -186,6 +210,7 @@ impl BackendClient {
         let audio_transcriptions_url = format!("{}/audio/transcriptions", base);
         let audio_speech_url = format!("{}/audio/speech", base);
         let rerank_url = format!("{}/rerank", base);
+        let parse_url = format!("{}/parse", base);
 
         debug!(
             "Backend client utworzony dla: {} (timeout: {}ms, circuit breaker: enabled)",
@@ -206,6 +231,7 @@ impl BackendClient {
             audio_transcriptions_url,
             audio_speech_url,
             rerank_url,
+            parse_url,
             request_overrides,
             codex_creds: tokio::sync::RwLock::new(None),
         })
@@ -812,6 +838,107 @@ impl BackendClient {
         Ok(rerank_response)
     }
 
+    /// RAG E1.2 — wysyla obraz strony dokumentu do serwisu vision-parse.
+    ///
+    /// POST multipart/form-data (pole `image`) do `/parse` (np. nemotron-parse).
+    /// Serwis zwraca `{markdown, blocks:[{class, bbox:[x1,y1,x2,y2], text}]}`,
+    /// które mapujemy na `DocumentParseResponse`. Reużywa circuit-breakera jak
+    /// `rerank_request` — 5xx i błąd transportu otwierają obwód, 4xx nie.
+    pub async fn parse_document(
+        &self,
+        model: &str,
+        image_bytes: &[u8],
+        mime: &str,
+    ) -> Result<crate::services::runtime::executor::DocumentParseResponse> {
+        self.check_circuit_breaker()?;
+
+        let url = &self.parse_url;
+        debug!(
+            "Wysylanie document parse request do: {} (model: {}, rozmiar: {} bajtow, mime: {})",
+            url,
+            model,
+            image_bytes.len(),
+            mime
+        );
+
+        let file_part = reqwest::multipart::Part::bytes(image_bytes.to_vec())
+            .file_name("page")
+            .mime_str(mime)
+            .map_err(|e| CoreError::InternalError {
+                message: "Nie mozna utworzyc image part".to_string(),
+                source: Some(e.into()),
+            })?;
+        let form = reqwest::multipart::Form::new().part("image", file_part);
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header_value.as_str())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
+                let error = self.map_reqwest_error(e);
+                self.circuit_breaker.record_failure();
+                error
+            })?;
+
+        let status = response.status();
+        debug!("Document parse response status: {}", status);
+
+        if !status.is_success() {
+            if status.is_server_error() {
+                self.circuit_breaker.record_failure();
+            }
+            let error_body = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Document parse API error ({}): {}", status, error_body),
+                source: None,
+            }
+            .into());
+        }
+
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Nie mozna sparsowac document parse response: {}", e),
+                source: Some(e.into()),
+            })?;
+
+        // Walidacja kształtu PRZED oznaczeniem sukcesu w circuit-breakerze.
+        // Backend zwracający `200 {"error":"..."}` albo odpowiedź bez pola
+        // `markdown` i bez `blocks` to NIE jest pusty wynik — to popsuta
+        // odpowiedź. Cichy "pusty sukces" zatrzymałby failover, więc taką
+        // odpowiedź zgłaszamy jako Err (pętla schodzi na kolejnego kandydata).
+        if let Err(detail) = validate_document_parse_shape(&body) {
+            return Err(CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Document parse response invalid shape: {}", detail),
+                source: None,
+            }
+            .into());
+        }
+
+        // Kształt poprawny — dopiero teraz sukces circuit-breakera.
+        self.circuit_breaker.record_success();
+
+        let markdown = body
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let blocks =
+            crate::services::runtime::executor::parse_blocks_json(body.get("blocks"));
+        Ok(crate::services::runtime::executor::DocumentParseResponse {
+            markdown,
+            blocks,
+            usage: None,
+        })
+    }
+
     /// Wysyla audio transcription request do backendu (Whisper).
     ///
     /// Tworzy multipart/form-data request z plikiem audio i parametrami,
@@ -1373,5 +1500,40 @@ impl BackendClient {
 
         debug!("OpenAI response utworzony");
         Ok(completion)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_document_parse_shape;
+    use serde_json::json;
+
+    /// Backend zwracający `200 {"error":"..."}` to popsuta odpowiedź → Err,
+    /// żeby failover zszedł na kolejnego kandydata (nie cichy pusty sukces).
+    #[test]
+    fn error_field_is_invalid_shape() {
+        let body = json!({ "error": "model overloaded" });
+        assert!(validate_document_parse_shape(&body).is_err());
+    }
+
+    /// Odpowiedź bez `markdown` (string) i bez `blocks` (array) → Err.
+    #[test]
+    fn missing_markdown_and_blocks_is_invalid_shape() {
+        assert!(validate_document_parse_shape(&json!({ "status": "ok" })).is_err());
+        // `markdown` złego typu nie liczy się jako obecny.
+        assert!(validate_document_parse_shape(&json!({ "markdown": 123 })).is_err());
+        // `blocks` złego typu nie liczy się jako obecny.
+        assert!(validate_document_parse_shape(&json!({ "blocks": "x" })).is_err());
+    }
+
+    /// Jawnie pusty, ale poprawny wynik (`{"markdown":"","blocks":[]}`) to Ok —
+    /// odróżniamy go od popsutej odpowiedzi.
+    #[test]
+    fn explicit_empty_result_is_valid_shape() {
+        assert!(validate_document_parse_shape(&json!({ "markdown": "", "blocks": [] })).is_ok());
+        // Samo `markdown` (string) wystarcza.
+        assert!(validate_document_parse_shape(&json!({ "markdown": "# Faktura" })).is_ok());
+        // Samo `blocks` (array) wystarcza.
+        assert!(validate_document_parse_shape(&json!({ "blocks": [] })).is_ok());
     }
 }

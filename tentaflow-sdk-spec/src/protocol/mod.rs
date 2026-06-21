@@ -13,6 +13,7 @@ pub mod camera;
 pub mod camera_metadata;
 pub mod canonical;
 pub mod control;
+pub mod doc_parse;
 pub mod envelope;
 pub mod flow;
 pub mod frame;
