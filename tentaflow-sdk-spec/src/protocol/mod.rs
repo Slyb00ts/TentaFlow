@@ -22,6 +22,7 @@ pub mod ids;
 pub mod lidar;
 pub mod recording;
 pub mod robot;
+pub mod robot_joints;
 pub mod services;
 pub mod state;
 pub mod stream;
