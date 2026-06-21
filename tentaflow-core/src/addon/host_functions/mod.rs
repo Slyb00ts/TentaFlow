@@ -16,6 +16,8 @@ pub mod config;
 pub mod events;
 pub mod flow;
 pub mod gate;
+#[cfg(feature = "graph")]
+pub mod graph;
 pub mod http;
 pub mod image;
 pub mod llm;
@@ -330,6 +332,29 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "vector_delete_v1", vector::vector_delete_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja vector_delete_v1: {e}"))?;
+    }
+
+    // --- Graph API (RAG 0.2 — embedded CozoDB per-addon per-collection graphs) ---
+    #[cfg(feature = "graph")]
+    {
+        linker
+            .func_wrap("tentaflow", "graph_upsert_node_v1", graph::graph_upsert_node_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_upsert_node_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "graph_upsert_edge_v1", graph::graph_upsert_edge_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_upsert_edge_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "graph_neighbors_v1", graph::graph_neighbors_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_neighbors_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "graph_pagerank_v1", graph::graph_pagerank_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_pagerank_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "graph_ppr_v1", graph::graph_ppr_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_ppr_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "graph_delete_v1", graph::graph_delete_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja graph_delete_v1: {e}"))?;
     }
 
     // --- Alias API (F1a M1.W5 — readonly: alias_get / alias_list_owned) ---

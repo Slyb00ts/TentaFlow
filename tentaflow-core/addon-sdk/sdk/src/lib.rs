@@ -318,6 +318,35 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Graph API (RAG 0.2) — per-addon per-collection embedded CozoDB graphs.
+    /// Requires `graph.read` (neighbors/pagerank/ppr) / `graph.write`
+    /// (upsert/delete). Wire format is CBOR. The addon only gets host-shaped,
+    /// capped primitives — there is no raw Datalog surface.
+    fn graph_upsert_node_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn graph_upsert_edge_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn graph_neighbors_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn graph_pagerank_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn graph_ppr_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn graph_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Web research API — search, read public URLs and read search results.
     /// Wire format is JSON so addons can pass provider-specific options
     /// without recompiling the ABI.
@@ -2013,6 +2042,10 @@ pub mod prelude {
         vector_upsert, vector_upsert_sparse, vector_search, vector_hybrid_search, vector_delete,
         encode_vector_b64, VectorHit,
         VectorField, VectorFieldType, VectorFieldValue, VectorFilter, VectorFusion, SparseVector,
+        graph_upsert_node, graph_upsert_edge, graph_neighbors, graph_pagerank,
+        graph_ppr, graph_delete_node, graph_delete_edge, graph_tombstone_node,
+        GraphNode, GraphProp, GraphSeed, GraphNeighbor, GraphRankedNode,
+        GraphDirection, Provenance,
         web_research, web_search, web_read_url, web_read_search_results,
         WebSearchRequest, WebReadUrlRequest, WebReadSearchResultsRequest,
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
@@ -3247,6 +3280,154 @@ pub fn vector_delete(namespace: &str, ref_id: u64) -> Result<bool, AbiError> {
     })?;
     let bytes = call_sql_with_one_input(vector_delete_v1, &payload)?;
     let resp: tentaflow_sdk_spec::VectorDeleteOutput = decode_cbor(&bytes)?;
+    Ok(resp.removed)
+}
+
+// =============================================================================
+// Graph API wrappers (RAG 0.2) — embedded CozoDB per-addon per-collection graphs
+// =============================================================================
+
+pub use tentaflow_sdk_spec::protocol::graph::GraphNode;
+pub use tentaflow_sdk_spec::{
+    GraphDirection, GraphNeighbor, GraphProp, GraphRankedNode, GraphSeed, Provenance,
+};
+
+/// Insert or replace a node in `collection`. Returns the post-upsert node count.
+/// Requires `graph.write`; the collection must be declared under
+/// `[[graph_collection]]` in the addon manifest.
+pub fn graph_upsert_node(collection: &str, node: GraphNode) -> Result<u64, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphUpsertNodeInput {
+        collection: collection.to_string(),
+        node,
+    })?;
+    let bytes = call_sql_with_one_input(graph_upsert_node_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphUpsertNodeOutput = decode_cbor(&bytes)?;
+    Ok(resp.count)
+}
+
+/// Insert or replace a directed edge `src -[rel]-> dst`. `weight = None` → 1.0.
+/// Returns the post-upsert edge count. Requires `graph.write`.
+pub fn graph_upsert_edge(
+    collection: &str,
+    src: &str,
+    rel: &str,
+    dst: &str,
+    weight: Option<f64>,
+    props: Vec<GraphProp>,
+    provenance: Option<Provenance>,
+) -> Result<u64, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphUpsertEdgeInput {
+        collection: collection.to_string(),
+        src: src.to_string(),
+        rel: rel.to_string(),
+        dst: dst.to_string(),
+        weight,
+        props,
+        provenance,
+    })?;
+    let bytes = call_sql_with_one_input(graph_upsert_edge_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphUpsertEdgeOutput = decode_cbor(&bytes)?;
+    Ok(resp.count)
+}
+
+/// Adjacency of `node` in `direction`, optionally filtered by `rel`, capped at
+/// `limit`. Requires `graph.read`.
+pub fn graph_neighbors(
+    collection: &str,
+    node: &str,
+    direction: GraphDirection,
+    rel: Option<&str>,
+    limit: u32,
+) -> Result<Vec<GraphNeighbor>, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphNeighborsInput {
+        collection: collection.to_string(),
+        node: node.to_string(),
+        direction,
+        rel: rel.map(str::to_string),
+        limit,
+    })?;
+    let bytes = call_sql_with_one_input(graph_neighbors_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphNeighborsOutput = decode_cbor(&bytes)?;
+    Ok(resp.neighbors)
+}
+
+/// Built-in Cozo PageRank, top-N nodes (highest first). Requires `graph.read`.
+pub fn graph_pagerank(
+    collection: &str,
+    top_n: u32,
+    damping: Option<f64>,
+    iterations: Option<u32>,
+) -> Result<Vec<GraphRankedNode>, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphPagerankInput {
+        collection: collection.to_string(),
+        top_n,
+        damping,
+        iterations,
+    })?;
+    let bytes = call_sql_with_one_input(graph_pagerank_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphPagerankOutput = decode_cbor(&bytes)?;
+    Ok(resp.ranked)
+}
+
+/// Personalized PageRank with `seeds` as the personalization vector, top-N nodes.
+/// Requires `graph.read`.
+pub fn graph_ppr(
+    collection: &str,
+    seeds: Vec<GraphSeed>,
+    top_n: u32,
+    damping: Option<f64>,
+    iterations: Option<u32>,
+) -> Result<Vec<GraphRankedNode>, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphPprInput {
+        collection: collection.to_string(),
+        seeds,
+        top_n,
+        damping,
+        iterations,
+    })?;
+    let bytes = call_sql_with_one_input(graph_ppr_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphPprOutput = decode_cbor(&bytes)?;
+    Ok(resp.ranked)
+}
+
+/// Delete a node (and its edges). Returns `true` if it existed. `graph.write`.
+pub fn graph_delete_node(collection: &str, id: &str) -> Result<bool, AbiError> {
+    graph_delete(collection, tentaflow_sdk_spec::GraphDeleteTarget::Node(id.to_string()))
+}
+
+/// Delete a single edge `(src, rel, dst)`. Returns `true` if it existed.
+pub fn graph_delete_edge(
+    collection: &str,
+    src: &str,
+    rel: &str,
+    dst: &str,
+) -> Result<bool, AbiError> {
+    graph_delete(
+        collection,
+        tentaflow_sdk_spec::GraphDeleteTarget::Edge(
+            src.to_string(),
+            rel.to_string(),
+            dst.to_string(),
+        ),
+    )
+}
+
+/// Soft-delete (tombstone) a node — keeps it for provenance chains but hides it
+/// from retrieval. Returns `true` if it existed. `graph.write`.
+pub fn graph_tombstone_node(collection: &str, id: &str) -> Result<bool, AbiError> {
+    graph_delete(collection, tentaflow_sdk_spec::GraphDeleteTarget::Tombstone(id.to_string()))
+}
+
+fn graph_delete(
+    collection: &str,
+    target: tentaflow_sdk_spec::GraphDeleteTarget,
+) -> Result<bool, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::GraphDeleteInput {
+        collection: collection.to_string(),
+        target,
+    })?;
+    let bytes = call_sql_with_one_input(graph_delete_v1, &payload)?;
+    let resp: tentaflow_sdk_spec::GraphDeleteOutput = decode_cbor(&bytes)?;
     Ok(resp.removed)
 }
 

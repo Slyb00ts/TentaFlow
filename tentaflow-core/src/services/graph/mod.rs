@@ -12,7 +12,7 @@ pub mod csr;
 pub mod error;
 pub mod ppr;
 
-pub use backend::{CozoBackend, GraphBackend, GraphEngine};
+pub use backend::{CozoBackend, GraphBackend, GraphEngine, NeighborDir, TOMBSTONE_LABEL};
 pub use collection::{
     GraphManager, MAX_COLLECTIONS_PER_ADDON, MAX_EDGES_PER_ADDON, MAX_NODES_PER_ADDON,
 };

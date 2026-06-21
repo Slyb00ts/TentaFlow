@@ -203,6 +203,23 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
     // Czysci tylko katalog instancji (orgs/<org>/addons/<addon_id>/), nigdy
     // wspoldzielonego store'u pakietow.
     crate::addon::storage_sql::close_addon_db(org_id, addon_id);
+    // B2 (RAG): jawny cleanup grafu PRZED `remove_dir_all(addon_data_dir)` —
+    // zamyka backendy sled, kasuje wiersze `addon_graph_collections` i pliki
+    // `.cozo` tej instancji, kluczowane `(org_id, addon_id)`. Inwariant izolacji:
+    // kasuje WYŁĄCZNIE graf tej instancji, nie rusza grafu innej instancji tego
+    // samego pakietu (osobny `instance_id` → osobny `addon_id` w kluczu).
+    // Korekta B1+B2 (MED #5): błąd cleanupu grafu NIE może być połknięty. Cozo
+    // zamyka uchwyty sled (`seal_key_for_delete` → slot `Removed`) i kasuje wiersze
+    // `addon_graph_collections` + pliki `.cozo` PRZED `remove_dir_all`. Gdy to się
+    // nie uda, PRZERYWAMY uninstall (instancja zostaje w DB → retry możliwy)
+    // zamiast usuwać katalog z na wpół-skasowanym grafem i zostawiać dane-widmo.
+    #[cfg(feature = "graph")]
+    {
+        let mgr = crate::services::graph_manager(db);
+        mgr.delete_all_for_addon(org_id, addon_id).map_err(|e| {
+            anyhow::anyhow!("uninstall_instance: graph cleanup dla '{addon_id}' nieudany: {e}")
+        })?;
+    }
     if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| {
@@ -801,6 +818,11 @@ pub(crate) fn materialize_addon_derived_state(
         registry.register(&manifest.addon_id, flow);
     }
     materialize_addon_skill(db, manifest, package_dir);
+    // B2 (RAG): unieważnij cache otwartych backendów grafowych tego addona po
+    // re-materializacji (upgrade) — następny `graph_*` odbuduje backend ze
+    // świeżego wpisu. NIE kasuje danych na dysku, tylko uchwyty (DashMap).
+    #[cfg(feature = "graph")]
+    crate::services::graph_manager(db).invalidate_addon(&manifest.addon_id);
     Ok(())
 }
 
@@ -1371,6 +1393,23 @@ pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) 
 /// 2. Usun z tabel powiazanych (addon_permissions, addon_secrets, addon_resource_limits, addon_config)
 /// 3. Usun z addons
 pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
+    // B2 (RAG): graf kasujemy PRZED wzięciem write-locka na `db` i otwarciem
+    // transakcji DB. `delete_all_for_addon` używa tej samej `DbPool` (read+write
+    // lock), więc trzymanie tu `db.write()` zakleszczyłoby się na własnym RwLocku.
+    // Cleanup robi close-handle → pliki → wiersz (files-before-row, jak
+    // `seal_key_for_delete`), więc wiersze `addon_graph_collections` znikają tą
+    // ścieżką, NIE generycznym DELETE w transakcji poniżej — inaczej zostałyby
+    // osierocone pliki `.cozo` bez wierszy rejestru. Błąd propagujemy (nie
+    // połykamy), spójnie z `uninstall_instance`.
+    #[cfg(feature = "graph")]
+    {
+        let org_id = crate::services::org::DEFAULT_ORG_ID;
+        let mgr = crate::services::graph_manager(db);
+        mgr.delete_all_for_addon(org_id, addon_id).map_err(|e| {
+            anyhow::anyhow!("uninstall: graph cleanup dla '{addon_id}' nieudany: {e}")
+        })?;
+    }
+
     let conn = db.write().unwrap();
 
     // Sprawdz czy addon istnieje
@@ -2358,6 +2397,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let aliases = parse_aliases(top.get("alias"))?;
     let gates = parse_gates(top.get("gate"))?;
     let vector_namespaces = parse_vector_namespaces(top.get("vector_namespace"))?;
+    let graph_collections = parse_graph_collections(top.get("graph_collection"))?;
     let flow_templates = parse_flow_templates(top.get("flow_template"))?;
     let ui_components = parse_ui_components(top.get("ui_component"))?;
     let gpu = parse_gpu_section(top.get("gpu"));
@@ -2379,6 +2419,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         &uses_models,
         publisher.as_ref(),
     )?;
+    crate::addon::manifest::validate_graph_collections(&graph_collections)?;
 
     let resources = top.get("resources").map(|res| ResourceRequirements {
         storage_total_mb: res
@@ -2441,6 +2482,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         aliases,
         gates,
         vector_namespaces,
+        graph_collections,
         flow_templates,
         ui_components,
         gpu,
@@ -2942,6 +2984,35 @@ fn parse_vector_namespaces(
             gate,
             fields,
             sparse,
+        });
+    }
+    Ok(out)
+}
+
+/// Parsuje sekcje `[[graph_collection]]` (RAG 0.2). Brak sekcji = pusta lista.
+fn parse_graph_collections(
+    val: Option<&toml::Value>,
+) -> Result<Vec<crate::addon::manifest::GraphCollectionSpec>> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[graph_collection]][{idx}] missing 'name'"))?
+            .to_string();
+        let data_class = item
+            .get("data_class")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[graph_collection]][{idx}] missing 'data_class'"))?
+            .to_string();
+        let gate = item.get("gate").and_then(|v| v.as_str()).map(String::from);
+        out.push(crate::addon::manifest::GraphCollectionSpec {
+            name,
+            data_class,
+            gate,
         });
     }
     Ok(out)

@@ -17,6 +17,7 @@ pub mod envelope;
 pub mod flow;
 pub mod frame;
 pub mod gate;
+pub mod graph;
 pub mod ids;
 pub mod recording;
 pub mod robot;

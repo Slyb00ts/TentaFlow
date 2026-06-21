@@ -18,6 +18,10 @@ pub enum PayloadKind {
     SqlCombined,
     /// vector_upsert per item (max 1 MB).
     VectorItem,
+    /// graph_* per item (max 256 KB). Ceiling pod jeden węzeł/krawędź/wynik
+    /// zapytania; SDK robi retry na `OutputBufferTooSmall` przy większych
+    /// odpowiedziach (np. szeroki PageRank/neighbors).
+    GraphItem,
     /// ui_render — drzewo komponentow (max 2 MB).
     UiRender,
     /// secret_set / secret_get — wartosc (max 64 KB).
@@ -31,6 +35,7 @@ impl PayloadKind {
             Self::ServiceCall => 8 * 1024 * 1024,
             Self::SqlCombined => 4 * 1024 * 1024,
             Self::VectorItem => 1024 * 1024,
+            Self::GraphItem => 256 * 1024,
             Self::UiRender => 2 * 1024 * 1024,
             Self::Secret => 64 * 1024,
         }

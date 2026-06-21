@@ -208,6 +208,18 @@ impl GraphManager {
         }
     }
 
+    /// Deterministyczna ścieżka pliku kolekcji (`<root>/.../<collection>.cozo`).
+    /// Udostępniona publicznie pod testy uninstall (sprawdzenie, że plik znika po
+    /// sukcesie / zostaje przy błędzie kasowania). Nie otwiera bazy.
+    pub fn collection_file_path(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+    ) -> Result<PathBuf> {
+        self.file_path_for(org_id, addon_id, collection)
+    }
+
     /// Eviction: dopóki w mapie jest więcej wpisów niż `MAX_OPEN_GRAPHS`, zamyka
     /// najdawniej używany (najmniejszy `last_used`). Zamknięcie jest REALNE i
     /// TERMINALNE dla wpisu (bug G): pod write-lockiem slotu ustawiamy `Removed`
@@ -661,23 +673,118 @@ impl GraphManager {
         self.with_read(org_id, addon_id, collection, |b| b.edge_count())
     }
 
-    /// Read-only zapytanie Datalog (addon-niezaufane wejście — `Immutable`).
-    /// Sandbox/whitelista to warstwa host-fn (slice B1); tu egzekwujemy tylko
-    /// niemutowalność na poziomie silnika. Read-lock — wiele zapytań równolegle.
-    pub fn query(
-        &self,
-        org_id: &str,
-        addon_id: &str,
-        collection: &str,
-        script: &str,
-    ) -> Result<cozo::NamedRows> {
-        self.with_read(org_id, addon_id, collection, |b| b.run_query(script))
-    }
-
     /// Eksport CSR kolekcji (pod PPR w Rust). Otwiera kolekcję jeśli trzeba.
     /// Read-lock obejmuje cały eksport, więc CSR jest spójnym snapshotem.
     pub fn export_csr(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<Csr> {
         self.with_read(org_id, addon_id, collection, |b| b.export_edges())
+    }
+
+    /// Sąsiedzi węzła (out/in/both, opcjonalny filtr relacji, limit). Read-lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn neighbors(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        node: &str,
+        direction: super::backend::NeighborDir,
+        rel: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<(String, String, f64)>> {
+        self.with_read(org_id, addon_id, collection, |b| {
+            b.neighbors(node, direction, rel, limit)
+        })
+    }
+
+    /// Wbudowany PageRank Cozo (`graph-algo`), top-N malejąco. Read-lock.
+    pub fn pagerank(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        top_n: u32,
+        damping: f64,
+        iterations: u32,
+    ) -> Result<Vec<(String, f64)>> {
+        self.with_read(org_id, addon_id, collection, |b| {
+            b.pagerank(top_n, damping, iterations)
+        })
+    }
+
+    /// Personalized PageRank liczony w Rust nad CSR z Cozo (`ppr.rs`). Seedy to
+    /// id węzłów stanowiących wektor personalizacji; nieznane id są pomijane.
+    /// Zwraca top-N `(id, score)` malejąco. Read-lock obejmuje eksport CSR, więc
+    /// PPR liczy się nad spójnym snapshotem grafu.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ppr(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        seeds: &[String],
+        top_n: u32,
+        damping: f64,
+        iterations: u32,
+    ) -> Result<Vec<(String, f64)>> {
+        let csr = self.export_csr(org_id, addon_id, collection)?;
+        let index = csr.id_index();
+        let seed_indices: Vec<usize> =
+            seeds.iter().filter_map(|s| index.get(s.as_str()).copied()).collect();
+        let mut scored =
+            super::ppr::personalized_pagerank(&csr, &seed_indices, damping, iterations as usize);
+        scored.truncate(top_n as usize);
+        Ok(scored)
+    }
+
+    /// Soft-delete (tombstone) węzła `id` + wykluczenie jego krawędzi z retrievalu.
+    /// Wiersz węzła ZOSTAJE (O(1) `:put` markera), więc liczba węzłów i ledger
+    /// quoty się NIE zmieniają — fizyczny purge to późniejsza kompakcja. Krawędzie
+    /// incydentne są pomijane przez retrieval (join z nie-tombstone węzłami), nie
+    /// kasowane fizycznie. Write-lock. Zwraca `(removed, node_count, edge_count)`.
+    pub fn delete_node_in(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<(bool, u64, u64)> {
+        self.with_write(org_id, addon_id, collection, |backend| {
+            let removed = backend.delete_node(id)?;
+            let nodes = backend.node_count()?;
+            let edges = backend.edge_count()?;
+            Ok((removed, nodes, edges))
+        })
+    }
+
+    /// Soft-delete pojedynczej krawędzi `(src, rel, dst)` (`alive=false`, O(1)).
+    /// Wiersz zostaje (ledger quoty bez zmian); retrieval pomija. Write-lock.
+    pub fn delete_edge_in(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        src: &str,
+        rel: &str,
+        dst: &str,
+    ) -> Result<(bool, u64, u64)> {
+        self.with_write(org_id, addon_id, collection, |backend| {
+            let removed = backend.delete_edge(src, rel, dst)?;
+            let nodes = backend.node_count()?;
+            let edges = backend.edge_count()?;
+            Ok((removed, nodes, edges))
+        })
+    }
+
+    /// Alias soft-delete węzła dla wariantu `GraphDeleteTarget::Tombstone` — ta
+    /// sama semantyka co `delete_node_in` (delete węzła w Etapie 0 = tombstone).
+    pub fn tombstone_node_in(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        id: &str,
+    ) -> Result<(bool, u64, u64)> {
+        self.delete_node_in(org_id, addon_id, collection, id)
     }
 
     /// Upsert węzła z egzekwowaniem GLOBALNEJ quoty węzłów na (org, addon),
@@ -986,13 +1093,17 @@ impl GraphManager {
     /// Kasuje jedną kolekcję. Protokół (bug H — serializacja per-klucz nawet przy
     /// cache-miss): WSZYSTKO dzieje się pod write-lockiem slotu KANONICZNEGO wpisu
     /// (interujemy go, jeśli go nie ma — patrz `seal_key_for_delete`). Pod tym
-    /// lockiem kolejno: `DELETE FROM addon_graph_collections` (wiersz znika, więc
-    /// równoległy `get_or_create` po wejściu nie znajdzie go i utworzy ŚWIEŻĄ,
-    /// pustą kolekcję, nie wskrzesi starych plików), potem zamknięcie backendu +
-    /// skasowanie plików (slot → `Removed`), na końcu usunięcie wpisu z mapy.
-    /// Kasowanie wiersza i plików jest atomowe względem każdej innej operacji na
-    /// tym kluczu, więc kasowanie pliku nigdy nie biegnie równolegle z
-    /// `sled::open` (brak korupcji). Idempotentne (brak wiersza / pliku => OK).
+    /// lockiem kolejno (files-before-row): zamknięcie backendu i oznaczenie slotu
+    /// `Removed`, potem skasowanie PLIKÓW `.cozo`, dopiero na końcu `DELETE FROM
+    /// addon_graph_collections` i zdjęcie wpisu z mapy. Wiersz znika DOPIERO po
+    /// udanym usunięciu plików, więc błąd I/O przerywa przed `DELETE` (wiersz +
+    /// pliki zostają, retry możliwy) i NIGDY nie powstają osierocone pliki bez
+    /// wiersza. Slot `Removed` pod lockiem sprawia, że równoległy `get_or_create`
+    /// po sukcesie (brak wiersza) tworzy ŚWIEŻĄ pustą kolekcję zamiast wskrzeszać
+    /// stare pliki, a po porażce reotwiera tę samą bazę z zachowanych plików.
+    /// Kasowanie pliku jest atomowe względem każdej innej operacji na tym kluczu,
+    /// więc nigdy nie biegnie równolegle z `sled::open` (brak korupcji).
+    /// Idempotentne (brak wiersza / pliku => OK).
     pub fn delete_collection(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<()> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
@@ -1028,11 +1139,16 @@ impl GraphManager {
     /// Pełny protokół kasowania pod write-lockiem slotu kanonicznego wpisu (bug H).
     /// Ścieżka pliku jest DETERMINISTYCZNA z `GraphKey` (`file_path_for`), więc
     /// liczymy ją z klucza niezależnie od tego, czy wiersz DB istnieje — wiersz DB
-    /// służy tylko do metadanych (engine), NIGDY do lokalizacji pliku (bug 2: pusty
-    /// `PathBuf::default()` przy cache-miss otwierał/operował na pustej ścieżce).
-    /// Interuje kanoniczny wpis, bierze jego write-lock i pod nim: kasuje wiersz DB
-    /// → zamyka backend + pliki → `Removed` → zdejmuje wpis z mapy. Zwraca
-    /// ewentualny błąd I/O usuwania.
+    /// służy tylko do metadanych (engine), NIGDY do lokalizacji pliku.
+    ///
+    /// KOLEJNOŚĆ (spójność przy awarii): close-handle → skasuj PLIKI → dopiero
+    /// potem skasuj WIERSZ rejestru → zdejmij wpis z mapy. Wiersz znika DOPIERO po
+    /// udanym usunięciu plików, więc błąd I/O kasowania PRZERYWA przed `DELETE` —
+    /// wiersz zostaje, operacja jest retry-able i NIGDY nie powstają osierocone
+    /// pliki bez wiersza (orphan-files). Slot ustawiamy na `Removed` pod lockiem,
+    /// więc równoległy `get_or_create` czekający na ten lock re-fetchuje: po sukcesie
+    /// (brak wiersza) tworzy świeżą pustą kolekcję, po porażce (wiersz + pliki nadal
+    /// są) reotwiera tę samą bazę — stan retry pozostaje spójny.
     fn seal_key_for_delete(&self, key: &GraphKey) -> Result<()> {
         // Ścieżka deterministyczna z klucza — ta sama, której użył writer przy
         // tworzeniu, więc współbieżny writer i delete operują na tym samym pliku
@@ -1064,9 +1180,23 @@ impl GraphManager {
             .write()
             .map_err(|_| GraphError::Backend("graph entry lock poisoned".into()))?;
 
-        // Kasuj wiersz DB POD slot-lockiem — równoległy `get_or_create`, który
-        // czeka na ten lock, po jego zwolnieniu zobaczy `Removed`, re-fetchnie i
-        // (brak wiersza) utworzy świeżą pustą kolekcję, nie wskrzesi starej.
+        // 1) Zamknij backend (dekrement licznika, gdy był otwarty) i oznacz slot
+        //    `Removed` — pod lockiem żaden inny wątek nie operuje na tej bazie.
+        if matches!(&*guard, BackendSlot::Open(_)) {
+            self.open_backends.fetch_sub(1, Ordering::AcqRel);
+        }
+        *guard = BackendSlot::Removed;
+
+        // 2) Skasuj PLIKI. Błąd → PRZERWIJ przed `DELETE` wiersza: wiersz zostaje,
+        //    pliki zostają, operacja jest retry-able, brak orphan-files bez wiersza.
+        if let Err(e) = remove_cozo_files(&path) {
+            // Wpis zostaje w mapie z `Removed`; następny dostęp re-fetchnie wiersz
+            // (nadal istnieje) i reotworzy bazę z tych samych plików.
+            drop(guard);
+            return Err(e);
+        }
+
+        // 3) Pliki skasowane → dopiero teraz skasuj WIERSZ rejestru.
         {
             let conn = self
                 .pool
@@ -1079,21 +1209,14 @@ impl GraphManager {
             )
             .map_err(|e| GraphError::Db(e.to_string()))?;
         }
-
-        // Zamknij backend (dekrement licznika, gdy był otwarty) i skasuj pliki.
-        if matches!(&*guard, BackendSlot::Open(_)) {
-            self.open_backends.fetch_sub(1, Ordering::AcqRel);
-        }
-        *guard = BackendSlot::Removed;
-        let file_err = remove_cozo_files(&path);
         drop(guard);
 
-        // Zdejmij kanoniczny wpis tylko jeśli to NADAL ten sam Arc (równoległy
-        // get_or_create mógł go już zastąpić świeżym po naszym `Removed`).
+        // 4) Zdejmij kanoniczny wpis tylko jeśli to NADAL ten sam Arc (równoległy
+        //    get_or_create mógł go już zastąpić świeżym po naszym `Removed`).
         self.collections
             .remove_if(key, |_, v| Arc::ptr_eq(v, &entry));
 
-        file_err
+        Ok(())
     }
 
     /// Kasuje WSZYSTKIE kolekcje grafowe addona W DANEJ ORGANIZACJI: kluczowane
@@ -1109,6 +1232,14 @@ impl GraphManager {
                 .pool
                 .read()
                 .map_err(|_| GraphError::Db("pool mutex poisoned".into()))?;
+            // Brak tabeli rejestru == addon nie ma żadnych kolekcji grafowych →
+            // nie ma czego sprzątać. Ten przypadek zachodzi na ścieżkach instalacji,
+            // które nigdy nie utworzyły schematu grafu (np. minimalne DB w testach
+            // jednostkowych). Tylko `no such table` traktujemy jako pustą listę;
+            // każdy inny błąd DB propagujemy (nie maskujemy korupcji).
+            if !table_exists(&conn, "addon_graph_collections")? {
+                return Ok(());
+            }
             let mut stmt = conn
                 .prepare(
                     "SELECT collection FROM addon_graph_collections \
@@ -1309,6 +1440,20 @@ fn map_vector_err(e: crate::services::vector::VectorError) -> GraphError {
         }
         other => GraphError::Backend(other.to_string()),
     }
+}
+
+/// Czy tabela istnieje w bieżącej bazie. Pozwala `delete_all_for_addon` tolerować
+/// brak rejestru grafu (DB instalacji, które nigdy nie utworzyły schematu grafu)
+/// bez maskowania innych błędów DB sztywnym dopasowaniem łańcucha błędu.
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            rusqlite::params![table],
+            |r| r.get(0),
+        )
+        .map_err(|e| GraphError::Db(e.to_string()))?;
+    Ok(count > 0)
 }
 
 /// Usuwa plik kolekcji Cozo wraz z plikami pomocniczymi SQLite (`-wal`/`-shm`).
