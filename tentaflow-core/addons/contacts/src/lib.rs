@@ -210,8 +210,10 @@ fn send_panel_shell() {
     let layout = Component {
         tag: 0x0103,
         id: "root".into(),
+        // Stack (0x0103) fields: 0=gap, 1=align, 2=children, 3=padding. Children
+        // belong at field 2; gap/align omitted -> default md/stretch.
         fields: FieldMap(vec![
-            (0, encode_children(&[nav_tabs, slot_ref])),
+            (2, encode_children(&[nav_tabs, slot_ref])),
         ]),
         handlers: None,
         bind: None,
@@ -401,7 +403,8 @@ fn stack_component(id: &str, children: &[Component]) -> Component {
     Component {
         tag: 0x0103,
         id: id.into(),
-        fields: FieldMap(vec![(0, encode_children(children))]),
+        // Stack (0x0103): children at field 2 (0=gap, 1=align, 3=padding).
+        fields: FieldMap(vec![(2, encode_children(children))]),
         handlers: None,
         bind: None,
         a11y: None,
