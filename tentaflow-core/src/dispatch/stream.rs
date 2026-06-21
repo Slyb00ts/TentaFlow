@@ -17,10 +17,11 @@ use tentaflow_protocol::{
     MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth, StreamClosedPayload,
     StreamFramePayload, StreamPayload, StreamSubscribeResponse,
 };
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use super::subscription::{
-    push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
+    push_chunk_async, push_chunk_lossy, push_end, push_end_async, LossyPush, StreamHandlerMeta,
+    Subscription,
 };
 use super::{HandlerContext, SessionAuthKind};
 use crate::services::stream_hub::{StreamHub, StreamHubError};
@@ -220,10 +221,40 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         // (and its inner SubscriptionHandle) lives on the stack so its
         // Drop runs on task exit, releasing the hub-side refcount.
         let mut receiver = handle.receiver;
+        // Live LiDAR is lossy latest-wins. A slow consumer must never (a) back up
+        // the queue — older point clouds are stale, forwarding them only inflates
+        // end-to-end latency frame-by-frame — nor (b) be force-disconnected on
+        // `Lagged`, which surfaced in the UI as the LiDAR toggle cycling off/on.
+        // So for `lidar:` we coalesce to the newest buffered frame and drop on
+        // backpressure. Camera fMP4 stays strictly lossless (MSE byte-stream
+        // continuity breaks if a media segment is skipped).
+        let lossy = stream_id.starts_with(LIDAR_PREFIX);
         let final_reason = loop {
             match receiver.recv().await {
-                Ok(chunk) => {
-                    if push_chunk_async(
+                Ok(mut chunk) => {
+                    if lossy {
+                        // Collapse any backlog to the most recent frame before send.
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(newer) => chunk = newer,
+                                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                                Err(TryRecvError::Lagged(_)) => continue,
+                            }
+                        }
+                        match push_chunk_lossy(
+                            &sub,
+                            MessageBody::StreamBody(StreamPayload::Frame(StreamFramePayload {
+                                stream_id: stream_id.clone(),
+                                is_init: false,
+                                data: chunk.to_vec(),
+                            })),
+                        ) {
+                            // Dropped == writer still draining the prior frame; a
+                            // newer frame will follow, so just keep the stream open.
+                            LossyPush::Sent | LossyPush::Dropped => {}
+                            LossyPush::Closed => return,
+                        }
+                    } else if push_chunk_async(
                         &sub,
                         MessageBody::StreamBody(StreamPayload::Frame(StreamFramePayload {
                             stream_id: stream_id.clone(),
@@ -240,7 +271,14 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
                         return;
                     }
                 }
-                Err(RecvError::Lagged(_)) => break "subscriber_lagged",
+                Err(RecvError::Lagged(_)) => {
+                    // Live lidar tolerates lag (skip to the newer frame on the next
+                    // recv); only a lossless stream treats lag as terminal.
+                    if lossy {
+                        continue;
+                    }
+                    break "subscriber_lagged";
+                }
                 Err(RecvError::Closed) => break "source_unregistered",
             }
         };
@@ -1010,6 +1048,7 @@ mod tests {
                 point_count: 1,
                 frame_seq: 1,
                 timestamp_us: 1,
+                host_send_us: 0,
                 resolution: 0.05,
                 origin: [0.0, 0.0, 0.0],
             };
