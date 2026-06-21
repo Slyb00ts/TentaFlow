@@ -101,15 +101,49 @@ impl LoopNodeAdapter {
         Self { runner }
     }
 
-    /// Reads the body flow id from node config. Required — a loop with no body
-    /// is a misconfiguration.
-    fn body_flow_id(node: &FlowNode) -> Result<String> {
-        node.config
+    /// Resolves the body flow id from node config. Two mutually exclusive forms:
+    ///   * `body_flow_id` — a static flow row id (authored loops, GUI builder).
+    ///   * `body_flow_engine_id` — an addon engine-flow LOCAL id (e.g.
+    ///     `retrieval_round`). The body flow gets a random UUID minted at
+    ///     install, so an addon's outer flow cannot hardcode it; instead it
+    ///     names the body by its local engine-flow id and the loop resolves
+    ///     `{ctx.addon_id}:{id}` → published name → flow row id at runtime,
+    ///     scoped to the running instance (RAG multi-hop E2.2).
+    /// Exactly one form is required; both present is a misconfiguration.
+    async fn resolve_body_flow_id(
+        runner: &SubflowRunner,
+        node: &FlowNode,
+        ctx: &ExecutionContext,
+    ) -> Result<String> {
+        let static_id = node
+            .config
             .get("body_flow_id")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("loop: missing config 'body_flow_id'"))
+            .filter(|s| !s.is_empty());
+        let engine_id = node
+            .config
+            .get("body_flow_engine_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        match (static_id, engine_id) {
+            (Some(_), Some(_)) => Err(anyhow!(
+                "loop: config has both 'body_flow_id' and 'body_flow_engine_id' (pick one)"
+            )),
+            (Some(id), None) => Ok(id.to_string()),
+            (None, Some(local)) => {
+                let addon = ctx.addon_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "loop: 'body_flow_engine_id' wymaga wywołania flow JAKO MODEL przez \
+                         addon (ctx.addon_id=None) — nie da się rozwiązać published-name"
+                    )
+                })?;
+                let published = format!("{addon}:{local}");
+                runner.resolve_published_flow_id(&published).await
+            }
+            (None, None) => Err(anyhow!(
+                "loop: missing config 'body_flow_id' or 'body_flow_engine_id'"
+            )),
+        }
     }
 
     /// The `until` CEL boolean. Empty / absent config uses `DEFAULT_UNTIL`.
@@ -303,13 +337,22 @@ impl LoopNodeAdapter {
 
     /// Runs the guards (depth + cycle) shared by `execute` and `produce_stream`,
     /// resolves the runner, and returns the resolved loop plan + seed envelope.
-    fn prepare(
+    async fn prepare(
         &self,
         node: &FlowNode,
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
     ) -> Result<(std::sync::Arc<SubflowRunner>, LoopPlan, FlowEnvelope)> {
-        let body_flow_id = Self::body_flow_id(node)?;
+        let runner = self
+            .runner
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow!("loop: SubflowRunner slot not wired"))?;
+
+        // Body flow id resolved here: static config id OR addon engine-flow
+        // local id resolved to its install-stable published name. The runner is
+        // resolved first so an unwired slot fails before any DB lookup.
+        let body_flow_id = Self::resolve_body_flow_id(&runner, node, ctx).await?;
 
         // Same recursion guards as `subflow` (§3.10).
         if ctx.subflow_depth >= MAX_SUBFLOW_DEPTH {
@@ -322,12 +365,6 @@ impl LoopNodeAdapter {
                 "loop: cycle detected — body flow '{body_flow_id}' already on the call path"
             ));
         }
-
-        let runner = self
-            .runner
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow!("loop: SubflowRunner slot not wired"))?;
 
         // The current envelope seeds iteration 0; each iteration's output feeds
         // the next. Built from the incoming input (falls back to the initial
@@ -460,7 +497,7 @@ impl NodeAdapter for LoopNodeAdapter {
         // shared with `produce_stream` (§3.5 block 1, §3.10). Sequential
         // repetition of the same body is legal — the visited set tracks nesting
         // depth of distinct flows, not repeat count.
-        let (runner, plan, seed) = self.prepare(node, inputs, ctx)?;
+        let (runner, plan, seed) = self.prepare(node, inputs, ctx).await?;
 
         let (mut current, mut iterations, exit_reason) =
             Self::run_budgeted_iterations(&runner, &plan, node, ctx, seed).await?;
@@ -597,7 +634,7 @@ impl StreamProducerAdapter for LoopNodeAdapter {
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
     ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
-        let (runner, plan, seed) = self.prepare(node, inputs, ctx)?;
+        let (runner, plan, seed) = self.prepare(node, inputs, ctx).await?;
 
         // Step 1: run intermediate tool-calling iterations blocking.
         let (mut current, iterations, exit_reason) =
@@ -822,6 +859,112 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(rows, 0, "light-mode loop spammed flow_executions");
+    }
+
+    /// Inserts a flow with a published_model_name so the loop's
+    /// `body_flow_engine_id` resolution path (published-name → flow id) can find
+    /// it. Mirrors how `register_engine_flow_atomic` publishes an addon body.
+    fn insert_published_flow(pool: &DbPool, id: &str, published: &str, flow_json: &str) {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO flows (id, name, service_type, flow_json, status, is_default, published_model_name) \
+             VALUES (?1, ?2, NULL, ?3, 'active', 0, ?4)",
+            rusqlite::params![id, "published-body", flow_json, published],
+        )
+        .expect("insert published flow");
+    }
+
+    /// RAG E2.2 — the loop resolves an addon body by its install-stable
+    /// published name (`{ctx.addon_id}:{body_flow_engine_id}`) instead of a
+    /// hardcoded UUID. Meta still accumulates across iterations (counter.iter
+    /// grows), proving the multi-hop accumulation contract on the resolved body.
+    #[tokio::test]
+    async fn body_flow_engine_id_resolves_published_name_and_meta_accumulates() {
+        let pool = db();
+        let body_id = "abcabcab-loop-0000-0000-000000000001";
+        insert_published_flow(&pool, body_id, "inst-7:retrieval_round", &counter_body_json());
+        // Body flips harness_done at iter 3 → exits `until` after 3 hops.
+        let (_registry, slot) = counter_registry_and_runner(pool.clone(), 3);
+
+        let mut ctx = stub_ctx();
+        ctx.addon_id = Some("inst-7".into());
+
+        let out = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({
+                    "body_flow_engine_id": "retrieval_round",
+                    "max_iterations": 4
+                })),
+                &[input(FlowEnvelope::empty())],
+                &ctx,
+            )
+            .await
+            .expect("execute via published-name resolution");
+
+        assert_eq!(
+            out.meta.get("loop_exit_reason").and_then(|v| v.as_str()),
+            Some("until")
+        );
+        // meta.iter accumulated across the 3 resolved-body iterations — the
+        // accumulation-survives-iterations invariant the RAG hop relies on.
+        assert_eq!(out.meta.get("iter").and_then(|v| v.as_i64()), Some(3));
+    }
+
+    /// `body_flow_engine_id` without ctx.addon_id is a node error — the loop
+    /// cannot build the published name (mirrors the vector node's addon-scope
+    /// guard). Resolution must not silently fall back.
+    #[tokio::test]
+    async fn body_flow_engine_id_without_addon_id_is_error() {
+        let pool = db();
+        let (_registry, slot) = counter_registry_and_runner(pool.clone(), 1);
+        // ctx.addon_id is None (stub default).
+        let err = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_engine_id": "retrieval_round"})),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("addon_id"), "{err}");
+    }
+
+    /// An unknown published name (addon not installed) surfaces a clear node
+    /// error rather than a silent no-op.
+    #[tokio::test]
+    async fn body_flow_engine_id_unknown_published_name_is_error() {
+        let pool = db();
+        let (_registry, slot) = counter_registry_and_runner(pool.clone(), 1);
+        let mut ctx = stub_ctx();
+        ctx.addon_id = Some("inst-missing".into());
+        let err = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"body_flow_engine_id": "retrieval_round"})),
+                &[input(FlowEnvelope::empty())],
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no flow published"), "{err}");
+    }
+
+    /// Both `body_flow_id` and `body_flow_engine_id` present is a config error.
+    #[tokio::test]
+    async fn both_body_refs_is_config_error() {
+        let pool = db();
+        let (_registry, slot) = counter_registry_and_runner(pool.clone(), 1);
+        let err = LoopNodeAdapter::new(slot)
+            .execute(
+                &node(json!({
+                    "body_flow_id": "x",
+                    "body_flow_engine_id": "retrieval_round"
+                })),
+                &[input(FlowEnvelope::empty())],
+                &stub_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("both"), "{err}");
     }
 
     #[tokio::test]

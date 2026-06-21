@@ -43,7 +43,8 @@ use crate::flow_engine::node_adapters::{
     ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
+    PiiFilterNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter,
+    RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
@@ -1019,6 +1020,12 @@ fn build_registry(
         Arc::new(SttNodeAdapter::new()),
         Arc::new(EmbeddingsNodeAdapter::new()),
         Arc::new(RerankerNodeAdapter::new()),
+        // RAG E2.2 — węzły pętli multi-hop: seed pod-pytania, akumulacja+dedup
+        // pasaży, parsowanie werdyktu sędziego LLM.
+        Arc::new(RagQuerySeedNodeAdapter::new()),
+        Arc::new(RagAccumulateNodeAdapter::new()),
+        Arc::new(RagJudgeNodeAdapter::new()),
+        Arc::new(RagFinalizeNodeAdapter::new()),
         // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
         Arc::new(VectorNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
