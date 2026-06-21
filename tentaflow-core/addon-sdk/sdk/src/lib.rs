@@ -326,6 +326,35 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Document/blob store API (RAG E1.3) — per-instance store for user-uploaded
+    /// files (PDF/image > the 1 MB KV ceiling). Requires `document.read`
+    /// (get/list) / `document.write` (put/delete). CBOR carries only chunk
+    /// metadata; raw chunk bytes cross a SEPARATE ptr/len, so a multi-MB file is
+    /// not bounded by the CBOR payload ceiling. `document_put_v1` takes the
+    /// metadata input plus a chunk ptr/len; `document_get_v1` writes chunk bytes
+    /// to `blob_out_ptr` and metadata CBOR to `meta_out_ptr`.
+    fn document_put_v1(
+        input_ptr: i32, input_len: i32,
+        chunk_ptr: i32, chunk_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn document_get_v1(
+        input_ptr: i32, input_len: i32,
+        blob_out_ptr: i32, blob_out_cap: i32,
+        meta_out_ptr: i32, meta_out_cap: i32, meta_out_len_ptr: i32,
+    ) -> i32;
+
+    fn document_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    fn document_list_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Graph API (RAG 0.2) — per-addon per-collection embedded CozoDB graphs.
     /// Requires `graph.read` (neighbors/pagerank/ppr) / `graph.write`
     /// (upsert/delete). Wire format is CBOR. The addon only gets host-shaped,
@@ -3314,6 +3343,182 @@ pub fn doc_parse(
     })?;
     let bytes = call_sql_with_one_input(doc_parse_v1, &payload)?;
     decode_cbor(&bytes)
+}
+
+// =============================================================================
+// Document/blob store API wrappers (RAG E1.3) — per-instance file upload store
+// =============================================================================
+
+pub use tentaflow_sdk_spec::{
+    DocumentDeleteOutput, DocumentGetMeta, DocumentMeta, DocumentPutOutput,
+};
+
+/// Rozmiar kawałka uploadu używany przez [`document_put`]. Dobrany pod sufit
+/// metadanych CBOR (bajty i tak jadą osobnym ptr/len) i deterministyczną
+/// iterację po stronie hosta. Większy plik = więcej wywołań `document_put_v1`.
+pub const DOCUMENT_PUT_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Wgrywa kompletny plik do per-instance document store, dzieląc go na kawałki
+/// i wołając `document_put_v1` sekwencyjnie. `doc_id = None` → host generuje
+/// nowy identyfikator (zwrócony w wyniku); `Some(id)` nadpisuje istniejący.
+/// Zwraca finalny [`DocumentPutOutput`] (`finalized = true`, `sha256`, rozmiar).
+/// Wymaga `document.write`. Plik > limitu KV 1 MB jest tu legalny — to właśnie
+/// powód istnienia tego store'u.
+pub fn document_put(
+    doc_id: Option<&str>,
+    mime: &str,
+    data: &[u8],
+) -> Result<DocumentPutOutput, AbiError> {
+    // Pusty plik = jeden pusty kawałek (total_chunks = 1), żeby finalizacja i
+    // tak nastąpiła i powstał wpis rejestru.
+    let total_chunks = data.len().div_ceil(DOCUMENT_PUT_CHUNK_BYTES).max(1) as u32;
+    // doc_id pierwszego kawałka: podany albo pusty (host wygeneruje); kolejne
+    // kawałki MUSZĄ użyć już ustalonego id, więc trzymamy go między iteracjami.
+    let mut current_id = doc_id.unwrap_or("").to_string();
+    let mut last: Option<DocumentPutOutput> = None;
+    for chunk_index in 0..total_chunks {
+        let start = chunk_index as usize * DOCUMENT_PUT_CHUNK_BYTES;
+        let end = (start + DOCUMENT_PUT_CHUNK_BYTES).min(data.len());
+        let chunk = &data[start..end];
+        let payload = encode_cbor_input(&tentaflow_sdk_spec::DocumentPutInput {
+            doc_id: current_id.clone(),
+            mime: mime.to_string(),
+            chunk_index,
+            total_chunks,
+        })?;
+        let bytes = call_document_put(&payload, chunk)?;
+        let out: DocumentPutOutput = decode_cbor(&bytes)?;
+        // Po pierwszym kawałku znamy ostateczny doc_id (host mógł go wygenerować).
+        current_id = out.doc_id.clone();
+        last = Some(out);
+    }
+    last.ok_or(AbiError::Operation)
+}
+
+/// Pobiera kompletny plik z document store, czytając kolejne kawałki przez
+/// `document_get_v1` aż do `total_chunks`. Zwraca `(bajty, mime)`. Wymaga
+/// `document.read`. Obcy/nieistniejący `doc_id` → `AbiError::NotFound`.
+pub fn document_get(doc_id: &str) -> Result<(Vec<u8>, String), AbiError> {
+    let mut assembled = Vec::new();
+    let mut mime = String::new();
+    let mut chunk_index: u32 = 0;
+    loop {
+        let payload = encode_cbor_input(&tentaflow_sdk_spec::DocumentGetInput {
+            doc_id: doc_id.to_string(),
+            chunk_index,
+        })?;
+        let (chunk, meta) = call_document_get(&payload)?;
+        assembled.extend_from_slice(&chunk);
+        mime = meta.mime;
+        chunk_index += 1;
+        if chunk_index >= meta.total_chunks {
+            break;
+        }
+    }
+    Ok((assembled, mime))
+}
+
+/// Kasuje dokument (plik + wpis rejestru) po `doc_id`. Idempotentny —
+/// nieistniejący `doc_id` zwraca `removed = false`. Wymaga `document.write`.
+pub fn document_delete(doc_id: &str) -> Result<DocumentDeleteOutput, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::DocumentDeleteInput {
+        doc_id: doc_id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(document_delete_v1, &payload)?;
+    decode_cbor(&bytes)
+}
+
+/// Listuje metadane wszystkich dokumentów tej instancji. Wymaga `document.read`.
+pub fn document_list() -> Result<Vec<DocumentMeta>, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::DocumentListInput {})?;
+    let bytes = call_sql_with_one_input(document_list_v1, &payload)?;
+    let out: tentaflow_sdk_spec::DocumentListOutput = decode_cbor(&bytes)?;
+    Ok(out.documents)
+}
+
+/// Woła `document_put_v1` (metadane CBOR + osobny bufor bajtów kawałka) z retry
+/// na za mały bufor wyjścia metadanych.
+fn call_document_put(meta: &[u8], chunk: &[u8]) -> Result<Vec<u8>, AbiError> {
+    let mut cap = INITIAL_CAP;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut buffer = vec![0u8; cap];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            document_put_v1(
+                meta.as_ptr() as i32,
+                meta.len() as i32,
+                chunk.as_ptr() as i32,
+                chunk.len() as i32,
+                buffer.as_mut_ptr() as i32,
+                cap as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buffer.truncate(out_len as usize);
+            return Ok(buffer);
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            let required = out_len as usize;
+            if attempts > MAX_RETRY_ATTEMPTS || required <= cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
+}
+
+/// Woła `document_get_v1`: bajty kawałka lądują w osobnym buforze, metadane w
+/// drugim. Gdy bufor bajtów za mały, host zwraca wymagany rozmiar w
+/// `meta_out_len_ptr` (retry semantics) i NIE pisze metadanych — realokujemy
+/// bufor bajtów i ponawiamy. Zwraca `(bajty_kawałka, metadane)`.
+fn call_document_get(meta_in: &[u8]) -> Result<(Vec<u8>, DocumentGetMeta), AbiError> {
+    let mut blob_cap = DOCUMENT_PUT_CHUNK_BYTES;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let mut blob_buf = vec![0u8; blob_cap];
+        let mut meta_buf = vec![0u8; INITIAL_CAP];
+        let mut out_len: u32 = 0;
+        let rc = unsafe {
+            document_get_v1(
+                meta_in.as_ptr() as i32,
+                meta_in.len() as i32,
+                blob_buf.as_mut_ptr() as i32,
+                blob_cap as i32,
+                meta_buf.as_mut_ptr() as i32,
+                meta_buf.len() as i32,
+                &mut out_len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            // Sukces: out_len niesie długość metadanych CBOR. Długość bajtów
+            // kawałka czytamy z `chunk_len` w metadanych.
+            meta_buf.truncate(out_len as usize);
+            let meta: DocumentGetMeta = decode_cbor(&meta_buf)?;
+            blob_buf.truncate(meta.chunk_len as usize);
+            return Ok((blob_buf, meta));
+        }
+        if rc == AbiError::OutputBufferTooSmall.as_i32() {
+            let required = out_len as usize;
+            if attempts > MAX_RETRY_ATTEMPTS || required <= blob_cap {
+                return Err(AbiError::OutputBufferTooSmall);
+            }
+            if required > MAX_OUT_CAP {
+                return Err(AbiError::PayloadTooLarge);
+            }
+            blob_cap = required;
+            continue;
+        }
+        return Err(AbiError::from_i32(rc));
+    }
 }
 
 // =============================================================================

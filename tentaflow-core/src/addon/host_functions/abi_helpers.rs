@@ -26,6 +26,10 @@ pub enum PayloadKind {
     UiRender,
     /// secret_set / secret_get — wartosc (max 64 KB).
     Secret,
+    /// document_* — metadane kawałka (doc_id, mime, indeksy). Sam bajty pliku
+    /// jadą OSOBNYM ptr/len (nie w CBOR), więc 64 KB na metadane wystarcza z
+    /// zapasem i NIE ogranicza rozmiaru wgrywanego dokumentu.
+    DocumentMeta,
 }
 
 impl PayloadKind {
@@ -38,6 +42,7 @@ impl PayloadKind {
             Self::GraphItem => 256 * 1024,
             Self::UiRender => 2 * 1024 * 1024,
             Self::Secret => 64 * 1024,
+            Self::DocumentMeta => 64 * 1024,
         }
     }
 }

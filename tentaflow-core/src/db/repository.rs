@@ -10833,6 +10833,8 @@ pub struct AddonResourceLimits {
     pub gpu_enabled: bool,
     pub vram_limit_mb: i64,
     pub storage_limit_mb: i64,
+    /// Limit laczny document/blob store (RAG E1.3) w MB. 0 = bez limitu.
+    pub document_storage_mb: i64,
     pub http_requests_per_min: i64,
     pub llm_tokens_per_min: i64,
     /// Limit paliwa WASM per wywolanie (0 = domyslny 10M instrukcji)
@@ -10845,8 +10847,8 @@ pub fn get_addon_resource_limits(pool: &DbPool, addon_id: &str) -> Result<AddonR
     let result = conn
         .query_row(
             "SELECT addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, \
-             gpu_enabled, vram_limit_mb, storage_limit_mb, http_requests_per_min, \
-             llm_tokens_per_min, fuel_limit \
+             gpu_enabled, vram_limit_mb, storage_limit_mb, document_storage_mb, \
+             http_requests_per_min, llm_tokens_per_min, fuel_limit \
              FROM addon_resource_limits WHERE addon_id = ?1",
             rusqlite::params![addon_id],
             |row| {
@@ -10858,9 +10860,10 @@ pub fn get_addon_resource_limits(pool: &DbPool, addon_id: &str) -> Result<AddonR
                     gpu_enabled: row.get::<_, i64>(4)? != 0,
                     vram_limit_mb: row.get(5)?,
                     storage_limit_mb: row.get(6)?,
-                    http_requests_per_min: row.get(7)?,
-                    llm_tokens_per_min: row.get(8)?,
-                    fuel_limit: row.get(9)?,
+                    document_storage_mb: row.get(7)?,
+                    http_requests_per_min: row.get(8)?,
+                    llm_tokens_per_min: row.get(9)?,
+                    fuel_limit: row.get(10)?,
                 })
             },
         )
@@ -10875,6 +10878,7 @@ pub fn get_addon_resource_limits(pool: &DbPool, addon_id: &str) -> Result<AddonR
         gpu_enabled: true,
         vram_limit_mb: 0,
         storage_limit_mb: 0,
+        document_storage_mb: 0,
         http_requests_per_min: 0,
         llm_tokens_per_min: 0,
         fuel_limit: 0,
@@ -10887,9 +10891,9 @@ pub fn set_addon_resource_limits(pool: &DbPool, limits: &AddonResourceLimits) ->
     conn.execute(
         "INSERT INTO addon_resource_limits \
          (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
-          vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min, \
-          fuel_limit, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now')) \
+          vram_limit_mb, storage_limit_mb, document_storage_mb, http_requests_per_min, \
+          llm_tokens_per_min, fuel_limit, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now')) \
          ON CONFLICT(addon_id) DO UPDATE SET \
          max_instances = excluded.max_instances, \
          cpu_limit_ms_per_min = excluded.cpu_limit_ms_per_min, \
@@ -10897,6 +10901,7 @@ pub fn set_addon_resource_limits(pool: &DbPool, limits: &AddonResourceLimits) ->
          gpu_enabled = excluded.gpu_enabled, \
          vram_limit_mb = excluded.vram_limit_mb, \
          storage_limit_mb = excluded.storage_limit_mb, \
+         document_storage_mb = excluded.document_storage_mb, \
          http_requests_per_min = excluded.http_requests_per_min, \
          llm_tokens_per_min = excluded.llm_tokens_per_min, \
          fuel_limit = excluded.fuel_limit, \
@@ -10909,6 +10914,7 @@ pub fn set_addon_resource_limits(pool: &DbPool, limits: &AddonResourceLimits) ->
             limits.gpu_enabled as i64,
             limits.vram_limit_mb,
             limits.storage_limit_mb,
+            limits.document_storage_mb,
             limits.http_requests_per_min,
             limits.llm_tokens_per_min,
             limits.fuel_limit,

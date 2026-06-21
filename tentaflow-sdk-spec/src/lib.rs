@@ -42,6 +42,10 @@ pub use protocol::{
         ServerLimits, SessionEnd, SessionEndCode,
     },
     doc_parse::{DocBlock, DocParseInput, DocParseOutput},
+    document::{
+        DocumentDeleteInput, DocumentDeleteOutput, DocumentGetInput, DocumentGetMeta,
+        DocumentListInput, DocumentListOutput, DocumentMeta, DocumentPutInput, DocumentPutOutput,
+    },
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},

@@ -472,7 +472,45 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "roles_add_graph_permissions",
             MigrationStep::Rust(roles_add_graph_permissions),
         ),
+        (
+            87,
+            "addon_document_store_limits",
+            MigrationStep::Rust(create_addon_document_store_limits),
+        ),
+        (
+            88,
+            "roles_add_document_permissions",
+            MigrationStep::Rust(roles_add_document_permissions),
+        ),
     ]
+}
+
+/// v87 — kolumna limitu document/blob store (RAG E1.3) w `addon_resource_limits`.
+/// Per-instancja addon przechowuje wgrane pliki (PDF/obraz > limit KV 1MB) w
+/// osobnym per-instance `FileBlobStore`; `document_storage_mb` ogranicza łączny
+/// rozmiar tych plików. `0` = brak limitu (spójne z `storage_limit_mb`). Dodawana
+/// idempotentnie, bo wcześniejsze slice'y (codex pkt 9) świadomie zostawiły tę
+/// kolumnę na slice document.
+fn create_addon_document_store_limits(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "addon_resource_limits", "document_storage_mb")? {
+        conn.execute_batch(
+            "ALTER TABLE addon_resource_limits ADD COLUMN document_storage_mb INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// v88 — uprawnienia `document.read`/`document.write` dla ról, które mają już
+/// odpowiedniki wektorowe/grafowe (RAG E1.3). Admin/operator dostają zapis i
+/// odczyt, viewer tylko odczyt — lustro `vector.read`/`vector.write`.
+fn roles_add_document_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator"],
+        &["document.read", "document.write"],
+    )?;
+    roles_add_permissions(conn, &["org_viewer"], &["document.read"])?;
+    Ok(())
 }
 
 /// v86 — udostępnia uprawnienia `graph.read`/`graph.write` rolom, które już mają
