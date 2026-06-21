@@ -6,7 +6,7 @@
 // is f32 (local extents are small); ICP queries convert to f64.
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nalgebra::{Point3, Vector3};
 
@@ -22,14 +22,16 @@ fn key_of(p: &Point3<f64>, voxel_size: f64) -> Key {
     ]
 }
 
-/// Downsample a scan to the CENTROID of each occupied voxel (order-independent, so
-/// the result is deterministic regardless of point order — important for repeatable
-/// registration). Returns one point per voxel.
+/// Downsample a scan to the CENTROID of each occupied voxel. Fully deterministic:
+/// the centroid is order-independent AND the output is emitted in sorted voxel-key
+/// order (a `BTreeMap`), so the SAME scan always yields the SAME point sequence.
+/// That matters both for repeatable registration and for the architecture's
+/// deterministic-derivation guarantee (mesh nodes must compute identically).
 pub fn voxel_downsample(points: &[Point3<f32>], voxel_size: f32) -> Vec<Point3<f32>> {
     debug_assert!(voxel_size > 0.0);
     let inv = 1.0 / voxel_size;
-    // accumulate sum + count per voxel.
-    let mut acc: HashMap<Key, (Vector3<f64>, u32)> = HashMap::new();
+    // accumulate sum + count per voxel, keyed in sorted order for deterministic output.
+    let mut acc: BTreeMap<Key, (Vector3<f64>, u32)> = BTreeMap::new();
     for p in points {
         let k = [
             (p.x * inv).floor() as i32,
