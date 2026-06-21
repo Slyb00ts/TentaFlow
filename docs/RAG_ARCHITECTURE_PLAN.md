@@ -115,6 +115,31 @@ mem / SQLite / RocksDB (mobile: sqlite). Licencja MPL-2.0.
 └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## 6a. Architektura RAG zrewidowana (decyzja właściciela po odkryciu 2 systemów flow)
+
+Repo ma DWA rozłączne systemy flow: `flow_engine` (wizualny FlowBuilder; bogate węzły llm/embeddings/
+reranker + `loop_block`/`map_block`/`subflow`/`agent_block`; odpalany JAKO MODEL przez `FlowDispatcher.
+try_dispatch`; `ExecutionContext` bez tożsamości addona) oraz `flow_runtime` (operatory source/predict/
+branch/threshold/aggregate/sink; MA tożsamość addona w `OperatorContext`; BEZ pętli; używany przez
+`flow_invoke_v1`).
+
+Podział RAG (wg wizji właściciela):
+- **Ingest (zapis) = ADDON bezpośrednio**: addon woła host-fn narzędzia (doc_parse, embeddings, vector/
+  graph upsert) i sam steruje zapisem chunków. Logika ingestu w addonie. (Codex rec: „logika w addonie,
+  core daje narzędzia".)
+- **Query→odpowiedź = FLOW w `flow_engine`** (FlowBuilder, bo TAM są pętle i węzły): `trigger → [loop:
+  embed-query → vector/graph-search → rerank → warunek] → llm → output`. Pętla = wielokrotne dociąganie
+  kontekstu (multi-hop RAG). Addon wyzwala swój przypisany query-flow JAKO MODEL (przez istniejący
+  `service_request`→`ModelRuntimeExecutor`→`FlowDispatcher`), z aliasami modeli (rag-llm/rag-reranker).
+- **Enabler (fundament)**: propagacja tożsamości — `addon_id`/`org_id` callera (CallerContext) przez
+  `service_call.rs` → executor → `FlowRequestMeta` (dla `ResolvedExecutionTarget::Flow`) → `ExecutionContext`
+  (flow_engine). Bez tego węzły retrievalu w query-flow nie wiedzą, w którą przestrzeń instancji uderzać
+  (codex: dziś tożsamość ginie w `ExecutionContext::new(None)`).
+
+Rewizja C-fazy: węzły flow są dla QUERY (flow_engine), NIE dla ingestu. Ingest = host fns. Potrzebne:
+enabler tożsamości; węzły `vector_search`/`graph_search` (scoped do instancji); reranker node (C2 ✓);
+host fns `doc_parse` + `document store` (ingest). C4 (vector node) wraca PO enablerze (wtedy żywy).
+
 ## 7. Plan etapowy
 
 ### Etap 0 — Fundamenty w core (odblokowują wszystko)
