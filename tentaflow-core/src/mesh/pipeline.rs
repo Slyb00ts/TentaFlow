@@ -675,9 +675,10 @@ async fn handle_peer_connected(
                 if !all_keys.is_empty() {
                     let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                         .iter()
-                        .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                        .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                             node_id: nid.clone(),
                             public_key_hex: pk.clone(),
+                            approved_at: approved_at.clone(),
                         })
                         .collect();
                     let payload =
@@ -1647,9 +1648,10 @@ fn spawn_quic_event_handler(
                         if !all_keys.is_empty() {
                             let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                                 .iter()
-                                .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                                     node_id: nid.clone(),
                                     public_key_hex: pk.clone(),
+                                    approved_at: approved_at.clone(),
                                 })
                                 .collect();
                             let payload =
@@ -1754,10 +1756,11 @@ fn spawn_quic_event_handler(
                                             tentaflow_protocol::mesh::TrustedKeyEntry,
                                         > = all_keys
                                             .iter()
-                                            .map(|(nid, pk)| {
+                                            .map(|(nid, pk, approved_at)| {
                                                 tentaflow_protocol::mesh::TrustedKeyEntry {
                                                     node_id: nid.clone(),
                                                     public_key_hex: pk.clone(),
+                                                    approved_at: approved_at.clone(),
                                                 }
                                             })
                                             .collect();
@@ -1787,10 +1790,11 @@ fn spawn_quic_event_handler(
                                             tentaflow_protocol::mesh::TrustedKeyEntry,
                                         > = updated_keys
                                             .iter()
-                                            .map(|(nid, pk)| {
+                                            .map(|(nid, pk, approved_at)| {
                                                 tentaflow_protocol::mesh::TrustedKeyEntry {
                                                     node_id: nid.clone(),
                                                     public_key_hex: pk.clone(),
+                                                    approved_at: approved_at.clone(),
                                                 }
                                             })
                                             .collect();
@@ -1863,7 +1867,7 @@ fn spawn_quic_event_handler(
                         // Przypadek 1: ja zostalam odlaczony z mesh — usun WSZYSTKIE klucze
                         if i_am_revoked && sender_trusted {
                             let all_trusted = sec.get_all_trusted_keys();
-                            for (trusted_id, _) in &all_trusted {
+                            for (trusted_id, _, _) in &all_trusted {
                                 let _ = sec.unpair(trusted_id);
                                 // F1b P3.B — drop the peer's mirrored HMAC keys
                                 // so their tokens stop verifying immediately.
@@ -1955,11 +1959,16 @@ fn spawn_quic_event_handler(
 
                     if let Some(ref sec) = mesh_security {
                         let mut added = 0u32;
-                        for (remote_node_id, public_key_hex) in &keys {
+                        for (remote_node_id, public_key_hex, approved_at) in &keys {
                             if sec.is_trusted(remote_node_id) {
                                 continue;
                             }
-                            match sec.add_trusted_key(remote_node_id, public_key_hex, "") {
+                            match sec.add_trusted_key(
+                                remote_node_id,
+                                public_key_hex,
+                                "",
+                                Some(approved_at),
+                            ) {
                                 Ok(()) => {
                                     peer_store.ensure_trusted_peer(
                                         remote_node_id,
