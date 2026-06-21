@@ -20,7 +20,7 @@ pub mod submap;
 
 pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
-    PoseNode, Scene,
+    PoseNode, Scene, SceneMergeError,
 };
 pub use frame::{decode_lidar_frame, DecodedLidar};
 pub use loop_closure::{verify_loop_closure, LoopGate, LoopVerification};
