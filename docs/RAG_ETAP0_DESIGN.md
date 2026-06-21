@@ -449,3 +449,15 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
 - `reranker`/`doc_parse`/`vector` rejestrują się i przechodzą `execute` na stub dispatcherach.
 - `doc_parse` zwraca markdown+bloki+provenance (strona/bbox). `document_put/get/delete` > 1MB, izolowany.
 - Działa na mobile (cozo sqlite) i serwer (cozo rocksdb).
+
+## STATUS INGEST (Etap 1 — doc_parse)
+
+- **E1.2 doc_parse foundation** ✅ (codex GO-WITH-CHANGES→fix): `execute_documents()` (lustro
+  execute_rerank, alias `rag-parse`, failover), `BackendClient::parse_document` (multipart→vision service),
+  host fn `doc_parse_v1` (permission `document.parse`, audyt/CBOR, tożsamość usera+addona). Wejście OBRAZ.
+  Gniazdo embedded-Burn (telefon, błąd→fallback). Walidacja kształtu odpowiedzi (failover na błąd),
+  skip malformed blocks, blob cleanup. PDF→obraz i multi-detektor = kolejne slice'y.
+- **REPO PRZENIESIONE na `/mnt/d` (lokalny nvme)** — `/mnt/e` (sieciowy) padł 2× (I/O storm + fabric drop);
+  praca na /mnt/d, /mnt/e backup. Buildy: CARGO_TARGET_DIR/TMPDIR/HOME na /mnt/d.
+- Następne: document/blob store host fn (upload pliku per instancja) → PDF→obraz (spike rasteryzera Rust)
+  → multi-detektor nv-ingest → addon RAG (manifest/flows/GUI/logika).
