@@ -461,3 +461,13 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
   praca na /mnt/d, /mnt/e backup. Buildy: CARGO_TARGET_DIR/TMPDIR/HOME na /mnt/d.
 - Następne: document/blob store host fn (upload pliku per instancja) → PDF→obraz (spike rasteryzera Rust)
   → multi-detektor nv-ingest → addon RAG (manifest/flows/GUI/logika).
+
+## STATUS INGEST cd.
+- **E1.3 document/blob store host fns** ✅ (codex GO, po 2 NO-GO + redesign): per-instancja store
+  (`addon_data_dir/documents/`), rejestr `documents.db`, **streaming chunków do pliku** (zero OOM),
+  serializacja per-instancja (mutex: put-finalize/get/delete/GC), **publikacja blob-PRZED-wierszem**
+  (czytelnik zawsze widzi spójny stan), quota transakcyjna (`BEGIN IMMEDIATE`), `document_storage_mb`
+  wpięte, limity pending (512MiB/8/2GiB), GC partial+finalizing, lock-map evict przy uninstall.
+  Migracje v87/v88. document_put/get/delete/list_v1.
+- Następne: PDF→obraz (rasteryzer Rust, cross-platform) → doc_parse obsługuje PDF (per strona) →
+  multi-detektor nv-ingest → **addon RAG** (manifest/flows/GUI/logika — Etap 1 właściwy).
