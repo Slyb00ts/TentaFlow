@@ -35,6 +35,12 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::AddonConfig
             | CoreSyncResourceKind::ApiKey
             | CoreSyncResourceKind::ResourcePermission
+            | CoreSyncResourceKind::PiiRule
+            | CoreSyncResourceKind::ComplianceDataCategory
+            | CoreSyncResourceKind::ComplianceProcessingActivity
+            | CoreSyncResourceKind::ComplianceLegalBasis
+            | CoreSyncResourceKind::ComplianceRetentionPolicy
+            | CoreSyncResourceKind::ComplianceProcessor
     )
 }
 
@@ -114,6 +120,21 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
         CoreSyncResourceKind::ApiKey => apply_api_key(&tx, operation)?,
         CoreSyncResourceKind::ResourcePermission => apply_resource_permission(&tx, operation)?,
+        CoreSyncResourceKind::FlowVersion => apply_flow_version(&tx, operation)?,
+        CoreSyncResourceKind::PiiRule => apply_pii_rule(&tx, operation)?,
+        CoreSyncResourceKind::ComplianceDataCategory => {
+            apply_compliance_data_category(&tx, operation)?
+        }
+        CoreSyncResourceKind::ComplianceProcessingActivity => {
+            apply_compliance_processing_activity(&tx, operation)?
+        }
+        CoreSyncResourceKind::ComplianceLegalBasis => {
+            apply_compliance_legal_basis(&tx, operation)?
+        }
+        CoreSyncResourceKind::ComplianceRetentionPolicy => {
+            apply_compliance_retention_policy(&tx, operation)?
+        }
+        CoreSyncResourceKind::ComplianceProcessor => apply_compliance_processor(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -1481,6 +1502,312 @@ fn apply_sync_explicit_share(
                     subject_id,
                     action,
                 ],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated flow_versions snapshot. The history is append-only, so
+/// Insert and Update both upsert the full row; the id is the resource id. The
+/// FK to `flows(id)` means a snapshot landing before its parent flow is a
+/// causal-ordering gap — surfaced as DeferredOrdering so the inbox retries it
+/// until the flow arrives (mirrors `apply_skill_file`).
+fn apply_flow_version(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let flow_id = field_string(operation, "flow_id")?;
+            let flow_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM flows WHERE id = ?1",
+                    rusqlite::params![flow_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .unwrap_or(false);
+            if !flow_exists {
+                return Err(SyncLedgerError::DeferredOrdering(format!(
+                    "flow_versions target flow not found: {flow_id}"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO flow_versions \
+                 (id, flow_id, version_num, name, description, status, created_by, flow_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 flow_id = excluded.flow_id, version_num = excluded.version_num, \
+                 name = excluded.name, description = excluded.description, \
+                 status = excluded.status, created_by = excluded.created_by, \
+                 flow_json = excluded.flow_json",
+                rusqlite::params![
+                    id,
+                    flow_id,
+                    field_i64_or(operation, "version_num", 0)?,
+                    field_string(operation, "name")?,
+                    field_optional_string(operation, "description")?,
+                    field_string(operation, "status")?,
+                    field_optional_string(operation, "created_by")?,
+                    field_string(operation, "flow_json")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM flow_versions WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated PII redaction rule. Insert/Update are full-row upserts
+/// keyed on the UUID `id`; `org_id` travels in the fields to satisfy the NOT
+/// NULL column. `created_at` is node-local and preserved on conflict.
+fn apply_pii_rule(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO pii_rules \
+                 (id, org_id, name, category, pattern, replacement, is_active, priority, description, test_examples) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, category = excluded.category, pattern = excluded.pattern, \
+                 replacement = excluded.replacement, is_active = excluded.is_active, \
+                 priority = excluded.priority, description = excluded.description, \
+                 test_examples = excluded.test_examples",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "name")?,
+                    field_string(operation, "category")?,
+                    field_string(operation, "pattern")?,
+                    field_string_or(operation, "replacement", "[UKRYTY]")?,
+                    field_bool_or(operation, "is_active", true)?,
+                    field_i64_or(operation, "priority", 0)?,
+                    field_optional_string(operation, "description")?,
+                    field_optional_string(operation, "test_examples")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM pii_rules WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated compliance data-category row. `org_id` travels in the
+/// fields; the receiver upserts the full synced config column set (runtime
+/// timestamps stay node-local).
+fn apply_compliance_data_category(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let category_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO compliance_data_categories \
+                 (category_id, org_id, slug, name_translations, description_translations, \
+                  personal_data, sensitive_data, risk_class, source_scope, addon_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(category_id) DO UPDATE SET \
+                 slug = excluded.slug, name_translations = excluded.name_translations, \
+                 description_translations = excluded.description_translations, \
+                 personal_data = excluded.personal_data, sensitive_data = excluded.sensitive_data, \
+                 risk_class = excluded.risk_class, source_scope = excluded.source_scope, \
+                 addon_id = excluded.addon_id",
+                rusqlite::params![
+                    category_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "slug")?,
+                    field_string_or(operation, "name_translations", "{}")?,
+                    field_string_or(operation, "description_translations", "{}")?,
+                    field_bool_or(operation, "personal_data", true)?,
+                    field_bool_or(operation, "sensitive_data", false)?,
+                    field_string_or(operation, "risk_class", "standard")?,
+                    field_string_or(operation, "source_scope", "core")?,
+                    field_optional_string(operation, "addon_id")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM compliance_data_categories WHERE category_id = ?1",
+                rusqlite::params![category_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated compliance processing-activity row.
+fn apply_compliance_processing_activity(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let activity_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO compliance_processing_activities \
+                 (activity_id, org_id, slug, name_translations, purpose_translations, \
+                  controller_role, owner_user_id, system_scope, addon_id, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(activity_id) DO UPDATE SET \
+                 slug = excluded.slug, name_translations = excluded.name_translations, \
+                 purpose_translations = excluded.purpose_translations, \
+                 controller_role = excluded.controller_role, owner_user_id = excluded.owner_user_id, \
+                 system_scope = excluded.system_scope, addon_id = excluded.addon_id, \
+                 status = excluded.status",
+                rusqlite::params![
+                    activity_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "slug")?,
+                    field_string_or(operation, "name_translations", "{}")?,
+                    field_string_or(operation, "purpose_translations", "{}")?,
+                    field_string_or(operation, "controller_role", "controller")?,
+                    field_optional_string(operation, "owner_user_id")?,
+                    field_string_or(operation, "system_scope", "core")?,
+                    field_optional_string(operation, "addon_id")?,
+                    field_string_or(operation, "status", "active")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM compliance_processing_activities WHERE activity_id = ?1",
+                rusqlite::params![activity_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated compliance legal-basis row. The FK to activity/category
+/// is satisfied by their own replicated rows; both are nullable here.
+fn apply_compliance_legal_basis(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let legal_basis_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO compliance_legal_basis \
+                 (legal_basis_id, org_id, activity_id, category_id, basis_kind, basis_reference, \
+                  description_translations, is_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(legal_basis_id) DO UPDATE SET \
+                 activity_id = excluded.activity_id, category_id = excluded.category_id, \
+                 basis_kind = excluded.basis_kind, basis_reference = excluded.basis_reference, \
+                 description_translations = excluded.description_translations, \
+                 is_active = excluded.is_active",
+                rusqlite::params![
+                    legal_basis_id,
+                    field_string(operation, "org_id")?,
+                    field_optional_string(operation, "activity_id")?,
+                    field_optional_string(operation, "category_id")?,
+                    field_string(operation, "basis_kind")?,
+                    field_string_or(operation, "basis_reference", "")?,
+                    field_string_or(operation, "description_translations", "{}")?,
+                    field_bool_or(operation, "is_active", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM compliance_legal_basis WHERE legal_basis_id = ?1",
+                rusqlite::params![legal_basis_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated compliance retention-policy row.
+fn apply_compliance_retention_policy(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let retention_policy_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO compliance_retention_policies \
+                 (retention_policy_id, org_id, slug, name_translations, scope_kind, category_id, \
+                  retention_days, minimum_days, action_after_retention, is_default, is_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(retention_policy_id) DO UPDATE SET \
+                 slug = excluded.slug, name_translations = excluded.name_translations, \
+                 scope_kind = excluded.scope_kind, category_id = excluded.category_id, \
+                 retention_days = excluded.retention_days, minimum_days = excluded.minimum_days, \
+                 action_after_retention = excluded.action_after_retention, \
+                 is_default = excluded.is_default, is_active = excluded.is_active",
+                rusqlite::params![
+                    retention_policy_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "slug")?,
+                    field_string_or(operation, "name_translations", "{}")?,
+                    field_string(operation, "scope_kind")?,
+                    field_optional_string(operation, "category_id")?,
+                    field_i64_or(operation, "retention_days", 0)?,
+                    field_i64_or(operation, "minimum_days", 0)?,
+                    field_string_or(operation, "action_after_retention", "delete")?,
+                    field_bool_or(operation, "is_default", false)?,
+                    field_bool_or(operation, "is_active", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM compliance_retention_policies WHERE retention_policy_id = ?1",
+                rusqlite::params![retention_policy_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated compliance processor row.
+fn apply_compliance_processor(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let processor_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO compliance_processors \
+                 (processor_id, org_id, name, role, country, transfer_mechanism, dpa_reference, is_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(processor_id) DO UPDATE SET \
+                 name = excluded.name, role = excluded.role, country = excluded.country, \
+                 transfer_mechanism = excluded.transfer_mechanism, dpa_reference = excluded.dpa_reference, \
+                 is_active = excluded.is_active",
+                rusqlite::params![
+                    processor_id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "name")?,
+                    field_string(operation, "role")?,
+                    field_string_or(operation, "country", "")?,
+                    field_string_or(operation, "transfer_mechanism", "")?,
+                    field_string_or(operation, "dpa_reference", "")?,
+                    field_bool_or(operation, "is_active", true)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM compliance_processors WHERE processor_id = ?1",
+                rusqlite::params![processor_id],
             )
             .map_err(sql_error),
     }
