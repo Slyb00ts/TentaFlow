@@ -1614,7 +1614,11 @@ fn ingest_lowstate_battery(raw: &[u8]) {
             .or_else(|| bms.and_then(|b| b.get("current")))
             .and_then(JsonValue::as_f64)
         {
-            t.bat_current = Some(curr);
+            // The Go2 BMS reports pack current in milliamps on this firmware (e.g.
+            // -1588 = -1.588 A), while `power_a` (when present) is already amps. A
+            // robot's real draw is well under ~50 A, so normalize an implausibly
+            // large magnitude from mA to A.
+            t.bat_current = Some(if curr.abs() > 100.0 { curr / 1000.0 } else { curr });
         }
         if let Some(temp) = bms
             .and_then(|b| b.get("temperature"))
