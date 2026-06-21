@@ -9,7 +9,9 @@
 
 use tentaflow_addon_sdk::prelude::*;
 use tentaflow_addon_sdk::{
-    doc_parse, document_get, vector_delete, vector_upsert, VectorField, VectorFieldValue,
+    doc_parse, document_get, graph_delete_edge, graph_delete_node, graph_upsert_edge,
+    graph_upsert_node, vector_delete, vector_upsert, GraphNode, GraphProp, Provenance, VectorField,
+    VectorFieldValue,
 };
 
 // Niskopoziomowy binding llm_generate z pelnym ABI (model + opcje) — dokladnie
@@ -38,6 +40,32 @@ const EMBED_DIMENSIONS: usize = 1024;
 /// ~512 tokenow * ~4 znaki/token.
 const CHUNK_SIZE_CHARS: usize = 2048;
 const CHUNK_OVERLAP_CHARS: usize = 200;
+
+// --- Ekstrakcja encji/relacji do grafu wiedzy (GraphRAG, Etap 2 / slice E3.0) ---
+
+/// Nazwa kolekcji grafowej (zgodna z [[graph_collection]] w manifescie).
+const KG_COLLECTION: &str = "kg";
+
+/// Wersja ekstraktora — wpisywana w provenance kazdego wezla/krawedzi, by mozna
+/// bylo pozniej (re)ekstrahowac i odroznic generacje faktow.
+const EXTRACTOR_VERSION: &str = "rag-e3.0";
+
+/// Bufor na odpowiedz ekstrakcji (JSON z lista encji/relacji — kilka KB wystarcza,
+/// ale dajemy zapas na wieksze chunki).
+const EXTRACT_BUFFER_SIZE: usize = 65_536;
+
+/// Domyslna pewnosc faktu, gdy LLM jej nie poda (ekstrakcja z tekstu, nie pewnik).
+const DEFAULT_CONFIDENCE: f32 = 0.6;
+
+// Capy anti-DoS — LLM moze halucynowac dlugie listy. Nadmiar przycinamy/odrzucamy.
+/// Max encji wziętych z jednego chunku.
+const MAX_ENTITIES_PER_CHUNK: usize = 30;
+/// Max relacji wziętych z jednego chunku.
+const MAX_RELATIONS_PER_CHUNK: usize = 30;
+/// Max dlugosc nazwy encji (znaki). Dluzsze odrzucamy (nie sa nazwami).
+const MAX_ENTITY_NAME_CHARS: usize = 200;
+/// Max laczna liczba triple'ow (relacji) na caly dokument.
+const MAX_TRIPLES_PER_DOC: usize = 2000;
 
 // =============================================================================
 // Lifecycle
@@ -499,18 +527,62 @@ fn run_ingest_pipeline(
     //    Wszystkie upsertowane ref_id zbieramy, by po failu wyczyscic wektory.
     let mut upserted: Vec<u64> = Vec::with_capacity(total);
 
+    // Akumulatory ekstrakcji grafu (best-effort). doc_triples pilnuje globalnego
+    // capa MAX_TRIPLES_PER_DOC; graph_failed zaznacza, ze graf jest czesciowy.
+    let mut total_entities = 0usize;
+    let mut total_relations = 0usize;
+    let mut doc_triples = 0usize;
+    let mut graph_partial = false;
+
     for (index, chunk_text) in chunks.iter().enumerate() {
         let step = ingest_one_chunk(collection_id, document_id, index, chunk_text, now, &mut upserted);
         if let Err(msg) = step {
-            // Cleanup-on-failure: skasuj wszystkie wektory + chunki tego dokumentu.
+            // Cleanup-on-failure: skasuj wszystkie wektory + chunki + graf dokumentu.
             cleanup_document_artifacts(document_id, &upserted);
             return Err(format!("Blad chunka {index}: {msg}"));
+        }
+
+        // Ekstrakcja grafu — BEST-EFFORT. Wektor chunku jest juz zapisany; blad
+        // ekstrakcji (LLM/parsowanie/upsert) NIE wywala ingestu, tylko oznacza graf
+        // jako czesciowy i leci dalej (wektory > graf).
+        // graph_partial sluzy tu DWOM zrodlom niekompletnosci: blad ekstrakcji (Err)
+        // ORAZ obciecie capem/za-dluga relacja (truncated, bug 5/6). Przekazujemy je
+        // jako wspolna flage `truncated` ustawiana wewnatrz extract_chunk_graph.
+        let chunk_result =
+            extract_chunk_graph(document_id, index, chunk_text, &mut doc_triples, &mut graph_partial);
+        // Blad ekstrakcji chunku (w tym blad REJESTRU graph_artifacts, bug 4)
+        // oznacza graf jako czesciowy — nigdy nie ginie cicho.
+        if chunk_extraction_marks_partial(&chunk_result) {
+            graph_partial = true;
+        }
+        match chunk_result {
+            Ok((ents, rels)) => {
+                total_entities += ents;
+                total_relations += rels;
+            }
+            Err(e) => {
+                log::warn(&format!(
+                    "rag: ekstrakcja grafu chunka {index} dok {document_id} nieudana (graf czesciowy): {e}"
+                ));
+            }
         }
 
         // Postep 30..95% rozlozony na chunki.
         let progress = 30 + ((index + 1) * 65 / total) as i64;
         update_progress(job_id, progress.min(95));
     }
+
+    // Zapisz liczniki ekstrakcji + flage czesciowosci na dokumencie (best-effort
+    // statystyka; brak trafienia nie jest bledem ingestu wektorowego).
+    let _ = sql_exec(
+        "UPDATE documents SET entity_count = ?, relation_count = ?, graph_partial = ? WHERE id = ?",
+        &[
+            SqlValue::I64(total_entities as i64),
+            SqlValue::I64(total_relations as i64),
+            SqlValue::I64(if graph_partial { 1 } else { 0 }),
+            SqlValue::String(document_id.to_string()),
+        ],
+    );
 
     Ok(total)
 }
@@ -614,9 +686,119 @@ fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) {
         }
     }
 
+    // Odwracalny cleanup grafu: skasuj wezly/krawedzie wniesione przez ten dokument
+    // wg rejestru graph_artifacts. Krawedzie kasujemy PRZED wezlami (kasowanie wezla
+    // i tak usuwa incydentne krawedzie, ale jawne usuniecie krawedzi czysci te,
+    // ktorych konce wspoldziela inny dokument i nie powinny zniknac).
+    cleanup_document_graph(document_id);
+
     // Na koncu usun chunki dokumentu.
     let _ = sql_exec(
         "DELETE FROM chunks WHERE document_id = ?",
+        &[SqlValue::String(document_id.to_string())],
+    );
+}
+
+/// Decyzja refcountu: czy skasowac wezel/krawedz z grafu po usunieciu wierszy
+/// rejestru kasowanego dokumentu. `remaining_refs` to liczba wierszy graph_artifacts
+/// INNYCH dokumentow, ktore wciaz referuja ten sam node_id / klucz krawedzi. Wezel
+/// (lub krawedz) ginie z grafu DOPIERO gdy refcount spadnie do 0 — inaczej zostaje,
+/// bo wspoldzieli go inny dokument (istota multi-doc GraphRAG).
+fn should_delete_from_graph(remaining_refs: i64) -> bool {
+    remaining_refs <= 0
+}
+
+/// Liczy ile wierszy graph_artifacts (poza wlasnie kasowanym dokumentem) wciaz
+/// referuje dany wezel. Konserwatywnie: blad zapytania -> traktujemy jak "wciaz
+/// referowany" (nie kasujemy z grafu), zeby nie usunac wspoldzielonego wezla.
+fn count_other_node_refs(node_id: &str, exclude_document_id: &str) -> i64 {
+    sql_query_one(
+        "SELECT COUNT(*) FROM graph_artifacts \
+         WHERE kind = 'node' AND n_id = ? AND document_id != ?",
+        &[
+            SqlValue::String(node_id.to_string()),
+            SqlValue::String(exclude_document_id.to_string()),
+        ],
+    )
+    .ok()
+    .flatten()
+    .and_then(|row| row.first().and_then(|v| v.as_i64()))
+    .unwrap_or(1)
+}
+
+/// Jak `count_other_node_refs`, ale dla krawedzi po kluczu (src, rel, dst).
+fn count_other_edge_refs(src: &str, rel: &str, dst: &str, exclude_document_id: &str) -> i64 {
+    sql_query_one(
+        "SELECT COUNT(*) FROM graph_artifacts \
+         WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ? AND document_id != ?",
+        &[
+            SqlValue::String(src.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(dst.to_string()),
+            SqlValue::String(exclude_document_id.to_string()),
+        ],
+    )
+    .ok()
+    .flatten()
+    .and_then(|row| row.first().and_then(|v| v.as_i64()))
+    .unwrap_or(1)
+}
+
+/// Kasuje artefakty grafu dokumentu (kolekcja 'kg') po rejestrze graph_artifacts z
+/// REFCOUNTEM i czysci wlasne wiersze rejestru. Idempotentny — wolany przy
+/// re-ingescie i cleanup-on-failure.
+///
+/// Wezly/krawedzie maja id = znormalizowana nazwa, wiec sa WSPOLDZIELONE miedzy
+/// dokumentami. Kasujemy je z grafu TYLKO gdy zaden inny dokument ich juz nie
+/// referuje (refcount po rejestrze == 0). Inaczej zostawiamy je w grafie, bo nalezą
+/// tez do innego dokumentu (multi-doc GraphRAG). Refcount liczymy PRZED usunieciem
+/// wlasnych wierszy (z warunkiem document_id != self), a usuniecie rejestru robimy
+/// na koncu.
+///
+/// Best-effort: pojedyncze bledy host graph API sa logowane, nie przerywaja reszty
+/// (graf nie moze blokowac cleanupu wektorow).
+fn cleanup_document_graph(document_id: &str) {
+    // Najpierw krawedzie, potem wezly (patrz komentarz w callerze). Distinct, bo ten
+    // sam klucz moze pojawic sie w rejestrze dokumentu wielokrotnie (rozne chunki).
+    if let Ok(rows) = sql_query(
+        "SELECT DISTINCT src, rel, dst FROM graph_artifacts WHERE document_id = ? AND kind = 'edge'",
+        &[SqlValue::String(document_id.to_string())],
+    ) {
+        for row in &rows {
+            let src = row.first().and_then(|v| v.as_str()).unwrap_or("");
+            let rel = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let dst = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            if src.is_empty() || rel.is_empty() || dst.is_empty() {
+                continue;
+            }
+            let remaining = count_other_edge_refs(src, rel, dst, document_id);
+            if should_delete_from_graph(remaining) {
+                if let Err(e) = graph_delete_edge(KG_COLLECTION, src, rel, dst) {
+                    log::warn(&format!("rag: cleanup krawedzi '{src}-{rel}-{dst}' nieudany: {e}"));
+                }
+            }
+        }
+    }
+    if let Ok(rows) = sql_query(
+        "SELECT DISTINCT n_id FROM graph_artifacts WHERE document_id = ? AND kind = 'node'",
+        &[SqlValue::String(document_id.to_string())],
+    ) {
+        for row in &rows {
+            let id = row.first().and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let remaining = count_other_node_refs(id, document_id);
+            if should_delete_from_graph(remaining) {
+                if let Err(e) = graph_delete_node(KG_COLLECTION, id) {
+                    log::warn(&format!("rag: cleanup wezla '{id}' nieudany: {e}"));
+                }
+            }
+        }
+    }
+
+    let _ = sql_exec(
+        "DELETE FROM graph_artifacts WHERE document_id = ?",
         &[SqlValue::String(document_id.to_string())],
     );
 }
@@ -630,7 +812,8 @@ fn handle_list_documents(params: &Value) -> Value {
 
     let rows = match sql_query(
         "SELECT d.id, d.filename, d.mime, d.status, d.page_count, d.created_at, \
-         (SELECT COUNT(*) FROM chunks ch WHERE ch.document_id = d.id) \
+         (SELECT COUNT(*) FROM chunks ch WHERE ch.document_id = d.id), \
+         d.entity_count, d.relation_count, d.graph_partial \
          FROM documents d WHERE d.collection_id = ? ORDER BY d.created_at DESC",
         &[SqlValue::String(collection_id.to_string())],
     ) {
@@ -649,6 +832,9 @@ fn handle_list_documents(params: &Value) -> Value {
                 "page_count": row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
                 "created_at": row.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
                 "chunk_count": row.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                "entity_count": row.get(7).and_then(|v| v.as_i64()).unwrap_or(0),
+                "relation_count": row.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+                "graph_partial": row.get(9).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
             })
         })
         .collect();
@@ -681,6 +867,393 @@ fn handle_ingest_status(params: &Value) -> Value {
         Ok(None) => err("Job nie istnieje"),
         Err(e) => err(&format!("Blad odczytu joba: {e}")),
     }
+}
+
+// =============================================================================
+// Ekstrakcja encji/relacji do grafu wiedzy (slice E3.0)
+//
+// Po zapisaniu wektora chunku wolamy rag-llm (llm_generate, model=rag-llm) z
+// promptem ekstrakcji i parsujemy JSON {entities, relations}. Encje -> wezly,
+// relacje -> krawedzie w kolekcji 'kg' z OBOWIAZKOWYM provenance (doc_id,
+// chunk_index, extractor_version) i odwracalnym rejestrem (graph_artifacts).
+//
+// Graf jest BEST-EFFORT: gdy rag-llm jest niedostepny albo zwroci smieci, NIE
+// wywalamy ingestu — wektory sa krytyczne, graf to wzbogacenie. Blad ekstrakcji
+// jest logowany, dokument oznaczany jako graph_partial, ingest leci dalej.
+// =============================================================================
+
+/// Wyekstrahowana encja: znormalizowane id (dedup) + oryginalna nazwa + typ.
+#[derive(Debug, Clone, PartialEq)]
+struct ExtractedEntity {
+    /// Znormalizowane id wezla (lowercase+trim) — podstawowy dedup. Pelna
+    /// entity-resolution to E3.1.
+    id: String,
+    /// Oryginalna nazwa (zachowana w props.name).
+    name: String,
+    /// Typ encji -> label wezla.
+    entity_type: String,
+}
+
+/// Wyekstrahowana relacja (triple): head -[relation]-> tail, znormalizowane konce.
+#[derive(Debug, Clone, PartialEq)]
+struct ExtractedRelation {
+    head_id: String,
+    relation: String,
+    tail_id: String,
+}
+
+/// Wynik parsowania + zastosowania capow dla jednego chunku. `truncated` = TRUE gdy
+/// cap per-chunk (encje/relacje) obcial liste albo za-dluga relacja zostala
+/// pominieta — sygnal do oznaczenia grafu jako czesciowy (graph_partial, bug 5/6).
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ChunkExtraction {
+    entities: Vec<ExtractedEntity>,
+    relations: Vec<ExtractedRelation>,
+    truncated: bool,
+}
+
+/// Normalizuje nazwe encji do stabilnego id wezla: trim + lowercase + scalenie
+/// bialych znakow w pojedyncza spacje. To PODSTAWOWY dedup (te same nazwy w roznej
+/// wielkosci liter/odstepach -> jeden wezel). Pelna entity-resolution to E3.1.
+fn normalize_entity_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Wycina tresc chat-completion lub bierze caly tekst, a nastepnie probuje
+/// wyciagnac obiekt JSON {entities, relations} TOLERUJAC proze wokol (LLM czesto
+/// owija JSON w komentarz albo ```json). Zwraca przyciety wg capow wynik. Smieci
+/// (brak parsowalnego JSON-a z oczekiwanym ksztaltem) -> pusty wynik (Default).
+fn parse_extraction_response(raw: &str) -> ChunkExtraction {
+    let inner = chat_completion_content(raw).unwrap_or_else(|| raw.to_string());
+    let json_slice = match extract_json_object(&inner) {
+        Some(s) => s,
+        None => return ChunkExtraction::default(),
+    };
+    let value: Value = match serde_json::from_str(json_slice) {
+        Ok(v) => v,
+        Err(_) => return ChunkExtraction::default(),
+    };
+    parse_extraction_value(&value)
+}
+
+/// Buduje `ChunkExtraction` z juz sparsowanego JSON-a, stosujac capy i dedup.
+fn parse_extraction_value(value: &Value) -> ChunkExtraction {
+    let mut entities: Vec<ExtractedEntity> = Vec::new();
+    let mut seen_ids: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    if let Some(arr) = value.get("entities").and_then(|v| v.as_array()) {
+        for item in arr {
+            if entities.len() >= MAX_ENTITIES_PER_CHUNK {
+                // Cap per-chunk obcial liste encji -> graf czesciowy (bug 5).
+                truncated = true;
+                break;
+            }
+            let name = match item.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.trim(),
+                None => continue,
+            };
+            if name.is_empty() || name.chars().count() > MAX_ENTITY_NAME_CHARS {
+                continue;
+            }
+            let id = normalize_entity_name(name);
+            if id.is_empty() || seen_ids.contains(&id) {
+                continue;
+            }
+            let entity_type = item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Entity")
+                .to_string();
+            seen_ids.push(id.clone());
+            entities.push(ExtractedEntity { id, name: name.to_string(), entity_type });
+        }
+    }
+
+    let mut relations: Vec<ExtractedRelation> = Vec::new();
+    if let Some(arr) = value.get("relations").and_then(|v| v.as_array()) {
+        for item in arr {
+            if relations.len() >= MAX_RELATIONS_PER_CHUNK {
+                // Cap per-chunk obcial liste relacji -> graf czesciowy (bug 5).
+                truncated = true;
+                break;
+            }
+            let head = item.get("head").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+            let tail = item.get("tail").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+            let relation = item
+                .get("relation")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if head.is_empty() || tail.is_empty() || relation.is_empty() {
+                continue;
+            }
+            // Cap dlugosci wszystkich trzech czlonow (bug 6): relation jest czescia
+            // klucza krawedzi (src,rel,dst) — bez capa 65KB-owa nazwa relacji
+            // rozdmuchalaby klucz w grafie i rejestrze. Za-dluga -> pomijamy triple
+            // i oznaczamy obciecie.
+            if head.chars().count() > MAX_ENTITY_NAME_CHARS
+                || tail.chars().count() > MAX_ENTITY_NAME_CHARS
+                || relation.chars().count() > MAX_ENTITY_NAME_CHARS
+            {
+                truncated = true;
+                continue;
+            }
+            relations.push(ExtractedRelation {
+                head_id: normalize_entity_name(head),
+                relation: relation.to_string(),
+                tail_id: normalize_entity_name(tail),
+            });
+        }
+    }
+
+    ChunkExtraction { entities, relations, truncated }
+}
+
+/// Znajduje pierwszy zbalansowany obiekt JSON `{...}` w tekscie (toleruje proze i
+/// fence ```json wokol). Liczy nawiasy klamrowe POZA stringami (z obsluga escape),
+/// wiec `{` w wartosci tekstowej nie psuje zliczania.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Wola rag-llm (llm_generate, model=rag-llm) z promptem ekstrakcji dla tekstu
+/// chunku i zwraca surowa odpowiedz. Blad host-fn / pusta odpowiedz -> Err (caller
+/// traktuje to best-effort: loguje i kontynuuje ingest wektorowy).
+fn call_extraction_llm(chunk_text: &str) -> Result<String, String> {
+    let prompt = format!(
+        "Wyciagnij encje i relacje z ponizszego tekstu. Zwroc WYLACZNIE JSON o ksztalcie \
+         {{\"entities\":[{{\"name\":\"...\",\"type\":\"...\"}}],\
+         \"relations\":[{{\"head\":\"...\",\"relation\":\"...\",\"tail\":\"...\"}}]}}. \
+         Uzywaj TYLKO faktow obecnych w tekscie, nie halucynuj. head i tail relacji musza \
+         odpowiadac nazwom encji. Bez komentarza, bez markdown.\n\nTEKST:\n{chunk_text}"
+    );
+    let model = "rag-llm";
+    let options = json!({ "task": "chat", "temperature": 0.0 });
+    let options_str =
+        serde_json::to_string(&options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
+
+    let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.as_bytes();
+    let options_bytes = options_str.as_bytes();
+    let mut buffer = vec![0u8; EXTRACT_BUFFER_SIZE];
+    let mut out_len: i32 = 0;
+
+    let rc = unsafe {
+        llm_generate(
+            prompt_bytes.as_ptr() as i32, prompt_bytes.len() as i32,
+            model_bytes.as_ptr() as i32, model_bytes.len() as i32,
+            options_bytes.as_ptr() as i32, options_bytes.len() as i32,
+            buffer.as_mut_ptr() as i32, EXTRACT_BUFFER_SIZE as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+    if rc < 0 {
+        return Err(format!("rag-llm zwrocil blad: {rc}"));
+    }
+    if out_len <= 0 {
+        return Err("rag-llm zwrocil pusta odpowiedz".to_string());
+    }
+    Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
+}
+
+/// Buduje provenance faktu — OBOWIAZKOWE pola (doc_id, chunk_id, extractor_version)
+/// + confidence. Wspolne dla wezlow i krawedzi tego chunku.
+fn build_provenance(document_id: &str, chunk_index: usize) -> Provenance {
+    Provenance {
+        chunk_id: Some(chunk_index.to_string()),
+        doc_id: Some(document_id.to_string()),
+        page: None,
+        span: None,
+        confidence: Some(DEFAULT_CONFIDENCE),
+        extractor_version: Some(EXTRACTOR_VERSION.to_string()),
+    }
+}
+
+/// Czy wynik ekstrakcji chunku ma oznaczyc graf jako czesciowy. KAZDY blad
+/// (LLM, parsowanie, upsert grafu, a takze blad REJESTRU graph_artifacts z bug 4)
+/// wraca tu jako Err i podnosi graph_partial — rozjazd "w grafie ale nie w
+/// rejestrze" / niepelna ekstrakcja nigdy nie ginie cicho. Obciecie capem jest
+/// sygnalizowane osobno (flaga `truncated`), wiec sukces (Ok) NIE podnosi flagi.
+fn chunk_extraction_marks_partial(result: &Result<(usize, usize), String>) -> bool {
+    result.is_err()
+}
+
+/// Ekstrakcja grafu dla jednego chunku: wola rag-llm, parsuje, upsertuje wezly +
+/// krawedzie do 'kg' z provenance i rejestruje artefakty (graph_artifacts) do
+/// odwracalnego cleanupu. Zwraca `(liczba_encji, liczba_relacji)` realnie
+/// zapisanych. BEST-EFFORT: kazdy blad (LLM/parsowanie/upsert) zwraca Err, ktory
+/// caller loguje i traktuje jako graf czesciowy — NIE przerywa ingestu wektorowego.
+///
+/// `doc_triples_so_far` to licznik triple'ow juz zapisanych dla calego dokumentu
+/// (cap MAX_TRIPLES_PER_DOC) — aktualizowany o realnie wstawione krawedzie.
+/// `truncated` jest ustawiane na TRUE gdy jakikolwiek cap (per-chunk, per-doc) lub
+/// pominiecie za-dlugiej relacji obcie dane — caller propaguje to do graph_partial
+/// (bug 5/6).
+fn extract_chunk_graph(
+    document_id: &str,
+    chunk_index: usize,
+    chunk_text: &str,
+    doc_triples_so_far: &mut usize,
+    truncated: &mut bool,
+) -> Result<(usize, usize), String> {
+    let raw = call_extraction_llm(chunk_text)?;
+    let extraction = parse_extraction_response(&raw);
+    // Capy per-chunk / pominiete za-dlugie relacje sygnalizowane przez parser (bug 5/6).
+    if extraction.truncated {
+        *truncated = true;
+    }
+    if extraction.entities.is_empty() && extraction.relations.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let provenance = build_provenance(document_id, chunk_index);
+    let now = now_unix();
+
+    // Wezly encji. Tylko encje z tego chunku staja sie "znane" do walidacji relacji.
+    // INWARIANT (bug 4): rejestr graph_artifacts MUSI byc nadzbiorem grafu — co w
+    // grafie, to w rejestrze, inaczej cleanup pominie artefakt (rozjazd refcountu).
+    // Dlatego rejestrujemy PRZED upsertem grafu i propagujemy blad rejestru jako Err
+    // (caller traktuje to best-effort: graph_partial, wektory niezmienione). Gdyby
+    // padl upsert grafu PO udanym rejestrze, rejestr ma "nadmiarowy" wiersz — cleanup
+    // sprobuje skasowac nieistniejacy wezel (idempotentnie, bez szkody).
+    let mut known: Vec<String> = Vec::with_capacity(extraction.entities.len());
+    let mut entity_count = 0usize;
+    for entity in &extraction.entities {
+        record_graph_node(document_id, &entity.id, now)
+            .map_err(|e| format!("rejestr wezla '{}': {e}", entity.id))?;
+        let node = GraphNode {
+            id: entity.id.clone(),
+            label: entity.entity_type.clone(),
+            props: vec![GraphProp {
+                name: "name".to_string(),
+                value: VectorFieldValue::Str(entity.name.clone()),
+            }],
+            provenance: Some(provenance.clone()),
+        };
+        graph_upsert_node(KG_COLLECTION, node)
+            .map_err(|e| format!("upsert wezla '{}': {e}", entity.id))?;
+        if !known.contains(&entity.id) {
+            known.push(entity.id.clone());
+        }
+        entity_count += 1;
+    }
+
+    // Krawedzie relacji. head/tail musza byc znanymi encjami tego chunku; gdy
+    // brakuje wezla konca, upsertujemy go (placeholder label "Entity"), by krawedz
+    // nie wisiala. Respektujemy globalny cap triple'ow na dokument.
+    let mut relation_count = 0usize;
+    for rel in &extraction.relations {
+        if *doc_triples_so_far >= MAX_TRIPLES_PER_DOC {
+            // Cap per-dokument obcial reszte relacji -> graf niekompletny (bug 5).
+            *truncated = true;
+            break;
+        }
+        for endpoint in [&rel.head_id, &rel.tail_id] {
+            if !known.contains(endpoint) {
+                record_graph_node(document_id, endpoint, now)
+                    .map_err(|e| format!("rejestr wezla konca '{endpoint}': {e}"))?;
+                let node = GraphNode {
+                    id: endpoint.clone(),
+                    label: "Entity".to_string(),
+                    props: vec![GraphProp {
+                        name: "name".to_string(),
+                        value: VectorFieldValue::Str(endpoint.clone()),
+                    }],
+                    provenance: Some(provenance.clone()),
+                };
+                graph_upsert_node(KG_COLLECTION, node)
+                    .map_err(|e| format!("upsert wezla konca '{endpoint}': {e}"))?;
+                known.push(endpoint.clone());
+            }
+        }
+        record_graph_edge(document_id, &rel.head_id, &rel.relation, &rel.tail_id, now)
+            .map_err(|e| {
+                format!("rejestr krawedzi '{}-{}-{}': {e}", rel.head_id, rel.relation, rel.tail_id)
+            })?;
+        graph_upsert_edge(
+            KG_COLLECTION,
+            &rel.head_id,
+            &rel.relation,
+            &rel.tail_id,
+            Some(DEFAULT_CONFIDENCE as f64),
+            Vec::new(),
+            Some(provenance.clone()),
+        )
+        .map_err(|e| format!("upsert krawedzi '{}-{}-{}': {e}", rel.head_id, rel.relation, rel.tail_id))?;
+        relation_count += 1;
+        *doc_triples_so_far += 1;
+    }
+
+    Ok((entity_count, relation_count))
+}
+
+/// Rejestruje wezel grafu utworzony dla dokumentu (do odwracalnego cleanupu +
+/// refcountu). Blad INSERT jest PROPAGOWANY (bug 4): bez wiersza rejestru cleanup
+/// nie znalby tego wezla i refcount bylby rozjechany, wiec lepiej oznaczyc graf
+/// jako czesciowy niz zostawic artefakt-sierote.
+fn record_graph_node(document_id: &str, node_id: &str, now: i64) -> Result<(), String> {
+    sql_exec(
+        "INSERT INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)",
+        &[
+            SqlValue::String(document_id.to_string()),
+            SqlValue::String(node_id.to_string()),
+            SqlValue::I64(now),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("{e}"))
+}
+
+/// Rejestruje krawedz grafu utworzona dla dokumentu (do odwracalnego cleanupu +
+/// refcountu). Blad INSERT propagowany — patrz `record_graph_node` (bug 4).
+fn record_graph_edge(document_id: &str, src: &str, rel: &str, dst: &str, now: i64) -> Result<(), String> {
+    sql_exec(
+        "INSERT INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
+         VALUES (?, 'edge', ?, ?, ?, ?)",
+        &[
+            SqlValue::String(document_id.to_string()),
+            SqlValue::String(src.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(dst.to_string()),
+            SqlValue::I64(now),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("{e}"))
 }
 
 // =============================================================================
@@ -1243,5 +1816,282 @@ mod tests {
         assert_eq!(chunks.len(), 1, "krotki tekst miesci sie w jednym chunku");
         assert!(chunks[0].contains("Pierwsze"));
         assert!(chunks[0].contains("akapit"));
+    }
+
+    // --- Ekstrakcja encji/relacji (slice E3.0) ---
+
+    #[test]
+    fn normalize_entity_name_dedup_basics() {
+        // Trim + lowercase + scalenie bialych znakow -> stabilny id (dedup).
+        assert_eq!(normalize_entity_name("  Ada  Lovelace "), "ada lovelace");
+        assert_eq!(normalize_entity_name("ADA\tLOVELACE"), "ada lovelace");
+        assert_eq!(
+            normalize_entity_name("Ada Lovelace"),
+            normalize_entity_name("ada   lovelace")
+        );
+    }
+
+    #[test]
+    fn parse_extraction_basic_entities_and_relations() {
+        let raw = r#"{"entities":[{"name":"Ada","type":"Person"},
+            {"name":"Babbage","type":"Person"}],
+            "relations":[{"head":"Ada","relation":"KNOWS","tail":"Babbage"}]}"#;
+        let ex = parse_extraction_response(raw);
+        assert_eq!(ex.entities.len(), 2);
+        assert_eq!(ex.entities[0].id, "ada");
+        assert_eq!(ex.entities[0].name, "Ada");
+        assert_eq!(ex.entities[0].entity_type, "Person");
+        assert_eq!(ex.relations.len(), 1);
+        assert_eq!(ex.relations[0].head_id, "ada");
+        assert_eq!(ex.relations[0].relation, "KNOWS");
+        assert_eq!(ex.relations[0].tail_id, "babbage");
+    }
+
+    #[test]
+    fn parse_extraction_tolerates_prose_and_fences() {
+        // LLM owija JSON w proze i fence ```json — i tak wyciagamy zbalansowany obiekt.
+        let raw = "Oto wynik:\n```json\n{\"entities\":[{\"name\":\"Paris\",\"type\":\"City\"}],\
+                   \"relations\":[]}\n```\nKoniec.";
+        let ex = parse_extraction_response(raw);
+        assert_eq!(ex.entities.len(), 1);
+        assert_eq!(ex.entities[0].id, "paris");
+        assert!(ex.relations.is_empty());
+    }
+
+    #[test]
+    fn parse_extraction_handles_chat_completion_wrapper() {
+        let inner = r#"{"entities":[{"name":"X","type":"T"}],"relations":[]}"#;
+        let escaped = serde_json::to_string(inner).unwrap();
+        let raw = format!(r#"{{"choices":[{{"message":{{"content":{escaped}}}}}]}}"#);
+        let ex = parse_extraction_response(&raw);
+        assert_eq!(ex.entities.len(), 1);
+        assert_eq!(ex.entities[0].id, "x");
+    }
+
+    #[test]
+    fn parse_extraction_rejects_garbage() {
+        for raw in ["zupelnie nic", "", "12345", "<xml>nope</xml>"] {
+            let ex = parse_extraction_response(raw);
+            assert!(ex.entities.is_empty() && ex.relations.is_empty(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn parse_extraction_dedups_entities() {
+        let raw = r#"{"entities":[{"name":"Ada","type":"Person"},
+            {"name":"ada","type":"Person"},{"name":" ADA ","type":"X"}],"relations":[]}"#;
+        let ex = parse_extraction_response(raw);
+        assert_eq!(ex.entities.len(), 1, "rozne warianty tej samej nazwy -> jeden wezel");
+        assert_eq!(ex.entities[0].id, "ada");
+    }
+
+    #[test]
+    fn parse_extraction_caps_entities_at_max() {
+        let mut items = String::new();
+        for i in 0..50 {
+            if i > 0 {
+                items.push(',');
+            }
+            items.push_str(&format!(r#"{{"name":"E{i}","type":"T"}}"#));
+        }
+        let raw = format!(r#"{{"entities":[{items}],"relations":[]}}"#);
+        let ex = parse_extraction_response(&raw);
+        assert_eq!(ex.entities.len(), MAX_ENTITIES_PER_CHUNK, "nadmiar encji przyciety");
+        assert!(ex.truncated, "obciecie capem encji musi sygnalizowac truncated (bug 5)");
+    }
+
+    #[test]
+    fn parse_extraction_caps_relations_at_max() {
+        let mut items = String::new();
+        for i in 0..50 {
+            if i > 0 {
+                items.push(',');
+            }
+            items.push_str(&format!(r#"{{"head":"a{i}","relation":"R","tail":"b{i}"}}"#));
+        }
+        let raw = format!(r#"{{"entities":[],"relations":[{items}]}}"#);
+        let ex = parse_extraction_response(&raw);
+        assert_eq!(ex.relations.len(), MAX_RELATIONS_PER_CHUNK, "nadmiar relacji przyciety");
+        assert!(ex.truncated, "obciecie capem relacji musi sygnalizowac truncated (bug 5)");
+    }
+
+    #[test]
+    fn parse_extraction_within_caps_not_truncated() {
+        // Dane mieszczace sie w capach NIE moga falszywie podnosic truncated.
+        let raw = r#"{"entities":[{"name":"A","type":"T"}],
+            "relations":[{"head":"A","relation":"R","tail":"B"}]}"#;
+        let ex = parse_extraction_response(raw);
+        assert!(!ex.truncated, "dane w granicach capow nie sa obciete");
+    }
+
+    #[test]
+    fn parse_extraction_overlong_relation_dropped_and_truncated() {
+        // Relacja > MAX_ENTITY_NAME_CHARS pomijana (klucz krawedzi nie moze byc
+        // gigantyczny) i sygnalizowana jako obciecie (bug 6).
+        let long_rel = "R".repeat(MAX_ENTITY_NAME_CHARS + 1);
+        let raw = format!(
+            r#"{{"entities":[],"relations":[
+                {{"head":"a","relation":"{long_rel}","tail":"b"}},
+                {{"head":"c","relation":"OK","tail":"d"}}]}}"#
+        );
+        let ex = parse_extraction_response(&raw);
+        assert_eq!(ex.relations.len(), 1, "za dluga relacja odrzucona, krotka zostaje");
+        assert_eq!(ex.relations[0].relation, "OK");
+        assert!(ex.truncated, "pominiecie za-dlugiej relacji ustawia truncated (bug 6)");
+    }
+
+    // --- Refcount cleanupu wspoldzielonych wezlow/krawedzi (bug 1+2) ---
+
+    #[test]
+    fn refcount_keeps_node_while_other_doc_references_it() {
+        // Dopoki INNY dokument referuje wezel/krawedz (remaining_refs > 0), NIE
+        // kasujemy z grafu — wspoldzielony przez multi-doc GraphRAG.
+        assert!(!should_delete_from_graph(1), "1 inny dokument trzyma wezel -> zostaw");
+        assert!(!should_delete_from_graph(3), "kilka innych dokumentow -> zostaw");
+    }
+
+    #[test]
+    fn refcount_deletes_node_when_no_other_doc_references_it() {
+        // Refcount 0 (zaden inny dokument) -> kasujemy z grafu.
+        assert!(should_delete_from_graph(0), "brak innych referencji -> kasuj");
+        // Wartosc ujemna (teoretycznie niemozliwa) tez traktujemy jak 0.
+        assert!(should_delete_from_graph(-1));
+    }
+
+    // Wiersz rejestru graph_artifacts (model in-memory do testu refcountu). Odwzorowuje
+    // schemat tabeli: per (document_id, obiekt). Edge-key = (src, rel, dst).
+    #[derive(Clone)]
+    struct Artifact {
+        document_id: &'static str,
+        key: &'static str,
+    }
+
+    // Mirror SQL `COUNT(*) ... WHERE key = ? AND document_id != ?` z count_other_*:
+    // ile INNYCH dokumentow trzyma dany klucz. To dokladnie predykat refcountu.
+    fn other_refs(registry: &[Artifact], key: &str, exclude_doc: &str) -> i64 {
+        registry
+            .iter()
+            .filter(|a| a.key == key && a.document_id != exclude_doc)
+            .count() as i64
+    }
+
+    // Model cleanupu dokumentu z refcountem: zwraca klucze faktycznie kasowane z grafu
+    // (refcount -> 0) i usuwa wiersze dokumentu z rejestru. Odwzorowuje
+    // cleanup_document_graph: decyzja per klucz = should_delete_from_graph(other_refs).
+    fn cleanup_doc_model(registry: &mut Vec<Artifact>, doc: &'static str) -> Vec<String> {
+        let mut deleted = Vec::new();
+        let mut own_keys: Vec<&str> =
+            registry.iter().filter(|a| a.document_id == doc).map(|a| a.key).collect();
+        own_keys.sort_unstable();
+        own_keys.dedup();
+        for key in own_keys {
+            if should_delete_from_graph(other_refs(registry, key, doc)) {
+                deleted.push(key.to_string());
+            }
+        }
+        registry.retain(|a| a.document_id != doc);
+        deleted
+    }
+
+    #[test]
+    fn refcount_cleanup_shared_entity_across_two_docs() {
+        // Doc A i doc B oba wnosza encje "einstein" i krawedz "einstein|knows|bohr".
+        let mut registry = vec![
+            Artifact { document_id: "A", key: "node:einstein" },
+            Artifact { document_id: "A", key: "edge:einstein|knows|bohr" },
+            Artifact { document_id: "B", key: "node:einstein" },
+            Artifact { document_id: "B", key: "edge:einstein|knows|bohr" },
+        ];
+
+        // Cleanup A: B nadal referuje oba -> NIC nie kasujemy z grafu (refcount > 0).
+        let deleted_a = cleanup_doc_model(&mut registry, "A");
+        assert!(
+            deleted_a.is_empty(),
+            "cleanup A nie moze usunac wezla/krawedzi wspoldzielonych z B: {deleted_a:?}"
+        );
+        // Wiersze A znikaja z rejestru, B zostaja.
+        assert_eq!(registry.iter().filter(|a| a.document_id == "B").count(), 2);
+        assert_eq!(registry.iter().filter(|a| a.document_id == "A").count(), 0);
+
+        // Cleanup B: teraz refcount obu kluczy = 0 -> kasujemy z grafu.
+        let mut deleted_b = cleanup_doc_model(&mut registry, "B");
+        deleted_b.sort();
+        assert_eq!(
+            deleted_b,
+            vec!["edge:einstein|knows|bohr".to_string(), "node:einstein".to_string()],
+            "po cleanup B (refcount 0) wezel i krawedz znikaja z grafu"
+        );
+        assert!(registry.is_empty(), "rejestr pusty po cleanupie obu dokumentow");
+    }
+
+    #[test]
+    fn refcount_cleanup_deletes_unshared_artifacts() {
+        // Encja unikalna dla A (zaden inny dokument) -> cleanup A kasuje ja od razu.
+        let mut registry = vec![
+            Artifact { document_id: "A", key: "node:solo" },
+            Artifact { document_id: "B", key: "node:other" },
+        ];
+        let deleted = cleanup_doc_model(&mut registry, "A");
+        assert_eq!(deleted, vec!["node:solo".to_string()], "wezel bez wspoldzielenia kasowany");
+        assert_eq!(registry.len(), 1, "wiersz B nietkniety");
+    }
+
+    // --- Propagacja bledu rejestru graph_artifacts -> graph_partial (bug 4) ---
+
+    #[test]
+    fn registry_failure_marks_graph_partial() {
+        // Blad rejestru (record_graph_node/edge) wraca z extract_chunk_graph jako Err
+        // i MUSI oznaczyc graf jako czesciowy — bez tego byl cichy rozjazd
+        // "w grafie ale nie w rejestrze" i cleanup nie usunalby artefaktu.
+        let err: Result<(usize, usize), String> = Err("rejestr wezla 'x': zapis sql padl".into());
+        assert!(chunk_extraction_marks_partial(&err), "blad rejestru -> graph_partial (bug 4)");
+    }
+
+    #[test]
+    fn successful_extraction_does_not_mark_partial() {
+        // Sukces ekstrakcji NIE podnosi graph_partial (obciecie sygnalizuje truncated).
+        let ok: Result<(usize, usize), String> = Ok((3, 2));
+        assert!(!chunk_extraction_marks_partial(&ok), "Ok nie oznacza grafu czesciowego");
+    }
+
+    #[test]
+    fn parse_extraction_rejects_overlong_entity_name() {
+        let long = "x".repeat(MAX_ENTITY_NAME_CHARS + 1);
+        let raw = format!(
+            r#"{{"entities":[{{"name":"{long}","type":"T"}},{{"name":"ok","type":"T"}}],"relations":[]}}"#
+        );
+        let ex = parse_extraction_response(&raw);
+        assert_eq!(ex.entities.len(), 1, "za dluga nazwa odrzucona");
+        assert_eq!(ex.entities[0].id, "ok");
+    }
+
+    #[test]
+    fn parse_extraction_drops_incomplete_relations() {
+        let raw = r#"{"entities":[],"relations":[
+            {"head":"a","relation":"R","tail":"b"},
+            {"head":"","relation":"R","tail":"b"},
+            {"head":"a","relation":"","tail":"b"},
+            {"head":"a","relation":"R","tail":""}]}"#;
+        let ex = parse_extraction_response(raw);
+        assert_eq!(ex.relations.len(), 1, "tylko kompletny triple przechodzi");
+    }
+
+    #[test]
+    fn extract_json_object_ignores_braces_in_strings() {
+        // Nawias '{' w wartosci tekstowej NIE moze psuc zliczania zbalansowania.
+        let raw = r#"prefix {"name":"a {b} c","type":"T"} suffix"#;
+        let slice = extract_json_object(raw).expect("powinien znalezc obiekt");
+        let v: Value = serde_json::from_str(slice).unwrap();
+        assert_eq!(v["name"].as_str(), Some("a {b} c"));
+    }
+
+    #[test]
+    fn build_provenance_has_mandatory_fields() {
+        // Provenance OBOWIAZKOWE: doc_id, chunk_id, extractor_version (wymog planu §8).
+        let p = build_provenance("doc42", 7);
+        assert_eq!(p.doc_id.as_deref(), Some("doc42"));
+        assert_eq!(p.chunk_id.as_deref(), Some("7"));
+        assert_eq!(p.extractor_version.as_deref(), Some(EXTRACTOR_VERSION));
+        assert!(p.confidence.is_some());
     }
 }
