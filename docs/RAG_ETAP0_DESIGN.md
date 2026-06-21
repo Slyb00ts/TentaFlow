@@ -481,3 +481,14 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
 - **Etap 1 (addon RAG)** — start: manifest (aliasy rag-*, namespaces, flow_template, [application], perms),
   per-instance SQLite (collections/documents/chunks/ingest_jobs), logika ingestu w WASM
   (document→doc_parse→chunk→embed→vector+graf), logika query (trigger flow→retrieval→answer), GUI.
+
+## MILESTONE — działający RAG end-to-end (E2.0)
+- **E2.0 query-flow** ✅ (codex GO po NO-GO→fix): `[[engine_flow]]` (addon dostarcza flow_engine flow,
+  core rejestruje przy install jako published model per-instancja, atomowo), `query.flow.json`
+  (trigger→embeddings→vector[collection-scoped]→combine→llm→output{answer,citations}), tool `ask`
+  (wyzwala flow z tożsamością instancji, realne cytaty z hitów). collection_id→meta→filtr vector node.
+- **DZIAŁA end-to-end**: create_collection → upload → ingest(doc_parse→chunk→embed→vector) →
+  ask(question) → query-flow(embed→search→generate) → answer + realne cytaty. Per-instancja, N instancji.
+- Refinementy query: reranker w flow (potrzebny węzeł reshape vector→reranker), pętla loop (multi-hop).
+- Następne fazy: GUI addona (upload/chat/eksplorator), Etap 2 (GraphRAG: ekstrakcja encji→graf),
+  Etap 3 (MemGraphRAG: 3-warstwowa pamięć + multi-agent konflikt).
