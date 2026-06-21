@@ -43,7 +43,8 @@ use crate::flow_engine::node_adapters::{
     ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter,
+    PiiFilterNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
+    RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
@@ -1026,6 +1027,11 @@ fn build_registry(
         Arc::new(RagAccumulateNodeAdapter::new()),
         Arc::new(RagJudgeNodeAdapter::new()),
         Arc::new(RagFinalizeNodeAdapter::new()),
+        // RAG E3.2 — hop grafowy (GraphRAG): identyfikacja encji zapytania ->
+        // seedy PPR, oraz PPR/neighbors -> fakty grafowe fuzowane z pasazami.
+        // Best-effort: bez feature `graph` / bez encji w grafie -> pass-through.
+        Arc::new(RagGraphSeedNodeAdapter::new()),
+        Arc::new(RagGraphFactsNodeAdapter::new()),
         // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
         Arc::new(VectorNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),

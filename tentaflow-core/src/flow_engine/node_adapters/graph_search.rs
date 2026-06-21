@@ -472,6 +472,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ppr_all_unknown_seeds_returns_empty_not_global() {
+        // Regresja bug 1: op=ppr z JAWNYMI seedami, ktorych ZADEN nie istnieje w
+        // grafie -> PUSTY ranking (NIE globalny PageRank). Graf jest niepusty
+        // (trojkat a/b/c z krawedziami), wiec gdyby PPR degenerowal do uniform,
+        // ranking zwrocilby globalne encje (szum). Personalized PageRank z
+        // zerowymi kotwicami = brak wyniku.
+        let g = stub_graph();
+        let ctx = addon_ctx("inst-a", "org-1", g.clone());
+        seed_triangle(&g, "org-1", "inst-a", "kg");
+
+        let out = GraphSearchNodeAdapter::new()
+            .execute(
+                &node(json!({"op": "ppr"})),
+                &[input(json!({
+                    "collection": "kg",
+                    "seeds": [{"id": "nieistniejaca"}, {"id": "tez-nie-ma"}],
+                    "top_n": 10
+                }))],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let ranked = match &out.payload {
+            FlowValue::Json(v) => v.get("ranked").and_then(|r| r.as_array()).cloned().unwrap(),
+            other => panic!("expected Json, got {other:?}"),
+        };
+        assert!(
+            ranked.is_empty(),
+            "same nieznane seedy -> pusty ranking (nie globalny), bylo: {ranked:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn pagerank_returns_ranking() {
         let g = stub_graph();
         let ctx = addon_ctx("inst-a", "org-1", g.clone());

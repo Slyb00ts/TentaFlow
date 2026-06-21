@@ -188,6 +188,49 @@ fn test_export_csr_via_manager() {
 }
 
 #[test]
+fn test_ppr_empty_seeds_given_is_global_pagerank() {
+    // Seedy NIE podane (pusta lista) -> legalny globalny PageRank: niepusty
+    // ranking (jednostajna teleportacja). To inny przypadek niz „podane same
+    // nieznane id" (ten zwraca pusto).
+    let (_dir, mgr) = mgr();
+    for id in ["a", "b", "c"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "a", "to", "c", 1.0, "{}", "null")
+        .unwrap();
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "b", "to", "c", 1.0, "{}", "null")
+        .unwrap();
+
+    let no_seeds: Vec<String> = Vec::new();
+    let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &no_seeds, 10, 0.85, 30).unwrap();
+    assert!(!ranked.is_empty(), "pusta lista seedow -> globalny PageRank (niepusty)");
+}
+
+#[test]
+fn test_ppr_all_unknown_seeds_returns_empty() {
+    // Seedy JAWNIE podane, ale ZADEN nie istnieje w grafie -> PUSTY wynik
+    // (NIE globalny PageRank). Graf jest niepusty, wiec uniform-degeneracja
+    // wyciekla by globalne encje — fix bug 1 to blokuje.
+    let (_dir, mgr) = mgr();
+    for id in ["a", "b", "c"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "a", "to", "c", 1.0, "{}", "null")
+        .unwrap();
+
+    let unknown: Vec<String> = vec!["x".into(), "y".into()];
+    let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &unknown, 10, 0.85, 30).unwrap();
+    assert!(ranked.is_empty(), "same nieznane seedy -> pusty wynik, bylo: {ranked:?}");
+
+    // Kontrola: jeden ZNANY seed wsrod nieznanych -> niepusty wynik (PPR dziala).
+    let mixed: Vec<String> = vec!["x".into(), "a".into()];
+    let ranked2 = mgr.ppr(ORG_A, "addon_a", "kg", &mixed, 10, 0.85, 30).unwrap();
+    assert!(!ranked2.is_empty(), "jeden znany seed -> niepusty wynik");
+}
+
+#[test]
 fn test_isolation_between_orgs() {
     let (_dir, mgr) = mgr();
     mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", "n1", "A", "{}", "null")
