@@ -9,12 +9,16 @@
 #![forbid(unsafe_code)]
 
 pub mod graph;
+pub mod lidar;
 pub mod pose;
 pub mod submap;
 
 pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
     PoseNode, Scene,
+};
+pub use lidar::{
+    register, voxel_downsample, IcpConfig, IcpResult, LioConfig, LioTracker, TrackResult, VoxelMap,
 };
 pub use pose::{rotation_pose, translation_pose, Pose};
 pub use submap::{LocalPoint, Submap, SubmapBuilder, SubmapGeometry, SubmapId};
