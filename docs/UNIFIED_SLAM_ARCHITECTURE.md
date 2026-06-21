@@ -489,3 +489,22 @@ model + a joint mapping, and the same renderer animates it.
 Chunks: R1 `RobotJointState` type + `robot_model.toml` schema; R2 addon go2 lowstate→
 joint stream; R3 package addon with `model.glb` + serve asset; R4 renderer glTF + FK +
 interpolation + base from `GlobalPose`.
+
+---
+
+## 16. Renderer strategy + sequencing (DECISION)
+
+- **Real visualization = Rust + wgpu compiled to WASM in the browser** (the heavy
+  point-cloud map @60fps — the whole lidar latency work feeds this). This is the
+  long-term renderer.
+- **Interim robot display = Three.js** — ONLY to show the articulated robot now
+  (model + FK from the live joint angles). Throwaway; replaced by the wgpu path.
+- **SEQUENCING (user directive):** the full POSITIONING system (real-world + virtual
+  pose) must be built BEFORE the real wgpu visualization. Order:
+  1. interim Three.js robot (quick visible win, animated from telemetry `joints`);
+  2. **positioning** — complete the localization (live SLAM wiring, Go2 world pose
+     via Ethernet/DDS since WebRTC lacks position, multi-sensor fusion, georeference);
+  3. real wgpu+WASM visualization (robot + georeferenced point-cloud map).
+- Go2 over WebRTC gives joints + orientation but NO world position (probe-confirmed:
+  only `rt/lf/lowstate`; no `sportmodestate`/pose topic), so the interim robot
+  animates in place; true world placement waits for the positioning phase.
