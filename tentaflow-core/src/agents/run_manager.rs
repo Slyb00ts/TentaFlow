@@ -1356,6 +1356,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             deadline,
             cancel_token: cancel,
             progress_sink: Some(progress),
+            flow_depth: 0,
         };
 
         let outcome = dispatcher

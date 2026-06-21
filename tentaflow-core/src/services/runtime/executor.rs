@@ -21,8 +21,8 @@ use futures::Stream;
 
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingData,
-    EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, TTSRequest,
-    TranscriptionRequest, TranscriptionResponse,
+    EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, RerankRequest,
+    RerankResponse, RerankResultEntry, TTSRequest, TranscriptionRequest, TranscriptionResponse,
 };
 use crate::error::Result as CoreResult;
 use crate::flow_engine::dispatcher::FlowDispatcher;
@@ -1438,8 +1438,12 @@ impl ModelRuntimeExecutor {
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
                 // and skips the per-flow ACL check.
-                let (initial, meta) =
+                let (initial, mut meta) =
                     embeddings_request_to_initial_envelope(&request, ctx.user.clone());
+                // RAG C2: re-wejście w flow dziedziczy bieżącą głębokość (po
+                // `enter_flow`), żeby self-referencyjny embeddings-flow narastał
+                // przez `subflow_depth` zamiast resetować się do 0.
+                meta.flow_depth = ctx.flow_stack.len() as u8;
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
@@ -1451,6 +1455,166 @@ impl ModelRuntimeExecutor {
                     EmbeddingInput::Multiple(texts) => texts.len(),
                 };
                 flow_outcome_to_embedding_response(outcome, &request, expected_count)
+            }
+        }
+    }
+
+    // =========================================================================
+    // RAG C2 — Rerank dispatch (cross-encoder, /v1/rerank)
+    // =========================================================================
+
+    /// Rerank dispatch — mirrors `execute_embeddings`. Resolves the requested
+    /// model with `ServiceSurface::Rerank` (text in / text out), ranks the
+    /// candidate list and tries each until one succeeds. Alias `rag-reranker`
+    /// gets the SAME failover (candidates + availability + `alias_fallback_total`
+    /// metric + warn) as chat/embeddings — there is no second rerank path.
+    ///
+    /// **ACL is the caller's responsibility.**
+    pub async fn execute_rerank(
+        &self,
+        request: RerankRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<RerankResponse, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Rerank,
+                required_input_modalities: &[InputModality::Text],
+                required_output_modalities: &[OutputModality::Text],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_rerank_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "rerank dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target rerank dispatch. Cross-encoders are served by external
+    /// runtimes (vLLM `--task score`), so HTTP/QUIC/mesh carry the request;
+    /// embedded engines have no reranking surface and surface an error so the
+    /// fallback chain moves on. Flow targets execute a rerank-surface flow.
+    async fn dispatch_rerank_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: RerankRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<RerankResponse, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
+                    "embedded backend does not support reranking".into(),
+                )),
+                BackendHandle::Http(client) => client
+                    .rerank_request(request)
+                    .await
+                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                BackendHandle::Quic(handle) => {
+                    let quic_client = handle.get_client().await.ok_or_else(|| {
+                        ExecutorError::Internal(format!(
+                            "QUIC client not connected for service '{}'",
+                            handle.config.name
+                        ))
+                    })?;
+                    let model_request = rerank_model_request(&request);
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("QUIC rerank: {}", e)))?;
+                    rerank_result_to_response(response.result)
+                }
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let mut forwarded = request.clone();
+                forwarded.model = model_name.clone();
+                let model_request = rerank_model_request(&forwarded);
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
+                rerank_result_to_response(response.result)
+            }
+            ResolvedExecutionTarget::Flow {
+                flow_id,
+                published_name: _,
+            } => {
+                let dispatcher = self
+                    .flow_dispatcher
+                    .as_ref()
+                    .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+                ctx.enter_flow(flow_id)
+                    .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
+                let (initial, mut meta) =
+                    rerank_request_to_initial_envelope(&request, ctx.user.clone());
+                // RAG C2: re-wejście w flow dziedziczy bieżącą głębokość (po
+                // `enter_flow`), żeby self-referencyjny rerank-flow narastał
+                // przez `subflow_depth` zamiast resetować się do 0.
+                meta.flow_depth = ctx.flow_stack.len() as u8;
+                let dispatch_result = dispatcher
+                    .dispatch_by_flow_id(flow_id.clone(), initial, meta)
+                    .await;
+                ctx.leave_flow();
+                let outcome =
+                    dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                flow_outcome_to_rerank_response(outcome)
             }
         }
     }
@@ -2225,6 +2389,131 @@ pub(crate) fn flow_outcome_to_embedding_response(
     Ok(response)
 }
 
+/// Buduje `ModelRequest` (QUIC/mesh) z `RerankRequest`. Strip well-known
+/// router-side prefixu z modelu jak embeddings — silnik widzi gołą nazwę.
+fn rerank_model_request(request: &RerankRequest) -> tentaflow_protocol::ModelRequest {
+    use tentaflow_protocol::*;
+    let engine_model_name = request
+        .model
+        .strip_prefix("tentaflow-rerank-")
+        .or_else(|| request.model.strip_prefix("rerank-"))
+        .unwrap_or(&request.model)
+        .to_string();
+    ModelRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        payload: ModelPayload::Rerank(RerankPayload {
+            model: engine_model_name,
+            query: request.query.clone(),
+            documents: request.documents.clone(),
+            top_n: request.top_n.map(|n| n as usize),
+            return_documents: false,
+        }),
+        stream: false,
+        metadata: None,
+        session_id: None,
+    }
+}
+
+/// Mapuje `ModelResult` (QUIC/mesh) na `RerankResponse`. Wynik z silnika niesie
+/// `index`/`relevance_score` — `document` ignorujemy (adapter ma własne teksty).
+fn rerank_result_to_response(
+    result: tentaflow_protocol::ModelResult,
+) -> Result<RerankResponse, ExecutorError> {
+    use tentaflow_protocol::ModelResult;
+    match result {
+        ModelResult::Rerank(r) => Ok(RerankResponse {
+            results: r
+                .results
+                .into_iter()
+                .map(|item| RerankResultEntry {
+                    index: item.index,
+                    relevance_score: item.relevance_score,
+                })
+                .collect(),
+        }),
+        ModelResult::Error(err) => {
+            Err(ExecutorError::Internal(format!("rerank error: {}", err.message)))
+        }
+        _ => Err(ExecutorError::Internal(
+            "rerank returned unexpected result type".into(),
+        )),
+    }
+}
+
+/// Buduje seed envelope + meta dla rerank-as-flow path. Query na payload (Text),
+/// dokumenty + model + top_n w meta — flow-owy adapter rerankera czyta je stamtąd.
+pub(crate) fn rerank_request_to_initial_envelope(
+    request: &RerankRequest,
+    user: Option<crate::auth::acl::UserContext>,
+) -> (
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+) {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let mut env = FlowEnvelope::empty();
+    env.payload = FlowValue::Json(serde_json::json!({
+        "query": request.query,
+        "candidates": request
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(i, text)| serde_json::json!({ "id": i.to_string(), "text": text }))
+            .collect::<Vec<_>>(),
+    }));
+    env.meta.insert(
+        "rerank_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    if let Some(n) = request.top_n {
+        env.meta
+            .insert("top_n".into(), serde_json::Value::Number(n.into()));
+    }
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    (env, meta)
+}
+
+/// Konwertuje FlowExecutionOutcome (rerank-as-flow) na `RerankResponse`. Flow
+/// output to `Json{ranked:[{id,score,text}]}` — `id` (string) mapujemy z
+/// powrotem na oryginalny `index` przez parsowanie pozycji.
+pub(crate) fn flow_outcome_to_rerank_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<RerankResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let ranked = match &outcome.final_envelope.payload {
+        FlowValue::Json(v) => v.get("ranked").and_then(|r| r.as_array()).cloned(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        ExecutorError::Internal("rerank flow returned no 'ranked' array in Json payload".into())
+    })?;
+
+    let mut results = Vec::with_capacity(ranked.len());
+    for entry in ranked {
+        let index = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| {
+                ExecutorError::Internal("rerank flow entry missing numeric 'id'".into())
+            })?;
+        let relevance_score = entry
+            .get("score")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| ExecutorError::Internal("rerank flow entry missing 'score'".into()))?
+            as f32;
+        results.push(RerankResultEntry {
+            index,
+            relevance_score,
+        });
+    }
+    Ok(RerankResponse { results })
+}
+
 /// Stage 3d-0b-4: buduje seed envelope + meta dla STT-as-flow path.
 /// Audio bytes lądują w BlobStore (sentinel BlobRef zostaje na payload),
 /// adapter STT pobiera bytes z `ctx.blobs.get(&blob_ref)` w execute().
@@ -2659,6 +2948,107 @@ mod tests {
         let err = flow_outcome_to_embedding_response(outcome, &request, 3)
             .expect_err("1 embedding for 3 inputs must reject");
         assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    // RAG C2: per-target `dispatch_rerank_blocking` tests. Embedded has no
+    // reranking surface (chain moves on); MeshForward defers to pending
+    // cutover; Flow without a dispatcher surfaces the typed error.
+
+    fn make_rerank_request(model: &str) -> RerankRequest {
+        RerankRequest {
+            model: model.to_string(),
+            query: "what is rust".into(),
+            documents: vec!["doc a".into(), "doc b".into()],
+            top_n: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_embedded_is_unsupported_so_chain_moves_on() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "rerank-m".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "rerank-m".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_rerank_blocking(&target, make_rerank_request("rerank-m"), &mut ctx)
+            .await
+            .expect_err("embedded reranking is unsupported");
+        // Internal (not abort) → the failover loop keeps trying later candidates.
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(!err.aborts_fallback_chain());
+    }
+
+    #[tokio::test]
+    async fn rerank_mesh_forward_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "rerank-m".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_rerank_blocking(&target, make_rerank_request("rerank-m"), &mut ctx)
+            .await
+            .expect_err("mesh_forward branch should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rerank_flow_without_dispatcher_returns_typed_error() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: "1".to_string(),
+            published_name: "rerank-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_rerank_blocking(&target, make_rerank_request("any"), &mut ctx)
+            .await
+            .expect_err("flow without dispatcher should be a typed error");
+        assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    /// `execute_rerank` for an unknown model surfaces the resolver error rather
+    /// than panicking — the empty catalog of `dummy_executor` has no rerank
+    /// service, so resolution fails cleanly.
+    #[tokio::test]
+    async fn execute_rerank_unknown_model_surfaces_resolve_error() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .execute_rerank(make_rerank_request("no-such-reranker"), &mut ctx)
+            .await
+            .expect_err("unknown rerank model must error, not panic");
+        assert!(matches!(err, ExecutorError::Resolve(_)));
+    }
+
+    /// Flow rerank outcome → `RerankResponse`: maps string `id` back to the
+    /// original index and reads `score`. Proves the rerank-as-flow contract
+    /// used by `dispatch_rerank_blocking`'s Flow branch.
+    #[test]
+    fn flow_outcome_to_rerank_maps_id_and_score() {
+        let outcome = outcome_with_payload(crate::flow_engine::envelope::FlowValue::Json(
+            serde_json::json!({ "ranked": [
+                { "id": "1", "score": 0.9, "text": "b" },
+                { "id": "0", "score": 0.4, "text": "a" }
+            ]}),
+        ));
+        let resp = flow_outcome_to_rerank_response(outcome).expect("flow rerank maps");
+        assert_eq!(resp.results.len(), 2);
+        assert_eq!(resp.results[0].index, 1);
+        assert!((resp.results[0].relevance_score - 0.9).abs() < 1e-6);
+        assert_eq!(resp.results[1].index, 0);
     }
 
     fn make_tts_request(model: &str) -> TTSRequest {

@@ -860,6 +860,51 @@ pub struct EmbeddingUsage {
 }
 
 // =============================================================================
+// RERANK
+// =============================================================================
+
+/// Request do /v1/rerank (cross-encoder reranking, OpenAI/Cohere/vLLM-compatible).
+///
+/// Reranker rangował pasaże/dokumenty względem zapytania — krok retrievalu RAG
+/// między vector-search a LLM. vLLM `--task score` wystawia ten endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankRequest {
+    /// Model rerankingu (np. alias "rag-reranker" → "llama-nemotron-rerank-1b-v2").
+    pub model: String,
+
+    /// Zapytanie, względem którego rangujemy dokumenty.
+    pub query: String,
+
+    /// Lista dokumentów (pasaży) do zrangowania.
+    pub documents: Vec<String>,
+
+    /// Ile najlepszych zwrócić (None = wszystkie). Cross-encoder jest wąskim
+    /// gardłem, więc adapter capuje tę wartość po stronie hosta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u32>,
+}
+
+/// Response z /v1/rerank — wyniki posortowane malejąco po `relevance_score`,
+/// z `index` wskazującym pozycję w oryginalnej liście `documents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+    #[serde(default)]
+    pub results: Vec<RerankResultEntry>,
+}
+
+/// Pojedynczy wynik rerankingu — odwzorowanie indeksu na score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResultEntry {
+    /// Index dokumentu w oryginalnej liście `documents` (0-indexed).
+    pub index: usize,
+
+    /// Relevance score (wyższy = bardziej trafny). Pole bywa nazywane
+    /// `relevance_score` (Cohere/vLLM) albo `score` — akceptujemy oba.
+    #[serde(alias = "score")]
+    pub relevance_score: f32,
+}
+
+// =============================================================================
 // ERROR RESPONSE
 // =============================================================================
 

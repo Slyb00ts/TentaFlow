@@ -101,6 +101,22 @@ impl ExecutionContext {
         }
     }
 
+    /// Top-level entry seeded with an inherited flow nesting depth (RAG C2).
+    /// Capability dispatchers (reranker/embeddings) build a fresh runtime
+    /// context per call; when the calling flow node already sits `depth`
+    /// flows deep, seeding the `flow_stack` with that many placeholders makes
+    /// the runtime `MAX_FLOW_DEPTH` guard account for the inbound depth, so a
+    /// self-referential rerank/embeddings flow trips the limit instead of
+    /// recursing forever (each re-entry would otherwise reset to 0).
+    pub fn new_with_flow_depth(user: Option<UserContext>, depth: u8) -> Self {
+        let mut ctx = Self::new(user);
+        // Cap przy zasiewie — głębokość ponad limit i tak natychmiast trafi
+        // w guard przy pierwszym `enter_flow`, nie potrzeba dłuższego wektora.
+        let seed = (depth as usize).min(MAX_FLOW_DEPTH);
+        ctx.flow_stack = (0..seed).map(|i| format!("__inherited_{i}")).collect();
+        ctx
+    }
+
     /// Push an alias onto the resolution chain. Returns `Err` when the
     /// limit is exceeded or the same alias appears twice (cycle).
     pub fn enter_alias(&mut self, alias: &str) -> Result<(), ContextLimitError> {
@@ -182,6 +198,43 @@ mod tests {
         }
         let err = ctx.enter_alias("overflow").unwrap_err();
         assert!(matches!(err, ContextLimitError::MaxAliasDepth { .. }));
+    }
+
+    /// RAG C2 (bug 1, recursion guard): kontekst zasiany odziedziczoną
+    /// głębokością NIE startuje od zera. Gdy węzeł flow (`subflow_depth`)
+    /// dispatchuje reranker/embeddings, świeży runtime-context dziedziczy tę
+    /// głębokość, więc kolejne `enter_flow` narasta od niej zamiast resetować
+    /// do 0 — self-referencyjny rerank-flow trafia w `MAX_FLOW_DEPTH`.
+    #[test]
+    fn seeded_flow_depth_does_not_reset_the_guard() {
+        // Re-wejście na głębokości 1: jeden `enter_flow` jeszcze przejdzie
+        // (1 → 2 → 3), czwarty trafia w limit.
+        let mut ctx = ExecutionContext::new_with_flow_depth(None, 1);
+        assert_eq!(ctx.flow_stack.len(), 1);
+        ctx.enter_flow("a").unwrap();
+        ctx.enter_flow("b").unwrap();
+        let err = ctx.enter_flow("c").unwrap_err();
+        assert!(matches!(err, ContextLimitError::MaxFlowDepth { .. }));
+    }
+
+    /// Re-wejście już NA limicie (głębokość == `MAX_FLOW_DEPTH`) ubija
+    /// rekurencję od razu: pierwszy `enter_flow` w zasianym kontekście trafia
+    /// w guard. Dowód, że nieograniczona rekurencja jest przerwana po N.
+    #[test]
+    fn seeded_at_max_flow_depth_trips_immediately() {
+        let mut ctx = ExecutionContext::new_with_flow_depth(None, MAX_FLOW_DEPTH as u8);
+        assert_eq!(ctx.flow_stack.len(), MAX_FLOW_DEPTH);
+        let err = ctx.enter_flow("self").unwrap_err();
+        assert!(matches!(err, ContextLimitError::MaxFlowDepth { .. }));
+    }
+
+    /// Zasiew ponad limit jest capowany do `MAX_FLOW_DEPTH` (brak alokacji
+    /// gigantycznego wektora przy zepsutej/zapętlonej głębokości), a guard
+    /// i tak trafia od razu.
+    #[test]
+    fn seeded_depth_is_capped_at_max() {
+        let ctx = ExecutionContext::new_with_flow_depth(None, 250);
+        assert_eq!(ctx.flow_stack.len(), MAX_FLOW_DEPTH);
     }
 
     #[test]

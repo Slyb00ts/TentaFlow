@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, PiiRulesStore, ProgressSink, PromptStore, SttDispatcher, TtsCleaningStore,
-    TtsDispatcher, VisionDispatcher,
+    MetricsSink, PiiRulesStore, ProgressSink, PromptStore, RerankDispatcher, SttDispatcher,
+    TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
@@ -134,6 +134,9 @@ pub struct ExecutionContext {
 
     pub llm: Arc<dyn LlmDispatcher>,
     pub embeddings: Arc<dyn EmbeddingsDispatcher>,
+    /// RAG C2 — cross-encoder reranker (/v1/rerank, alias `rag-reranker`).
+    /// Krok retrievalu między vector-search a LLM.
+    pub reranker: Arc<dyn RerankDispatcher>,
     pub stt: Arc<dyn SttDispatcher>,
     pub tts: Arc<dyn TtsDispatcher>,
     pub vision: Arc<dyn VisionDispatcher>,
@@ -544,6 +547,9 @@ pub mod test_support {
     use crate::flow_engine::dispatchers::metrics::NoopMetrics;
     use crate::flow_engine::dispatchers::pii_rules::PiiRule;
     use crate::flow_engine::dispatchers::progress::NoopProgress;
+    use crate::flow_engine::dispatchers::rerank::{
+        RerankRequest, RerankResponse, RerankResult,
+    };
     use crate::flow_engine::dispatchers::stt::{SttRequest, SttResponse};
     use crate::flow_engine::dispatchers::tts::{TtsRequest, TtsResponse};
     use crate::flow_engine::envelope::{ChatMessage, FlowEnvelope, LlmStreamChunk};
@@ -570,6 +576,31 @@ pub mod test_support {
     impl EmbeddingsDispatcher for StubEmbeddings {
         async fn embed(&self, _req: EmbeddingsRequest) -> Result<EmbeddingsResponse> {
             panic!("stub EmbeddingsDispatcher: embed called");
+        }
+    }
+
+    /// Deterministyczny stub rerankera: score = pozycja od końca (pierwszy
+    /// dokument dostaje najwyższy score), wynik posortowany malejąco, ucięty
+    /// do `top_n`. NIE panickuje — inne węzły z `stub_ctx` mają działać.
+    pub struct StubReranker;
+    #[async_trait]
+    impl RerankDispatcher for StubReranker {
+        async fn rerank(&self, req: RerankRequest) -> Result<RerankResponse> {
+            let n = req.documents.len();
+            let mut results: Vec<RerankResult> = (0..n)
+                .map(|i| RerankResult {
+                    index: i,
+                    score: (n - i) as f32,
+                })
+                .collect();
+            results.sort_by(|a, b| b.score.total_cmp(&a.score));
+            if let Some(top) = req.top_n {
+                results.truncate(top as usize);
+            }
+            Ok(RerankResponse {
+                results,
+                usage: crate::flow_engine::envelope::TokenUsage::default(),
+            })
         }
     }
 
@@ -678,6 +709,7 @@ pub mod test_support {
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
+            reranker: Arc::new(StubReranker),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
             vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),

@@ -23,12 +23,13 @@ use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
     MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
-    SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
+    RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
     AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
-    MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, ServiceManagerQuicFinder,
-    SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl, VisionDispatcherImpl,
+    MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, RerankDispatcherImpl,
+    ServiceManagerQuicFinder, SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
+    VisionDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -42,7 +43,8 @@ use crate::flow_engine::node_adapters::{
     ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter,
+    PiiFilterNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
+    SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionClassifyNodeAdapter,
     VisionNodeAdapter, VisionOcrNodeAdapter,
@@ -107,6 +109,14 @@ pub struct FlowRequestMeta {
     /// no-op (headless / tests). Scope = session_id, falling back to
     /// request_id so a broadcast key always exists.
     pub progress_sink: Option<Arc<dyn ProgressSink>>,
+    /// RAG C2 (recursion guard) — głębokość zagnieżdżenia flow odziedziczona
+    /// po runtime'owym `ExecutionContext.flow_stack`. Gdy capability dispatcher
+    /// (reranker/embeddings) rozwiąże alias na flow-surface, ten flow re-wchodzi
+    /// w silnik przez `dispatch_by_flow_id`; bez przekazania głębokości nowy
+    /// `make_context` resetowałby `subflow_depth` do 0 i guard rekurencji nigdy
+    /// by nie narósł (nieograniczona rekurencja). `make_context` seeduje z tego
+    /// pola `subflow_depth`.
+    pub flow_depth: u8,
 }
 
 impl FlowRequestMeta {
@@ -119,6 +129,7 @@ impl FlowRequestMeta {
             deadline: None,
             cancel_token: CancellationToken::new(),
             progress_sink: None,
+            flow_depth: 0,
         }
     }
 
@@ -183,6 +194,7 @@ struct ContextFactory {
     blobs: Arc<dyn BlobStore>,
     llm: Arc<dyn LlmDispatcher>,
     embeddings: Arc<dyn EmbeddingsDispatcher>,
+    reranker: Arc<dyn RerankDispatcher>,
     stt: Arc<dyn SttDispatcher>,
     tts: Arc<dyn TtsDispatcher>,
     vision: Arc<dyn VisionDispatcher>,
@@ -208,13 +220,14 @@ impl ContextFactory {
             deadline: meta.deadline,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),
-            subflow_depth: 0,
+            subflow_depth: meta.flow_depth,
             subflow_visited: Arc::new(Vec::new()),
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: self.clock.clone(),
             blobs: self.blobs.clone(),
             llm: self.llm.clone(),
             embeddings: self.embeddings.clone(),
+            reranker: self.reranker.clone(),
             stt: self.stt.clone(),
             tts: self.tts.clone(),
             vision: self.vision.clone(),
@@ -286,6 +299,8 @@ impl FlowDispatcher {
         ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
+        let reranker: Arc<dyn RerankDispatcher> =
+            Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
@@ -297,6 +312,7 @@ impl FlowDispatcher {
             blobs: ctx_blobs,
             llm,
             embeddings,
+            reranker,
             stt,
             tts,
             vision,
@@ -970,6 +986,7 @@ fn build_registry(
         Arc::new(CombineNodeAdapter::new()),
         Arc::new(SttNodeAdapter::new()),
         Arc::new(EmbeddingsNodeAdapter::new()),
+        Arc::new(RerankerNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
         Arc::new(PersistTurnNodeAdapter::new()),
