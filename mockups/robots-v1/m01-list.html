@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Robots · Lista (R1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .rgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+  .rcard { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .rcard:hover { border-color: var(--border-hover); }
+  .rcard.off { opacity: .72; }
+  .rc-head { display: flex; align-items: center; gap: 10px; }
+  .rc-title { font-weight: 700; font-size: 15px; }
+  .rc-id { color: var(--text-3); font-size: 12px; font-family: ui-monospace, monospace; }
+  .rc-kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .rc-kpi { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 11px; }
+  .rc-kpi .l { color: var(--text-3); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+  .rc-kpi .v { font-size: 17px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .rc-kpi .v small { font-size: 11px; color: var(--text-2); font-weight: 600; }
+  .rc-ctl { display: flex; align-items: center; gap: 8px; }
+  .rc-ctl .ml-auto { margin-left: auto; }
+  .dpad { display: grid; grid-template-columns: repeat(3, 26px); grid-template-rows: repeat(2, 26px); gap: 3px; }
+  .dpad .btn { padding: 0; min-width: 0; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; }
+  .dpad .sp { visibility: hidden; }
+  .rc-foot { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; border-top: 1px solid var(--border); }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .toolbar h1 { font-size: 20px; font-weight: 800; margin: 0; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M19.44 12.99 20 13a2 2 0 0 1 0 4h-1v3a2 2 0 0 1-2 2h-3v-1a2 2 0 0 0-4 0v1H7a2 2 0 0 1-2-2v-3H4a2 2 0 0 1 0-4h1V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 4 0v1h3a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2a8 8 0 0 1-7-4"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="i-map" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">R1</span>
+    <h2>Lista robotów</h2>
+    <div class="desc">Tylko ogólne info + ogólne sterowanie. Pełnia opcji w szczegółach (klik „Szczegóły").</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>General</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Services</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-puzzle"/></svg>Applications</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-cpu"/></svg>Roboty<span class="badge">3</span></div>
+          <div class="nav-item"><svg class="icon"><use href="#i-video"/></svg>TentaVision</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Management</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Users &amp; Groups</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip">
+            <div class="avatar">PJ</div>
+            <div><div class="name-t">Piotr Jarocki</div><div class="role">Operator</div></div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="toolbar">
+          <h1>Roboty</h1>
+          <span class="chip accent">3 online · 1 offline</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+          <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Dodaj robota</button>
+        </div>
+
+        <div class="rgrid">
+
+          <!-- online -->
+          <div class="rcard">
+            <div class="rc-head">
+              <span class="status-pill online">online</span>
+              <span class="rc-title">Go2 — Salon</span>
+              <span style="flex:1"></span>
+              <span class="rc-id">go2-be69</span>
+            </div>
+            <div class="rc-kpis">
+              <div class="rc-kpi"><div class="l">Bateria</div><div class="v">86<small>%</small></div></div>
+              <div class="rc-kpi"><div class="l">RTT</div><div class="v">24<small>ms</small></div></div>
+              <div class="rc-kpi"><div class="l">Status</div><div class="v" style="font-size:14px;color:var(--success)">Gotowy</div></div>
+            </div>
+            <div class="rc-ctl">
+              <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-stop"/></svg>E-STOP</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-play"/></svg>Start</button>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-hand"/></svg></button>
+              <div class="ml-auto dpad">
+                <span class="btn sp"></span><button class="btn btn-secondary"><svg class="icon"><use href="#i-up"/></svg></button><span class="btn sp"></span>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-left"/></svg></button>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-down"/></svg></button>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-right"/></svg></button>
+              </div>
+            </div>
+            <div class="rc-foot">
+              <span class="chip success">kamera · lidar</span>
+              <a class="btn btn-ghost btn-sm" href="m02-detail.html">Szczegóły<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+
+          <!-- online, low battery -->
+          <div class="rcard">
+            <div class="rc-head">
+              <span class="status-pill online">online</span>
+              <span class="rc-title">Go2 — Kuchnia</span>
+              <span style="flex:1"></span>
+              <span class="rc-id">go2-4a1c</span>
+            </div>
+            <div class="rc-kpis">
+              <div class="rc-kpi"><div class="l">Bateria</div><div class="v" style="color:var(--warning)">21<small>%</small></div></div>
+              <div class="rc-kpi"><div class="l">RTT</div><div class="v">31<small>ms</small></div></div>
+              <div class="rc-kpi"><div class="l">Status</div><div class="v" style="font-size:14px;color:var(--success)">Gotowy</div></div>
+            </div>
+            <div class="rc-ctl">
+              <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-stop"/></svg>E-STOP</button>
+              <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-play"/></svg>Start</button>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-hand"/></svg></button>
+              <div class="ml-auto dpad">
+                <span class="btn sp"></span><button class="btn btn-secondary"><svg class="icon"><use href="#i-up"/></svg></button><span class="btn sp"></span>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-left"/></svg></button>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-down"/></svg></button>
+                <button class="btn btn-secondary"><svg class="icon"><use href="#i-right"/></svg></button>
+              </div>
+            </div>
+            <div class="rc-foot">
+              <span class="chip success">kamera · lidar</span>
+              <a class="btn btn-ghost btn-sm" href="m02-detail.html">Szczegóły<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+
+          <!-- offline (auto-reconnecting) -->
+          <div class="rcard off">
+            <div class="rc-head">
+              <span class="status-pill">offline</span>
+              <span class="rc-title">Go2 — Magazyn</span>
+              <span style="flex:1"></span>
+              <span class="rc-id">go2-1c44</span>
+            </div>
+            <div class="rc-kpis">
+              <div class="rc-kpi"><div class="l">Bateria</div><div class="v">—</div></div>
+              <div class="rc-kpi"><div class="l">RTT</div><div class="v">—</div></div>
+              <div class="rc-kpi"><div class="l">Status</div><div class="v" style="font-size:13px;color:var(--warning)">łączenie…</div></div>
+            </div>
+            <div class="rc-ctl">
+              <button class="btn btn-danger btn-sm" disabled><svg class="icon"><use href="#i-stop"/></svg>E-STOP</button>
+              <button class="btn btn-secondary btn-sm" disabled><svg class="icon"><use href="#i-play"/></svg>Start</button>
+              <button class="btn btn-ghost btn-sm" disabled><svg class="icon"><use href="#i-hand"/></svg></button>
+              <span class="ml-auto chip warning">auto-reconnect</span>
+            </div>
+            <div class="rc-foot">
+              <span class="chip">kamera · lidar</span>
+              <a class="btn btn-ghost btn-sm" href="m02-detail.html">Szczegóły<svg class="icon"><use href="#i-chevron"/></svg></a>
+            </div>
+          </div>
+
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
