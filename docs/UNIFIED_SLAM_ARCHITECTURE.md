@@ -244,3 +244,133 @@ pose-graph GN (poses-only is small) before reaching for gtsam FFI.
    `SpatialFrame`/pose-stream split.
 7. Gauge convention for deterministic cross-node pose solve (anchor georef submap?
    lowest-id at identity until georeferenced?).
+
+---
+
+## 10. Auto-calibration (observability-driven, mostly NOT ML)
+
+Calibration is NOT a separate mode — the calibration parameters (IMU biases,
+camera/lidar↔IMU extrinsics, time offset, monocular scale, gravity) are extra
+**state variables in the same graph**. A short "calibration dance" only *accelerates*
+their convergence by exciting them; normal operation keeps refining them online.
+
+**Why the dance works — parameters are observable only under excitation:**
+
+| Parameter | Motion that observes it |
+|-----------|-------------------------|
+| gyro bias | brief **stillness** (gyro at rest = pure bias) |
+| gravity → roll/pitch | stillness (accel reads only g) |
+| metric scale (mono cam) | **translation with accel/decel** (accel must feel motion) |
+| camera↔IMU extrinsics | **rotation + translation in several axes** |
+| sensor time offset | fast yaw rotation |
+| magnetometer hard/soft-iron | full 3D rotation ("figure-8") |
+| wheel odom (radius, baseline) | straight + turns |
+
+Sensible dance: **stillness → slow yaw → 1 m fwd/back → strafe → small figure-8.**
+Each element excites a specific row above; nothing is arbitrary.
+
+**Intelligent part = uncertainty-driven, closed-loop ("next-best-motion"):** the
+engine watches each parameter's covariance (information-matrix eigenvalues) and (a)
+stops when uncertainty is below threshold (adaptive, not fixed-time), (b) if a DoF is
+still unobserved, **requests the specific missing motion** ("rotate the other axis",
+"step sideways"). All classical (observability), no ML.
+
+**Per-platform, same logic, different actuator:**
+- **Robot (Go2):** scripted init routine as a covariance-driven behavior — performs
+  yaw/fwd-back/strafe/figure-8, monitors convergence, stops when calibrated; checks
+  free space first (lidar/camera) for safety.
+- **Phone:** the human is the actuator — AR prompts ("turn slowly", "take a few
+  steps") + a coverage bar. ARKit/ARCore already do this at session start; we
+  piggyback or replicate.
+- **Drone:** brief in-flight pattern (yaw + small axis translations) when safe.
+
+**ML or not?**
+- Calibration MATH (extrinsics/bias/scale/time) → **NO ML.** Classical
+  self-calibration (parameters as graph variables) is more accurate, provably
+  convergent, and yields uncertainty. An ML model emitting "extrinsics" would be
+  worse and unverifiable.
+- Perception front-ends (metric depth, feature matching, VPR) → **pretrained
+  off-the-shelf ONNX**, not trained by us initially.
+- Custom training → **optional, later, accuracy boost only**: domain fine-tuning of
+  depth/VPR on our own captured environments (the one genuinely worthwhile custom
+  model, once we have deployment data); a learned next-best-motion policy is overkill
+  vs the observability heuristic.
+
+**Critical caveat:** the dance gives an accurate LOCAL frame (scale, gravity, sensor
+alignment) — it is NOT a GPS fix. Global position still needs an absolute anchor
+(GNSS, map-relative reloc, or a known start). Dance calibrates *how* we measure; the
+anchor says *where* that is on Earth.
+
+---
+
+## 11. Camera ↔ LiDAR unification on POINTS + render modes
+
+Goal: camera and lidar emit the SAME thing — a 3D point cloud — so everything renders
+uniformly, with a live per-device 3D view that heat-maps depth.
+
+**Unify at the point level (in the per-device addon):** a camera frame + depth becomes
+a colored point cloud by back-projection through the intrinsics `K`:
+
+```
+P_xyz = depth · K⁻¹ · [u, v, 1]      // per pixel → 3D point (same XYZ as lidar)
+```
+
+So camera → **XYZRGB** points; lidar → **XYZ (+intensity)**. Both flow into the same
+canonical `SpatialFrame`, same wire pipeline, same renderer. Core/renderer never know
+the source.
+
+**Depth source for the camera (best → fallback):**
+1. hardware depth (iPhone LiDAR/ToF, RGB-D) → metric depth for free;
+2. stereo → triangulated metric depth;
+3. monocular metric depth model (Depth Anything V2 metric / Metric3D v2 / UniDepth)
+   via `ort`/tract when there is no depth hardware.
+
+**New canonical layout `XYZRGB`** (+ a compressed/quantized variant) joins `XYZ`,
+`XYZI`, `XYZ_I16_PLANAR`. Decoder normalizes everything to `points: Float32Array`
+(+ optional `colors`). Camera uses `XYZRGB`; lidar uses `XYZ`/`XYZI`. (Layout stays a
+wire concern; see §13 of `SPATIAL_3D_PLAN.md`.)
+
+**Depth heatmap is a SHADER, not data.** Points carry `XYZ`; the header carries the
+sensor `origin`. The renderer computes per-point range and colormaps it:
+
+```
+range = |P - origin|     near → 🔴 red     far → 🔵 blue   (red→blue ramp, e.g. inverted turbo)
+```
+
+Works identically for camera and lidar (both are just points), so the live "device
+depth view" is uniform across sources. near/far thresholds auto from the frame's
+min/max range or a manual slider. Zero data cost (computed on GPU).
+
+**Two color modes, toggleable** (extends "textured/untextured", `SPATIAL_3D_PLAN.md`
+§3.2):
+- **RGB / textured** — real camera colors (lidar would be grey/intensity here);
+- **Depth heatmap** — red=near, blue=far, for ANY source → "I can see depth".
+
+**Performance:** camera clouds can be dense (iPhone depth ~256×192 ≈ 49k pts; from
+full RGB we decimate to a target density at the source). Color = +3 B/point on the
+same i16/quant + LZ4 transport; the heatmap is free (GPU-side).
+
+---
+
+## 12. Phase 0 — chunk plan (LiDAR-only SLAM loop on Go2; codex review per chunk)
+
+Prove the whole architecture on the tractable sensor we already drive live, in a new
+pure-Rust crate `tentaflow-slam` (testable off-device; no GPU).
+
+- **0a — Shared data model + frozen-submap invariant.** `tentaflow-slam` crate:
+  `Pose(SE3)`, `SubmapId`, `Submap` (frozen geometry handle + keyframes), `Constraint`
+  (Odometry|LoopClosure|Gnss|Georef|InterSubmap, with information matrix + status),
+  `PoseGraph`, `Scene`. Unit tests: immutability of sealed submaps, constraint
+  add-only, deterministic pose-solve gauge. (THIS chunk now.)
+- **0b — LiDAR-inertial odometry.** Point-to-plane ICP (KISS-ICP style: voxel
+  downsample + adaptive threshold), frame→active-submap tracking, IMU preintegration
+  prior. Deps: `nalgebra` + a kd-tree (`kiddo`). Tested on synthetic + recorded Go2
+  clouds.
+- **0c — Submap sealing + frozen TSDF integration** (reuse SPATIAL voxel store).
+- **0d — Pose-graph backend.** Evaluate `factrs`; loop-closure factor with §5 gating
+  (geom verify + χ² + 2nd confirmation); incremental optimization → repositioned
+  submaps. Fallback: hand-rolled sparse GN; escalation: gtsam FFI.
+- **0e — Wire into core.** Consume Go2 canonical lidar frames → SLAM → canonical
+  `GlobalPose` stream (lat/lon/alt once georeferenced, else scene-local + covariance).
+- **0f — 2-node mesh merge.** Replicate submaps + constraints over the sync ledger;
+  confirm both nodes derive convergent submap poses.
