@@ -10,6 +10,7 @@
 
 pub mod graph;
 pub mod lidar;
+pub mod mapping;
 pub mod pose;
 pub mod submap;
 
@@ -17,6 +18,7 @@ pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
     PoseNode, Scene,
 };
+pub use mapping::{MapStep, MappingFrontend, SealPolicy};
 pub use lidar::{
     register, voxel_downsample, IcpConfig, IcpResult, LioConfig, LioTracker, TrackResult, VoxelMap,
 };
