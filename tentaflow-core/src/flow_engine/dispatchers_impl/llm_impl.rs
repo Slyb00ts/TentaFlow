@@ -575,6 +575,11 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
             completion_tokens: u.completion_tokens as u64,
             total_tokens: u.total_tokens as u64,
         }),
+        perf: chunk.perf.map(|p| crate::flow_engine::envelope::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
         finish_reason,
         error: None,
     }
@@ -855,6 +860,7 @@ mod tests {
             speaker_id: None,
             speaker_name: None,
             usage: None,
+            perf: None,
         };
         let mapped = chat_chunk_to_llm_chunk(chunk);
         assert_eq!(mapped.tool_calls.len(), 2);

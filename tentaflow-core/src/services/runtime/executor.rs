@@ -478,6 +478,7 @@ impl ModelRuntimeExecutor {
                                             speaker_id: None,
                                             speaker_name: None,
                                             usage: None,
+                                            perf: None,
                                         }))
                                     }
                                     StreamChunkType::ReasoningDelta(reasoning) => {
@@ -505,6 +506,7 @@ impl ModelRuntimeExecutor {
                                             speaker_id: None,
                                             speaker_name: None,
                                             usage: None,
+                                            perf: None,
                                         }))
                                     }
                                     StreamChunkType::ToolCallDelta(tc) => {
@@ -534,6 +536,7 @@ impl ModelRuntimeExecutor {
                                             speaker_id: None,
                                             speaker_name: None,
                                             usage: None,
+                                            perf: None,
                                         }))
                                     }
                                     StreamChunkType::Done { final_metrics } => {
@@ -570,6 +573,7 @@ impl ModelRuntimeExecutor {
                                             speaker_id: None,
                                             speaker_name: None,
                                             usage,
+                                            perf: None,
                                         }))
                                     }
                                     _ => None,
@@ -2517,6 +2521,7 @@ mod tests {
             final_envelope: env,
             trace: vec![],
             usage: crate::flow_engine::envelope::TokenUsage::default(),
+            perf: None,
             finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
             total_latency_ms: 0,
             error: None,

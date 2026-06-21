@@ -238,6 +238,16 @@ impl TokenUsage {
     }
 }
 
+/// Per-message metryki wydajnosci inferencji (kopia envelope odpowiadajaca
+/// `api::openai::types::GenPerf`). Liczone wall-clockiem w konsumencie
+/// strumienia, przewlekane obok `TokenUsage` do `FlowExecutionOutcome`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct GenPerf {
+    pub ttft_ms: u32,
+    pub prefill_tps: f32,
+    pub decode_tps: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TraceStatus {
@@ -380,6 +390,9 @@ pub struct FlowExecutionOutcome {
     pub final_envelope: FlowEnvelope,
     pub trace: Vec<TraceStep>,
     pub usage: TokenUsage,
+    /// Per-message metryki wydajnosci z ostatniego LLM chunku (TTFT, prefill/
+    /// decode tok/s). `None` gdy backend ich nie zaraportowal.
+    pub perf: Option<GenPerf>,
     pub finish_reason: FinishReason,
     pub total_latency_ms: i64,
     pub error: Option<String>,
@@ -401,6 +414,9 @@ pub struct LlmStreamChunk {
     pub reasoning_delta: Option<String>,
     pub tool_calls: Vec<ToolCallDelta>,
     pub usage: Option<TokenUsage>,
+    /// Per-message metryki wydajnosci. Niesione tylko na finalnym chunku
+    /// (obok `usage`); regular chunki maja `None`.
+    pub perf: Option<GenPerf>,
     pub finish_reason: Option<FinishReason>,
     /// Engine-level error embedded w streamie (np. backend rate limit). Adapter
     /// może zdecydować — przerwać flow albo skonsumować i kontynuować.
