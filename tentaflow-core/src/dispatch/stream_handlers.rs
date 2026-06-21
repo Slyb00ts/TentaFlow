@@ -102,8 +102,17 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             Some(flow_id) => crate::routing::streaming::ChatFlowSelector::FlowId(flow_id),
             None => crate::routing::streaming::ChatFlowSelector::Synthetic,
         };
+        // Realny zalogowany użytkownik z sesji → atrybucja zużycia tokenów i kwot
+        // per-user (bez tego AiGateway zapisywałby zużycie na sentinel __system__).
+        let user = match &ctx.session {
+            SessionAuth::UserSession { user_id, role } => Some(crate::auth::acl::UserContext::new(
+                super::handlers::user_id_to_uuid(user_id),
+                role.clone().unwrap_or_else(|| "user".to_string()),
+            )),
+            _ => None,
+        };
         let route_result = match router
-            .route_chat_completion_stream(request, None, None, flow_selector)
+            .route_chat_completion_stream(request, user, None, flow_selector)
             .await
         {
             Ok(r) => r,
