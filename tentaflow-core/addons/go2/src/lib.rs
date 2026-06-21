@@ -770,6 +770,9 @@ struct Telemetry {
     imu_yaw: Option<f64>,
     imu_quaternion: Vec<f64>,
     imu_temperature: Option<f64>,
+    // Leg joint angles (radians) from lowstate `motor_state[i].q`, Go2 order:
+    // 0-2 FR, 3-5 FL, 6-8 RR, 9-11 RL. Drives the dashboard robot animation (R2).
+    joints: Vec<f64>,
     bat_soc: Option<f64>,
     bat_voltage: Option<f64>,
     bat_current: Option<f64>,
@@ -1636,6 +1639,19 @@ fn ingest_lowstate_battery(raw: &[u8]) {
                 t.imu_temperature = Some(temp);
             }
         }
+        // Leg joint angles for the dashboard robot animation (R2). The first 12 of
+        // `motor_state` are FR/FL/RR/RL × hip/thigh/calf; later entries (jaw etc.)
+        // are ignored. Only stored when all 12 are present (never a partial pose).
+        if let Some(ms) = data.get("motor_state").and_then(JsonValue::as_array) {
+            let q: Vec<f64> = ms
+                .iter()
+                .take(12)
+                .filter_map(|m| m.get("q").and_then(JsonValue::as_f64))
+                .collect();
+            if q.len() == 12 {
+                t.joints = q;
+            }
+        }
     });
 }
 
@@ -1678,6 +1694,10 @@ fn telemetry_json() -> JsonValue {
         }
         if !t.foot_force.is_empty() {
             obj.insert("foot_force".into(), json!(t.foot_force));
+        }
+        // 12 leg joint angles (rad) for the dashboard robot animation (R2).
+        if !t.joints.is_empty() {
+            obj.insert("joints".into(), json!(t.joints));
         }
 
         let mut imu = serde_json::Map::new();
