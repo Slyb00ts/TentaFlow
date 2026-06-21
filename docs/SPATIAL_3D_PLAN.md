@@ -71,7 +71,7 @@ Header (fixed LE):
   units = meters; coordinate convention = right-handed, Z-up (CANONICAL — addons normalize)
 Pose (sensor → world, for THIS frame):
   translation x,y,z f32 ; rotation quaternion qx,qy,qz,qw f32
-  world_frame_id (interned)   ; pose_source (robot_odom|vio|lio|anchor|none) u8
+  scene_id (interned) + frame_id/parent_frame_id  ; pose_source (robot_odom|vio|lio|anchor|none) u8
   pose_confidence f32 (+ optional 6x6 covariance, later)
   points_are_world bool       (false = points in sensor frame; fuser applies pose)
 Body: packed f32, points in SENSOR frame; optional interleaved channels
@@ -341,3 +341,41 @@ Storage is the #1 requirement → it must be the first serious benchmark gate.
 
 Keep preview (latest-wins live stream) and the durable reconstruction store as two
 separate paths throughout.
+
+## 11. Multi-site / multi-scene scoping (NO single global world)
+
+Hard requirement: robots may be in **different buildings**. There is **no one global
+visualization**. The system manages **many independent scenes**, and fusion happens
+ONLY within a scene.
+
+- **Scene = the unit of one coherent reconstruction** — its own coordinate origin,
+  anchors, voxel/TSDF store, primitive layer, pose graph, and persistence partition.
+  Typically one building or one floor.
+- **Hierarchy** for organization + LOD: `site → building → floor → area`. The
+  FUSION unit is the scene (building/floor); the hierarchy is metadata for browsing
+  and coarse LOD, not a cross-building merge.
+- **`SpatialFrame.scene_id`** binds every frame to its scene; `frame_id`/
+  `parent_frame_id` give the transform tree WITHIN the scene. A `SpatialSource` is
+  assigned to a scene at config/install time (where the robot physically is) — like
+  the per-instance IP.
+- **Everything scene-scoped**: integration, registration, anchors, loop-closure,
+  the fused map, and the query/stream API. **Cross-scene sources are NEVER fused.**
+  Two robots in the same building share a scene → one map; robots in different
+  buildings → separate scenes → separate maps.
+- **Persistence partitioned per scene** (separate chunk namespace/dir per scene) →
+  load, stream, snapshot, and evict one scene independently; a node never has to
+  load unrelated buildings.
+- **Mesh / multi-node**: the spatial registry tracks `scene_id` per source; a fuser
+  instance runs per ACTIVE scene; scenes can live on different nodes; a building's
+  robots (even across nodes) feed that building's scene. A node hosts only the
+  scenes it owns/needs.
+- **Visualization**: the engine selects ONE scene (or a sub-scope like a floor) —
+  never a global cross-building view. Switching scene = load that scene's store.
+- **Edge cases**: a robot that moves to another building → reassigned to a new scene
+  (new world, no carry-over of the old map's frame). A source with unknown location
+  → its own provisional scene until anchored/assigned.
+
+This composes cleanly with §10: the durable store, ingest WAL, submaps, and pose
+graph all already key by scene; we just make `scene_id` a first-class partition key
+everywhere (format, store path, registry, query). S0/S1 must bake `scene_id` into
+the block/chunk format and the ingest queue from the start.
