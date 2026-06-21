@@ -105,26 +105,28 @@ pub fn mirror_trusted_peer_to_registry(
 /// moze trwac) i jest wznawialne przy starcie z trwalego stanu `Elected`.
 fn begin_baseline_adopt_after_confirm(
     db: &DbPool,
-    local_node_id: &str,
     remote_node_id: &str,
     quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) {
-    use crate::sync::core_baseline::{
-        begin_adopt_atomic, local_role, BaselinePhase, BaselineRole, BeginOutcome,
-    };
+    use crate::sync::core_baseline::{begin_adopt_atomic, BaselinePhase, BaselineRole, BeginOutcome};
 
     let donor_epoch = crate::sync::runtime::core_epoch();
-    let (donor, _joiner) =
-        crate::sync::core_baseline::decide_roles(local_node_id, remote_node_id, None);
-    let role = local_role(local_node_id, &donor);
 
-    // Atomowy single-flight: check+write w jednej transakcji zamiast goly zapis.
-    // Wywolywane przez OBIE strony pairingu (inicjator po confirm w
-    // `initiate_pairing`, RECEIVER po confirm w `confirm_pairing`) — kazda strona
-    // liczy te same role z `decide_roles`, wiec stan jest spojny po obu stronach.
+    // Content-aware auto-election. The old "lowest node_id is donor" rule was
+    // data-blind: a freshly installed (empty) node with a lower id was elected
+    // donor over a populated peer, so the data-holder adopted the empty baseline
+    // and lost its content. Instead BOTH sides arm as JOINER and dial the peer;
+    // the authoritative role is settled in the baseline transport, where the
+    // donor session compares ledger op counts (carried in `BaselineElect`) and
+    // serves only when it genuinely holds more content. The empty node's pull is
+    // answered with a snapshot; the data-holder's reciprocal pull is refused by
+    // the empty peer (it is not the rightful donor), so content flows one way:
+    // data-holder -> empty node. Two populated nodes auto-pairing do NOT auto-
+    // adopt (the would-be joiner's pull is refused both ways) — merging two
+    // populated nodes stays an explicit admin action (`admin_start_baseline_adopt`).
     match begin_adopt_atomic(
         db,
-        role,
+        BaselineRole::Joiner,
         remote_node_id,
         &donor_epoch,
         BaselinePhase::Elected,
@@ -139,38 +141,31 @@ fn begin_baseline_adopt_after_confirm(
             return;
         }
     }
-    match role {
-        BaselineRole::Joiner => {
-            info!(
-                peer = %remote_node_id,
-                "baseline adopt: lokalny nod jest JOINEREM — pobieram snapshot dawcy w tle"
-            );
-            if let Some(qm) = quic_mesh.clone() {
-                let donor_node_id = remote_node_id.to_string();
-                let epoch_seen = donor_epoch.counter;
-                tokio::spawn(async move {
-                    if let Err(e) = qm
-                        .pull_baseline_from_donor(&donor_node_id, epoch_seen)
-                        .await
-                    {
-                        warn!(
-                            donor = %donor_node_id,
-                            "baseline adopt: pobranie snapshotu nieudane (wznowi przy starcie): {}",
-                            e
-                        );
-                    }
-                });
-            } else {
+
+    info!(
+        peer = %remote_node_id,
+        "baseline adopt: arming as JOINER — pulling peer baseline in background (donor settled by content)"
+    );
+    if let Some(qm) = quic_mesh.clone() {
+        let donor_node_id = remote_node_id.to_string();
+        let epoch_seen = donor_epoch.counter;
+        tokio::spawn(async move {
+            if let Err(e) = qm
+                .pull_baseline_from_donor(&donor_node_id, epoch_seen)
+                .await
+            {
                 warn!(
-                    peer = %remote_node_id,
-                    "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
+                    donor = %donor_node_id,
+                    "baseline adopt: pull failed (peer may be the joiner, or resume at startup): {}",
+                    e
                 );
             }
-        }
-        BaselineRole::Donor => info!(
+        });
+    } else {
+        warn!(
             peer = %remote_node_id,
-            "baseline adopt: lokalny nod jest DAWCA — odpowie na BaselineElect snapshotem"
-        ),
+            "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
+        );
     }
 }
 
@@ -609,12 +604,7 @@ pub async fn initiate_pairing(
                         )
                     })?;
                 send_pairing_bootstrap(qm, security, &remote_hints.node_id, local_node_id).await?;
-                begin_baseline_adopt_after_confirm(
-                    &security.db,
-                    local_node_id,
-                    &remote_hints.node_id,
-                    quic_mesh,
-                );
+                begin_baseline_adopt_after_confirm(&security.db, &remote_hints.node_id, quic_mesh);
                 completed = true;
             }
             Ok(PairingAttemptOutcome::Pending) => {
@@ -743,7 +733,7 @@ pub async fn confirm_pairing(
     // durable `Elected` row that krok 2 can resume from — instead of a trusted peer
     // with no adopt state and no retry. `decide_roles` is pure, so both ends compute
     // the identical donor/joiner split.
-    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id, quic_mesh);
+    begin_baseline_adopt_after_confirm(&security.db, remote_node_id, quic_mesh);
 
     if let Some(ref qm) = quic_mesh {
         if let Some(ref hints) = pending_hints {

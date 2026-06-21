@@ -9439,6 +9439,26 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
             rusqlite::params![node.node_id, node.public_key, display_name],
         )?;
     }
+    // A newly-trusted node becomes a sync TARGET, but the donor's existing ops were
+    // minted before it existed, so the mint-time outbox fan-out never queued them
+    // to it and they sit until brand-new activity nudges the outbox. Bumping the
+    // permission epoch makes the periodic authority-side backfill
+    // (`backfill_outbox_for_permission_grants`) re-evaluate every op against the now-
+    // expanded target set and replay the full content backlog to the new node
+    // promptly — the same machinery that already backfills permission grants. Only
+    // bump when a row actually changed, so a steady-state restart is a no-op.
+    if changed > 0 {
+        let org_ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT org_id FROM organizations ORDER BY org_id ASC")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        };
+        for org_id in org_ids {
+            bump_sync_permission_epoch_with_conn(&conn, &org_id)?;
+        }
+    }
     Ok(changed)
 }
 

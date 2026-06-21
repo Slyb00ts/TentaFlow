@@ -1453,6 +1453,14 @@ pub struct BaselineElect {
     pub node_id: String,
     pub proposed_donor: String,
     pub epoch_seen: u64,
+    /// Number of ledger operations the sender (the dialing node) currently holds.
+    /// The donor side uses it to settle the role data-aware: the node with MORE
+    /// content is the donor, so an empty node that dials a data-holder is told it
+    /// is the joiner (it adopts), never the other way round — which would wipe the
+    /// data-holder. `serde(default)` keeps the frame readable from peers that
+    /// predate this field (they decode as `0` = "no content advertised").
+    #[serde(default)]
+    pub sender_op_count: u64,
 }
 
 /// Odpowiedz donora na `BaselineElect` — akceptacja albo odrzucenie roli donora.
@@ -1898,12 +1906,14 @@ mod tests {
             node_id: "joiner-1".to_string(),
             proposed_donor: "donor-1".to_string(),
             epoch_seen: 7,
+            sender_op_count: 42,
         };
         let bytes = crate::cbor::encode(&elect).expect("encode");
         let decoded = crate::cbor::decode::<BaselineElect>(&bytes).expect("decode");
         assert_eq!(decoded.node_id, "joiner-1");
         assert_eq!(decoded.proposed_donor, "donor-1");
         assert_eq!(decoded.epoch_seen, 7);
+        assert_eq!(decoded.sender_op_count, 42);
 
         let ack = BaselineAck {
             accepted: true,

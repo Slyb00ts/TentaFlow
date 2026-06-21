@@ -172,7 +172,25 @@ fn conflicts_with(
         return false;
     }
     let same_target = existing.role == desired && existing.peer == peer && &existing.epoch == epoch;
-    !same_target
+    if same_target {
+        return false;
+    }
+    // An ARMED slot (`Elected`) for the SAME peer+epoch may flip role. The auto-
+    // pairing path arms BOTH sides toward each other and then both dial; the content
+    // election in the transport settles who actually donates. So a node armed as
+    // JOINER toward a peer may still need to act as DONOR when that peer dials it
+    // (the peer turned out to be the empty one), and a node armed as DONOR may need
+    // to become JOINER when it decides to pull. `Elected` means "armed, no transfer
+    // started", so the flip is safe. This is narrow: only the `Elected` phase, only
+    // the same peer+epoch — an active transfer (Receiving/Importing/Imported) or a
+    // different peer/epoch still conflicts, so split-brain protection is intact.
+    if existing.peer == peer
+        && &existing.epoch == epoch
+        && existing.phase == BaselinePhase::Elected
+    {
+        return false;
+    }
+    true
 }
 
 /// Age of the persisted adopt state in seconds, derived from
@@ -343,6 +361,32 @@ pub fn decide_roles(
         local_node_id.to_string()
     };
     (donor, joiner)
+}
+
+/// Data-aware donor election. The donor is the node that HOLDS MORE content
+/// (ledger operation count); ties fall back to the lexicographically lower
+/// node_id, so the result is deterministic and identical on both sides given the
+/// same two `(node_id, op_count)` pairs. This is the rule the auto-pairing path
+/// needs: a freshly installed (near-empty) node must adopt FROM the established
+/// data-holder, never the reverse — donating an empty baseline over a populated
+/// peer would wipe that peer's content. Returns `(donor, joiner)`.
+pub fn decide_roles_by_content(
+    local_node_id: &str,
+    local_op_count: u64,
+    remote_node_id: &str,
+    remote_op_count: u64,
+) -> (String, String) {
+    let local_is_donor = match local_op_count.cmp(&remote_op_count) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Equal content: deterministic node_id tie-break, same on both sides.
+        std::cmp::Ordering::Equal => local_node_id <= remote_node_id,
+    };
+    if local_is_donor {
+        (local_node_id.to_string(), remote_node_id.to_string())
+    } else {
+        (remote_node_id.to_string(), local_node_id.to_string())
+    }
 }
 
 /// Lokalna rola wynikajaca z elekcji.
