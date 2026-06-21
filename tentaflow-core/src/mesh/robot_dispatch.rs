@@ -191,6 +191,10 @@ pub struct RobotTelemetrySnapshot {
     pub imu: Option<RobotImuSnapshot>,
     #[serde(default)]
     pub battery: Option<RobotBatterySnapshot>,
+    /// Leg joint angles (rad), Go2 order FR/FL/RR/RL × hip/thigh/calf (empty absent).
+    /// APPENDED LAST for wire back-compat (new fields go at the end).
+    #[serde(default)]
+    pub joints: Vec<f64>,
 }
 
 /// One numeric parameter of a parametered robot action, with the inclusive range
@@ -649,6 +653,7 @@ fn parse_telemetry_snapshot(status: &serde_json::Value) -> Option<RobotTelemetry
         vyaw: vnum("vyaw"),
         position: arr("position"),
         foot_force: arr("foot_force"),
+        joints: arr("joints"),
         imu,
         battery,
     };
