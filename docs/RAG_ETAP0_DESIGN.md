@@ -45,6 +45,19 @@ CBOR I/O, audit na każdej ścieżce wyjścia, zero stubów. Nadrzędny plan: `R
   C1 (document/blob store per-instancja), D2 (quoty per-profil HW).
 - ⚠️ Buildy: TYLKO `/mnt/d` (CARGO_TARGET_DIR/TMPDIR/HOME), NIE /tmp ani /mnt/e (sieciowy). Wąskie testy.
 
+## STATUS QUERY-FLOW (architektura zrewidowana — patrz RAG_ARCHITECTURE_PLAN §6a)
+
+- **C2 reranker flow node** ✅ (codex GO) — dla query-flow + FlowBuilder.
+- **E1.0 enabler tożsamości + vector node** ✅ (codex GO-WITH-CHANGES→fix). `addon_id`/`org_id` callera
+  propagowane z `service_call.rs` → executor (4 gałęzie Flow) → `FlowRequestMeta` → `flow_engine::
+  ExecutionContext`; węzeł `vector` (upsert/search/hybrid) scoped do instancji, walidacja-przed-zapisem.
+  Addon wyzwala query-flow JAKO MODEL (`service_request`), tożsamość dociera do węzłów retrievalu.
+- Następne: `graph_search` node (neighbors/ppr scoped do instancji) → host-fn `doc_parse` + `document store`
+  (ingest) → Etap 1 (addon RAG + flow templates + GUI).
+- **Hardening (nie blocker):** PK `addon_vector_namespaces` to `(addon_id, namespace)` bez `org_id` —
+  bezpieczne bo `instance_id` globalnie unikalny + runtime kluczuje po org wszędzie; do migracji na
+  `(org_id, addon_id, namespace)` przy okazji (graf już ma poprawny PK).
+
 ## Spike CozoDB — wynik: GO (potwierdzone realnym uruchomieniem)
 
 - `cozo` 0.7.6, MPL-2.0. Do produkcji rozważyć utrzymywany fork `cozo-ce` 0.7.13 lub `mnestic`
