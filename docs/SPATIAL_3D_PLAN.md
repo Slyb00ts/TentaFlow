@@ -418,3 +418,48 @@ Architecture/format already support this: `pose_source` covers `lio|vio|anchor|n
 poses carry confidence/covariance, submaps + the scene pose graph absorb anchor and
 markerless constraints uniformly. Phase 2 implements the markerless registration +
 relocalization first; anchor support is an additive constraint type on top.
+
+## 13. Canonical frame layout — DECISION (wire-only; decoder normalizes)
+
+Settled while optimizing the live Go2 LiDAR path; applies to every source.
+
+- **`layout` is a WIRE concern only.** The per-frame header `layout` byte tells the
+  DECODER how to read the body; it is NOT a contract the renderer sees. The decode
+  boundary (`decodeLidarFrame` in wasm) ALWAYS outputs world-space `points` as a
+  `Float32Array`, regardless of how the body was packed. The renderer therefore
+  never branches on layout — input is uniform. Heterogeneous wire → decoder
+  unifies → homogeneous renderer. (`raw` still carries the canonical bytes if a
+  future GPU path wants to upload compact data and expand in a shader.)
+- **Layouts are per-source, each lossless for its data:**
+  - `XYZ` (3×f32) / `XYZI` (4×f32): continuous sources (raw lidar, iPhone ARKit) —
+    full precision.
+  - `XYZ_I16_PLANAR` (tag 6): grid-aligned sources (voxel maps, e.g. Go2). i16 grid
+    indices, planar (all `ix`, then `iy`, then `iz`). LOSSLESS for grid data; half
+    the bytes; planar so each plane is a low-entropy run for the compressor.
+  - Future `XYZ_Q16` (quantized i16 + per-frame scale/offset): continuous sources
+    where quantization to sub-sensor-noise precision is acceptable (e.g. iPhone
+    depth noise ~1 cm ≫ mm-grid) — near-lossless, half the bytes. f32 stays the
+    escape hatch for unusual dynamic range. Submap-local origins (§11) keep i16
+    range sufficient even at building scale.
+- **LZ4 (`LIDAR_FLAG_LZ4_BODY`) is a UNIVERSAL, LOSSLESS wire compression on TOP of
+  any layout.** Applied host-side (native, off the metered addon tick), it never
+  touches quality and works for f32 and i16 alike. Header stays uncompressed so the
+  host can stamp `host_send_us` and the decoder can size the inflate buffer.
+- **Point COUNT is a separate axis from per-point bytes.** Density is managed by
+  source-side voxel decimation in the per-device addon (target a max points/frame),
+  NOT by the wire format. So a high-resolution sensor (e.g. dense aerial scan) does
+  not imply fat frames.
+- **Measured effect (live Go2, ~45k pts):** f32 → i16 halved bytes (decode 2 ms →
+  0.4 ms via bulk `Float32Array`); + LZ4 on planar i16 compresses the low-entropy
+  planes far better than interleaved. Net latency dropped from ~20 ms (f32) toward
+  single-digit ms. The lidar stream is also lossy latest-wins server-side (a slow
+  consumer never backs up the queue nor force-disconnects).
+
+## 14. Universal positioning / localization
+
+The map layer here is the GNSS-denied backbone for *knowing where any device is*
+(indoor/outdoor/air/ground, any sensor mix, robust to RF jamming). That system —
+multi-sensor → global pose fusion, georeferenced map-relative relocalization,
+self-location — is designed in **`docs/UNIVERSAL_POSITIONING_PLAN.md`**. It reuses
+this plan's georeferenced scenes (§11), markerless relocalization (§12) and the
+canonical frame/decoder split (§13).
