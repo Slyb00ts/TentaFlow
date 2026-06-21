@@ -360,6 +360,11 @@ same i16/quant + LZ4 transport; the heatmap is free (GPU-side).
 Prove the whole architecture on the tractable sensor we already drive live, in a new
 pure-Rust crate `tentaflow-slam` (testable off-device; no GPU).
 
+> **STATUS:** 0a–0f DONE in crate `tentaflow-slam` (36 tests, each chunk
+> codex-reviewed). REMAINING = the LIVE core/dashboard hook + real-Go2 run, gated on
+> (a) fixing the wgpu GPU-leak that crashes the instance, and (b) deciding how to feed
+> Go2's pre-fused `voxel_map_compressed` (already a map, not raw scans) into LIO.
+
 - **0a — Shared data model + frozen-submap invariant.** `tentaflow-slam` crate:
   `Pose(SE3)`, `SubmapId`, `Submap` (frozen geometry handle + keyframes), `Constraint`
   (Odometry|LoopClosure|Gnss|Georef|InterSubmap, with information matrix + status),
