@@ -1,7 +1,7 @@
 {
   "id": "query",
   "name": "RAG — query",
-  "description": "Flow zapytania RAG (flow_engine): trigger -> embeddings -> vector(search w przestrzeni 'passages' instancji, FILTR po collection_id z meta) -> combine (sklejenie pasazy w kontekst) -> llm (odpowiedz wylacznie z kontekstu) -> output (serializuje {answer, citations} z realnych hitow). collection_id i top_k jada z meta (addon przeprowadza je przez options llm_generate). Petla retrievalu (rerank/multi-hop) to przyszly slice; struktura DAG jest na to gotowa.",
+  "description": "Flow zapytania RAG (flow_engine): trigger -> embeddings -> vector(search w przestrzeni 'passages' instancji, FILTR po collection_id z meta) -> reranker(cross-encoder rag-reranker, top_n=5; query z meta.rag_query_text, kandydaci z vector hits) -> combine (sklejenie rerankowanych pasazy w kontekst) -> llm (odpowiedz wylacznie z kontekstu) -> output (serializuje {answer, citations} z RERANKOWANYCH hitow). collection_id i top_k jada z meta (addon przeprowadza je przez options llm_generate). Reranker jest w sciezce: gdy alias rag-reranker (failover A1) nie ma zadnego dostepnego targetu, wezel zwraca blad (rerank krytyczny dla tego flow).",
   "nodes": [
     {
       "id": "trigger",
@@ -30,27 +30,36 @@
       "position": { "x": 440, "y": 0 }
     },
     {
+      "id": "rerank",
+      "type": "reranker",
+      "config": {
+        "model": "rag-reranker",
+        "top_n": 5
+      },
+      "position": { "x": 660, "y": 0 }
+    },
+    {
       "id": "context",
       "type": "combine",
       "config": {
         "separator": "\n\n---\n\n"
       },
-      "position": { "x": 660, "y": 0 }
+      "position": { "x": 880, "y": 0 }
     },
     {
       "id": "answer",
       "type": "llm",
       "config": {
         "model": "rag-llm",
-        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (pasaze ponizej w formacie JSON z polami ref_id/score/fields.text/fields.doc_id/fields.chunk_index). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo jako [doc_id#chunk_index]. Nie zmyslaj faktow spoza kontekstu."
+        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (rerankowane pasaze ponizej w formacie JSON {ranked:[{id,score,text}]}, posortowane malejaco po score rerankera). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo na podstawie cytatow z odpowiedzi. Nie zmyslaj faktow spoza kontekstu."
       },
-      "position": { "x": 880, "y": 0 }
+      "position": { "x": 1100, "y": 0 }
     },
     {
       "id": "out",
       "type": "output",
       "config": { "emit_citations": true },
-      "position": { "x": 1100, "y": 0 }
+      "position": { "x": 1320, "y": 0 }
     }
   ],
   "edges": [
@@ -70,6 +79,13 @@
     },
     {
       "from_node": "retrieve",
+      "to_node": "rerank",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "rerank",
       "to_node": "context",
       "from_port": "full",
       "to_port": "in",

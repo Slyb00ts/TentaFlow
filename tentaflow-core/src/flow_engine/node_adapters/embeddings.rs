@@ -153,6 +153,22 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         ctx.usage_sink.record(&node.id, response.usage);
 
         let mut out: FlowEnvelope = (**envelope).clone();
+        // RAG E2.1 — zachowaj ORYGINALNY tekst zapytania w meta ZANIM payload
+        // zostanie zamieniony na Embedding. Po tym węźle tekst pytania ginie
+        // (payload = wektor), a reranker (vector→reranker→combine) potrzebuje go
+        // jako `query` do cross-encodera. Meta propaguje się przez vector→reranker
+        // (każdy klonuje envelope bazowy). Stash tylko dla single-input path —
+        // batch embeddingów nie ma jednego "query text".
+        if batch_count == 1 {
+            if let FlowValue::Text(t) = &envelope.payload {
+                if !t.is_empty() {
+                    out.meta.insert(
+                        "rag_query_text".to_string(),
+                        serde_json::Value::String(t.clone()),
+                    );
+                }
+            }
+        }
         if batch_count > 1 || response.vectors.len() > 1 {
             // Batch payload — Json shape akceptowany przez
             // converter::flow_outcome_to_embedding_response::parse_embedding_batch.
@@ -323,6 +339,30 @@ mod tests {
             }
             other => panic!("expected Json batch payload, got {other:?}"),
         }
+    }
+
+    /// RAG E2.1 — single-input embeddings stashuje ORYGINALNY tekst zapytania do
+    /// meta["rag_query_text"] PRZED zamianą payloadu na Embedding, żeby reranker
+    /// (downstream) miał query mimo że payload to już wektor.
+    #[tokio::test]
+    async fn stashes_query_text_into_meta_for_reranker() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("jakie jest pytanie?".into());
+        let mut ctx = stub_ctx();
+        ctx.embeddings = Arc::new(FakeEmbeddings {
+            last_input: Mutex::new(None),
+            vector: vec![0.1, 0.2],
+        });
+        let out = EmbeddingsNodeAdapter::new()
+            .execute(&node(json!({"model": "m"})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.meta.get("rag_query_text").and_then(|v| v.as_str()),
+            Some("jakie jest pytanie?")
+        );
+        // Payload mimo to jest wektorem (tekst już niedostępny w payloadzie).
+        assert!(matches!(out.payload, FlowValue::Embedding(_)));
     }
 
     #[tokio::test]
