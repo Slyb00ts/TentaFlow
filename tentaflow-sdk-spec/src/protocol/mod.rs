@@ -17,6 +17,7 @@ pub mod envelope;
 pub mod flow;
 pub mod frame;
 pub mod gate;
+pub mod global_pose;
 pub mod ids;
 pub mod lidar;
 pub mod recording;
