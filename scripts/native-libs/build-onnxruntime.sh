@@ -9,7 +9,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PLATFORM="${1:-$(detect_platform)}"
-ONNXRUNTIME_REF="${ONNXRUNTIME_REF:-v1.22.0}"
+# v1.26.0: 1.22.0/1.23.x maja hang w tworzeniu sesji na niektorych grafach (MoveNet,
+# duze modele Supertone) — naprawione w 1.24-1.26. 1.26.0 ma prebuilty dla wszystkich
+# platform (1.27.0 nie ma juz CPU win-x64). Konsument to ort (supertonic); sherpa ma
+# wlasny onnxruntime (xcframework), wiec bump nie dotyka STT.
+ONNXRUNTIME_REF="${ONNXRUNTIME_REF:-v1.26.0}"
 MODE="${ONNXRUNTIME_MODE:-dynamic}"
 prepare_layout "$PLATFORM"
 require_cmd git
