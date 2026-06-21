@@ -8,7 +8,7 @@
 // gauge node is held FIXED to remove the global gauge freedom.
 // =============================================================================
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nalgebra::{DMatrix, DVector, Matrix6, Vector6};
 
@@ -26,6 +26,12 @@ pub struct OptConfig {
     pub damping: f64,
     /// Finite-difference step for numerical Jacobians.
     pub fd_eps: f64,
+    /// Re-initialize all poses CANONICALLY (spanning tree from the gauge) before
+    /// solving, making the result a pure function of (submaps, constraints, gauge)
+    /// — independent of the incoming pose estimates. REQUIRED for cross-node mesh
+    /// convergence (every node derives identical poses). Off by default so live
+    /// incremental optimization keeps its warm-start.
+    pub reinitialize: bool,
 }
 
 impl Default for OptConfig {
@@ -35,6 +41,7 @@ impl Default for OptConfig {
             convergence_eps: 1e-7,
             damping: 1e-6,
             fd_eps: 1e-6,
+            reinitialize: false,
         }
     }
 }
@@ -144,6 +151,11 @@ pub fn optimize(graph: &mut PoseGraph, cfg: &OptConfig) -> OptReport {
         return OptReport { iterations: 0, converged: true, final_cost: cost, free_nodes: n };
     }
 
+    // Canonical re-initialization for deterministic (cross-node) convergence.
+    if cfg.reinitialize {
+        canonical_init(&mut poses, &edges, fixed.or_else(|| graph.gauge_anchor()));
+    }
+
     let dim = 6 * n;
     let mut converged = false;
     let mut iters = 0;
@@ -226,10 +238,13 @@ pub fn optimize(graph: &mut PoseGraph, cfg: &OptConfig) -> OptReport {
         }
     }
 
-    // Write optimized poses back (geometry untouched; covariance left as-is for now).
-    for id in &free {
+    // Write poses back (geometry untouched; covariance left as-is for now). ALL
+    // nodes, including the fixed gauge — under `reinitialize` the gauge is canonically
+    // pinned (identity / anchor) and must be persisted so every mesh node agrees on
+    // it; without reinit its snapshot equals its current pose, so this is a no-op.
+    for (id, pose) in &poses {
         let cov = graph.node(*id).map(|n| n.covariance).unwrap_or_else(Matrix6::identity);
-        graph.set_node(*id, poses[id], cov);
+        graph.set_node(*id, *pose, cov);
     }
 
     let final_cost = edges
@@ -241,4 +256,58 @@ pub fn optimize(graph: &mut PoseGraph, cfg: &OptConfig) -> OptReport {
         .sum();
 
     OptReport { iterations: iters, converged, final_cost, free_nodes: n }
+}
+
+/// Deterministically seed every reachable pose from the gauge via a spanning tree of
+/// the constraints — so the solve does not depend on incoming estimates. Absolute
+/// anchors pin their nodes; otherwise the gauge node is pinned at identity. Relative
+/// edges then propagate poses outward. Edge order is the constraints' sorted-id order
+/// (same on every node), so the result is identical across the mesh. Nodes
+/// unreachable from any seed keep their prior pose.
+fn canonical_init(poses: &mut BTreeMap<SubmapId, Pose>, edges: &[Edge], gauge: Option<SubmapId>) {
+    let mut visited: BTreeSet<SubmapId> = BTreeSet::new();
+
+    // Seeds: absolute-anchored nodes at their anchor pose.
+    for e in edges {
+        if let Edge::Absolute { s, z, .. } = e {
+            poses.insert(*s, *z);
+            visited.insert(*s);
+        }
+    }
+    // No anchor → pin the gauge at identity (the §6 "lowest-id at identity" rule).
+    if visited.is_empty() {
+        if let Some(g) = gauge {
+            poses.insert(g, Pose::identity());
+            visited.insert(g);
+        }
+    }
+    if visited.is_empty() {
+        return;
+    }
+
+    // Fixed-point propagation over relative edges (deterministic edge order).
+    loop {
+        let mut changed = false;
+        for e in edges {
+            if let Edge::Relative { a, b, z, .. } = e {
+                let (va, vb) = (visited.contains(a), visited.contains(b));
+                if va && !vb {
+                    // z = Ta⁻¹·Tb ⇒ Tb = Ta·z
+                    let tb = poses[a].compose(z);
+                    poses.insert(*b, tb);
+                    visited.insert(*b);
+                    changed = true;
+                } else if vb && !va {
+                    // Ta = Tb·z⁻¹
+                    let ta = poses[b].compose(&z.inverse());
+                    poses.insert(*a, ta);
+                    visited.insert(*a);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }

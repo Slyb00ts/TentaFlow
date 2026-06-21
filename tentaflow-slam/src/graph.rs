@@ -264,4 +264,39 @@ impl Scene {
     pub fn submaps(&self) -> impl Iterator<Item = (&SubmapId, &Submap)> {
         self.submaps.iter()
     }
+
+    /// Merge another node's scene into this one (mesh replication, §6/§13). Submaps
+    /// are keep-first (immutable, content-addressed) and constraints are add-only, so
+    /// merge is a CONFLICT-FREE union — order-independent and idempotent. After both
+    /// nodes merge each other and run `optimize` with `reinitialize`, they derive
+    /// byte-identical poses. Returns counts of newly added (submaps, constraints), or
+    /// `Err` if `other` is a DIFFERENT scene (a misrouted/stale cross-scene payload
+    /// must be rejected, never silently unioned — enforced in release too).
+    pub fn merge_from(&mut self, other: &Scene) -> Result<(usize, usize), SceneMergeError> {
+        if self.id != other.id {
+            return Err(SceneMergeError::SceneIdMismatch { expected: self.id, got: other.id });
+        }
+        let mut new_submaps = 0;
+        for (_id, sm) in other.submaps() {
+            let before = self.submap_count();
+            self.insert_submap(sm.clone());
+            if self.submap_count() != before {
+                new_submaps += 1;
+            }
+        }
+        let mut new_constraints = 0;
+        for c in other.graph.constraints() {
+            if self.graph.add_constraint(c.clone()) {
+                new_constraints += 1;
+            }
+        }
+        Ok((new_submaps, new_constraints))
+    }
+}
+
+/// Why a [`Scene::merge_from`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneMergeError {
+    /// `other` belongs to a different scene — merging would corrupt the map.
+    SceneIdMismatch { expected: u64, got: u64 },
 }
