@@ -58,6 +58,9 @@ const BATTERY_ALERT_PCT: i64 = 20;
 // that stops advancing telemetry (persistent drain/state errors) is declared dead.
 const CONNECT_TIMEOUT_SECS: i64 = 20;
 const VALIDATION_TIMEOUT_SECS: i64 = 20;
+// Auto-connect backoff: when offline with connect-intent on, the tick retries a
+// connect at most this often (the tick runs every 100ms — don't hammer the robot).
+const RECONNECT_BACKOFF_SECS: i64 = 5;
 const ONLINE_STALE_SECS: i64 = 12;
 
 static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -1787,6 +1790,9 @@ fn lidar_status_from_store() -> Result<JsonValue, AbiError> {
 
 fn do_connect() -> JsonValue {
     log::info("go2: do_connect entered");
+    // Explicit connect = operator wants the link up: persist the intent so the tick
+    // auto-reconnects if it later drops.
+    let _ = state::set_durable(state::KEY_CONNECT_INTENT, alloc::vec![1u8]);
     let robot = db::get_robot().unwrap_or_default();
     // The configured IP (install-time `ip` connection_param) is the single source
     // of truth. No default — an unconfigured instance refuses to connect.
@@ -1902,6 +1908,9 @@ fn do_connect() -> JsonValue {
 }
 
 fn do_disconnect() -> JsonValue {
+    // Explicit disconnect = stay down: clear the intent so the tick does NOT
+    // auto-reconnect until the operator connects again.
+    let _ = state::set_durable(state::KEY_CONNECT_INTENT, alloc::vec![0u8]);
     if let Ok(robot) = db::get_robot() {
         if !robot.channel_id.is_empty() {
             wc_close(&robot.channel_id);
@@ -1948,6 +1957,26 @@ fn do_reset_estop() -> JsonValue {
     let _ = db::set_estop(false);
     publish_event("go2.estop", json!({ "active": false }));
     json!({ "status": "estop_cleared" })
+}
+
+/// Operator connect intent (durable, DEFAULT-ON). A read error or absent key both
+/// yield `true` so a transient store hiccup never silently disables auto-connect.
+fn connect_intent() -> bool {
+    match state::get(state::KEY_CONNECT_INTENT) {
+        Ok(Some(v)) => v.first().map(|b| *b != 0).unwrap_or(true),
+        // Never set yet → default-on (auto-connect a fresh robot).
+        Ok(None) => true,
+        // Read hiccup → FAIL CLOSED: do NOT auto-connect this tick. If the operator
+        // had disconnected (intent=0), a transient error must not resurrect the link;
+        // a genuine auto-connect just retries next tick once the read succeeds.
+        Err(_) => false,
+    }
+}
+
+std::thread_local! {
+    // Wall-clock second of the last auto-connect attempt (backoff gate). Resets on
+    // restart, which is fine — a fresh process should attempt promptly.
+    static LAST_CONNECT_ATTEMPT: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
 }
 
 /// Tick: drive validation, then continuous telemetry.
@@ -2275,7 +2304,19 @@ fn tick() {
                 }
             }
         }
-        _ => {}
+        // offline / error / unknown → AUTO-CONNECT. When the operator intent is
+        // "connected" (default), the tick re-establishes the link itself (with a
+        // backoff), so a robot comes online without any manual connect in any UI.
+        _ => {
+            if connect_intent() {
+                let now = db::now_secs();
+                let last = LAST_CONNECT_ATTEMPT.with(|c| c.get());
+                if last == 0 || now - last >= RECONNECT_BACKOFF_SECS {
+                    LAST_CONNECT_ATTEMPT.with(|c| c.set(now));
+                    let _ = do_connect();
+                }
+            }
+        }
     }
 }
 
