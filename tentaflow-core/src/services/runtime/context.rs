@@ -60,6 +60,16 @@ pub struct ExecutionContext {
     /// callers (addons, reverse mesh, translate) that bypass user-level
     /// ACL by design.
     pub user: Option<UserContext>,
+    /// RAG E1.0 — tożsamość addona-callera (== instance_id) zasiana z
+    /// `CallerContext.addon_id` w `service_call.rs`. Przeprowadzana do
+    /// `FlowRequestMeta.addon_id` w gałęziach `ResolvedExecutionTarget::Flow`
+    /// (chat/embeddings/rerank/tts), żeby węzeł retrievalu w query-flow wiedział
+    /// w którą przestrzeń instancji uderzać. `None` dla wywołań nie-addonowych
+    /// (routing /v1 user, kamera, agent).
+    pub addon_id: Option<String>,
+    /// RAG E1.0 — organizacja-właściciel (`CallerContext.org_id`). `None` =>
+    /// domyślny tenant. Przeprowadzana razem z `addon_id`.
+    pub org_id: Option<String>,
     /// Total mesh hops this request has crossed. Each forward step must
     /// `enter_hop` to bump it; loops trip `MaxHopCount`.
     pub hop_count: u8,
@@ -94,11 +104,27 @@ impl ExecutionContext {
     pub fn new(user: Option<UserContext>) -> Self {
         Self {
             user,
+            addon_id: None,
+            org_id: None,
             hop_count: 0,
             flow_stack: Vec::new(),
             alias_stack: Vec::new(),
             route_metadata: RouteMetadata::default(),
         }
+    }
+
+    /// RAG E1.0 — zasiewa tożsamość addona-callera (instance_id) i org. Wołane w
+    /// `service_call.rs` z `req.caller`, żeby executor mógł ją przepisać do
+    /// `FlowRequestMeta` dla flow-targetu. Builder (zwraca `self`) — zwięzłe
+    /// wpięcie tuż po `ExecutionContext::new(None)`.
+    pub fn with_addon_identity(
+        mut self,
+        addon_id: Option<String>,
+        org_id: Option<String>,
+    ) -> Self {
+        self.addon_id = addon_id;
+        self.org_id = org_id;
+        self
     }
 
     /// Top-level entry seeded with an inherited flow nesting depth (RAG C2).
@@ -255,6 +281,29 @@ mod tests {
         }
         let err = ctx.enter_hop().unwrap_err();
         assert!(matches!(err, ContextLimitError::MaxHopCount { .. }));
+    }
+
+    /// RAG E1.0 (enabler): `with_addon_identity` zasiewa tożsamość addona-callera
+    /// (instance_id) i org. To ono niesie tożsamość z `service_call.rs` (z
+    /// `req.caller`) przez executor do `FlowRequestMeta` dla flow-targetu. Bez
+    /// niego flow widziałby `addon_id=None` i węzeł retrievalu nie wiedziałby w
+    /// którą przestrzeń instancji uderzać.
+    #[test]
+    fn with_addon_identity_seeds_instance_and_org() {
+        let ctx = ExecutionContext::new(None)
+            .with_addon_identity(Some("inst-rag-1".to_string()), Some("org-7".to_string()));
+        assert_eq!(ctx.addon_id.as_deref(), Some("inst-rag-1"));
+        assert_eq!(ctx.org_id.as_deref(), Some("org-7"));
+    }
+
+    /// Wywołanie nie-addonowe (routing /v1 user, kamera, agent) nie zasiewa
+    /// tożsamości — `ExecutionContext::new` zostawia `addon_id`/`org_id` None,
+    /// więc węzeł vector odmawia zapisu zamiast trafić w cudzą przestrzeń.
+    #[test]
+    fn new_without_identity_leaves_addon_and_org_none() {
+        let ctx = ExecutionContext::new(None);
+        assert!(ctx.addon_id.is_none());
+        assert!(ctx.org_id.is_none());
     }
 
     #[test]
