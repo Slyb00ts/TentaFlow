@@ -568,7 +568,13 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
         text_delta,
         reasoning_delta,
         tool_calls,
-        usage: None,
+        // Przewlekamy realne liczniki z finalnego chunku silnika do flow-engine
+        // (executor agreguje to do FlowExecutionOutcome.usage → bump tokenów).
+        usage: chunk.usage.map(|u| TokenUsage {
+            prompt_tokens: u.prompt_tokens as u64,
+            completion_tokens: u.completion_tokens as u64,
+            total_tokens: u.total_tokens as u64,
+        }),
         finish_reason,
         error: None,
     }

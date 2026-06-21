@@ -175,6 +175,11 @@ pub struct StreamToken {
     /// tylko na tokenie finalnym, gdy generacja przerwana błędem. Konsument musi
     /// propagować ten błąd zamiast cicho kończyć strumień jako "stop".
     pub error: Option<String>,
+    /// Liczniki tokenów wypełniane WYŁĄCZNIE na tokenie finalnym (is_final=true),
+    /// 0 na fragmentach. Per-request mieszczą się w u32; kumulacja globalna w górę
+    /// (token_usage_daily) jest i64 i nigdy nie przenosi sumy tym kanałem.
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// Parametry embeddingów
