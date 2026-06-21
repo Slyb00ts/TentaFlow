@@ -22,7 +22,9 @@ use serde_json::{json, Value as JsonValue};
 
 use tentaflow_hardware::unitree::go2::protocol;
 use tentaflow_sdk_spec::protocol::control::CborMap;
-use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ};
+use tentaflow_sdk_spec::{
+    LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ_I16,
+};
 use tentaflow_sdk_spec::protocol::ui::{
     actions::Button as ButtonComp,
     bind::BindRef,
@@ -973,7 +975,7 @@ fn count_voxel_points(buf: &[u8]) -> usize {
 /// on the service tick instead of building a `Vec<[f32;3]>` + JSON.
 ///
 /// INVARIANT (the whole point of L1): zero JSON; the output `Vec<u8>` is
-/// PREALLOCATED to exactly `LIDAR_HEADER_LEN + point_count*3*4` from the exact
+/// PREALLOCATED to exactly `LIDAR_HEADER_LEN + point_count*3*2` from the exact
 /// popcount, so it never grows during the bit-scan, and the whole frame is one
 /// buffer for a single WASM->host copy in `publish_lidar_frame`.
 ///
@@ -992,10 +994,19 @@ fn decode_voxel_to_canonical(
     }
     let header = LidarFrameHeader {
         version: LIDAR_FRAME_VERSION,
-        layout: LIDAR_LAYOUT_XYZ,
+        // Packed-i16 grid indices: half the wire bytes of f32 XYZ and lossless for
+        // a voxel map (every point already lands on `origin + index * resolution`).
+        // The browser reconstructs world meters from these indices + the header's
+        // resolution/origin, so those two fields are now load-bearing, not just
+        // informational. Emitting indices is also cheaper per point than the f32
+        // multiply-add, easing the service-tick fuel budget.
+        layout: LIDAR_LAYOUT_XYZ_I16,
         point_count: point_count as u32,
         frame_seq,
         timestamp_us: ts_us,
+        // The addon does not know when the host will broadcast this frame; the
+        // host pump stamps `host_send_us` in place just before the WS send.
+        host_send_us: 0,
         resolution,
         origin,
     };
@@ -1003,11 +1014,11 @@ fn decode_voxel_to_canonical(
     // never overflow usize and panic the allocation size. point_count is already
     // capped at LIDAR_MAX_POINTS above, so the checked path always succeeds here;
     // the saturating fallback is a defensive belt-and-braces (still a finite,
-    // bounded reserve — never a panic). The body is `point_count * 3 * 4` bytes
-    // (3 f32 per point, XYZ layout).
+    // bounded reserve — never a panic). The body is `point_count * 3 * 2` bytes
+    // (3 i16 grid indices per point, XYZ_I16 layout).
     let body_cap = point_count
         .checked_mul(3)
-        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_mul(2))
         .and_then(|n| n.checked_add(LIDAR_HEADER_LEN))
         .unwrap_or(LIDAR_HEADER_LEN);
     // Fallible reserve instead of with_capacity: under panic = abort an oversized
@@ -1019,33 +1030,32 @@ fn decode_voxel_to_canonical(
         return None;
     }
     out.extend_from_slice(&header.encode_header());
-    let res = resolution;
+    // Emit raw grid INDICES as i16 (browser reconstructs `idx * resolution +
+    // origin`). No per-point float math here; the multiply-add moves to the
+    // decoder, which both halves the wire body and trims the service-tick fuel.
     for (i, &byte) in decompressed.iter().enumerate() {
         if byte == 0 {
             continue;
         }
-        let z = (i / 0x800) as f32;
+        let z = (i / 0x800) as i16;
         let n_slice = i % 0x800;
-        let y = (n_slice / 0x10) as f32;
-        let x_base = ((n_slice % 0x10) * 8) as f32;
-        // y/z are constant for this byte; only x varies per set bit. Precompute
-        // world y/z ONCE per byte (not per bit), and emit each point as a single
-        // 12-byte write (ONE extend per point instead of three). A real frame is
-        // ~32k points, so cutting the per-point WASM instruction/extend count is
-        // what keeps the decode under the service-tick fuel budget.
-        let yw = (y * res + origin[1]).to_le_bytes();
-        let zw = (z * res + origin[2]).to_le_bytes();
+        let y = (n_slice / 0x10) as i16;
+        let x_base = ((n_slice % 0x10) * 8) as i16;
+        // y/z are constant for this byte; only x varies per set bit. Emit each
+        // point as a single 6-byte write (ONE extend per point).
+        let yi = y.to_le_bytes();
+        let zi = z.to_le_bytes();
         // Bit-scan: only set bits do work. The Go2 grid is MSB-first along x
         // (bit 0 == 0x80), so reverse the trailing-zero index to recover x.
         let mut bits = byte;
         while bits != 0 {
             let b = bits.trailing_zeros();
             bits &= bits - 1;
-            let xw = ((x_base + (7 - b) as f32) * res + origin[0]).to_le_bytes();
-            let mut pt = [0u8; 12];
-            pt[0..4].copy_from_slice(&xw);
-            pt[4..8].copy_from_slice(&yw);
-            pt[8..12].copy_from_slice(&zw);
+            let xi = (x_base + (7 - b) as i16).to_le_bytes();
+            let mut pt = [0u8; 6];
+            pt[0..2].copy_from_slice(&xi);
+            pt[2..4].copy_from_slice(&yi);
+            pt[4..6].copy_from_slice(&zi);
             out.extend_from_slice(&pt);
         }
     }
@@ -2804,27 +2814,33 @@ mod tests {
 
         let frame = decode_voxel_to_canonical(&grid, resolution, origin, 5, 1_234_000_000)
             .expect("under cap");
-        // Preallocation is EXACT: no growth during the bit-scan.
-        assert_eq!(frame.len(), LIDAR_HEADER_LEN + k * 3 * 4);
-        assert_eq!(frame.capacity(), LIDAR_HEADER_LEN + k * 3 * 4);
+        // Preallocation is EXACT: no growth during the bit-scan. Body is 6 B/point
+        // (3 i16 grid indices) under the XYZ_I16 layout.
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + k * 3 * 2);
+        assert_eq!(frame.capacity(), LIDAR_HEADER_LEN + k * 3 * 2);
 
         let h = LidarFrameHeader::decode_header(&frame).expect("header");
         assert_eq!(h.point_count as usize, k);
         assert_eq!(h.frame_seq, 5);
         assert_eq!(h.timestamp_us, 1_234_000_000);
+        // The addon never stamps the host send time; the host pump does.
+        assert_eq!(h.host_send_us, 0);
         assert_eq!(h.resolution, resolution);
         assert_eq!(h.origin, origin);
 
-        // Reconstruct points from the packed body and compare to the upstream
-        // MSB-first decode computed inline as the reference oracle.
+        // Reconstruct points from the packed i16 grid body (world =
+        // `idx * resolution + origin`, exactly what the browser decoder does) and
+        // compare to the upstream MSB-first decode computed inline as the oracle.
         let body = &frame[LIDAR_HEADER_LEN..];
         let mut got: Vec<[f32; 3]> = Vec::new();
         for i in 0..k {
-            let off = i * 3 * 4;
-            let rd = |o: usize| {
-                f32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
-            };
-            got.push([rd(off), rd(off + 4), rd(off + 8)]);
+            let off = i * 3 * 2;
+            let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
+            got.push([
+                rd(off) * resolution + origin[0],
+                rd(off + 2) * resolution + origin[1],
+                rd(off + 4) * resolution + origin[2],
+            ]);
         }
         let res = resolution as f64;
         let mut expected: Vec<[f32; 3]> = Vec::new();
@@ -2887,7 +2903,7 @@ mod tests {
         assert!(count <= LIDAR_MAX_POINTS);
         let frame = decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0)
             .expect("at-cap frame must decode, not abort");
-        assert_eq!(frame.len(), LIDAR_HEADER_LEN + count * 3 * 4);
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + count * 3 * 2);
     }
 
     #[test]
