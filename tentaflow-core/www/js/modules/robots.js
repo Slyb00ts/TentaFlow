@@ -29,6 +29,7 @@ import '/js/components/tf-modal.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
 import '/js/components/tf-video-stream.js';
+import '/js/components/tf-robot-view.js';
 
 // Mesh discovery refreshes the registry periodically; re-poll so status, battery
 // and online/offline transitions appear without a manual reload.
@@ -694,6 +695,9 @@ function updateCard(el, r) {
   // Refresh the LiDAR row in place (its own container, never the video node).
   updateLidar(el, r);
 
+  // Refresh the live 3D robot (joints + orientation) in place.
+  updateRobot3d(el, r);
+
   // Rebuild the capability-driven controls only when the advertised action set
   // actually changed (signature compare inside buildControls). This never touches
   // the video node above it.
@@ -804,6 +808,36 @@ function updateTelemetry(el, r) {
   host.innerHTML = `
     <div class="robots-telemetry-title">Telemetria</div>
     <div class="robots-telemetry-rows">${rows.join('')}</div>`;
+}
+
+// Live 3D robot (interim Three.js) IN PLACE inside [data-field="robot3d"]: shows the
+// articulated robot driven by the telemetry joint angles + IMU orientation. Hidden
+// until 12 joint angles are present and the robot is online. The <tf-robot-view> is
+// created once and fed each refresh so the WebGL context is never re-created.
+function updateRobot3d(el, r) {
+  const host = el.querySelector('[data-field="robot3d"]');
+  if (!host) return;
+  const t = telemetry(r);
+  const joints = t && Array.isArray(t.joints) ? t.joints : null;
+  const offline = !isControllable(r.status || '');
+  if (!joints || joints.length < 12 || offline) {
+    host.hidden = true;
+    // Tear down the view so its WebGL render loop stops (disconnectedCallback
+    // cancels the rAF + disposes the renderer); it is recreated when joints return.
+    if (host.firstChild) host.replaceChildren();
+    return;
+  }
+  host.hidden = false;
+  let view = host.querySelector('tf-robot-view');
+  if (!view) {
+    host.innerHTML = '<div class="robots-robot3d-title">Model 3D — stawy na żywo</div>';
+    view = document.createElement('tf-robot-view');
+    view.className = 'robots-robot3d-view';
+    host.appendChild(view);
+  }
+  const imu = t.imu || {};
+  const rpy = [Number(imu.roll) || 0, Number(imu.pitch) || 0, Number(imu.yaw) || 0];
+  view.setPose({ joints, rpy });
 }
 
 // Renders the LiDAR row IN PLACE inside [data-field="lidar"]: an enable/disable
@@ -1370,6 +1404,8 @@ function robotCard(r) {
       <div class="robots-telemetry" data-field="telemetry" hidden></div>
 
       <div class="robots-lidar" data-field="lidar" hidden></div>
+
+      <div class="robots-robot3d" data-field="robot3d" hidden></div>
 
       <div class="robots-controls" data-field="controls"></div>
 

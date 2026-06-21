@@ -7935,6 +7935,11 @@ fn robot_telemetry_to_js(t: &tentaflow_protocol::RobotTelemetrySnapshot) -> JsVa
     }
     set(&obj, "footForce", foot_force.clone().into());
     set(&obj, "foot_force", foot_force.into());
+    let joints = js_sys::Array::new();
+    for v in &t.joints {
+        joints.push(&JsValue::from(*v));
+    }
+    set(&obj, "joints", joints.into());
     match t.vx {
         Some(vx) => set(&obj, "vx", vx.into()),
         None => set(&obj, "vx", JsValue::NULL),

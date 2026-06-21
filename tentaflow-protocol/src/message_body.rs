@@ -2003,6 +2003,11 @@ pub struct RobotTelemetrySnapshot {
     pub imu: Option<RobotImuSnapshot>,
     #[serde(default)]
     pub battery: Option<RobotBatterySnapshot>,
+    /// Leg joint angles in radians, Go2 order FR/FL/RR/RL × hip/thigh/calf
+    /// (empty when absent). Drives the dashboard robot animation. APPENDED LAST for
+    /// wire back-compat (ciborium positional fields — new fields go at the end).
+    #[serde(default)]
+    pub joints: Vec<f64>,
 }
 
 /// SMALL LiDAR availability snapshot — NEVER the point cloud (which would be far
@@ -7751,6 +7756,7 @@ mod tests {
                 vyaw: Some(0.05),
                 position: vec![1.0, 2.0, 0.3],
                 foot_force: vec![120.0, 118.0, 121.0, 119.0],
+                joints: vec![0.1, -0.8, 1.4, -0.1, -0.8, 1.4, 0.1, -0.9, 1.4, -0.1, -0.9, 1.4],
                 imu: Some(RobotImuSnapshot {
                     roll: Some(0.01),
                     pitch: Some(-0.02),
