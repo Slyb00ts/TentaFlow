@@ -957,6 +957,10 @@ pub struct CameraStreamSubscribePayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CameraStreamFrame {
     pub is_init: bool,
+    /// `serde_bytes` → CBOR byte string (bulk copy), not an array-of-integers
+    /// (per-element, ~100ns/byte). Same fix as `StreamFramePayload.data`: cross-node
+    /// relay of ~hundreds-of-KB frames would otherwise serialize byte-by-byte.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -978,6 +982,10 @@ pub struct LidarStreamSubscribePayload {
 /// observer simply treats the latest received frame as its dynamic init segment.
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct LidarStreamFrame {
+    /// `serde_bytes` → CBOR byte string (bulk copy), not an array-of-integers.
+    /// Same root-cause fix as `StreamFramePayload.data` / `CameraStreamFrame.data`:
+    /// a ~300KB canonical cloud relayed cross-node must not serialize byte-by-byte.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
