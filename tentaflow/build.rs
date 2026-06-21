@@ -144,6 +144,21 @@ fn copy_native_dynamic_libs() {
         }
     };
 
+    // Usun stare wersjonowane libonnxruntime z targetu zanim skopiujemy aktualne —
+    // po bumpie wersji (np. 1.22.0 -> 1.26.0) zostawalyby OBA pliki, a ort
+    // load-dynamic (probe w supertonic.rs) wybralby niedeterministycznie stary.
+    if let Ok(target_entries) = std::fs::read_dir(&target_dir) {
+        for e in target_entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let versioned_ort = name.starts_with("libonnxruntime.so")
+                || (name.starts_with("libonnxruntime.") && name.ends_with(".dylib"));
+            if versioned_ort {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
     for entry in entries.flatten() {
         let dest = target_dir.join(entry.file_name());
         if let Err(e) = copy_runtime_entry(&entry.path(), &dest) {
