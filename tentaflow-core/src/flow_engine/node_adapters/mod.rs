@@ -30,6 +30,7 @@ pub mod on_subagent_complete;
 pub mod output;
 pub mod persist_turn;
 pub mod pii_filter;
+pub mod rag_graphrag;
 pub mod rag_multihop;
 pub mod reranker;
 pub mod sentence_buffer;
@@ -74,6 +75,7 @@ pub use on_subagent_complete::{CompletionFilter, OnSubagentCompleteNodeAdapter};
 pub use output::OutputNodeAdapter;
 pub use persist_turn::PersistTurnNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
+pub use rag_graphrag::{RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter};
 pub use rag_multihop::{
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter,

@@ -715,6 +715,17 @@ impl GraphManager {
     /// id węzłów stanowiących wektor personalizacji; nieznane id są pomijane.
     /// Zwraca top-N `(id, score)` malejąco. Read-lock obejmuje eksport CSR, więc
     /// PPR liczy się nad spójnym snapshotem grafu.
+    ///
+    /// SEMANTYKA SEEDÓW (retrieval z JAWNYMI kotwicami): ta ścieżka jest zawsze
+    /// wołana z jawnie podaną listą seedów (host-fn `graph_ppr_v1`, `graph_search`
+    /// op=ppr, GraphRAG). Rozróżniamy więc dwa przypadki:
+    ///   * `seeds` PUSTE  — caller nie podał kotwic → globalny PageRank (jednostajna
+    ///     teleportacja w `personalized_pagerank`); legalne wejście.
+    ///   * `seeds` NIEPUSTE, ale ŻADEN nie istnieje w grafie (wszystkie odpadły po
+    ///     filtrowaniu przez `id_index`) → PUSTY wynik. Personalized PageRank z
+    ///     zerowymi kotwicami to brak wyniku, NIE globalny ranking — inaczej
+    ///     zapytanie o encje spoza KG dostałoby top globalne encje (szum, łamie
+    ///     degradację „brak encji → sam wektor").
     #[allow(clippy::too_many_arguments)]
     pub fn ppr(
         &self,
@@ -730,6 +741,11 @@ impl GraphManager {
         let index = csr.id_index();
         let seed_indices: Vec<usize> =
             seeds.iter().filter_map(|s| index.get(s.as_str()).copied()).collect();
+        // Jawne seedy podane, ale żaden nie trafił w graf → brak ważnych kotwic.
+        // Zwracamy pusto zamiast degenerować do globalnego PageRanku.
+        if !seeds.is_empty() && seed_indices.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut scored =
             super::ppr::personalized_pagerank(&csr, &seed_indices, damping, iterations as usize);
         scored.truncate(top_n as usize);

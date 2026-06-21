@@ -28,6 +28,12 @@ pub type PprScores = Vec<(String, f64)>;
 /// (degeneruje do zwykłego PageRanku). `damping` w (0,1) (typowo 0.85), `iters`
 /// to liczba iteracji power-iteration.
 ///
+/// UWAGA: ta funkcja jest niskopoziomowa i celowo NIE rozróżnia „seedów nie
+/// podano" od „podano same nieznane id" — z jej perspektywy oba to pusty wektor
+/// → uniform. Rozróżnienie semantyczne (retrieval z jawnymi kotwicami: same
+/// nieznane seedy → PUSTY wynik, nie uniform) egzekwuje `GraphManager::ppr`
+/// PRZED wywołaniem tej funkcji.
+///
 /// Zwraca pełny wektor `(id, score)` posortowany malejąco. Pruning top-N robi
 /// warstwa wyżej (host-fn / retrieval).
 pub fn personalized_pagerank(

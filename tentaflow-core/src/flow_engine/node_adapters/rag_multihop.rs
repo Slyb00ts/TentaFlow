@@ -456,7 +456,21 @@ impl NodeAdapter for RagFinalizeNodeAdapter {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        out.payload = FlowValue::Text(build_context_text(&question, &accumulated));
+        // GraphRAG (E3.2): finalny kontekst FUZUJE pasaże wektorowe z faktami
+        // grafowymi ostatniego hopu (meta.rag_graph_facts), żeby finalny LLM —
+        // tak jak sędzia — widział OBA źródła. Brak faktów → sam kontekst pasaży.
+        let vector_context = build_context_text(&question, &accumulated);
+        let graph_facts = out
+            .meta
+            .get(crate::flow_engine::node_adapters::rag_graphrag::META_GRAPH_FACTS)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        out.payload = FlowValue::Text(
+            crate::flow_engine::node_adapters::rag_graphrag::fuse_context(
+                &vector_context,
+                graph_facts,
+            ),
+        );
 
         // Cytaty finalnej odpowiedzi = WSZYSTKIE zakumulowane pasaże (dedup, top
         // wg score) — przepinamy je na rag_citations, bo output emituje stamtąd.
