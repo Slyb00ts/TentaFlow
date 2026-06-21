@@ -1,0 +1,13 @@
+[package]
+name = "tentaflow-slam"
+version = "0.1.0"
+edition = "2021"
+authors = ["TentaFlow"]
+description = "Unified SLAM core: frozen submaps + pose graph (spatial + positioning)"
+
+[dependencies]
+# SE(3) poses and linear algebra. f64 poses for global accuracy; f32 point geometry.
+nalgebra = "0.33"
+
+[dev-dependencies]
+approx = "0.5"

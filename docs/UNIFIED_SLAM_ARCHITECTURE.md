@@ -165,12 +165,15 @@ materialization. Map it directly:
   ledger ops; the hash dedupes.
 - **Constraints = add-only facts** in the ledger (each is an immutable observation
   with provenance + information matrix). The set of constraints is a grow-only set.
-- **Pose graph is DERIVED, not synced**: every node runs the SAME deterministic
-  optimizer over the SAME merged (submaps, constraints) set → the same submap poses
-  (up to a gauge fixed by a convention, e.g. anchor the georeferenced submap, or the
-  lowest-id submap at identity). This mirrors the existing "materialization already
-  convergent; admission is the only thing to control" design — poses converge because
-  they are a pure function of replicated facts.
+- **Pose graph is DERIVED, not synced**: the optimized submap poses are a pure
+  deterministic function of the merged (submaps, constraints) set + a fixed gauge
+  (anchor the georeferenced submap, else the lowest-id submap at identity).
+  **Determinism here is the correctness/failover backstop, NOT a mandate that every
+  node optimize.** In practice ONE elected owner per scene runs the optimization and
+  publishes the resulting poses as facts; everyone else consumes them cheaply. Because
+  the input is a replicated deterministic set, any node can recompute the identical
+  result, so owner failover needs no handoff state (the new owner just re-derives).
+  See §13 for who computes what.
 - **Georeference** is just `Georef` constraints (submap→ECEF) contributed by
   GNSS-equipped nodes; once one node georeferences a scene, the fact replicates and
   every GNSS-denied node inherits a global frame. Multiple/disagreeing georef facts
@@ -374,3 +377,77 @@ pure-Rust crate `tentaflow-slam` (testable off-device; no GPU).
   `GlobalPose` stream (lat/lon/alt once georeferenced, else scene-local + covariance).
 - **0f — 2-node mesh merge.** Replicate submaps + constraints over the sync ledger;
   confirm both nodes derive convergent submap poses.
+
+---
+
+## 13. Work distribution & multi-node roles (no node does everything, no node idles)
+
+Governing rule: **light work follows the sensors; heavy-global work has ONE owner
+per scene; heavy-offloadable work goes to whichever node is free + capable.** Nothing
+is computed N× "just because".
+
+**Pinned to the node a robot is connected to (local, latency-bound):**
+- fast-path tracking (per-frame odometry) — the sensor stream is there;
+- submap production (accumulate geometry, seal, keyframes, descriptors); that node is
+  the submap's `origin_node`.
+So robots on node A are tracked+mapped by A, robots on B by B — work spreads with the
+sensors automatically.
+
+**Shared = replicated facts (the "common point map"):** submaps (immutable,
+content-hashed) + constraints + poses flow over the existing sync ledger. The scene's
+map is the UNION of every node's submaps, placed by the shared pose graph. A and B
+each publish theirs → both hold the whole map.
+
+**One owner per scene (avoid N× compute):** the heavy GLOBAL work — pose-graph
+optimization, cross-submap loop-closure search, the scene VPR index — runs on a single
+elected coordinator node per scene; it publishes resulting submap poses as facts that
+others consume cheaply.
+- Election: deterministic, capability-weighted (strongest live node; ties → lowest id).
+- Failover: deterministic derivation (§6) means a new owner recomputes the identical
+  result — no handoff state.
+- Different scenes → different owners → natural load spread (building 1 optimized on A,
+  building 2 on B).
+
+**Offloadable heavy tasks (so node B isn't idle even with all robots on A):** depth-model
+ONNX inference (for cameras), VPR descriptor computation, scan registration / loop
+geometric verification, global optimization — are dispatched to the least-loaded
+*capable* node via mesh-command, exactly like the existing `WebResearch` offload (to a
+node with SearXNG) and cross-node frame pickup. So A (CPU-bound ingesting+tracking)
+pushes depth-inference + optimization to an idle GPU server B; B earns its keep as a
+compute sink with zero robots of its own.
+
+**Capability-aware roles:** phone / robot / drone = thin (ingest + fast tracking, light
+ESKF, offload the rest); server (GPU) = heavy (optimization, VPR index, depth models,
+georeference). A drone on node A offloads its vision/depth to beefy node B.
+
+**Concrete A+B:** same building → same scene → submaps from A and B land in one scene →
+the scene owner finds loop closures BETWEEN A's and B's submaps and stitches them → one
+coherent map. Different buildings → different scenes → never fused (§SPATIAL-11).
+
+---
+
+## 14. Mesh transport — channels = QUIC streams per traffic class + priorities
+
+Today: one iroh/QUIC connection per peer (UFP/2 framed channels). Refinement so a bulk
+transfer can't block a control message:
+
+- **Do NOT** use N fixed connections or a hardcoded "6 channels". QUIC streams are
+  already mutually non-blocking (loss on one never stalls another) — use **one stream
+  (class) per traffic type**; it is strictly more flexible.
+- **Head-of-line blocking is handled per level:** across streams → QUIC isolates;
+  within a stream → ordered bytes, so **bulk transfers get one stream PER transfer**
+  (a submap blob = open→send→close, never queued behind another); connection level →
+  all streams share one bandwidth/congestion controller, so use **stream priorities**.
+- **Traffic class → transport:**
+  | class | nature | transport |
+  |------|--------|-----------|
+  | control / mesh-command / election | small, latency-critical | high-priority reliable stream (req/resp) |
+  | pose / telemetry / live point-cloud preview | ephemeral, latest-wins | **QUIC datagrams** (no retransmit — stale data is useless) |
+  | video | real-time | own stream / datagrams (existing path) |
+  | map sync (submaps, blobs, constraints) | bulk, reliable, throughput | one stream per transfer, low priority, backpressured |
+- **Priorities, not round-robin.** Round-robin gives equal share; we want UNEQUAL: a
+  50 KB control message must preempt a 5 MB submap, not get an equal slice. Order:
+  **control > real-time (pose/preview) > video > bulk sync.** Round-robin only as a
+  crude fallback if priorities are unavailable.
+- Maps onto existing UFP/2 channels: each logical channel = a separate QUIC stream;
+  add per-class priority; use datagrams for ephemeral real-time.
