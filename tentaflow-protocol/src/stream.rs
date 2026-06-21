@@ -73,6 +73,12 @@ pub struct StreamFramePayload {
     pub stream_id: String,
     /// `true` for the MSE init segment (ftyp+moov), `false` for media chunks.
     pub is_init: bool,
+    /// `serde_bytes` so ciborium emits a CBOR byte string (one bulk copy) instead of
+    /// a CBOR array-of-integers. Plain `Vec<u8>` via serde encodes each byte as a
+    /// separate CBOR item (~100ns/byte en+decode) — for a ~300KB LiDAR frame / fMP4
+    /// chunk that was the dominant push-path latency. Byte string = length-prefixed
+    /// bulk on both server encode and wasm decode.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
