@@ -46,8 +46,8 @@ use crate::flow_engine::node_adapters::{
     PiiFilterNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
-    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VisionClassifyNodeAdapter,
-    VisionNodeAdapter, VisionOcrNodeAdapter,
+    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
+    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -102,6 +102,14 @@ pub struct FlowRequestMeta {
     pub session_id: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// RAG E1.0 — tożsamość addona-callera (== instance_id) przeprowadzona z
+    /// `CallerContext.addon_id` przez executor. `Some` tylko dla flow wyzwolonego
+    /// przez addon JAKO MODEL; `None` dla /v1 user / kamera / agent. `make_context`
+    /// kopiuje to do `ExecutionContext.addon_id`.
+    pub addon_id: Option<String>,
+    /// RAG E1.0 — organizacja-właściciel (`CallerContext.org_id`). `None` =>
+    /// domyślny tenant rozwiązywany przy użyciu. Kopiowane do `ExecutionContext.org_id`.
+    pub org_id: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
@@ -126,6 +134,8 @@ impl FlowRequestMeta {
             session_id: None,
             user_id: None,
             user_role: None,
+            addon_id: None,
+            org_id: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
             progress_sink: None,
@@ -192,6 +202,7 @@ pub struct FlowDispatcher {
 struct ContextFactory {
     clock: Arc<dyn Clock>,
     blobs: Arc<dyn BlobStore>,
+    vectors: Arc<crate::services::vector::NamespaceManager>,
     llm: Arc<dyn LlmDispatcher>,
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     reranker: Arc<dyn RerankDispatcher>,
@@ -217,6 +228,8 @@ impl ContextFactory {
             session_id: meta.session_id.clone(),
             user_id: meta.user_id.clone(),
             user_role: meta.user_role.clone(),
+            addon_id: meta.addon_id.clone(),
+            org_id: meta.org_id.clone(),
             deadline: meta.deadline,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),
@@ -225,6 +238,7 @@ impl ContextFactory {
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: self.clock.clone(),
             blobs: self.blobs.clone(),
+            vectors: self.vectors.clone(),
             llm: self.llm.clone(),
             embeddings: self.embeddings.clone(),
             reranker: self.reranker.clone(),
@@ -307,9 +321,15 @@ impl FlowDispatcher {
             Arc::new(SttDispatcherImpl::new(runtime_slot, ctx_blobs.clone()));
         let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
 
+        // RAG E1.0 — współdzielony proces-szeroki rejestr przestrzeni wektorowych.
+        // Te same backendy co host functions addona (jeden katalog w procesie),
+        // więc flow-node i ingest host-fn widzą tę samą przestrzeń instancji.
+        let vectors = crate::services::vector_namespace_manager(&db).clone();
+
         let ctx_factory = Arc::new(ContextFactory {
             clock,
             blobs: ctx_blobs,
+            vectors,
             llm,
             embeddings,
             reranker,
@@ -987,6 +1007,8 @@ fn build_registry(
         Arc::new(SttNodeAdapter::new()),
         Arc::new(EmbeddingsNodeAdapter::new()),
         Arc::new(RerankerNodeAdapter::new()),
+        // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
+        Arc::new(VectorNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
         Arc::new(PersistTurnNodeAdapter::new()),
@@ -1072,6 +1094,59 @@ pub fn build_registry_with_runner(subflow_runner: SubflowRunnerSlot) -> AdapterR
 mod tests {
     use super::*;
 
+    /// RAG E1.0 (enabler): `make_context` przepisuje `addon_id`/`org_id` z
+    /// `FlowRequestMeta` do `flow_engine::ExecutionContext`. To finalne ogniwo
+    /// łańcucha tożsamości: caller (service_call) → executor (FlowRequestMeta dla
+    /// flow-targetu) → make_context → ExecutionContext, którego używa węzeł
+    /// vector. Test buduje minimalny ContextFactory na stubach test_support.
+    fn stub_context_factory() -> ContextFactory {
+        use crate::flow_engine::dispatchers::clock::SystemClock;
+        use crate::flow_engine::dispatchers::metrics::NoopMetrics;
+        use crate::flow_engine::node_adapter::test_support::{
+            stub_vectors, StubAudit, StubEmbeddings, StubHistory, StubLlm, StubMemory,
+            StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
+        };
+        ContextFactory {
+            clock: Arc::new(SystemClock),
+            blobs: Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
+            vectors: stub_vectors(),
+            llm: Arc::new(StubLlm),
+            embeddings: Arc::new(StubEmbeddings),
+            reranker: Arc::new(StubReranker),
+            stt: Arc::new(StubStt),
+            tts: Arc::new(StubTts),
+            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
+            prompts: Arc::new(StubPrompts),
+            memory: Arc::new(StubMemory),
+            history: Arc::new(StubHistory),
+            audit: Arc::new(StubAudit),
+            metrics: Arc::new(NoopMetrics),
+            pii_rules: Arc::new(StubPiiRules),
+            tts_cleaning: Arc::new(StubTtsCleaning),
+        }
+    }
+
+    #[test]
+    fn make_context_propagates_addon_identity_from_meta() {
+        let factory = stub_context_factory();
+        let mut meta = FlowRequestMeta::new("req-1");
+        meta.addon_id = Some("inst-rag-1".to_string());
+        meta.org_id = Some("org-7".to_string());
+        let ctx = factory.make_context(&meta);
+        assert_eq!(ctx.addon_id.as_deref(), Some("inst-rag-1"));
+        assert_eq!(ctx.org_id.as_deref(), Some("org-7"));
+    }
+
+    #[test]
+    fn make_context_non_addon_call_leaves_identity_none() {
+        let factory = stub_context_factory();
+        // Domyślne meta (np. routing /v1 user / kamera / agent) — bez tożsamości.
+        let meta = FlowRequestMeta::new("req-2");
+        let ctx = factory.make_context(&meta);
+        assert!(ctx.addon_id.is_none());
+        assert!(ctx.org_id.is_none());
+    }
+
     #[test]
     fn registry_includes_all_node_types() {
         let r = build_registry(
@@ -1088,6 +1163,7 @@ mod tests {
             "stt",
             "tts",
             "embeddings",
+            "vector",
             "memory",
             "conversation_history",
             "persist_turn",

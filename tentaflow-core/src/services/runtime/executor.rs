@@ -975,10 +975,13 @@ impl ModelRuntimeExecutor {
                 let dispatch_result = {
                     let user = ctx.user.clone();
                     let blobs = dispatcher.blobs();
-                    let (initial, meta) =
+                    let (initial, mut meta) =
                         crate::routing::build_initial_envelope_for_user(&request, user, &blobs)
                             .await
                             .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
+                    // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
+                    meta.addon_id = ctx.addon_id.clone();
+                    meta.org_id = ctx.org_id.clone();
                     dispatcher
                         .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                         .await
@@ -1444,6 +1447,9 @@ impl ModelRuntimeExecutor {
                 // `enter_flow`), żeby self-referencyjny embeddings-flow narastał
                 // przez `subflow_depth` zamiast resetować się do 0.
                 meta.flow_depth = ctx.flow_stack.len() as u8;
+                // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
+                meta.addon_id = ctx.addon_id.clone();
+                meta.org_id = ctx.org_id.clone();
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
@@ -1608,6 +1614,9 @@ impl ModelRuntimeExecutor {
                 // `enter_flow`), żeby self-referencyjny rerank-flow narastał
                 // przez `subflow_depth` zamiast resetować się do 0.
                 meta.flow_depth = ctx.flow_stack.len() as u8;
+                // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
+                meta.addon_id = ctx.addon_id.clone();
+                meta.org_id = ctx.org_id.clone();
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;
@@ -1965,7 +1974,10 @@ impl ModelRuntimeExecutor {
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
                 ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
-                let (initial, meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let (initial, mut meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
+                // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
+                meta.addon_id = ctx.addon_id.clone();
+                meta.org_id = ctx.org_id.clone();
                 let dispatch_result = dispatcher
                     .dispatch_by_flow_id(flow_id.clone(), initial, meta)
                     .await;

@@ -1353,6 +1353,9 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             session_id: Some(scope),
             user_id: principal.user_id().map(String::from),
             user_role: None,
+            // Ścieżka agenta (nie-addon) — bez tożsamości instancji addona.
+            addon_id: None,
+            org_id: None,
             deadline,
             cancel_token: cancel,
             progress_sink: Some(progress),

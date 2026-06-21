@@ -234,7 +234,16 @@ pub async fn dispatch(
     // test DB-less) degradujemy do legacy dispatchu po nazwie aliasu poniżej.
     if let (Some(_), Some(executor)) = (&alias_row, executor) {
         let started = Instant::now();
-        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None);
+        // RAG E1.0 — zasiej tożsamość addona-callera (instance_id) i org z
+        // `req.caller`. `service_call::dispatch` to ścieżka addon-as-model
+        // (host-fn `service_request` + operatory flow_runtime), więc `addon_id`
+        // jest tu zawsze instancją addona. Executor przepisze to do
+        // `FlowRequestMeta` dla `ResolvedExecutionTarget::Flow`.
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None)
+            .with_addon_identity(
+                Some(req.caller.addon_id.clone()),
+                req.caller.org_id.clone(),
+            );
         let routed = route_alias_via_executor(
             executor,
             &service_name,

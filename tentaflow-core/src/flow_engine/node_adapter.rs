@@ -99,6 +99,17 @@ pub struct ExecutionContext {
     pub session_id: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// RAG E1.0 — tożsamość addona-callera (== instance_id; `install_instance`
+    /// przepisuje `[addon].id` na instancję, więc to klucz izolacji per-instancja).
+    /// `Some` gdy flow został wyzwolony przez addon JAKO MODEL (przez
+    /// `service_request`→executor→`FlowDispatcher`). `None` dla wywołań
+    /// nie-addonowych (routing /v1 user, kamera, agent) — węzeł retrievalu odmawia
+    /// zapisu bez tożsamości zamiast trafiać w cudzą przestrzeń.
+    pub addon_id: Option<String>,
+    /// RAG E1.0 — organizacja-właściciel wywołania. `None` => domyślny tenant
+    /// (`DEFAULT_ORG_ID`) rozwiązywany przy użyciu w węźle. Razem z `addon_id`
+    /// składa się na `(org, addon_instance, namespace)` izolacji wektorowej.
+    pub org_id: Option<String>,
     pub deadline: Option<Instant>,
     /// §3.13 — accumulated human-wait time (millis) that the deadline check adds
     /// back to `deadline`, so time a run spends parked in `waiting_user` (an
@@ -131,6 +142,12 @@ pub struct ExecutionContext {
 
     pub clock: Arc<dyn Clock>,
     pub blobs: Arc<dyn BlobStore>,
+
+    /// RAG E1.0 — rejestr przestrzeni wektorowych `(org, addon_instance, namespace)`.
+    /// `VectorNodeAdapter` uderza w niego z `ctx.addon_id`/`ctx.org_id`. Współdzielony
+    /// proces-szeroki manager (`services::vector_namespace_manager`); testy wstrzykują
+    /// `with_root(tempdir)`.
+    pub vectors: Arc<crate::services::vector::NamespaceManager>,
 
     pub llm: Arc<dyn LlmDispatcher>,
     pub embeddings: Arc<dyn EmbeddingsDispatcher>,
@@ -690,6 +707,26 @@ pub mod test_support {
         }
     }
 
+    /// Stub `NamespaceManager` na izolowanym tempdirze (root pod `TMPDIR`, więc
+    /// nie dotyka `~/.tentaflow` ani sieciowego dysku). DB in-memory z pełnymi
+    /// migracjami (tabela `addon_vector_namespaces`). Każde wywołanie daje świeży
+    /// katalog (unikalny suffix), więc testy nie współdzielą stanu. Katalog NIE
+    /// jest sprzątany — to ephemeralny tmpfs/scratch w testach.
+    pub fn stub_vectors() -> Arc<crate::services::vector::NamespaceManager> {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let pool = Arc::new(crate::db::Db::from_connection(conn));
+        let root = std::env::temp_dir().join(format!(
+            "tf-vec-stub-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create stub vectors root");
+        Arc::new(crate::services::vector::NamespaceManager::with_root(
+            pool, root,
+        ))
+    }
+
     pub fn stub_ctx() -> ExecutionContext {
         ExecutionContext {
             request_id: "test".into(),
@@ -699,6 +736,8 @@ pub mod test_support {
             session_id: None,
             user_id: None,
             user_role: None,
+            addon_id: None,
+            org_id: None,
             deadline: None,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: CancellationToken::new(),
@@ -707,6 +746,7 @@ pub mod test_support {
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: Arc::new(SystemClock),
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,
+            vectors: stub_vectors(),
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),
