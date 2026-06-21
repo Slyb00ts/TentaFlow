@@ -21,21 +21,12 @@ use base64::Engine;
 use serde_json::{json, Value as JsonValue};
 
 use tentaflow_hardware::unitree::go2::protocol;
-use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::{
     LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ_I16_PLANAR,
 };
-use tentaflow_sdk_spec::protocol::ui::{
-    actions::Button as ButtonComp,
-    bind::BindRef,
-    data::{Heading as HeadingComp, Text as TextComp},
-    inline::*,
-    layout::SectionCard,
-    tokens::*,
-};
 use tentaflow_sdk_spec::{
-    CameraGrantInput, CameraGrantOut, Component, FailurePolicy, Handler, HandlerMap, PanelShell,
-    RobotActionWire, RobotControlResponseWire, RobotDispatchInput, StateEntry, UiPayload, Value,
+    CameraGrantInput, CameraGrantOut,
+    RobotActionWire, RobotControlResponseWire, RobotDispatchInput,
     WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput, WebRtcDrainOutput,
     WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput, WebRtcSendInput, WebRtcSetAnswerInput,
     WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
@@ -48,7 +39,6 @@ const VISION_ADDON_ID: &str = "tentavision";
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const ADDON_ID: &str = "go2";
-const PANEL_ID: &str = "overview";
 // The robot IP is provided per-install via the `ip` connection_param and read
 // from addon_config at runtime — there is intentionally NO hardcoded default.
 const IP_CONFIG_KEY: &str = "ip";
@@ -63,7 +53,6 @@ const VALIDATION_TIMEOUT_SECS: i64 = 20;
 const RECONNECT_BACKOFF_SECS: i64 = 5;
 const ONLINE_STALE_SECS: i64 = 12;
 
-static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
 // Sport command api_ids (Go2 normal mode). This addon drives the robot over the
@@ -114,7 +103,6 @@ const FOOT_RAISE_MAX: f64 = 0.10;
 
 #[link(wasm_import_module = "tentaflow")]
 extern "C" {
-    fn ui_render_cbor(cbor_ptr: i32, cbor_len: i32) -> i32;
     fn event_publish(et_ptr: i32, et_len: i32, p_ptr: i32, p_len: i32) -> i32;
     fn log_info(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_warn(msg_ptr: i32, msg_len: i32) -> i32;
@@ -2325,150 +2313,6 @@ fn tick() {
 }
 
 // =============================================================================
-// UI
-// =============================================================================
-
-fn next_id() -> String {
-    static C: AtomicU64 = AtomicU64::new(0);
-    alloc::format!("c{}", C.fetch_add(1, Ordering::Relaxed))
-}
-
-fn lit(s: &str) -> BindRef {
-    BindRef::Literal(Value::Text(s.into()))
-}
-
-fn text(content: &str) -> Component {
-    TextComp {
-        content: lit(content),
-        style: TextStyle::Body,
-        tone: None,
-        align: None,
-        wrap: None,
-        max_lines: None,
-        format: None,
-    }
-    .into_component(next_id())
-    .expect("Text")
-}
-
-fn heading(level: u8, content: &str) -> Component {
-    HeadingComp { content: lit(content), level, tone: None, align: None }
-        .into_component(next_id())
-        .expect("Heading")
-}
-
-fn button(label: &str, action: &str, variant: &str) -> Component {
-    let v = match variant {
-        "primary" => ButtonVariant::Primary,
-        "danger" => ButtonVariant::Destructive,
-        _ => ButtonVariant::Secondary,
-    };
-    let mut c = ButtonComp {
-        variant: v,
-        tone: Tone::Neutral,
-        label: lit(label),
-        icon_leading: None,
-        icon_trailing: None,
-        size: ButtonSize::Md,
-        full_width: false,
-        disabled: None,
-        loading: None,
-        density: Density::Default,
-    }
-    .into_component(next_id())
-    .expect("Button");
-    c.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Click,
-        Handler::Backend {
-            action_id: action.into(),
-            params: CborMap::default(),
-            optimistic: None,
-            on_failure: FailurePolicy::Toast,
-        },
-    )]));
-    c
-}
-
-fn card(title: &str, children: Vec<Component>) -> Component {
-    SectionCard {
-        title: lit(title),
-        subtitle: None,
-        header_actions: vec![],
-        header_divider: false,
-        body: children,
-        footer: None,
-        padding: Spacing::Lg,
-        gap: Spacing::Md,
-        variant: CardVariant::Outlined,
-        radius: RadiusToken::Lg,
-        shadow: ShadowToken::Subtle,
-        border: BorderToken::Hairline,
-        background: BackgroundToken::None,
-        accent: None,
-    }
-    .into_component(next_id())
-    .expect("SectionCard")
-}
-
-fn render_panel() {
-    let robot = db::get_robot().unwrap_or_default();
-    let battery = if robot.battery_pct >= 0 {
-        alloc::format!("{}%", robot.battery_pct)
-    } else {
-        "—".into()
-    };
-    let rtt = if robot.rtt_ms >= 0 {
-        alloc::format!("{} ms", robot.rtt_ms)
-    } else {
-        "—".into()
-    };
-    // IP pochodzi WYLACZNIE z konfiguracji instalacji (connection-param). Brak
-    // fallbacku do starej kolumny robot.ip — niesakonfigurowana instancja pokazuje
-    // marker, zeby UI nie sugerowal polaczenia z nieaktualnym/legacy adresem.
-    let ip_display = config_get(IP_CONFIG_KEY).unwrap_or_else(|| "(brak konfiguracji)".to_string());
-    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, ip_display);
-    let estop_line = if robot.estop_active { "E-STOP AKTYWNY".into() } else { "e-stop: wyłączony".to_string() };
-
-    let layout = card(
-        "Unitree Go2",
-        vec![
-            heading(2, "Status"),
-            text(&status_line),
-            text(&alloc::format!("Bateria: {battery}   ·   Latency (RTT): {rtt}")),
-            text(&estop_line),
-            heading(3, "Połączenie"),
-            button("Połącz", "go2.connect", "primary"),
-            button("Rozłącz", "go2.disconnect", "secondary"),
-            heading(3, "Bezpieczeństwo"),
-            button("STOP (e-stop)", "go2.estop", "danger"),
-            button("Reset e-stop", "go2.reset_estop", "secondary"),
-            heading(3, "Sterowanie"),
-            button("RecoveryStand", "go2.action_recovery", "secondary"),
-            button("Hello", "go2.action_hello", "secondary"),
-            button("Sit", "go2.action_sit", "secondary"),
-            button("Naprzód", "go2.move_fwd", "secondary"),
-            button("W tył", "go2.move_back", "secondary"),
-            button("Lewo", "go2.move_left", "secondary"),
-            button("Prawo", "go2.move_right", "secondary"),
-        ],
-    );
-
-    let payload = UiPayload::PanelShell(PanelShell {
-        addon_id: ADDON_ID.into(),
-        panel_id: PANEL_ID.into(),
-        panel_epoch: PANEL_EPOCH.load(Ordering::Relaxed),
-        layout,
-        slots: Vec::<tentaflow_sdk_spec::SlotDecl>::new(),
-        initial_state: Vec::<StateEntry>::new(),
-        initial_commands: vec![],
-    });
-    let mut buf = Vec::with_capacity(4096);
-    if minicbor::encode(&payload, &mut buf).is_ok() {
-        unsafe { ui_render_cbor(buf.as_ptr() as i32, buf.len() as i32); }
-    }
-}
-
-// =============================================================================
 // Request dispatch
 // =============================================================================
 
@@ -2844,9 +2688,7 @@ pub extern "C" fn on_event(_ptr: i32, _len: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn on_panel_open(_id_ptr: i32, _id_len: i32, epoch: i64) -> i32 {
-    PANEL_EPOCH.store(epoch.max(1) as u64, Ordering::Relaxed);
-    render_panel();
+pub extern "C" fn on_panel_open(_id_ptr: i32, _id_len: i32, _epoch: i64) -> i32 {
     0
 }
 
@@ -2884,8 +2726,6 @@ mod host_stubs {
     extern "C" fn log_warn(_p: i32, _l: i32) -> i32 { 0 }
     #[no_mangle]
     extern "C" fn event_publish(_a: i32, _b: i32, _c: i32, _d: i32) -> i32 { 0 }
-    #[no_mangle]
-    extern "C" fn ui_render_cbor(_p: i32, _l: i32) -> i32 { 0 }
     #[no_mangle]
     extern "C" fn config_get_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 2 }
     #[no_mangle]
@@ -3766,11 +3606,10 @@ pub extern "C" fn on_request(
     let req: JsonValue = serde_json::from_str(&input).unwrap_or(JsonValue::Null);
     let raw_tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(JsonValue::Null);
-    // Panel button actions arrive from the dashboard as `ui.<panel_id>.<action_id>`
-    // (ui_channel: format!("ui.{panel}.{action}")). Strip the panel prefix so the
-    // declared action_ids (go2.connect, go2.estop, …) route to handle(). Flow
-    // blocks come via invoke_block as `block.go2.*` with no ui prefix.
-    let tool = raw_tool.strip_prefix("ui.overview.").unwrap_or(raw_tool);
+    // Control actions arrive as raw declared action_ids (go2.connect, go2.estop, …)
+    // from the core Roboty module via robot dispatch. Flow blocks come via
+    // invoke_block as `block.go2.*`.
+    let tool = raw_tool;
     let response = if let Some(block_type) = tool.strip_prefix("block.") {
         handle_block(block_type, &params)
     } else {
