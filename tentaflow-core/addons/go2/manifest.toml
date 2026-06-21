@@ -19,13 +19,6 @@ runtime = "wasmtime"
 platforms = ["linux"]
 wasm_file = "addon.wasm"
 
-[application]
-entry_panel = "overview"
-title = "Unitree Go2"
-icon = "robot"
-description = "Sterowanie i podgląd robota Unitree Go2"
-sort_order = 60
-
 # Service tick drives the connection state machine (validation handshake) and
 # continuous telemetry (battery + RTT). 200ms so the validation challenge is
 # answered promptly; telemetry/publish is throttled inside on_tick.
@@ -115,12 +108,6 @@ max_yaw_rps = 1.0
 require_estop_clear = true
 
 # ── Permissions (forward declaration of what the Chunk 4 code will need) ──────
-[[permission]]
-id = "ui"
-display_name = "Renderowanie UI"
-description = "Renderowanie deklaratywnego UI panelu sterowania robotem."
-risk = "low"
-
 [[permission]]
 id = "webrtc.connect"
 display_name = "Połączenie WebRTC"
