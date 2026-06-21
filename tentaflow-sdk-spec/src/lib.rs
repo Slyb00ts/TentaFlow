@@ -61,6 +61,9 @@ pub use protocol::{
         SaveRecordingOut, StatsOut, StatsPerCamera, StatsTotals, UrlOut,
     },
     robot::{RobotActionWire, RobotControlResponseWire, RobotDispatchInput},
+    robot_joints::{
+        RobotJointsFrame, ROBOT_JOINTS_HEADER_LEN, ROBOT_JOINTS_MAX, ROBOT_JOINTS_VERSION,
+    },
     services::{
         GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
         ServiceListOutput,
