@@ -225,6 +225,26 @@ pub fn llm_generate(
 
     // Most async→sync: host function jest synchroniczna, router jest async.
     // Uzywamy tokio::task::block_in_place aby uniknac deadlocka w wielowatkowym runtime.
+    // RAG E2.0 — wąska allowlista opcji wywołania przepuszczana do flow.meta:
+    // tylko `collection_id` (str) i `top_k` (dodatnia liczba całkowita). Reszta
+    // opcji NIE jest przepuszczana, żeby addon nie wstrzyknął dowolnych pól w
+    // meta flow. Węzeł `vector` flow czyta z tego filtr po kolekcji i top_k.
+    let mut flow_meta: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    if let Some(opts) = _options_json.as_ref() {
+        if let Some(cid) = opts.get("collection_id").and_then(|v| v.as_str()) {
+            if !cid.is_empty() {
+                flow_meta.insert(
+                    "collection_id".to_string(),
+                    serde_json::Value::String(cid.to_string()),
+                );
+            }
+        }
+        if let Some(k) = opts.get("top_k").and_then(|v| v.as_u64()).filter(|n| *n > 0) {
+            flow_meta.insert("top_k".to_string(), serde_json::Value::from(k));
+        }
+    }
+
     let compliance_context = crate::compliance::ai_gateway::AiGatewayContext {
         org_id: caller.data().org_id.clone(),
         addon_id: Some(addon_id.clone()),
@@ -236,6 +256,7 @@ pub fn llm_generate(
         // Root context: the routing session event anchors the turn to its own
         // request_id (§3.4); per-call flow events copy it from there.
         correlation_id: None,
+        flow_meta,
     };
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(router.route_chat_completion(

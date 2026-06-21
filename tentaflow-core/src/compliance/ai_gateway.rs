@@ -39,6 +39,15 @@ pub struct AiGatewayContext {
     /// `llm` events copy that value here so all rows of one turn share it. When
     /// `None`, a started event becomes its own anchor (its `request_id`).
     pub correlation_id: Option<String>,
+    /// RAG E2.0 — wąski, allowlistowany kanał przeniesienia opcji wywołania z
+    /// addona (host-fn `llm_generate`) do `envelope.meta` flow. Routing kopiuje
+    /// te pary do `initial.meta`, a węzeł `vector` czyta z nich filtr po
+    /// kolekcji (`collection_id`) i rozmiar retrievalu (`top_k`). Wypełniany
+    /// WYŁĄCZNIE przez `llm_generate` z allowlisty kluczy — nie przepuszczamy
+    /// dowolnych opcji. Pusty dla /v1 user / kamera / agent. To NIE jest dane
+    /// audytowe (nie trafia do `compliance_ai_events`), tylko plumbing flow,
+    /// który podróżuje tą samą, już-wpiętą ścieżką co addon_id/org_id.
+    pub flow_meta: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

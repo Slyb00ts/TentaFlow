@@ -1,0 +1,93 @@
+{
+  "id": "query",
+  "name": "RAG — query",
+  "description": "Flow zapytania RAG (flow_engine): trigger -> embeddings -> vector(search w przestrzeni 'passages' instancji, FILTR po collection_id z meta) -> combine (sklejenie pasazy w kontekst) -> llm (odpowiedz wylacznie z kontekstu) -> output (serializuje {answer, citations} z realnych hitow). collection_id i top_k jada z meta (addon przeprowadza je przez options llm_generate). Petla retrievalu (rerank/multi-hop) to przyszly slice; struktura DAG jest na to gotowa.",
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "trigger",
+      "config": {},
+      "position": { "x": 0, "y": 0 }
+    },
+    {
+      "id": "embed_query",
+      "type": "embeddings",
+      "config": {
+        "model": "rag-embeddings",
+        "dimensions": 1024
+      },
+      "position": { "x": 220, "y": 0 }
+    },
+    {
+      "id": "retrieve",
+      "type": "vector",
+      "config": {
+        "op": "search",
+        "namespace": "passages",
+        "metric": "cosine",
+        "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
+      },
+      "position": { "x": 440, "y": 0 }
+    },
+    {
+      "id": "context",
+      "type": "combine",
+      "config": {
+        "separator": "\n\n---\n\n"
+      },
+      "position": { "x": 660, "y": 0 }
+    },
+    {
+      "id": "answer",
+      "type": "llm",
+      "config": {
+        "model": "rag-llm",
+        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (pasaze ponizej w formacie JSON z polami ref_id/score/fields.text/fields.doc_id/fields.chunk_index). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo jako [doc_id#chunk_index]. Nie zmyslaj faktow spoza kontekstu."
+      },
+      "position": { "x": 880, "y": 0 }
+    },
+    {
+      "id": "out",
+      "type": "output",
+      "config": { "emit_citations": true },
+      "position": { "x": 1100, "y": 0 }
+    }
+  ],
+  "edges": [
+    {
+      "from_node": "trigger",
+      "to_node": "embed_query",
+      "from_port": "text",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "embed_query",
+      "to_node": "retrieve",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "embedding"
+    },
+    {
+      "from_node": "retrieve",
+      "to_node": "context",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "context",
+      "to_node": "answer",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "answer",
+      "to_node": "out",
+      "from_port": "full",
+      "to_port": "text",
+      "data_type": "text"
+    }
+  ]
+}

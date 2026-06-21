@@ -250,6 +250,52 @@ pub fn is_entry_node_type(node_type: &str) -> bool {
     matches!(node_type, "trigger" | "on_subagent_complete")
 }
 
+/// Walidacja STRUKTURALNA bez rejestru adapterów (RAG E2.0 bug 4). Sprawdza
+/// reguły niezależne od specyfikacji portów adaptera: R1 (każdy endpoint krawędzi
+/// wskazuje na istniejący node), R5 (dokładnie jeden węzeł-entry), unikalność
+/// node id i niepustość grafu. Używana przy rejestracji engine-flow gdy globalny
+/// dispatcher (rejestr) nie jest jeszcze dostępny — żeby NIGDY nie persystować
+/// strukturalnie niepoprawnego DAG. Gdy rejestr jest dostępny, wołamy pełne
+/// `validate` (R1–R10), które ten podzbiór zawiera.
+pub fn validate_structural(def: &FlowDefinition) -> Result<(), FlowValidationError> {
+    let mut ids: HashSet<&str> = HashSet::with_capacity(def.nodes.len());
+    for node in &def.nodes {
+        if !ids.insert(node.id.as_str()) {
+            return Err(FlowValidationError::UnknownAdapter {
+                node_id: node.id.clone(),
+                node_type: format!("duplicate node id '{}'", node.id),
+            });
+        }
+    }
+
+    let entry_count = def
+        .nodes
+        .iter()
+        .filter(|n| is_entry_node_type(&n.node_type))
+        .count();
+    if entry_count != 1 {
+        return Err(FlowValidationError::EntryNodeCount {
+            actual: entry_count,
+        });
+    }
+
+    for edge in &def.edges {
+        if !ids.contains(edge.from.as_str()) {
+            return Err(FlowValidationError::UnknownNode {
+                edge_endpoint: "from",
+                node_id: edge.from.clone(),
+            });
+        }
+        if !ids.contains(edge.to.as_str()) {
+            return Err(FlowValidationError::UnknownNode {
+                edge_endpoint: "to",
+                node_id: edge.to.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(
     def: &FlowDefinition,
     registry: &AdapterRegistry,

@@ -151,6 +151,11 @@ pub struct AddonManifest {
     /// Szablony Flow z `[[flow_template]]` — opt-in install do flow-engine.
     #[serde(default)]
     pub flow_templates: Vec<manifest::FlowTemplateSpec>,
+    /// Flow silnika flow_engine z `[[engine_flow]]` — rejestrowane przy install
+    /// instancji jako published model o unikalnej-per-instancję nazwie
+    /// (`{addon_id}:{id}`). Addon wyzwala je JAKO MODEL (RAG E2.0).
+    #[serde(default)]
+    pub engine_flows: Vec<manifest::EngineFlowSpec>,
     /// Custom komponenty UI z `[[ui_component]]`. Sygnatura Ed25519
     /// weryfikowana w F1c packaging tools.
     #[serde(default)]

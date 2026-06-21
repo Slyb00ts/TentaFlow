@@ -101,6 +101,7 @@ impl LlmDispatcherImpl {
             agent_id: req.agent_id.clone(),
             agent_run_id: req.agent_run_id.clone(),
             correlation_id: req.correlation_id.clone(),
+            flow_meta: std::collections::BTreeMap::new(),
         };
         let mut per_call = api_req.clone();
         per_call.user = None;
