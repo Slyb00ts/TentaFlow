@@ -25,6 +25,7 @@ pub mod camera_relay;
 pub mod catalog;
 pub mod deploy;
 pub mod detection_bus;
+pub mod document;
 pub mod frame_proxy;
 pub mod frame_storage;
 #[cfg(feature = "graph")]
