@@ -24,7 +24,20 @@ CBOR I/O, audit na każdej ścieżce wyjścia, zero stubów. Nadrzędny plan: `R
 - **Dług pre-existing (NIE A1, do osobnej naprawy):** testy `db::repository::alias_resolve_tests` (i pokrewne)
   failują `no such table: model_alias_{owners,changes,aliases}` — testowy harness DB nie aplikuje migracji
   tych tabel (migracje istnieją, np. `model_alias_changes` migrations.rs:3998). A1 nie dotyka `db/`/migracji.
-- Następne: B1 (0.2 graph host functions nad serwisem grafu z A2) — patrz kolejność.
+- **Slice B1+B2 = 0.2 graph host functions + uninstall cleanup: ZROBIONE, codex GO** (po 2 NO-GO +
+  decyzja właściciela). KLUCZOWA decyzja: **raw `graph_query` (Datalog od addona) USUNIĘTY** — niebezpieczny
+  (compute DoS, obejście gramatyki, tombstone/alive leak). Addon dostaje TYLKO bezpieczne prymitywy:
+  upsert_node/edge, neighbors, pagerank (cap iter 100), ppr (cap iter + 64 seedy), delete=tombstone.
+  Parametry clampowane host-side, cap współbieżności (globalny 8 + per-addon 2, RAII, fail-closed),
+  tombstone/alive filtrowane joinem wszędzie, uninstall files-before-row (jedna ścieżka przez
+  `delete_all_for_addon`). Workaround: Cozo 0.7.6+sled nie honoruje `:rm` → delete = tombstone (`alive=false`),
+  fizyczny purge = późniejsza kompakcja. 18 host-fn + 638 sdk-spec + 32 A2 zielone.
+- **Dług pre-existing (NIE nasze):** testy `:memory:` masowo czerwone na branchu (`flows`/alias tabele
+  „no such table" na świeżym `db::init(":memory:")`) — harness `:memory:`+pool czyta osobne puste połączenie;
+  migration runner ma transakcję PER-migrację (nie all-or-nothing), a `flows` to wczesna tabela → nasze
+  v85/v86 NIE mogą tego powodować (pliki-bazowane testy grafu przechodzą pełny łańcuch). Do naprawy osobno.
+- Następne: C0 (ExecutionContext +addon_id/+reranker/+vectors), C1 (document store), C2 (reranker node),
+  C3 (doc_parse node), C4 (vector node), D2 (quoty per-profil) — patrz kolejność.
 
 ## Spike CozoDB — wynik: GO (potwierdzone realnym uruchomieniem)
 
@@ -192,6 +205,94 @@ Codex zweryfikował projekt wobec realnego kodu. Przed implementacją zastosowa�
 
 Kolejność uwzględnia poprawki: do Fazy A/B dołożyć migracje kolumn (pkt 9) i poprawny PK (pkt 3)
 PRZED host fns; sandbox Datalog (pkt 1-2) jest częścią 0.2, nie dodatkiem.
+
+## DECYZJA: raw graph_query USUNIĘTY z Etapu 0 (2× NO-GO codex — raw Datalog niebezpieczny)
+
+Surowy Datalog od addona przecieka za każdym razem (compute DoS, obejście gramatyki przez reguły-
+pomocnicze, tombstone filtr błędny, alive-leak). Decyzja właściciela: **usunąć `graph_query_v1` (raw
+Datalog) z Etapu 0**; addon dostaje TYLKO bezpieczne, host-kontrolowane prymitywy. Raw/strukturalne
+zapytania odłożone na później (za adminem / osobny slice z kompilatorem zapytań nad żywym widokiem).
+
+Rework B1+B2 (finalny):
+1. **USUŃ `graph_query_v1`** całkowicie: host fn, rejestracja, SDK wrapper, CBOR `GraphQuery*`,
+   `validate_query` (gramatyka/blacklist), watchdog/`run_immutable_budgeted` jeśli służył tylko query,
+   host-side tombstone filter zapytania, manager `query_params`/backend `run_query_params` jeśli używane
+   tylko przez raw query. Usuń martwy kod i testy raw-query. (Wewnętrzne, host-budowane zapytania
+   neighbors/pagerank/ppr/export ZOSTAJĄ — są bezpieczne, nie przechodzą przez addona.)
+2. **Bezpieczne prymitywy ZOSTAJĄ**: upsert_node/edge, neighbors (bounded depth 1..=3), pagerank
+   (CAP iteracji host-side), ppr (CAP iteracji + CAP liczby seedów), delete=tombstone. Wszystkie filtrują
+   alive/tombstone (już zrobione joinem) i capują parametry — addon nie kontroluje kształtu zapytania.
+3. **Cap współbieżności na funkcjach liczących** (pagerank/ppr/neighbors): globalny + per-addon licznik
+   in-flight (np. AtomicUsize/semafor), acquire PRZED pracą, release po; saturacja → fail-closed błąd
+   rate-limit/quota. Bez tego addon odpala N ciężkich pagerank równolegle → CPU exhaustion.
+4. **Uninstall atomowy(-ie spójny)**: kolejność close-handle → delete pliki → delete wiersz rejestru
+   (wiersz znika DOPIERO gdy pliki skasowane, więc fail zostawia wiersz → retry działa, brak orphan-files
+   bez wiersza). `delete_all_for_addon` zbiera błędy i propaguje; uninstall przerywa przed remove_dir.
+
+Cel GO: zero ścieżki raw-Datalog od addona; ciężkie funkcje capowane parametrami + współbieżnością;
+tombstone/alive niewidoczne nigdzie; uninstall spójny.
+
+## KOREKTA B1+B2 (NO-GO codex — sandbox Datalog + delete + cleanup) [HISTORYCZNE — zastąpione decyzją powyżej]
+
+Ustalenie upraszczające: **addony wykonują się w NATYWNYM core (wasmtime host), nie w przeglądarce**
+— browser-wasm to tylko dashboard. Więc graph host fns zawsze idą przez natywne Cozo, gdzie host MOŻE
+wymusić timeout. To czyni host-injected timeout poprawnym budżetem na wszystkich celach (serwer+telefon).
+
+Rework (wymagane przed akceptacją):
+
+1. **Budżet obliczeniowy graph_query (CRIT #1/#2):**
+   - `validate_query` ODRZUCA fixed-rules (`<~`) i user-defined reguły rekursywne (te dają
+     `PageRank(iterations:1e9)` / transitive-closure). Dozwolone tylko NIEREKURENCYJNE koniunkcyjne
+     odczyty nad `*nodes`/`*edges` (filtry, projekcje, join nodes↔edges). Blacklist `::`/tx zostaje jako
+     defense-in-depth, ale to NIE jedyna bariera.
+   - **Host WSTRZYKUJE twardy `:timeout N` do KAŻDEGO wykonywanego zapytania** (np. 2s). ZWERYFIKUJ
+     realnym testem, że Cozo faktycznie ABORTUJE zapytanie typu iloczyn-kartezjański w ~timeout (nie
+     wisi) — jeśli Cozo nie przerywa wewnątrz wielkiego joina, dołóż watchdog/ograniczenie arności joinu.
+   - Zostają: cap bajtów skryptu, cap wierszy wyniku, cap params. Udokumentuj budżety i dozwoloną gramatykę.
+
+2. **Delete = tombstone, filtrowany JEDNOLICIE (CRIT #3/#4):**
+   - `graph_delete_v1` = **tombstone (O(1) `:put` etykiety)**; USUŃ z host-path hard-delete przez
+     `:replace` całej relacji (O(N+E), nieatomowy, + bug `:rm` na sled). Fizyczny purge odłożony do
+     późniejszej operacji kompakcji (batch, jeden `:replace`).
+   - **WSZYSTKIE ścieżki retrievalu wykluczają tombstone**: graph_query (auto-filtr `label != tombstone`
+     wstrzykiwany przez host), neighbors, pagerank, ppr, export_csr — węzły tombstone ORAZ ich incydentne
+     krawędzie nie wchodzą do wyniku/obliczeń. Test: po tombstone węzeł znika z query/neighbors/pagerank/ppr.
+
+3. **Uninstall cleanup (MED #5):** błąd `delete_all_for_addon` NIE może być połknięty — propaguj/surface
+   (fail uninstall albo twardy retry) przed usunięciem katalogu/wierszy; upewnij się że uchwyty zamknięte.
+
+### Rozstrzygnięcie po implementacji (B1+B2 rework)
+
+**Budżet czasu — POTWIERDZONE empirycznie, że samo `:timeout` NIE wystarcza.** Cozo 0.7.6
+sprawdza poison-pill (`:timeout`) TYLKO między etapami rule-eval (`query/eval.rs`: `poison.check()`
+po pełnym przebiegu `rule.relation.iter`), a NIE wewnątrz materializacji pojedynczego joina —
+ciężki spięty join (np. 3-hop ścieżka na klice) finiszuje DALEKO za budżetem zanim poison
+zapali. Dlatego budżet to TRZY warstwy:
+1. **Gramatyka sandboxa** (`validate_query`): odrzuca fixed-rules (`<~`), reguły rekurencyjne
+   (cykl w grafie zależności reguł), join kartezjański (atomy relacji niespięte wspólną zmienną)
+   oraz **cap arności joinu** `MAX_RELATION_ATOMS_PER_RULE = 3` (≥4 atomy relacji w regule → reject).
+2. **`:timeout` wstrzykiwany przez host** (`QUERY_TIMEOUT_SECS = 2s`) — tnie rekurencję/wieloetapowe
+   zapytania (defense-in-depth).
+3. **Watchdog wall-clock** (`backend.rs`): zapytanie biegnie na ODDZIELNYM wątku, host czeka co
+   najwyżej `QUERY_TIMEOUT_SECS + QUERY_WATCHDOG_GRACE_SECS` (≈3s) i zwraca `GraphError::QueryTimeout`.
+   To TWARDA gwarancja, że host nie wisi nawet, gdy pojedynczy join materializuje się jednym
+   przebiegiem (cap arności trzyma wątek-uciekiniera skończonym i krótkim). Na wasm32 (brak wątków/
+   `:timeout`) jedyną barierą jest gramatyka. Test `e2e_query_timeout_aborts_heavy_query` dowodzi,
+   że host wraca ~przy budżecie (nie rośnie z rozmiarem joina).
+
+**Dozwolona gramatyka graph_query:** nierekursywne koniunkcyjne ODCZYTY nad `*nodes`/`*edges`
+(filtry, projekcje, join nodes↔edges po wspólnych zmiennych), opcje `:limit`/`:order`/`:offset`,
+≤3 atomy relacji na regułę. Pagerank/PPR/neighbors/głębsze trawersy idą przez dedykowane host-fn.
+
+**Delete = soft-delete (O(1)).** `delete_node` → tombstone (label = `__tombstone__`, `:put`),
+`delete_edge` → `alive=false` (`:put` na tym samym kluczu). Hard-delete przez `:replace` całej
+relacji USUNIĘTY. Wszystkie ścieżki retrievalu wykluczają tombstone: `neighbors`/`pagerank`/
+`export_csr` joinem z nie-tombstone węzłami + `alive==true`; `graph_query` host-side filtrem po
+zbiorze tombstone'owanych id (`tombstoned_ids`). Fizyczny purge = późniejsza kompakcja.
+
+**Uninstall cleanup** propagowany: `uninstall_instance` PRZERYWA z błędem, gdy
+`delete_all_for_addon` zawiedzie (przed `remove_dir_all`); uchwyty sled zamknięte w
+`seal_key_for_delete` (slot → `Removed`).
 
 ## KOREKTA A1 (NO-GO codex — reuse istniejącego resolvera, NIE budować równoległego)
 
