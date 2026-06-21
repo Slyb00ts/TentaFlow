@@ -1,19 +1,25 @@
-// ===== File: robots.js — Robots core app (mesh robot list, live camera, control) =====
+// ===== File: robots.js — Robots core app (mesh robot list + tabbed detail) =====
 // Talks to Core over the binary protocol via MessageBody::RobotsBody:
 //   RobotsListRequest / RobotControlRequest / RobotCameraShareRequest.
-// Renders one card per robot advertised in the mesh (org-scoped): status badge,
-// owner node, battery / RTT, an optional live camera tile and a CAPABILITY-DRIVEN
-// control surface generated from each robot's advertised `actions_meta` (label /
-// risk / param schema) — no hardcoded action list. High-risk / acrobatic actions
-// are gated behind a confirm dialog using the UNION of advertised risk and an
-// authoritative client-side known-dangerous set (a hostile descriptor can't
-// downgrade a flip to a one-click button). Parametered actions write values into
-// FIXED p1..p4 slots BY NAME and refuse to send if a required param is missing
-// (no slot shifting). An always-present E-stop is independent of the advertised
-// metadata and stays clickable even when the robot reads offline — safety must
-// never depend on status metadata. The server remains the real safety gate.
-// The list auto-refreshes so mesh discovery state stays visible.
-// tf-* components only; control results surface through tf-toast.
+// Two in-module views (no app.js route — state lives here):
+//   LIST   — one card per robot advertised in the mesh (status, KPIs, an always-
+//            present E-stop + a few quick controls routed through the SAME
+//            capability dispatch as the full surface, capability chips and a
+//            "Szczegóły" button that opens the detail).
+//   DETAIL — a single robot in tabs (Przegląd / Kamera / LiDAR 3D / Sterowanie /
+//            Informacje / Log): live camera, live LiDAR (data-path + wgpu voxel
+//            view), the full CAPABILITY-DRIVEN control surface generated from the
+//            robot's advertised `actions_meta` (label / risk / param schema), live
+//            telemetry + the 3D robot model, and a control-outcome log.
+// High-risk / acrobatic actions are gated behind a confirm dialog using the UNION
+// of advertised risk and an authoritative client-side known-dangerous set (a
+// hostile descriptor can't downgrade a flip to a one-click button). Parametered
+// actions write values into FIXED p1..p4 slots BY NAME and refuse to send if a
+// required param is missing (no slot shifting). An always-present E-stop is
+// independent of the advertised metadata and stays clickable even when the robot
+// reads offline — safety must never depend on status metadata. The server remains
+// the real safety gate. The list/detail auto-refresh so mesh discovery state and
+// live telemetry stay visible. tf-* components only; results surface via tf-toast.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -28,6 +34,7 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-modal.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
+import '/js/components/tf-tabs.js';
 import '/js/components/tf-video-stream.js';
 import '/js/components/tf-robot-view.js';
 
@@ -35,12 +42,11 @@ import '/js/components/tf-robot-view.js';
 // and online/offline transitions appear without a manual reload.
 const REFRESH_INTERVAL_MS = 4000;
 
-// Real-time LiDAR PUSH: each robot's canonical frame stream is subscribed via the
-// generic StreamHub rails (`streamId = "lidar:<robotId>"`), the SAME path camera
-// video uses. The server pushes every canonical L1 frame as a StreamFrame whose
-// `data` is the raw frame bytes; we decode it with the sdk-spec header decoder.
-// This is the live data-path consumer that proves L1→L3a end to end (no 3D render
-// here — raw/points are stashed for L4).
+// Real-time LiDAR PUSH: the open detail subscribes to its robot's canonical frame
+// stream via the generic StreamHub rails (`streamId = "lidar:<robotId>"`), the
+// SAME path camera video uses. The server pushes every canonical L1 frame as a
+// StreamFrame whose `data` is the raw frame bytes; we decode it with the sdk-spec
+// header decoder and feed the decoded points to the wgpu voxel renderer.
 //
 // Sliding window for the measured frame rate. Wide enough to smooth the ~5 fps
 // arrival jitter, short enough to react quickly when streaming stops.
@@ -58,8 +64,9 @@ const LIDAR_E2E_MAX_MS = 30000;
 // periodic staleness sweep flips the badge even when frames simply stop arriving.
 const LIDAR_STALE_AFTER_MS = 1500;
 
-// Cadence of the freshness sweep that re-renders each active card so the badge
-// can flip to "nieaktualne" when frames stop (no push would otherwise re-render).
+// Cadence of the freshness sweep that re-renders the open detail's LiDAR status so
+// the badge can flip to "nieaktualne" when frames stop (no push would otherwise
+// re-render). NOT a poll — it carries no network traffic.
 const LIDAR_STALE_SWEEP_MS = 500;
 
 // After the server ends a lidar stream because the subscriber lagged, wait this
@@ -67,9 +74,14 @@ const LIDAR_STALE_SWEEP_MS = 500;
 // a `subscriber_lagged` end triggers one retry; any other end leaves it stale.
 const LIDAR_RESUBSCRIBE_DELAY_MS = 1000;
 
-// Locomotion magnitude (m/s) for the directional pad, matching the go2 driver's
-// own move buttons. The owner re-clamps to its safety cap regardless.
+// Locomotion magnitude (m/s) for the directional pad / quick-move buttons,
+// matching the go2 driver's own move buttons. The owner re-clamps to its safety
+// cap regardless.
 const MOVE_SPEED = 0.3;
+
+// Bounded control-outcome history shown in the detail "Log" tab. Old entries are
+// trimmed so a long session can't grow this without bound.
+const LOG_MAX_ENTRIES = 200;
 
 // Kinds the control surface must NOT render as a button: read-only telemetry, the
 // camera tag, and the e-stop family (a dedicated, always-present STOP button owns
@@ -115,49 +127,55 @@ const REQUIRED_PARAMS = {
 let robots = [];
 let refreshTimer = null;
 let inFlightRefresh = false;
-// robotId -> card element currently in the DOM. Lets renderList() do a keyed
-// diff (append new, remove gone, update-in-place existing) instead of rebuilding
-// innerHTML each poll — rebuilding tears down the live <tf-video-stream> (MSE)
-// every REFRESH_INTERVAL_MS and the video never stabilizes.
+// robotId -> card element currently in the DOM (LIST view only). Lets renderList()
+// do a keyed diff (append new, remove gone, update-in-place existing) instead of
+// rebuilding innerHTML each poll.
 let cardEls = new Map();
 
-// Per-robot live LiDAR state, keyed by robotId. An entry exists ONLY while that
-// robot's LiDAR row is on screen AND enabled AND the robot is online — it's added
-// by updateLidar() and removed the moment any of those stops holding (toggle off,
-// card gone, robot offline) so no subscription stays open on a dead source. Each
-// start has a matching close; teardown closes all (no leaked subscriptions).
-// Shape: { unsub:fn|null, closed:bool, resubTimer:number|null,
+// Which view is active. null = LIST; a robot id = DETAIL of that robot. Managed
+// entirely in-module (no router): the "Szczegóły" button sets it, the "Roboty"
+// back button clears it.
+let selectedRobotId = null;
+
+// Per-detail live LiDAR state. At most ONE entry exists — for the open detail's
+// robot, ONLY while LiDAR is enabled AND the robot is online. Adding/removing it
+// owns the single subscription lifecycle: every start has a matching close, so no
+// subscription leaks on unmount / back / offline / toggle-off.
+// Shape: { unsub:fn|null, closed:bool, resubTimer:number|null, resubUsed:bool,
 //          frameTimes:number[], lastPointCount, lastFrameAtMs,
 //          lastRaw:Uint8Array|null, lastPoints:Float32Array|null,
-//          timing:{atMs,decodeMs,intervalMs,e2eMs}[] }.
+//          timing:{atMs,decodeMs,intervalMs,e2eMs,hostMs,netMs}[] }.
 let lidarLive = new Map();
-// Single shared slow timer that re-renders every active card so the freshness
-// badge flips to "nieaktualne" when frames stop arriving. NOT a poll — it carries
-// no network traffic. Started lazily when the first robot subscribes, stopped when
-// the set empties or on unmount.
+// Single shared slow timer that re-renders the open detail's LiDAR status so the
+// freshness badge flips to "nieaktualne" when frames stop arriving. NOT a poll.
 let lidarTimer = null;
+
+// The wgpu voxel renderer view for the open detail, plus the canvas it owns and a
+// ResizeObserver that keeps the renderer sized to its container. Created lazily
+// when a LiDAR canvas becomes visible (Przegląd tile or LiDAR 3D tab); disposed
+// when leaving the detail or switching away from a LiDAR surface.
+let voxelView = null;
+let voxelCanvas = null;
+let voxelResizeObs = null;
+// Guards overlapping async voxel init (import + initVoxelView are async): a later
+// teardown that races an in-flight init disposes the late-resolved view at once.
+let voxelInitToken = 0;
+
+// Bounded control-outcome log for the open detail's robot. Cleared when the
+// detail changes robot or closes. Each entry: { atMs, level, text }.
+let detailLog = [];
 
 const RobotsScreen = {
   get title() { return 'Roboty'; },
 
   render() {
-    return `
-      <div class="page-header">
-        <div>
-          <h1>${sprite('cpu')} Roboty</h1>
-          <div class="sub" id="robots-sub">Roboty wykryte w sieci mesh — status, podgląd i sterowanie</div>
-        </div>
-        <div class="actions">
-          <tf-button variant="ghost" icon="refresh" id="robots-refresh">Odśwież</tf-button>
-        </div>
-      </div>
-
-      <div id="robots-list" class="robots-grid"></div>
-    `;
+    // A single host the active view renders into so the poll can swap LIST↔DETAIL
+    // without the screen shell flickering.
+    return `<div id="robots-root" class="robots-root"></div>`;
   },
 
   async mount() {
-    byId('robots-refresh')?.addEventListener('click', () => loadRobots({ showSpinner: true }));
+    renderShell();
     await loadRobots({ showSpinner: true });
     // Periodic re-poll. Skips overlapping requests (inFlightRefresh) so a slow
     // mesh round-trip can't stack timers.
@@ -170,9 +188,12 @@ const RobotsScreen = {
       refreshTimer = null;
     }
     stopLidarLoop();
+    disposeVoxel();
     robots = [];
     inFlightRefresh = false;
     cardEls = new Map();
+    selectedRobotId = null;
+    detailLog = [];
   },
 };
 
@@ -192,6 +213,8 @@ function isLocal(r) { return !!field(r, 'isLocal', 'is_local'); }
 function batteryPercent(r) { return field(r, 'batteryPercent', 'battery_percent'); }
 function rttMs(r) { return field(r, 'rttMs', 'rtt_ms'); }
 function cameraId(r) { return field(r, 'cameraId', 'camera_id'); }
+function robotKind(r) { return field(r, 'kind', 'kind') || 'robot'; }
+function firmware(r) { return field(r, 'firmware', 'firmware') ?? field(r, 'fw', 'fw'); }
 
 // Rich capability descriptors driving the control surface. camel/snake tolerant.
 // Each entry: {kind, label, risk, acrobatic, readOnly|read_only, params:[{name,min,max}]}.
@@ -262,29 +285,33 @@ function statusLabel(status) {
   return map[s] || (status || '—');
 }
 
+// A robot is controllable unless its status reads as offline/lost/error.
+function isControllable(status) {
+  const s = String(status || '').toLowerCase();
+  return s !== 'offline' && s !== 'lost' && s !== 'error';
+}
+
+function findRobot(id) {
+  return robots.find((x) => robotId(x) === id) || null;
+}
+
 async function loadRobots({ showSpinner }) {
   if (inFlightRefresh) return;
   inFlightRefresh = true;
-  const list = byId('robots-list');
-  if (showSpinner && list) {
-    list.innerHTML = '<div class="robots-loading"><tf-spinner></tf-spinner></div>';
+  if (showSpinner) {
+    const host = activeViewHost();
+    if (host) host.innerHTML = '<div class="robots-loading"><tf-spinner></tf-spinner></div>';
   }
   try {
     robots = await ApiBinary.list('robotsListRequest', { arrayKey: 'robots' });
     if (!Array.isArray(robots)) robots = [];
-    renderList();
-    const sub = byId('robots-sub');
-    if (sub) {
-      sub.textContent = robots.length
-        ? `${robots.length} ${plural(robots.length, 'robot', 'roboty', 'robotów')} w sieci mesh`
-        : 'Roboty wykryte w sieci mesh — status, podgląd i sterowanie';
-    }
+    renderActiveView();
   } catch (err) {
-    // A background poll failure must not wipe a working list; only surface the
+    // A background poll failure must not wipe a working view; only surface the
     // error path on an explicit (spinner) load.
     if (showSpinner) {
       robots = [];
-      renderError(list, err);
+      renderError(err);
       toast(`Roboty: ${err.message}`, 'error');
     }
   } finally {
@@ -292,14 +319,43 @@ async function loadRobots({ showSpinner }) {
   }
 }
 
-function renderError(list, err) {
-  if (!list) return;
-  // The error empty-state replaces the grid contents; drop stale card refs so a
-  // later successful poll rebuilds every card from scratch. No cards remain on
-  // screen, so no robot can be an active LiDAR source — close every subscription.
+// =============================================================================
+// View shell + dispatch
+// =============================================================================
+
+// Builds the persistent screen shell (a single root). The active view renders
+// into it; switching LIST↔DETAIL only swaps the root's children.
+function renderShell() {
+  const root = byId('robots-root');
+  if (!root) return;
+  root.innerHTML = '';
+}
+
+function activeViewHost() {
+  return byId('robots-root');
+}
+
+// Routes the current poll to whichever view is open: DETAIL when a robot is
+// selected AND still present, otherwise LIST. A selected robot that disappears
+// from the mesh falls back to the list (its subscriptions are torn down).
+function renderActiveView() {
+  if (selectedRobotId && findRobot(selectedRobotId)) {
+    renderDetail();
+  } else {
+    if (selectedRobotId) closeDetail();
+    renderList();
+  }
+}
+
+function renderError(err) {
+  const host = activeViewHost();
+  if (!host) return;
+  // The error empty-state replaces the view; drop stale refs and close every
+  // subscription (no card/detail remains on screen to be a live source).
   cardEls = new Map();
-  stopLidarLoop();
-  list.innerHTML = '';
+  closeDetail();
+  selectedRobotId = null;
+  host.innerHTML = '';
   const empty = document.createElement('tf-empty-state');
   empty.setAttribute('icon', 'alert');
   empty.setAttribute('title', 'Nie udało się wczytać robotów');
@@ -309,21 +365,73 @@ function renderError(list, err) {
   retry.textContent = 'Spróbuj ponownie';
   retry.addEventListener('click', () => loadRobots({ showSpinner: true }));
   empty.appendChild(retry);
-  list.appendChild(empty);
+  host.appendChild(empty);
 }
 
-// Keyed reconcile by robot id. Cards (and their <tf-video-stream>) are created
-// once and kept across polls; only mutable fields update in place. A card is
-// recreated only when its robot appears, disappears, or its camera_id changes.
+// Opens the detail view for a robot: tears down list cards (none can be a live
+// source while the detail is open), resets the per-robot log, then renders.
+function openDetail(id) {
+  if (!id || selectedRobotId === id) return;
+  selectedRobotId = id;
+  cardEls = new Map();
+  detailLog = [];
+  renderActiveView();
+}
+
+// Returns to the list view, closing the detail's subscriptions + voxel view.
+function backToList() {
+  closeDetail();
+  selectedRobotId = null;
+  renderActiveView();
+}
+
+// Tears down everything that belongs to the open detail: the single LiDAR
+// subscription, the staleness sweep and the wgpu voxel view. Called on back,
+// robot-gone, error and unmount.
+function closeDetail() {
+  stopLidarLoop();
+  disposeVoxel();
+}
+
+// =============================================================================
+// LIST view
+// =============================================================================
+
+// Keyed reconcile by robot id. Cards are created once and kept across polls; only
+// mutable fields update in place. A card is recreated only when its robot appears
+// or disappears.
 function renderList() {
-  const host = byId('robots-list');
-  if (!host) return;
+  let host = byId('robots-list');
+  if (!host) {
+    // First entry into the list view (or returning from detail): build the shell.
+    const root = activeViewHost();
+    if (!root) return;
+    cardEls = new Map();
+    root.innerHTML = `
+      <div class="page-header">
+        <div>
+          <h1>${sprite('cpu')} Roboty</h1>
+          <div class="sub" id="robots-sub">Roboty wykryte w sieci mesh — status, podgląd i sterowanie</div>
+        </div>
+        <div class="actions">
+          <tf-button variant="ghost" icon="refresh" id="robots-refresh">Odśwież</tf-button>
+        </div>
+      </div>
+      <div id="robots-list" class="robots-grid"></div>`;
+    byId('robots-refresh')?.addEventListener('click', () => loadRobots({ showSpinner: true }));
+    host = byId('robots-list');
+  }
+
+  const sub = byId('robots-sub');
+  if (sub) {
+    sub.textContent = robots.length
+      ? `${robots.length} ${plural(robots.length, 'robot', 'roboty', 'robotów')} w sieci mesh`
+      : 'Roboty wykryte w sieci mesh — status, podgląd i sterowanie';
+  }
 
   if (!robots.length) {
     host.innerHTML = '';
     cardEls = new Map();
-    // No robots on screen → no LiDAR sources; close every subscription.
-    stopLidarLoop();
     const empty = document.createElement('tf-empty-state');
     empty.setAttribute('icon', 'cpu');
     empty.setAttribute('title', 'Brak robotów w sieci mesh');
@@ -332,82 +440,884 @@ function renderList() {
     return;
   }
 
-  // The previous poll may have left a non-card child (spinner/empty-state) as
-  // the sole content; clear it so card append order stays clean.
-  if (cardEls.size === 0 && host.firstChild) {
-    host.innerHTML = '';
-  }
+  // The previous poll may have left a non-card child (spinner/empty-state) as the
+  // sole content; clear it so card append order stays clean.
+  if (cardEls.size === 0 && host.firstChild) host.innerHTML = '';
 
   const present = new Set();
   for (const r of robots) {
     const id = robotId(r);
     if (!id) continue;
     present.add(id);
-
     let el = cardEls.get(id);
-    // Recreate the card when the camera tile identity changes (camera_id flip,
-    // or camera appearing/disappearing) — otherwise the stream-id would be stale.
-    if (el && el.dataset.cameraId !== String(cameraId(r) ?? '')) {
-      el.remove();
-      cardEls.delete(id);
-      el = null;
-    }
-
     if (!el) {
       el = buildCard(r);
       cardEls.set(id, el);
       host.appendChild(el);
     }
-    // Apply mutable state on both new and existing cards (a freshly built card
-    // still needs its offline-disable applied for a robot that appears offline).
     updateCard(el, r);
   }
 
-  // Remove cards for robots no longer in the list.
   for (const [id, el] of cardEls) {
     if (!present.has(id)) {
       el.remove();
       cardEls.delete(id);
-      // A gone robot can't produce frames — drop its live loop entry too.
-      stopRobotLidar(id);
     }
   }
 }
 
-// Creates a card element from robotCard() markup, then builds the capability-
-// driven control surface and binds the e-stop / share handlers once. Listeners
-// live on the persistent element, so update polls never rebind.
+// Creates a list card element from cardMarkup(), then builds the quick controls
+// and binds the e-stop / details handlers once. Listeners live on the persistent
+// element, so update polls never rebind.
 function buildCard(r) {
   const tmp = document.createElement('div');
-  tmp.innerHTML = robotCard(r);
+  tmp.innerHTML = cardMarkup(r);
   const el = tmp.firstElementChild;
-
   const id = robotId(r);
+
   // E-stop is rendered as static markup (always present) — bind it once.
   el.querySelectorAll('[data-control="estop"]').forEach((btn) => {
     btn.addEventListener('click', () => handleControl(id, 'estop', btn));
   });
-  el.querySelectorAll('[data-share-camera]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
-    });
-  });
+  el.querySelector('[data-open-detail]')?.addEventListener('click', () => openDetail(id));
 
-  // Capability-driven controls live in their own sub-container so they can be
-  // rebuilt independently of the video node when the advertised action set
-  // changes — the <tf-video-stream> is NEVER touched.
-  buildControls(el, r);
+  buildCardQuickControls(el, r);
   return el;
 }
 
-// Renders the capability-driven controls into [data-field="controls"], grouped by
-// kind/risk. Rebuilt only when the advertised action signature actually changed,
-// so a steady action set survives every poll untouched (and the video node above
-// it stays stable). The e-stop button is separate static markup, never rebuilt.
-function buildControls(el, r) {
-  const host = el.querySelector('[data-field="controls"]');
-  if (!host) return;
+function cardMarkup(r) {
+  const id = robotId(r);
+  const status = r.status || '';
+  const offlineClass = isControllable(status) ? '' : ' off';
+  return `
+    <article class="robots-card${offlineClass}" data-robot-card="${escapeAttr(id)}">
+      <div class="robots-card-head">
+        <tf-badge data-field="status" tone="${statusTone(status)}" value="${escapeAttr(statusLabel(status))}"></tf-badge>
+        <span class="robots-card-title">${escapeHtml(robotKind(r))}</span>
+        <span class="robots-card-spacer"></span>
+        <span class="robots-card-id">${escapeHtml(id || '(bez id)')}</span>
+      </div>
 
+      <div class="robots-kpis">
+        <div class="robots-kpi"><div class="robots-kpi-l">Bateria</div><div class="robots-kpi-v" data-kpi="battery">—</div></div>
+        <div class="robots-kpi"><div class="robots-kpi-l">RTT</div><div class="robots-kpi-v" data-kpi="rtt">—</div></div>
+        <div class="robots-kpi"><div class="robots-kpi-l">Status</div><div class="robots-kpi-v robots-kpi-status" data-kpi="status">—</div></div>
+      </div>
+
+      <div class="robots-card-ctl" data-field="quick"></div>
+
+      <div class="robots-card-foot">
+        <span class="robots-caps" data-field="caps"></span>
+        <tf-button variant="ghost" size="sm" icon="chevron-right" data-open-detail>Szczegóły</tf-button>
+      </div>
+    </article>`;
+}
+
+// Quick controls on the list card: an always-present E-stop, Start (stand_up if
+// advertised, else a generic resume), Hello (if advertised) and a 4-way dpad
+// (forward/back/left/right) — ALL routed through the same handleControl()
+// capability dispatch as the full surface. Rebuilt only when the advertised
+// action signature changes.
+function buildCardQuickControls(el, r) {
+  const host = el.querySelector('[data-field="quick"]');
+  if (!host) return;
+  const meta = actionsMeta(r);
+  const sig = `quick|${controlsSignature(meta)}`;
+  if (host.dataset.quickSig === sig) return;
+  host.dataset.quickSig = sig;
+  host.innerHTML = '';
+
+  const id = robotId(r);
+  const controllable = meta.filter((a) => !NON_CONTROL_KINDS.has(a.kind) && !actionReadOnly(a));
+  const byKind = (k) => controllable.find((a) => a.kind === k);
+
+  // E-STOP — always present, never disabled (safety independent of metadata).
+  const estop = document.createElement('tf-button');
+  estop.setAttribute('variant', 'danger');
+  estop.setAttribute('size', 'sm');
+  estop.setAttribute('icon', 'stop');
+  estop.dataset.control = 'estop';
+  estop.textContent = 'E-STOP';
+  estop.addEventListener('click', () => handleControl(id, 'estop', estop));
+  host.appendChild(estop);
+
+  // Start / stand up — only when advertised (and only parameterless variants on
+  // the card; the full parametered surface lives in the detail).
+  const stand = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
+  if (stand && actionParams(stand).length === 0) {
+    host.appendChild(quickButton(id, stand, 'play', 'Start'));
+  }
+
+  // Hello — a friendly wave, when advertised.
+  const hello = byKind('hello');
+  if (hello && actionParams(hello).length === 0) {
+    host.appendChild(quickButton(id, hello, 'sparkle', hello.label || 'Hello'));
+  }
+
+  // 4-way dpad — only when "move" is advertised. Spacer-grid layout via CSS.
+  const move = byKind('move');
+  if (move) host.appendChild(buildDpad(id, move));
+}
+
+// One quick action button on the card, routed through handleControl with the
+// action's own high-risk gating (a quick button never bypasses confirm).
+function quickButton(id, a, icon, label) {
+  const high = isHighRisk(a);
+  const btn = document.createElement('tf-button');
+  btn.setAttribute('variant', high ? 'danger' : 'secondary');
+  btn.setAttribute('size', 'sm');
+  btn.setAttribute('icon', high ? 'alert' : icon);
+  btn.dataset.control = a.kind;
+  btn.textContent = label;
+  btn.addEventListener('click', () => handleControl(id, a.kind, btn, null, label, high));
+  return btn;
+}
+
+// Compact 4-way directional pad (forward/back/left/right at MOVE_SPEED) sending
+// "move" through handleControl — the SAME dispatch the full surface uses.
+function buildDpad(id, move) {
+  const wrap = document.createElement('div');
+  wrap.className = 'robots-dpad';
+  const cells = [
+    { sp: true },
+    { label: 'Przód', icon: 'arrow', vx: MOVE_SPEED, vy: 0, vyaw: 0 },
+    { sp: true },
+    { label: 'Lewo', icon: 'arrow', vx: 0, vy: MOVE_SPEED, vyaw: 0 },
+    { label: 'Tył', icon: 'arrow', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
+    { label: 'Prawo', icon: 'arrow', vx: 0, vy: -MOVE_SPEED, vyaw: 0 },
+  ];
+  for (const c of cells) {
+    if (c.sp) {
+      const sp = document.createElement('span');
+      sp.className = 'robots-dpad-sp';
+      wrap.appendChild(sp);
+      continue;
+    }
+    const btn = document.createElement('tf-button');
+    btn.setAttribute('variant', 'outline');
+    btn.setAttribute('size', 'sm');
+    btn.setAttribute('icon', c.icon);
+    btn.setAttribute('aria-label', c.label);
+    btn.dataset.control = 'move';
+    btn.addEventListener('click', () =>
+      handleControl(id, 'move', btn, { vx: c.vx, vy: c.vy, vyaw: c.vyaw }, move.label || c.label),
+    );
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
+// Updates only the mutable fields of an existing list card.
+function updateCard(el, r) {
+  const status = r.status || '';
+  const offline = !isControllable(status);
+  el.classList.toggle('off', offline);
+
+  const badge = el.querySelector('[data-field="status"]');
+  if (badge) {
+    badge.setAttribute('tone', statusTone(status));
+    badge.setAttribute('value', statusLabel(status));
+  }
+
+  setKpi(el, 'battery', batteryPercent(r), (v) => `${Math.round(Number(v))}<small>%</small>`);
+  setKpi(el, 'rtt', rttMs(r), (v) => `${Math.round(Number(v))}<small>ms</small>`);
+  const statusKpi = el.querySelector('[data-kpi="status"]');
+  if (statusKpi) {
+    statusKpi.textContent = offline ? statusLabel(status) : 'Gotowy';
+    statusKpi.dataset.tone = offline ? 'warning' : 'success';
+  }
+
+  updateCaps(el, r);
+  buildCardQuickControls(el, r);
+
+  // Offline robots can't take commands: disable every control EXCEPT the e-stop
+  // family. STOP must stay clickable regardless of advertised status.
+  el.querySelectorAll('[data-control]').forEach((btn) => {
+    const ctrl = btn.dataset.control;
+    if (ctrl === 'estop' || ctrl === 'stop' || ctrl === 'reset_estop') {
+      btn.removeAttribute('disabled');
+      return;
+    }
+    if (offline) btn.setAttribute('disabled', '');
+    else btn.removeAttribute('disabled');
+  });
+}
+
+// Writes a KPI value (HTML, for the <small> unit) or a placeholder when absent.
+function setKpi(el, name, raw, format) {
+  const node = el.querySelector(`[data-kpi="${name}"]`);
+  if (!node) return;
+  node.innerHTML = raw == null ? '—' : format(raw);
+}
+
+// Capability chips (camera / lidar / auto-reconnect) for the card footer.
+function updateCaps(el, r) {
+  const host = el.querySelector('[data-field="caps"]');
+  if (!host) return;
+  const caps = [];
+  if (cameraId(r)) caps.push('kamera');
+  if (lidar(r)) caps.push('lidar');
+  const offline = !isControllable(r.status || '');
+  host.innerHTML = '';
+  if (caps.length) {
+    const chip = document.createElement('tf-chip');
+    chip.setAttribute('variant', 'tag');
+    chip.setAttribute('tone', offline ? 'muted' : 'success');
+    chip.setAttribute('label', caps.join(' · '));
+    host.appendChild(chip);
+  }
+  if (offline) {
+    const re = document.createElement('tf-chip');
+    re.setAttribute('variant', 'tag');
+    re.setAttribute('tone', 'warning');
+    re.setAttribute('label', 'auto-reconnect');
+    host.appendChild(re);
+  }
+}
+
+// =============================================================================
+// DETAIL view
+// =============================================================================
+
+const DETAIL_TABS = [
+  { id: 'overview', label: 'Przegląd', icon: 'dashboard' },
+  { id: 'camera', label: 'Kamera', icon: 'eye' },
+  { id: 'lidar', label: 'LiDAR 3D', icon: 'globe-grid' },
+  { id: 'control', label: 'Sterowanie', icon: 'grid-2x2' },
+  { id: 'info', label: 'Informacje', icon: 'list' },
+  { id: 'log', label: 'Log', icon: 'code' },
+];
+
+// Builds the detail shell once per selected robot, then keeps it updated in place
+// across polls. The active tab panel is (re)rendered on tab change; persistent
+// live nodes (camera, voxel, robot-view) are created once and never rebuilt by a
+// poll.
+function renderDetail() {
+  const r = findRobot(selectedRobotId);
+  if (!r) { backToList(); return; }
+  const id = robotId(r);
+
+  let shell = byId('robots-detail');
+  if (!shell || shell.dataset.robot !== id) {
+    // Building (or rebuilding for a different robot): tear down any prior live
+    // surfaces before replacing the DOM.
+    closeDetail();
+    const root = activeViewHost();
+    if (!root) return;
+    root.innerHTML = detailMarkup(r);
+    shell = byId('robots-detail');
+    shell.dataset.robot = id;
+    shell.dataset.activeTab = 'overview';
+
+    shell.querySelector('[data-detail-back]')?.addEventListener('click', backToList);
+
+    // Action row (E-STOP + capability-mapped Start / Lie / Hello).
+    bindDetailActionRow(shell, id);
+
+    const tabs = shell.querySelector('tf-tabs');
+    tabs?.addEventListener('change', (e) => {
+      const tabId = e.detail?.value;
+      if (!tabId) return;
+      shell.dataset.activeTab = tabId;
+      renderDetailPanel(shell, tabId);
+      // Apply live state to the freshly rendered panel at once (start/stop the
+      // LiDAR subscription for the now-visible surface, feed telemetry) instead
+      // of waiting up to one poll interval.
+      const cur = findRobot(shell.dataset.robot);
+      if (cur) updateDetailPanel(shell, cur);
+    });
+    renderDetailPanel(shell, 'overview');
+  }
+
+  updateDetailHeader(shell, r);
+  // Refresh whichever panel is open (live telemetry / lidar status / controls).
+  updateDetailPanel(shell, r);
+}
+
+function detailMarkup(r) {
+  const id = robotId(r);
+  const status = r.status || '';
+  const fw = firmware(r);
+  const idLine = fw ? `${id} · fw ${fw}` : id;
+  return `
+    <div id="robots-detail" class="robots-detail">
+      <div class="robots-detail-toolbar">
+        <tf-button variant="ghost" size="sm" icon="chevron-left" data-detail-back>Roboty</tf-button>
+        <h1 class="robots-detail-name">${escapeHtml(robotKind(r))}</h1>
+        <tf-badge data-field="status" tone="${statusTone(status)}" value="${escapeAttr(statusLabel(status))}"></tf-badge>
+        <span class="robots-detail-id" data-field="idline">${escapeHtml(idLine)}</span>
+        <span class="robots-detail-spacer"></span>
+        <span class="robots-detail-conn" data-field="conn">połączenie auto</span>
+      </div>
+
+      <div class="robots-detail-kpis">
+        <div class="robots-dkpi"><div class="robots-dkpi-l">${sprite('zap')} Bateria</div><div class="robots-dkpi-v" data-dkpi="battery">—</div><div class="robots-dkpi-d" data-dkpi="battery-sub">—</div></div>
+        <div class="robots-dkpi"><div class="robots-dkpi-l">${sprite('bolt')} RTT</div><div class="robots-dkpi-v" data-dkpi="rtt">—</div><div class="robots-dkpi-d" data-dkpi="rtt-sub">—</div></div>
+        <div class="robots-dkpi"><div class="robots-dkpi-l">${sprite('globe-grid')} LiDAR</div><div class="robots-dkpi-v" data-dkpi="lidar">—</div><div class="robots-dkpi-d" data-dkpi="lidar-sub">—</div></div>
+        <div class="robots-dkpi"><div class="robots-dkpi-l">${sprite('cpu')} Tryb</div><div class="robots-dkpi-v robots-dkpi-mode" data-dkpi="mode">—</div><div class="robots-dkpi-d" data-dkpi="mode-sub">—</div></div>
+      </div>
+
+      <div class="robots-detail-actions" data-field="actionrow"></div>
+
+      <tf-tabs variant="underline" value="overview">
+        ${DETAIL_TABS.map((t) => `<tf-tab id="${t.id}" icon="${t.icon}" label="${escapeAttr(t.label)}"></tf-tab>`).join('')}
+      </tf-tabs>
+
+      <div class="robots-detail-panel" data-field="panel"></div>
+    </div>`;
+}
+
+// E-STOP (always present + clickable), plus capability-mapped Start/Wstań,
+// Połóż się (lie) and Hello in the action row. All routed through handleControl.
+function bindDetailActionRow(shell, id) {
+  const host = shell.querySelector('[data-field="actionrow"]');
+  if (!host) return;
+  host.innerHTML = '';
+  const r = findRobot(id);
+  const meta = r ? actionsMeta(r) : [];
+  const controllable = meta.filter((a) => !NON_CONTROL_KINDS.has(a.kind) && !actionReadOnly(a));
+  const byKind = (k) => controllable.find((a) => a.kind === k);
+
+  const estop = document.createElement('tf-button');
+  estop.setAttribute('variant', 'danger');
+  estop.setAttribute('icon', 'stop');
+  estop.dataset.control = 'estop';
+  estop.textContent = 'E-STOP';
+  estop.addEventListener('click', () => handleControl(id, 'estop', estop));
+  host.appendChild(estop);
+
+  const stand = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
+  if (stand && actionParams(stand).length === 0) {
+    const b = document.createElement('tf-button');
+    b.setAttribute('variant', 'primary');
+    b.setAttribute('icon', 'play');
+    b.dataset.control = stand.kind;
+    b.textContent = 'Start / Wstań';
+    b.addEventListener('click', () => handleControl(id, stand.kind, b, null, 'Start / Wstań', isHighRisk(stand)));
+    host.appendChild(b);
+  }
+
+  const lie = byKind('stand_down') || byKind('sit') || byKind('lie_down');
+  if (lie && actionParams(lie).length === 0) {
+    const b = document.createElement('tf-button');
+    b.setAttribute('variant', 'secondary');
+    b.setAttribute('icon', 'pause');
+    b.dataset.control = lie.kind;
+    b.textContent = lie.label || 'Połóż się';
+    b.addEventListener('click', () => handleControl(id, lie.kind, b, null, lie.label || 'Połóż się', isHighRisk(lie)));
+    host.appendChild(b);
+  }
+
+  const hello = byKind('hello');
+  if (hello && actionParams(hello).length === 0) {
+    const b = document.createElement('tf-button');
+    b.setAttribute('variant', 'ghost');
+    b.setAttribute('icon', 'sparkle');
+    b.dataset.control = hello.kind;
+    b.textContent = hello.label || 'Hello';
+    b.addEventListener('click', () => handleControl(id, hello.kind, b, null, hello.label || 'Hello', isHighRisk(hello)));
+    host.appendChild(b);
+  }
+}
+
+// Header KPIs + status badge + connection indicator, refreshed every poll.
+function updateDetailHeader(shell, r) {
+  const status = r.status || '';
+  const offline = !isControllable(status);
+
+  const badge = shell.querySelector('[data-field="status"]');
+  if (badge) {
+    badge.setAttribute('tone', statusTone(status));
+    badge.setAttribute('value', statusLabel(status));
+  }
+
+  const fw = firmware(r);
+  const idLine = fw ? `${robotId(r)} · fw ${fw}` : robotId(r);
+  const idEl = shell.querySelector('[data-field="idline"]');
+  if (idEl) idEl.textContent = idLine;
+
+  const conn = shell.querySelector('[data-field="conn"]');
+  if (conn) {
+    conn.textContent = offline ? 'auto-reconnect' : 'połączenie auto';
+    conn.dataset.state = offline ? 'reconnect' : 'live';
+  }
+
+  const battery = batteryPercent(r);
+  setDkpi(shell, 'battery', battery == null ? '—' : `${Math.round(Number(battery))} <span class="robots-dkpi-u">%</span>`);
+  const t = telemetry(r);
+  const bat = t && t.battery ? t.battery : null;
+  const volt = bat ? telNum(bat, 'voltage', 'voltage') : null;
+  const curr = bat ? telNum(bat, 'current', 'current') : null;
+  setDkpi(shell, 'battery-sub',
+    volt != null || curr != null
+      ? [volt != null ? `${volt.toFixed(1)} V` : null, curr != null ? `${curr.toFixed(1)} A` : null].filter(Boolean).join(' · ')
+      : '—');
+
+  const rtt = rttMs(r);
+  setDkpi(shell, 'rtt', rtt == null ? '—' : `${Math.round(Number(rtt))} <span class="robots-dkpi-u">ms</span>`);
+  setDkpi(shell, 'rtt-sub', offline ? 'offline' : 'stabilne');
+
+  // LiDAR KPI: live kl/s + points + decode when a frame is flowing, else snapshot.
+  const live = lidarLive.get(robotId(r));
+  if (live && live.lastFrameAtMs) {
+    const fps = computeLidarFps(live);
+    const timing = computeLidarTiming(live);
+    setDkpi(shell, 'lidar', `${fps.toFixed(1)} <span class="robots-dkpi-u">kl/s</span>`);
+    setDkpi(shell, 'lidar-sub',
+      `${live.lastPointCount} pkt · ${timing.decodeMs.toFixed(1)} ms`);
+  } else {
+    const l = lidar(r);
+    const pts = l ? Number(l.pointCount ?? l.point_count ?? 0) : 0;
+    setDkpi(shell, 'lidar', l ? (l.enabled ? '…' : 'wył.') : '—');
+    setDkpi(shell, 'lidar-sub', l && pts > 0 ? `${pts} pkt` : (l ? 'oczekiwanie' : 'brak'));
+  }
+
+  const modeEl = shell.querySelector('[data-dkpi="mode"]');
+  if (modeEl) {
+    modeEl.textContent = offline ? statusLabel(status) : 'Gotowy';
+    modeEl.dataset.tone = offline ? 'warning' : 'success';
+  }
+  setDkpi(shell, 'mode-sub', 'e-stop zwolniony');
+
+  // Keep the action row in sync with capability changes (signature compare).
+  const arHost = shell.querySelector('[data-field="actionrow"]');
+  const sig = `actionrow|${controlsSignature(actionsMeta(r))}`;
+  if (arHost && arHost.dataset.sig !== sig) {
+    arHost.dataset.sig = sig;
+    bindDetailActionRow(shell, robotId(r));
+  }
+  // Apply offline disable to the action row (e-stop excepted).
+  arHost?.querySelectorAll('[data-control]').forEach((btn) => {
+    const ctrl = btn.dataset.control;
+    if (ctrl === 'estop' || ctrl === 'stop' || ctrl === 'reset_estop') {
+      btn.removeAttribute('disabled');
+      return;
+    }
+    if (offline) btn.setAttribute('disabled', '');
+    else btn.removeAttribute('disabled');
+  });
+}
+
+function setDkpi(shell, name, html) {
+  const node = shell.querySelector(`[data-dkpi="${name}"]`);
+  if (node) node.innerHTML = html;
+}
+
+// Renders the active tab panel from scratch. Persistent live nodes (camera,
+// voxel canvas, robot-view) are created here once and then fed in place by
+// updateDetailPanel(); leaving a LiDAR surface disposes the voxel view.
+function renderDetailPanel(shell, tabId) {
+  const panel = shell.querySelector('[data-field="panel"]');
+  if (!panel) return;
+  const r = findRobot(shell.dataset.robot);
+  if (!r) return;
+  const id = robotId(r);
+
+  // Switching away from any LiDAR surface tears down the voxel renderer so only
+  // the visible surface holds a GPU context.
+  if (tabId !== 'overview' && tabId !== 'lidar') disposeVoxel();
+
+  panel.innerHTML = '';
+
+  if (tabId === 'overview') {
+    panel.innerHTML = `
+      <div class="robots-tiles">
+        <div class="robots-tile" data-field="camera-tile"></div>
+        <div class="robots-tile robots-tile-lidar" data-field="lidar-tile"></div>
+      </div>
+      <div class="robots-panels">
+        <div class="robots-section" data-field="telemetry"></div>
+        <div class="robots-section">
+          <div class="robots-section-head"><h3>Szybkie sterowanie</h3></div>
+          <div class="robots-controls" data-field="quickmove"></div>
+        </div>
+      </div>`;
+    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, false);
+    mountLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
+    buildQuickMove(panel.querySelector('[data-field="quickmove"]'), id, r);
+    updateTelemetry(panel.querySelector('[data-field="telemetry"]'), r);
+    return;
+  }
+
+  if (tabId === 'camera') {
+    panel.innerHTML = `<div class="robots-tile robots-tile-full" data-field="camera-tile"></div>`;
+    mountCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, true);
+    return;
+  }
+
+  if (tabId === 'lidar') {
+    panel.innerHTML = `<div class="robots-tile robots-tile-lidar robots-tile-full" data-field="lidar-tile"></div>`;
+    mountLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
+    return;
+  }
+
+  if (tabId === 'control') {
+    panel.innerHTML = `<div class="robots-section">
+        <div class="robots-section-head"><h3>Pełne sterowanie</h3></div>
+        <div class="robots-controls" data-field="controls"></div>
+      </div>`;
+    buildControls(panel.querySelector('[data-field="controls"]'), r);
+    return;
+  }
+
+  if (tabId === 'info') {
+    panel.innerHTML = `
+      <div class="robots-panels">
+        <div class="robots-section" data-field="telemetry-full"></div>
+        <div class="robots-section">
+          <div class="robots-section-head"><h3>Model 3D — stawy na żywo</h3></div>
+          <div class="robots-robot3d" data-field="robot3d"></div>
+        </div>
+      </div>`;
+    updateTelemetryFull(panel.querySelector('[data-field="telemetry-full"]'), r);
+    updateRobot3d(panel.querySelector('[data-field="robot3d"]'), r);
+    return;
+  }
+
+  if (tabId === 'log') {
+    panel.innerHTML = `<div class="robots-section">
+        <div class="robots-section-head"><h3>Dziennik zdarzeń</h3></div>
+        <div class="robots-log" data-field="log"></div>
+      </div>`;
+    renderLog(panel.querySelector('[data-field="log"]'));
+    return;
+  }
+}
+
+// Refreshes the open panel in place from the latest poll — never rebuilds the
+// persistent live nodes (camera / voxel / robot-view), only their fed data and
+// the surrounding telemetry/controls/log.
+function updateDetailPanel(shell, r) {
+  const panel = shell.querySelector('[data-field="panel"]');
+  if (!panel) return;
+  const tabId = shell.dataset.activeTab || 'overview';
+  const id = robotId(r);
+
+  // The LiDAR subscription lifecycle is owned by whichever LiDAR surface is open
+  // (Przegląd tile or LiDAR 3D tab): keep it running only while such a surface is
+  // visible AND lidar is enabled AND the robot is online.
+  const lidarSurfaceOpen = tabId === 'overview' || tabId === 'lidar';
+  syncDetailLidar(r, lidarSurfaceOpen);
+
+  if (tabId === 'overview') {
+    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, false);
+    updateTelemetry(panel.querySelector('[data-field="telemetry"]'), r);
+    reconcileLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
+    refreshOfflineDisable(panel, r);
+  } else if (tabId === 'camera') {
+    reconcileCameraTile(panel.querySelector('[data-field="camera-tile"]'), r, true);
+  } else if (tabId === 'lidar') {
+    reconcileLidarTile(panel.querySelector('[data-field="lidar-tile"]'), r);
+  } else if (tabId === 'control') {
+    buildControls(panel.querySelector('[data-field="controls"]'), r);
+    refreshOfflineDisable(panel, r);
+  } else if (tabId === 'info') {
+    updateTelemetryFull(panel.querySelector('[data-field="telemetry-full"]'), r);
+    updateRobot3d(panel.querySelector('[data-field="robot3d"]'), r);
+  } else if (tabId === 'log') {
+    renderLog(panel.querySelector('[data-field="log"]'));
+  }
+  void id;
+}
+
+// Disables controls in the open panel for an offline robot (e-stop excepted).
+function refreshOfflineDisable(panel, r) {
+  const offline = !isControllable(r.status || '');
+  panel.querySelectorAll('[data-control]').forEach((btn) => {
+    const ctrl = btn.dataset.control;
+    if (ctrl === 'estop' || ctrl === 'stop' || ctrl === 'reset_estop') {
+      btn.removeAttribute('disabled');
+      return;
+    }
+    if (offline) btn.setAttribute('disabled', '');
+    else btn.removeAttribute('disabled');
+  });
+}
+
+// =============================================================================
+// Camera tile (created once, never torn down by a poll)
+// =============================================================================
+
+// Mounts the live camera stream into a tile. The <tf-video-stream> is keyed by
+// stream-id so a poll never rebuilds the live MSE element. `full` controls tile
+// height (full-size on the Kamera tab).
+function mountCameraTile(host, r, full) {
+  if (!host) return;
+  const cam = cameraId(r);
+  const id = robotId(r);
+  // Key the tile by camera id + size so reconcileCameraTile() can detect a flip
+  // and avoid rebuilding the live <tf-video-stream> when nothing changed.
+  host.dataset.cam = String(cam ?? '');
+  host.dataset.full = full ? '1' : '';
+  if (!cam) {
+    host.classList.add('robots-tile-empty');
+    host.innerHTML = `<div class="robots-tile-ph">Brak kamery</div>`;
+    return;
+  }
+  host.classList.remove('robots-tile-empty');
+  const h = full ? 520 : 280;
+  host.innerHTML = `
+    <div class="robots-tile-top"><span class="robots-tile-title">Kamera</span><span class="robots-tile-rec">● na żywo</span></div>
+    <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" height-px="${h}"></tf-video-stream>
+    <div class="robots-tile-bottom">
+      <tf-button variant="outline" size="sm" icon="image" data-share-camera="${escapeAttr(cam)}" data-robot="${escapeAttr(id)}">Dodaj do TentaVision</tf-button>
+    </div>`;
+  host.querySelector('[data-share-camera]')?.addEventListener('click', (e) => {
+    const btn = e.currentTarget;
+    handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
+  });
+}
+
+// Keyed camera reconcile across polls: rebuild the tile (and its live MSE element)
+// ONLY when the camera id (or tile size) actually changed — a steady camera keeps
+// the same <tf-video-stream> playing, mirroring the list's old keyed reconcile.
+function reconcileCameraTile(host, r, full) {
+  if (!host) return;
+  const wantCam = String(cameraId(r) ?? '');
+  const wantFull = full ? '1' : '';
+  if (host.dataset.cam === wantCam && host.dataset.full === wantFull) return;
+  mountCameraTile(host, r, full);
+}
+
+// =============================================================================
+// LiDAR tile + wgpu voxel renderer lifecycle
+// =============================================================================
+
+// Mounts the LiDAR tile: an enable/disable toggle (routed via lidar_on/off), a
+// live status line and the wgpu voxel canvas (lazily initialized). Built once per
+// renderDetailPanel; updateLidarTile() refreshes text/state in place.
+function mountLidarTile(host, r) {
+  if (!host) return;
+  const id = robotId(r);
+  const l = lidar(r);
+  if (!l) {
+    // Capability absent: dispose any live voxel view so a stale point cloud can't
+    // linger, then show the placeholder.
+    disposeVoxel();
+    host.dataset.hasLidar = '';
+    host.classList.add('robots-tile-empty');
+    host.innerHTML = `<div class="robots-tile-ph">Robot nie zgłasza LiDAR-u</div>`;
+    return;
+  }
+  host.dataset.hasLidar = '1';
+  host.classList.remove('robots-tile-empty');
+  host.innerHTML = `
+    <div class="robots-tile-top">
+      <span class="robots-tile-title">LiDAR — głębia</span>
+      <span class="robots-tile-rec" data-lidar-rec>● —</span>
+    </div>
+    <div class="robots-voxel" data-field="voxel">
+      <div class="robots-voxel-ph" data-voxel-ph>renderer się uruchamia…</div>
+    </div>
+    <div class="robots-tile-bottom robots-lidar-bar">
+      <tf-toggle data-lidar-toggle></tf-toggle>
+      <span class="robots-lidar-label">Strumień 3D</span>
+      <span class="robots-lidar-status" data-lidar-status>—</span>
+    </div>
+    <div class="robots-lidar-diag" data-lidar-diag hidden></div>`;
+
+  const toggle = host.querySelector('[data-lidar-toggle]');
+  toggle.addEventListener('change', (e) => {
+    const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
+    handleLidarToggle(id, !!on, toggle);
+  });
+
+  updateLidarTile(host, r);
+  // Kick off the voxel renderer for the now-visible canvas.
+  ensureVoxel(host.querySelector('[data-field="voxel"]'));
+}
+
+// Keyed LiDAR reconcile across polls: rebuild the tile (and tear down the voxel
+// view) when the capability appears or disappears; otherwise refresh in place.
+function reconcileLidarTile(host, r) {
+  if (!host) return;
+  const want = lidar(r) ? '1' : '';
+  if (host.dataset.hasLidar !== want) {
+    mountLidarTile(host, r);
+    return;
+  }
+  updateLidarTile(host, r);
+}
+
+// Refreshes the LiDAR tile's toggle state, status line and freshness in place.
+function updateLidarTile(host, r) {
+  if (!host || host.classList.contains('robots-tile-empty')) return;
+  const l = lidar(r);
+  if (!l) return;
+  const offline = !isControllable(r.status || '');
+  const enabled = !!l.enabled;
+  const available = !!l.available;
+  const snapshotPoints = Number(l.pointCount ?? l.point_count ?? 0);
+  const resolution = l.resolution;
+
+  const toggle = host.querySelector('[data-lidar-toggle]');
+  if (toggle) {
+    if (enabled) toggle.setAttribute('checked', '');
+    else toggle.removeAttribute('checked');
+    if (offline) toggle.setAttribute('disabled', '');
+    else toggle.removeAttribute('disabled');
+  }
+
+  renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution });
+}
+
+// Writes the LiDAR status text + freshness rec badge + diagnostics line. Called
+// from updateLidarTile() (poll cadence) and from the PUSH handler (per frame).
+function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution }) {
+  const status = host.querySelector('[data-lidar-status]');
+  const rec = host.querySelector('[data-lidar-rec]');
+  const diag = host.querySelector('[data-lidar-diag]');
+  if (!status) return;
+
+  if (!enabled) {
+    status.textContent = 'wyłączony';
+    if (rec) { rec.textContent = '● off'; rec.dataset.tone = 'muted'; }
+    if (diag) diag.hidden = true;
+    return;
+  }
+  if (offline) {
+    status.textContent = 'robot offline';
+    if (rec) { rec.textContent = '● offline'; rec.dataset.tone = 'warning'; }
+    if (diag) diag.hidden = true;
+    return;
+  }
+
+  const res = typeof resolution === 'number' && Number.isFinite(resolution)
+    ? `  ·  ${resolution.toFixed(2)} m`
+    : '';
+
+  const id = selectedRobotId || '';
+  const live = lidarLive.get(id);
+  const hasLiveFrame = !!(live && live.lastFrameAtMs);
+
+  if (hasLiveFrame) {
+    const points = live.lastPointCount;
+    const fps = computeLidarFps(live);
+    const ageMs = performance.now() - live.lastFrameAtMs;
+    const stale = ageMs > LIDAR_STALE_AFTER_MS;
+    status.textContent =
+      `${points} ${plural(points, 'punkt', 'punkty', 'punktów')}  ·  ${fps.toFixed(1)} kl./s${res}`;
+    if (rec) {
+      rec.textContent = stale ? '● nieaktualne' : `● ${fps.toFixed(0)} Hz`;
+      rec.dataset.tone = stale ? 'warning' : 'live';
+    }
+    if (diag) {
+      const t = computeLidarTiming(live);
+      if (t.deliveredHz > 0) {
+        const e2e = t.e2eMs == null ? 'n/d' : `${t.e2eMs.toFixed(0)} ms`;
+        const hop = (v) => (v == null ? '–' : v.toFixed(0));
+        diag.hidden = false;
+        diag.textContent =
+          `dostarczanie ${t.deliveredHz.toFixed(1)} Hz  ·  dekodowanie ${t.decodeMs.toFixed(2)} ms  ·  opóźnienie ${e2e}`
+          + `  ·  host/net/decode ${hop(t.hostMs)}/${hop(t.netMs)}/${t.decodeMs.toFixed(1)} ms`;
+      } else {
+        diag.hidden = true;
+      }
+    }
+    return;
+  }
+  if (diag) diag.hidden = true;
+
+  if (available && snapshotPoints > 0) {
+    status.textContent =
+      `${snapshotPoints} ${plural(snapshotPoints, 'punkt', 'punkty', 'punktów')}${res}`;
+  } else {
+    status.textContent = 'aktywny, oczekiwanie na dane…';
+  }
+  if (rec) { rec.textContent = '● łączenie'; rec.dataset.tone = 'info'; }
+}
+
+// Lazily initializes the wgpu voxel renderer over the tile's canvas container. The
+// glue module may not exist yet (sibling renderer not built) — a failed import
+// degrades to a "renderer niedostępny" placeholder instead of throwing. A new
+// init invalidates any older in-flight init via voxelInitToken.
+async function ensureVoxel(container) {
+  if (!container) return;
+  if (voxelView && voxelCanvas && container.contains(voxelCanvas)) return;
+  disposeVoxel();
+
+  const token = ++voxelInitToken;
+  const ph = container.querySelector('[data-voxel-ph]');
+
+  const canvas = document.createElement('canvas');
+  canvas.className = 'robots-voxel-canvas';
+  container.appendChild(canvas);
+
+  // Resolution (meters per voxel) from the robot's snapshot, default 0.05 m.
+  const r = findRobot(selectedRobotId);
+  const l = r ? lidar(r) : null;
+  const resolution = typeof l?.resolution === 'number' && Number.isFinite(l.resolution) ? l.resolution : 0.05;
+
+  try {
+    const mod = await import('/js/voxel/voxel_glue.js');
+    // wasm-bindgen glue exports a default init that must run before use.
+    if (typeof mod.default === 'function') await mod.default();
+    if (token !== voxelInitToken) { canvas.remove(); return; }
+    const view = await mod.initVoxelView(canvas, resolution);
+    if (token !== voxelInitToken) {
+      try { view.dispose(); } catch { /* ignore */ }
+      canvas.remove();
+      return;
+    }
+    voxelView = view;
+    voxelCanvas = canvas;
+    if (ph) ph.hidden = true;
+    // Keep the renderer sized to its container.
+    voxelResizeObs = new ResizeObserver(() => resizeVoxel());
+    voxelResizeObs.observe(container);
+    resizeVoxel();
+    // Push the last decoded frame immediately so the view isn't blank until the
+    // next push lands.
+    const live = lidarLive.get(selectedRobotId);
+    if (live && live.lastPoints && voxelView) {
+      try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
+    }
+  } catch (err) {
+    if (token !== voxelInitToken) { canvas.remove(); return; }
+    canvas.remove();
+    if (ph) {
+      ph.hidden = false;
+      ph.textContent = 'renderer niedostępny';
+    }
+    console.warn('[robots] voxel renderer unavailable:', err?.message ?? err);
+  }
+}
+
+function resizeVoxel() {
+  if (!voxelView || !voxelCanvas) return;
+  const parent = voxelCanvas.parentElement;
+  if (!parent) return;
+  const w = Math.max(1, Math.floor(parent.clientWidth));
+  const h = Math.max(1, Math.floor(parent.clientHeight));
+  try { voxelView.resize(w, h); } catch { /* ignore */ }
+}
+
+// Tears down the voxel renderer + its canvas + resize observer. Invalidates any
+// in-flight init via the token bump so a racing init disposes itself.
+function disposeVoxel() {
+  voxelInitToken += 1;
+  if (voxelResizeObs) {
+    try { voxelResizeObs.disconnect(); } catch { /* ignore */ }
+    voxelResizeObs = null;
+  }
+  if (voxelView) {
+    try { voxelView.dispose(); } catch { /* ignore */ }
+    voxelView = null;
+  }
+  if (voxelCanvas) {
+    try { voxelCanvas.remove(); } catch { /* ignore */ }
+    voxelCanvas = null;
+  }
+}
+
+// =============================================================================
+// Capability-driven control surface (full — Sterowanie tab)
+// =============================================================================
+
+// Renders the capability-driven controls grouped Ruch / Pozy / Akcje / Akrobacje.
+// Rebuilt only when the advertised action signature actually changed.
+function buildControls(host, r) {
+  if (!host) return;
   const meta = actionsMeta(r);
   const sig = controlsSignature(meta);
   if (host.dataset.controlsSig === sig) return;
@@ -417,19 +1327,14 @@ function buildControls(el, r) {
   const id = robotId(r);
   const controllable = meta.filter((a) => !NON_CONTROL_KINDS.has(a.kind) && !actionReadOnly(a));
 
-  // Locomotion dpad (only when "move" is advertised).
   const move = controllable.find((a) => a.kind === 'move');
   if (move) host.appendChild(buildMoveGroup(id, move));
 
-  // Parametered poses/levels (euler/pose/body_height/foot_raise_height/speed_level
-  // and any other action that advertises params).
   const parametered = controllable.filter((a) => a.kind !== 'move' && actionParams(a).length > 0);
   if (parametered.length) {
     host.appendChild(buildGroup('Pozy', parametered.map((a) => buildParameteredControl(id, a))));
   }
 
-  // Simple parameterless actions, split by risk so acrobatics are visually and
-  // behaviourally distinct.
   const simple = controllable.filter(
     (a) => a.kind !== 'move' && actionParams(a).length === 0 && !isHighRisk(a),
   );
@@ -441,8 +1346,49 @@ function buildControls(el, r) {
     (a) => a.kind !== 'move' && actionParams(a).length === 0 && isHighRisk(a),
   );
   if (acrobatic.length) {
-    host.appendChild(buildGroup('Akrobacje', acrobatic.map((a) => buildSimpleButton(id, a))));
+    host.appendChild(buildGroup('Akrobacje — wymagają potwierdzenia', acrobatic.map((a) => buildSimpleButton(id, a))));
   }
+
+  if (!host.children.length) {
+    const ph = document.createElement('div');
+    ph.className = 'robots-controls-empty';
+    ph.textContent = 'Robot nie zgłasza żadnych sterowalnych akcji.';
+    host.appendChild(ph);
+  }
+}
+
+// Quick-move row for the Przegląd tab: forward/back + rotate L/R, routed through
+// the same handleControl dispatch. Always shown when "move" is advertised.
+function buildQuickMove(host, id, r) {
+  if (!host) return;
+  host.innerHTML = '';
+  const move = actionsMeta(r).find((a) => a.kind === 'move' && !actionReadOnly(a));
+  if (!move) {
+    const ph = document.createElement('div');
+    ph.className = 'robots-controls-empty';
+    ph.textContent = 'Brak sterowania ruchem.';
+    host.appendChild(ph);
+    return;
+  }
+  const dirs = [
+    { label: 'Naprzód', vx: MOVE_SPEED, vy: 0, vyaw: 0 },
+    { label: 'Tył', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
+    { label: 'Obrót L', vx: 0, vy: 0, vyaw: MOVE_SPEED },
+    { label: 'Obrót P', vx: 0, vy: 0, vyaw: -MOVE_SPEED },
+  ];
+  const row = document.createElement('div');
+  row.className = 'robots-controls-row';
+  for (const d of dirs) {
+    const btn = document.createElement('tf-button');
+    btn.setAttribute('variant', 'secondary');
+    btn.setAttribute('size', 'sm');
+    btn.dataset.control = 'move';
+    btn.textContent = d.label;
+    btn.addEventListener('click', () =>
+      handleControl(id, 'move', btn, { vx: d.vx, vy: d.vy, vyaw: d.vyaw }, move.label || d.label));
+    row.appendChild(btn);
+  }
+  host.appendChild(row);
 }
 
 // Stable signature of the action set: any change in the set/order/risk/params of
@@ -531,16 +1477,12 @@ function buildParameteredControl(id, a) {
   const high = isHighRisk(a);
   const slots = slotsForKind(a.kind, params);
 
-  // For a KNOWN kind, every required documented param must be advertised; missing
-  // one means the descriptor is malformed for this kind, so we refuse rather than
-  // guess which slot each value belongs to.
   const required = REQUIRED_PARAMS[a.kind];
   const advertisedNames = new Set(params.map((p) => p.name));
   const missingRequired = required
     ? required.filter((name) => !advertisedNames.has(name))
     : [];
 
-  // speed_level is a discrete level, not a continuous range: a select is clearer.
   if (a.kind === 'speed_level') {
     const sel = document.createElement('tf-select');
     sel.setAttribute('label', 'Poziom');
@@ -565,9 +1507,6 @@ function buildParameteredControl(id, a) {
     return wrap;
   }
 
-  // Build one input per param that has a FIXED slot. For unknown kinds slotsForKind
-  // assigns slots by the meta's declared order (no compaction); a param it can't
-  // place at all (more than 4 on an unknown kind) is reported as ambiguous below.
   const fields = [];
   let ambiguous = false;
   for (const p of params) {
@@ -589,8 +1528,6 @@ function buildParameteredControl(id, a) {
 
   const send = makeSendButton(a.label || a.kind);
 
-  // Refuse on a malformed/ambiguous descriptor — prefer refusing over guessing for
-  // anything that moves the robot.
   if (missingRequired.length) {
     refuseControl(wrap, send, a.kind, missingRequired);
   } else if (ambiguous) {
@@ -670,89 +1607,49 @@ function paramLabel(name) {
   return map[name] || name;
 }
 
-// Updates only the mutable fields of an existing card. Never touches the
-// <tf-video-stream> node, so the live MSE stream keeps playing across polls.
-function updateCard(el, r) {
-  const status = r.status || '';
-  const badge = el.querySelector('[data-field="status"]');
-  if (badge) {
-    badge.setAttribute('tone', statusTone(status));
-    badge.setAttribute('value', statusLabel(status));
-  }
+// =============================================================================
+// Telemetry panel + 3D robot model
+// =============================================================================
 
-  setMetric(el, 'battery', batteryPercent(r), (v) => `${Math.round(Number(v))}%`);
-  setMetric(el, 'rtt', rttMs(r), (v) => `${Math.round(Number(v))} ms`);
-
-  const ownerEl = el.querySelector('[data-field="owner"]');
-  if (ownerEl) {
-    ownerEl.textContent = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
-  }
-
-  // Refresh the telemetry panel in place (its own container, never the video
-  // node above it). Only present fields render; an absent snapshot hides it.
-  updateTelemetry(el, r);
-
-  // Refresh the LiDAR row in place (its own container, never the video node).
-  updateLidar(el, r);
-
-  // Refresh the live 3D robot (joints + orientation) in place.
-  updateRobot3d(el, r);
-
-  // Rebuild the capability-driven controls only when the advertised action set
-  // actually changed (signature compare inside buildControls). This never touches
-  // the video node above it.
-  buildControls(el, r);
-
-  // Offline robots can't take commands: disable every control + share button —
-  // EXCEPT the e-stop family. STOP must stay clickable regardless of advertised
-  // status so safety never depends on status metadata (the server still validates).
-  const offline = !isControllable(status);
-  el.querySelectorAll('[data-control], [data-share-camera]').forEach((btn) => {
-    const ctrl = btn.dataset.control;
-    if (ctrl === 'estop' || ctrl === 'stop' || ctrl === 'reset_estop') {
-      btn.removeAttribute('disabled');
-      return;
-    }
-    if (offline) btn.setAttribute('disabled', '');
-    else btn.removeAttribute('disabled');
-  });
-}
-
-// Updates a metric row in place, inserting/removing the row's value text. Rows
-// that are optional (battery/RTT) keep a stable slot rendered by robotCard().
-function setMetric(el, fieldName, raw, format) {
-  const row = el.querySelector(`[data-metric="${fieldName}"]`);
-  if (!row) return;
-  if (raw == null) {
-    row.hidden = true;
-    return;
-  }
-  row.hidden = false;
-  const valueEl = row.querySelector('.robots-metric-value');
-  if (valueEl) valueEl.textContent = format(raw);
-}
-
-// Rebuilds the telemetry panel from the latest snapshot, IN PLACE inside the
-// [data-field="telemetry"] container. The container sits below the video node and
-// is never the video node itself, so the live <tf-video-stream> is untouched. Only
-// fields actually present render; an absent snapshot hides the whole panel.
-function updateTelemetry(el, r) {
-  const host = el.querySelector('[data-field="telemetry"]');
+// Rebuilds a compact telemetry summary IN PLACE. Only fields actually present
+// render; an absent snapshot hides the whole panel.
+function updateTelemetry(host, r) {
   if (!host) return;
-  const t = telemetry(r);
-  if (!t) {
-    host.hidden = true;
-    host.innerHTML = '';
+  const rows = telemetryRows(r);
+  if (!rows.length) {
+    host.innerHTML = `<div class="robots-section-head"><h3>Telemetria</h3></div><div class="robots-controls-empty">Brak telemetrii.</div>`;
     return;
   }
+  host.innerHTML = `
+    <div class="robots-section-head"><h3>Telemetria</h3></div>
+    <dl class="robots-kv">${rows.join('')}</dl>`;
+}
 
+// Full telemetry list for the Informacje tab (same source, all rows).
+function updateTelemetryFull(host, r) {
+  if (!host) return;
+  const rows = telemetryRows(r);
+  if (!rows.length) {
+    host.innerHTML = `<div class="robots-section-head"><h3>Telemetria</h3></div><div class="robots-controls-empty">Robot nie raportuje telemetrii.</div>`;
+    return;
+  }
+  host.innerHTML = `
+    <div class="robots-section-head"><h3>Telemetria</h3></div>
+    <dl class="robots-kv">${rows.join('')}</dl>`;
+}
+
+// Builds the telemetry key/value rows (label/value <dt>/<dd>) from the snapshot.
+// IMU RPY in degrees; battery V/A; temperatures; foot force; velocities; gait.
+function telemetryRows(r) {
+  const t = telemetry(r);
+  if (!t) return [];
   const rows = [];
   const mode = telNum(t, 'mode', 'mode');
   const gait = telNum(t, 'gaitType', 'gait_type');
-  if (mode != null) rows.push(telRow('Tryb', String(Math.round(mode))));
-  if (gait != null) rows.push(telRow('Chód', String(Math.round(gait))));
+  if (mode != null) rows.push(kvRow('Tryb', String(Math.round(mode))));
+  if (gait != null) rows.push(kvRow('Chód', String(Math.round(gait))));
   const bh = telNum(t, 'bodyHeight', 'body_height');
-  if (bh != null) rows.push(telRow('Wys. ciała', `${bh.toFixed(2)} m`));
+  if (bh != null) rows.push(kvRow('Wys. ciała', `${bh.toFixed(2)} m`));
 
   const vx = telNum(t, 'vx', 'vx');
   const vy = telNum(t, 'vy', 'vy');
@@ -762,7 +1659,7 @@ function updateTelemetry(el, r) {
     if (vx != null) parts.push(`vx ${vx.toFixed(2)}`);
     if (vy != null) parts.push(`vy ${vy.toFixed(2)}`);
     if (vyaw != null) parts.push(`yaw ${vyaw.toFixed(2)}`);
-    rows.push(telRow('Prędkość', parts.join('  ·  ')));
+    rows.push(kvRow('Prędkość', parts.join('  ·  ')));
   }
 
   const imu = t.imu || null;
@@ -772,19 +1669,19 @@ function updateTelemetry(el, r) {
     const yaw = radToDeg(telNum(imu, 'yaw', 'yaw'));
     if (roll != null || pitch != null || yaw != null) {
       const parts = [];
-      if (roll != null) parts.push(`R ${roll.toFixed(1)}°`);
-      if (pitch != null) parts.push(`P ${pitch.toFixed(1)}°`);
-      if (yaw != null) parts.push(`Y ${yaw.toFixed(1)}°`);
-      rows.push(telRow('Orientacja', parts.join('  ·  ')));
+      if (roll != null) parts.push(`${roll.toFixed(1)}°`);
+      if (pitch != null) parts.push(`${pitch.toFixed(1)}°`);
+      if (yaw != null) parts.push(`${yaw.toFixed(1)}°`);
+      rows.push(kvRow('Orientacja (RPY)', parts.join(' / ')));
     }
     const imuTemp = telNum(imu, 'temperature', 'temperature');
-    if (imuTemp != null) rows.push(telRow('Temp. IMU', `${imuTemp.toFixed(0)} °C`));
+    if (imuTemp != null) rows.push(kvRow('Temp. IMU', `${imuTemp.toFixed(0)} °C`));
   }
 
   const foot = Array.isArray(t.footForce ?? t.foot_force) ? t.footForce ?? t.foot_force : [];
   if (foot.length) {
     const vals = foot.map((f) => (Number.isFinite(Number(f)) ? Math.round(Number(f)) : '—'));
-    rows.push(telRow('Siły stóp', vals.join('  ·  ')));
+    rows.push(kvRow('Siły stóp (FL/FR/RL/RR)', vals.join('  ·  ')));
   }
 
   const bat = t.battery || null;
@@ -793,209 +1690,53 @@ function updateTelemetry(el, r) {
     const volt = telNum(bat, 'voltage', 'voltage');
     const curr = telNum(bat, 'current', 'current');
     const temp = telNum(bat, 'temperature', 'temperature');
-    if (soc != null) rows.push(telRow('Bateria SOC', `${Math.round(soc)} %`));
-    if (volt != null) rows.push(telRow('Napięcie', `${volt.toFixed(1)} V`));
-    if (curr != null) rows.push(telRow('Prąd', `${curr.toFixed(1)} A`));
-    if (temp != null) rows.push(telRow('Temp. baterii', `${temp.toFixed(0)} °C`));
+    if (soc != null) rows.push(kvRow('Bateria SOC', `${Math.round(soc)} %`));
+    if (volt != null) rows.push(kvRow('Napięcie', `${volt.toFixed(1)} V`));
+    if (curr != null) rows.push(kvRow('Prąd', `${curr.toFixed(1)} A`));
+    if (temp != null) rows.push(kvRow('Temp. baterii', `${temp.toFixed(0)} °C`));
   }
 
-  if (!rows.length) {
-    host.hidden = true;
-    host.innerHTML = '';
-    return;
-  }
-  host.hidden = false;
-  host.innerHTML = `
-    <div class="robots-telemetry-title">Telemetria</div>
-    <div class="robots-telemetry-rows">${rows.join('')}</div>`;
+  return rows;
 }
 
-// Live 3D robot (interim Three.js) IN PLACE inside [data-field="robot3d"]: shows the
-// articulated robot driven by the telemetry joint angles + IMU orientation. Hidden
-// until 12 joint angles are present and the robot is online. The <tf-robot-view> is
-// created once and fed each refresh so the WebGL context is never re-created.
-function updateRobot3d(el, r) {
-  const host = el.querySelector('[data-field="robot3d"]');
+// One telemetry key/value row (<dt>/<dd>) for the .robots-kv definition list.
+function kvRow(label, value) {
+  return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`;
+}
+
+// Live 3D robot (interim Three.js) IN PLACE: shows the articulated robot driven by
+// the telemetry joint angles + IMU orientation. Hidden until 12 joint angles are
+// present and the robot is online. The <tf-robot-view> is created once and fed
+// each refresh so the WebGL context is never re-created.
+function updateRobot3d(host, r) {
   if (!host) return;
   const t = telemetry(r);
   const joints = t && Array.isArray(t.joints) ? t.joints : null;
   const offline = !isControllable(r.status || '');
   if (!joints || joints.length < 12 || offline) {
-    host.hidden = true;
-    // Tear down the view so its WebGL render loop stops (disconnectedCallback
-    // cancels the rAF + disposes the renderer); it is recreated when joints return.
     if (host.firstChild) host.replaceChildren();
+    host.innerHTML = '<div class="robots-controls-empty">Model 3D pojawi się, gdy robot zgłosi kąty stawów.</div>';
+    host.dataset.has3d = '';
     return;
   }
-  host.hidden = false;
   let view = host.querySelector('tf-robot-view');
   if (!view) {
-    host.innerHTML = '<div class="robots-robot3d-title">Model 3D — stawy na żywo</div>';
+    host.innerHTML = '';
     view = document.createElement('tf-robot-view');
     view.className = 'robots-robot3d-view';
     host.appendChild(view);
+    host.dataset.has3d = '1';
   }
   const imu = t.imu || {};
   const rpy = [Number(imu.roll) || 0, Number(imu.pitch) || 0, Number(imu.yaw) || 0];
   view.setPose({ joints, rpy });
 }
 
-// Renders the LiDAR row IN PLACE inside [data-field="lidar"]: an enable/disable
-// toggle (routed to go2.lidar_on/off via the standard control path) plus a LIVE
-// status (point count, measured FPS, freshness) fed by the real-time PUSH stream.
-// NO 3D canvas/renderer here — this is the data-path surface only. The container
-// sits below the telemetry panel and is never the video node, so the live
-// <tf-video-stream> is untouched. The toggle + status nodes are built once and
-// then updated in place each poll so a click handler is never lost.
-//
-// This also OWNS the subscription lifecycle: a robot is subscribed to its PUSH
-// stream only while its row is visible AND LiDAR is enabled AND the robot is
-// online; any of those dropping closes the subscription (and stops the shared
-// staleness sweep when none remain), so no stream stays open on a disabled / gone
-// / offline source.
-function updateLidar(el, r) {
-  const host = el.querySelector('[data-field="lidar"]');
-  if (!host) return;
-  const l = lidar(r);
-  const id = robotId(r);
-  // Only show the row for a robot that advertises a LiDAR snapshot (capability).
-  if (!l) {
-    host.hidden = true;
-    host.innerHTML = '';
-    host.dataset.built = '';
-    stopRobotLidar(id);
-    return;
-  }
-  const offline = !isControllable(r.status || '');
-  const enabled = !!l.enabled;
-  const available = !!l.available;
-  // Snapshot point count from the list — shown until the first live frame lands.
-  const snapshotPoints = Number(l.pointCount ?? l.point_count ?? 0);
-  const resolution = l.resolution;
+// =============================================================================
+// Live LiDAR data path (subscription + decode + voxel feed)
+// =============================================================================
 
-  // Build the static structure once; subsequent polls only refresh text/state.
-  if (host.dataset.built !== '1') {
-    host.innerHTML = `
-      <div class="robots-lidar-title">LiDAR</div>
-      <div class="robots-lidar-row">
-        <tf-toggle data-lidar-toggle></tf-toggle>
-        <span class="robots-lidar-status" data-lidar-status></span>
-        <tf-badge data-lidar-fresh tone="info" value="—" hidden></tf-badge>
-      </div>
-      <div class="robots-lidar-diag" data-lidar-diag hidden></div>`;
-    const toggle = host.querySelector('[data-lidar-toggle]');
-    toggle.addEventListener('change', (e) => {
-      // tf-toggle emits its boolean either on e.detail or as its `checked` prop.
-      const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
-      handleLidarToggle(id, !!on, toggle);
-    });
-    host.dataset.built = '1';
-  }
-
-  host.hidden = false;
-  const toggle = host.querySelector('[data-lidar-toggle]');
-  if (toggle) {
-    if (enabled) toggle.setAttribute('checked', '');
-    else toggle.removeAttribute('checked');
-    if (offline) toggle.setAttribute('disabled', '');
-    else toggle.removeAttribute('disabled');
-  }
-
-  // Open / close the real-time PUSH subscription. We only subscribe when the
-  // source can actually produce frames; otherwise the static text (below) suffices.
-  if (enabled && !offline) {
-    startRobotLidar(id);
-  } else {
-    stopRobotLidar(id);
-  }
-
-  // Render the status. While a live entry has frames, the live numbers win; the
-  // snapshot value is only the placeholder shown before the first frame arrives.
-  renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution });
-}
-
-// Writes the LiDAR status text + freshness badge. Called from updateLidar() (4 s
-// list cadence) and from the PUSH handler (per live frame) so the live numbers
-// refresh at frame rate, not only every 4 s.
-function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution }) {
-  const status = host.querySelector('[data-lidar-status]');
-  const fresh = host.querySelector('[data-lidar-fresh]');
-  if (!status) return;
-
-  if (!enabled) {
-    status.textContent = 'wyłączony';
-    if (fresh) fresh.hidden = true;
-    return;
-  }
-  if (offline) {
-    status.textContent = 'robot offline';
-    if (fresh) fresh.hidden = true;
-    return;
-  }
-
-  const res = typeof resolution === 'number' && Number.isFinite(resolution)
-    ? `  ·  ${resolution.toFixed(2)} m`
-    : '';
-
-  // The live entry exists for an active robot; once a frame has landed we show the
-  // live point count + measured FPS, otherwise we fall back to the snapshot count.
-  const id = host.closest('[data-robot-card]')?.dataset.robotCard || '';
-  const live = lidarLive.get(id);
-  const hasLiveFrame = !!(live && live.lastFrameAtMs);
-
-  const diag = host.querySelector('[data-lidar-diag]');
-  if (hasLiveFrame) {
-    const points = live.lastPointCount;
-    const fps = computeLidarFps(live);
-    const ageMs = performance.now() - live.lastFrameAtMs;
-    const stale = ageMs > LIDAR_STALE_AFTER_MS;
-    status.textContent =
-      `${points} ${plural(points, 'punkt', 'punkty', 'punktów')}  ·  ${fps.toFixed(1)} kl./s${res}`;
-    if (fresh) {
-      fresh.hidden = false;
-      fresh.setAttribute('tone', stale ? 'warning' : 'success');
-      fresh.setAttribute('value', stale ? 'nieaktualne' : 'na żywo');
-    }
-    // Live pipeline diagnostics: delivered cadence, browser decode cost and the
-    // end-to-end latency (addon decode-stamp → browser decode done). Hidden when
-    // there is not enough of a window yet to compute a cadence.
-    if (diag) {
-      const t = computeLidarTiming(live);
-      if (t.deliveredHz > 0) {
-        const e2e = t.e2eMs == null ? 'n/d' : `${t.e2eMs.toFixed(0)} ms`;
-        // Per-hop breakdown folded in so it is visible without devtools.
-        const hop = (v) => (v == null ? '–' : v.toFixed(0));
-        diag.hidden = false;
-        diag.textContent =
-          `dostarczanie ${t.deliveredHz.toFixed(1)} Hz  ·  dekodowanie ${t.decodeMs.toFixed(2)} ms  ·  opóźnienie ${e2e}`
-          + `  ·  host/net/decode ${hop(t.hostMs)}/${hop(t.netMs)}/${t.decodeMs.toFixed(1)} ms`;
-      } else {
-        diag.hidden = true;
-      }
-    }
-    return;
-  }
-  if (diag) diag.hidden = true;
-
-  // Active but no live frame yet: show the snapshot count (if any) as a hint while
-  // we wait for the first binary frame to arrive.
-  if (available && snapshotPoints > 0) {
-    status.textContent =
-      `${snapshotPoints} ${plural(snapshotPoints, 'punkt', 'punkty', 'punktów')}${res}`;
-  } else {
-    status.textContent = 'aktywny, oczekiwanie na dane…';
-  }
-  if (fresh) {
-    fresh.hidden = false;
-    fresh.setAttribute('tone', 'info');
-    fresh.setAttribute('value', 'łączenie…');
-  }
-}
-
-// Measured frame rate over the sliding window: count frames whose arrival falls
-// inside the last LIDAR_FPS_WINDOW_MS and divide by the actual span covered. Using
-// the real span (not the nominal window) keeps the number honest right after the
-// stream starts when fewer than a full window of samples exist.
+// Measured frame rate over the sliding window.
 function computeLidarFps(live) {
   const now = performance.now();
   const cutoff = now - LIDAR_FPS_WINDOW_MS;
@@ -1007,11 +1748,19 @@ function computeLidarFps(live) {
   return ((times.length - 1) * 1000) / spanMs;
 }
 
-// Opens the real-time PUSH subscription for a robot (idempotent) and ensures the
-// shared staleness sweep is running. Does NOT reset an existing entry, so an
-// in-progress FPS window survives a 4 s list refresh. The subscription uses the
-// generic StreamHub rails (the SAME call shape tf-video-stream uses); every frame
-// arrives as a StreamFrame whose `data` is the raw canonical L1 bytes.
+// Owns the single detail LiDAR subscription. Subscribes only when a LiDAR surface
+// is open AND lidar is enabled AND the robot is online; otherwise closes it.
+function syncDetailLidar(r, surfaceOpen) {
+  const id = robotId(r);
+  const l = lidar(r);
+  const offline = !isControllable(r.status || '');
+  const want = !!(surfaceOpen && l && l.enabled && !offline);
+  if (want) startRobotLidar(id);
+  else stopRobotLidar(id);
+}
+
+// Opens the real-time PUSH subscription (idempotent) and ensures the staleness
+// sweep is running.
 function startRobotLidar(id) {
   if (!id) return;
   if (lidarLive.has(id)) return;
@@ -1019,18 +1768,12 @@ function startRobotLidar(id) {
     unsub: null,
     closed: false,
     resubTimer: null,
-    // One re-subscribe per live session. A fresh start (this object) resets it;
-    // once consumed we never re-arm, so sustained lag can't spin a 1 s retry loop.
     resubUsed: false,
     frameTimes: [],
     lastPointCount: 0,
     lastFrameAtMs: 0,
     lastRaw: null,
     lastPoints: null,
-    // Pipeline timing samples over the same ~2 s window as the FPS counter.
-    // Each entry is { atMs, decodeMs, intervalMs, e2eMs } so the diagnostics
-    // line can show rolling averages of browser decode cost, delivered cadence
-    // and end-to-end latency without keeping unbounded history.
     timing: [],
   };
   lidarLive.set(id, live);
@@ -1041,9 +1784,8 @@ function startRobotLidar(id) {
 }
 
 // Subscribes to `lidar:<id>` and wires the per-frame / end / error handlers.
-// Mirrors tf-video-stream's deferred-unsub guard: if the robot is torn down while
-// ApiBinary.subscribe is still resolving, the late-resolved unsub is fired at once
-// so no subscription leaks.
+// Mirrors tf-video-stream's deferred-unsub guard: a teardown that races an
+// in-flight subscribe still closes once it resolves.
 function openLidarSubscription(id, live) {
   const pending = { disposed: false };
   live.unsub = () => {
@@ -1072,29 +1814,18 @@ function openLidarSubscription(id, live) {
     });
 }
 
-// A pushed frame: decode the RAW canonical bytes via the sdk-spec header decoder.
-// hasFrame:false (malformed/short) is ignored. On a real frame we update the live
-// point count, the FPS sliding window and the freshness timestamp, stash raw/points
-// for L4 (not rendered here), then re-render just this card.
+// A pushed frame: decode the RAW canonical bytes, update live counters + timing,
+// stash the decoded points and feed the wgpu voxel view (if mounted), then refresh
+// the open LiDAR status in place.
 function onLidarChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
-  // The StreamHub also pushes a StreamSubscribeResponse handshake (mime_type);
-  // only StreamFrame carries point-cloud bytes.
   if (body.variant !== 'StreamFrame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
-  // The current live entry may have been torn down/replaced while this chunk was
-  // in flight — drop it rather than resurrect a dead source.
   if (lidarLive.get(id) !== live) return;
-  // Capture the wall-clock µs at the very top of onChunk, BEFORE any JS decode.
-  // The CBOR codec decode of the ~384 KB MessageBody already happened before this
-  // callback fires, so `tOnChunk - hostSendUs` measures WS transport + browser
-  // receive + that CBOR unwrap together (the "net+unwrap" segment).
   const tOnChunk = Date.now() * 1000;
-  // Stage 4: delivered cadence — interval since the previous onChunk frame.
   const arrivalMs = performance.now();
   const intervalMs = live.lastFrameAtMs ? arrivalMs - live.lastFrameAtMs : 0;
-  // Stage 5: browser decode duration — wrap only decodeLidarFrame itself.
   const decodeStart = performance.now();
   let f;
   try {
@@ -1108,15 +1839,9 @@ function onLidarChunk(id, live, body) {
   live.lastPointCount = Number(f.pointCount ?? f.point_count ?? 0);
   live.lastFrameAtMs = arrivalMs;
   live.frameTimes.push(live.lastFrameAtMs);
-  // Bound the window buffer so a long-lived stream can't grow it unbounded.
   const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
   while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
-  // Stage 6: end-to-end latency split into per-hop segments using the two header
-  // timestamps (addon decode `timestampUs`, host pump-send `hostSendUs`) and the
-  // two browser anchors (`tOnChunk` captured above, `Date.now()` taken now, after
-  // decodeLidarFrame). All in µs; segments reported in ms. Only meaningful when
-  // both machines share a clock; clock-skew/garbage samples are clamped/skipped
-  // (negative or > LIDAR_E2E_MAX_MS) rather than averaged in.
+
   const stampUs = Number(f.timestampUs ?? f.timestamp_us ?? 0);
   const hostSendUs = Number(f.hostSendUs ?? f.host_send_us ?? 0);
   const tDone = Date.now() * 1000;
@@ -1124,40 +1849,42 @@ function onLidarChunk(id, live, body) {
   let hostMs = null;
   let netMs = null;
   let totalMs = null;
-  // decode_ms is a pure local duration (no cross-machine clock), always valid.
   const decodeStageMs = (tDone - tOnChunk) / 1000;
   if (stampUs > 0 && hostSendUs > 0) {
-    const h = (hostSendUs - stampUs) / 1000; // addon decode → host pump send
-    const n = (tOnChunk - hostSendUs) / 1000; // WS transport + receive + CBOR unwrap
+    const h = (hostSendUs - stampUs) / 1000;
+    const n = (tOnChunk - hostSendUs) / 1000;
     if (plausible(h)) hostMs = h;
     if (plausible(n)) netMs = n;
   }
   if (stampUs > 0) {
-    const t = (tDone - stampUs) / 1000; // full end-to-end
+    const t = (tDone - stampUs) / 1000;
     if (plausible(t)) totalMs = t;
   }
-  // Per-frame breakdown to the console so it is visible in a REAL browser. ~7/s is
-  // low enough to print every frame without flooding devtools.
   const fmt = (ms) => (ms == null ? 'n/d' : ms.toFixed(1));
   console.debug(
     `[lidar latency] host=${fmt(hostMs)}ms net+unwrap=${fmt(netMs)}ms `
     + `decode=${decodeStageMs.toFixed(1)}ms total=${fmt(totalMs)}ms pts=${live.lastPointCount}`,
   );
   const e2eMs = totalMs;
-  live.timing.push({
-    atMs: live.lastFrameAtMs, decodeMs, intervalMs, e2eMs, hostMs, netMs,
-  });
+  live.timing.push({ atMs: live.lastFrameAtMs, decodeMs, intervalMs, e2eMs, hostMs, netMs });
   while (live.timing.length && live.timing[0].atMs < cutoff) live.timing.shift();
-  // Stash the raw frame + packed points for the L4 wgpu renderer (not drawn yet).
   live.lastRaw = f.raw ?? null;
   live.lastPoints = f.points ?? null;
-  refreshLidarCard(id);
+
+  // Feed the wgpu voxel renderer (open LiDAR surface only). The renderer owns
+  // color/orbit; we only push the interleaved world-XYZ Float32Array + count.
+  if (voxelView && id === selectedRobotId && live.lastPoints) {
+    try {
+      voxelView.setPoints(live.lastPoints, live.lastPointCount);
+    } catch (e) {
+      console.warn('[robots] voxel setPoints threw:', e?.message ?? e);
+    }
+  }
+
+  refreshLidarUi(id);
 }
 
-// Rolling timing diagnostics over the same ~2 s window as the FPS counter:
-// delivered Hz (from inter-arrival samples), average browser decode cost and
-// average end-to-end latency (skew samples already excluded at ingest). Cheap:
-// a single pass over at most ~10–20 samples, no per-point work.
+// Rolling timing diagnostics over the same ~2 s window as the FPS counter.
 function computeLidarTiming(live) {
   const samples = live.timing;
   let decodeSum = 0;
@@ -1199,17 +1926,11 @@ function computeLidarTiming(live) {
   };
 }
 
-// Stream ended. A `subscriber_lagged` end means the server dropped us because we
-// fell behind — re-subscribe ONCE per live session after a short backoff (mirrors
-// tf-video-stream). Under sustained lag the server keeps ending the (re)stream;
-// `resubUsed` makes the retry genuinely one-shot so we don't schedule a new 1 s
-// resubscribe on every lagged end forever. After the single retry is spent the
-// badge just goes stale until the user re-enables (a fresh session resets the
-// flag). Any other end (source unregistered, our own close) leaves it stale too.
+// Stream ended. `subscriber_lagged` → re-subscribe ONCE per live session after a
+// short backoff (mirrors tf-video-stream). Any other end leaves it stale.
 function onLidarEnd(id, live, body) {
   if (lidarLive.get(id) !== live) return;
   const reason = String(body?.reason ?? '');
-  // Our own close already dropped the entry; nothing to do.
   if (reason === 'client_request') return;
   if (reason === 'subscriber_lagged') {
     if (live.resubTimer != null) return;
@@ -1222,20 +1943,16 @@ function onLidarEnd(id, live, body) {
     }, LIDAR_RESUBSCRIBE_DELAY_MS);
     return;
   }
-  // Source unregistered / unknown end: stop pumping, let freshness go stale.
   live.unsub = null;
 }
 
 function onLidarError(id, live, err) {
   if (lidarLive.get(id) !== live) return;
   console.warn('[robots] lidar stream error:', err?.message ?? err);
-  // Leave the badge to go stale; the user can re-enable. No aggressive retry.
 }
 
 // Closes a robot's PUSH subscription, drops its live state and stops the shared
-// staleness sweep once no robot remains active. Called on toggle-off, robot
-// offline, card removal, panel close and unmount — every start has a matching
-// close here, so no subscription is ever leaked.
+// staleness sweep once no robot remains active. Every start has a matching close.
 function stopRobotLidar(id) {
   if (id) {
     const live = lidarLive.get(id);
@@ -1248,12 +1965,8 @@ function stopRobotLidar(id) {
 }
 
 // Tears down a single live entry: cancels a pending re-subscribe and fires the
-// subscription handle. That handle (from ApiBinary.subscribe) drops the local
-// listener AND emits a StreamCloseRequest on the ORIGINAL subscribe correlation
-// id, which is the only id the server's close handler can cancel by — so this is
-// what actually frees the server-side slot + frame pump. The handle is set even
-// while ApiBinary.subscribe is still resolving (it flips `pending.disposed`), so
-// a teardown that races an in-flight subscribe still closes once it resolves.
+// subscription handle (which emits the StreamCloseRequest on the original
+// correlation id — the only id the server's close handler can cancel by).
 function closeLidarSubscription(id, live) {
   live.closed = true;
   if (live.resubTimer != null) {
@@ -1271,43 +1984,32 @@ function stopLidarLoop() {
     window.clearInterval(lidarTimer);
     lidarTimer = null;
   }
-  // Close every still-open subscription before clearing, so unmount/error paths
-  // that call stopLidarLoop directly never leak a stream.
   for (const [id, live] of lidarLive) closeLidarSubscription(id, live);
   lidarLive.clear();
 }
 
-// One tick of the shared staleness sweep: re-render every active card so the
-// freshness badge flips to "nieaktualne" even when frames simply STOP arriving (no
-// push would otherwise re-render). Carries no network traffic.
+// One tick of the shared staleness sweep: re-render the open LiDAR status so the
+// freshness badge flips to "nieaktualne" when frames stop. Carries no traffic.
 function sweepLidarStaleness() {
   for (const [id, live] of lidarLive) {
-    if (live.lastFrameAtMs) refreshLidarCard(id);
+    if (live.lastFrameAtMs) refreshLidarUi(id);
   }
 }
 
-// Re-renders just one robot's LiDAR status from its current live state, without a
-// full list refresh — driven by the PUSH handler on each new frame and by a
-// periodic staleness sweep so the freshness badge flips even when frames stop.
-function refreshLidarCard(id) {
-  const el = cardEls.get(id);
-  if (!el) return;
-  const host = el.querySelector('[data-field="lidar"]');
-  if (!host || host.hidden) return;
-  const r = robots.find((x) => robotId(x) === id);
-  const l = r ? lidar(r) : null;
-  const offline = r ? !isControllable(r.status || '') : false;
-  renderLidarStatus(host, {
-    enabled: !!(l && l.enabled),
-    available: !!(l && l.available),
-    offline,
-    snapshotPoints: Number(l?.pointCount ?? l?.point_count ?? 0),
-    resolution: l?.resolution,
-  });
+// Re-renders the open detail's LiDAR status + KPI from current live state, without
+// a full poll — driven by the PUSH handler and the staleness sweep.
+function refreshLidarUi(id) {
+  if (id !== selectedRobotId) return;
+  const shell = byId('robots-detail');
+  if (!shell) return;
+  const r = findRobot(id);
+  if (r) updateDetailHeader(shell, r);
+  const tile = shell.querySelector('[data-field="lidar-tile"]');
+  if (tile && r) updateLidarTile(tile, r);
 }
 
 // Sends a LiDAR enable/disable through the standard robot control path
-// (lidar_on / lidar_off kinds → go2.lidar_on/off, routed locally or over the mesh).
+// (lidar_on / lidar_off → go2.lidar_on/off, routed locally or over the mesh).
 async function handleLidarToggle(id, on, toggle) {
   if (!id) return;
   toggle.setAttribute('disabled', '');
@@ -1318,124 +2020,40 @@ async function handleLidarToggle(id, on, toggle) {
       vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
     });
     if (resp.ok) {
-      // React to the action RESULT immediately so the live state reflects the new
-      // setting without waiting for (or depending on) the 4 s list refresh: close
-      // the subscription on a now-disabled source at once; open one only AFTER a
-      // confirmed enable. Also patch the local snapshot row so the toggle/status
-      // stay consistent until the next authoritative refresh.
-      const r = robots.find((x) => robotId(x) === id);
+      const r = findRobot(id);
       const l = r ? lidar(r) : null;
       if (l) l.enabled = on;
-      if (on) startRobotLidar(id);
+      // Gate the (re)subscription through the CURRENT detail/tab state: an in-flight
+      // lidar_on must not resurrect a subscription if the user already left the
+      // LiDAR surface (tab switch / back to list) while the request was pending.
+      const shell = byId('robots-detail');
+      const tabId = shell?.dataset.activeTab || 'overview';
+      const surfaceOpen = !!r && id === selectedRobotId && (tabId === 'overview' || tabId === 'lidar');
+      if (r) syncDetailLidar(r, surfaceOpen);
       else stopRobotLidar(id);
-      refreshLidarCard(id);
+      refreshLidarUi(id);
+      pushLog('success', `LiDAR ${on ? 'włączony' : 'wyłączony'}`);
       toast(`LiDAR ${on ? 'włączony' : 'wyłączony'} ✓`, 'success');
     } else if (resp.rejected) {
+      pushLog('error', `LiDAR odrzucony: ${resp.rejected}`);
       toast(`LiDAR: odrzucono — ${resp.rejected}`, 'error');
     } else {
+      pushLog('error', `LiDAR błąd: ${resp.error || 'nieznany'}`);
       toast(`LiDAR: błąd — ${resp.error || 'nieznany'}`, 'error');
     }
   } catch (err) {
+    pushLog('error', `LiDAR: ${err.message}`);
     toast(`LiDAR: ${err.message}`, 'error');
   } finally {
     toggle.removeAttribute('disabled');
   }
 }
 
-// One compact telemetry row (label + value), mirroring the metricRow pattern.
-function telRow(label, value) {
-  return `
-    <div class="robots-telemetry-row">
-      <span class="robots-telemetry-label">${escapeHtml(label)}</span>
-      <span class="robots-telemetry-value">${escapeHtml(value)}</span>
-    </div>`;
-}
+// =============================================================================
+// Control dispatch + camera share + log
+// =============================================================================
 
-// A robot is controllable unless its status reads as offline/lost/error.
-function isControllable(status) {
-  const s = String(status || '').toLowerCase();
-  return s !== 'offline' && s !== 'lost' && s !== 'error';
-}
-
-function robotCard(r) {
-  const id = robotId(r);
-  const status = r.status || '';
-  const kind = field(r, 'kind', 'kind') || 'robot';
-  const owner = isLocal(r) ? 'ten węzeł' : shortNode(ownerNodeId(r));
-  const battery = batteryPercent(r);
-  const rtt = rttMs(r);
-  const cam = cameraId(r);
-
-  // Battery/RTT rows always render so updateCard() has a stable slot to fill;
-  // they're hidden via [hidden] when the value is absent (mirrors null checks).
-  const metrics = [
-    metricRow('zap', 'Bateria', battery != null ? `${Math.round(Number(battery))}%` : '', 'battery', battery == null),
-    metricRow('bolt', 'RTT', rtt != null ? `${Math.round(Number(rtt))} ms` : '', 'rtt', rtt == null),
-    metricRow('host', 'Węzeł', '', 'owner', false, owner),
-  ];
-
-  const cameraHtml = cam
-    ? `
-      <div class="robots-camera">
-        <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" height-px="240"></tf-video-stream>
-        <tf-button variant="outline" size="sm" icon="image" full-width
-          data-robot="${escapeAttr(id)}" data-share-camera="${escapeAttr(cam)}">
-          Dodaj kamerę do TentaVision
-        </tf-button>
-      </div>`
-    : '';
-
-  // Controls sub-container is populated by buildControls() AFTER the card mounts,
-  // so the action set can be rebuilt independently of the video node above it.
-  return `
-    <article class="robots-card" data-robot-card="${escapeAttr(id)}" data-camera-id="${escapeAttr(cam ?? '')}">
-      <div class="robots-card-top">
-        <div class="robots-card-ico">${sprite('cpu')}</div>
-        <div class="robots-card-id">
-          <div class="robots-card-name">${escapeHtml(id || '(bez identyfikatora)')}</div>
-          <div class="robots-card-kind">${escapeHtml(kind)}</div>
-        </div>
-        <tf-badge data-field="status" tone="${statusTone(status)}" value="${escapeAttr(statusLabel(status))}"></tf-badge>
-      </div>
-
-      <div class="robots-metrics">${metrics.join('')}</div>
-      ${cameraHtml}
-
-      <div class="robots-telemetry" data-field="telemetry" hidden></div>
-
-      <div class="robots-lidar" data-field="lidar" hidden></div>
-
-      <div class="robots-robot3d" data-field="robot3d" hidden></div>
-
-      <div class="robots-controls" data-field="controls"></div>
-
-      <div class="robots-estop">
-        <tf-button variant="danger-solid" icon="stop" full-width
-          data-robot="${escapeAttr(id)}" data-control="estop">
-          STOP awaryjny
-        </tf-button>
-      </div>
-    </article>
-  `;
-}
-
-// `metricName` is the stable update key (battery/rtt/owner) used by updateCard().
-// The owner row carries its value in a [data-field="owner"] span (updated by id),
-// the numeric rows in `.robots-metric-value` (updated by formatted value).
-function metricRow(icon, label, value, metricName, hidden, ownerValue) {
-  const isOwner = metricName === 'owner';
-  const valueSpan = isOwner
-    ? `<span class="robots-metric-value" data-field="owner">${escapeHtml(ownerValue ?? '')}</span>`
-    : `<span class="robots-metric-value">${escapeHtml(value)}</span>`;
-  return `
-    <div class="robots-metric" data-metric="${escapeAttr(metricName)}"${hidden ? ' hidden' : ''}>
-      <span class="robots-metric-ico">${sprite(icon)}</span>
-      <span class="robots-metric-label">${escapeHtml(label)}</span>
-      ${valueSpan}
-    </div>`;
-}
-
-// Owner node ids are endpoint-id hex; show a short prefix for the card.
+// Owner node ids are endpoint-id hex; show a short prefix.
 function shortNode(nodeId) {
   const s = String(nodeId || '');
   return s.length > 12 ? `${s.slice(0, 12)}…` : (s || '—');
@@ -1453,6 +2071,7 @@ async function handleControl(id, kind, btn, params, label, requireConfirm = fals
   }
 
   btn.setAttribute('loading', '');
+  const name = label || kind;
   try {
     const resp = await ApiBinary.action('robotControlRequest', {
       robotId: id,
@@ -1465,19 +2084,20 @@ async function handleControl(id, kind, btn, params, label, requireConfirm = fals
       p3: Number(params?.p3 ?? 0),
       p4: Number(params?.p4 ?? 0),
     });
-    // A robot-level refusal is still a successful call carrying `rejected`;
-    // `error` is an execution failure (RobotControlResponse, message_body.rs).
     const rejected = resp.rejected;
     const error = resp.error;
-    const name = label || kind;
     if (resp.ok) {
+      pushLog('success', `${name} ✓`);
       toast(`Robot ${shortNode(id)}: ${name} ✓`, 'success');
     } else if (rejected) {
+      pushLog('error', `${name}: odrzucono — ${rejected}`);
       toast(`Robot ${shortNode(id)}: odrzucono — ${rejected}`, 'error');
     } else {
+      pushLog('error', `${name}: błąd — ${error || 'nieznany'}`);
       toast(`Robot ${shortNode(id)}: błąd — ${error || 'nieznany'}`, 'error');
     }
   } catch (err) {
+    pushLog('error', `${name}: ${err.message}`);
     toast(`Robot ${shortNode(id)}: ${err.message}`, 'error');
   } finally {
     btn.removeAttribute('loading');
@@ -1509,16 +2129,52 @@ async function handleShareCamera(id, cam, btn) {
       cameraId: cam,
     });
     if (resp.ok) {
-      // For a remote robot there is no local grant; `note` explains the path.
+      pushLog('success', 'Kamera dodana do TentaVision');
       toast(resp.note || 'Kamera dodana do TentaVision ✓', 'success');
     } else {
+      pushLog('error', `Udostępnienie kamery: ${resp.error || 'nieznany'}`);
       toast(`Udostępnienie kamery: błąd — ${resp.error || 'nieznany'}`, 'error');
     }
   } catch (err) {
+    pushLog('error', `Udostępnienie kamery: ${err.message}`);
     toast(`Udostępnienie kamery: ${err.message}`, 'error');
   } finally {
     btn.removeAttribute('loading');
   }
+}
+
+// Appends a control-outcome entry to the bounded detail log and re-renders the
+// Log tab if it is open. The log is per-open-detail (cleared on robot change).
+function pushLog(level, text) {
+  detailLog.push({ atMs: Date.now(), level, text });
+  if (detailLog.length > LOG_MAX_ENTRIES) {
+    detailLog.splice(0, detailLog.length - LOG_MAX_ENTRIES);
+  }
+  const shell = byId('robots-detail');
+  if (shell && shell.dataset.activeTab === 'log') {
+    renderLog(shell.querySelector('[data-field="log"]'));
+  }
+}
+
+// Renders the detail Log tab: newest-first list of control outcomes.
+function renderLog(host) {
+  if (!host) return;
+  if (!detailLog.length) {
+    host.innerHTML = '<div class="robots-controls-empty">Brak zdarzeń — wyślij polecenie, aby zobaczyć tu jego wynik.</div>';
+    return;
+  }
+  const rows = detailLog
+    .slice()
+    .reverse()
+    .map((e) => {
+      const time = new Date(e.atMs).toLocaleTimeString('pl-PL', { hour12: false });
+      return `<div class="robots-log-row robots-log-${escapeAttr(e.level)}">
+          <span class="robots-log-time">${escapeHtml(time)}</span>
+          <span class="robots-log-text">${escapeHtml(e.text)}</span>
+        </div>`;
+    })
+    .join('');
+  host.innerHTML = rows;
 }
 
 function plural(n, one, few, many) {
