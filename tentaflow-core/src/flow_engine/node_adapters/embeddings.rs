@@ -134,6 +134,7 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             encoding_format,
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
+            flow_depth: ctx.subflow_depth,
         };
 
         let response = ctx

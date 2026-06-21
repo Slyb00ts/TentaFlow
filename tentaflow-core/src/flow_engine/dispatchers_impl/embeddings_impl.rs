@@ -3,9 +3,12 @@
 // Opis: EmbeddingsDispatcherImpl — wrapper nad
 //       `services::runtime::executor::ModelRuntimeExecutor::execute_embeddings`.
 //       Adapter widzi tylko narrow trait. Mutable runtime `ExecutionContext`
-//       (resolver/strategy/route_metadata) tworzymy świeży per call —
-//       flow-engine ma własny `ExecutionContext` w `node_adapter.rs`,
-//       runtime-level state nie wycieka między requestami.
+//       (resolver/strategy/route_metadata) tworzymy świeży per call,
+//       ZASIANY głębokością flow z węzła (`req.flow_depth`), żeby
+//       self-referencyjny embeddings-flow trafił w guard rekurencji zamiast
+//       resetować głębokość do 0 (RAG C2). Flow-engine ma własny
+//       `ExecutionContext` w `node_adapter.rs`; runtime-level state nie
+//       wycieka między requestami.
 // =============================================================================
 
 use anyhow::{anyhow, Result};
@@ -42,6 +45,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             EmbeddingInput::Multiple(req.inputs.clone())
         };
 
+        let flow_depth = req.flow_depth;
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = EmbeddingRequest {
             model: req.model,
@@ -51,7 +55,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             user: None,
         };
 
-        let mut rctx = RuntimeContext::new(user);
+        let mut rctx = RuntimeContext::new_with_flow_depth(user, flow_depth);
         let runtime = self
             .runtime
             .read()

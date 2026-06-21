@@ -20,6 +20,11 @@ pub struct EmbeddingsRequest {
     pub encoding_format: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// RAG C2 (recursion guard) — głębokość zagnieżdżenia flow, z której
+    /// pochodzi to wywołanie (`ExecutionContext.subflow_depth` węzła). Dispatcher
+    /// seeduje nim runtime'owy `flow_stack`, żeby re-wejście embeddings w
+    /// flow-surface DZIEDZICZYŁO głębokość zamiast resetować do 0.
+    pub flow_depth: u8,
 }
 
 #[derive(Debug, Clone)]

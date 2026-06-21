@@ -60,6 +60,9 @@ pub struct BackendClient {
     audio_transcriptions_url: String,
     audio_speech_url: String,
 
+    /// Pre-built URL dla /rerank (cross-encoder reranking)
+    rerank_url: String,
+
     /// Typed request-time parameters z `services.config_json` propagowane
     /// przez `LiveHandlesCache`. Backend materializuje je przy kazdym
     /// requestcie:
@@ -182,6 +185,7 @@ impl BackendClient {
         let embeddings_url = format!("{}/embeddings", base);
         let audio_transcriptions_url = format!("{}/audio/transcriptions", base);
         let audio_speech_url = format!("{}/audio/speech", base);
+        let rerank_url = format!("{}/rerank", base);
 
         debug!(
             "Backend client utworzony dla: {} (timeout: {}ms, circuit breaker: enabled)",
@@ -201,6 +205,7 @@ impl BackendClient {
             embeddings_url,
             audio_transcriptions_url,
             audio_speech_url,
+            rerank_url,
             request_overrides,
             codex_creds: tokio::sync::RwLock::new(None),
         })
@@ -745,6 +750,66 @@ impl BackendClient {
         self.circuit_breaker.record_success();
 
         Ok(embedding_response)
+    }
+
+    /// Wysyla rerank request do backendu (cross-encoder).
+    ///
+    /// POST do /v1/rerank (vLLM `--task score`, OpenAI/Cohere-compatible).
+    /// Zwraca wyniki z `index` (pozycja w oryginalnej liście) + `relevance_score`.
+    pub async fn rerank_request(&self, mut request: RerankRequest) -> Result<RerankResponse> {
+        self.check_circuit_breaker()?;
+        self.apply_model_override(&mut request.model);
+
+        let url = &self.rerank_url;
+        debug!(
+            "Wysylanie rerank request do: {} (model: {}, docs: {})",
+            url,
+            request.model,
+            request.documents.len()
+        );
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header_value.as_str())
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                let error = self.map_reqwest_error(e);
+                self.circuit_breaker.record_failure();
+                error
+            })?;
+
+        let status = response.status();
+        debug!("Rerank response status: {}", status);
+
+        if !status.is_success() {
+            if status.is_server_error() {
+                self.circuit_breaker.record_failure();
+            }
+            let error_body = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Rerank API error ({}): {}", status, error_body),
+                source: None,
+            }
+            .into());
+        }
+
+        let rerank_response =
+            response
+                .json::<RerankResponse>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac rerank response: {}", e),
+                    source: Some(e.into()),
+                })?;
+
+        self.circuit_breaker.record_success();
+        Ok(rerank_response)
     }
 
     /// Wysyla audio transcription request do backendu (Whisper).
