@@ -275,14 +275,21 @@ pub enum RobotChange {
 #[derive(Default)]
 pub struct MeshRobotRegistry {
     /// `node_id` → that node's advertised robots. The local node's own entry is
-    /// kept here too (under the local node id) via `replace_local`.
+    /// kept here too (under the local node id) via `replace_local`. ONLINE robots
+    /// only — this is what the owner-resolver and peer pull-on-connect read.
     by_node: RwLock<HashMap<String, Vec<AdvertisedRobot>>>,
+    /// This node's configured-but-OFFLINE robots. Deliberately separate from
+    /// `by_node`: it must NOT feed owner-resolution, control routing, or peer
+    /// gossip — only the local robots-list handler merges it in so the owner can
+    /// see and open a powered-down robot it owns.
+    local_offline: RwLock<Vec<AdvertisedRobot>>,
 }
 
 impl MeshRobotRegistry {
     pub fn new() -> Self {
         Self {
             by_node: RwLock::new(HashMap::new()),
+            local_offline: RwLock::new(Vec::new()),
         }
     }
 
@@ -353,6 +360,18 @@ impl MeshRobotRegistry {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Replace this node's configured-but-offline robots (owner-local view only).
+    pub fn set_local_offline(&self, robots: Vec<AdvertisedRobot>) {
+        *self.local_offline.write() = robots;
+    }
+
+    /// This node's configured-but-offline robots — merged ONLY into the local
+    /// robots-list handler so the owner can see/open a powered-down robot. Never
+    /// used by the resolver, control routing, or peer gossip.
+    pub fn local_offline(&self) -> Vec<AdvertisedRobot> {
+        self.local_offline.read().clone()
+    }
 }
 
 /// Process-global robot registry. Self-contained (like `node_info_collector`'s
@@ -381,7 +400,13 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
     // 10 s), so a read-only tool call per owned robot is acceptable.
     let addon_manager = dispatch_context().map(|c| c.addon_manager);
     let candidates = crate::mesh::command_executor::collect_local_robot_addons(db);
+    // ONLINE robots only ever enter the shared registry + peer broadcast — the
+    // resolver and peer pull-on-connect must keep treating offline robots as
+    // non-existent (a powered-down robot must NOT make this node win ownership).
+    // Configured-but-offline robots go to a SEPARATE owner-local store
+    // (`set_local_offline`) that only this node's dashboard list reads.
     let mut robots: Vec<AdvertisedRobot> = Vec::with_capacity(candidates.len());
+    let mut offline: Vec<AdvertisedRobot> = Vec::new();
     for c in candidates {
         // Without a wired addon manager we cannot read the status tool, so we
         // cannot prove the robot is connected — do not advertise it.
@@ -389,7 +414,39 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             break;
         };
         let telemetry = read_robot_status(am, &c.addon_id, &c.package_id).await;
+        // Tenant of this robot — resolved the same way for online and offline
+        // entries (see the online push below for the full rationale).
+        let org_id = am
+            .instance_org_id(&c.addon_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
         if !telemetry.is_online {
+            // Owner-local visibility: record the configured robot as offline so the
+            // owner's OWN dashboard can see and open it while it is powered down
+            // (status / detail review, auto-reconnect indicator). This goes to the
+            // SEPARATE owner-local store, never the shared registry — so it is
+            // never gossiped to peers AND never wins owner-resolution / control
+            // routing (which only consider online registry entries).
+            let status = if telemetry.status.is_empty() {
+                "offline".to_string()
+            } else {
+                telemetry.status
+            };
+            offline.push(AdvertisedRobot {
+                robot_id: c.addon_id,
+                package_id: c.package_id,
+                kind: c.kind,
+                node_id: local_node_id.to_string(),
+                org_id,
+                camera_id: None,
+                status,
+                battery_percent: None,
+                rtt_ms: None,
+                capabilities: Vec::new(),
+                actions_meta: Vec::new(),
+                telemetry: None,
+                lidar: None,
+            });
             continue;
         }
         // A successful online status may still omit camera_id (no camera yet);
@@ -406,10 +463,7 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
         // org — both fall back to the default org so the robot is visible to the
         // default-org session (the same org a membership-less-default session
         // resolves to). A real multi-org install keeps its explicit org.
-        let org_id = am
-            .instance_org_id(&c.addon_id)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+        // (Resolved above for both online + offline entries.)
         robots.push(AdvertisedRobot {
             robot_id: c.addon_id,
             package_id: c.package_id,
@@ -426,7 +480,11 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             lidar: telemetry.lidar,
         });
     }
+    // Shared registry + peer broadcast get ONLINE robots only (resolver and
+    // pull-on-connect stay online-only). Offline robots go to the owner-local
+    // store, read solely by this node's robots-list handler.
     global().replace_local(local_node_id, robots.clone());
+    global().set_local_offline(offline);
     robots
 }
 

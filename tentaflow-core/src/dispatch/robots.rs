@@ -156,11 +156,28 @@ pub fn robots_list(
     let org = require_org(ctx)?;
     let local_node_id = ctx.state.local_node_id.to_string();
     // The mesh registry holds robots from ALL orgs by design (like services);
-    // org scoping is enforced HERE, at the consumption layer.
-    let robots = robot_dispatch::global()
+    // org scoping is enforced HERE, at the consumption layer. We also merge this
+    // node's OWN configured-but-offline robots (owner-local store) so the operator
+    // can see and open a powered-down robot it owns; an online entry always wins
+    // over an offline duplicate of the same robot id.
+    // Org-scope BOTH sources first, then dedup within this org — otherwise a
+    // same-robot_id entry in a DIFFERENT org could suppress this org's own offline
+    // robot before the org filter runs.
+    let online: Vec<_> = robot_dispatch::global()
         .all()
         .into_iter()
         .filter(|r| r.org_id == org.org_id)
+        .collect();
+    let online_ids: std::collections::HashSet<String> =
+        online.iter().map(|r| r.robot_id.clone()).collect();
+    let robots = online
+        .into_iter()
+        .chain(
+            robot_dispatch::global()
+                .local_offline()
+                .into_iter()
+                .filter(|r| r.org_id == org.org_id && !online_ids.contains(&r.robot_id)),
+        )
         .map(|r| to_entry(r, &local_node_id))
         .collect();
     Ok(MessageBody::RobotsBody(RobotsPayload::ListResponse(
