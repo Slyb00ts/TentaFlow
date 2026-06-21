@@ -203,6 +203,8 @@ struct ContextFactory {
     clock: Arc<dyn Clock>,
     blobs: Arc<dyn BlobStore>,
     vectors: Arc<crate::services::vector::NamespaceManager>,
+    #[cfg(feature = "graph")]
+    graph: Arc<crate::services::graph::GraphManager>,
     llm: Arc<dyn LlmDispatcher>,
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     reranker: Arc<dyn RerankDispatcher>,
@@ -239,6 +241,8 @@ impl ContextFactory {
             clock: self.clock.clone(),
             blobs: self.blobs.clone(),
             vectors: self.vectors.clone(),
+            #[cfg(feature = "graph")]
+            graph: self.graph.clone(),
             llm: self.llm.clone(),
             embeddings: self.embeddings.clone(),
             reranker: self.reranker.clone(),
@@ -326,10 +330,18 @@ impl FlowDispatcher {
         // więc flow-node i ingest host-fn widzą tę samą przestrzeń instancji.
         let vectors = crate::services::vector_namespace_manager(&db).clone();
 
+        // RAG E1.1 — współdzielony proces-szeroki rejestr kolekcji grafowych.
+        // Te same backendy co host functions addona (jeden katalog w procesie),
+        // więc graph_search node i ingest host-fn widzą tę samą kolekcję instancji.
+        #[cfg(feature = "graph")]
+        let graph = crate::services::graph_manager(&db).clone();
+
         let ctx_factory = Arc::new(ContextFactory {
             clock,
             blobs: ctx_blobs,
             vectors,
+            #[cfg(feature = "graph")]
+            graph,
             llm,
             embeddings,
             reranker,
@@ -1032,6 +1044,12 @@ fn build_registry(
     for a in arcs {
         r.register(a);
     }
+    // RAG E1.1 — węzeł graph-retrievalu scoped do (org, addon_instance, collection).
+    // Pod `feature = "graph"` (cozo opt-in), obok `vector`.
+    #[cfg(feature = "graph")]
+    r.register(Arc::new(
+        crate::flow_engine::node_adapters::GraphSearchNodeAdapter::new(),
+    ));
     // Harness §3.5: agent_context + tool_exec + agent_router + compact_context
     // share the late-bound AgentServiceSlot (filled by main.rs after the
     // AddonManager exists). agent_router/compact_context also issue audited LLM
@@ -1110,6 +1128,8 @@ mod tests {
             clock: Arc::new(SystemClock),
             blobs: Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
             vectors: stub_vectors(),
+            #[cfg(feature = "graph")]
+            graph: crate::flow_engine::node_adapter::test_support::stub_graph(),
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),

@@ -19,6 +19,8 @@ pub mod compact_context;
 pub mod condition;
 pub mod conversation_history;
 pub mod embeddings;
+#[cfg(feature = "graph")]
+pub mod graph_search;
 pub mod interval;
 pub mod llm;
 pub mod loop_block;
@@ -60,6 +62,8 @@ pub use compact_context::CompactContextNodeAdapter;
 pub use condition::ConditionNodeAdapter;
 pub use conversation_history::ConversationHistoryNodeAdapter;
 pub use embeddings::EmbeddingsNodeAdapter;
+#[cfg(feature = "graph")]
+pub use graph_search::GraphSearchNodeAdapter;
 pub use interval::IntervalNodeAdapter;
 pub use llm::LlmNodeAdapter;
 pub use loop_block::LoopNodeAdapter;

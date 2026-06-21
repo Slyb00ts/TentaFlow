@@ -32,10 +32,6 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
-
-use dashmap::DashMap;
 use tentaflow_sdk_spec::{
     FieldValue, GraphDeleteInput, GraphDeleteOutput, GraphDeleteTarget, GraphDirection,
     GraphNeighbor, GraphNeighborsInput, GraphNeighborsOutput, GraphPagerankInput,
@@ -50,7 +46,7 @@ use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmC
 use crate::addon::errors::AbiError;
 use crate::addon::manifest::GraphCollectionSpec;
 use crate::audit::RiskClass;
-use crate::services::graph::{GraphError, GraphManager, NeighborDir};
+use crate::services::graph::{GraphComputeGuard, GraphError, GraphManager, NeighborDir};
 
 // =============================================================================
 // Permission constants
@@ -78,83 +74,11 @@ pub const MAX_RANK_ITERATIONS: u32 = 100;
 /// ile id addon wrzuci.
 pub const MAX_PPR_SEEDS: usize = 64;
 
-// =============================================================================
-// Cap współbieżności obliczeń grafowych (neighbors/pagerank/ppr trzymają lock
-// kolekcji i liczą — bez capa addon odpala N ciężkich obliczeń równolegle i
-// wysyca CPU). Dwa poziomy: globalny (cały proces) i per-addon. Acquire PRZED
-// pracą, RAII guard zwalnia slot także przy panice/błędzie (Drop). Saturacja →
-// fail-closed `GraphError::ComputeBusy`.
-// =============================================================================
-
-/// Maks. równoległych ciężkich obliczeń grafowych w CAŁYM procesie.
-pub const MAX_GLOBAL_GRAPH_COMPUTE: usize = 8;
-
-/// Maks. równoległych ciężkich obliczeń grafowych dla POJEDYNCZEGO addona.
-pub const MAX_PER_ADDON_GRAPH_COMPUTE: usize = 2;
-
-/// Globalny licznik in-flight ciężkich obliczeń grafowych.
-static GLOBAL_GRAPH_COMPUTE: AtomicUsize = AtomicUsize::new(0);
-
-/// Per-addon liczniki in-flight (`addon_id -> count`). Wpisy zostają (mała,
-/// ograniczona liczbą zainstalowanych addonów mapa); licznik wraca do 0.
-static PER_ADDON_GRAPH_COMPUTE: OnceLock<DashMap<String, AtomicUsize>> = OnceLock::new();
-
-/// Leniwie inicjalizowana mapa per-addon liczników.
-fn per_addon_compute() -> &'static DashMap<String, AtomicUsize> {
-    PER_ADDON_GRAPH_COMPUTE.get_or_init(DashMap::new)
-}
-
-/// RAII-guard slotu obliczeń grafowych. `acquire` inkrementuje globalny i
-/// per-addon licznik PRZED pracą; jeśli którykolwiek przekroczyłby cap, roluje
-/// inkrement z powrotem i zwraca `Err(ComputeBusy)` (fail-closed). `Drop`
-/// dekrementuje oba liczniki — slot wraca także przy panice/błędzie pracy.
-struct GraphComputeGuard {
-    addon_id: String,
-}
-
-impl GraphComputeGuard {
-    /// Próbuje zająć slot globalny i per-addon. Kolejność: najpierw globalny
-    /// (fetch_add + sprawdzenie capa, rollback jeśli za dużo), potem per-addon
-    /// (to samo, z rollbackiem globalnego, gdy per-addon saturuje).
-    fn acquire(addon_id: &str) -> Result<Self, GraphError> {
-        let prev_global = GLOBAL_GRAPH_COMPUTE.fetch_add(1, Ordering::AcqRel);
-        if prev_global >= MAX_GLOBAL_GRAPH_COMPUTE {
-            GLOBAL_GRAPH_COMPUTE.fetch_sub(1, Ordering::AcqRel);
-            return Err(GraphError::ComputeBusy {
-                scope: "global",
-                max: MAX_GLOBAL_GRAPH_COMPUTE,
-            });
-        }
-
-        let counter = per_addon_compute()
-            .entry(addon_id.to_string())
-            .or_insert_with(|| AtomicUsize::new(0));
-        let prev_addon = counter.fetch_add(1, Ordering::AcqRel);
-        if prev_addon >= MAX_PER_ADDON_GRAPH_COMPUTE {
-            counter.fetch_sub(1, Ordering::AcqRel);
-            drop(counter);
-            GLOBAL_GRAPH_COMPUTE.fetch_sub(1, Ordering::AcqRel);
-            return Err(GraphError::ComputeBusy {
-                scope: "per_addon",
-                max: MAX_PER_ADDON_GRAPH_COMPUTE,
-            });
-        }
-        drop(counter);
-
-        Ok(GraphComputeGuard {
-            addon_id: addon_id.to_string(),
-        })
-    }
-}
-
-impl Drop for GraphComputeGuard {
-    fn drop(&mut self) {
-        GLOBAL_GRAPH_COMPUTE.fetch_sub(1, Ordering::AcqRel);
-        if let Some(c) = per_addon_compute().get(&self.addon_id) {
-            c.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
+// Cap współbieżności ciężkich obliczeń grafowych (neighbors/pagerank/ppr) żyje w
+// `services::graph::compute_guard` — JEDEN mechanizm współdzielony z węzłem flow
+// `graph_search`, żeby addon nie obchodził kontroli DoS, wołając przez flow.
+// `GraphComputeGuard` jest importowany na górze; caps (`MAX_*_GRAPH_COMPUTE`)
+// re-eksportuje `test_api` wprost z `services::graph`.
 
 // =============================================================================
 // Shared helpers
@@ -783,10 +707,8 @@ pub fn graph_delete_v1(
 pub mod test_api {
     use super::{GraphComputeGuard, GraphError};
 
-    pub use super::{
-        check_gate, map_graph_error, props_to_json, MAX_GLOBAL_GRAPH_COMPUTE, MAX_PPR_SEEDS,
-        MAX_PER_ADDON_GRAPH_COMPUTE, MAX_RANK_ITERATIONS, MAX_RESULT_ROWS,
-    };
+    pub use super::{check_gate, map_graph_error, props_to_json, MAX_PPR_SEEDS, MAX_RANK_ITERATIONS, MAX_RESULT_ROWS};
+    pub use crate::services::graph::{MAX_GLOBAL_GRAPH_COMPUTE, MAX_PER_ADDON_GRAPH_COMPUTE};
 
     /// Nieprzezroczysty uchwyt slotu obliczeń — trzymanie go zajmuje slot, a
     /// `drop` go zwalnia (jak w prawdziwej ścieżce host-fn). Test trzyma N
