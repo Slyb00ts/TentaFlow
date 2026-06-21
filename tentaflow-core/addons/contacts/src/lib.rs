@@ -13,11 +13,14 @@ use alloc::vec::Vec;
 
 use serde_json::Value as JsonValue;
 
-use tentaflow_sdk_spec::protocol::ui::bind::{PathSegment, StatePath};
-use tentaflow_sdk_spec::protocol::ui::component::{Component, FieldMap, HandlerMap};
-use tentaflow_sdk_spec::protocol::ui::typed_field::encode_to_value;
+use tentaflow_sdk_spec::protocol::ui::bind::{BindRef, PathSegment, StatePath};
+use tentaflow_sdk_spec::protocol::ui::component::{Component, HandlerMap};
 use tentaflow_sdk_spec::protocol::ui::a11y::EventKind;
+use tentaflow_sdk_spec::protocol::ui::data::{Heading, Text};
 use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
+use tentaflow_sdk_spec::protocol::ui::inline::NavTab;
+use tentaflow_sdk_spec::protocol::ui::layout::{NavTabs, Stack};
+use tentaflow_sdk_spec::protocol::ui::molecules::Inspector;
 use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
 use tentaflow_sdk_spec::protocol::ui::patch::{PatchOp, PatchOpKind};
 use tentaflow_sdk_spec::protocol::ui::slot::{
@@ -25,6 +28,7 @@ use tentaflow_sdk_spec::protocol::ui::slot::{
 };
 use tentaflow_sdk_spec::protocol::ui::slot_msg::SlotContent;
 use tentaflow_sdk_spec::protocol::ui::state::StatePatch;
+use tentaflow_sdk_spec::protocol::ui::tokens::{FlexAlign, NavTabsVariant, Spacing, TextStyle, Tone};
 use tentaflow_sdk_spec::protocol::ui::ui_payload::UiPayload;
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::value::Value as CborValue;
@@ -175,53 +179,48 @@ fn send_ui(payload: &UiPayload) -> i32 {
 fn send_panel_shell() {
     let epoch = unsafe { PANEL_EPOCH };
 
-    let nav_tabs = Component {
-        tag: 0x0404,
-        id: "nav-tabs".into(),
-        fields: FieldMap(vec![
-            (0, encode_nav_items()),
-        ]),
-        handlers: Some(HandlerMap(vec![
-            (EventKind::Click, Handler::Backend {
-                action_id: "panel-navigate".into(),
-                params: CborMap(vec![]),
-                optimistic: None,
-                on_failure: FailurePolicy::Toast,
-            }),
-        ])),
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
-    };
+    let mut nav_tabs = NavTabs {
+        items: vec![
+            nav_tab("all", "Wszystkie"),
+            nav_tab("companies", "Firmy"),
+            nav_tab("persons", "Osoby"),
+            nav_tab("relationship-map", "Mapy relacji"),
+            nav_tab("smart-lists", "Smart lists"),
+        ],
+        active_id: bound("active_tab"),
+        variant: NavTabsVariant::Underlined,
+        scroll_overflow: true,
+    }
+    .into_component("nav-tabs")
+    .expect("NavTabs encode");
+    nav_tabs.handlers = Some(HandlerMap(vec![(
+        EventKind::Select,
+        Handler::Backend {
+            action_id: "panel-navigate".into(),
+            params: CborMap(vec![]),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
 
-    let slot_ref = Component {
-        tag: 0x0001,
-        id: "slot-content-ref".into(),
-        fields: FieldMap(vec![
-            (0, CborValue::Text(SLOT_ID.into())),
-        ]),
-        handlers: None,
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
-    };
+    let content_host = Inspector {
+        title: lit("Kontakty"),
+        content_slot: SLOT_ID.into(),
+        actions: vec![],
+        tabs: None,
+        collapsible: false,
+    }
+    .into_component("content-host")
+    .expect("Inspector encode");
 
-    let layout = Component {
-        tag: 0x0103,
-        id: "root".into(),
-        // Stack (0x0103) fields: 0=gap, 1=align, 2=children, 3=padding. Children
-        // belong at field 2; gap/align omitted -> default md/stretch.
-        fields: FieldMap(vec![
-            (2, encode_children(&[nav_tabs, slot_ref])),
-        ]),
-        handlers: None,
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
-    };
+    let layout = Stack {
+        gap: Spacing::Md,
+        align: FlexAlign::Stretch,
+        children: vec![nav_tabs, content_host],
+        padding: None,
+    }
+    .into_component("root")
+    .expect("Stack encode");
 
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
@@ -326,7 +325,7 @@ fn build_all_tab() -> Component {
     let persons = count_table("persons").unwrap_or(0);
     let relations = count_table("person_relations").unwrap_or(0);
 
-    let heading = text_component("heading-all", "Kontakty");
+    let heading = heading_component("heading-all", "Kontakty");
     let stats = build_stat_row(companies, persons, relations);
     let table = build_contacts_table(None, 100);
 
@@ -334,7 +333,7 @@ fn build_all_tab() -> Component {
 }
 
 fn build_companies_tab() -> Component {
-    let heading = text_component("heading-companies", "Firmy");
+    let heading = heading_component("heading-companies", "Firmy");
     let form = build_company_form();
     let table = build_contacts_table(Some("company"), 100);
 
@@ -342,7 +341,7 @@ fn build_companies_tab() -> Component {
 }
 
 fn build_persons_tab() -> Component {
-    let heading = text_component("heading-persons", "Osoby");
+    let heading = heading_component("heading-persons", "Osoby");
     let form = build_person_form();
     let table = build_persons_table_component();
 
@@ -388,45 +387,53 @@ fn build_smart_lists_tab() -> Component {
 // =============================================================================
 
 fn text_component(id: &str, content: &str) -> Component {
-    Component {
-        tag: 0x0200,
-        id: id.into(),
-        fields: FieldMap(vec![(0, CborValue::Text(content.into()))]),
-        handlers: None,
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
+    Text {
+        content: lit(content),
+        style: TextStyle::Body,
+        tone: None,
+        align: None,
+        wrap: None,
+        max_lines: None,
+        format: None,
     }
+    .into_component(id)
+    .expect("Text encode")
+}
+
+fn heading_component(id: &str, content: &str) -> Component {
+    Heading {
+        content: lit(content),
+        level: 2,
+        tone: None,
+        align: None,
+    }
+    .into_component(id)
+    .expect("Heading encode")
 }
 
 fn stack_component(id: &str, children: &[Component]) -> Component {
-    Component {
-        tag: 0x0103,
-        id: id.into(),
-        // Stack (0x0103): children at field 2 (0=gap, 1=align, 3=padding).
-        fields: FieldMap(vec![(2, encode_children(children))]),
-        handlers: None,
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
+    Stack {
+        gap: Spacing::Md,
+        align: FlexAlign::Stretch,
+        children: children.to_vec(),
+        padding: Some(Spacing::Md),
     }
+    .into_component(id)
+    .expect("Stack encode")
 }
 
 fn empty_state_component(id: &str, title: &str, message: &str) -> Component {
-    Component {
-        tag: 0x0200,
-        id: id.into(),
-        fields: FieldMap(vec![
-            (0, CborValue::Text(format!("{} — {}", title, message))),
-        ]),
-        handlers: None,
-        bind: None,
-        a11y: None,
-        visibility: None,
-        test_id: None,
+    Text {
+        content: lit(&format!("{} — {}", title, message)),
+        style: TextStyle::Body,
+        tone: Some(Tone::Muted),
+        align: None,
+        wrap: None,
+        max_lines: None,
+        format: None,
     }
+    .into_component(id)
+    .expect("Text encode")
 }
 
 fn build_stat_row(companies: i64, persons: i64, relations: i64) -> Component {
@@ -501,32 +508,23 @@ fn build_person_form() -> Component {
 // CBOR helpers
 // =============================================================================
 
-fn encode_children(children: &[Component]) -> CborValue {
-    // Children must be a CBOR Array Value (one element per child Component), the
-    // same shape the spec's typed builders emit and the renderer decodes. The old
-    // code wrapped the encoded array in CborValue::Bytes, so the renderer saw a
-    // byte blob instead of an array ("Stack.children: expected Array, got object").
-    encode_to_value(&children.to_vec()).unwrap()
+fn nav_tab(id: &str, label: &str) -> NavTab {
+    NavTab {
+        id: id.into(),
+        label: lit(label),
+        icon: None,
+        badge: None,
+        panel_id: None,
+        locked: false,
+    }
 }
 
-fn encode_nav_items() -> CborValue {
-    let items = CborValue::Array(vec![
-        nav_item("all", "Wszystkie"),
-        nav_item("companies", "Firmy"),
-        nav_item("persons", "Osoby"),
-        nav_item("relationship-map", "Mapy relacji"),
-        nav_item("smart-lists", "Smart lists"),
-    ]);
-    let mut buf = Vec::with_capacity(128);
-    minicbor::encode(&items, &mut buf).unwrap();
-    CborValue::Bytes(buf)
+fn lit(text: &str) -> BindRef {
+    BindRef::Literal(CborValue::Text(text.into()))
 }
 
-fn nav_item(id: &str, label: &str) -> CborValue {
-    CborValue::Map(vec![
-        (CborValue::Text("id".into()), CborValue::Text(id.into())),
-        (CborValue::Text("label".into()), CborValue::Text(label.into())),
-    ])
+fn bound(key: &str) -> BindRef {
+    BindRef::Bound(state_path(key))
 }
 
 fn state_path(key: &str) -> StatePath {
