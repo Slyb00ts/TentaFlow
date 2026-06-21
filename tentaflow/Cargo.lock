@@ -11039,6 +11039,7 @@ version = "0.2.0"
 dependencies = [
  "ciborium",
  "serde",
+ "serde_bytes",
 ]
 
 [[package]]

@@ -24,14 +24,41 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tentaflow_sdk_spec::{LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET};
 use tokio::sync::broadcast;
 
 use crate::services::lidar_hub::LidarStreamHub;
 use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
+
+/// Stamp `host_send_us` (wall-clock µs since the Unix epoch) into the frame's
+/// fixed header just before it is broadcast, so the browser can split end-to-end
+/// latency into addon-decode→host-dispatch vs host-send→browser segments.
+///
+/// The latest-frame bytes come straight from the hub (the SAME `Bytes` the addon
+/// produced, with `host_send_us == 0`), so we must take an owned copy before
+/// mutating the 8 LE bytes in place — overwriting the shared buffer would corrupt
+/// the hub's retained frame for other subscribers / late joiners. This adds one
+/// per-frame copy of the ~384 KB frame; it is a deliberate, accepted cost for the
+/// latency diagnostic. Frames shorter than the header (should never happen here)
+/// are broadcast unchanged rather than risking an out-of-range write.
+fn stamp_host_send_us(frame: &Bytes) -> Bytes {
+    if frame.len() < LIDAR_HEADER_LEN {
+        return frame.clone();
+    }
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let mut buf = frame.to_vec();
+    buf[LIDAR_HOST_SEND_US_OFFSET..LIDAR_HOST_SEND_US_OFFSET + 8]
+        .copy_from_slice(&now_us.to_le_bytes());
+    Bytes::from(buf)
+}
 
 /// Canonical LiDAR frames are self-describing, so the wire is opaque bytes; the
 /// browser parses the 36-byte header itself rather than trusting this string.
@@ -132,7 +159,7 @@ async fn spawn_pump(
             let Some(src) = source.upgrade() else {
                 return;
             };
-            src.broadcast(frame);
+            src.broadcast(stamp_host_send_us(&frame));
         }
     }
 
@@ -155,7 +182,7 @@ async fn spawn_pump(
         // frame (lag is handled by the broadcast `Lagged` path upstream).
         if let Some(frame) = hub.latest(&robot_id) {
             if !frame.is_empty() {
-                src.broadcast(frame);
+                src.broadcast(stamp_host_send_us(&frame));
             }
         }
     }
@@ -210,8 +237,14 @@ impl Drop for LocalLidarStreamSource {
 mod tests {
     use super::*;
     use tentaflow_sdk_spec::{
-        LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_LAYOUT_XYZ,
+        LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ,
     };
+
+    /// The packed-f32 body after the fixed header — the part the pump never
+    /// rewrites, so it stays byte-identical to the originally published frame.
+    fn body_after_header(frame: &[u8]) -> &[u8] {
+        &frame[LIDAR_HEADER_LEN..]
+    }
 
     fn build_frame(points: &[[f32; 3]], seq: u32) -> Bytes {
         let header = LidarFrameHeader {
@@ -220,6 +253,7 @@ mod tests {
             point_count: points.len() as u32,
             frame_seq: seq,
             timestamp_us: 1_000,
+            host_send_us: 0,
             resolution: 0.05,
             origin: [0.0, 0.0, 0.0],
         };
@@ -262,23 +296,27 @@ mod tests {
             .expect("live source has a broadcaster")
             .subscribe();
 
-        // (a) The pump seeds the current latest frame onto the broadcast.
+        // (a) The pump seeds the current latest frame onto the broadcast. The pump
+        // stamps `host_send_us` in place, so the broadcast bytes differ from the
+        // retained frame ONLY in that field — body + the rest of the header match.
         let got_seed = rx.recv().await.expect("seeded frame");
-        assert_eq!(&got_seed[..], &seed[..]);
-        // (c) round-trips a valid header.
+        assert_eq!(body_after_header(&got_seed), body_after_header(&seed));
+        // (c) round-trips a valid header with the host send time now stamped.
         let h = LidarFrameHeader::decode_header(&got_seed).expect("header decodes");
         assert_eq!(h.frame_seq, 1);
         assert_eq!(h.point_count, 1);
+        assert!(h.host_send_us > 0, "pump stamps host_send_us");
 
         // (b) A newer publish is received on the broadcast via the watch notify.
         let next = build_frame(&[[4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], 2);
         hub.publish(robot_id, 2, next.clone());
         let got_next = rx.recv().await.expect("pushed frame");
-        assert_eq!(&got_next[..], &next[..]);
+        assert_eq!(body_after_header(&got_next), body_after_header(&next));
         // (c) round-trips a valid header.
         let h2 = LidarFrameHeader::decode_header(&got_next).expect("header decodes");
         assert_eq!(h2.frame_seq, 2);
         assert_eq!(h2.point_count, 2);
+        assert!(h2.host_send_us > 0, "pump stamps host_send_us");
 
         hub.remove(robot_id);
     }
@@ -304,8 +342,10 @@ mod tests {
         let first = build_frame(&[[1.0, 1.0, 1.0]], 1);
         hub.publish(robot_id, 1, first.clone());
         let got = rx.recv().await.expect("first frame pushed");
-        assert_eq!(&got[..], &first[..]);
-        assert!(LidarFrameHeader::decode_header(&got).is_some());
+        // The pump stamps host_send_us, so only the body is byte-identical.
+        assert_eq!(body_after_header(&got), body_after_header(&first));
+        let h = LidarFrameHeader::decode_header(&got).expect("header decodes");
+        assert!(h.host_send_us > 0, "pump stamps host_send_us");
 
         hub.remove(robot_id);
     }

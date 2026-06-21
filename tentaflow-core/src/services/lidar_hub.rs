@@ -162,6 +162,7 @@ mod tests {
             point_count: points.len() as u32,
             frame_seq: seq,
             timestamp_us: 123_456,
+            host_send_us: 0,
             resolution: 0.05,
             origin: [0.0, 0.0, 0.0],
         };

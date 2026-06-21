@@ -45,6 +45,13 @@ const REFRESH_INTERVAL_MS = 4000;
 // arrival jitter, short enough to react quickly when streaming stops.
 const LIDAR_FPS_WINDOW_MS = 2000;
 
+// End-to-end latency is `now_wall - frame.timestampUs`. For the local case the
+// addon, Core and browser share one wall clock, so the value is real; across
+// machines (or with clock skew) it can be negative or absurdly large. Anything
+// outside [0, 30 s] is treated as unmeasurable skew and dropped from the average
+// rather than poisoning it — the cadence/decode numbers stay valid regardless.
+const LIDAR_E2E_MAX_MS = 30000;
+
 // A frame older than this reads as "stale" — at 5 fps a healthy stream lands a
 // new frame every ~200 ms, so 1.5 s without one means the source went quiet. A
 // periodic staleness sweep flips the badge even when frames simply stop arriving.
@@ -120,7 +127,8 @@ let cardEls = new Map();
 // start has a matching close; teardown closes all (no leaked subscriptions).
 // Shape: { unsub:fn|null, closed:bool, resubTimer:number|null,
 //          frameTimes:number[], lastPointCount, lastFrameAtMs,
-//          lastRaw:Uint8Array|null, lastPoints:Float32Array|null }.
+//          lastRaw:Uint8Array|null, lastPoints:Float32Array|null,
+//          timing:{atMs,decodeMs,intervalMs,e2eMs}[] }.
 let lidarLive = new Map();
 // Single shared slow timer that re-renders every active card so the freshness
 // badge flips to "nieaktualne" when frames stop arriving. NOT a poll — it carries
@@ -839,7 +847,8 @@ function updateLidar(el, r) {
         <tf-toggle data-lidar-toggle></tf-toggle>
         <span class="robots-lidar-status" data-lidar-status></span>
         <tf-badge data-lidar-fresh tone="info" value="—" hidden></tf-badge>
-      </div>`;
+      </div>
+      <div class="robots-lidar-diag" data-lidar-diag hidden></div>`;
     const toggle = host.querySelector('[data-lidar-toggle]');
     toggle.addEventListener('change', (e) => {
       // tf-toggle emits its boolean either on e.detail or as its `checked` prop.
@@ -900,6 +909,7 @@ function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, 
   const live = lidarLive.get(id);
   const hasLiveFrame = !!(live && live.lastFrameAtMs);
 
+  const diag = host.querySelector('[data-lidar-diag]');
   if (hasLiveFrame) {
     const points = live.lastPointCount;
     const fps = computeLidarFps(live);
@@ -912,8 +922,26 @@ function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, 
       fresh.setAttribute('tone', stale ? 'warning' : 'success');
       fresh.setAttribute('value', stale ? 'nieaktualne' : 'na żywo');
     }
+    // Live pipeline diagnostics: delivered cadence, browser decode cost and the
+    // end-to-end latency (addon decode-stamp → browser decode done). Hidden when
+    // there is not enough of a window yet to compute a cadence.
+    if (diag) {
+      const t = computeLidarTiming(live);
+      if (t.deliveredHz > 0) {
+        const e2e = t.e2eMs == null ? 'n/d' : `${t.e2eMs.toFixed(0)} ms`;
+        // Per-hop breakdown folded in so it is visible without devtools.
+        const hop = (v) => (v == null ? '–' : v.toFixed(0));
+        diag.hidden = false;
+        diag.textContent =
+          `dostarczanie ${t.deliveredHz.toFixed(1)} Hz  ·  dekodowanie ${t.decodeMs.toFixed(2)} ms  ·  opóźnienie ${e2e}`
+          + `  ·  host/net/decode ${hop(t.hostMs)}/${hop(t.netMs)}/${t.decodeMs.toFixed(1)} ms`;
+      } else {
+        diag.hidden = true;
+      }
+    }
     return;
   }
+  if (diag) diag.hidden = true;
 
   // Active but no live frame yet: show the snapshot count (if any) as a hint while
   // we wait for the first binary frame to arrive.
@@ -965,6 +993,11 @@ function startRobotLidar(id) {
     lastFrameAtMs: 0,
     lastRaw: null,
     lastPoints: null,
+    // Pipeline timing samples over the same ~2 s window as the FPS counter.
+    // Each entry is { atMs, decodeMs, intervalMs, e2eMs } so the diagnostics
+    // line can show rolling averages of browser decode cost, delivered cadence
+    // and end-to-end latency without keeping unbounded history.
+    timing: [],
   };
   lidarLive.set(id, live);
   if (lidarTimer == null) {
@@ -1019,6 +1052,16 @@ function onLidarChunk(id, live, body) {
   // The current live entry may have been torn down/replaced while this chunk was
   // in flight — drop it rather than resurrect a dead source.
   if (lidarLive.get(id) !== live) return;
+  // Capture the wall-clock µs at the very top of onChunk, BEFORE any JS decode.
+  // The CBOR codec decode of the ~384 KB MessageBody already happened before this
+  // callback fires, so `tOnChunk - hostSendUs` measures WS transport + browser
+  // receive + that CBOR unwrap together (the "net+unwrap" segment).
+  const tOnChunk = Date.now() * 1000;
+  // Stage 4: delivered cadence — interval since the previous onChunk frame.
+  const arrivalMs = performance.now();
+  const intervalMs = live.lastFrameAtMs ? arrivalMs - live.lastFrameAtMs : 0;
+  // Stage 5: browser decode duration — wrap only decodeLidarFrame itself.
+  const decodeStart = performance.now();
   let f;
   try {
     f = decodeLidarFrame(data);
@@ -1026,17 +1069,100 @@ function onLidarChunk(id, live, body) {
     console.warn('[robots] lidar decode failed:', e?.message ?? e);
     return;
   }
+  const decodeMs = performance.now() - decodeStart;
   if (!f || !(f.hasFrame ?? f.has_frame)) return;
   live.lastPointCount = Number(f.pointCount ?? f.point_count ?? 0);
-  live.lastFrameAtMs = performance.now();
+  live.lastFrameAtMs = arrivalMs;
   live.frameTimes.push(live.lastFrameAtMs);
   // Bound the window buffer so a long-lived stream can't grow it unbounded.
   const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
   while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
+  // Stage 6: end-to-end latency split into per-hop segments using the two header
+  // timestamps (addon decode `timestampUs`, host pump-send `hostSendUs`) and the
+  // two browser anchors (`tOnChunk` captured above, `Date.now()` taken now, after
+  // decodeLidarFrame). All in µs; segments reported in ms. Only meaningful when
+  // both machines share a clock; clock-skew/garbage samples are clamped/skipped
+  // (negative or > LIDAR_E2E_MAX_MS) rather than averaged in.
+  const stampUs = Number(f.timestampUs ?? f.timestamp_us ?? 0);
+  const hostSendUs = Number(f.hostSendUs ?? f.host_send_us ?? 0);
+  const tDone = Date.now() * 1000;
+  const plausible = (ms) => ms != null && ms >= 0 && ms <= LIDAR_E2E_MAX_MS;
+  let hostMs = null;
+  let netMs = null;
+  let totalMs = null;
+  // decode_ms is a pure local duration (no cross-machine clock), always valid.
+  const decodeStageMs = (tDone - tOnChunk) / 1000;
+  if (stampUs > 0 && hostSendUs > 0) {
+    const h = (hostSendUs - stampUs) / 1000; // addon decode → host pump send
+    const n = (tOnChunk - hostSendUs) / 1000; // WS transport + receive + CBOR unwrap
+    if (plausible(h)) hostMs = h;
+    if (plausible(n)) netMs = n;
+  }
+  if (stampUs > 0) {
+    const t = (tDone - stampUs) / 1000; // full end-to-end
+    if (plausible(t)) totalMs = t;
+  }
+  // Per-frame breakdown to the console so it is visible in a REAL browser. ~7/s is
+  // low enough to print every frame without flooding devtools.
+  const fmt = (ms) => (ms == null ? 'n/d' : ms.toFixed(1));
+  console.debug(
+    `[lidar latency] host=${fmt(hostMs)}ms net+unwrap=${fmt(netMs)}ms `
+    + `decode=${decodeStageMs.toFixed(1)}ms total=${fmt(totalMs)}ms pts=${live.lastPointCount}`,
+  );
+  const e2eMs = totalMs;
+  live.timing.push({
+    atMs: live.lastFrameAtMs, decodeMs, intervalMs, e2eMs, hostMs, netMs,
+  });
+  while (live.timing.length && live.timing[0].atMs < cutoff) live.timing.shift();
   // Stash the raw frame + packed points for the L4 wgpu renderer (not drawn yet).
   live.lastRaw = f.raw ?? null;
   live.lastPoints = f.points ?? null;
   refreshLidarCard(id);
+}
+
+// Rolling timing diagnostics over the same ~2 s window as the FPS counter:
+// delivered Hz (from inter-arrival samples), average browser decode cost and
+// average end-to-end latency (skew samples already excluded at ingest). Cheap:
+// a single pass over at most ~10–20 samples, no per-point work.
+function computeLidarTiming(live) {
+  const samples = live.timing;
+  let decodeSum = 0;
+  let intervalSum = 0;
+  let intervalN = 0;
+  let e2eSum = 0;
+  let e2eN = 0;
+  let hostSum = 0;
+  let hostN = 0;
+  let netSum = 0;
+  let netN = 0;
+  for (const s of samples) {
+    decodeSum += s.decodeMs;
+    if (s.intervalMs > 0) {
+      intervalSum += s.intervalMs;
+      intervalN += 1;
+    }
+    if (s.e2eMs != null) {
+      e2eSum += s.e2eMs;
+      e2eN += 1;
+    }
+    if (s.hostMs != null) {
+      hostSum += s.hostMs;
+      hostN += 1;
+    }
+    if (s.netMs != null) {
+      netSum += s.netMs;
+      netN += 1;
+    }
+  }
+  const avgIntervalMs = intervalN ? intervalSum / intervalN : 0;
+  return {
+    decodeMs: samples.length ? decodeSum / samples.length : 0,
+    deliveredIntervalMs: avgIntervalMs,
+    deliveredHz: avgIntervalMs > 0 ? 1000 / avgIntervalMs : 0,
+    e2eMs: e2eN ? e2eSum / e2eN : null,
+    hostMs: hostN ? hostSum / hostN : null,
+    netMs: netN ? netSum / netN : null,
+  };
 }
 
 // Stream ended. A `subscriber_lagged` end means the server dropped us because we

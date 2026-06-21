@@ -179,6 +179,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+.robots-lidar-diag {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
 .robots-camera {
   display: flex;
   flex-direction: column;
