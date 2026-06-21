@@ -379,3 +379,42 @@ This composes cleanly with §10: the durable store, ingest WAL, submaps, and pos
 graph all already key by scene; we just make `scene_id` a first-class partition key
 everywhere (format, store path, registry, query). S0/S1 must bake `scene_id` into
 the block/chunk format and the ingest queue from the start.
+
+## 12. Localization WITHOUT markers (anchors are optional)
+
+Hard requirement: rooms MAY but need NOT have markers; devices must still find
+themselves in the scene. So **markerless is the DEFAULT path and must work on its
+own**; anchors are an optional accelerator, never assumed.
+
+- **Anchors (AprilTag / QR / UWB) = optional constraints.** When present they give
+  cheap, instant, drift-free absolute alignment. When absent, the system relies
+  entirely on markerless methods below. Anchors are just one more edge type in the
+  scene pose graph — never a prerequisite.
+- **Default markerless localization:** each device runs odometry/SLAM (LiDAR-inertial
+  for robots/raw LiDAR; ARKit VIO for iPhone; visual(-inertial) for camera-only) →
+  its trajectory in its own frame. The COMMON scene frame comes from **overlap-based
+  registration**: place recognition (e.g. Scan Context / learned global descriptors;
+  visual bag-of-words for cameras) + point-cloud registration (GICP / TEASER++) +
+  loop closure in the scene pose graph.
+- **Relocalization (a device "finds itself"):** when a device enters/re-enters a
+  scene, it matches its current observation against the scene's existing fused map
+  via markerless place-recognition + registration → snaps into the scene frame. No
+  marker needed; works for the second robot joining a building the first one mapped.
+- **Alignment fallback order per new/returning source:**
+  1. anchor seen → use it (instant absolute);
+  2. else relocalize markerlessly vs the scene's existing map (place-rec + register);
+  3. else (no anchor, no overlap yet) → keep it as its OWN provisional submap and
+     merge automatically once overlap appears (or it sees an anchor). It is never
+     blindly fused into an unrelated frame.
+- **Honest limits (inherent, not a defect):** markerless alignment needs sufficient
+  OVERLAP and geometric/visual STRUCTURE. Two devices that never see a shared region,
+  or a long featureless corridor, can drift or fail to relate until overlap/structure
+  appears — exactly the case where an optional marker removes the ambiguity. So:
+  markerless first; markers offered as an optional reliability boost where the
+  environment is degenerate. Cameras add visual place-recognition to help LiDAR-poor
+  geometry, and vice-versa.
+
+Architecture/format already support this: `pose_source` covers `lio|vio|anchor|none`,
+poses carry confidence/covariance, submaps + the scene pose graph absorb anchor and
+markerless constraints uniformly. Phase 2 implements the markerless registration +
+relocalization first; anchor support is an additive constraint type on top.
