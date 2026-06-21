@@ -1,0 +1,276 @@
+[addon]
+id = "rag"
+name = "RAG"
+version = "0.1.0"
+description = "Niezalezne instancje RAG — kolekcje, ingest dokumentow (parse + chunk + embedding), wyszukiwanie wektorowe i graf wiedzy."
+category = "AI"
+keywords = ["rag", "retrieval", "embeddings", "vector", "graph", "ingest", "dokumenty"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "rag-db"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+# --- Uprawnienia ---
+# Uwaga: czesc uprawnien (vector.read, graph.read/write, document.write, flow.invoke)
+# jeszcze nie jest uzywana przez ingest — zadeklarowane swiadomie dla query/graph
+# slice (Etap 1/2), nie sa przypadkowe.
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt metadanych RAG"
+description = "Czyta kolekcje, dokumenty, chunki i joby ingestu z bazy instancji RAG."
+risk = "low"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis metadanych RAG"
+description = "Tworzy i aktualizuje kolekcje, dokumenty, chunki i joby ingestu."
+risk = "medium"
+
+[[permission]]
+id = "vector.read"
+display_name = "Wyszukiwanie wektorowe"
+description = "k-NN nad przestrzenia wektorowa 'passages' instancji RAG."
+risk = "low"
+
+[[permission]]
+id = "vector.write"
+display_name = "Zapis wektorow"
+description = "Upsert/delete wektorow chunkow w przestrzeni 'passages'."
+risk = "medium"
+
+[[permission]]
+id = "graph.read"
+display_name = "Odczyt grafu wiedzy"
+description = "Odczyt encji i relacji z kolekcji grafowej 'kg' (Etap 2)."
+risk = "low"
+
+[[permission]]
+id = "graph.write"
+display_name = "Zapis grafu wiedzy"
+description = "Zapis encji i relacji do kolekcji grafowej 'kg' (Etap 2)."
+risk = "medium"
+
+[[permission]]
+id = "document.read"
+display_name = "Odczyt plikow zrodlowych"
+description = "Czyta surowe pliki (PDF/obraz) z per-instance document store."
+risk = "low"
+
+[[permission]]
+id = "document.write"
+display_name = "Zapis plikow zrodlowych"
+description = "Zapisuje wgrane pliki zrodlowe do per-instance document store."
+risk = "medium"
+
+[[permission]]
+id = "document.parse"
+display_name = "Parsowanie dokumentow"
+description = "Parsuje obrazy stron dokumentow na markdown przez alias rag-parse."
+risk = "medium"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generowanie embeddingow / LLM"
+description = "Wola modele embeddingow (rag-embeddings) i LLM (rag-llm) przez host."
+risk = "medium"
+
+[[permission]]
+id = "flow.invoke"
+display_name = "Uruchamianie flow zapytan"
+description = "Wyzwala flow zapytania RAG (retrieval -> rerank -> llm) — Etap 1."
+risk = "medium"
+
+[[permission]]
+id = "ui"
+display_name = "Interfejs RAG"
+description = "Renderuje panel RAG (kolekcje, status ingestu) w launcherze."
+risk = "low"
+
+# --- Aliasy modeli wystawiane przez addon (z suggested_default) ---
+
+[[alias]]
+id = "rag-embeddings"
+display_name = "RAG — embeddingi"
+methods = ["embed"]
+suggested_default = "llama-nemotron-embed-1b-v2"
+visibility = "private"
+
+[[alias]]
+id = "rag-llm"
+display_name = "RAG — LLM"
+methods = ["chat"]
+suggested_default = "nemotron-3-super-120b"
+visibility = "private"
+
+[[alias]]
+id = "rag-reranker"
+display_name = "RAG — reranker"
+methods = ["rerank"]
+suggested_default = "llama-nemotron-rerank-1b-v2"
+visibility = "private"
+
+[[alias]]
+id = "rag-parse"
+display_name = "RAG — parsowanie dokumentow"
+methods = ["parse"]
+suggested_default = "nemotron-parse"
+visibility = "private"
+
+# --- Aliasy konsumowane przez addon ---
+# rag-llm i rag-reranker sa dla query slice (Etap 1) — swiadomie required=false.
+
+[[uses_alias]]
+id = "rag-embeddings"
+required = true
+reason = "Generowanie wektorow chunkow podczas ingestu."
+
+[[uses_alias]]
+id = "rag-llm"
+required = false
+reason = "Generowanie odpowiedzi w flow zapytania (Etap 1)."
+
+[[uses_alias]]
+id = "rag-reranker"
+required = false
+reason = "Re-ranking kandydatow w retrievalu (Etap 1)."
+
+[[uses_alias]]
+id = "rag-parse"
+required = true
+reason = "Parsowanie obrazow stron PDF/skanow na markdown (ingest image/PDF go wymaga)."
+
+# --- Przestrzen wektorowa chunkow ---
+
+[[vector_namespace]]
+name = "passages"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[[vector_namespace.fields]]
+name = "doc_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "chunk_index"
+type = "int"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "created_at"
+type = "int"
+indexed = false
+
+# --- Kolekcja grafowa (struktura gotowa, wypelniana w Etapie 2) ---
+
+[[graph_collection]]
+name = "kg"
+data_class = "C"
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "RAG"
+icon = "rag-db"
+description = "Kolekcje, ingest dokumentow i wyszukiwanie semantyczne."
+sort_order = 30
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 256
+fuel_limit = 200000000
+storage_total_mb = 1024
+llm_tokens_per_min = 500000
+
+[lifecycle]
+background = false
+auto_start = false
+
+# --- Narzedzia ---
+
+[[tool]]
+id = "create_collection"
+display_name = "Utworz kolekcje"
+description = "Tworzy nowa kolekcje dokumentow w instancji RAG."
+keywords = ["rag", "collection", "kolekcja", "create"]
+
+[[tool.parameter]]
+name = "name"
+param_type = "string"
+description = "Nazwa kolekcji."
+required = true
+
+[[tool]]
+id = "list_collections"
+display_name = "Lista kolekcji"
+description = "Zwraca wszystkie kolekcje instancji RAG."
+keywords = ["rag", "collection", "list"]
+
+[[tool]]
+id = "ingest_document"
+display_name = "Ingest dokumentu"
+description = "Pelny pipeline ingestu: parse -> chunking -> embedding -> upsert wektorow + zapis chunkow."
+keywords = ["rag", "ingest", "document", "parse", "embed"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji docelowej."
+required = true
+
+[[tool.parameter]]
+name = "doc_id_blob"
+param_type = "string"
+description = "Identyfikator pliku zrodlowego w document store (z document_put)."
+required = true
+
+[[tool.parameter]]
+name = "filename"
+param_type = "string"
+description = "Nazwa pliku (do wyswietlenia)."
+required = true
+
+[[tool.parameter]]
+name = "mime"
+param_type = "string"
+description = "Typ MIME pliku (np. image/png, application/pdf, text/markdown)."
+required = true
+
+[[tool]]
+id = "list_documents"
+display_name = "Lista dokumentow"
+description = "Zwraca dokumenty w kolekcji wraz ze statusem ingestu."
+keywords = ["rag", "documents", "list"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji."
+required = true
+
+[[tool]]
+id = "ingest_status"
+display_name = "Status ingestu"
+description = "Zwraca status, postep i ewentualny blad joba ingestu."
+keywords = ["rag", "ingest", "status", "job"]
+
+[[tool.parameter]]
+name = "job_id"
+param_type = "string"
+description = "Identyfikator joba ingestu."
+required = true

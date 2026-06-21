@@ -1,0 +1,22 @@
+# =============================================================================
+# Plik: addons/rag/Cargo.toml
+# Opis: Crate addona RAG (WASM cdylib) — fundament ingestu: parse -> chunk ->
+#       embedding (alias rag-embeddings) -> vector upsert + zapis chunkow do SQL.
+# =============================================================================
+[package]
+name = "tentaflow-addon-rag"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
