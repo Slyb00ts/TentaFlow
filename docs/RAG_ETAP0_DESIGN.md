@@ -502,3 +502,14 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
   (max iter + cap + next_query cap 1024). loop_block: meta przetrwa między iteracjami, flow_depth NIE narasta.
 - **Query RAG kompletny wg wizji**: flow steruje query→odpowiedź, z pętlą multi-hop. Proste pytanie=1 iter.
 - Zostało: GUI addona; Etap 2 (GraphRAG: ekstrakcja encji→graf, PPR); Etap 3 (MemGraphRAG: 3-warstwowa pamięć).
+
+## C (Etap 2 GraphRAG) FUNKCJONALNY
+- **E3.0 ekstrakcja triple'ów w ingeście** ✅ (codex GO): rag-llm→encje/relacje→graf kg z provenance,
+  refcount cleanup (encje współdzielone między dokumentami żyją dopóki referowane), best-effort, capy.
+- **E3.2 retrieval grafowy w query** ✅ (codex GO): rag_graph_seed (encje zapytania→seedy), PPR nad kg,
+  fakty „źródło—relacja→cel" fuzowane z pasażami wektorowymi w kontekście sędziego+finalize, akumulacja
+  między hopami, degradacja (brak encji w KG→sam wektor, PPR jawne-nieznane-seedy→puste nie globalne).
+- **Entity resolution (scalanie aliasów encji) ŚWIADOMIE odłożone do D** (MemGraphRAG „Structural
+  Unification via Memory-Guided Bridging" robi to przez podobieństwo embeddingów + adjudykację — nie dublować).
+- Następne: **D (Etap 3 MemGraphRAG)** — projekt + implementacja (3-warstwowa pamięć, multi-agent konflikt,
+  memory-guided retrieval). Potem A (GUI).
