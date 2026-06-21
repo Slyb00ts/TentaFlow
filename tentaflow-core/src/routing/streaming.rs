@@ -402,6 +402,13 @@ fn make_chunk(
         speaker_id: None,
         speaker_name: None,
         usage: None,
+        // Metryki wydajnosci jada na finalnym chunku (trailer LlmStreamChunk
+        // niesie perf razem z usage); regular delty maja None.
+        perf: c.perf.map(|p| crate::api::openai::types::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
     }
 }
 
@@ -429,6 +436,11 @@ fn build_flow_tail_chunk(
             prompt_tokens: outcome.usage.prompt_tokens as u32,
             completion_tokens: outcome.usage.completion_tokens as u32,
             total_tokens: outcome.usage.total_tokens as u32,
+        }),
+        perf: outcome.perf.map(|p| crate::api::openai::types::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
         }),
     }
 }

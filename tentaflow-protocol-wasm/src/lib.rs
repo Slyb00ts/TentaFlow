@@ -4208,6 +4208,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 Some(t) => set(&obj, "text", t.into()),
                 None => set(&obj, "text", JsValue::NULL),
             }
+            // Metryki wydajnosci jako Number (f64) — patrz memory: u64.into()
+            // daloby BigInt i psulo arytmetyke w JS.
+            set(&obj, "ttftMs", (end.ttft_ms as f64).into());
+            set(&obj, "ttft_ms", (end.ttft_ms as f64).into());
+            set(&obj, "prefillTps", (end.prefill_tps as f64).into());
+            set(&obj, "prefill_tps", (end.prefill_tps as f64).into());
+            set(&obj, "decodeTps", (end.decode_tps as f64).into());
+            set(&obj, "decode_tps", (end.decode_tps as f64).into());
         }
         MessageBody::FlowInvokeRequestBody(_) => {
             // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.

@@ -443,6 +443,20 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+/// Per-message metryki wydajnosci inferencji liczone wall-clockiem w
+/// konsumencie strumienia (nie z perf-ctx silnika — ten jest kumulatywny
+/// dla continuous-batching i bezuzyteczny per-request). Niesione razem z
+/// `Usage` na finalnym chunku.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct GenPerf {
+    /// Czas do pierwszego tokena w ms.
+    pub ttft_ms: u32,
+    /// Predkosc prefill: prompt_tokens / ttft_secs.
+    pub prefill_tps: f32,
+    /// Predkosc dekodowania: (completion_tokens-1) / (end - first_token).
+    pub decode_tps: f32,
+}
+
 /// Streaming options (Etap 3a). Dziś jedyne pole to `include_usage` —
 /// gdy `true`, serwer emituje przed `[DONE]` dodatkowy chunk z `usage`
 /// (rollup tokenów); regular chunki mają `usage: None`. Klient bez tego
@@ -500,6 +514,11 @@ pub struct ChatCompletionChunk {
     /// pola nie zobaczy (back compat).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+
+    /// Per-message metryki wydajnosci. Niesione TYLKO przez finalny chunk
+    /// (obok `usage`); regular chunki maja `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf: Option<GenPerf>,
 }
 
 /// Choice w streaming chunk

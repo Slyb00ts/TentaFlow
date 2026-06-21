@@ -257,6 +257,10 @@ function renderBubble(msg) {
     ? `<div class="bubble-meta"><span>${timeStr}</span><span class="who">${escapeHtml(I18n.t('chat.you') || 'Ty')}</span></div>`
     : `<div class="bubble-meta"><span class="who">${escapeHtml(msg.modelLabel || I18n.t('chat.assistant') || 'Asystent')}</span><span>·</span><span>${timeStr}</span></div>`;
 
+  // Stopka metryk inferencji — tylko dla gotowych (nie-streaming) odpowiedzi
+  // asystenta z dostepnymi liczbami z ChatStreamEnd.
+  const perf = (!isUser && !isStreaming) ? renderPerfFooter(msg.perf) : '';
+
   const actions = isUser ? renderUserActions() : renderAssistantActions();
 
   return `
@@ -273,6 +277,7 @@ function renderBubble(msg) {
         <div class="bubble-wrap">
           ${meta}
           <div class="bubble">${bubbleHtml}${streamCaret}</div>
+          ${perf}
           ${actions}
         </div>
       `}
@@ -285,6 +290,30 @@ function formatBubbleTime(ts) {
   const d = new Date(ts);
   const pad = (n) => String(n).padStart(2, '0');
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Stopka z metrykami inferencji pod odpowiedzia asystenta. Zwraca pusty string
+// gdy brak danych albo gdy wszystkie wartosci sa zerowe (nie ma czego pokazac).
+function renderPerfFooter(perf) {
+  if (!perf) return '';
+  const completionTokens = Number(perf.completionTokens || 0);
+  const decodeTps = Number(perf.decodeTps || 0);
+  const ttftMs = Number(perf.ttftMs || 0);
+  const prefillTps = Number(perf.prefillTps || 0);
+  if (!completionTokens && !decodeTps && !ttftMs && !prefillTps) return '';
+
+  const lblTok = escapeHtml(I18n.t('chat.perf_tokens') || 'tok');
+  const lblDecode = escapeHtml(I18n.t('chat.perf_decode') || 'tok/s');
+  const lblTtft = escapeHtml(I18n.t('chat.perf_ttft') || 'TTFT');
+  const lblPrefill = escapeHtml(I18n.t('chat.perf_prefill') || 'prefill');
+
+  const parts = [];
+  if (completionTokens) parts.push(`${completionTokens} ${lblTok}`);
+  if (decodeTps) parts.push(`${Math.round(decodeTps)} ${lblDecode}`);
+  if (ttftMs) parts.push(`${lblTtft} ${Math.round(ttftMs)} ms`);
+  if (prefillTps) parts.push(`${lblPrefill} ${Math.round(prefillTps)} ${lblDecode}`);
+
+  return `<div class="bubble-perf">${parts.join(' · ')}</div>`;
 }
 
 function renderUserActions() {
@@ -847,6 +876,17 @@ function sendMessageInternal(text, opts = {}) {
         }
         if (assistantMsg.text === '') {
           assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
+        }
+        // Metryki wydajnosci inferencji z ChatStreamEnd — backend podaje je w
+        // obu konwencjach (camelCase + snake_case), wartosci to liczby JS.
+        if (endBody) {
+          assistantMsg.perf = {
+            promptTokens: Number(endBody.promptTokens ?? endBody.prompt_tokens ?? 0),
+            completionTokens: Number(endBody.completionTokens ?? endBody.completion_tokens ?? 0),
+            ttftMs: Number(endBody.ttftMs ?? endBody.ttft_ms ?? 0),
+            prefillTps: Number(endBody.prefillTps ?? endBody.prefill_tps ?? 0),
+            decodeTps: Number(endBody.decodeTps ?? endBody.decode_tps ?? 0),
+          };
         }
         conv.updatedAt = Date.now();
         saveConversations();

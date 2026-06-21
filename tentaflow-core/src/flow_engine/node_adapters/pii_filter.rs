@@ -299,6 +299,7 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     reasoning_delta: reasoning_cleaned,
                                     tool_calls: chunk.tool_calls,
                                     usage: chunk.usage,
+                                    perf: chunk.perf,
                                     finish_reason: chunk.finish_reason,
                                     error: chunk.error,
                                 };
