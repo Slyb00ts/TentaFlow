@@ -1154,8 +1154,9 @@ fn enrich_ios_live(gpus: &mut [PeerGpuInfo]) {
         sys.total_memory() / (1024 * 1024)
     };
 
+    // Unified memory — VRAM total = RAM, niezaleznie od usage (jak na macOS).
     for gpu in gpus.iter_mut() {
-        if gpu.vram_total_mb == 0 && gpu.usage_percent == 0.0 {
+        if gpu.vram_total_mb == 0 {
             gpu.vram_total_mb = total_ram_mb;
         }
     }

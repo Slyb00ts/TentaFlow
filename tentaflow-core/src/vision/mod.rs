@@ -41,6 +41,18 @@ pub mod detector_rfdetr;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;
 
+// Apple Vision OCR (VNRecognizeTextRequest) — ZAWSZE skompilowany na macOS/iOS,
+// bez feature flag (jak apple-tts). Systemowy silnik, nie wymaga modelu na dysku.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod apple_ocr;
+
+// PaddleOCR PP-OCRv5 (det -> cls -> rec) przez tract-onnx — embedded OCR runner
+// dla nie-Apple (Linux/Windows). Ten sam trait OcrRunner co apple-ocr; pure tract
+// (jak reszta vision), wiec kompiluje sie w domyslnym buildzie bez feature flag.
+// Na macOS/iOS OCR pokrywa apple_ocr (Vision), wiec tam modulu nie wlaczamy.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub mod onnx_ocr;
+
 pub mod hsemotion;
 pub mod movenet;
 pub mod scrfd;
@@ -107,6 +119,44 @@ pub trait EmotionClassifier: Send + Sync {
 
 pub trait PoseEstimator: Send + Sync {
     fn estimate(&self, image_rgb: &[u8], width: u32, height: u32) -> Result<Vec<PoseDetection>>;
+}
+
+/// In-process OCR runner — wspolny kontrakt dla zamiennych silnikow OCR
+/// (Apple Vision, a w przyszlosci inne natywne backendy). Mirror `FaceDetector`
+/// itp.: `&self` + interior mutability w implementacji, zeby jeden runner
+/// mogl byc dzielony przez VisionDispatcher i camera-enrich bez `&mut`.
+///
+/// `crop_rgb` — tightly-packed RGB24 (`cw*ch*3`). `None` = nic nie odczytano.
+pub trait OcrRunner: Send + Sync {
+    fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>>;
+}
+
+/// Globalny, nadpisywalny in-process OCR runner. Domyslnie `None` —
+/// VisionDispatcher uzywa wtedy wbudowanego Burn `PlateOcr` (gated
+/// `inference-vision-gpu`). Deploy `apple-ocr` ustawia tu silnik Apple Vision
+/// przez `set_ocr_runner`, dzieki czemu OCR dziala na macOS/iOS bez
+/// `inference-vision-gpu`. `set` ma pierwszenstwo nad wbudowanym runnerem.
+static OCR_RUNNER: OnceLock<RwLock<Option<Arc<dyn OcrRunner>>>> = OnceLock::new();
+
+fn ocr_runner_slot() -> &'static RwLock<Option<Arc<dyn OcrRunner>>> {
+    OCR_RUNNER.get_or_init(|| RwLock::new(None))
+}
+
+/// Ustawia globalny in-process OCR runner (deploy `apple-ocr`). Zastepuje
+/// poprzedni, jezeli byl.
+pub fn set_ocr_runner(runner: Arc<dyn OcrRunner>) {
+    *ocr_runner_slot().write() = Some(runner);
+}
+
+/// Zwraca clone Arc-a do aktywnego in-process OCR runnera, jezeli ustawiony.
+/// VisionDispatcher woła to PRZED wbudowanym Burn runnerem.
+pub fn get_ocr_runner() -> Option<Arc<dyn OcrRunner>> {
+    ocr_runner_slot().read().clone()
+}
+
+/// Usuwa globalny OCR runner (stop service / rollback deployu apple-ocr).
+pub fn clear_ocr_runner() {
+    *ocr_runner_slot().write() = None;
 }
 
 /// Identyfikator silnika vision — odpowiada `engine.id` z manifestu TOML.

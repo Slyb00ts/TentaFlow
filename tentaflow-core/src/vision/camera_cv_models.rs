@@ -100,6 +100,77 @@ pub fn is_camera_cv_engine(engine_id: &str) -> bool {
     BUNDLES.iter().any(|b| b.engine_id == engine_id)
 }
 
+/// PP-OCRv5 (onnx-ocr) bundle: `(nazwa, wymagany, opcjonalny_absolutny_url)`.
+/// Gdy `abs_url` = `Some`, plik leci z tego URL-a zamiast `<base_url>/<name>` —
+/// dict PP-OCRv5 trzymamy z kanonicznego repo PaddleOCR (modele det/rec hostuja
+/// repo ONNX bez slownika). `cls` opcjonalny (404 nie przerywa deployu — silnik
+/// pomija korekte kata), `det`/`rec`/`dict` wymagane.
+const ONNX_OCR_FILES: &[(&str, bool, Option<&str>)] = &[
+    ("ppocrv5_det.onnx", true, None),
+    ("ppocrv5_rec.onnx", true, None),
+    ("ppocrv5_cls.onnx", false, None),
+    (
+        "ppocrv5_dict.txt",
+        true,
+        Some("https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt"),
+    ),
+];
+
+/// Materializuje bundle PP-OCRv5 (onnx-ocr) do `vision_models_dir()`: pobiera
+/// det/rec/cls/dict z `<base_url>/<file>`. `base_url` to manifestowy
+/// `[[model_preset]] repo` (URL katalogu z plikami). Idempotentne — istniejace
+/// pliki sa pomijane. Opcjonalny `cls` ktorego brak na serwerze (404) jest
+/// tolerowany; brak wymaganego pliku to blad.
+pub async fn ensure_onnx_ocr_bundle(base_url: &str, log_sink: Option<&LogSink>) -> Result<()> {
+    let dir = vision_models_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
+
+    let base = base_url.trim_end_matches('/');
+    if base.is_empty() || !base.starts_with("http") {
+        return Err(anyhow!(
+            "onnx-ocr: brak URL bundla (manifest model_preset.repo musi byc URL-em http(s) do katalogu z plikami PP-OCRv5)"
+        ));
+    }
+
+    for (name, required, abs_url) in ONNX_OCR_FILES {
+        let dest = dir.join(name);
+        if file_ok(&dest) {
+            continue;
+        }
+        let url = match abs_url {
+            Some(u) => (*u).to_string(),
+            None => format!("{}/{}", base, name),
+        };
+        if let Some(s) = log_sink {
+            s.phase("downloading-vision", &format!("Pobieram {}", name));
+        }
+        let progress: Option<ProgressFn> = log_sink
+            .cloned()
+            .map(|sink| progress_for_sink(sink, name.to_string()));
+
+        match download_with_progress(&url, &dest, name, progress).await {
+            Ok(_) => {
+                if let Some(s) = log_sink {
+                    s.info(&format!("onnx-ocr: {} pobrany", name));
+                }
+            }
+            Err(e) => {
+                if *required {
+                    return Err(anyhow!("download {} from {}: {}", name, url, e));
+                }
+                if let Some(s) = log_sink {
+                    s.info(&format!(
+                        "onnx-ocr: opcjonalny {} niedostepny ({}) — pomijam korekte kata",
+                        name, e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn bundle(engine_id: &str) -> Option<&'static CvBundle> {
     BUNDLES.iter().find(|b| b.engine_id == engine_id)
 }

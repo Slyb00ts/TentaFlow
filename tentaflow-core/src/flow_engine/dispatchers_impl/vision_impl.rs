@@ -26,10 +26,29 @@ impl Default for VisionDispatcherImpl {
     }
 }
 
+/// Próbuje rozpoznac tekst przez nadpisany in-process OCR runner (np.
+/// `apple-ocr`). Zwraca `Some(result)` gdy runner jest ustawiony (i jego wynik),
+/// `None` gdy zaden override nie jest zarejestrowany — caller spada wtedy na
+/// wbudowany Burn `PlateOcr`. Dziala niezaleznie od `inference-vision-gpu`.
+async fn try_override_ocr(req: &VisionOcrRequest) -> Option<Result<Option<String>>> {
+    let runner = crate::vision::get_ocr_runner()?;
+    let rgb = req.rgb.clone();
+    let (width, height) = (req.width, req.height);
+    let out = tokio::task::spawn_blocking(move || runner.read(&rgb, width, height))
+        .await
+        .map_err(|e| anyhow::anyhow!("vision ocr task: {e}"))
+        .and_then(|r| r);
+    Some(out)
+}
+
 #[cfg(feature = "inference-vision-gpu")]
 #[async_trait]
 impl VisionDispatcher for VisionDispatcherImpl {
     async fn ocr(&self, req: VisionOcrRequest) -> Result<Option<String>> {
+        // Nadpisany runner (apple-ocr) ma pierwszenstwo nad wbudowanym Burn.
+        if let Some(out) = try_override_ocr(&req).await {
+            return out;
+        }
         let Some(runner) = crate::services::camera_ingest::vision_analysis::get_ocr().await else {
             return Ok(None); // runner unavailable → no text, never an error
         };
@@ -61,7 +80,12 @@ impl VisionDispatcher for VisionDispatcherImpl {
 #[cfg(not(feature = "inference-vision-gpu"))]
 #[async_trait]
 impl VisionDispatcher for VisionDispatcherImpl {
-    async fn ocr(&self, _req: VisionOcrRequest) -> Result<Option<String>> {
+    async fn ocr(&self, req: VisionOcrRequest) -> Result<Option<String>> {
+        // Bez Burn `PlateOcr` (brak `inference-vision-gpu`) jedyna sciezka OCR to
+        // nadpisany in-process runner, np. `apple-ocr` na macOS/iOS.
+        if let Some(out) = try_override_ocr(&req).await {
+            return out;
+        }
         Ok(None)
     }
     async fn classify(&self, _req: VisionClassifyRequest) -> Result<Vec<String>> {
