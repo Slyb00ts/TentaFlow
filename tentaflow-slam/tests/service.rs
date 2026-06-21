@@ -154,6 +154,30 @@ fn service_rejects_undecodable_frame() {
 }
 
 #[test]
+fn option_b_adopts_device_pose_verbatim() {
+    // Option B: adopt the device's own pose. The emitted GlobalPose must equal it
+    // EXACTLY (no ICP refinement, no drift), with full 6-DoF fidelity.
+    let mut svc = service();
+    let poses = [pose_tz(0.0, 0.0), pose_tz(1.2, 0.05), pose_tz(2.4, 0.10), pose_tz(3.6, 0.15)];
+    for (i, gt) in poses.iter().enumerate() {
+        let gp = svc.adopt_pose(*gt, i as i64 * 1000);
+        assert_eq!(gp.state, POSE_STATE_SCENE_LOCAL);
+        assert_eq!(gp.timestamp_us, i as i64 * 1000);
+        // Source = device odometry, NOT LiDAR (no ICP ran).
+        assert_eq!(gp.source, tentaflow_sdk_spec::POSE_SRC_ODOM);
+        assert_eq!(gp.source & POSE_SRC_LIDAR, 0, "must not claim LiDAR");
+        let t = gt.translation();
+        let q = gt.quat_xyzw();
+        for k in 0..3 {
+            assert!((gp.position[k] - t[k]).abs() < 1e-9, "position adopted verbatim");
+        }
+        for k in 0..4 {
+            assert!((gp.quat_xyzw[k] - q[k]).abs() < 1e-9, "orientation adopted verbatim");
+        }
+    }
+}
+
+#[test]
 fn decode_rejects_non_finite_points() {
     let frame = encode_xyz(&[[1.0, f32::NAN, 3.0]], 1);
     assert!(decode_lidar_frame(&frame).is_none(), "NaN coordinate must be rejected");

@@ -46,8 +46,8 @@ pub use protocol::{
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
     global_pose::{
         GlobalPoseFrame, GLOBAL_POSE_LEN, GLOBAL_POSE_VERSION, POSE_SRC_GNSS, POSE_SRC_IMU,
-        POSE_SRC_LIDAR, POSE_SRC_MAP, POSE_SRC_VISION, POSE_SRC_WIFI, POSE_STATE_GLOBAL,
-        POSE_STATE_LOST, POSE_STATE_SCENE_LOCAL,
+        POSE_SRC_LIDAR, POSE_SRC_MAP, POSE_SRC_ODOM, POSE_SRC_VISION, POSE_SRC_WIFI,
+        POSE_STATE_GLOBAL, POSE_STATE_LOST, POSE_STATE_SCENE_LOCAL,
     },
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
     lidar::{

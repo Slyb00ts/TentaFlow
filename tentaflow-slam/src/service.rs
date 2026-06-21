@@ -10,8 +10,8 @@
 
 use nalgebra::Point3;
 use tentaflow_sdk_spec::{
-    GlobalPoseFrame, GLOBAL_POSE_VERSION, POSE_SRC_IMU, POSE_SRC_LIDAR, POSE_STATE_LOST,
-    POSE_STATE_SCENE_LOCAL,
+    GlobalPoseFrame, GLOBAL_POSE_VERSION, POSE_SRC_IMU, POSE_SRC_LIDAR, POSE_SRC_ODOM,
+    POSE_STATE_LOST, POSE_STATE_SCENE_LOCAL,
 };
 
 use crate::frame::decode_lidar_frame;
@@ -60,7 +60,19 @@ impl SlamService {
         let decoded = decode_lidar_frame(bytes)?;
         self.last_timestamp_us = decoded.timestamp_us;
         let step = self.fe.process_scan(&decoded.points, prior);
-        Some(self.pose_frame(&step.track, prior.is_some()))
+        Some(self.pose_frame(&step.track, lidar_source(prior.is_some())))
+    }
+
+    /// OPTION B (UNIFIED_SLAM_ARCHITECTURE §15): adopt a trusted EXTERNAL device pose
+    /// (the Go2's own `sportmodestate` odometry) and emit it as a `GlobalPose`,
+    /// bypassing ICP. For a device that self-localizes against its own fused map we
+    /// trust its pose; its map is streamed to the renderer separately, so no geometry
+    /// is accumulated here (cross-robot fusion of such maps is a later phase).
+    pub fn adopt_pose(&mut self, pose: Pose, timestamp_us: i64) -> GlobalPoseFrame {
+        self.last_timestamp_us = timestamp_us;
+        let step = self.fe.ingest_posed(pose);
+        // The pose is the device's own odometry/fused estimate — NOT LiDAR/ICP.
+        self.pose_frame(&step.track, POSE_SRC_ODOM)
     }
 
     /// Ingest already-decoded points (e.g. core read them from the hub directly).
@@ -72,15 +84,13 @@ impl SlamService {
     ) -> GlobalPoseFrame {
         self.last_timestamp_us = timestamp_us;
         let step = self.fe.process_scan(points, prior);
-        self.pose_frame(&step.track, prior.is_some())
+        self.pose_frame(&step.track, lidar_source(prior.is_some()))
     }
 
-    fn pose_frame(&self, track: &TrackResult, had_prior: bool) -> GlobalPoseFrame {
+    /// Source bits for a LiDAR-tracked pose: LiDAR always, plus IMU when an IMU
+    /// prior fed the prediction.
+    fn pose_frame(&self, track: &TrackResult, source: u8) -> GlobalPoseFrame {
         let pose = self.fe.current_pose();
-        let mut source = POSE_SRC_LIDAR;
-        if had_prior {
-            source |= POSE_SRC_IMU;
-        }
         // Honest uncertainty: a rejected scan → Lost with huge covariance; an accepted
         // track → SceneLocal (metric, not georeferenced) with covariance DERIVED from
         // ICP quality (residual + inlier support), so a weak-but-accepted track is not
@@ -107,6 +117,16 @@ impl SlamService {
             cov_diag,
         }
     }
+}
+
+/// Source bitmask for a LiDAR-tracked pose: LiDAR always, plus IMU when an IMU
+/// prior contributed the motion prediction.
+fn lidar_source(had_imu_prior: bool) -> u8 {
+    let mut s = POSE_SRC_LIDAR;
+    if had_imu_prior {
+        s |= POSE_SRC_IMU;
+    }
+    s
 }
 
 /// Translational + rotational variance (m², rad²) from ICP quality: more residual

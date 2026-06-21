@@ -56,6 +56,9 @@ pub struct MappingFrontend {
     active_points: Vec<LocalPoint>,
     prev_submap: Option<SubmapId>,
     started: bool,
+    /// Latest pose, set by EITHER the tracker (`process_scan`) or an external
+    /// device pose (`ingest_posed`, option B). `current_pose()` returns this.
+    current_pose: Pose,
 }
 
 impl MappingFrontend {
@@ -79,6 +82,7 @@ impl MappingFrontend {
             active_points: Vec::new(),
             prev_submap: None,
             started: false,
+            current_pose: Pose::identity(),
         }
     }
 
@@ -87,7 +91,7 @@ impl MappingFrontend {
     }
 
     pub fn current_pose(&self) -> Pose {
-        self.tracker.pose()
+        self.current_pose
     }
 
     pub fn active_submap_id(&self) -> SubmapId {
@@ -107,19 +111,13 @@ impl MappingFrontend {
             self.active_anchor = track.pose;
             self.started = true;
         }
+        self.current_pose = track.pose;
 
         // Only accumulate geometry from a SUCCESSFULLY tracked scan — a rejected
         // (degraded) scan must not pollute the frozen submap, mirroring the tracker
         // not folding it into the local map.
         if track.ok {
-            let down = voxel_downsample(scan, self.submap_voxel);
-            let to_local = self.active_anchor.inverse();
-            for p in &down {
-                let world = track.pose.transform_point([p.x as f64, p.y as f64, p.z as f64]);
-                let loc = to_local.transform_point(world);
-                self.active_points
-                    .push(LocalPoint::xyz(loc[0] as f32, loc[1] as f32, loc[2] as f32));
-            }
+            self.accumulate(scan, track.pose);
         }
 
         let sealed = if self.should_seal(&track.pose) {
@@ -129,6 +127,35 @@ impl MappingFrontend {
         };
 
         MapStep { track, sealed }
+    }
+
+    /// Option B (UNIFIED_SLAM_ARCHITECTURE §15): adopt an EXTERNALLY supplied, trusted
+    /// pose (e.g. a Go2's own `sportmodestate` odometry) WITHOUT running ICP — for a
+    /// device that already self-localizes against its OWN fused map.
+    ///
+    /// It does NOT accumulate geometry: the device's `voxel_map_compressed` is its
+    /// whole world-frame map re-sent every frame, so per-scan accumulation would
+    /// duplicate it (and re-transforming already-world points would corrupt it). That
+    /// map is already streamed to the renderer separately; ingesting it into the SLAM
+    /// scene only matters for cross-robot fusion, handled in a later phase. Here we
+    /// just adopt the pose → `GlobalPose`. Returns `ok` with `icp: None`.
+    pub fn ingest_posed(&mut self, pose: Pose) -> MapStep {
+        self.started = true;
+        let delta = self.current_pose.relative_to(&pose);
+        self.current_pose = pose;
+        MapStep { track: TrackResult { pose, delta, icp: None, ok: true }, sealed: None }
+    }
+
+    /// Fold a sensor-frame scan into the active submap at `pose` (anchor-local).
+    fn accumulate(&mut self, scan: &[nalgebra::Point3<f32>], pose: Pose) {
+        let down = voxel_downsample(scan, self.submap_voxel);
+        let to_local = self.active_anchor.inverse();
+        for p in &down {
+            let world = pose.transform_point([p.x as f64, p.y as f64, p.z as f64]);
+            let loc = to_local.transform_point(world);
+            self.active_points
+                .push(LocalPoint::xyz(loc[0] as f32, loc[1] as f32, loc[2] as f32));
+        }
     }
 
     fn should_seal(&self, current: &Pose) -> bool {
