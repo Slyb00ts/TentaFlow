@@ -109,7 +109,8 @@ fn test_upsert_nodes_and_edges_counts() {
 }
 
 #[test]
-fn test_neighbors_datalog_query() {
+fn test_neighbors_out_edges() {
+    use super::backend::NeighborDir;
     let (_dir, mgr) = mgr();
     mgr.ensure_collection(ORG_A, "addon_a", "kg").unwrap();
     for (id, label) in [("n1", "Acme"), ("n2", "Globex"), ("n3", "Alice")] {
@@ -121,25 +122,13 @@ fn test_neighbors_datalog_query() {
     mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "n3", "knows", "n2", 0.5, "{}", "null")
         .unwrap();
 
-    // Sąsiedzi n3 (out-edges) z labelem celu — czyste zapytanie read-only.
-    let rows = mgr
-        .query(
-            ORG_A,
-            "addon_a",
-            "kg",
-            r"
-            ?[dst, rel, weight, label] :=
-                *edges{src: 'n3', dst, rel, weight},
-                *nodes{id: dst, label}
-            ",
-        )
+    // Sąsiedzi n3 (out-edges) przez bezpieczny prymityw host-budowany.
+    let out = mgr
+        .neighbors(ORG_A, "addon_a", "kg", "n3", NeighborDir::Out, None, 10)
         .unwrap();
-    assert_eq!(rows.rows.len(), 2);
-    let dsts: std::collections::HashSet<String> = rows
-        .rows
-        .iter()
-        .map(|r| r[0].get_str().unwrap().to_string())
-        .collect();
+    assert_eq!(out.len(), 2);
+    let dsts: std::collections::HashSet<String> =
+        out.iter().map(|(id, _, _)| id.clone()).collect();
     assert!(dsts.contains("n1") && dsts.contains("n2"));
 }
 
@@ -1168,3 +1157,11 @@ fn build_sample_graph() -> (TempDir, CozoBackend) {
     }
     (dir, be)
 }
+
+
+
+
+
+
+
+

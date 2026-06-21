@@ -143,6 +143,11 @@ pub struct AddonManifest {
     /// F1a tylko parsuje i przechowuje; vector API stub do F1c/F2.
     #[serde(default)]
     pub vector_namespaces: Vec<manifest::VectorNamespaceSpec>,
+    /// Deklaracje kolekcji grafowych z `[[graph_collection]]` (CozoDB,
+    /// services/graph). Addon MUSI zadeklarować kolekcję, żeby `graph_*` host-fn
+    /// jej dotknęły — blokuje ad-hoc kolekcje w runtime.
+    #[serde(default)]
+    pub graph_collections: Vec<manifest::GraphCollectionSpec>,
     /// Szablony Flow z `[[flow_template]]` — opt-in install do flow-engine.
     #[serde(default)]
     pub flow_templates: Vec<manifest::FlowTemplateSpec>,

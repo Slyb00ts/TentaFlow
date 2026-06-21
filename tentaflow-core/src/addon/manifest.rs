@@ -337,6 +337,26 @@ pub struct VectorFieldSpec {
 }
 
 // =============================================================================
+// Sekcja [[graph_collection]]
+// =============================================================================
+
+/// Deklaracja kolekcji grafowej addona (CozoDB, services/graph). Addon MUSI
+/// zadeklarować każdą kolekcję, której używa przez `graph_*` host-fn — to wiąże
+/// kolekcję z klasą danych RODO i opcjonalnym gate przy instalacji i blokuje
+/// tworzenie ad-hoc kolekcji w runtime (lustro `[[vector_namespace]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphCollectionSpec {
+    /// Nazwa kolekcji (np. "knowledge"). Unikalna w obrebie addona, walidowana
+    /// regexem nazw (`^[a-z0-9_-]{1,64}$`) tak jak namespace wektorowy.
+    pub name: String,
+    /// Klasa danych RODO: "A" / "B" / "C". Wplywa na audyt i retention.
+    pub data_class: String,
+    /// Opcjonalny gate ograniczajacy uzycie kolekcji (jak vector namespace).
+    #[serde(default)]
+    pub gate: Option<String>,
+}
+
+// =============================================================================
 // Sekcja [[flow_template]]
 // =============================================================================
 
@@ -686,6 +706,43 @@ pub fn validate_manifest_extensions(
     }
 
     Ok(())
+}
+
+/// Waliduje sekcje `[[graph_collection]]`: unikalne nazwy, klasa danych z
+/// `VECTOR_DATA_CLASSES` (A/B/C), poprawna nazwa kolekcji. Trzymane osobno od
+/// `validate_manifest_extensions`, żeby nie łamać jej stabilnej sygnatury (i
+/// testów). Wołane z `lifecycle::parse_manifest_toml` obok tamtej walidacji.
+pub fn validate_graph_collections(collections: &[GraphCollectionSpec]) -> Result<()> {
+    check_unique_ids("graph_collection", collections.iter().map(|c| c.name.as_str()))?;
+    for col in collections {
+        if !VECTOR_DATA_CLASSES.contains(&col.data_class.as_str()) {
+            bail!(
+                "graph_collection '{}' has invalid data_class '{}' (allowed: {:?})",
+                col.name,
+                col.data_class,
+                VECTOR_DATA_CLASSES
+            );
+        }
+        if !graph_collection_name_ok(&col.name) {
+            bail!(
+                "graph_collection '{}' has an invalid name (must match ^[a-z0-9_-]{{1,64}}$)",
+                col.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Walidacja nazwy kolekcji grafowej — identyczna reguła co
+/// `services::vector::namespace::validate_namespace_name`, ale bez zależności od
+/// tamtego (prywatnego) modułu w warstwie manifestu. Publiczna, bo host-fn
+/// `graph.rs` używa jej do odrzucenia złych nazw przed dispatch.
+pub fn graph_collection_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 fn validate_storage(cfg: &StorageConfig) -> Result<()> {

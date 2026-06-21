@@ -44,6 +44,15 @@ pub use protocol::{
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
+    // NOTE: graph's `GraphNode` is intentionally NOT re-exported here — it would
+    // collide with `ui::inline::GraphNode`. Reach it via `protocol::graph::GraphNode`.
+    graph::{
+        GraphDeleteInput, GraphDeleteOutput, GraphDeleteTarget, GraphDirection, GraphNeighbor,
+        GraphNeighborsInput, GraphNeighborsOutput, GraphPagerankInput, GraphPagerankOutput,
+        GraphPprInput, GraphPprOutput, GraphProp,
+        GraphRankedNode, GraphSeed, GraphUpsertEdgeInput, GraphUpsertEdgeOutput,
+        GraphUpsertNodeInput, GraphUpsertNodeOutput, Provenance,
+    },
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
     recording::{
         FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,

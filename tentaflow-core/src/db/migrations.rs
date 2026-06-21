@@ -467,7 +467,24 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_graph_collections",
             MigrationStep::Rust(create_addon_graph_collections),
         ),
+        (
+            86,
+            "roles_add_graph_permissions",
+            MigrationStep::Rust(roles_add_graph_permissions),
+        ),
     ]
+}
+
+/// v86 — udostępnia uprawnienia `graph.read`/`graph.write` rolom, które już mają
+/// odpowiedniki wektorowe (RAG 0.2). Admin/operator dostają zapis i odczyt,
+/// viewer tylko odczyt — lustro `vector.read`/`vector.write`.
+fn roles_add_graph_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator"],
+        &["graph.read", "graph.write"],
+    )?;
+    roles_add_permissions(conn, &["org_viewer"], &["graph.read"])
 }
 
 /// v85 — rejestr kolekcji grafowych CozoDB (services/graph) + kolumny limitów

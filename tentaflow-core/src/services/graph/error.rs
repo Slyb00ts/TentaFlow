@@ -4,8 +4,9 @@
 // `CozoBackend` i `GraphManager`. Lustro `vector::error::VectorError` — warianty
 // mapują się 1:1 na te same klasy problemów (nie znaleziono / już istnieje /
 // quota / nazwa / I/O / błąd backendu/DB), plus warianty specyficzne dla grafu
-// (`Datalog` — błąd zapytania Datalog niezaufanego addona). Host-fn dispatcher
-// (slice B1) mapuje to na `AbiError` tak jak robi to vector.
+// (`Datalog` — błąd wewnętrznego, host-budowanego zapytania Cozo; `ComputeBusy`
+// — fail-closed z capa współbieżności ciężkich prymitywów). Host-fn dispatcher
+// mapuje to na `AbiError` tak jak robi to vector.
 
 use std::path::PathBuf;
 
@@ -51,11 +52,11 @@ pub enum GraphError {
     #[error("invalid graph collection name '{0}' (must match ^[a-z0-9_-]{{1,64}}$)")]
     InvalidCollectionName(String),
 
-    #[error("invalid graph query: {0}")]
-    InvalidQuery(String),
-
     #[error("datalog error: {0}")]
     Datalog(String),
+
+    #[error("graph compute capacity exhausted ({scope} limit {max}) — try again")]
+    ComputeBusy { scope: &'static str, max: usize },
 
     #[error("graph backend error: {0}")]
     Backend(String),
