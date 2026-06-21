@@ -36,8 +36,14 @@ CBOR I/O, audit na każdej ścieżce wyjścia, zero stubów. Nadrzędny plan: `R
   „no such table" na świeżym `db::init(":memory:")`) — harness `:memory:`+pool czyta osobne puste połączenie;
   migration runner ma transakcję PER-migrację (nie all-or-nothing), a `flows` to wczesna tabela → nasze
   v85/v86 NIE mogą tego powodować (pliki-bazowane testy grafu przechodzą pełny łańcuch). Do naprawy osobno.
-- Następne: C0 (ExecutionContext +addon_id/+reranker/+vectors), C1 (document store), C2 (reranker node),
-  C3 (doc_parse node), C4 (vector node), D2 (quoty per-profil) — patrz kolejność.
+- **Slice C2 = 0.5 reranker flow node: ZROBIONE, codex GO** (po GO-WITH-CHANGES). Węzeł `reranker`
+  (`{query,candidates}`→`{ranked}`, cap 200/top_n), `RerankDispatcher` + `execute_rerank` reuse pętli
+  failoveru A1 (alias `rag-reranker`, metryka w jednym punkcie). Naprawiony recursion-hole: głębokość
+  flow propagowana przez `new_with_flow_depth` (guard `MAX_FLOW_DEPTH=3` narasta przy re-wejściu) — TEN
+  SAM fix dla embeddings; resolver pomija Embedded dla surface Rerank.
+- Następne: C4 (vector node + addon_id w ExecutionContext), C3 (doc_parse node nad vision services),
+  C1 (document/blob store per-instancja), D2 (quoty per-profil HW).
+- ⚠️ Buildy: TYLKO `/mnt/d` (CARGO_TARGET_DIR/TMPDIR/HOME), NIE /tmp ani /mnt/e (sieciowy). Wąskie testy.
 
 ## Spike CozoDB — wynik: GO (potwierdzone realnym uruchomieniem)
 
