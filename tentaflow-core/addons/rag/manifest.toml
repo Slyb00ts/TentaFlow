@@ -198,11 +198,23 @@ indexed = false
 # tozsamosc instancji do ExecutionContext, wiec wezel vector uderza w przestrzen
 # 'passages' TEJ instancji.
 
+# query MUSI byc pierwszy: register_engine_flows zapisuje nazwe PIERWSZEGO
+# engine-flow do KV instancji (engine_flow_model), ktora odczytuje narzedzie ask.
 [[engine_flow]]
 id = "query"
 path = "flows/query.flow.json"
 service_type = "chat"
-description = "Retrieval (embeddings -> vector search) -> kontekst -> LLM z cytatami."
+description = "Multi-hop RAG: petla retrieval-round (sedzia LLM) -> finalna odpowiedz z cytatami."
+
+# retrieval_round — cialo pojedynczego hopu, wykonywane przez loop block z query.
+# Rejestrowane jako osobny engine-flow, bo loop.body_flow_engine_id rozwiazuje je
+# po install-stabilnej published-name {addon_id}:retrieval_round (id wiersza flow
+# to losowy UUID nadawany przy install). NIE jest wolane bezposrednio jako model.
+[[engine_flow]]
+id = "retrieval-round"
+path = "flows/retrieval_round.flow.json"
+service_type = "chat"
+description = "Cialo jednego hopu petli multi-hop: embed -> vector -> rerank -> akumulacja -> sedzia."
 
 # --- Kolekcja grafowa (struktura gotowa, wypelniana w Etapie 2) ---
 

@@ -3734,9 +3734,18 @@ service_type = "chat"
         )
         .expect("rewrite instancji");
         let m = parse_manifest_toml(&rewritten).expect("parse manifestu instancji RAG");
-        assert_eq!(m.engine_flows.len(), 1);
+        // Manifest RAG ma DWA engine-flow: `query` (chat) + `retrieval-round`
+        // (ciało pętli multi-hop). Inwariant: `query` MUSI być pierwszy, bo
+        // register_engine_flows zapisuje nazwę PIERWSZEGO do engine_flow_model.
+        assert_eq!(m.engine_flows.len(), 2);
         assert_eq!(m.engine_flows[0].id, "query");
         assert_eq!(m.engine_flows[0].service_type, "chat");
+        let flow_ids: Vec<&str> = m.engine_flows.iter().map(|f| f.id.as_str()).collect();
+        assert!(flow_ids.contains(&"query"), "engine_flows: {flow_ids:?}");
+        assert!(
+            flow_ids.contains(&"retrieval-round"),
+            "engine_flows: {flow_ids:?}"
+        );
         // Przestrzeń 'passages' niesie pola text + collection_id (retrieval grounding).
         let passages = m
             .vector_namespaces

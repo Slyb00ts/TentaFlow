@@ -48,6 +48,26 @@ impl SubflowRunner {
         Self { db, registry }
     }
 
+    /// Resolves a published model name (`{addon_id}:{engine_flow_id}`) to the
+    /// flow row id. Addon engine-flows get a random UUID minted at install
+    /// (`register_engine_flow_atomic`), so an outer flow cannot hardcode the
+    /// body flow id in JSON; instead it names the body by its install-stable
+    /// published name and resolves it here at runtime. Used by `loop`/`subflow`
+    /// blocks whose body is a sibling engine-flow of the same addon instance.
+    pub async fn resolve_published_flow_id(&self, published_name: &str) -> Result<String> {
+        let pool = self.db.clone();
+        let name = published_name.to_string();
+        let id = tokio::task::spawn_blocking(move || {
+            repository::get_flow_id_by_published_model_name(&pool, &name)
+        })
+        .await
+        .map_err(|e| anyhow!("subflow_runner: join: {e}"))?
+        .map_err(|e| anyhow!("subflow_runner: resolve '{published_name}': {e}"))?;
+        id.ok_or_else(|| {
+            anyhow!("subflow_runner: no flow published as '{published_name}' (not installed?)")
+        })
+    }
+
     /// Runs `flow_id` with `initial_envelope` as its trigger input on a clone of
     /// `parent_ctx`. `extra_depth` is added to the parent depth (1 for a single
     /// nested run such as `subflow`/`agent`; `loop`/`map` bodies pass 1 too —
