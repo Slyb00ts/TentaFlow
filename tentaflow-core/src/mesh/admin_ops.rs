@@ -191,16 +191,27 @@ async fn pull_baseline_with_hint_retry(
                 return;
             }
             Err(e) => {
-                let waiting_for_hints =
-                    e.to_string().contains("no trusted contact hints for donor");
-                if waiting_for_hints && attempt < BACKOFF_SECS.len() {
+                // Retry transients that occur right after pairing while the iroh path is
+                // still settling: contact hints not yet resolved, OR the freshly-opened
+                // baseline stream dropping (relay->direct path switch) before/while the
+                // snapshot transfers. Both clear within seconds once the link stabilizes.
+                let es = e.to_string();
+                let retryable = es.contains("no trusted contact hints for donor")
+                    || es.contains("connection lost")
+                    || es.contains("connection reset")
+                    || es.contains("connection closed")
+                    || es.contains("ConnectionLost")
+                    || es.contains("timed out")
+                    || es.contains("timeout");
+                if retryable && attempt < BACKOFF_SECS.len() {
                     let delay = BACKOFF_SECS[attempt];
                     attempt += 1;
                     info!(
                         donor = %donor_node_id,
                         attempt,
                         delay_secs = delay,
-                        "baseline adopt: donor contact hints not resolved yet — retrying pull"
+                        reason = %es,
+                        "baseline adopt: transient pull error — retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     continue;
