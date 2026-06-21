@@ -1,14 +1,14 @@
 /* =============================================================================
    Plik: robots.css
-   Opis: Style modułu Roboty — siatka kart robotów wykrytych w sieci mesh:
-         nagłówek karty ze statusem, metryki (bateria/RTT/węzeł), chipy
-         możliwości, kafelek live kamery oraz rząd przycisków sterowania.
+   Opis: Style modułu Roboty — dwa widoki: LISTA (siatka kart ze statusem,
+         KPI, szybkim sterowaniem i chipami możliwości) oraz SZCZEGÓŁY
+         (pasek narzędzi, 4 KPI, rząd akcji, zakładki: przegląd / kamera /
+         LiDAR 3D / sterowanie / informacje / log) z kafelkami kamery, kafelkiem
+         głębi LiDAR (canvas wgpu), telemetrią, modelem 3D i dziennikiem.
    ============================================================================= */
 
-.robots-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 16px;
+.robots-root {
+  display: block;
 }
 
 .robots-loading {
@@ -17,84 +17,130 @@
   padding: 48px 0;
 }
 
+/* ============================== LISTA ====================================== */
+
+.robots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 16px;
+}
+
 .robots-card {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
   padding: 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--bg-card);
 }
 
-.robots-card-top {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+.robots-card:hover {
+  border-color: var(--border-hover);
+}
+
+.robots-card.off {
+  opacity: 0.72;
+}
+
+.robots-card-head {
+  display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
-.robots-card-ico {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  border-radius: var(--radius-sm);
-  background: var(--accent-glow);
-  color: var(--accent-2);
-}
-
-.robots-card-ico .icon {
-  width: 22px;
-  height: 22px;
-}
-
-.robots-card-name {
+.robots-card-title {
   font-weight: 700;
+  font-size: 15px;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.robots-card-kind {
-  font-size: 12px;
+.robots-card-spacer {
+  flex: 1;
+}
+
+.robots-card-id {
   color: var(--text-3);
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
 }
 
-.robots-metrics {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.robots-metric {
+.robots-kpis {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.robots-kpi {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 9px 11px;
+}
+
+.robots-kpi-l {
+  color: var(--text-3);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.robots-kpi-v {
+  font-size: 17px;
+  font-weight: 700;
+  margin-top: 2px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.robots-kpi-v small {
+  font-size: 11px;
+  color: var(--text-2);
+  font-weight: 600;
+  margin-left: 1px;
+}
+
+.robots-kpi-status {
+  font-size: 14px;
+}
+
+.robots-kpi-status[data-tone="success"] { color: var(--success); }
+.robots-kpi-status[data-tone="warning"] { color: var(--warning); }
+
+.robots-card-ctl {
+  display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  flex-wrap: wrap;
 }
 
-.robots-metric-ico {
-  display: inline-flex;
-  color: var(--text-3);
+.robots-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 30px);
+  grid-template-rows: repeat(2, 30px);
+  gap: 3px;
+  margin-left: auto;
 }
 
-.robots-metric-ico .icon {
-  width: 16px;
-  height: 16px;
+.robots-dpad tf-button {
+  width: 30px;
+  height: 30px;
 }
 
-.robots-metric-label {
-  color: var(--text-2);
+.robots-dpad-sp {
+  visibility: hidden;
 }
 
-.robots-metric-value {
-  color: var(--text);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+.robots-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
 }
 
 .robots-caps {
@@ -103,134 +149,428 @@
   gap: 6px;
 }
 
-/* Structured runtime telemetry panel (gait / velocity / IMU / battery detail).
-   Compact label+value rows mirroring the metric rows; hidden when the robot
-   reports no telemetry. */
-.robots-telemetry {
+/* ============================ SZCZEGÓŁY ==================================== */
+
+.robots-detail {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
-  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-sm);
-  background: var(--bg-2);
+  gap: 0;
 }
 
-.robots-telemetry-title {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-3);
-}
-
-.robots-telemetry-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.robots-telemetry-row {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: baseline;
-  gap: 8px;
-  font-size: 13px;
-}
-
-.robots-telemetry-label {
-  color: var(--text-2);
-}
-
-.robots-telemetry-value {
-  color: var(--text);
-  font-weight: 600;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.robots-lidar {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
-  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
-  border-radius: var(--radius-sm);
-  background: var(--bg-2);
-}
-
-.robots-lidar-title {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-3);
-}
-
-.robots-lidar-row {
+.robots-detail-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
+  margin-bottom: 16px;
+}
+
+.robots-detail-name {
+  font-size: 19px;
+  font-weight: 800;
+  margin: 0;
+  color: var(--text);
+}
+
+.robots-detail-id {
+  color: var(--text-3);
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+}
+
+.robots-detail-spacer {
+  flex: 1;
+}
+
+.robots-detail-conn {
   font-size: 13px;
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.robots-detail-conn::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.robots-detail-conn[data-state="reconnect"]::before {
+  background: var(--warning);
+}
+
+.robots-detail-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.robots-dkpi {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.robots-dkpi-l {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.robots-dkpi-l .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.robots-dkpi-v {
+  font-size: 22px;
+  font-weight: 800;
+  margin-top: 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.robots-dkpi-u {
+  font-size: 12px;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.robots-dkpi-mode[data-tone="success"] { color: var(--success); font-size: 18px; }
+.robots-dkpi-mode[data-tone="warning"] { color: var(--warning); font-size: 18px; }
+
+.robots-dkpi-d {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.robots-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 16px 0 18px;
+}
+
+.robots-detail-panel {
+  margin-top: 14px;
+}
+
+/* Sekcje (karty) w panelu szczegółów. */
+.robots-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+.robots-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.robots-section-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.robots-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+/* Kafelki kamera + LiDAR (przegląd) lub pełnoekranowe (zakładki). */
+.robots-tiles {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.robots-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.robots-tile-full {
+  min-height: 540px;
+}
+
+.robots-tile-empty {
+  min-height: 200px;
+  align-items: center;
+  justify-content: center;
+}
+
+.robots-tile-ph {
+  padding: 24px;
+  color: var(--text-3);
+  font-size: 13px;
+  text-align: center;
+}
+
+.robots-tile-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.robots-tile-title {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.robots-tile-rec {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.robots-tile-rec[data-tone="live"] { color: var(--success); }
+.robots-tile-rec[data-tone="info"] { color: var(--accent-2); }
+.robots-tile-rec[data-tone="warning"] { color: var(--warning); }
+.robots-tile-rec[data-tone="muted"] { color: var(--text-3); }
+
+.robots-tile tf-video-stream {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+}
+
+.robots-tile-bottom {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+}
+
+/* Kafelek głębi LiDAR — canvas renderera wgpu. */
+.robots-voxel {
+  position: relative;
+  width: 100%;
+  min-height: 240px;
+  flex: 1;
+  background:
+    radial-gradient(circle at 38% 62%, rgba(239, 68, 68, 0.18), transparent 42%),
+    radial-gradient(circle at 66% 36%, rgba(59, 130, 246, 0.18), transparent 46%),
+    var(--bg);
+}
+
+.robots-tile-full .robots-voxel {
+  min-height: 480px;
+}
+
+.robots-voxel-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  inset: 0;
+}
+
+.robots-voxel-ph {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+  padding: 16px;
+}
+
+.robots-lidar-bar {
+  border-top: 1px solid var(--border);
+}
+
+.robots-lidar-label {
+  font-size: 13px;
+  color: var(--text-2);
 }
 
 .robots-lidar-status {
+  margin-left: auto;
+  font-size: 13px;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
 
 .robots-lidar-diag {
-  margin-top: 4px;
+  padding: 6px 12px 10px;
   font-size: 11px;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
-.robots-camera {
+/* Telemetria — lista klucz/wartość. */
+.robots-kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 9px 16px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.robots-kv dt {
+  color: var(--text-3);
+}
+
+.robots-kv dd {
+  margin: 0;
+  text-align: right;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sterowanie — grupy i rzędy przycisków. */
+.robots-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.robots-control-group {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.robots-camera tf-video-stream {
-  width: 100%;
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  background: var(--bg-2);
-}
-
-.robots-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: auto;
-  padding-top: 4px;
-}
-
-/* Inline refusal shown when a parametered action's descriptor is missing a
-   required param or is ambiguous — the send button stays disabled. */
-.robots-param-error {
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--danger, #dc3545);
-}
-
-/* Live 3D robot tile (interim Three.js robot-view). */
-.robots-robot3d {
-  background: var(--bg-2, #0a0d24);
-  border: 1px solid var(--border, #1f2548);
-  border-radius: var(--radius, 10px);
-  overflow: hidden;
-}
-.robots-robot3d-title {
+.robots-control-group-title {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--text-3, #6a7196);
-  padding: 8px 10px 0;
+  color: var(--text-3);
 }
+
+.robots-controls-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.robots-controls-empty {
+  font-size: 13px;
+  color: var(--text-3);
+}
+
+.robots-param-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  min-width: 160px;
+}
+
+.robots-param-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.robots-param-error {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+/* Model 3D na żywo (tf-robot-view). */
+.robots-robot3d {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
 .robots-robot3d-view {
   display: block;
   width: 100%;
-  height: 220px;
+  height: 280px;
+}
+
+/* Dziennik zdarzeń. */
+.robots-log {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 420px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+.robots-log-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.robots-log-row:nth-child(odd) {
+  background: var(--bg-2);
+}
+
+.robots-log-time {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, monospace;
+}
+
+.robots-log-text {
+  color: var(--text);
+}
+
+.robots-log-error .robots-log-text {
+  color: var(--danger);
+}
+
+.robots-log-success .robots-log-text {
+  color: var(--success);
+}
+
+/* Responsywność. */
+@media (max-width: 1100px) {
+  .robots-detail-kpis {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .robots-tiles,
+  .robots-panels {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .robots-grid {
+    grid-template-columns: 1fr;
+  }
+  .robots-detail-kpis {
+    grid-template-columns: 1fr;
+  }
 }

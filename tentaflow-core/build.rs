@@ -24,6 +24,11 @@ fn main() {
     // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
     build_protocol_wasm_bindings();
 
+    // Zbuduj tentaflow-voxel-wasm (browser WebGPU/WebGL voxel point-cloud
+    // renderer) i wygeneruj wasm-bindgen JS glue do www/js/voxel/.
+    // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
+    build_voxel_wasm_bindings();
+
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
     // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
@@ -1951,6 +1956,128 @@ fn build_protocol_wasm_bindings() {
         }
         Err(e) => {
             panic!("nie udalo sie uruchomic wasm-bindgen: {}", e);
+        }
+    }
+}
+
+/// Buduje crate tentaflow-voxel-wasm do targetu wasm32-unknown-unknown, potem
+/// wola wasm-bindgen CLI (target=web) zeby wygenerowac JS glue do www/js/voxel/
+/// (voxel_glue.js + voxel_glue_bg.wasm). Te pliki sa pozniej embedowane do
+/// binarki przez generate_wwwroot_embed.
+///
+/// Non-blocking jak build_protocol_wasm_bindings: brak wasm32-unknown-unknown
+/// targetu lub brak wasm-bindgen CLI skutkuje cargo:warning, nie bledem — robot
+/// LiDAR tab po prostu nie wczyta renderera, reszta dashboardu dziala.
+fn build_voxel_wasm_bindings() {
+    let crate_dir = Path::new("../tentaflow-voxel-wasm");
+    let out_js_dir = Path::new("www/js/voxel");
+
+    if !crate_dir.exists() {
+        println!(
+            "cargo:warning=build_voxel_wasm_bindings: brak crate {}, pomijam",
+            crate_dir.display()
+        );
+        return;
+    }
+
+    // Rerun-if-changed hooks na zrodlach crate'a. Per-plik (rekursja), bo
+    // rerun-if-changed na katalogu lapie tylko dodanie/usuniecie wpisu, nie
+    // edycje istniejacego src/lib.rs — bez tego edycja renderera zostawialaby
+    // stary voxel_glue_bg.wasm w embedzie.
+    println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
+    for f in walkdir_rs(&crate_dir.join("src")) {
+        println!("cargo:rerun-if-changed={}", f.display());
+    }
+
+    if !check_wasm_browser_target() {
+        println!(
+            "cargo:warning=tentaflow-voxel-wasm: brak wasm32-unknown-unknown targetu \
+             (zainstaluj: rustup target add wasm32-unknown-unknown), pomijam generacje JS glue"
+        );
+        return;
+    }
+
+    let bindgen_version = detect_wasm_bindgen_version().unwrap_or_else(|| "unknown".to_string());
+    if bindgen_version == "unknown" {
+        println!(
+            "cargo:warning=tentaflow-voxel-wasm: brak wasm-bindgen CLI w PATH \
+             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.120 --locked), pomijam"
+        );
+        return;
+    }
+
+    // Oddzielny target dir zeby uniknac lockingu na parent cargo.
+    let isolated_target =
+        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("voxel_wasm_target");
+    std::fs::create_dir_all(&isolated_target).ok();
+
+    let status = Command::new("cargo")
+        .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
+        .current_dir(crate_dir)
+        .env("CARGO_TARGET_DIR", &isolated_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:warning=tentaflow-voxel-wasm: kompilacja wasm32 OK");
+        }
+        Ok(s) => {
+            println!(
+                "cargo:warning=tentaflow-voxel-wasm: cargo build zakonczone kodem {}, pomijam glue",
+                s
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow-voxel-wasm: nie udalo sie uruchomic cargo: {}, pomijam",
+                e
+            );
+            return;
+        }
+    }
+
+    let wasm_file =
+        isolated_target.join("wasm32-unknown-unknown/release/tentaflow_voxel_wasm.wasm");
+    if !wasm_file.exists() {
+        println!(
+            "cargo:warning=tentaflow-voxel-wasm: brak wynikowego .wasm: {}, pomijam",
+            wasm_file.display()
+        );
+        return;
+    }
+
+    std::fs::create_dir_all(out_js_dir).ok();
+    let status = Command::new("wasm-bindgen")
+        .args(["--target", "web", "--out-dir"])
+        .arg(out_js_dir)
+        .args(["--out-name", "voxel_glue", "--no-typescript"])
+        .arg(&wasm_file)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "cargo:warning=tentaflow-voxel-wasm: wasm-bindgen ({}) wygenerowal glue do {}",
+                bindgen_version,
+                out_js_dir.display()
+            );
+        }
+        Ok(s) => {
+            panic!(
+                "wasm-bindgen (voxel) zakonczone kodem {} — JS glue moze byc niespojny z .wasm. \
+                 Sprawdz czy `wasm-bindgen --version` zgadza sie z \
+                 `tentaflow-voxel-wasm/Cargo.toml`. Reinstall: \
+                 `cargo install wasm-bindgen-cli --version <X.Y.Z> --locked`.",
+                s
+            );
+        }
+        Err(e) => {
+            panic!("nie udalo sie uruchomic wasm-bindgen (voxel): {}", e);
         }
     }
 }

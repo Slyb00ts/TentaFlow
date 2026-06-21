@@ -1,0 +1,51 @@
+[package]
+name = "tentaflow-voxel-wasm"
+version = "0.1.0"
+edition = "2021"
+authors = ["TentaFlow"]
+description = "Browser WebGPU/WebGL point-cloud (voxel) renderer — wgpu + wasm-bindgen, instanced cubes"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# wasm-bindgen version MUST match the pinned version the repo uses
+# (tentaflow-protocol-wasm/Cargo.toml). The wasm-bindgen CLI in build.rs is
+# installed at this exact version; a mismatch produces incompatible JS glue.
+wasm-bindgen = "=0.2.120"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3.97"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "WheelEvent",
+    "PointerEvent",
+    "Event",
+    "EventTarget",
+    "AddEventListenerOptions",
+] }
+
+# wgpu with the webgl backend so the renderer works on browsers without native
+# WebGPU (Firefox, Safari, older Chrome). The webgl backend targets WebGL2.
+wgpu = { version = "0.20", default-features = false, features = ["webgl", "wgsl"] }
+
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.27", features = ["bytemuck"] }
+
+# getrandom with `js` — wgpu pulls transitive deps that need an RNG on wasm.
+getrandom = { version = "0.2", features = ["js"] }
+
+# Browser panic hook + logging.
+console_error_panic_hook = { version = "0.1.7", optional = true }
+log = "0.4"
+console_log = { version = "1", optional = true }
+
+[features]
+default = ["console_error_panic_hook", "console_log"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
