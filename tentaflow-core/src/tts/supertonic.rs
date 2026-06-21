@@ -795,11 +795,26 @@ fn ensure_ort_dylib() {
         } else {
             "libonnxruntime.so"
         };
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                candidates.push(dir.join(libname));
-                candidates.push(dir.join("lib").join(libname));
+                search_dirs.push(dir.to_path_buf());
+                search_dirs.push(dir.join("lib"));
+            }
+        }
+        // Katalogi z linkera (`LD_LIBRARY_PATH` / `DYLD_*`) — deploy uruchamia
+        // binarke z `native-libs/<platform>/lib-dynamic` na tej liscie, gdzie
+        // lezy (czesto wylacznie wersjonowany) libonnxruntime.
+        let linker_var = if cfg!(target_os = "macos") {
+            "DYLD_LIBRARY_PATH"
+        } else if cfg!(target_os = "windows") {
+            "PATH"
+        } else {
+            "LD_LIBRARY_PATH"
+        };
+        if let Some(paths) = std::env::var_os(linker_var) {
+            for dir in std::env::split_paths(&paths) {
+                search_dirs.push(dir);
             }
         }
         for base in [
@@ -808,14 +823,49 @@ fn ensure_ort_dylib() {
             "/usr/local/lib",
             "/opt/onnxruntime/lib",
             "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
         ] {
-            candidates.push(std::path::Path::new(base).join(libname));
+            search_dirs.push(std::path::PathBuf::from(base));
         }
-        if let Some(found) = candidates.into_iter().find(|p| p.exists()) {
+
+        // Najpierw dokladna nazwa (`libonnxruntime.so`), potem wersjonowana
+        // (`libonnxruntime.so.1.22.0`) — native-libs dostarcza tylko wersjonowany
+        // plik, wiec bez tego fallbacku ort load-dynamic nie znajduje runtime'u.
+        let found = search_dirs.iter().map(|d| d.join(libname)).find(|p| p.exists())
+            .or_else(|| find_versioned_dylib(&search_dirs, libname));
+        if let Some(found) = found {
             std::env::set_var("ORT_DYLIB_PATH", &found);
             tracing::info!("[supertonic] ORT_DYLIB_PATH -> {}", found.display());
+        } else {
+            tracing::warn!(
+                "[supertonic] nie znaleziono {libname} (ani wersjonowanego) — ort load-dynamic zawiedzie"
+            );
         }
     });
+}
+
+/// Szuka wersjonowanego `<libname>.<ver>` (np. `libonnxruntime.so.1.22.0`) w
+/// podanych katalogach — `ensure_ort_dylib` probuje go gdy brak dokladnej nazwy.
+fn find_versioned_dylib(
+    dirs: &[std::path::PathBuf],
+    libname: &str,
+) -> Option<std::path::PathBuf> {
+    let prefix = format!("{libname}.");
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
 impl SupertonicTtsEngine {
