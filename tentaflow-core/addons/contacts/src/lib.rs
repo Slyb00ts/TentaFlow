@@ -15,6 +15,7 @@ use serde_json::Value as JsonValue;
 
 use tentaflow_sdk_spec::protocol::ui::bind::{PathSegment, StatePath};
 use tentaflow_sdk_spec::protocol::ui::component::{Component, FieldMap, HandlerMap};
+use tentaflow_sdk_spec::protocol::ui::typed_field::encode_to_value;
 use tentaflow_sdk_spec::protocol::ui::a11y::EventKind;
 use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
 use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
@@ -501,9 +502,11 @@ fn build_person_form() -> Component {
 // =============================================================================
 
 fn encode_children(children: &[Component]) -> CborValue {
-    let mut buf = Vec::with_capacity(256);
-    minicbor::encode(children, &mut buf).unwrap();
-    CborValue::Bytes(buf)
+    // Children must be a CBOR Array Value (one element per child Component), the
+    // same shape the spec's typed builders emit and the renderer decodes. The old
+    // code wrapped the encoded array in CborValue::Bytes, so the renderer saw a
+    // byte blob instead of an array ("Stack.children: expected Array, got object").
+    encode_to_value(&children.to_vec()).unwrap()
 }
 
 fn encode_nav_items() -> CborValue {
