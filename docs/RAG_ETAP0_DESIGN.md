@@ -471,3 +471,13 @@ H. **Delete finalny i serializowany nawet przy cache-miss** (`collection.rs:813`
   Migracje v87/v88. document_put/get/delete/list_v1.
 - Następne: PDF→obraz (rasteryzer Rust, cross-platform) → doc_parse obsługuje PDF (per strona) →
   multi-detektor nv-ingest → **addon RAG** (manifest/flows/GUI/logika — Etap 1 właściwy).
+
+## STATUS — Etap 0/ingest ZAKOŃCZONE, start Etapu 1 (addon RAG)
+- **E1.4 PDF→obraz** ✅ (codex GO-WITH-CHANGES→fix): pdfium-render (feature `pdf`), build-pdfium.sh
+  (prebuilt+SHA256+hardened tar), rasteryzacja **streaming** (bounded channel, O(1 strona)), wpięte w
+  execute_documents (multi-page parse+merge), anti-DoS capy, izolacja symboli FPDF_*.
+- **Warstwa prymitywów RAG kompletna**: graf(CozoDB)+host fns, wektory+host fns/węzeł, aliasy+fallback,
+  reranker/vector/graph_search węzły, tożsamość addon→flow_engine, doc_parse(obraz+PDF), document store.
+- **Etap 1 (addon RAG)** — start: manifest (aliasy rag-*, namespaces, flow_template, [application], perms),
+  per-instance SQLite (collections/documents/chunks/ingest_jobs), logika ingestu w WASM
+  (document→doc_parse→chunk→embed→vector+graf), logika query (trigger flow→retrieval→answer), GUI.
