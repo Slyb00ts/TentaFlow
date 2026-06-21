@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
+use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -62,7 +62,7 @@ impl NodeAdapter for OutputNodeAdapter {
 
     async fn execute(
         &self,
-        _node: &FlowNode,
+        node: &FlowNode,
         inputs: &[NodeInput],
         _ctx: &ExecutionContext,
     ) -> Result<FlowEnvelope> {
@@ -76,26 +76,54 @@ impl NodeAdapter for OutputNodeAdapter {
         // konsumencie), ale my wiemy ze edge.to_port to nasz input port. W
         // executor.rs build_inputs przekazuje wszystkie krawedzie incoming —
         // dopasowanie po typie payloadu jest najprostszym sygnałem.
-        for prio in PORT_PRIORITY {
+        let mut primary: Option<FlowEnvelope> = None;
+        'outer: for prio in PORT_PRIORITY {
             let prio_type = self.input_port_type(prio);
             for inp in inputs {
                 let payload_kind =
                     crate::flow_engine::types::FlowDataType::from_value(&inp.envelope.payload);
                 if payload_kind == Some(prio_type) {
-                    return Ok((*inp.envelope).clone());
+                    primary = Some((*inp.envelope).clone());
+                    break 'outer;
                 }
             }
         }
         // Zaden input nie pasuje do typed portow — zwroc pierwszy (Any
         // fallback, np. Empty / Json).
-        Ok((*inputs[0].envelope).clone())
+        let mut out = primary.unwrap_or_else(|| (*inputs[0].envelope).clone());
+
+        // RAG E2.0 — gdy flow jawnie tego zażąda (`emit_citations: true`) i
+        // envelope niesie realne cytaty retrievalu w meta["rag_citations"],
+        // serializuj odpowiedź jako `{answer, citations}` JSON do payloadu Text.
+        // Dzięki temu addon dostaje odpowiedź LLM RAZEM z cytatami wybranymi
+        // dokładnie przez retrieval (jedno źródło prawdy), bez osobnego SELECT-a.
+        // Bez flagi output zachowuje się jak dotąd (passthrough) — generyczne
+        // flow nie są dotknięte.
+        let emit = node
+            .config
+            .get("emit_citations")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if emit {
+            if let (Some(answer), Some(citations)) = (
+                out.payload.as_text().map(str::to_string),
+                out.meta.get("rag_citations").cloned(),
+            ) {
+                let wrapped = serde_json::json!({
+                    "answer": answer,
+                    "citations": citations,
+                });
+                out.payload =
+                    FlowValue::Text(serde_json::to_string(&wrapped).unwrap_or(answer));
+            }
+        }
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_engine::envelope::FlowValue;
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use std::sync::Arc;
 
@@ -165,6 +193,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.payload.as_text(), Some("priority-wins"));
+    }
+
+    #[tokio::test]
+    async fn output_emits_answer_and_citations_when_flagged() {
+        // RAG E2.0 bug 2 — z emit_citations output serializuje {answer, citations}
+        // z meta.rag_citations (realne hity) razem z tekstem LLM.
+        let adapter = OutputNodeAdapter::new();
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("Odpowiedz LLM".into()));
+        env.meta.insert(
+            "rag_citations".into(),
+            serde_json::json!([{"doc_id": "d1", "chunk_index": 3, "text": "t", "score": 0.2}]),
+        );
+        let inputs = vec![NodeInput {
+            from_node_id: "llm".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(env),
+        }];
+        let node = FlowNode {
+            id: "out-1".into(),
+            node_type: "output".into(),
+            config: serde_json::json!({ "emit_citations": true }),
+            position: None,
+            label: None,
+            region: None,
+        };
+        let r = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap();
+        let text = r.payload.as_text().expect("payload Text");
+        let parsed: serde_json::Value = serde_json::from_str(text).expect("treść to JSON");
+        assert_eq!(parsed["answer"].as_str(), Some("Odpowiedz LLM"));
+        assert_eq!(parsed["citations"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(parsed["citations"][0]["doc_id"].as_str(), Some("d1"));
+        assert_eq!(parsed["citations"][0]["chunk_index"].as_i64(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn output_passthrough_without_flag() {
+        // Bez emit_citations output zachowuje się jak passthrough (generyczne flow).
+        let adapter = OutputNodeAdapter::new();
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("plain".into()));
+        env.meta
+            .insert("rag_citations".into(), serde_json::json!([{"doc_id": "d"}]));
+        let inputs = vec![NodeInput {
+            from_node_id: "llm".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(env),
+        }];
+        let r = adapter
+            .execute(&output_node(), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(r.payload.as_text(), Some("plain"));
     }
 
     #[tokio::test]

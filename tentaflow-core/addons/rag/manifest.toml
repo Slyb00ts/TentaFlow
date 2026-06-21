@@ -90,6 +90,18 @@ display_name = "Interfejs RAG"
 description = "Renderuje panel RAG (kolekcje, status ingestu) w launcherze."
 risk = "low"
 
+[[permission]]
+id = "state.read"
+display_name = "Odczyt stanu instancji"
+description = "Czyta instancyjny stan KV (m.in. nazwe published query-flow z install)."
+risk = "low"
+
+[[permission]]
+id = "state.write"
+display_name = "Zapis stanu instancji"
+description = "Zapis instancyjnego stanu KV (rezerwa pod cache zapytan RAG)."
+risk = "low"
+
 # --- Aliasy modeli wystawiane przez addon (z suggested_default) ---
 
 [[alias]]
@@ -166,6 +178,32 @@ name = "created_at"
 type = "int"
 indexed = false
 
+# collection_id — indeksowane, by query-flow mogl filtrowac retrieval po kolekcji.
+[[vector_namespace.fields]]
+name = "collection_id"
+type = "str"
+indexed = true
+
+# text — tresc chunka przechowywana przy wektorze, by query-flow (vector search)
+# mogl zwrocic ja przez output_fields i zbudowac kontekst dla LLM bez siegania do
+# instancyjnego SQLite z poziomu wezla flow. Nieindeksowane (nie filtrujemy po tresci).
+[[vector_namespace.fields]]
+name = "text"
+type = "str"
+indexed = false
+
+# --- Flow zapytania (flow_engine) ---
+# Rejestrowany przy install instancji jako published model "{addon_id}:query".
+# Addon wyzwala go przez llm_generate(model=<ta nazwa>); executor przepisuje
+# tozsamosc instancji do ExecutionContext, wiec wezel vector uderza w przestrzen
+# 'passages' TEJ instancji.
+
+[[engine_flow]]
+id = "query"
+path = "flows/query.flow.json"
+service_type = "chat"
+description = "Retrieval (embeddings -> vector search) -> kontekst -> LLM z cytatami."
+
 # --- Kolekcja grafowa (struktura gotowa, wypelniana w Etapie 2) ---
 
 [[graph_collection]]
@@ -220,6 +258,30 @@ id = "list_collections"
 display_name = "Lista kolekcji"
 description = "Zwraca wszystkie kolekcje instancji RAG."
 keywords = ["rag", "collection", "list"]
+
+[[tool]]
+id = "ask"
+display_name = "Zapytanie RAG"
+description = "Retrieval + LLM: zadaje pytanie do kolekcji i zwraca odpowiedz z cytatami."
+keywords = ["rag", "ask", "query", "pytanie", "retrieval", "answer"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji, ktorej dotyczy pytanie."
+required = true
+
+[[tool.parameter]]
+name = "question"
+param_type = "string"
+description = "Pytanie uzytkownika."
+required = true
+
+[[tool.parameter]]
+name = "top_k"
+param_type = "integer"
+description = "Liczba pasazy do pobrania (domyslnie 10)."
+required = false
 
 [[tool]]
 id = "ingest_document"

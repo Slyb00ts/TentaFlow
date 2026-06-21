@@ -126,9 +126,30 @@ impl Router {
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
-            let (mut initial, meta) =
+            let (mut initial, mut meta) =
                 crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
                     .await?;
+            // RAG E2.0 (enabler) — przeprowadź tożsamość addona-callera do
+            // FlowRequestMeta. Gdy chat jest wyzwolony przez addon (host-fn
+            // llm_generate ustawia compliance_context.addon_id/org_id), executor
+            // skopiuje to do ExecutionContext, dzięki czemu węzeł `vector` flow
+            // uderza w przestrzeń wektorową TEJ instancji. /v1 user / kamera /
+            // agent nie mają addon_id => meta zostaje bez tożsamości.
+            if let Some(ctx) = compliance_context.as_ref() {
+                if meta.addon_id.is_none() {
+                    meta.addon_id = ctx.addon_id.clone();
+                }
+                if meta.org_id.is_none() {
+                    meta.org_id = ctx.org_id.clone();
+                }
+                // RAG E2.0 — przenieś allowlistowane opcje retrievalu
+                // (collection_id, top_k) z host-fn llm_generate do envelope.meta.
+                // Węzeł `vector` czyta z meta filtr po kolekcji i top_k. Klucze
+                // już-obecne w seedzie (z requestu) mają pierwszeństwo.
+                for (k, v) in &ctx.flow_meta {
+                    initial.meta.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
             // §3.4: seed the turn's correlation key with the session event's
             // request_id so every per-call `llm` event in the flow links back to
             // this one row. Without a session event (no DB) there is nothing to

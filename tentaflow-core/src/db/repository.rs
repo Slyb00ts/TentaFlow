@@ -3737,15 +3737,42 @@ pub fn get_default_flow_for_service_type(
 
 pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
+    // Bug 5 (LIKE wildcard) — `model_pattern` to glob z `*` jako jedynym
+    // wildcardem. Bez ochrony znaki LIKE `_`/`%`/`\` we wzorcu (a engine-flow
+    // published-name to `{addon_id}:{id}`, gdzie `_` jest legalne) działałyby
+    // jako wildcardy LIKE: `col_a` zmatchowałby `colXa`. Escapujemy je tu w SQL:
+    // najpierw `\`→`\\`, `%`→`\%`, `_`→`\_`, a DOPIERO potem `*`→`%`. Dzięki temu
+    // tylko jawny `*` jest wildcardem; reszta wzorca jest literalna. ESCAPE '\'
+    // mówi LIKE, że `\` poprzedza znak literalny.
     let mut stmt = conn.prepare_cached(
-        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.created_at, f.updated_at \
+        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at \
          FROM flows f INNER JOIN flow_model_bindings b ON f.id = b.flow_id \
-         WHERE ?1 LIKE REPLACE(b.model_pattern, '*', '%') AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",
+         WHERE ?1 LIKE REPLACE(REPLACE(REPLACE(REPLACE(b.model_pattern, '\\', '\\\\'), '%', '\\%'), '_', '\\_'), '*', '%') ESCAPE '\\' \
+         AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",
     )?;
     let result = stmt
         .query_row(rusqlite::params![model_name], row_to_flow)
         .optional()?;
     Ok(result)
+}
+
+/// Zwraca id flow o podanej `published_model_name` (UNIQUE w `flows`) albo
+/// `None`. Używane przy idempotentnej (re)rejestracji engine-flow addona oraz
+/// przy cleanupie przy uninstall — pozwala znaleźć dokładnie ten flow, który
+/// instancja opublikowała pod swoją unikalną nazwą.
+pub fn get_flow_id_by_published_model_name(
+    pool: &DbPool,
+    published_model_name: &str,
+) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let id = conn
+        .query_row(
+            "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
+            rusqlite::params![published_model_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
 }
 
 fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
@@ -5396,6 +5423,121 @@ pub fn create_flow_model_binding(
     Ok(id)
 }
 
+/// RAG E2.0 (bug 3 — rejestracja atomowa) — (re)rejestruje engine-flow jako
+/// published model + wiązanie W JEDNEJ TRANSAKCJI. Sekwencja w środku jednego
+/// `BEGIN`/`COMMIT`: (1) skasuj stary flow o tej `published_model_name` (kasuje
+/// też jego wiązania przez ON DELETE CASCADE / dodatkowo jawnie po wzorcu), (2)
+/// wstaw nowy flow, (3) wstaw wiązanie `model_pattern == published_model_name`.
+/// Brak okna „flow bez wiązania" / „model niedostępny": albo widoczny jest stary
+/// komplet, albo nowy komplet — nigdy stan pośredni. Zwraca id nowego flow.
+///
+/// `published_model_name` jest UNIQUE w `flows`, więc krok (1) usuwa dokładnie
+/// poprzednią rejestrację tej instancji (idempotencja install/upgrade/reconcile).
+pub fn register_engine_flow_atomic(
+    pool: &DbPool,
+    params: &FlowParams<'_>,
+    published_model_name: &str,
+    binding_priority: i64,
+) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+
+    // (1) Skasuj stary flow o tej published-name (jeśli istnieje) + jego wiązania.
+    let old_flow_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
+            rusqlite::params![published_model_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(ref old_id) = old_flow_id {
+        // Wiązania starego flow po wzorcu == published-name (kasujemy jawnie z
+        // capture, niezależnie od CASCADE, żeby ledger zobaczył usunięcie).
+        let old_binding_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM flow_model_bindings WHERE model_pattern = ?1")?;
+            let rows = stmt
+                .query_map(rusqlite::params![published_model_name], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        for bid in &old_binding_ids {
+            tx.execute(
+                "DELETE FROM flow_model_bindings WHERE id = ?1",
+                rusqlite::params![bid],
+            )?;
+            let mut fields = BTreeMap::new();
+            fields.insert("id".to_string(), field_string(bid));
+            record_core_capture_tx(
+                &tx,
+                crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+                bid.to_string(),
+                crate::sync::runtime::SqlWriteAction::Delete,
+                fields,
+                None,
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM flows WHERE id = ?1",
+            rusqlite::params![old_id],
+        )?;
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(old_id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            old_id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+
+    // (2) Wstaw nowy flow.
+    let flow_id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO flows (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            flow_id,
+            params.name,
+            params.description,
+            params.is_default,
+            params.service_type,
+            params.flow_json,
+            params.status,
+            params.published_model_name,
+        ],
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Flow,
+        flow_id.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_changed_fields(params),
+        params.actor_user_id.map(|id| id.to_string()),
+    )?;
+
+    // (3) Wstaw wiązanie modelu na published-name.
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![binding_id, flow_id, published_model_name, binding_priority],
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+        binding_id.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        flow_binding_changed_fields(&flow_id, published_model_name, binding_priority),
+        None,
+    )?;
+
+    tx.commit()?;
+    Ok(flow_id)
+}
+
 pub fn update_flow_model_binding(
     pool: &DbPool,
     id: &str,
@@ -5421,6 +5563,39 @@ pub fn update_flow_model_binding(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Kasuje wiązania modelu po dokładnym `model_pattern` (nie glob). Używane przy
+/// uninstall engine-flow addona — `published_model_name` jest unikalny per
+/// instancja, więc kasuje wyłącznie wiązanie tej instancji. Zwraca liczbę
+/// skasowanych wierszy.
+pub fn delete_flow_model_binding_for_pattern(pool: &DbPool, model_pattern: &str) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let ids: Vec<String> = {
+        let mut stmt =
+            tx.prepare("SELECT id FROM flow_model_bindings WHERE model_pattern = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![model_pattern], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    for id in &ids {
+        tx.execute(
+            "DELETE FROM flow_model_bindings WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(ids.len())
 }
 
 pub fn delete_flow_model_binding(pool: &DbPool, id: &str) -> Result<()> {
@@ -21129,5 +21304,86 @@ mod api_key_access_v2_tests {
                 .unwrap();
             assert_eq!(count, 1, "missing default policy for {resource_type}");
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_flow_binding_tests {
+    use super::*;
+    use crate::db::models::FlowParams;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test DB")
+    }
+
+    fn params<'a>(name: &'a str, published: &'a str) -> FlowParams<'a> {
+        FlowParams {
+            name,
+            description: None,
+            is_default: false,
+            service_type: Some("chat"),
+            flow_json: r#"{"nodes":[],"edges":[]}"#,
+            status: "active",
+            published_model_name: Some(published),
+            actor_user_id: None,
+        }
+    }
+
+    /// Bug 3 — atomowa rejestracja podmienia flow+wiązanie; po podmianie model
+    /// rozwiązuje się na NOWY flow, a stare wiązanie znika (brak duplikatów).
+    #[test]
+    fn register_engine_flow_atomic_replaces_in_one_shot() {
+        let db = fresh_db();
+        let name = "rag-aaaa:query";
+        let id1 = register_engine_flow_atomic(&db, &params("v1", name), name, 100).unwrap();
+        assert_eq!(get_flow_for_model(&db, name).unwrap().unwrap().id, id1);
+
+        let id2 = register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(
+            get_flow_for_model(&db, name).unwrap().unwrap().id,
+            id2,
+            "model rozwiązuje się na nowy flow"
+        );
+        let count = list_flow_model_bindings(&db)
+            .unwrap()
+            .iter()
+            .filter(|b| b.model_pattern == name)
+            .count();
+        assert_eq!(count, 1, "jedno wiązanie po podmianie");
+    }
+
+    /// Bug 5 — `_` we wzorcu jest LITERALNY (nie wildcard LIKE). Wzorzec
+    /// `rag-aaaa:que_ry` nie może zmatchować `rag-aaaa:queXry`. Glob `*` dalej
+    /// działa jako wildcard.
+    #[test]
+    fn like_specials_in_pattern_are_literal() {
+        let db = fresh_db();
+        // Wzorzec z literalnym '_' (gdyby trafił do bindingu mimo walidacji id).
+        let pat = "rag-aaaa:que_ry";
+        register_engine_flow_atomic(&db, &params("u", pat), pat, 100).unwrap();
+        // '_' nie może działać jako "dowolny znak": 'queXry' NIE matchuje.
+        assert!(
+            get_flow_for_model(&db, "rag-aaaa:queXry").unwrap().is_none(),
+            "'_' we wzorcu nie może być wildcardem LIKE"
+        );
+        // Dokładna nazwa nadal matchuje (literał).
+        assert!(get_flow_for_model(&db, pat).unwrap().is_some());
+
+        // '%' też literalny: wzorzec 'a%b' nie matchuje 'aXYZb'.
+        let pct = "a%b";
+        register_engine_flow_atomic(&db, &params("p", pct), pct, 90).unwrap();
+        assert!(get_flow_for_model(&db, "aXYZb").unwrap().is_none());
+        assert!(get_flow_for_model(&db, "a%b").unwrap().is_some());
+
+        // Glob '*' NADAL jest wildcardem (zachowana semantyka wzorców operatora).
+        let glob = "team-*";
+        let fid = create_flow(&db, &params("g", "team-flow")).unwrap();
+        create_flow_model_binding(&db, &fid, glob, 80).unwrap();
+        assert!(
+            get_flow_for_model(&db, "team-anything").unwrap().is_some(),
+            "glob '*' nadal matchuje dowolny sufiks"
+        );
     }
 }

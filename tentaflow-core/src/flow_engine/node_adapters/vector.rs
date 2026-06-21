@@ -180,17 +180,56 @@ impl VectorNodeAdapter {
         Ok(Some(SparseVector { indices, values }))
     }
 
-    /// `top_k` z node.config (domyślnie 10). Walidacja zakresu (1..=MAX_TOP_K)
-    /// PRZED rzutowaniem na u32 (bug 3: 4294967297 zawijał do 1).
-    fn parse_top_k(node: &FlowNode) -> Result<usize> {
-        let raw = node.config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
-        let k = u64_to_u32(raw, "top_k")?;
-        if k == 0 || k > MAX_TOP_K {
-            return Err(anyhow!(
-                "vector adapter: top_k={k} poza zakresem 1..={MAX_TOP_K}"
-            ));
+    /// `top_k` z node.config (priorytet), fallback do `envelope.meta["top_k"]`
+    /// (RAG E2.0 — addon przeprowadza top_k przez options llm_generate), na
+    /// końcu domyślne 10. Walidacja zakresu (1..=MAX_TOP_K) PRZED rzutowaniem na
+    /// u32 (bug 3: 4294967297 zawijał do 1). Wartość z meta JEST capowana do
+    /// MAX_TOP_K (a nie odrzucana), bo to podpowiedź addona, nie ręczna
+    /// konfiguracja operatora — addon nie powinien wywrócić retrievalu zbyt
+    /// dużym top_k; node.config nadal odrzuca poza-zakresową wartość operatora.
+    fn parse_top_k(node: &FlowNode, envelope: &FlowEnvelope) -> Result<usize> {
+        if let Some(raw) = node.config.get("top_k").and_then(|v| v.as_u64()) {
+            let k = u64_to_u32(raw, "top_k")?;
+            if k == 0 || k > MAX_TOP_K {
+                return Err(anyhow!(
+                    "vector adapter: top_k={k} poza zakresem 1..={MAX_TOP_K}"
+                ));
+            }
+            return Ok(k as usize);
         }
-        Ok(k as usize)
+        if let Some(raw) = envelope.meta.get("top_k").and_then(|v| v.as_u64()) {
+            let k = (raw.clamp(1, MAX_TOP_K as u64)) as u32;
+            return Ok(k as usize);
+        }
+        Ok(10)
+    }
+
+    /// Filtr po kolekcji z `envelope.meta["collection_id"]` (RAG E2.0). Gdy
+    /// obecny, retrieval jest twardo ograniczony do tej kolekcji w przestrzeni
+    /// instancji — bez tego pasaże innych kolekcji tej samej instancji
+    /// wyciekałyby do odpowiedzi (izolacja per-kolekcja). Łączymy go z filtrem
+    /// z node.config przez `And` (oba muszą być spełnione). Brak collection_id w
+    /// meta => zwraca filtr z node.config bez zmian (search po całej instancji).
+    fn merge_collection_filter(
+        config_filter: Option<Filter>,
+        envelope: &FlowEnvelope,
+    ) -> Option<Filter> {
+        let collection = envelope
+            .meta
+            .get("collection_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        match (collection, config_filter) {
+            (Some(cid), Some(cfg)) => Some(Filter::And(vec![
+                Filter::Eq("collection_id".to_string(), FieldValue::Str(cid.to_string())),
+                cfg,
+            ])),
+            (Some(cid), None) => Some(Filter::Eq(
+                "collection_id".to_string(),
+                FieldValue::Str(cid.to_string()),
+            )),
+            (None, cfg) => cfg,
+        }
     }
 
     /// Fuzja dla hybrid: `{"rrf": k}` albo `{"weighted":[dense,sparse]}`.
@@ -369,9 +408,10 @@ impl VectorNodeAdapter {
         let org = Self::org_scope(ctx);
         let addon = Self::addon_scope(ctx)?;
         let namespace = Self::pick_namespace(node)?;
-        let top_k = Self::parse_top_k(node)?;
+        let top_k = Self::parse_top_k(node, envelope)?;
         let query = Self::query_vector(envelope)?;
-        let filter = parse_filter(node.config.get("filter"))?;
+        let config_filter = parse_filter(node.config.get("filter"))?;
+        let filter = Self::merge_collection_filter(config_filter, envelope);
         let output_fields = parse_output_fields(node.config.get("output_fields"));
 
         let backend = ctx
@@ -382,6 +422,15 @@ impl VectorNodeAdapter {
             .search(&query, top_k, filter.as_ref(), &output_fields)
             .map_err(|e| anyhow!("vector adapter: search: {e}"))?;
 
+        // RAG E2.0 — realne cytaty z faktycznych hitów retrievalu wędrują w
+        // envelope.meta["rag_citations"] (NIE zmyślony SELECT po stronie addona).
+        // Każdy hit niesie doc_id/chunk_index/score/text z pól wektora. Meta
+        // propaguje się przez combine→llm→output (każdy klonuje envelope bazowy),
+        // a output node serializuje {answer, citations} gdy ma ten klucz.
+        out.meta.insert(
+            "rag_citations".to_string(),
+            citations_from_hits(hits.iter()),
+        );
         out.payload = FlowValue::Json(hits_to_json(&namespace, "search", hits));
         Ok(())
     }
@@ -396,7 +445,7 @@ impl VectorNodeAdapter {
         let org = Self::org_scope(ctx);
         let addon = Self::addon_scope(ctx)?;
         let namespace = Self::pick_namespace(node)?;
-        let top_k = Self::parse_top_k(node)?;
+        let top_k = Self::parse_top_k(node, envelope)?;
         let query = Self::query_vector(envelope)?;
 
         let sparse_json = match &envelope.payload {
@@ -639,6 +688,38 @@ fn hits_to_json(
     })
 }
 
+/// RAG E2.0 — buduje listę cytatów z REALNYCH hitów retrievalu. Każdy cytat to
+/// `{doc_id, chunk_index, text, score}` wyciągnięte z pól wektora (output_fields
+/// muszą zawierać `doc_id`/`chunk_index`/`text`, jak w query.flow.json). `score`
+/// to faktyczny dystans z backendu. To jedyne źródło prawdy o cytatach — addon
+/// NIE buduje ich osobnym SELECT-em.
+fn citations_from_hits<'a>(
+    hits: impl Iterator<Item = &'a crate::services::vector::backend::SearchHit>,
+) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = hits
+        .map(|h| {
+            let mut doc_id = serde_json::Value::Null;
+            let mut chunk_index = serde_json::Value::Null;
+            let mut text = serde_json::Value::Null;
+            for f in &h.fields {
+                match f.name.as_str() {
+                    "doc_id" => doc_id = field_value_to_json(f.value.clone()),
+                    "chunk_index" => chunk_index = field_value_to_json(f.value.clone()),
+                    "text" => text = field_value_to_json(f.value.clone()),
+                    _ => {}
+                }
+            }
+            serde_json::json!({
+                "doc_id": doc_id,
+                "chunk_index": chunk_index,
+                "text": text,
+                "score": h.score,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
 fn field_value_to_json(v: FieldValue) -> serde_json::Value {
     match v {
         FieldValue::Str(s) => serde_json::Value::String(s),
@@ -692,6 +773,159 @@ mod tests {
 
     fn upsert_payload(items: serde_json::Value) -> FlowValue {
         FlowValue::Json(json!({ "items": items }))
+    }
+
+    /// Search input z payloadem Embedding + ustawionym `meta` (collection_id,
+    /// top_k) — lustro tego, co seeduje routing z opcji addona (RAG E2.0).
+    fn search_input_with_meta(query: Vec<f32>, meta: serde_json::Value) -> NodeInput {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Embedding(query);
+        if let Some(obj) = meta.as_object() {
+            for (k, v) in obj {
+                env.meta.insert(k.clone(), v.clone());
+            }
+        }
+        NodeInput {
+            from_node_id: "embed".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(env),
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_filter_from_meta_isolates_collections() {
+        // RAG E2.0 bug 1 — dwie kolekcje w TEJ SAMEJ instancji/namespace.
+        // Search z meta.collection_id=A musi zwrócić wyłącznie pasaże A.
+        let v = stub_vectors();
+        let ctx = addon_ctx("inst-a", "org-1", v);
+        // Wektor kolekcji A (ref 1) i kolekcji B (ref 2) — niemal identyczne, więc
+        // bez filtra B też by się znalazł w top-k dla zapytania ~A.
+        VectorNodeAdapter::new()
+            .execute(
+                &node(json!({"op": "upsert", "namespace": "passages", "dim": 3})),
+                &[input(upsert_payload(json!([
+                    {"ref_id": 1, "vector": [1.0, 0.0, 0.0], "fields": [
+                        {"name": "collection_id", "value": "col-A"},
+                        {"name": "doc_id", "value": "docA"},
+                        {"name": "chunk_index", "value": 0},
+                        {"name": "text", "value": "pasaz A"}
+                    ]},
+                    {"ref_id": 2, "vector": [0.99, 0.01, 0.0], "fields": [
+                        {"name": "collection_id", "value": "col-B"},
+                        {"name": "doc_id", "value": "docB"},
+                        {"name": "chunk_index", "value": 0},
+                        {"name": "text", "value": "pasaz B"}
+                    ]},
+                ])))],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let search_node = node(json!({
+            "op": "search",
+            "namespace": "passages",
+            "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
+        }));
+        let out = VectorNodeAdapter::new()
+            .execute(
+                &search_node,
+                &[search_input_with_meta(
+                    vec![1.0, 0.0, 0.0],
+                    json!({"collection_id": "col-A", "top_k": 10}),
+                )],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let hits = match &out.payload {
+            FlowValue::Json(v) => v.get("hits").and_then(|h| h.as_array()).cloned().unwrap(),
+            other => panic!("expected Json, got {other:?}"),
+        };
+        assert_eq!(hits.len(), 1, "filtr po collection_id zwraca tylko kolekcję A");
+        assert_eq!(hits[0]["fields"]["collection_id"].as_str(), Some("col-A"));
+        assert_eq!(hits[0]["fields"]["doc_id"].as_str(), Some("docA"));
+        // Pasaż kolekcji B NIE może wyciec.
+        assert!(
+            hits.iter().all(|h| h["fields"]["collection_id"].as_str() != Some("col-B")),
+            "pasaż kolekcji B nie może trafić do wyniku zapytania o kolekcję A"
+        );
+    }
+
+    #[tokio::test]
+    async fn citations_in_meta_are_real_hits() {
+        // RAG E2.0 bug 2 — meta.rag_citations niesie REALNE hity (doc_id,
+        // chunk_index, text, score), nie zmyślony SELECT.
+        let v = stub_vectors();
+        let ctx = addon_ctx("inst-a", "org-1", v);
+        VectorNodeAdapter::new()
+            .execute(
+                &node(json!({"op": "upsert", "namespace": "passages", "dim": 3})),
+                &[input(upsert_payload(json!([
+                    {"ref_id": 1, "vector": [1.0, 0.0, 0.0], "fields": [
+                        {"name": "collection_id", "value": "col-A"},
+                        {"name": "doc_id", "value": "docA"},
+                        {"name": "chunk_index", "value": 7},
+                        {"name": "text", "value": "realny pasaz"}
+                    ]},
+                ])))],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let out = VectorNodeAdapter::new()
+            .execute(
+                &node(json!({
+                    "op": "search",
+                    "namespace": "passages",
+                    "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
+                })),
+                &[search_input_with_meta(
+                    vec![1.0, 0.0, 0.0],
+                    json!({"collection_id": "col-A"}),
+                )],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let cites = out
+            .meta
+            .get("rag_citations")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .expect("meta.rag_citations obecne po search");
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0]["doc_id"].as_str(), Some("docA"));
+        assert_eq!(cites[0]["chunk_index"].as_i64(), Some(7));
+        assert_eq!(cites[0]["text"].as_str(), Some("realny pasaz"));
+        assert!(cites[0]["score"].as_f64().is_some(), "cytat niesie realny score");
+    }
+
+    #[tokio::test]
+    async fn top_k_from_meta_is_clamped_not_rejected() {
+        // top_k z meta (podpowiedź addona) ponad MAX jest CAPOWANE do MAX (nie
+        // odrzucane jak ręczna konfiguracja operatora) — search nie pada.
+        let v = stub_vectors();
+        let ctx = addon_ctx("inst-a", "org-1", v);
+        VectorNodeAdapter::new()
+            .execute(
+                &node(json!({"op": "upsert", "namespace": "p", "dim": 2})),
+                &[input(upsert_payload(json!([{"ref_id": 1, "vector": [1.0, 0.0]}])))],
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let out = VectorNodeAdapter::new()
+            .execute(
+                &node(json!({"op": "search", "namespace": "p"})),
+                &[search_input_with_meta(vec![1.0, 0.0], json!({"top_k": 9_999_999}))],
+                &ctx,
+            )
+            .await;
+        assert!(out.is_ok(), "top_k z meta ponad MAX ma być capowany, nie błąd");
     }
 
     #[tokio::test]

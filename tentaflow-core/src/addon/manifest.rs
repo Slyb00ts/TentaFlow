@@ -376,6 +376,33 @@ pub struct FlowTemplateSpec {
 }
 
 // =============================================================================
+// Sekcja [[engine_flow]]
+// =============================================================================
+
+/// Flow silnika flow_engine (DAG typowanych węzłów) dostarczany przez addon.
+/// W odróżnieniu od `[[flow_template]]` (który ląduje w `flow_runtime` jako
+/// opt-in import dla admina), `[[engine_flow]]` jest rejestrowany AUTOMATYCZNIE
+/// przy instalacji instancji jako *published model* o unikalnej-per-instancję
+/// nazwie. Dzięki temu addon może wyzwolić własny flow JAKO MODEL (przez
+/// `llm_generate(model=<published name>)`), a executor przepisuje tożsamość
+/// instancji (`addon_id`/`org_id`) do `ExecutionContext` — węzeł `vector`
+/// uderza wtedy w przestrzeń wektorową tej instancji (RAG E2.0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineFlowSpec {
+    /// Identyfikator flow w obrębie addona (np. "query"). Złożenie z `addon_id`
+    /// daje unikalną nazwę published model: `"{addon_id}:{id}"`.
+    pub id: String,
+    /// Ścieżka względna do pliku `.flow.json` (DAG flow_engine) w katalogu addona.
+    pub path: String,
+    /// Typ serwisu, pod którym flow jest rozwiązywany (np. "chat"). Wiązanie
+    /// modelu (`flow_model_bindings`) wpina go pod ten service_type.
+    pub service_type: String,
+    /// Krótki opis (informacyjny, do logów / katalogu).
+    #[serde(default)]
+    pub description: String,
+}
+
+// =============================================================================
 // Sekcja [[ui_component]]
 // =============================================================================
 

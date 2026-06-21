@@ -58,6 +58,19 @@ pub extern "C" fn on_start() -> i32 {
         json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
     );
     register_tool(
+        "ask",
+        "Zadaje pytanie do kolekcji RAG: retrieval (embeddings -> vector search) -> kontekst -> LLM z cytatami. Zwraca odpowiedz i liste cytowanych pasazy.",
+        json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "question": {"type": "string"},
+                "top_k": {"type": "integer"}
+            },
+            "required": ["collection_id", "question"]
+        }),
+    );
+    register_tool(
         "ingest_document",
         "Ingest dokumentu: parse -> chunk -> embedding -> upsert wektorow.",
         json!({
@@ -120,6 +133,7 @@ pub extern "C" fn on_request(
     let result = match tool_name {
         "create_collection" => handle_create_collection(&params),
         "list_collections" => handle_list_collections(),
+        "ask" => handle_ask(&params),
         "ingest_document" => handle_ingest_document(&params),
         "list_documents" => handle_list_documents(&params),
         "ingest_status" => handle_ingest_status(&params),
@@ -181,6 +195,158 @@ fn handle_list_collections() -> Value {
         .collect();
 
     json!({"ok": true, "data": {"collections": collections}})
+}
+
+/// Klucz instancyjnego KV, pod ktorym Core (przy install) zapisuje nazwe
+/// published query-flow tej instancji. Addon nie zna wlasnego addon_id, wiec
+/// odczytuje gotowa nazwe modelu stad.
+const ENGINE_FLOW_STATE_KEY: &str = "engine_flow_model";
+
+/// Bufor na odpowiedz query-flow (odpowiedz LLM + kontekst moga byc spore).
+const ASK_BUFFER_SIZE: usize = 262_144;
+
+/// `ask(collection_id, question, top_k?)` — wyzwala query-flow JAKO MODEL przez
+/// llm_generate(model=<published name tej instancji>). Flow robi retrieval
+/// (embeddings -> vector search w 'passages') -> kontekst -> LLM z cytatami.
+/// Zwraca `{answer, citations:[{doc_id, chunk_index, text, score}]}`.
+///
+/// `collection_id`/`top_k` jada w options jako podpowiedz dla flow (filtr po
+/// kolekcji i rozmiar retrievalu). v1 query-flow szuka po calej przestrzeni
+/// instancji; filtr po collection_id wejdzie razem z parametryzacja vector node
+/// z meta (pole jest juz indeksowane w 'passages').
+fn handle_ask(params: &Value) -> Value {
+    let collection_id = match params.get("collection_id").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c,
+        _ => return err("Brak wymaganego parametru 'collection_id'"),
+    };
+    let question = match params.get("question").and_then(|v| v.as_str()) {
+        Some(q) if !q.trim().is_empty() => q.trim(),
+        _ => return err("Brak wymaganego parametru 'question'"),
+    };
+    let top_k = params.get("top_k").and_then(|v| v.as_i64()).filter(|n| *n > 0);
+
+    // Kolekcja musi istniec (czytelny blad zamiast pustego retrievalu).
+    match sql_query_one(
+        "SELECT id FROM collections WHERE id = ?",
+        &[SqlValue::String(collection_id.to_string())],
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err("Kolekcja nie istnieje"),
+        Err(e) => return err(&format!("Blad weryfikacji kolekcji: {e}")),
+    }
+
+    // Nazwa published query-flow (zapisana przez Core przy install instancji).
+    let model = match state_get(ENGINE_FLOW_STATE_KEY) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return err("Nazwa query-flow w stanie instancji jest nieprawidlowa"),
+        },
+        Ok(None) => {
+            return err("Query-flow nie jest zarejestrowany dla tej instancji (brak engine_flow_model w stanie)")
+        }
+        Err(e) => return err(&format!("Blad odczytu stanu instancji: {e:?}")),
+    };
+
+    // Wyzwol flow JAKO MODEL. Pytanie jest promptem (trigger.text -> embeddings),
+    // a collection_id/top_k jada w options — Core przeprowadza je do envelope.meta,
+    // wiec vector node FILTRUJE retrieval po tej kolekcji (izolacja per-kolekcja).
+    let mut options = json!({ "collection_id": collection_id });
+    if let Some(k) = top_k {
+        options["top_k"] = json!(k);
+    }
+    // Flow zwraca JSON `{answer, citations}` w tresci odpowiedzi: answer to tekst
+    // LLM, citations to REALNE hity retrievalu (doc_id/chunk_index/text/score)
+    // zebrane przez output node z meta vector node. Cytaty = dokladnie to, co
+    // retrieval zwrocil — zero zmyslania, zero osobnego SELECT-a.
+    let (answer, citations) = match call_query_flow(&model, question, &options) {
+        Ok(a) => a,
+        Err(e) => return err(&e),
+    };
+
+    json!({
+        "ok": true,
+        "data": {
+            "answer": answer,
+            "citations": citations
+        }
+    })
+}
+
+/// Wywoluje query-flow przez host llm_generate i zwraca `(odpowiedz, cytaty)`.
+/// Tresc flow to JSON `{answer, citations}` (output node z emit_citations);
+/// gdy flow zwroci goly tekst (np. inna konfiguracja), cytaty sa puste.
+fn call_query_flow(model: &str, question: &str, options: &Value) -> Result<(String, Vec<Value>), String> {
+    let options_str =
+        serde_json::to_string(options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
+
+    let prompt_bytes = question.as_bytes();
+    let model_bytes = model.as_bytes();
+    let options_bytes = options_str.as_bytes();
+    let mut buffer = vec![0u8; ASK_BUFFER_SIZE];
+    let mut out_len: i32 = 0;
+
+    let rc = unsafe {
+        llm_generate(
+            prompt_bytes.as_ptr() as i32, prompt_bytes.len() as i32,
+            model_bytes.as_ptr() as i32, model_bytes.len() as i32,
+            options_bytes.as_ptr() as i32, options_bytes.len() as i32,
+            buffer.as_mut_ptr() as i32, ASK_BUFFER_SIZE as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+    if rc < 0 {
+        return Err(format!("Wyzwolenie query-flow ({model}) zwrocilo blad: {rc}"));
+    }
+    if out_len <= 0 {
+        return Err("Query-flow zwrocil pusta odpowiedz".to_string());
+    }
+
+    let raw = String::from_utf8_lossy(&buffer[..out_len as usize]).to_string();
+    Ok(parse_flow_response(&raw))
+}
+
+/// Parsuje odpowiedz flow na `(answer, citations)`. Tresc to JSON
+/// `{answer, citations}` (output node RAG z emit_citations) — moze przyjsc
+/// bezposrednio albo zagniezdzona w chat-completion (`choices[0].message.content`
+/// jako string z tym JSON-em). Fallbacki: goly tekst / inne ksztalty => answer
+/// = tekst, citations puste.
+fn parse_flow_response(raw: &str) -> (String, Vec<Value>) {
+    // 1. Wyciagnij wewnetrzna tresc: chat-completion content albo cala odpowiedz.
+    let inner = chat_completion_content(raw).unwrap_or_else(|| raw.trim().to_string());
+
+    // 2. Tresc to JSON {answer, citations}? Wyciagnij oba pola.
+    if let Ok(v) = serde_json::from_str::<Value>(&inner) {
+        if let Some(answer) = v.get("answer").and_then(|x| x.as_str()) {
+            let citations = v
+                .get("citations")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            return (answer.to_string(), citations);
+        }
+        // Inny ksztalt JSON ze znanym polem tekstowym — bez cytatow.
+        for key in ["content", "text"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                return (s.to_string(), Vec::new());
+            }
+        }
+    }
+
+    // 3. Goly tekst — answer = tresc, brak cytatow.
+    (inner, Vec::new())
+}
+
+/// Gdy `raw` to chat-completion, zwraca `choices[0].message.content` jako string.
+/// W p.p. `None` (caller uzyje calego `raw`).
+fn chat_completion_content(raw: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    v.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
 }
 
 /// Pelny pipeline ingestu jednego dokumentu.
@@ -396,6 +562,11 @@ fn ingest_one_chunk(
         VectorField { name: "doc_id".to_string(), value: VectorFieldValue::Str(document_id.to_string()) },
         VectorField { name: "chunk_index".to_string(), value: VectorFieldValue::Int(index as i64) },
         VectorField { name: "created_at".to_string(), value: VectorFieldValue::Int(now) },
+        // collection_id — pozwala query-flow filtrowac retrieval po kolekcji.
+        VectorField { name: "collection_id".to_string(), value: VectorFieldValue::Str(collection_id.to_string()) },
+        // text — tresc chunka przy wektorze, by vector search w query-flow zwrocil
+        // ja przez output_fields i zbudowal kontekst dla LLM (bez siegania do SQLite).
+        VectorField { name: "text".to_string(), value: VectorFieldValue::Str(chunk_text.to_string()) },
     ];
     if let Err(e) = vector_upsert(PASSAGES_NS, ref_id, &vector, &fields) {
         let _ = sql_exec("DELETE FROM chunks WHERE id = ?", &[SqlValue::I64(rowid)]);
@@ -960,6 +1131,44 @@ mod tests {
     #[test]
     fn parse_embedding_rejects_unrecognized_shape() {
         assert!(parse_embedding_response(r#"{"foo":123}"#).is_err());
+    }
+
+    #[test]
+    fn parse_flow_response_extracts_answer_and_real_citations() {
+        // Output node serializuje {answer, citations} jako tresc; tu owinieta w
+        // chat-completion (jak wraca z route_chat_completion).
+        let inner = r#"{"answer":"Odpowiedz [doc1#0]","citations":[{"doc_id":"doc1","chunk_index":0,"text":"pasaz","score":0.12}]}"#;
+        let escaped = serde_json::to_string(inner).unwrap();
+        let raw = format!(r#"{{"choices":[{{"message":{{"content":{escaped}}}}}]}}"#);
+        let (answer, citations) = parse_flow_response(&raw);
+        assert_eq!(answer, "Odpowiedz [doc1#0]");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0]["doc_id"].as_str(), Some("doc1"));
+        assert_eq!(citations[0]["chunk_index"].as_i64(), Some(0));
+        assert_eq!(citations[0]["text"].as_str(), Some("pasaz"));
+        assert!(citations[0]["score"].as_f64().is_some());
+    }
+
+    #[test]
+    fn parse_flow_response_handles_direct_answer_citations() {
+        // Tresc bezposrednio jako {answer, citations} (bez owijki chat-completion).
+        let raw = r#"{"answer":"A","citations":[{"doc_id":"d","chunk_index":2,"text":"t","score":0.5}]}"#;
+        let (answer, citations) = parse_flow_response(raw);
+        assert_eq!(answer, "A");
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0]["chunk_index"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn parse_flow_response_falls_back_to_plain_text_without_citations() {
+        // Goly tekst oraz inne ksztalty JSON => answer = tekst, brak cytatow
+        // (zero zmyslania — cytaty istnieja tylko gdy retrieval je zwrocil).
+        let (a, c) = parse_flow_response("  zwykly tekst  ");
+        assert_eq!(a, "zwykly tekst");
+        assert!(c.is_empty());
+        let (a2, c2) = parse_flow_response(r#"{"content":"B"}"#);
+        assert_eq!(a2, "B");
+        assert!(c2.is_empty());
     }
 
     #[test]
