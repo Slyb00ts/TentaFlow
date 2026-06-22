@@ -55,6 +55,8 @@ type TokenCallbackFn = extern "C" fn(
     is_final: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    prefill_tps: f32,
+    completion_tps: f32,
     callback_context: *mut c_void,
 );
 
@@ -161,6 +163,8 @@ extern "C" fn rust_token_callback(
     is_final: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    prefill_tps: f32,
+    completion_tps: f32,
     callback_context: *mut c_void,
 ) {
     // SAFETY: callback_context to &mpsc::Sender<StreamToken> rzutowany na *mut c_void
@@ -187,6 +191,8 @@ extern "C" fn rust_token_callback(
         completion_tokens,
         finish_reason: None,
         error: None,
+        prefill_tps,
+        completion_tps,
     });
 }
 
@@ -460,6 +466,8 @@ impl InferenceEngine for MlxSwiftEngine {
                     error: Some(msg),
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    prefill_tps: 0.0,
+                    completion_tps: 0.0,
                 });
             }
 

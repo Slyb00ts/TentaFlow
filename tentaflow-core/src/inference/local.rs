@@ -441,7 +441,12 @@ impl LocalInferenceHandler {
             } else {
                 None
             };
-            // Metryki wall-clock liczone raz, na finalnym chunku obok usage.
+            // Metryki przepustowości: preferujemy pomiar silnika (realne granice faz
+            // prefill/dekodowanie), wall-clock jest tylko fallbackiem gdy silnik nie
+            // podał wartości (0.0). TTFT zostaje zawsze wall-clock — to realny,
+            // user-facing czas do pierwszego tokena.
+            let engine_prefill_tps = token.prefill_tps;
+            let engine_completion_tps = token.completion_tps;
             let perf = usage.as_ref().map(|u| {
                 let ttft_ms = first_token_at
                     .map(|t| t.duration_since(start).as_millis() as u32)
@@ -451,18 +456,24 @@ impl LocalInferenceHandler {
                     .map(|t| now.duration_since(t).as_secs_f32())
                     .unwrap_or(0.0);
                 let prefill_secs = (ttft_ms as f32) / 1000.0;
+                let prefill_tps = if engine_prefill_tps > 0.0 {
+                    engine_prefill_tps
+                } else if prefill_secs > 0.0 {
+                    u.prompt_tokens as f32 / prefill_secs
+                } else {
+                    0.0
+                };
+                let decode_tps = if engine_completion_tps > 0.0 {
+                    engine_completion_tps
+                } else if decode_secs > 0.0 && u.completion_tokens > 1 {
+                    (u.completion_tokens - 1) as f32 / decode_secs
+                } else {
+                    0.0
+                };
                 GenPerf {
                     ttft_ms,
-                    prefill_tps: if prefill_secs > 0.0 {
-                        u.prompt_tokens as f32 / prefill_secs
-                    } else {
-                        0.0
-                    },
-                    decode_tps: if decode_secs > 0.0 && u.completion_tokens > 1 {
-                        (u.completion_tokens - 1) as f32 / decode_secs
-                    } else {
-                        0.0
-                    },
+                    prefill_tps,
+                    decode_tps,
                 }
             });
             let chunk = ChatCompletionChunk {

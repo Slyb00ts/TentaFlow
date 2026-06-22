@@ -24,7 +24,7 @@ type GenerateFn = unsafe extern "C" fn(
     top_p: f32,
     max_context_tokens: i32,
     memory_budget_mb: i32,
-    token_callback: extern "C" fn(*const c_char, bool, u32, u32, *mut c_void),
+    token_callback: extern "C" fn(*const c_char, bool, u32, u32, f32, f32, *mut c_void),
     callback_context: *mut c_void,
     context: *mut c_void,
 ) -> i32;
