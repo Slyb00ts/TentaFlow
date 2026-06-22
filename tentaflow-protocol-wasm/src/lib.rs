@@ -3282,6 +3282,29 @@ pub fn encode_vision_infer_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::RerankBody(Request) — encoder rerankingu (Tier 1). `topN`
+/// opcjonalne (None = wszystkie dokumenty).
+#[wasm_bindgen(js_name = encodeRerankRequest)]
+pub fn encode_rerank_request(
+    model: String,
+    query: String,
+    documents: Vec<String>,
+    top_n: Option<u32>,
+    return_documents: bool,
+) -> Result<Vec<u8>, JsError> {
+    let req = tentaflow_protocol::RerankRequest {
+        model,
+        query,
+        documents,
+        top_n,
+        return_documents,
+    };
+    encode_body_inner(&MessageBody::RerankBody(
+        tentaflow_protocol::RerankExchange::Request(req),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Fast-path ------------------------------------------------------------
 
 /// MessageBody::FastPathListRequest (unit).
@@ -6066,6 +6089,26 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&obj, "poses", arr.into());
                     }
                 }
+            }
+        },
+        MessageBody::RerankBody(p) => match p {
+            tentaflow_protocol::RerankExchange::Request(_) => {
+                set(&obj, "variant", "RerankRequest".into());
+            }
+            tentaflow_protocol::RerankExchange::Response(r) => {
+                set(&obj, "variant", "RerankResponse".into());
+                set(&obj, "model", r.model.into());
+                let arr = js_sys::Array::new();
+                for item in r.results {
+                    let entry = js_sys::Object::new();
+                    set(&entry, "index", (item.index as u32).into());
+                    set(&entry, "relevanceScore", item.relevance_score.into());
+                    if let Some(doc) = item.document {
+                        set(&entry, "document", doc.into());
+                    }
+                    arr.push(&entry.into());
+                }
+                set(&obj, "results", arr.into());
             }
         },
         MessageBody::FastPathListRequest => {

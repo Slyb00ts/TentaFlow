@@ -1617,7 +1617,7 @@ pub struct EmbeddingsResult {
 /// Result dla rerank.
 ///
 /// Zawiera posortowaną listę dokumentów z ich relevance scores.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct RerankResult {
     /// Lista wyników rerankingu posortowana malejąco po score
     pub results: Vec<RerankResultItem>,
@@ -1627,7 +1627,7 @@ pub struct RerankResult {
 }
 
 /// Pojedynczy wynik rerankingu dla dokumentu.
-#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct RerankResultItem {
     /// Index dokumentu w oryginalnej liście (0-indexed)
     pub index: usize,
@@ -1637,6 +1637,37 @@ pub struct RerankResultItem {
 
     /// Tekst dokumentu (opcjonalnie, jeśli return_documents=true)
     pub document: Option<String>,
+}
+
+/// Request rerankingu dla natywnego protokołu binarnego (Tier 1).
+///
+/// Odrębny od `RerankPayload` (Tier 2 / REST), bo na drucie używamy `u32`
+/// zamiast platformozależnego `usize` — CBOR i WASM mają stabilny `u32`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RerankRequest {
+    /// Nazwa modelu/serwisu reranking (klucz katalogu, ACL po nim).
+    pub model: String,
+
+    /// Zapytanie względem którego rerankować dokumenty.
+    pub query: String,
+
+    /// Lista dokumentów do rerankowania.
+    pub documents: Vec<String>,
+
+    /// Ile najlepszych dokumentów zwrócić (None = wszystkie).
+    pub top_n: Option<u32>,
+
+    /// Czy zwrócić tekst dokumentów w wyniku.
+    pub return_documents: bool,
+}
+
+/// Inner-enum pack rerankingu — jeden slot w `MessageBody`. CBOR 0.8 ma twardy
+/// limit 256 wariantów `MessageBody`, więc request i response dzielą jeden slot
+/// (wzorzec `VisionInferPayload` / `ProfilingPayload`).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum RerankExchange {
+    Request(RerankRequest),
+    Response(RerankResult),
 }
 
 /// Result dla completion (non-streaming).

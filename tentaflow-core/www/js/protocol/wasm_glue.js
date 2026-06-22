@@ -4765,6 +4765,32 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::RerankBody(Request) — encoder rerankingu (Tier 1). `topN`
+ * opcjonalne (None = wszystkie dokumenty).
+ * @param {string} model
+ * @param {string} query
+ * @param {string[]} documents
+ * @param {number | null | undefined} top_n
+ * @param {boolean} return_documents
+ * @returns {Uint8Array}
+ */
+export function encodeRerankRequest(model, query, documents, top_n, return_documents) {
+    const ptr0 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(query, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArrayJsValueToWasm0(documents, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRerankRequest(ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(top_n) ? Number.MAX_SAFE_INTEGER : (top_n) >>> 0, return_documents);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
  * MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
  * TentaVision (local grant) or surface the remote-view note (remote robot).
  * @param {string} robot_id

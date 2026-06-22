@@ -12,6 +12,9 @@ icon = "comfyui"
 default_port = 5000
 api = "comfyui"
 version = "0.3.10"
+service_surfaces = ["image_gen"]
+input_modalities = ["text"]
+output_modalities = ["image"]
 
 [deploy.docker]
 context_path = "image-gen/docker/comfyui"
