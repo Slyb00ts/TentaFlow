@@ -181,3 +181,5 @@ tylko stable) → D3 (A_det async, fact_seq, lock per-collection, org_id) → D4
 D5 (merge wg R5) → D6 (memory-guided + ppr ważone R6). Każdy slice: codex review realnego kodu.
 
 ## STATUS: D1 ✅ (c82ab056), D2 ✅ — denoising przez idempotentny reconcile po commicie (promocja z COUNT≥τ, exactly-once aktywacja przez warunkowy enqueue WHERE active=0 + BEGIN IMMEDIATE, migracja 004 dedupe+unique, COUNT(DISTINCT) refcount). Codex GO. Następne: D3 (A_det async).
+
+## D3 ✅ — A_det async detekcja konfliktów (0 LLM): kursor monotoniczny activation_seq, lock atomowy (rows_affected+owner), detekcja symboliczna head+rel (klasyfikacja po relation_cardinality functional/temporal/hierarchical), conflict_members znormalizowane (atomowe INSERT OR IGNORE, cap 64), tozsamosc=grupa (1 open/grupa), scheduler org_id (stempel z auth + asercja instance_org_id, addon_id==instance_id unikalny). Migracje 005/006. Codex GO. Nastepne: D4 (A_res LLM adjudykacja + limity R8). similarity-gate odlozony do D5.
