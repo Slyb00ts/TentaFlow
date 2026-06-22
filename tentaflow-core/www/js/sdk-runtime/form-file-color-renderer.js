@@ -23,6 +23,11 @@ import {
   lookupComponentRenderer,
 } from './component-renderer.js';
 import { resolveBindRef, subscribeBindRef } from './bind-resolver.js';
+import { ApiBinary } from '../protocol/api-binary-shim.js';
+
+// Fragment uploadu (256 KiB) — mieści się z zapasem w pojedynczej ramce WS i
+// pasuje do rozmiaru kawałka odczytu w document store host-fn.
+const UPLOAD_CHUNK_SIZE = 256 * 1024;
 
 // =============================================================================
 // Validators
@@ -242,8 +247,9 @@ function renderFileInput(component, ctx) {
   ctx.registerCleanup(ctx.store.subscribe(bindPath, renderStoreFiles));
 
   // FileList validation → emit 'files_selected' with metadata or 'reject'.
+  // Zwraca tablicę zwalidowanych `File` (do uploadu) albo `null` przy odrzuceniu.
   const validateAndEmit = (files) => {
-    if (!files || files.length === 0) return;
+    if (!files || files.length === 0) return null;
     const arr = Array.from(files);
     if (arr.length > maxFiles) {
       wrapper.dispatchEvent(
@@ -252,7 +258,7 @@ function renderFileInput(component, ctx) {
           detail: { reason: 'max_files', count: arr.length, max: maxFiles },
         })
       );
-      return;
+      return null;
     }
     for (const f of arr) {
       if (!fileMatchesAnyAccept(f, accept)) {
@@ -262,7 +268,7 @@ function renderFileInput(component, ctx) {
             detail: { reason: 'accept', name: f.name, type: f.type },
           })
         );
-        return;
+        return null;
       }
       const fSize = typeof f.size === 'bigint' ? f.size : BigInt(f.size || 0);
       const maxBig = typeof maxSizeBytes === 'bigint' ? maxSizeBytes : BigInt(maxSizeBytes);
@@ -273,7 +279,7 @@ function renderFileInput(component, ctx) {
             detail: { reason: 'max_size', name: f.name, size: f.size, max: maxSizeBytes },
           })
         );
-        return;
+        return null;
       }
     }
     const meta = arr.map((f) => ({
@@ -285,8 +291,8 @@ function renderFileInput(component, ctx) {
     // The FileInput spec schema (schema/data.rs:1139) declares
     // handlers=["files_selected", "upload_progress", "upload_complete",
     // "upload_error"]. The renderer emits `files_selected` on a valid pick;
-    // upload_* events are emitted by the host after the actual upload (the
-    // renderer does no networking).
+    // upload_* events are emitted by the host AFTER the actual chunked upload
+    // (see uploadFiles below).
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('files_selected', {
         bubbles: false,
@@ -297,17 +303,156 @@ function renderFileInput(component, ctx) {
         },
       })
     );
+    return arr;
+  };
+
+  // Addon_id panelu — per-instancja. Host uploaduje do document store tej
+  // instancji; serwer i tak waliduje własność (org z sesji + otwarty panel).
+  const addonId = ctx.store && ctx.store.addon_id;
+
+  // Token przerwania bieżącej sekwencji uploadu. Tworzymy nowy obiekt na każdą
+  // sekwencję `uploadFiles`; ustawienie `.aborted` (cleanup renderera albo nowy
+  // wybór plików) przerywa pętlę MIĘDZY fragmentami — nie wysyłamy kolejnych i
+  // nie startujemy następnego pliku. Współdzielony obiekt (nie goła zmienna), bo
+  // stara sekwencja musi widzieć przerwanie nawet gdy ruszyła już nowa.
+  let activeUpload = null;
+
+  // Generyczny chunked upload JEDNEGO pliku do document store addona. Czytamy
+  // PER FRAGMENT (`file.slice(start, end).arrayBuffer()`) — nigdy nie buforujemy
+  // całego pliku w RAM, więc upload setek MiB nie wywala karty (anty-OOM). Każdy
+  // fragment 256 KiB → AddonDocumentUploadChunkRequest. Emituje `upload_progress`
+  // (pasek), a na końcu `upload_complete` z `doc_ref` (eventDispatcher przekaże
+  // to do addona jako action params {doc_ref, filename, mime, name, size}) albo
+  // `upload_error`. Bajtów NIE wkładamy w detail eventu.
+  const uploadOne = async (file, token) => {
+    const filename = file.name || 'plik';
+    const mime = file.type || 'application/octet-stream';
+    const total = typeof file.size === 'number' ? file.size : Number(file.size || 0);
+    const uploadId = (globalThis.crypto && globalThis.crypto.randomUUID
+      && globalThis.crypto.randomUUID())
+      || `up-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    // total_chunks = ceil(size/CHUNK); pusty plik to wciąż jeden fragment (0 B),
+    // żeby serwer dostał i sfinalizował blob.
+    const totalChunks = Math.max(1, Math.ceil(total / UPLOAD_CHUNK_SIZE));
+    try {
+      let docRef = null;
+      for (let seq = 0; seq < totalChunks; seq += 1) {
+        if (token.aborted) return false;
+        const start = seq * UPLOAD_CHUNK_SIZE;
+        const end = Math.min(start + UPLOAD_CHUNK_SIZE, total);
+        // Odczyt JEDNEGO wycinka — slice jest leniwy (widok na plik), arrayBuffer
+        // materializuje tylko ten fragment. `slice` zwalniany po wysłaniu.
+        let slice;
+        try {
+          slice = new Uint8Array(await file.slice(start, end).arrayBuffer());
+        } catch (err) {
+          if (token.aborted) return false;
+          wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_error', {
+            bubbles: false,
+            detail: { filename, name: filename, mime, reason: 'read_failed', message: String(err && err.message) },
+          }));
+          return false;
+        }
+        if (token.aborted) return false;
+        const resp = await ApiBinary.one('addonDocumentUploadChunkRequest', {
+          addonId,
+          uploadId,
+          filename,
+          mime,
+          seq,
+          totalChunks,
+          bytes: slice,
+        });
+        if (token.aborted) return false;
+        const sent = end;
+        wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_progress', {
+          bubbles: false,
+          detail: {
+            filename, name: filename, mime,
+            sent_bytes: sent, total_bytes: total,
+            percent: total > 0 ? Math.round((sent / total) * 100) : 100,
+          },
+        }));
+        if (resp && (resp.docRef != null || resp.doc_ref != null)) {
+          docRef = resp.docRef ?? resp.doc_ref;
+        }
+      }
+      if (docRef == null) {
+        wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_error', {
+          bubbles: false,
+          detail: { filename, name: filename, mime, reason: 'no_doc_ref' },
+        }));
+        return false;
+      }
+      // upload_complete — detail trafia do addona jako action params przez
+      // eventDispatcher (component-renderer applyEventHandlers nasłuchuje tej
+      // nazwy EventKind na wrapperze). Kształt zgodny z kontraktem addona.
+      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_complete', {
+        bubbles: false,
+        detail: {
+          doc_ref: docRef,
+          filename,
+          mime,
+          name: filename,
+          size: total,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (token.aborted) return false;
+      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_error', {
+        bubbles: false,
+        detail: { filename, name: filename, mime, reason: 'upload_failed', message: String(err && err.message) },
+      }));
+      return false;
+    }
+  };
+
+  // Sekwencyjny upload listy plików: jeden plik na raz (await), łatwiejszy postęp
+  // i mniejsze ryzyko przepełnienia bufora WS. Nowy wybór plików abortuje
+  // poprzednią sekwencję (patrz onChange). Błąd JEDNEGO pliku PRZERYWA sekwencję
+  // (już wyemitował `upload_error`) — świadomy wybór: kolejne pliki często zależą
+  // od poprzednich (np. komplet dokumentów), a ciche kontynuowanie po błędzie
+  // ukryłoby częściowy upload przed addonem.
+  const uploadFiles = async (arr) => {
+    if (!addonId) {
+      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_error', {
+        bubbles: false,
+        detail: { reason: 'no_addon_context' },
+      }));
+      return;
+    }
+    // Przerwij ewentualną trwającą sekwencję przed startem nowej.
+    if (activeUpload) activeUpload.aborted = true;
+    const token = { aborted: false };
+    activeUpload = token;
+    for (const f of arr) {
+      if (token.aborted) return;
+      const ok = await uploadOne(f, token);
+      if (!ok) return;
+    }
   };
 
   // tf-file-input emits a bubbling 'change' with detail {files}. Block the
   // raw event (its shape is not the SDK contract) and run validation; the
   // SDK-shaped 'files_selected'/'reject' events are dispatched on the wrapper.
+  // After a valid pick the host performs the chunked upload (upload_* events).
   const onChange = (e) => {
     e.stopImmediatePropagation();
-    validateAndEmit(e.detail && e.detail.files);
+    // Nowy wybór plików abortuje trwającą sekwencję (uploadFiles też to robi, ale
+    // ustawiamy tu od razu, gdyby walidacja odrzuciła nowy wybór — stary upload
+    // i tak musi paść, bo użytkownik zmienił intencję).
+    if (activeUpload) activeUpload.aborted = true;
+    const validated = validateAndEmit(e.detail && e.detail.files);
+    if (validated && validated.length > 0) void uploadFiles(validated);
   };
   fileEl.addEventListener('change', onChange);
   ctx.registerCleanup(() => fileEl.removeEventListener('change', onChange));
+  // Cleanup renderera (panel zamknięty / przerenderowany) przerywa upload —
+  // pętla nie wyśle kolejnych fragmentów po zwolnieniu kontekstu.
+  ctx.registerCleanup(() => {
+    if (activeUpload) activeUpload.aborted = true;
+  });
 
   return wrapper;
 }

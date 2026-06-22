@@ -23,6 +23,7 @@ pub type HandlerFuture<'a> =
 /// przez makro produkuje funkcje o tej signaturze zwracajaca boxed future.
 pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> HandlerFuture<'a>;
 
+pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
 #[cfg(feature = "camera")]
@@ -524,6 +525,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::SchedulerPayload::JobRunNowResponse(_) => {
                 "SchedulerJobRunNowResponse"
+            }
+        },
+        MessageBody::AddonDocumentBody(p) => match p {
+            tentaflow_protocol::AddonDocumentPayload::UploadChunkRequest(_) => {
+                "AddonDocumentUploadChunkRequest"
+            }
+            tentaflow_protocol::AddonDocumentPayload::UploadChunkResponse(_) => {
+                "AddonDocumentUploadChunkResponse"
             }
         },
         MessageBody::MlStudioBody(p) => match p {

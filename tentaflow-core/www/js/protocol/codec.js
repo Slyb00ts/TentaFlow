@@ -2582,6 +2582,34 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::AddonDocumentUploadChunkRequestBody. Jeden fragment pliku
+   * wgrywanego z panelu UI addona do JEGO document store. Klient dzieli plik na
+   * części `seq` (0..totalChunks) pod wspólnym `uploadId`; serwer zwraca `docRef`
+   * po ostatnim fragmencie. `org` bierze z sesji — NIE jest polem requestu.
+   * payload: { addonId, uploadId, filename, mime, seq, totalChunks, bytes }
+   */
+  addonDocumentUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeAddonDocumentUploadChunkRequest(
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      String(payload.filename ?? ''),
+      String(payload.mime ?? ''),
+      Number(payload.seq ?? 0),
+      Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::MlStudioBody(DatasetsListRequest). payload: { projectId }. */
   mlStudioDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
