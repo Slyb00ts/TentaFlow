@@ -339,6 +339,13 @@ impl AiEventHandle {
         let Some(usage) = usage else {
             return;
         };
+        // Empty model_id = a flow/session-level event with no resolved model
+        // (the dashboard chat selects a FLOW, not a model). Per-node LLM events
+        // inside the flow own attribution under the real model, so bumping here
+        // would both mis-attribute to "" AND double-count the node's tokens.
+        if self.model_id.trim().is_empty() {
+            return;
+        }
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         if let Err(err) = crate::db::repository::bump_token_usage(
             &self.db,
