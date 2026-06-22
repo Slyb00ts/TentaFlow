@@ -379,14 +379,20 @@ wasmi = "1.0.9"
 # gated PER-TARGET (runda 2 codex bug #1): every non-wasm target gets
 # `storage-sled` (pure-Rust embedded KV, no `links="sqlite3"` collision with our
 # bundled rusqlite); wasm32 gets cozo WITHOUT sled (mem-only — sled pulls
-# fs2/libc/mmap which don't compile to wasm). `graph-algo` enables the built-in
-# PageRank/community algorithms on both. RocksDB stays an additive opt-in via the
-# `graph-rocksdb` feature (server only, non-wasm).
+# fs2/libc/mmap which don't compile to wasm). RocksDB stays an additive opt-in via
+# the `graph-rocksdb` feature (server only, non-wasm).
+#
+# `graph-algo` (wbudowany PageRank Cozo) jest CELOWO wyłączone: rozwija się do
+# `["graph", "rayon"]`, gdzie feature `graph` ciągnie crate `graph_builder`, który
+# unifikuje rayon do wersji niezgodnej z resztą binarki (E0271/E0308 przy pełnym
+# buildzie). Włączamy więc TYLKO `rayon` (cozo używa go wewnętrznie w eval/lib i
+# bez niego sam się nie kompiluje), bez `graph`/`graph_builder`. PageRank liczymy
+# w Rust nad CSR (`services/graph/ppr.rs` z pustymi seedami = globalny PageRank).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cozo = { version = "0.7.6", default-features = false, features = ["graph-algo", "storage-sled"], optional = true }
+cozo = { version = "0.7.6", default-features = false, features = ["storage-sled", "rayon"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-cozo = { version = "0.7.6", default-features = false, features = ["graph-algo"], optional = true }
+cozo = { version = "0.7.6", default-features = false, features = ["rayon"], optional = true }
 
 [build-dependencies]
 rcgen = "0.14.7"

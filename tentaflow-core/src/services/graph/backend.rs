@@ -192,10 +192,6 @@ pub trait GraphBackend: Send + Sync {
         limit: u32,
     ) -> Result<Vec<(String, String, f64)>>;
 
-    /// Wbudowany PageRank Cozo (`graph-algo`). Zwraca `(id, score)` posortowane
-    /// malejąco, do `top_n` wierszy. `damping`/`iterations` to tuning fixed-rule.
-    fn pagerank(&self, top_n: u32, damping: f64, iterations: u32) -> Result<Vec<(String, f64)>>;
-
     /// Soft-delete węzła `id` (tombstone, O(1) `:put`): zostawia wiersz, ustawia
     /// label na marker tombstone i zeruje props/provenance. Wiersz krawędzi
     /// nietknięty (łańcuch provenance żyje), ale retrieval wyklucza krawędzie
@@ -556,36 +552,6 @@ impl GraphBackend for CozoBackend {
                 .and_then(|v| v.get_float().or_else(|| v.get_int().map(|i| i as f64)))
                 .unwrap_or(1.0);
             out.push((id.to_string(), rel.to_string(), w));
-        }
-        Ok(out)
-    }
-
-    fn pagerank(&self, top_n: u32, damping: f64, iterations: u32) -> Result<Vec<(String, f64)>> {
-        let theta = damping.clamp(0.0, 1.0);
-        let iters = iterations.max(1);
-        // Wbudowany fixed-rule PageRank Cozo nad relacją krawędzi (from, to).
-        // Read-only: PageRank nie mutuje bazy. Krawędzie martwe (`alive=false`) i
-        // incydentne do węzłów tombstone są wykluczone przez join z `*nodes` na
-        // nie-tombstone po obu końcach — PageRank liczy się na grafie bez
-        // tombstone (korekta B1+B2).
-        let script = format!(
-            "e[a, b] := *edges{{src: a, dst: b, alive}}, alive == true, \
-             *nodes{{id: a, label: la}}, la != '{TOMBSTONE_LABEL}', \
-             *nodes{{id: b, label: lb}}, lb != '{TOMBSTONE_LABEL}'\n\
-             ?[node, score] <~ PageRank(e[], theta: {theta}, iterations: {iters})\n\
-             :order -score\n:limit {top_n}"
-        );
-        let rows = self.run_query(&script)?;
-        let mut out = Vec::with_capacity(rows.rows.len());
-        for r in &rows.rows {
-            let Some(id) = r.first().and_then(|v| v.get_str()) else {
-                continue;
-            };
-            let score = r
-                .get(1)
-                .and_then(|v| v.get_float().or_else(|| v.get_int().map(|i| i as f64)))
-                .unwrap_or(0.0);
-            out.push((id.to_string(), score));
         }
         Ok(out)
     }

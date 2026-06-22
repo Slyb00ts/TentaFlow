@@ -135,22 +135,30 @@ fn test_neighbors_out_edges() {
 }
 
 #[test]
-fn test_builtin_pagerank() {
-    let (_dir, be) = build_sample_graph();
-    let rows = be
-        .run_query(
-            r"
-            ?[node, score] <~ PageRank(*edges[src, dst]);
-            :order -score
-            :limit 5
-            ",
-        )
+fn test_global_pagerank() {
+    // Globalny PageRank przez manager (CSR + `personalized_pagerank` z pustymi
+    // seedami). Dawniej wbudowany cozo `<~ PageRank`; przeniesiony do Rust, bo
+    // cozo `graph-algo`/`graph_builder` konfliktuje z rayon binarki.
+    let (_dir, mgr) = mgr();
+    for id in ["a", "b", "c", "d", "e"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    // Węzeł `c` jest hubem (wiele wejść) -> najwyższy PageRank.
+    for src in ["a", "b", "d", "e"] {
+        mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", src, "to", "c", 1.0, "{}", "null")
+            .unwrap();
+    }
+    let ranked = mgr
+        .pagerank(ORG_A, "addon_a", "kg", 5, 0.85, 50)
         .unwrap();
-    assert!(!rows.rows.is_empty());
+    assert!(!ranked.is_empty());
     // Wyniki posortowane malejąco: pierwszy score >= ostatni.
-    let first = rows.rows.first().unwrap()[1].get_float().unwrap();
-    let last = rows.rows.last().unwrap()[1].get_float().unwrap();
+    let first = ranked.first().unwrap().1;
+    let last = ranked.last().unwrap().1;
     assert!(first >= last);
+    // Hub `c` jest najwyżej.
+    assert_eq!(ranked.first().unwrap().0, "c", "hub powinien mieć najwyższy PageRank");
 }
 
 #[test]

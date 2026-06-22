@@ -696,7 +696,14 @@ impl GraphManager {
         })
     }
 
-    /// Wbudowany PageRank Cozo (`graph-algo`), top-N malejąco. Read-lock.
+    /// Globalny PageRank, top-N malejąco. Read-lock.
+    ///
+    /// Liczony w Rust nad CSR (`personalized_pagerank` z PUSTYMI seedami =
+    /// jednostajna teleportacja = klasyczny globalny PageRank), bo wbudowany
+    /// PageRank Cozo (`graph-algo`) ciągnie crate `graph_builder`, który
+    /// konfliktuje z wersją rayon binarki (E0271/E0308 przy pełnym buildzie).
+    /// To dokładnie ta sama semantyka co dawny cozo `<~ PageRank`, ale bez
+    /// niezgodnej zależności.
     pub fn pagerank(
         &self,
         org_id: &str,
@@ -706,9 +713,11 @@ impl GraphManager {
         damping: f64,
         iterations: u32,
     ) -> Result<Vec<(String, f64)>> {
-        self.with_read(org_id, addon_id, collection, |b| {
-            b.pagerank(top_n, damping, iterations)
-        })
+        let csr = self.export_csr(org_id, addon_id, collection)?;
+        let mut scored =
+            super::ppr::personalized_pagerank(&csr, &[], damping, iterations as usize);
+        scored.truncate(top_n as usize);
+        Ok(scored)
     }
 
     /// Personalized PageRank liczony w Rust nad CSR z Cozo (`ppr.rs`). Seedy to
