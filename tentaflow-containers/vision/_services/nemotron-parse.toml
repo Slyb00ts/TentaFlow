@@ -16,10 +16,14 @@ homepage = "https://huggingface.co/nvidia/NVIDIA-Nemotron-Parse-v1.2"
 license = "nvidia-open-model-license"
 icon = "vision"
 default_port = 8094
-api = "custom"
+# API zgodne z NVIDIA nemoretriever-parse: model jest VLM serwowanym po
+# OpenAI `/v1/chat/completions`, dlatego klasyfikujemy go jako `chat` z wejsciem
+# image — Core rozwiazuje go ta sama sciezka vision-chat co inne VLM, a
+# `openai-compatible` sprawia ze endpoint dostaje `/v1` (`.../v1/chat/completions`).
+api = "openai-compatible"
 version = "v1.2"
-service_surfaces = ["documents"]
-input_modalities = ["image"]
+service_surfaces = ["chat"]
+input_modalities = ["text", "image"]
 output_modalities = ["text"]
 
 [deploy.native]

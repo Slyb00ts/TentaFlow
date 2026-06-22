@@ -447,7 +447,8 @@ impl FlowDispatcher {
             }
             ResolvedFlow::NotFound => {
                 // Universal Flow Gateway — synthetic ad-hoc fallback.
-                let compiled = self.compile_synthetic_blocking(service_type, model_name)?;
+                let compiled =
+                    self.compile_synthetic_blocking(service_type, model_name, modality)?;
                 self.run_blocking(compiled, initial, meta)
                     .await
                     .map_err(DispatchError::from)
@@ -641,7 +642,17 @@ impl FlowDispatcher {
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
     ) -> std::result::Result<StreamingExecution, DispatchError> {
-        let compiled = self.compile_synthetic_streaming(service_type, model_name)?;
+        let modality = derive_modality(&initial);
+        let compiled = self.compile_synthetic_streaming(service_type, model_name, modality)?;
+        if !compiled.is_streaming {
+            // Vision synthetic flow jest blocking-only — wykonaj blocking
+            // i opakuj jako single-chunk stream.
+            let outcome = self
+                .run_blocking(compiled, initial, meta)
+                .await
+                .map_err(DispatchError::from)?;
+            return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
+        }
         let ctx = self.ctx_factory.make_context(&meta);
         let stream_exec = execute_streaming(
             self.db.clone(),
@@ -686,7 +697,21 @@ impl FlowDispatcher {
                 }
                 cached.compiled.clone()
             }
-            ResolvedFlow::NotFound => self.compile_synthetic_streaming(service_type, model_name)?,
+            ResolvedFlow::NotFound => {
+                let synth =
+                    self.compile_synthetic_streaming(service_type, model_name, modality)?;
+                if !synth.is_streaming {
+                    // Vision synthetic flow jest blocking-only — wykonaj blocking
+                    // i opakuj jako single-chunk stream (jak user-defined blocking
+                    // flow powyżej).
+                    let outcome = self
+                        .run_blocking(synth, initial, meta)
+                        .await
+                        .map_err(DispatchError::from)?;
+                    return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
+                }
+                synth
+            }
             ResolvedFlow::CompileFailed => {
                 return Err(DispatchError::CompileFailed {
                     flow_id: String::new(),
@@ -808,16 +833,18 @@ impl FlowDispatcher {
         &self,
         service_type: &str,
         model: &str,
+        modality: &str,
     ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
-        self.compile_synthetic_inner(service_type, model, false)
+        self.compile_synthetic_inner(service_type, model, modality, false)
     }
 
     fn compile_synthetic_streaming(
         &self,
         service_type: &str,
         model: &str,
+        modality: &str,
     ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
-        self.compile_synthetic_inner(service_type, model, true)
+        self.compile_synthetic_inner(service_type, model, modality, true)
     }
 
     /// Stage 3d-0b-final P2#2: rozdziela `Unsupported` (service_type bez
@@ -828,9 +855,16 @@ impl FlowDispatcher {
         &self,
         service_type: &str,
         model: &str,
+        modality: &str,
         streaming: bool,
     ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
+        // Image-modality chat: vision_llm konsumuje obraz i zwraca tekst. Adapter
+        // jest blocking-only (brak streaming wariantu), więc nawet na ścieżce
+        // streaming budujemy blocking flow — caller opakowuje outcome w
+        // single-chunk stream.
+        let is_vision = service_type == "chat" && modality == "image";
         let kind = match (service_type, streaming) {
+            ("chat", _) if is_vision => "vision",
             ("chat", false) => "chat",
             ("chat", true) => "chat_stream",
             ("tts", _) => "tts",
@@ -847,12 +881,13 @@ impl FlowDispatcher {
         if let Some(hit) = self.cache.synthetic_get(&synth_key) {
             return Ok(hit);
         }
-        let definition = match (service_type, streaming) {
-            ("chat", false) => synthetic::synthetic_chat(model),
-            ("chat", true) => synthetic::synthetic_chat_stream(model),
-            ("tts", _) => synthetic::synthetic_tts(model),
-            ("stt", _) => synthetic::synthetic_stt(model),
-            ("embeddings", _) => synthetic::synthetic_embeddings(model),
+        let definition = match kind {
+            "vision" => synthetic::synthetic_vision(model),
+            "chat" => synthetic::synthetic_chat(model),
+            "chat_stream" => synthetic::synthetic_chat_stream(model),
+            "tts" => synthetic::synthetic_tts(model),
+            "stt" => synthetic::synthetic_stt(model),
+            "embeddings" => synthetic::synthetic_embeddings(model),
             _ => unreachable!("kind matched powyżej"),
         };
         let compiled = match CompiledFlow::compile("", definition, &self.registry) {
