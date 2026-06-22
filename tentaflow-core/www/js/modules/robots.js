@@ -1231,6 +1231,21 @@ function renderLidarStatus(host, { enabled, available, offline, snapshotPoints, 
 // glue module may not exist yet (sibling renderer not built) — a failed import
 // degrades to a "renderer niedostępny" placeholder instead of throwing. A new
 // init invalidates any older in-flight init via voxelInitToken.
+// Push the robot's world pose (from telemetry, odom frame) into the voxel view so
+// the robot model sits at its real position/orientation and the radial colormap
+// radiates from the robot. Absent pose leaves the previous one in place.
+function applyRobotPose(id) {
+  if (!voxelView) return;
+  const r = findRobot(id);
+  const t = r ? telemetry(r) : null;
+  if (!t) return;
+  const p = t.posePosition ?? t.pose_position;
+  const q = t.poseOrientation ?? t.pose_orientation;
+  if (!Array.isArray(p) || p.length < 3) return;
+  const o = Array.isArray(q) && q.length >= 4 ? q : [0, 0, 0, 1];
+  try { voxelView.setRobotPose(p[0], p[1], p[2], o[0], o[1], o[2], o[3]); } catch { /* ignore */ }
+}
+
 async function ensureVoxel(container) {
   if (!container) return;
   if (voxelView && voxelCanvas && container.contains(voxelCanvas)) return;
@@ -1272,6 +1287,7 @@ async function ensureVoxel(container) {
     if (live && live.lastPoints && voxelView) {
       try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
     }
+    applyRobotPose(selectedRobotId);
   } catch (err) {
     if (token !== voxelInitToken) { canvas.remove(); return; }
     canvas.remove();
@@ -1876,6 +1892,7 @@ function onLidarChunk(id, live, body) {
   if (voxelView && id === selectedRobotId && live.lastPoints) {
     try {
       voxelView.setPoints(live.lastPoints, live.lastPointCount);
+      applyRobotPose(id);
     } catch (e) {
       console.warn('[robots] voxel setPoints threw:', e?.message ?? e);
     }
