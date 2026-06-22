@@ -4,7 +4,7 @@
 // voxel cubes (Z-up) colored by horizontal radial distance from the robot (magenta
 // near -> green at the edges), each cube outlined with a dark Minecraft-style edge,
 // on top of a wireframe ground grid, with a small robot marker placed at the robot's
-// world pose, faint LiDAR rays and mouse orbit/zoom.
+// world pose and mouse orbit/zoom.
 //
 // The Go2 voxel_map arrives ALREADY in a fixed odom world frame (the grid origin is
 // constant across frames; the robot moves through it). We therefore accumulate the
@@ -104,7 +104,7 @@ struct Uniforms {
 }
 
 // Uniform for the robot marker: a world-space model transform applied on top of
-// the shared view_proj. The grid and rays render in world space directly and
+// the shared view_proj. The grid renders in world space directly and
 // reuse only view_proj from the same buffer (model is identity for them).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -167,13 +167,13 @@ fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
 }
 
-// Radial-distance colormap: close to the robot = magenta/pink, sweeping through
-// red, orange, yellow to green at the far edges. t is normalized horizontal
-// distance from the cloud center [0,1]. Hue starts at ~magenta (0.85) and sweeps
-// forward, wrapping past red/orange (~0.0-0.1) to green (~0.33).
+// Radial-distance colormap: close to the robot = RED, sweeping through orange,
+// yellow, green, cyan to BLUE at the far edges (the classic, readable depth ramp).
+// t is normalized horizontal distance from the robot [0,1]; hue 0 (red) -> 0.66
+// (blue).
 fn radialcolor(t: f32) -> vec3<f32> {
     let c = clamp(t, 0.0, 1.0);
-    let h = fract(0.85 + c * 0.48);
+    let h = c * 0.66;
     return hsv2rgb(h, 0.95, 1.0);
 }
 
@@ -202,15 +202,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let m0 = max(a.x, max(a.y, a.z));   // largest (always ~0.5 on a face)
     let m2 = min(a.x, min(a.y, a.z));   // smallest
     let mid = (a.x + a.y + a.z) - m0 - m2; // middle component
-    // Edge band: within ~7% of the cube half-extent on the second axis too.
-    let edge = step(0.5 - 0.035, mid);
-    let shade = mix(1.0, 0.35, edge);
+    // Edge band: darken a WIDE border on every voxel so each cube is clearly
+    // separated (smoothstep gives a clean anti-aliased outline). ~16% of the cube
+    // half-extent on the second axis, darkened hard toward black.
+    let edge = smoothstep(0.5 - 0.10, 0.5 - 0.04, mid);
+    let shade = mix(1.0, 0.15, edge);
     return vec4<f32>(in.color * shade, 1.0);
 }
 "#;
 
-// Shared shader for per-vertex-colored line and solid geometry (grid, rays, robot
-// marker). The robot draw applies a model matrix; grid/rays bind an identity model.
+// Shared shader for per-vertex-colored line and solid geometry (grid, robot
+// marker). The robot draw applies a model matrix; grid bind an identity model.
 const COLORED_SHADER_SRC: &str = r#"
 struct ModelUniforms {
     view_proj: mat4x4<f32>,
@@ -325,11 +327,11 @@ struct State {
     instance_capacity: u32,
     instance_count: u32,
 
-    // Shared pipeline for colored line/solid geometry (grid, rays, robot).
+    // Shared pipeline for colored line/solid geometry (grid, robot).
     colored_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
 
-    // view_proj-only uniform (identity model) for world-space grid + rays.
+    // view_proj-only uniform (identity model) for world-space grid.
     world_uniform_buffer: wgpu::Buffer,
     world_bind_group: wgpu::BindGroup,
     // view_proj + robot model transform.
@@ -345,10 +347,14 @@ struct State {
     robot_model: Mat4,
     robot_visible: bool,
 
-    // Faint LiDAR rays from the robot to a subset of points.
-    ray_buffer: wgpu::Buffer,
-    ray_capacity: u32,
-    ray_vertex_count: u32,
+    // Real Go2 body mesh loaded from /assets/go2/base.glb at init. When present it
+    // replaces the box marker; on a fetch/parse failure these stay None and the box
+    // marker is used as the fallback. The mesh reuses the robot bind group (and thus
+    // `robot_model`) so it tracks the pose exactly like the box did.
+    mesh_buffer: Option<wgpu::Buffer>,
+    mesh_index_buffer: Option<wgpu::Buffer>,
+    mesh_index_count: u32,
+
 
     depth_view: wgpu::TextureView,
 
@@ -375,15 +381,11 @@ struct State {
     capped_logged: bool,
 
     // Robot world pose from the separate pose topic. `robot_pose_set` gates the
-    // marker, the radial colormap origin and the ray origin: before the first pose
+    // marker and the radial colormap origin: before the first pose
     // arrives the marker stays hidden and the colormap falls back to cloud bounds.
     robot_position: Vec3,
     robot_orientation: Quat,
     robot_pose_set: bool,
-    // Last frame's raw XYZ triples, kept so a pose-only update (no new cloud) can
-    // re-aim the LiDAR rays from the robot's new position.
-    last_points: Vec<f32>,
-    last_point_count: usize,
 }
 
 // Geometry of the robot marker, in the marker's local frame (Z-up): a low box
@@ -396,11 +398,14 @@ const ROBOT_NOSE_LEN: f32 = 0.12;
 const ROBOT_COLOR: [f32; 3] = [0.92, 0.94, 0.97];
 const ROBOT_NOSE_COLOR: [f32; 3] = [1.0, 0.85, 0.45];
 
-// Render every Nth point as a faint ray; a large stride keeps the rays sparse so
-// they read as a few faint beams under the robot rather than a dense fan.
-const RAY_STRIDE: usize = 128;
-// Near-black/dark gray so the rays stay subtle, like the reference.
-const RAY_COLOR: [f32; 3] = [0.10, 0.10, 0.10];
+// URL of the decimated Go2 body glTF binary served by the dashboard. Authored in
+// the URDF base_link frame (Z-up, X-forward), real scale in meters, body at the
+// origin — the same convention as our odom Z-up frame, so no axis fixup is needed.
+const GO2_MESH_URL: &str = "/assets/go2/base.glb";
+
+// Flat light-gray the Go2 body is rendered with (materials/textures are ignored),
+// matching the near-white box marker it replaces.
+const GO2_MESH_COLOR: [f32; 3] = [0.82, 0.85, 0.90];
 
 impl State {
     fn write_uniforms(&self) {
@@ -415,7 +420,7 @@ impl State {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        // World-space colored geometry (grid, rays): identity model.
+        // World-space colored geometry (grid): identity model.
         let world = ModelUniforms {
             view_proj: view_proj.to_cols_array_2d(),
             model: Mat4::IDENTITY.to_cols_array_2d(),
@@ -479,14 +484,6 @@ impl State {
                 pass.draw(0..self.grid_vertex_count, 0..1);
             }
 
-            // Faint LiDAR rays from the robot to a subset of points.
-            if self.ray_vertex_count > 0 {
-                pass.set_pipeline(&self.line_pipeline);
-                pass.set_bind_group(0, &self.world_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.ray_buffer.slice(..));
-                pass.draw(0..self.ray_vertex_count, 0..1);
-            }
-
             // Instanced voxel cubes.
             if self.instance_count > 0 {
                 pass.set_pipeline(&self.pipeline);
@@ -497,12 +494,27 @@ impl State {
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.instance_count);
             }
 
-            // Robot marker on top so it reads as the focal point.
-            if self.robot_visible && self.robot_vertex_count > 0 {
-                pass.set_pipeline(&self.colored_pipeline);
-                pass.set_bind_group(0, &self.robot_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.robot_buffer.slice(..));
-                pass.draw(0..self.robot_vertex_count, 0..1);
+            // Robot on top so it reads as the focal point. Prefer the real Go2 body
+            // mesh (loaded from base.glb); fall back to the box marker if the mesh
+            // failed to load, so the robot is always visible. Both reuse the robot bind
+            // group, so they track the pose identically.
+            if self.robot_visible {
+                match (self.mesh_buffer.as_ref(), self.mesh_index_buffer.as_ref()) {
+                    (Some(vbuf), Some(ibuf)) if self.mesh_index_count > 0 => {
+                        pass.set_pipeline(&self.colored_pipeline);
+                        pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                        pass.set_vertex_buffer(0, vbuf.slice(..));
+                        pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+                    }
+                    _ if self.robot_vertex_count > 0 => {
+                        pass.set_pipeline(&self.colored_pipeline);
+                        pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.robot_buffer.slice(..));
+                        pass.draw(0..self.robot_vertex_count, 0..1);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -651,31 +663,31 @@ impl State {
         verts
     }
 
-    // Rebuild the faint ray buffer from the robot origin to every RAY_STRIDE-th
-    // point. Called from set_points where the cloud is already in scope.
-    fn update_rays(&mut self, points: &[f32], n: usize, origin: Vec3) {
-        let mut verts: Vec<LineVertex> = Vec::new();
-        let max_rays = (self.ray_capacity / 2) as usize;
-        let mut i = 0;
-        while i < n && verts.len() / 2 < max_rays {
-            let p = [points[i * 3], points[i * 3 + 1], points[i * 3 + 2]];
-            verts.push(LineVertex {
-                position: origin.to_array(),
-                color: RAY_COLOR,
-            });
-            verts.push(LineVertex {
-                position: p,
-                color: RAY_COLOR,
-            });
-            i += RAY_STRIDE;
-        }
-        if verts.is_empty() {
-            self.ray_vertex_count = 0;
+    // Upload a parsed Go2 body mesh (flat-colored triangle list) as the robot model,
+    // replacing the box marker. Reuses the colored pipeline + robot bind group, so the
+    // mesh follows the pose via `robot_model` exactly like the box. Indexed to keep the
+    // upload compact.
+    fn install_robot_mesh(&mut self, vertices: &[SolidVertex], indices: &[u32]) {
+        if vertices.is_empty() || indices.is_empty() {
             return;
         }
-        self.queue
-            .write_buffer(&self.ray_buffer, 0, bytemuck::cast_slice(&verts));
-        self.ray_vertex_count = verts.len() as u32;
+        let vbuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("go2-mesh-vertices"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let ibuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("go2-mesh-indices"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.mesh_buffer = Some(vbuf);
+        self.mesh_index_buffer = Some(ibuf);
+        self.mesh_index_count = indices.len() as u32;
     }
 
     // Quantize a world point to its voxel cell coordinate (round to the nearest
@@ -1013,7 +1025,7 @@ pub async fn init_voxel_view(
         multiview: None,
     });
 
-    // --- Colored line/solid pipelines (grid, rays, robot) ---
+    // --- Colored line/solid pipelines (grid, robot) ---
     let model_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model-bgl"),
@@ -1040,7 +1052,7 @@ pub async fn init_voxel_view(
         attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
     };
 
-    // Lines (grid + rays): no culling.
+    // Lines (grid): no culling.
     let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("line-pipeline"),
         layout: Some(&model_pipeline_layout),
@@ -1169,15 +1181,6 @@ pub async fn init_voxel_view(
         mapped_at_creation: false,
     });
 
-    // Ray buffer: cap the number of rays so the line draw stays cheap.
-    let ray_capacity = 4096u32;
-    let ray_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ray-vertices"),
-        size: (ray_capacity as u64) * std::mem::size_of::<LineVertex>() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
     let instance_capacity = 65_536u32;
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("voxel-instances"),
@@ -1217,9 +1220,9 @@ pub async fn init_voxel_view(
         robot_vertex_count,
         robot_model: Mat4::IDENTITY,
         robot_visible: false,
-        ray_buffer,
-        ray_capacity,
-        ray_vertex_count: 0,
+        mesh_buffer: None,
+        mesh_index_buffer: None,
+        mesh_index_count: 0,
         depth_view,
         camera,
         voxel_size,
@@ -1235,9 +1238,21 @@ pub async fn init_voxel_view(
         robot_position: Vec3::ZERO,
         robot_orientation: Quat::IDENTITY,
         robot_pose_set: false,
-        last_points: Vec::new(),
-        last_point_count: 0,
     }));
+
+    // Load the real Go2 body mesh. On any failure (network, parse, no geometry) keep
+    // the box marker as the fallback so the robot is always visible, and warn.
+    match fetch_bytes(GO2_MESH_URL).await {
+        Ok(bytes) => match parse_glb_mesh(&bytes) {
+            Ok((verts, idx)) => {
+                state.borrow_mut().install_robot_mesh(&verts, &idx);
+            }
+            Err(e) => log::warn!("Go2 body mesh parse failed ({e}); using box marker"),
+        },
+        Err(e) => log::warn!(
+            "Go2 body mesh fetch failed ({e:?}); using box marker"
+        ),
+    }
 
     let raf_handle: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
     let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
@@ -1290,7 +1305,7 @@ impl VoxelView {
     ///
     /// On the first non-empty frame the camera auto-frames the accumulated bounds; it
     /// does NOT re-frame on every subsequent growth. The radial colormap, robot marker
-    /// and LiDAR rays are driven by the robot world pose set via `setRobotPose`.
+    /// is driven by the robot world pose set via `setRobotPose`.
     #[wasm_bindgen(js_name = setPoints)]
     pub fn set_points(&self, points: &[f32], count: u32) {
         let state = match self.state.as_ref() {
@@ -1304,11 +1319,6 @@ impl VoxelView {
             // An empty frame does not erase the accumulated map; nothing to do.
             return;
         }
-
-        // Cache this frame's points so a later pose-only update can re-aim the rays.
-        st.last_points.clear();
-        st.last_points.extend_from_slice(&points[..usable * 3]);
-        st.last_point_count = usable;
 
         // Merge this frame's cells into the accumulated union.
         if st.accumulate_cells(points, usable) {
@@ -1336,16 +1346,6 @@ impl VoxelView {
         // material change).
         st.update_grid(min, max);
 
-        // Faint rays cast from the robot's actual position to a subset of THIS frame's
-        // points. `robot_position.z` is already the body center, so no extra offset.
-        // Only shown once a pose is known.
-        if st.robot_pose_set {
-            let ray_origin = st.robot_position;
-            st.update_rays(points, usable, ray_origin);
-        } else {
-            st.ray_vertex_count = 0;
-        }
-
         // Auto-frame once on the first accumulated cloud; do not re-frame as the map
         // grows so the user's orbit/zoom is preserved.
         if !st.framed {
@@ -1357,9 +1357,9 @@ impl VoxelView {
 
     /// Set the robot's world pose (odom frame, meters + unit quaternion) from the
     /// separate pose topic. Drives the robot marker placement (translate * quaternion),
-    /// the radial colormap origin (color radiates from the robot) and the LiDAR ray
-    /// origin. Until this is called the marker stays hidden so it is never drawn at a
-    /// wrong spot. `pose.z` already reflects the body center (~0.31 m above the floor).
+    /// and the radial colormap origin (color radiates from the robot). Until this is
+    /// called the marker stays hidden so it is never drawn at a wrong spot.
+    /// `pose.z` already reflects the body center (~0.31 m above the floor).
     #[wasm_bindgen(js_name = setRobotPose)]
     pub fn set_robot_pose(&self, x: f32, y: f32, z: f32, qx: f32, qy: f32, qz: f32, qw: f32) {
         let state = match self.state.as_ref() {
@@ -1382,16 +1382,8 @@ impl VoxelView {
         st.robot_pose_set = true;
 
         // Pose-driven visuals must follow the robot even when the pose advances
-        // between cloud frames: recompute the colormap origin and re-aim the rays from
-        // the new position using the last cached frame.
+        // between cloud frames: recompute the colormap origin from the new position.
         st.refresh_color_field();
-        if st.last_point_count > 0 {
-            let pts = std::mem::take(&mut st.last_points);
-            let n = st.last_point_count;
-            let origin = st.robot_position;
-            st.update_rays(&pts, n, origin);
-            st.last_points = pts;
-        }
     }
 
     /// Reset the accumulated occupancy map: clears the cell set, the FIFO order and the
@@ -1408,9 +1400,6 @@ impl VoxelView {
         st.cell_order.clear();
         st.cells_dirty = false;
         st.instance_count = 0;
-        st.ray_vertex_count = 0;
-        st.last_points.clear();
-        st.last_point_count = 0;
         st.accum_min = Vec3::splat(f32::INFINITY);
         st.accum_max = Vec3::splat(f32::NEG_INFINITY);
         st.capped_logged = false;
@@ -1470,8 +1459,8 @@ impl VoxelView {
         }
         // Drop our owning State handle. With the rAF closure and all pointer
         // closures already dropped above, this releases the last Rc strong
-        // reference, so the wgpu device/surface/buffers (including the grid, robot
-        // and ray pipelines/buffers) are freed now rather than at JS GC of the
+        // reference, so the wgpu device/surface/buffers (including the grid, robot,
+        // Go2 mesh and ray pipelines/buffers) are freed now rather than at JS GC of the
         // wrapper.
         self.state = None;
     }
@@ -1579,6 +1568,109 @@ fn install_pointer_handlers(
 
 fn window() -> web_sys::Window {
     web_sys::window().expect("no global window")
+}
+
+// Fetch the Go2 body glb over HTTP and return its raw bytes. Errors (network,
+// non-200) propagate so the caller can fall back to the box marker.
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("GET");
+    let request = web_sys::Request::new_with_str_and_init(url, &opts)?;
+    let resp_value =
+        wasm_bindgen_futures::JsFuture::from(window().fetch_with_request(&request)).await?;
+    let resp: web_sys::Response = resp_value.dyn_into()?;
+    if !resp.ok() {
+        return Err(JsValue::from_str(&format!(
+            "fetch {url} -> HTTP {}",
+            resp.status()
+        )));
+    }
+    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
+    let array = js_sys::Uint8Array::new(&buf);
+    Ok(array.to_vec())
+}
+
+// Parse a binary glTF (.glb) byte buffer into a single merged flat-colored triangle
+// mesh: every primitive of every mesh is appended (positions transformed by its
+// node's world transform), indices are offset and concatenated. Materials and
+// textures are intentionally ignored — the body renders flat. Returns the merged
+// (vertices, indices) or an error if the file has no usable triangle geometry.
+fn parse_glb_mesh(bytes: &[u8]) -> Result<(Vec<SolidVertex>, Vec<u32>), String> {
+    // Gltf::from_slice parses the glb container and exposes its binary chunk as
+    // `blob`; that single embedded buffer holds all buffer data for a self-contained
+    // file, so map it to the one internal buffer the primitive reader expects.
+    let document = gltf::Gltf::from_slice(bytes).map_err(|e| format!("gltf parse: {e}"))?;
+    let bin = document.blob.as_deref().unwrap_or(&[]);
+    let buffers: Vec<&[u8]> = vec![bin];
+
+    let mut vertices: Vec<SolidVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    // Walk every node in every scene and accumulate world-space geometry so a model
+    // built from several nodes/primitives merges into one mesh.
+    for scene in document.scenes() {
+        for node in scene.nodes() {
+            accumulate_node(&node, Mat4::IDENTITY, &buffers, &mut vertices, &mut indices);
+        }
+    }
+
+    if vertices.is_empty() || indices.is_empty() {
+        return Err("glb contained no triangle geometry".to_string());
+    }
+    Ok((vertices, indices))
+}
+
+// Recursively append a node's mesh primitives (and its children) to the merged
+// vertex/index buffers, applying the cumulative world transform.
+fn accumulate_node(
+    node: &gltf::Node,
+    parent: Mat4,
+    buffers: &[&[u8]],
+    vertices: &mut Vec<SolidVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let local = Mat4::from_cols_array_2d(&node.transform().matrix());
+    let world = parent * local;
+
+    if let Some(mesh) = node.mesh() {
+        for prim in mesh.primitives() {
+            // Only triangle lists carry renderable body geometry here.
+            if prim.mode() != gltf::mesh::Mode::Triangles {
+                continue;
+            }
+            let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
+            let positions = match reader.read_positions() {
+                Some(p) => p,
+                None => continue,
+            };
+            let base = vertices.len() as u32;
+            for p in positions {
+                let wp = world.transform_point3(Vec3::from_array(p));
+                vertices.push(SolidVertex {
+                    position: wp.to_array(),
+                    color: GO2_MESH_COLOR,
+                });
+            }
+            match reader.read_indices() {
+                Some(idx) => {
+                    for i in idx.into_u32() {
+                        indices.push(base + i);
+                    }
+                }
+                // Non-indexed primitive: emit a sequential index per appended vertex.
+                None => {
+                    let added = vertices.len() as u32 - base;
+                    for i in 0..added {
+                        indices.push(base + i);
+                    }
+                }
+            }
+        }
+    }
+
+    for child in node.children() {
+        accumulate_node(&child, world, buffers, vertices, indices);
+    }
 }
 
 fn request_animation_frame(cb: &Closure<dyn FnMut()>) -> i32 {
