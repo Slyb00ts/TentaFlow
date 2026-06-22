@@ -78,6 +78,13 @@ const LIDAR_RESUBSCRIBE_DELAY_MS = 1000;
 // matching the go2 driver's own move buttons. The owner re-clamps to its safety
 // cap regardless.
 const MOVE_SPEED = 0.3;
+// Yaw rate (rad/s) for turning. The Go2 has a minimum effective turn rate (~0.5
+// rad/s); below it the robot simply does not rotate. Linear speed (m/s) and yaw
+// rate (rad/s) are DIFFERENT units, so turning uses its own higher magnitude with
+// a floor that clears the threshold, instead of reusing the small linear speed.
+const YAW_SPEED = 0.9;
+const PAD_YAW_MIN = 0.7;
+const PAD_YAW_MAX = 1.8;
 
 // Bounded control-outcome history shown in the detail "Log" tab. Old entries are
 // trimmed so a long session can't grow this without bound.
@@ -205,16 +212,35 @@ const PAD_RAMP_TIME_MS = 1000;
 
 // Standard-gamepad button indices we ACT on. These are defaults — this unit's real
 // indices are unknown until we read the live raw readout, so they live here as the
-// single place to change. E-STOP has priority over every other mapped button.
-// (Standard mapping: 0=A/south, 1=B/east, 2=X/west, 3=Y/north, 9=start.)
+// single place to change. E-STOP has priority over every other mapped button. The
+// e-stop index deliberately sits OUTSIDE 0–7 (the user-assigned block): it is a
+// best-effort guess for this stick (the on-screen E-STOP always works regardless).
 const PAD_BUTTONS = {
-  estop: 1,       // B / east — emergency stop (priority)
-  standUp: 3,     // Y / north — stand up / recover
-  lieDown: 0,     // A / south — lie down / sit
-  hello: 2,       // X / west — hello wave
-  speedDown: 4,   // gamepad button INDEX 4 — decrease max speed by PAD_SPEED_STEP
-  speedUp: 5,     // gamepad button INDEX 5 — increase max speed by PAD_SPEED_STEP
+  lookDown: 0,    // INDEX 0 — pitch the body DOWN (tap nudges, hold ramps)
+  sit: 1,         // INDEX 1 — sit (prefer `sit`, else `stand_down`)
+  lookUp: 2,      // INDEX 2 — pitch the body UP (tap nudges, hold ramps)
+  standUp: 3,     // INDEX 3 — stand up (`stand_up` / `recovery_stand` / `balance_stand`)
+  speedUp: 4,     // INDEX 4 — increase max speed by PAD_SPEED_STEP
+  hello: 5,       // INDEX 5 — hello wave
+  speedDown: 6,   // INDEX 6 — decrease max speed by PAD_SPEED_STEP
+  frontJump: 7,   // INDEX 7 — front jump, dispatched DIRECTLY (no confirm dialog)
+  estop: 8,       // INDEX 8 (OUTSIDE 0–7) — emergency stop (priority, best-effort)
+  resetEstop: 9,  // INDEX 9 — clear e-stop (exit emergency stop)
 };
+
+// Body-pitch (look up/down) tuning, used by buttons 0/2. The accumulator persists
+// across toggle off/on like padMaxSpeed; the robot keeps looking where it was left.
+//   - TAP (rising edge) nudges by PAD_PITCH_TAP_STEP.
+//   - HOLD time-ramps the per-second pitch rate from a floor up to a cap over
+//     PAD_PITCH_RAMP_TIME_MS, integrated per rAF frame (dt).
+//   - The value is clamped to [PAD_PITCH_MIN, PAD_PITCH_MAX] (radians).
+// Look (euler) is INDEPENDENT from drive (move): both can run the same tick.
+const PAD_PITCH_MIN = -0.5;
+const PAD_PITCH_MAX = 0.5;
+const PAD_PITCH_TAP_STEP = 0.06;
+const PAD_PITCH_RATE_FLOOR = 0.15;
+const PAD_PITCH_RATE_CAP = 0.9;
+const PAD_PITCH_RAMP_TIME_MS = 1000;
 
 // Standard-gamepad d-pad button indices (when the lever surfaces as buttons, not
 // axes). Up/Down/Left/Right.
@@ -224,7 +250,9 @@ const PAD_DPAD = { up: 12, down: 13, left: 14, right: 15 };
 // enabled. Mirrors the lidar loop lifecycle: every start has a matching stop, so
 // the rAF loop + listeners never leak past detail close / unmount.
 // Shape: { enabled, rafId, rampStartMs, rampActive, lastMoveAtMs, lastMoveZero,
-//          prevButtons:Set, connected, padId, lastAxes:number[], lastButtons:number[] }
+//          prevButtons:Set, connected, padId, lastAxes:number[], lastButtons:number[],
+//          lastTickMs, pitchHoldStartMs, pitchDownPrev, pitchUpPrev, lastEulerAtMs,
+//          lastSentPitch }
 let padState = null;
 
 // Whether the pad is ON. Default true (DEFAULT ENABLED): the loop auto-starts when
@@ -237,6 +265,12 @@ let padEnabled = true;
 // [PAD_SPEED_MIN, PAD_SPEED_MAX]. Kept at module level so it survives a toggle
 // off/on and the loop being destroyed.
 let padMaxSpeed = PAD_SPEED_DEFAULT;
+
+// Current body-pitch (radians) the look up/down buttons drive via the `euler`
+// command. Held at module level so it survives a toggle off/on and the loop being
+// destroyed; on RELEASE it stays put (the robot keeps looking there). Clamped to
+// [PAD_PITCH_MIN, PAD_PITCH_MAX].
+let padPitch = 0;
 
 const RobotsScreen = {
   get title() { return 'Roboty'; },
@@ -1577,8 +1611,8 @@ function buildQuickMove(host, id, r) {
   const dirs = [
     { label: 'Naprzód', vx: MOVE_SPEED, vy: 0, vyaw: 0 },
     { label: 'Tył', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
-    { label: 'Obrót L', vx: 0, vy: 0, vyaw: MOVE_SPEED },
-    { label: 'Obrót P', vx: 0, vy: 0, vyaw: -MOVE_SPEED },
+    { label: 'Obrót L', vx: 0, vy: 0, vyaw: YAW_SPEED },
+    { label: 'Obrót P', vx: 0, vy: 0, vyaw: -YAW_SPEED },
   ];
   const row = document.createElement('div');
   row.className = 'robots-controls-row';
@@ -1631,8 +1665,8 @@ function buildMoveGroup(id, move) {
     { label: 'Tył', icon: 'arrow', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
     { label: 'Lewo', icon: 'arrow', vx: 0, vy: MOVE_SPEED, vyaw: 0 },
     { label: 'Prawo', icon: 'arrow', vx: 0, vy: -MOVE_SPEED, vyaw: 0 },
-    { label: 'Obrót L', icon: 'rotate', vx: 0, vy: 0, vyaw: MOVE_SPEED },
-    { label: 'Obrót P', icon: 'rotate', vx: 0, vy: 0, vyaw: -MOVE_SPEED },
+    { label: 'Obrót L', icon: 'rotate', vx: 0, vy: 0, vyaw: YAW_SPEED },
+    { label: 'Obrót P', icon: 'rotate', vx: 0, vy: 0, vyaw: -YAW_SPEED },
   ];
   const nodes = dirs.map((d) => {
     const btn = document.createElement('tf-button');
@@ -2280,9 +2314,23 @@ function buildPadSection(host, r) {
       </div>
       <div class="robots-pad-hint">
         Ruch: góra/dół = przód/tył, lewo/prawo = obrót. Przytrzymanie kierunku
-        płynnie rozpędza robota (rampa do maks. prędkości). Przyciski na padzie:
-        E-STOP, Wstań, Połóż się, Hello, a przyciski 4/5 zmieniają maks. prędkość
-        o ${PAD_SPEED_STEP.toFixed(1)} m/s.
+        płynnie rozpędza robota (rampa do maks. prędkości). Mapa przycisków padu:
+        <ul class="robots-pad-map">
+          <li><b>0</b> — patrz w dół (tap = krok, przytrzymanie = płynnie)</li>
+          <li><b>1</b> — usiądź</li>
+          <li><b>2</b> — patrz w górę (tap = krok, przytrzymanie = płynnie)</li>
+          <li><b>3</b> — wstań</li>
+          <li><b>4</b> — szybciej (+${PAD_SPEED_STEP.toFixed(1)} m/s)</li>
+          <li><b>5</b> — Hello</li>
+          <li><b>6</b> — wolniej (−${PAD_SPEED_STEP.toFixed(1)} m/s)</li>
+          <li><b>7</b> — Front Jump (od razu, bez potwierdzenia)</li>
+          <li><b>${PAD_BUTTONS.estop}</b> — E-STOP (zgadywany dla tego pada; przycisk
+            E-STOP na ekranie działa zawsze, niezależnie od mapowania)</li>
+          <li><b>${PAD_BUTTONS.resetEstop}</b> — wyjście z E-STOP (reset)</li>
+        </ul>
+        Patrzenie (pochylenie) jest niezależne od jazdy — po puszczeniu przycisku
+        robot pozostaje w danym pochyleniu; aby wrócić do poziomu, naciśnij przeciwny
+        kierunek.
       </div>
       <div class="robots-pad-readout" data-pad-readout>
         <div class="robots-pad-conn" data-pad-conn>
@@ -2292,6 +2340,7 @@ function buildPadSection(host, r) {
           <dt>Urządzenie</dt><dd data-pad-rd-id>—</dd>
           <dt>Maks. prędkość</dt><dd data-pad-rd-max>—</dd>
           <dt>Prędkość (rampa)</dt><dd data-pad-rd-speed>—</dd>
+          <dt>Pochylenie</dt><dd data-pad-rd-pitch>—</dd>
           <dt>Osie</dt><dd data-pad-rd-axes>—</dd>
           <dt>Wciśnięte przyciski</dt><dd data-pad-rd-buttons>—</dd>
         </dl>
@@ -2368,6 +2417,17 @@ function startPadLoop(id) {
     padId: '',
     lastAxes: [],
     lastButtons: [],
+    // Per-frame dt source for the pitch ramp integration.
+    lastTickMs: 0,
+    // When a look up/down button started being HELD (0 = not held).
+    pitchHoldStartMs: 0,
+    // Own rising-edge prev-state for the look buttons (separate from prevButtons,
+    // which handlePadButtons overwrites earlier in the tick).
+    pitchDownPrev: false,
+    pitchUpPrev: false,
+    // Rate-limit + change-detection for the euler dispatch.
+    lastEulerAtMs: 0,
+    lastSentPitch: padPitch,
   };
   window.addEventListener('gamepadconnected', onGamepadConnected);
   window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
@@ -2449,16 +2509,37 @@ function padTick() {
     isControllable(r.status || '')
   );
 
+  // Per-frame dt (seconds) for the pitch ramp integration; clamped so a backgrounded
+  // tab that resumes after a long gap can't jump the accumulator in one big step.
+  const tickNow = performance.now();
+  const dt = padState.lastTickMs ? Math.min(0.1, (tickNow - padState.lastTickMs) / 1000) : 0;
+  padState.lastTickMs = tickNow;
+
   if (armed) {
     // E-STOP takes the whole tick: when it fires, motion is already cut inside
     // handlePadButtons and no other action / move may run the same frame.
     const estopped = handlePadButtons(pad, r);
-    if (!estopped) handlePadMovement(pad);
-  } else if (!padState.lastMoveZero) {
-    // Disarmed (offline / detail changed) while driving → send one stop.
-    if (padState.robotId) sendPadStop(padState.robotId);
-    padState.lastMoveZero = true;
-    padState.rampActive = false;
+    if (!estopped) {
+      // Look (euler) and drive (move) are independent commands — both may run.
+      handlePadLook(pad, dt);
+      handlePadMovement(pad);
+    } else {
+      // E-stop consumed the tick: still sync the look prev-state from the live pad
+      // so a look button held DURING e-stop isn't seen as a fresh rising edge the
+      // moment e-stop clears. Reset the hold ramp too.
+      syncLookPrevState(pad);
+    }
+  } else {
+    // Disarmed (offline / detail changed): keep the look prev-state in sync with the
+    // live pad so a held look button doesn't fire on re-arm, and reset the hold ramp.
+    // The accumulator value itself persists (robot stays where it was commanded).
+    syncLookPrevState(pad);
+    if (!padState.lastMoveZero) {
+      // Was driving → send one stop.
+      if (padState.robotId) sendPadStop(padState.robotId);
+      padState.lastMoveZero = true;
+      padState.rampActive = false;
+    }
   }
 
   renderPadReadout();
@@ -2527,10 +2608,13 @@ function handlePadMovement(pad) {
   const speed = floor + (cap - floor) * held;
 
   const vx = fwd * speed;
+  // Yaw uses its OWN magnitude (rad/s), not the linear speed (m/s): the linear gear
+  // is too small to clear the Go2's minimum effective turn rate, so turning needs a
+  // floored, higher rate that still scales a bit with the gear.
+  const yawMag = Math.min(Math.max(speed * 2.0, PAD_YAW_MIN), PAD_YAW_MAX);
   // Invert the turn while REVERSING so left/right matches the operator's view
-  // (RC-car style). The robot yaws in its own body frame, so driving backward the
-  // steering otherwise feels mirrored. Pure in-place turn (fwd == 0) is unchanged.
-  const vyaw = (fwd < 0 ? -turn : turn) * speed;
+  // (RC-car style). Pure in-place turn (fwd == 0) is unchanged.
+  const vyaw = (fwd < 0 ? -turn : turn) * yawMag;
   sendPadMove(padState.robotId, vx, 0, vyaw);
   padState.lastMoveZero = false;
   padState.lastMoveAtMs = now;
@@ -2570,25 +2654,38 @@ function handlePadButtons(pad, r) {
     return true;
   }
 
-  // Buttons 4/5 are the primary path for the continuous max-speed (rising-edge so a
-  // hold steps once per press). adjustMaxSpeed clamps and refreshes the readout +
-  // the camera/lidar speed overlays.
+  // Exit e-stop on the rising edge. Always sent (safety reset must work even if the
+  // kind isn't in advertised metadata), mirroring the e-stop button.
+  if (rising('resetEstop')) handleControl(id, 'reset_estop', makeVirtualButton());
+
+  // Speed buttons step the continuous max-speed (rising-edge so a hold steps once
+  // per press). adjustMaxSpeed clamps and refreshes the readout + speed overlays.
   if (rising('speedDown')) adjustMaxSpeed(-PAD_SPEED_STEP);
   if (rising('speedUp')) adjustMaxSpeed(PAD_SPEED_STEP);
 
+  // Discrete posture/gesture actions fire on the rising edge only. These route
+  // through handleControl WITHOUT requireConfirm (gamepad buttons never pop a
+  // confirm dialog) and are skipped gracefully when the kind isn't advertised.
   if (rising('standUp')) {
     const a = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
-    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, false);
   }
 
-  if (rising('lieDown')) {
-    const a = byKind('stand_down') || byKind('sit') || byKind('lie_down');
-    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+  if (rising('sit')) {
+    const a = byKind('sit') || byKind('stand_down');
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, false);
   }
 
   if (rising('hello')) {
     const a = byKind('hello');
-    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, false);
+  }
+
+  // Front jump is dispatched DIRECTLY on the rising edge, no confirm dialog and no
+  // advertised-kind check: the user wants it instant on the pad. (`front_jump` is a
+  // server-allowlisted kind; the owner stays the real safety gate.)
+  if (rising('frontJump')) {
+    handleControl(id, 'front_jump', makeVirtualButton(), null, 'Front Jump', false);
   }
 
   padState.prevButtons = pressed;
@@ -2600,6 +2697,77 @@ function handlePadButtons(pad, r) {
 // the attribute mutations.
 function makeVirtualButton() {
   return document.createElement('span');
+}
+
+// Look up/down: drives the persistent `padPitch` accumulator from buttons 0 (down)
+// and 2 (up), then dispatches a rate-limited `euler` command when the pitch changed.
+//   - TAP (rising edge) nudges padPitch by ±PAD_PITCH_TAP_STEP.
+//   - HOLD time-ramps: the per-second rate climbs from PAD_PITCH_RATE_FLOOR to
+//     PAD_PITCH_RATE_CAP over PAD_PITCH_RAMP_TIME_MS, integrated with the frame dt.
+//   - RELEASE holds padPitch where it is; press the opposite direction to level out.
+// `dt` is the frame delta in SECONDS. Look is independent of drive.
+function handlePadLook(pad, dt) {
+  const downHeld = buttonPressed(pad, PAD_BUTTONS.lookDown);
+  const upHeld = buttonPressed(pad, PAD_BUTTONS.lookUp);
+  // Own prev-state for the look buttons. handlePadButtons overwrites padState.prevButtons
+  // before this runs, so we can't reuse it for rising-edge detection here.
+  const downRising = downHeld && !padState.pitchDownPrev;
+  const upRising = upHeld && !padState.pitchUpPrev;
+  padState.pitchDownPrev = downHeld;
+  padState.pitchUpPrev = upHeld;
+
+  let pitch = padPitch;
+
+  // Tap nudges fire immediately on the rising edge (single discrete step).
+  if (downRising) pitch -= PAD_PITCH_TAP_STEP;
+  if (upRising) pitch += PAD_PITCH_TAP_STEP;
+
+  // Continuous hold ramp: while exactly one direction is held, integrate a rate that
+  // climbs over time. Opposing presses cancel (no net ramp). The tap above already
+  // gave the press its initial kick; the ramp only adds the continuous portion. A
+  // rising edge (including a direct up↔down switch) restarts the ramp from the floor.
+  const oneDirHeld = (downHeld || upHeld) && !(downHeld && upHeld);
+  if (oneDirHeld) {
+    if (!padState.pitchHoldStartMs || downRising || upRising) {
+      padState.pitchHoldStartMs = performance.now();
+    }
+    const held = Math.min(1, (performance.now() - padState.pitchHoldStartMs) / PAD_PITCH_RAMP_TIME_MS);
+    const rate = PAD_PITCH_RATE_FLOOR + (PAD_PITCH_RATE_CAP - PAD_PITCH_RATE_FLOOR) * held;
+    const sign = upHeld ? 1 : -1;
+    pitch += sign * rate * dt;
+  } else {
+    padState.pitchHoldStartMs = 0;
+  }
+
+  pitch = Math.min(PAD_PITCH_MAX, Math.max(PAD_PITCH_MIN, pitch));
+
+  if (pitch !== padPitch) {
+    padPitch = pitch;
+    renderPadReadout();
+  }
+
+  // Dispatch only when the pitch actually changed since the last SUCCESSFUL send,
+  // rate-limited like moves. lastSentPitch advances only after the request resolves
+  // ok, so a failed/rejected euler stays "unsent" and is retried on the next eligible
+  // tick instead of being silently swallowed by the only-on-change guard.
+  const now = performance.now();
+  if (
+    padPitch !== padState.lastSentPitch &&
+    now - padState.lastEulerAtMs >= PAD_MOVE_INTERVAL_MS
+  ) {
+    padState.lastEulerAtMs = now;
+    sendPadEuler(padState.robotId, padPitch);
+  }
+}
+
+// Keeps the look-button rising-edge prev-state aligned with the live pad and clears
+// the hold ramp, for frames where the look handler does NOT run (e-stop held or pad
+// disarmed). Without this a button still held when control resumes would be misread
+// as a fresh press and fire an unwanted tap/ramp.
+function syncLookPrevState(pad) {
+  padState.pitchDownPrev = !!pad && buttonPressed(pad, PAD_BUTTONS.lookDown);
+  padState.pitchUpPrev = !!pad && buttonPressed(pad, PAD_BUTTONS.lookUp);
+  padState.pitchHoldStartMs = 0;
 }
 
 // Continuous move sent DIRECTLY (no toast/log/confirm) so the poll loop can stream
@@ -2616,6 +2784,24 @@ function sendPadMove(id, vx, vy, vyaw) {
 
 function sendPadStop(id) {
   sendPadMove(id, 0, 0, 0);
+}
+
+// Body-pitch sent DIRECTLY (no toast/log/confirm) via the Go2 `euler` command.
+// Euler param slots: p1 = roll, p2 = pitch, p3 = yaw — so pitch goes in p2. Sent
+// at the move cadence; the caller rate-limits + only calls on an actual change.
+// lastSentPitch is advanced ONLY when the request resolves ok, so a failed/rejected
+// euler stays "unsent" and is retried on a later tick (the loop may have been torn
+// down by then — guard padState before writing).
+function sendPadEuler(id, pitch) {
+  if (!id) return;
+  ApiBinary.action('robotControlRequest', {
+    robotId: id,
+    kind: 'euler',
+    vx: 0, vy: 0, vyaw: 0,
+    p1: 0, p2: pitch, p3: 0, p4: 0,
+  }).then((resp) => {
+    if (resp && resp.ok && padState) padState.lastSentPitch = pitch;
+  }).catch(() => { /* transient control-plane errors are non-fatal for a stream */ });
 }
 
 // Re-derives whether the pad loop is armed when the poll reports a status change
@@ -2643,6 +2829,7 @@ function renderPadReadout() {
   const idEl = section.querySelector('[data-pad-rd-id]');
   const maxEl = section.querySelector('[data-pad-rd-max]');
   const speedEl = section.querySelector('[data-pad-rd-speed]');
+  const pitchEl = section.querySelector('[data-pad-rd-pitch]');
   const axesEl = section.querySelector('[data-pad-rd-axes]');
   const buttonsEl = section.querySelector('[data-pad-rd-buttons]');
 
@@ -2677,6 +2864,8 @@ function renderPadReadout() {
       speedEl.textContent = 'neutralnie';
     }
   }
+
+  if (pitchEl) pitchEl.textContent = `${padPitch.toFixed(2)} rad`;
 
   if (axesEl) {
     const axes = (padState && padState.lastAxes) || [];
