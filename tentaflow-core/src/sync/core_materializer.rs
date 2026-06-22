@@ -1834,14 +1834,17 @@ fn apply_token_usage_daily(
             .execute(
                 "INSERT INTO token_usage_daily \
                  (id, node_id, org_id, user_id, model_id, usage_day, \
-                  prompt_tokens, completion_tokens, total_tokens, request_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                  prompt_tokens, completion_tokens, total_tokens, request_count, \
+                  audio_ms, images, embedding_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT(id) DO UPDATE SET \
                  node_id = excluded.node_id, org_id = excluded.org_id, \
                  user_id = excluded.user_id, model_id = excluded.model_id, \
                  usage_day = excluded.usage_day, prompt_tokens = excluded.prompt_tokens, \
                  completion_tokens = excluded.completion_tokens, \
-                 total_tokens = excluded.total_tokens, request_count = excluded.request_count",
+                 total_tokens = excluded.total_tokens, request_count = excluded.request_count, \
+                 audio_ms = excluded.audio_ms, images = excluded.images, \
+                 embedding_tokens = excluded.embedding_tokens",
                 rusqlite::params![
                     id,
                     field_string(operation, "node_id")?,
@@ -1853,6 +1856,9 @@ fn apply_token_usage_daily(
                     field_i64_or(operation, "completion_tokens", 0)?,
                     field_i64_or(operation, "total_tokens", 0)?,
                     field_i64_or(operation, "request_count", 0)?,
+                    field_i64_or(operation, "audio_ms", 0)?,
+                    field_i64_or(operation, "images", 0)?,
+                    field_i64_or(operation, "embedding_tokens", 0)?,
                 ],
             )
             .map_err(sql_error),

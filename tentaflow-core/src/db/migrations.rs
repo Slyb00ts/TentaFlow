@@ -477,8 +477,22 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "token_metrics_permissions",
             MigrationStep::Rust(token_metrics_add_permissions),
         ),
+        (
+            88,
+            "token_metrics_modalities",
+            MigrationStep::Sql(TOKEN_METRICS_MODALITIES),
+        ),
     ]
 }
+
+// v88 — rozszerza per-dzienny licznik o pozostale modalnosci poza chatem LLM:
+// STT (milisekundy audio), generacja obrazow (sztuki) i embeddingi (tokeny).
+// Liczniki kumulatywne w zakresie i64 (audio_ms moze byc bardzo duze).
+const TOKEN_METRICS_MODALITIES: &str = r#"
+ALTER TABLE token_usage_daily ADD COLUMN audio_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN images INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN embedding_tokens INTEGER NOT NULL DEFAULT 0;
+"#;
 
 // v87 — RBAC dla metryk tokenów. Admin/DPO dostają odczyt i zapis, operator
 // oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`.
