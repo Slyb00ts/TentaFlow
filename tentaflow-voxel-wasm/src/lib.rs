@@ -22,10 +22,9 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-// Fixed heatmap range in meters. The palette is mapped over radial distance from
-// the cloud's min-corner; a fixed range keeps the coloring stable frame-to-frame
-// instead of flickering as per-frame min/max wobble. 8 m covers a typical indoor
-// LiDAR sweep; points beyond clamp to the far (blue) end.
+// Initial heatmap range in meters until the first cloud sets an adaptive range
+// from its actual radius. The palette maps depth (distance from the cloud center,
+// i.e. the robot) near = red → far = blue; points beyond clamp to the blue end.
 const HEATMAP_RANGE_METERS: f32 = 8.0;
 
 // -----------------------------------------------------------------------------
@@ -151,18 +150,21 @@ impl Camera {
     }
 
     fn eye(&self) -> Vec3 {
+        // Z-up scene (LiDAR convention): elevation tilts the eye along +Z so the
+        // floor (the X-Y plane) renders horizontal instead of edge-on. Azimuth
+        // orbits in the horizontal plane.
         let cos_e = self.elevation.cos();
         let dir = Vec3::new(
             cos_e * self.azimuth.cos(),
-            self.elevation.sin(),
             cos_e * self.azimuth.sin(),
+            self.elevation.sin(),
         );
         self.target + dir * self.distance
     }
 
     fn view_proj(&self) -> Mat4 {
         let eye = self.eye();
-        let view = Mat4::look_at_rh(eye, self.target, Vec3::Y);
+        let view = Mat4::look_at_rh(eye, self.target, Vec3::Z);
         // Near/far scale with the orbit distance so close clouds and far clouds
         // both stay inside the frustum without hand-tuning.
         let near = (self.distance * 0.01).max(0.01);
@@ -197,6 +199,7 @@ struct State {
     camera: Camera,
     voxel_size: f32,
     heatmap_origin: Vec3,
+    heatmap_range: f32,
     framed: bool,
 }
 
@@ -205,7 +208,7 @@ impl State {
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
             heatmap_origin: self.heatmap_origin.to_array(),
-            inv_heatmap_range: 1.0 / HEATMAP_RANGE_METERS,
+            inv_heatmap_range: 1.0 / self.heatmap_range.max(0.5),
             voxel_size: self.voxel_size,
             _pad: [0.0; 3],
         };
@@ -505,6 +508,7 @@ pub async fn init_voxel_view(
         camera,
         voxel_size,
         heatmap_origin: Vec3::ZERO,
+        heatmap_range: HEATMAP_RANGE_METERS,
         framed: false,
     }));
 
@@ -581,15 +585,19 @@ impl VoxelView {
         st.queue.write_buffer(&st.instance_buffer, 0, bytes);
         st.instance_count = n as u32;
 
-        // Heatmap measured from the cloud's min-corner (near = red).
-        st.heatmap_origin = min;
-
-        if !st.framed && min.is_finite() && max.is_finite() {
+        if min.is_finite() && max.is_finite() {
             let center = (min + max) * 0.5;
             let extent = (max - min).length().max(0.5);
-            st.camera.target = center;
-            st.camera.distance = extent * 1.2;
-            st.framed = true;
+            // Depth heatmap measured from the cloud CENTER (≈ the robot/sensor):
+            // near the robot = red, far = blue. Range tracks the cloud radius so
+            // the full palette is used regardless of room size.
+            st.heatmap_origin = center;
+            st.heatmap_range = (extent * 0.5).max(0.5);
+            if !st.framed {
+                st.camera.target = center;
+                st.camera.distance = extent * 1.2;
+                st.framed = true;
+            }
         }
     }
 
