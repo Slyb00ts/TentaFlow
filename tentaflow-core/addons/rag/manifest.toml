@@ -192,6 +192,33 @@ name = "text"
 type = "str"
 indexed = false
 
+# --- Przestrzen wektorowa NAZW ENCJI (MemGraphRAG D5, Structural Unification) ---
+# Embedding nazwy encji (wezla grafu) pod similarity-based kandydatow entity merge.
+# entity_merge_scan embeduje nazwy nowych encji do tej przestrzeni (leniwie) i robi
+# k-NN, by znalezc encje o podobnych nazwach poza progiem prefix/edit-distance (np.
+# "USA" vs "United States"). ref_id = stabilny hash node_id (deterministyczny, by
+# re-embedding tej samej encji nadpisywal jej wektor, nie duplikowal).
+[[vector_namespace]]
+name = "entities"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+# node_id — znormalizowane id encji (klucz wezla grafu). Indeksowane: hit k-NN zwraca
+# je przez output_fields, by skan wiedzial KTORA encja jest kandydatem (ref_id to tylko
+# hash, nie da sie z niego odzyskac node_id).
+[[vector_namespace.fields]]
+name = "node_id"
+type = "str"
+indexed = true
+
+# label — typ encji (Person/City/...). Indeksowany: similarity-merge laczymy tylko
+# encje TEGO SAMEGO typu (jak type-based), wiec filtrujemy k-NN po label.
+[[vector_namespace.fields]]
+name = "label"
+type = "str"
+indexed = true
+
 # --- Flow zapytania (flow_engine) ---
 # Rejestrowany przy install instancji jako published model "{addon_id}:query".
 # Addon wyzwala go przez llm_generate(model=<ta nazwa>); executor przepisuje
@@ -349,4 +376,38 @@ keywords = ["rag", "ingest", "status", "job"]
 name = "job_id"
 param_type = "string"
 description = "Identyfikator joba ingestu."
+required = true
+
+# A_uni (MemGraphRAG D5): Structural Unification — skan kandydatow merge encji + scalanie.
+# Wolalny przez Scheduler (interval) ORAZ recznie. Konsumuje tez konflikty
+# 'resolved_merge_pending' z A_res (D4).
+[[tool]]
+id = "entity_merge_scan"
+display_name = "Skan scalania encji"
+description = "A_uni (0 LLM w detekcji): wykrywa kandydatow merge encji (type-based: ten sam typ + podobna nazwa; similarity-based: embedding nazwy, k-NN). Powyzej progu twardego auto-scala aliasy w kanoniczny wezel (odwracalnie, przez outbox), w szarej strefie tworzy konflikt 'entity_merge' (open) dla A_res. Konsumuje tez 'resolved_merge_pending' z A_res."
+keywords = ["rag", "entity", "merge", "unification", "alias", "dedup"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji (sentinel: skan jest per-instancja)."
+required = false
+
+[[tool.parameter]]
+name = "batch_size"
+param_type = "integer"
+description = "Rozmiar partii skanu nowych encji."
+required = false
+
+# Odwracalnosc (R5): cofniecie zastosowanego merge'u z entity_merge_log (inverse-outbox).
+[[tool]]
+id = "entity_merge_undo"
+display_name = "Cofnij scalanie encji"
+description = "Cofa zastosowany merge encji (R5): z entity_merge_log odtwarza inverse-outbox (przywraca krawedzie aliasu, kasuje dodane kanoniczne gdy nie sa wspoldzielone), oznacza alias 'reverted'. Pelna sciezka odwrocenia."
+keywords = ["rag", "entity", "merge", "undo", "revert", "alias"]
+
+[[tool.parameter]]
+name = "alias_id"
+param_type = "string"
+description = "Znormalizowane id aliasu do cofniecia merge'u."
 required = true

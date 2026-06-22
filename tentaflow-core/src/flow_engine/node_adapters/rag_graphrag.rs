@@ -35,6 +35,10 @@ const KG_COLLECTION: &str = "kg_active";
 const META_CURRENT_QUERY: &str = "rag_current_query";
 /// Meta-klucz: seedy grafu wyliczone z encji zapytania = `[{id, weight}]`.
 pub const META_GRAPH_SEEDS: &str = "graph_seeds";
+/// Meta-klucz (MemGraphRAG D5): mapa aktywnych aliasow encji `[{alias, canonical}]`, wstrzykiwana
+/// przez addon RAG do flow.meta (host-fn allowlist). `rag_graph_seed` uzywa jej do alias-rewrite
+/// seedow PPR (alias->canonical). Brak klucza => brak rewrite (degradacja).
+pub const META_ENTITY_ALIASES: &str = "entity_aliases";
 /// Meta-klucz: sformatowany tekst faktow grafowych (fuzowany do kontekstu LLM).
 /// Po E3.2 niesie fakty ZAKUMULOWANE przez wszystkie hopy (lustro pasazy w
 /// `rag_accumulated`), nie tylko ostatni hop — `rag_finalize` go fuzuje.
@@ -185,6 +189,57 @@ pub fn identify_query_entities(query: &str) -> Vec<(String, f64)> {
     seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
     seeds.truncate(MAX_GRAPH_SEEDS);
     seeds
+}
+
+/// D5 alias-rewrite (R5): przepisuje id seedow przez mape aliasow `[{alias, canonical}]` z meta.
+/// Seed pasujacy do `alias` (po znormalizowanym id — alias-id z ingestu jest juz znormalizowany,
+/// jak seed) staje sie `canonical`. Gdy dwa seedy zmapuja na ten sam canonical, scalamy je biorac
+/// WIEKSZA wage (najsilniejszy sygnal personalizacji PPR). Czysta funkcja — testowalna bez hosta.
+/// Mapa to TYLKO ulatwienie retrievalu; brak/zly ksztalt => seedy bez zmian (degradacja).
+fn rewrite_seeds_with_aliases(seeds: Vec<(String, f64)>, aliases: Option<&Value>) -> Vec<(String, f64)> {
+    use std::collections::HashMap;
+    let map: HashMap<String, String> = aliases
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let a = e.get("alias").and_then(|v| v.as_str())?;
+                    let c = e.get("canonical").and_then(|v| v.as_str())?;
+                    if a.is_empty() || c.is_empty() {
+                        return None;
+                    }
+                    Some((a.to_string(), c.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if map.is_empty() {
+        return seeds;
+    }
+
+    // Zachowaj kolejnosc pierwszego pojawienia (stabilnosc), scalaj duplikaty po wiekszej wadze.
+    let mut order: Vec<String> = Vec::with_capacity(seeds.len());
+    let mut by_id: HashMap<String, f64> = HashMap::with_capacity(seeds.len());
+    for (id, w) in seeds {
+        let canonical = map.get(&id).cloned().unwrap_or(id);
+        match by_id.get(&canonical) {
+            Some(prev) if *prev >= w => {}
+            Some(_) => {
+                by_id.insert(canonical, w);
+            }
+            None => {
+                order.push(canonical.clone());
+                by_id.insert(canonical, w);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|id| {
+            let w = by_id.get(&id).copied().unwrap_or(1.0);
+            (id, w)
+        })
+        .collect()
 }
 
 /// Serializuje seedy do JSON `[{id, weight}]` (ksztalt zgodny z `GraphSeed` /
@@ -386,6 +441,10 @@ impl NodeAdapter for RagGraphSeedNodeAdapter {
             .unwrap_or_default();
 
         let seeds = identify_query_entities(&query);
+        // D5 alias-rewrite (R5, TYLKO retrieval-side): przepisz alias->canonical na seedach,
+        // by zapytanie o alias ("einstein") trafilo w kanoniczny wezel PPR ("albert einstein").
+        // Mapa aliasow przychodzi z addona RAG przez flow.meta (host-fn allowlist); brak => no-op.
+        let seeds = rewrite_seeds_with_aliases(seeds, out.meta.get(META_ENTITY_ALIASES));
         out.meta
             .insert(META_GRAPH_SEEDS.to_string(), seeds_to_json(&seeds));
         // Payload nietkniety — embeddings dostaje ten sam tekst pytania.
@@ -645,6 +704,73 @@ mod tests {
         assert!(identify_query_entities("   ").is_empty());
         // Samo stopwordy/za krotkie -> brak seedow (degradacja w hopie).
         assert!(identify_query_entities("a w i").is_empty());
+    }
+
+    // --- D5 alias-rewrite seedow (R5, retrieval-side) ----------------------
+
+    #[test]
+    fn alias_rewrite_maps_alias_to_canonical() {
+        // Seed "einstein" (alias) -> "albert einstein" (canonical) wg mapy z meta.
+        let seeds = vec![("einstein".to_string(), 2.0), ("physics".to_string(), 1.0)];
+        let aliases = json!([{ "alias": "einstein", "canonical": "albert einstein" }]);
+        let out = rewrite_seeds_with_aliases(seeds, Some(&aliases));
+        let ids: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"albert einstein"), "alias przepisany na canonical: {ids:?}");
+        assert!(!ids.contains(&"einstein"), "alias zniknal: {ids:?}");
+        assert!(ids.contains(&"physics"), "nie-alias bez zmian: {ids:?}");
+    }
+
+    #[test]
+    fn alias_rewrite_merges_duplicate_canonical_keeping_max_weight() {
+        // Dwa aliasy ("usa", "us") tej samej encji -> jeden canonical "united states", waga = MAX.
+        let seeds = vec![("usa".to_string(), 1.0), ("us".to_string(), 3.0)];
+        let aliases = json!([
+            { "alias": "usa", "canonical": "united states" },
+            { "alias": "us", "canonical": "united states" }
+        ]);
+        let out = rewrite_seeds_with_aliases(seeds, Some(&aliases));
+        assert_eq!(out.len(), 1, "duplikaty canonical scalone: {out:?}");
+        assert_eq!(out[0].0, "united states");
+        assert_eq!(out[0].1, 3.0, "scalona waga = MAX (najsilniejszy sygnal PPR)");
+    }
+
+    #[test]
+    fn alias_rewrite_no_map_is_noop() {
+        let seeds = vec![("einstein".to_string(), 2.0)];
+        // Brak mapy / pusta / zly ksztalt => seedy bez zmian (degradacja).
+        assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), None), seeds);
+        assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), Some(&json!([]))), seeds);
+        assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), Some(&json!("garbage"))), seeds);
+    }
+
+    #[test]
+    fn rag_graph_seed_applies_alias_rewrite_from_meta() {
+        // E2E adaptera: meta.entity_aliases -> seedy w meta.graph_seeds przepisane na canonical.
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("einstein".to_string());
+        env.meta.insert(
+            META_ENTITY_ALIASES.to_string(),
+            json!([{ "alias": "einstein", "canonical": "albert einstein" }]),
+        );
+        let ctx = stub_ctx();
+        let adapter = RagGraphSeedNodeAdapter::new();
+        let out = tokio_test_block(adapter.execute(&node("rag_graph_seed"), &[input(env)], &ctx)).unwrap();
+        let seeds = out.meta.get(META_GRAPH_SEEDS).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let ids: Vec<String> = seeds
+            .iter()
+            .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.iter().any(|i| i == "albert einstein"), "seed przepisany na canonical: {ids:?}");
+        assert!(!ids.iter().any(|i| i == "einstein"), "alias zniknal z seedow: {ids:?}");
+    }
+
+    /// Mini-runtime do odpalenia jednego async execute w tescie synchronicznym.
+    fn tokio_test_block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
     }
 
     // --- format_graph_facts + cap ------------------------------------------
