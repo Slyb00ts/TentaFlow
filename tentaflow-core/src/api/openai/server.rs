@@ -333,6 +333,39 @@ pub async fn handle_request(
         // Embeddings
         ("POST", "/v1/embeddings") => handle_embeddings(req, router).await,
 
+        // NVIDIA NIM Object-Detection / OCR — reverse-proxy do serwisu wizyjnego
+        // (nemotron-ocr, paddle-ocr, detektory YOLOX). Body forwardowane verbatim.
+        ("POST", "/v1/infer") => {
+            handle_passthrough(
+                req,
+                router,
+                crate::services::catalog::ServiceSurface::Documents,
+                &[crate::services::catalog::InputModality::Image],
+                "/v1/infer",
+            )
+            .await
+        }
+
+        // Rerank — reverse-proxy do serwisów vLLM `--task score`
+        // (nemotron-rerank, nemotron-rerank-vl). Body forwardowane verbatim.
+        ("POST", "/v1/rerank") => {
+            handle_passthrough(
+                req,
+                router,
+                crate::services::catalog::ServiceSurface::Rerank,
+                &[crate::services::catalog::InputModality::Text],
+                "/v1/rerank",
+            )
+            .await
+        }
+
+        // NVIDIA NeMo Retriever reranking — kontrakt NVIDIA (query/passages →
+        // rankings). Zdeployowane kontenery to czysty vLLM i wystawiają tylko
+        // Cohere-style `/v1/rerank`, dlatego Core TŁUMACZY request i response,
+        // a nie forwarduje verbatim (inaczej kontener zwróciłby 404 na
+        // `/v1/ranking`). Współistnieje z `/v1/rerank` dla klientów Cohere/Jina.
+        ("POST", "/v1/ranking") => handle_ranking(req, router).await,
+
         // Health check (dla load balancerow)
         ("GET", "/health") | ("GET", "/v1/health") => Ok(json_response(
             StatusCode::OK,
@@ -1318,6 +1351,456 @@ async fn handle_embeddings(
         }
     }
 }
+/// Wspólny reverse-proxy dla endpointów, które nie mają typowanej odpowiedzi
+/// OpenAI (`/v1/infer` NVIDIA NIM, `/v1/rerank` vLLM score). Rozwiązuje model
+/// przez ten sam resolver/ACL co reszta `/v1`, a body przekazuje verbatim do
+/// `endpoint_url` rozwiązanego serwisu pod tą samą ścieżką. Odpowiedź (status +
+/// body) jest kopiowana bez reserializacji — to przezroczysty passthrough.
+async fn handle_passthrough(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+    surface: crate::services::catalog::ServiceSurface,
+    input_modalities: &[crate::services::catalog::InputModality],
+    forward_path: &str,
+) -> std::result::Result<
+    Response<
+        StreamBody<
+            Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
+        >,
+    >,
+    hyper::Error,
+> {
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
+
+    let body_bytes = req.collect().await?.to_bytes();
+
+    // Parsujemy tylko po to, by odczytać pole `model`; reszta leci verbatim.
+    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Passthrough {}: niepoprawny JSON: {}", forward_path, e);
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Niepoprawny JSON: {}", e),
+            ));
+        }
+    };
+    let model = match parsed.get("model").and_then(|m| m.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Brak wymaganego pola 'model'".to_string(),
+            ));
+        }
+    };
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &model) {
+        return Ok(resp);
+    }
+
+    let base = match resolve_local_v1_base(
+        &router,
+        &model,
+        surface,
+        input_modalities,
+        user_ctx,
+        &format!("passthrough {}", forward_path),
+    ) {
+        Ok(b) => b,
+        Err(resp) => return Ok(resp),
+    };
+
+    // `endpoint_url` zwykle kończy się na `/v1` — sklejamy z gołą ścieżką
+    // (`/infer`, `/rerank`), żeby nie zdublować segmentu `/v1`.
+    let base = base.as_str();
+    let suffix = forward_path.strip_prefix("/v1").unwrap_or(forward_path);
+    let target_url = if base.ends_with("/v1") {
+        format!("{}{}", base, suffix)
+    } else {
+        format!("{}{}", base, forward_path)
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Passthrough {}: budowa klienta HTTP: {}", forward_path, e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                e.to_string(),
+            ));
+        }
+    };
+
+    let upstream = client
+        .post(&target_url)
+        .header("Content-Type", "application/json")
+        .body(body_bytes.to_vec())
+        .send()
+        .await;
+
+    match upstream {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            match resp.bytes().await {
+                Ok(bytes) => Ok(json_response(status, bytes.to_vec())),
+                Err(e) => {
+                    error!("Passthrough {}: odczyt body z upstream: {}", forward_path, e);
+                    Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "service_unavailable",
+                        format!("błąd odczytu odpowiedzi z serwisu: {}", e),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!("Passthrough {} → {}: {}", forward_path, target_url, e);
+            Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "service_unavailable",
+                format!("błąd forwardu do serwisu: {}", e),
+            ))
+        }
+    }
+}
+
+/// Rozwiązuje lokalny `<base>/v1` endpoint serwisu dla danego modelu przez ten
+/// sam resolver/ACL co reszta `/v1` (autoryzacja MUSI być już sprawdzona przez
+/// `v1_authorize` przed wywołaniem). Zwraca bazowy URL zakończony na `/v1`
+/// (bez trailing slash) gotowy do doklejenia gołej ścieżki (`/rerank`), albo
+/// gotowy error-response gdy serwis jest zdalny / nie jest serwisem HTTP /
+/// nie ma endpointu. Współdzielony przez passthrough i tłumaczące handlery.
+fn resolve_local_v1_base(
+    router: &Router,
+    model: &str,
+    surface: crate::services::catalog::ServiceSurface,
+    input_modalities: &[crate::services::catalog::InputModality],
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> std::result::Result<String, Response<OpenAIBody>> {
+    let executor = match router.executor() {
+        Some(e) => e,
+        None => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "Executor niedostępny".to_string(),
+            ));
+        }
+    };
+
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    let target = match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("{} resolve dla '{}': {}", context_label, model, e);
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                format!("model '{}' niedostępny: {}", model, e),
+            ));
+        }
+    };
+
+    // Endpoint bierzemy WPROST z żywego `handle` zwróconego przez resolver, a nie
+    // ze snapshotu `service_manager`: `service_id` z resolvera (przestrzeń
+    // katalogu) nie pokrywa się z kluczami `services_by_id`, a serwis tuż po
+    // reconcile (status `starting`) bywa chwilowo nieobecny w snapshocie mimo
+    // żywego handle. `client.url()` to bazowy `endpoint_url` (np. `.../v1`).
+    match &target {
+        crate::services::runtime::target::ResolvedExecutionTarget::Local { handle, .. } => {
+            match crate::services::runtime::transport_client::resolve_http_client(
+                handle,
+                context_label,
+            ) {
+                Ok(resolved) => Ok(resolved.client.url().trim_end_matches('/').to_string()),
+                Err(e) => Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    format!("model '{}' nie jest lokalnym serwisem HTTP: {}", model, e),
+                )),
+            }
+        }
+        crate::services::runtime::target::ResolvedExecutionTarget::MeshForward { node_id, .. } => {
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                format!(
+                    "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+                    model, node_id, context_label
+                ),
+            ))
+        }
+        crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => {
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                format!("model '{}' rozwiązał się do flow, nie do serwisu HTTP", model),
+            ))
+        }
+    }
+}
+
+/// Handler dla `POST /v1/ranking` (kontrakt NVIDIA NeMo Retriever reranking).
+///
+/// Zdeployowane kontenery rerank to czysty vLLM i wystawiają wyłącznie
+/// Cohere-style `/v1/rerank` (`/v1/ranking` na kontenerze → 404), dlatego Core
+/// musi TŁUMACZYĆ, a nie forwardować:
+/// - request NVIDIA `{query:{text}|"q", passages:[{text}], truncate}` →
+///   vLLM `{model, query:"q", documents:[...]}` (`truncate` nie jest
+///   forwardowane — vLLM je ignoruje),
+/// - response vLLM `{results:[{index, relevance_score, ...}]}` →
+///   NVIDIA `{rankings:[{index, logit}]}` z zachowaniem oryginalnego `index`
+///   i sortowania malejąco po score.
+async fn handle_ranking(
+    req: Request<Incoming>,
+    router: Arc<Router>,
+) -> std::result::Result<
+    Response<
+        StreamBody<
+            Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
+        >,
+    >,
+    hyper::Error,
+> {
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
+
+    let body_bytes = req.collect().await?.to_bytes();
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("/v1/ranking: niepoprawny JSON: {}", e);
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Niepoprawny JSON: {}", e),
+            ));
+        }
+    };
+
+    let model = match parsed.get("model").and_then(|m| m.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Brak wymaganego pola 'model'".to_string(),
+            ));
+        }
+    };
+
+    // `query` jest leniwy: kontrakt NVIDIA wysyła `{text:"..."}`, ale przyjmujemy
+    // też gołego stringa dla nietypowych klientów.
+    let query = match parsed.get("query") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(o)) => match o.get("text").and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Pole 'query' musi mieć 'text' lub być stringiem".to_string(),
+                ));
+            }
+        },
+        _ => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Brak wymaganego pola 'query'".to_string(),
+            ));
+        }
+    };
+
+    let documents: Vec<String> = match parsed.get("passages").and_then(|p| p.as_array()) {
+        Some(arr) => {
+            let mut docs = Vec::with_capacity(arr.len());
+            for passage in arr {
+                let text = match passage {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Object(o) => {
+                        o.get("text").and_then(|t| t.as_str()).map(|t| t.to_string())
+                    }
+                    _ => None,
+                };
+                match text {
+                    Some(t) => docs.push(t),
+                    None => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "Każdy element 'passages' musi mieć 'text' lub być stringiem"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            docs
+        }
+        None => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Brak wymaganego pola 'passages'".to_string(),
+            ));
+        }
+    };
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &model) {
+        return Ok(resp);
+    }
+
+    let base = match resolve_local_v1_base(
+        &router,
+        &model,
+        crate::services::catalog::ServiceSurface::Rerank,
+        &[crate::services::catalog::InputModality::Text],
+        user_ctx,
+        "/v1/ranking",
+    ) {
+        Ok(b) => b,
+        Err(resp) => return Ok(resp),
+    };
+
+    // Forward leci ZAWSZE na Cohere-style `/v1/rerank` (kontener nie zna
+    // `/v1/ranking`). `endpoint_url` zwykle kończy się na `/v1`.
+    let target_url = if base.ends_with("/v1") {
+        format!("{}/rerank", base)
+    } else {
+        format!("{}/v1/rerank", base)
+    };
+
+    let upstream_body = serde_json::json!({
+        "model": model,
+        "query": query,
+        "documents": documents,
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("/v1/ranking: budowa klienta HTTP: {}", e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                e.to_string(),
+            ));
+        }
+    };
+
+    let upstream = client.post(&target_url).json(&upstream_body).send().await;
+
+    let resp = match upstream {
+        Ok(r) => r,
+        Err(e) => {
+            error!("/v1/ranking → {}: {}", target_url, e);
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "service_unavailable",
+                format!("błąd forwardu do serwisu: {}", e),
+            ));
+        }
+    };
+
+    let upstream_status = resp.status();
+    let upstream_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("/v1/ranking: odczyt body z upstream: {}", e);
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "service_unavailable",
+                format!("błąd odczytu odpowiedzi z serwisu: {}", e),
+            ));
+        }
+    };
+
+    // Upstream zwrócił błąd — przekazujemy jego treść w OpenAI-style error,
+    // żeby klient zobaczył powód (np. zły model / kontekst za długi).
+    if !upstream_status.is_success() {
+        let detail = String::from_utf8_lossy(&upstream_bytes);
+        warn!(
+            "/v1/ranking: upstream {} zwrócił {}: {}",
+            target_url, upstream_status, detail
+        );
+        let status =
+            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Ok(error_response(
+            status,
+            "service_unavailable",
+            format!("serwis rerank zwrócił {}: {}", upstream_status, detail),
+        ));
+    }
+
+    let vllm: serde_json::Value = match serde_json::from_slice(&upstream_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("/v1/ranking: niepoprawny JSON z upstream: {}", e);
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "service_unavailable",
+                format!("serwis rerank zwrócił niepoprawny JSON: {}", e),
+            ));
+        }
+    };
+
+    // vLLM zwraca `results` już posortowane malejąco po score; zachowujemy ten
+    // porządek i oryginalny `index`, mapując `relevance_score` → `logit`.
+    let rankings: Vec<serde_json::Value> = match vllm.get("results").and_then(|r| r.as_array()) {
+        Some(results) => results
+            .iter()
+            .filter_map(|item| {
+                let index = item.get("index").and_then(|i| i.as_u64())?;
+                let score = item.get("relevance_score").and_then(|s| s.as_f64())?;
+                Some(serde_json::json!({ "index": index, "logit": score }))
+            })
+            .collect(),
+        None => {
+            error!("/v1/ranking: upstream nie zwrócił 'results'");
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "service_unavailable",
+                "serwis rerank nie zwrócił pola 'results'".to_string(),
+            ));
+        }
+    };
+
+    let nvidia_response = serde_json::json!({ "rankings": rankings });
+    let body = match serde_json::to_vec(&nvidia_response) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("/v1/ranking: serializacja odpowiedzi NVIDIA: {}", e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                e.to_string(),
+            ));
+        }
+    };
+
+    Ok(json_response(StatusCode::OK, body))
+}
+
 /// Handler dla /v1/documents (document ingestion)
 async fn handle_readiness_check(
     router: Arc<Router>,

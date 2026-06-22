@@ -3,28 +3,38 @@
 # Opis: Serwer FastAPI dla Nemotron-Parse (NVIDIA-Nemotron-Parse-v1.2). Model to
 #       transformers VLM (trust_remote_code) z wlasnym task-promptem i logits
 #       processorami; uzywamy oficjalnej sciezki z example_with_processor.py.
-#       POST /parse zwraca markdown + bloki layoutu (klasa, bbox, tekst).
-# Przyklad: curl -F image=@faktura.png http://127.0.0.1:8094/parse
+#       Wystawia OpenAI-kompatybilny POST /v1/chat/completions: obraz pobierany z
+#       ostatniej wiadomosci uzytkownika, a wynikowy markdown trafia do
+#       message.content. GET /health do prob.
+# Przyklad: curl -X POST http://127.0.0.1:8094/v1/chat/completions -d \
+#   '{"model":"nemotron-parse","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'
 # =============================================================================
 
 import base64
 import io
 import os
+import re
 import threading
+import time
+import uuid
+from typing import Any
 
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pydantic import BaseModel
 from transformers import AutoModel, AutoProcessor, AutoTokenizer, GenerationConfig
 
 # Skrypty pomocnicze z repo HF (skopiowane do /app przez Dockerfile).
-from postprocessing import extract_classes_bboxes, transform_bbox_to_original, postprocess_text
+from postprocessing import extract_classes_bboxes, postprocess_text
 from hf_logits_processor import TableInsertionLogitsProcessor, RepetitionStopProcessor
 
 MODEL_ID = os.environ.get("MODEL", "nvidia/NVIDIA-Nemotron-Parse-v1.2")
 # Prompt zadania: predykcja bbox + klas + markdown (jak w example_with_processor.py).
 TASK_PROMPT = "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+
+# Prefiks data-URL: "data:image/png;base64,<...>".
+_DATA_URL_RE = re.compile(r"^data:[^;,]*(;base64)?,(?P<payload>.*)$", re.DOTALL)
 
 app = FastAPI(title="Nemotron-Parse")
 
@@ -32,8 +42,15 @@ app = FastAPI(title="Nemotron-Parse")
 _state: dict = {"model": None, "tokenizer": None, "processor": None, "gen": None}
 
 
-class ParseBase64Request(BaseModel):
-    image_base64: str
+class ChatMessage(BaseModel):
+    role: str
+    # Zgodnie z OpenAI: content moze byc stringiem albo lista czesci (tekst/obraz).
+    content: Any
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str | None = None
+    messages: list[ChatMessage]
 
 
 def _require_cuda() -> None:
@@ -66,10 +83,21 @@ def _ensure_model() -> None:
 # Model ladowany w WATKU TLA przy starcie — synchroniczne ladowanie w handlerze
 # blokowaloby event-loop uvicorna, przez co /health przestawal odpowiadac i
 # supervisor Core ubijal+restartowal proces w petli (zwlaszcza dla wiekszych
-# modeli). W tle /health odpowiada od razu, a /parse zwraca 503 do czasu gotowosci.
+# modeli). W tle /health odpowiada od razu, a /v1/chat/completions zwraca 503 do
+# czasu gotowosci.
 @app.on_event("startup")
 def _start_background_load() -> None:
     threading.Thread(target=_ensure_model, name="model-load", daemon=True).start()
+
+
+def _decode_data_url(url: str) -> bytes:
+    """Wyciaga surowe bajty obrazu z data-URL (base64) lub czystego base64."""
+    dopasowanie = _DATA_URL_RE.match(url.strip())
+    payload = dopasowanie.group("payload") if dopasowanie else url.strip()
+    try:
+        return base64.b64decode(payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Bledny base64 w url: {exc}")
 
 
 def _decode_image(raw: bytes) -> Image.Image:
@@ -79,7 +107,38 @@ def _decode_image(raw: bytes) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"Nieprawidlowy obraz: {exc}")
 
 
-def _run_parse(image: Image.Image) -> dict:
+def _wyodrebnij_url_obrazu(content: Any) -> str:
+    """Znajduje URL obrazu w content wiadomosci OpenAI. Obsluguje:
+    - liste czesci z {"type":"image_url","image_url":{"url":...}}
+    - liste czesci z {"type":"image_url","image_url":"<str>"} lub {"url":...}
+    - czysty string traktowany jako sam URL/data-URL obrazu."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for czesc in content:
+            if not isinstance(czesc, dict):
+                continue
+            if czesc.get("type") not in (None, "image_url"):
+                continue
+            obraz = czesc.get("image_url")
+            if isinstance(obraz, dict) and obraz.get("url"):
+                return obraz["url"]
+            if isinstance(obraz, str) and obraz:
+                return obraz
+            if isinstance(czesc.get("url"), str) and czesc["url"]:
+                return czesc["url"]
+    raise HTTPException(status_code=400, detail="Brak obrazu (image_url) w ostatniej wiadomosci uzytkownika.")
+
+
+def _obraz_z_zadania(req: ChatCompletionRequest) -> Image.Image:
+    uzytkownik = [m for m in req.messages if m.role == "user"]
+    if not uzytkownik:
+        raise HTTPException(status_code=400, detail="Brak wiadomosci uzytkownika z obrazem.")
+    url = _wyodrebnij_url_obrazu(uzytkownik[-1].content)
+    return _decode_image(_decode_data_url(url))
+
+
+def _run_parse(image: Image.Image) -> str:
     if _state["model"] is None:
         raise HTTPException(status_code=503, detail="Model jeszcze sie laduje, sprobuj za chwile.")
     model = _state["model"]
@@ -106,17 +165,11 @@ def _run_parse(image: Image.Image) -> dict:
 
     generated_text = processor.batch_decode(outputs, skip_special_tokens=True)[0]
     classes, bboxes, texts = extract_classes_bboxes(generated_text)
-    bboxes = [transform_bbox_to_original(b, image.width, image.height) for b in bboxes]
     texts = [
         postprocess_text(t, cls=c, table_format="HTML", text_format="markdown", blank_text_in_figures=False)
         for t, c in zip(texts, classes)
     ]
-    blocks = [
-        {"class": c, "bbox": b, "text": t}
-        for c, b, t in zip(classes, bboxes, texts)
-    ]
-    markdown = "\n\n".join(t for t in texts if t)
-    return {"markdown": markdown, "blocks": blocks}
+    return "\n\n".join(t for t in texts if t)
 
 
 @app.get("/health")
@@ -124,16 +177,21 @@ def health() -> dict:
     return {"status": "ok", "model": MODEL_ID, "loaded": _state["model"] is not None}
 
 
-@app.post("/parse")
-async def parse(image: UploadFile = File(...)) -> dict:
-    raw = await image.read()
-    return _run_parse(_decode_image(raw))
-
-
-@app.post("/parse/base64")
-def parse_base64(req: ParseBase64Request) -> dict:
-    try:
-        raw = base64.b64decode(req.image_base64)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Bledny base64: {exc}")
-    return _run_parse(_decode_image(raw))
+@app.post("/v1/chat/completions")
+def chat_completions(req: ChatCompletionRequest) -> dict:
+    image = _obraz_z_zadania(req)
+    markdown = _run_parse(image)
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model or MODEL_ID,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": markdown},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }

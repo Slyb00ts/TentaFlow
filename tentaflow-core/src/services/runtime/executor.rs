@@ -1235,6 +1235,46 @@ impl ModelRuntimeExecutor {
         })
     }
 
+    /// Rozwiązuje `model` dla zadanej powierzchni/modalności i zwraca pierwszy
+    /// żywy kandydat po rankingu. Używane przez reverse-proxy endpointy
+    /// (`/v1/infer`, `/v1/rerank`), które nie reserializują odpowiedzi do
+    /// typowanej struktury, tylko potrzebują adresu docelowego serwisu. Cała
+    /// logika katalogu/aliasów/ACL-modalności jest współdzielona z resztą
+    /// dispatchu — nie duplikujemy resolvera. Zwracamy `ResolvedExecutionTarget`,
+    /// bo to on niesie `service_id` (Local) albo `node_id` (MeshForward),
+    /// których caller potrzebuje do wyciągnięcia `endpoint_url` ze snapshotu
+    /// serwisów.
+    pub fn resolve_proxy_target(
+        &self,
+        model: &str,
+        surface: ServiceSurface,
+        input_modalities: &[InputModality],
+        ctx: &mut ExecutionContext,
+    ) -> Result<ResolvedExecutionTarget, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: model,
+                required_surface: surface,
+                required_input_modalities: input_modalities,
+                required_output_modalities: &[],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        ranked
+            .into_iter()
+            .find(|t| t.is_alive())
+            .ok_or(ExecutorError::AllCandidatesFailed {
+                target_kind: "unknown",
+                attempts: 0,
+                last_error: "no live candidate after rank".into(),
+            })
+    }
+
     /// Per-target embeddings dispatch. Embedded backends route through
     /// `LocalInferenceHandler::handle_embeddings` — engines that don't
     /// implement embeddings (the trait default is `bail!`) surface their
