@@ -326,6 +326,38 @@ struct GridBounds {
     z: f32,
 }
 
+// A single articulated link's GPU geometry + its parsed kinematic placement.
+// `visual_origin` is the URDF <visual><origin> transform applied INSIDE the link
+// frame; `joint_origin`/`joint_axis` describe how the link attaches to its parent.
+// `joint_index` is Some(i) for a revolute joint driven by `setRobotJoints[i]`, None
+// for fixed joints (the body root and feet). Each link owns its own model-matrix
+// uniform + bind group so it can be drawn at its own world transform per frame.
+struct RobotLink {
+    parent: Option<usize>,
+    joint_origin: Mat4,
+    joint_axis: Vec3,
+    joint_index: Option<usize>,
+    visual_origin: Mat4,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+// Parsed URDF link/joint metadata, before meshes are fetched. `mesh_part` is the
+// base name of the per-link glb (e.g. "thigh_mirror"); None for link with no visual.
+struct UrdfLink {
+    name: String,
+    parent: Option<String>,
+    joint_origin: Mat4,
+    joint_axis: Vec3,
+    revolute: bool,
+    joint_name: Option<String>,
+    visual_origin: Mat4,
+    mesh_part: Option<String>,
+}
+
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -370,6 +402,16 @@ struct State {
     mesh_index_buffer: Option<wgpu::Buffer>,
     mesh_index_count: u32,
 
+    // Articulated robot: one GPU link per URDF link with a visual mesh, plus the
+    // bind-group layout needed to allocate each link's per-frame model uniform.
+    // When non-empty this is the primary robot render path and the single-mesh
+    // (`mesh_buffer`) / box marker fallbacks are skipped. The kinematic tree is
+    // stored as a flat list ordered parents-before-children so a single forward
+    // pass computes every world transform.
+    robot_links: Vec<RobotLink>,
+    model_bind_group_layout: wgpu::BindGroupLayout,
+    // Current 12 leg-joint angles in radians (Go2 order), defaulting to 0.
+    joint_angles: [f32; 12],
 
     depth_view: wgpu::TextureView,
 
@@ -416,11 +458,38 @@ const ROBOT_NOSE_COLOR: [f32; 3] = [1.0, 0.85, 0.45];
 // URL of the decimated Go2 body glTF binary served by the dashboard. Authored in
 // the URDF base_link frame (Z-up, X-forward), real scale in meters, body at the
 // origin — the same convention as our odom Z-up frame, so no axis fixup is needed.
+// Used ONLY as the single-mesh fallback when the articulated URDF path fails.
 const GO2_MESH_URL: &str = "/assets/go2/go2_full.glb";
 
-// Flat light-gray the Go2 body is rendered with (materials/textures are ignored),
-// matching the near-white box marker it replaces.
+// Flat light-gray the Go2 body is rendered with on the fallback single-mesh path
+// (materials/textures ignored), matching the near-white box marker it replaces.
 const GO2_MESH_COLOR: [f32; 3] = [0.82, 0.85, 0.90];
+
+// URDF + per-link mesh asset base for the articulated robot.
+const GO2_URDF_URL: &str = "/assets/go2/go2.urdf";
+const GO2_ASSET_BASE: &str = "/assets/go2/";
+
+// Names of the 12 revolute leg joints in the order `setRobotJoints` receives them:
+// FR(hip,thigh,calf), FL, RR, RL.
+const GO2_JOINT_ORDER: [&str; 12] = [
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+];
+
+// Go2 color scheme used when a glTF primitive has no material base-color factor:
+// dark body, lighter gray legs. Picked by link-name prefix.
+const GO2_BODY_FALLBACK_COLOR: [f32; 3] = [0.12, 0.12, 0.13];
+const GO2_LEG_FALLBACK_COLOR: [f32; 3] = [0.55, 0.57, 0.60];
 
 impl State {
     fn write_uniforms(&self) {
@@ -450,6 +519,45 @@ impl State {
         };
         self.queue
             .write_buffer(&self.robot_uniform_buffer, 0, bytemuck::bytes_of(&robot));
+
+        // Articulated robot: forward kinematics from the body pose down the tree,
+        // writing each link's per-frame model uniform (view_proj + world transform).
+        self.update_robot_links(&view_proj);
+    }
+
+    // Compute every link's world transform via forward kinematics and upload its
+    // model uniform. The list is ordered parents-before-children, so each link's
+    // parent world transform is already resolved when we reach it. World transform =
+    // parent_world * joint_origin * joint_rotation(angle about axis) * visual_origin.
+    // The root link (base_link, parent None) uses `robot_model` as its body pose.
+    fn update_robot_links(&self, view_proj: &Mat4) {
+        if self.robot_links.is_empty() {
+            return;
+        }
+        let vp = view_proj.to_cols_array_2d();
+        // Link world transforms WITHOUT the visual origin (children attach to the
+        // link frame, not the visual frame), indexed parallel to `robot_links`.
+        let mut link_world: Vec<Mat4> = Vec::with_capacity(self.robot_links.len());
+        for link in self.robot_links.iter() {
+            let parent_world = match link.parent {
+                Some(p) => link_world[p],
+                None => self.robot_model,
+            };
+            let joint_rot = match link.joint_index {
+                Some(idx) => Mat4::from_axis_angle(link.joint_axis, self.joint_angles[idx]),
+                None => Mat4::IDENTITY,
+            };
+            let world = parent_world * link.joint_origin * joint_rot;
+            link_world.push(world);
+
+            let model = world * link.visual_origin;
+            let u = ModelUniforms {
+                view_proj: vp,
+                model: model.to_cols_array_2d(),
+            };
+            self.queue
+                .write_buffer(&link.uniform_buffer, 0, bytemuck::bytes_of(&u));
+        }
     }
 
     fn render(&self) {
@@ -509,26 +617,43 @@ impl State {
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.instance_count);
             }
 
-            // Robot on top so it reads as the focal point. Prefer the real Go2 body
-            // mesh (loaded from base.glb); fall back to the box marker if the mesh
-            // failed to load, so the robot is always visible. Both reuse the robot bind
-            // group, so they track the pose identically.
+            // Robot on top so it reads as the focal point. Primary path: the
+            // articulated per-link robot (each link drawn at its own world transform
+            // computed from the live joint angles). Fallbacks, in order: the single
+            // pre-assembled Go2 mesh, then the box marker — so the robot is always
+            // visible even if the URDF/mesh load failed.
             if self.robot_visible {
-                match (self.mesh_buffer.as_ref(), self.mesh_index_buffer.as_ref()) {
-                    (Some(vbuf), Some(ibuf)) if self.mesh_index_count > 0 => {
-                        pass.set_pipeline(&self.colored_pipeline);
-                        pass.set_bind_group(0, &self.robot_bind_group, &[]);
-                        pass.set_vertex_buffer(0, vbuf.slice(..));
-                        pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+                if !self.robot_links.is_empty() {
+                    pass.set_pipeline(&self.colored_pipeline);
+                    for link in &self.robot_links {
+                        if link.index_count == 0 {
+                            continue;
+                        }
+                        pass.set_bind_group(0, &link.bind_group, &[]);
+                        pass.set_vertex_buffer(0, link.vertex_buffer.slice(..));
+                        pass.set_index_buffer(
+                            link.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        pass.draw_indexed(0..link.index_count, 0, 0..1);
                     }
-                    _ if self.robot_vertex_count > 0 => {
-                        pass.set_pipeline(&self.colored_pipeline);
-                        pass.set_bind_group(0, &self.robot_bind_group, &[]);
-                        pass.set_vertex_buffer(0, self.robot_buffer.slice(..));
-                        pass.draw(0..self.robot_vertex_count, 0..1);
+                } else {
+                    match (self.mesh_buffer.as_ref(), self.mesh_index_buffer.as_ref()) {
+                        (Some(vbuf), Some(ibuf)) if self.mesh_index_count > 0 => {
+                            pass.set_pipeline(&self.colored_pipeline);
+                            pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                            pass.set_vertex_buffer(0, vbuf.slice(..));
+                            pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+                        }
+                        _ if self.robot_vertex_count > 0 => {
+                            pass.set_pipeline(&self.colored_pipeline);
+                            pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                            pass.set_vertex_buffer(0, self.robot_buffer.slice(..));
+                            pass.draw(0..self.robot_vertex_count, 0..1);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -703,6 +828,151 @@ impl State {
         self.mesh_buffer = Some(vbuf);
         self.mesh_index_buffer = Some(ibuf);
         self.mesh_index_count = indices.len() as u32;
+    }
+
+    // Build the articulated robot's GPU links from the parsed URDF and a map of
+    // already-fetched per-link meshes (link mesh-part -> (vertices, indices)). Links
+    // are emitted in topological order (parents before children) so the per-frame
+    // forward-kinematics pass can resolve each parent before its child. Only links
+    // that both have a visual mesh AND a successfully fetched/parsed glb become a GPU
+    // link; structural links (odom/map/imu/feet without mesh) are skipped but their
+    // joints are still folded into descendants via the chain walk. Returns true if at
+    // least one renderable link was built (so the caller can keep the fallback).
+    fn build_robot_links(
+        &mut self,
+        urdf: &[UrdfLink],
+        meshes: &HashMap<String, (Vec<SolidVertex>, Vec<u32>)>,
+    ) -> bool {
+        // Resolve link name -> URDF index and verify a single root (parent None).
+        let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
+        for (i, l) in urdf.iter().enumerate() {
+            name_to_idx.insert(l.name.as_str(), i);
+        }
+
+        // Topological order over the kinematic tree rooted at the parent-less link.
+        // The chain is shallow (<= ~5 deep) so a repeated-insertion walk is fine.
+        let mut order: Vec<usize> = Vec::with_capacity(urdf.len());
+        let mut placed = vec![false; urdf.len()];
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for (i, l) in urdf.iter().enumerate() {
+                if placed[i] {
+                    continue;
+                }
+                let parent_ready = match &l.parent {
+                    None => true,
+                    Some(p) => match name_to_idx.get(p.as_str()) {
+                        Some(&pi) => placed[pi],
+                        // Parent not in the URDF link set: treat as root-attached.
+                        None => true,
+                    },
+                };
+                if parent_ready {
+                    placed[i] = true;
+                    order.push(i);
+                    progressed = true;
+                }
+            }
+        }
+
+        // Map a URDF link index to its position in the emitted RobotLink list, so a
+        // child can reference its parent by RobotLink index.
+        let mut urdf_to_link: HashMap<usize, usize> = HashMap::new();
+        let mut links: Vec<RobotLink> = Vec::new();
+
+        for &ui in &order {
+            let l = &urdf[ui];
+            // Resolve this link's parent in the EMITTED list by walking up the URDF
+            // chain until we hit a link that produced a RobotLink (skips structural
+            // links like odom/map). Their joint origins are folded in below.
+            let mut parent_link: Option<usize> = None;
+            let mut acc_origin = l.joint_origin;
+            let mut cursor = l.parent.clone();
+            loop {
+                match cursor {
+                    None => break,
+                    Some(pname) => match name_to_idx.get(pname.as_str()) {
+                        None => break,
+                        Some(&pi) => {
+                            if let Some(&li) = urdf_to_link.get(&pi) {
+                                parent_link = Some(li);
+                                break;
+                            }
+                            // Parent has no GPU link: absorb its joint origin and keep
+                            // climbing. A structural parent is always a fixed joint, so
+                            // no rotation is lost.
+                            acc_origin = urdf[pi].joint_origin * acc_origin;
+                            cursor = urdf[pi].parent.clone();
+                        }
+                    },
+                }
+            }
+
+            let mesh = match &l.mesh_part {
+                Some(part) => meshes.get(part),
+                None => None,
+            };
+            let (verts, idx) = match mesh {
+                Some(m) if !m.0.is_empty() && !m.1.is_empty() => m,
+                _ => continue,
+            };
+
+            let joint_index = l
+                .joint_name
+                .as_deref()
+                .and_then(|jn| GO2_JOINT_ORDER.iter().position(|n| *n == jn))
+                .filter(|_| l.revolute);
+
+            let vbuf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("go2-link-vertices"),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ibuf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("go2-link-indices"),
+                    contents: bytemuck::cast_slice(idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            let ubuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("go2-link-uniforms"),
+                size: std::mem::size_of::<ModelUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("go2-link-bg"),
+                layout: &self.model_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubuf.as_entire_binding(),
+                }],
+            });
+
+            urdf_to_link.insert(ui, links.len());
+            links.push(RobotLink {
+                parent: parent_link,
+                joint_origin: acc_origin,
+                joint_axis: l.joint_axis,
+                joint_index,
+                visual_origin: l.visual_origin,
+                vertex_buffer: vbuf,
+                index_buffer: ibuf,
+                index_count: idx.len() as u32,
+                uniform_buffer: ubuf,
+                bind_group: bg,
+            });
+        }
+
+        if links.is_empty() {
+            return false;
+        }
+        self.robot_links = links;
+        true
     }
 
     // Quantize a world point to its voxel cell coordinate (round to the nearest
@@ -1024,7 +1294,10 @@ pub async fn init_voxel_view(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
+            // No culling: the cube index winding was showing inner faces (the
+            // outer faces were being culled). Depth-testing both faces shows the
+            // correct outer surfaces regardless of winding.
+            cull_mode: None,
             unclipped_depth: false,
             polygon_mode: wgpu::PolygonMode::Fill,
             conservative: false,
@@ -1238,6 +1511,9 @@ pub async fn init_voxel_view(
         mesh_buffer: None,
         mesh_index_buffer: None,
         mesh_index_count: 0,
+        robot_links: Vec::new(),
+        model_bind_group_layout,
+        joint_angles: [0.0; 12],
         depth_view,
         camera,
         voxel_size,
@@ -1255,18 +1531,21 @@ pub async fn init_voxel_view(
         robot_pose_set: false,
     }));
 
-    // Load the real Go2 body mesh. On any failure (network, parse, no geometry) keep
-    // the box marker as the fallback so the robot is always visible, and warn.
-    match fetch_bytes(GO2_MESH_URL).await {
-        Ok(bytes) => match parse_glb_mesh(&bytes) {
-            Ok((verts, idx)) => {
-                state.borrow_mut().install_robot_mesh(&verts, &idx);
-            }
-            Err(e) => log::warn!("Go2 body mesh parse failed ({e}); using box marker"),
-        },
-        Err(e) => log::warn!(
-            "Go2 body mesh fetch failed ({e:?}); using box marker"
-        ),
+    // Primary path: load the URDF + per-link meshes and build the articulated robot.
+    // On ANY failure (network, parse, no usable links) fall back to the single
+    // pre-assembled go2_full.glb, and if that also fails, the box marker — so the
+    // robot is always visible.
+    if !load_articulated_robot(&state).await {
+        log::warn!("Go2 articulated load failed; falling back to single go2_full.glb mesh");
+        match fetch_bytes(GO2_MESH_URL).await {
+            Ok(bytes) => match parse_glb_mesh(&bytes) {
+                Ok((verts, idx)) => {
+                    state.borrow_mut().install_robot_mesh(&verts, &idx);
+                }
+                Err(e) => log::warn!("Go2 body mesh parse failed ({e}); using box marker"),
+            },
+            Err(e) => log::warn!("Go2 body mesh fetch failed ({e:?}); using box marker"),
+        }
     }
 
     let raf_handle: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
@@ -1399,6 +1678,23 @@ impl VoxelView {
         // Pose-driven visuals must follow the robot even when the pose advances
         // between cloud frames: recompute the colormap origin from the new position.
         st.refresh_color_field();
+    }
+
+    /// Set the 12 live leg-joint angles (radians) that articulate the robot. Order is
+    /// the Go2 convention: idx 0-2 = FR(hip,thigh,calf), 3-5 = FL, 6-8 = RR, 9-11 = RL,
+    /// matching `GO2_JOINT_ORDER`. Fewer than 12 values leaves the remaining joints at
+    /// their last value; extra values are ignored. The next rendered frame recomputes
+    /// every link's world transform from these angles. No-op until the articulated
+    /// robot has loaded (the single-mesh / box fallback has no joints).
+    #[wasm_bindgen(js_name = setRobotJoints)]
+    pub fn set_robot_joints(&self, joints: &[f32]) {
+        let state = match self.state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut st = state.borrow_mut();
+        let n = joints.len().min(12);
+        st.joint_angles[..n].copy_from_slice(&joints[..n]);
     }
 
     /// Reset the accumulated occupancy map: clears the cell set, the FIFO order and the
@@ -1603,6 +1899,313 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, JsValue> {
     let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer()?).await?;
     let array = js_sys::Uint8Array::new(&buf);
     Ok(array.to_vec())
+}
+
+// Parse three space-separated f32s from an attribute string ("x y z"), defaulting
+// missing components to 0.
+fn parse_xyz(s: &str) -> Vec3 {
+    let mut it = s.split_whitespace().map(|t| t.parse::<f32>().unwrap_or(0.0));
+    Vec3::new(
+        it.next().unwrap_or(0.0),
+        it.next().unwrap_or(0.0),
+        it.next().unwrap_or(0.0),
+    )
+}
+
+// URDF <origin> -> homogeneous transform. URDF applies translation then RPY where
+// RPY is the fixed-axis convention R = Rz(yaw) * Ry(pitch) * Rx(roll). glam's
+// `from_euler(EulerRot::ZYX, yaw, pitch, roll)` produces exactly that rotation.
+fn urdf_origin_to_mat(xyz: Vec3, rpy: Vec3) -> Mat4 {
+    let rot = Quat::from_euler(glam::EulerRot::ZYX, rpy.z, rpy.y, rpy.x);
+    Mat4::from_rotation_translation(rot, xyz)
+}
+
+// Read an element's <origin xyz rpy> child into a transform (identity if absent).
+fn read_origin(el: roxmltree::Node) -> Mat4 {
+    for c in el.children() {
+        if c.has_tag_name("origin") {
+            let xyz = parse_xyz(c.attribute("xyz").unwrap_or("0 0 0"));
+            let rpy = parse_xyz(c.attribute("rpy").unwrap_or("0 0 0"));
+            return urdf_origin_to_mat(xyz, rpy);
+        }
+    }
+    Mat4::IDENTITY
+}
+
+// Parse the Go2 URDF into a flat list of links carrying their attaching joint's
+// origin/axis/type and their visual <origin> + mesh part name. The mesh part is the
+// file stem of the `package://.../dae/<part>.dae` reference, mapped 1:1 to
+// `/assets/go2/<part>.glb`. Joints connect parent->child; we store each joint on its
+// CHILD link so the kinematic tree is link-indexed.
+fn parse_urdf(xml: &str) -> Result<Vec<UrdfLink>, String> {
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("urdf parse: {e}"))?;
+    let root = doc.root_element();
+
+    // First pass: every link with its visual origin + mesh part (if any).
+    let mut links: HashMap<String, UrdfLink> = HashMap::new();
+    for link in root.children().filter(|n| n.has_tag_name("link")) {
+        let name = match link.attribute("name") {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let mut visual_origin = Mat4::IDENTITY;
+        let mut mesh_part: Option<String> = None;
+        if let Some(visual) = link.children().find(|c| c.has_tag_name("visual")) {
+            visual_origin = read_origin(visual);
+            if let Some(geom) = visual.children().find(|c| c.has_tag_name("geometry")) {
+                if let Some(mesh) = geom.children().find(|c| c.has_tag_name("mesh")) {
+                    if let Some(fname) = mesh.attribute("filename") {
+                        mesh_part = mesh_part_from_filename(fname);
+                    }
+                }
+            }
+        }
+        links.insert(
+            name.clone(),
+            UrdfLink {
+                name,
+                parent: None,
+                joint_origin: Mat4::IDENTITY,
+                joint_axis: Vec3::X,
+                revolute: false,
+                joint_name: None,
+                visual_origin,
+                mesh_part,
+            },
+        );
+    }
+
+    // Second pass: fold each joint onto its child link (parent, origin, axis, type).
+    for joint in root.children().filter(|n| n.has_tag_name("joint")) {
+        let jtype = joint.attribute("type").unwrap_or("fixed");
+        let jname = joint.attribute("name").map(|s| s.to_string());
+        let parent = joint
+            .children()
+            .find(|c| c.has_tag_name("parent"))
+            .and_then(|p| p.attribute("link"))
+            .map(|s| s.to_string());
+        let child = joint
+            .children()
+            .find(|c| c.has_tag_name("child"))
+            .and_then(|c| c.attribute("link"))
+            .map(|s| s.to_string());
+        let origin = read_origin(joint);
+        let axis = joint
+            .children()
+            .find(|c| c.has_tag_name("axis"))
+            .and_then(|a| a.attribute("xyz"))
+            .map(parse_xyz)
+            .unwrap_or(Vec3::X);
+
+        if let Some(child_name) = child {
+            if let Some(cl) = links.get_mut(&child_name) {
+                cl.parent = parent;
+                cl.joint_origin = origin;
+                cl.joint_axis = if axis.length_squared() > 1e-9 {
+                    axis.normalize()
+                } else {
+                    Vec3::X
+                };
+                cl.revolute = jtype == "revolute" || jtype == "continuous";
+                cl.joint_name = jname;
+            }
+        }
+    }
+
+    if links.is_empty() {
+        return Err("urdf had no links".to_string());
+    }
+    Ok(links.into_values().collect())
+}
+
+// "package://go2_robot_sdk/dae/thigh_mirror.dae" -> Some("thigh_mirror").
+fn mesh_part_from_filename(filename: &str) -> Option<String> {
+    let stem = filename.rsplit('/').next().unwrap_or(filename);
+    let stem = stem.strip_suffix(".dae").unwrap_or(stem);
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+// Default per-link color when a glTF primitive carries no material base-color
+// factor: dark for the body (base) link, lighter gray for the legs.
+fn fallback_link_color(link_name: &str) -> [f32; 3] {
+    if link_name == "base_link" {
+        GO2_BODY_FALLBACK_COLOR
+    } else {
+        GO2_LEG_FALLBACK_COLOR
+    }
+}
+
+// Parse a per-link glb into a colored triangle mesh. Each primitive is rendered in
+// its material's base-color factor when present; otherwise the link's fallback color.
+// Node-internal transforms are applied so the mesh sits correctly in the link frame
+// (this is the SAME accumulation as the fallback path, but with real material color).
+fn parse_glb_mesh_colored(
+    bytes: &[u8],
+    fallback_color: [f32; 3],
+) -> Result<(Vec<SolidVertex>, Vec<u32>), String> {
+    let document = gltf::Gltf::from_slice(bytes).map_err(|e| format!("gltf parse: {e}"))?;
+    let bin = document.blob.as_deref().unwrap_or(&[]);
+    let buffers: Vec<&[u8]> = vec![bin];
+
+    let mut vertices: Vec<SolidVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for scene in document.scenes() {
+        for node in scene.nodes() {
+            accumulate_node_colored(
+                &node,
+                Mat4::IDENTITY,
+                &buffers,
+                fallback_color,
+                &mut vertices,
+                &mut indices,
+            );
+        }
+    }
+    if vertices.is_empty() || indices.is_empty() {
+        return Err("glb contained no triangle geometry".to_string());
+    }
+    Ok((vertices, indices))
+}
+
+// Like `accumulate_node`, but colors each primitive by its material base-color
+// factor (falling back to `fallback_color`) instead of a single flat color.
+fn accumulate_node_colored(
+    node: &gltf::Node,
+    parent: Mat4,
+    buffers: &[&[u8]],
+    fallback_color: [f32; 3],
+    vertices: &mut Vec<SolidVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let local = Mat4::from_cols_array_2d(&node.transform().matrix());
+    let world = parent * local;
+
+    if let Some(mesh) = node.mesh() {
+        for prim in mesh.primitives() {
+            if prim.mode() != gltf::mesh::Mode::Triangles {
+                continue;
+            }
+            let base_color = prim.material().pbr_metallic_roughness().base_color_factor();
+            // Only use the material color when it is meaningfully set (glTF defaults
+            // to white [1,1,1,1]); a pure-white factor reads as "no authored color"
+            // for these CAD-exported meshes, so fall back to the Go2 scheme.
+            let color = if base_color[0] >= 0.999
+                && base_color[1] >= 0.999
+                && base_color[2] >= 0.999
+            {
+                fallback_color
+            } else {
+                [base_color[0], base_color[1], base_color[2]]
+            };
+
+            let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
+            let positions = match reader.read_positions() {
+                Some(p) => p,
+                None => continue,
+            };
+            let start = vertices.len() as u32;
+            for p in positions {
+                let wp = world.transform_point3(Vec3::from_array(p));
+                vertices.push(SolidVertex {
+                    position: wp.to_array(),
+                    color,
+                });
+            }
+            match reader.read_indices() {
+                Some(idx) => {
+                    for i in idx.into_u32() {
+                        indices.push(start + i);
+                    }
+                }
+                None => {
+                    let added = vertices.len() as u32 - start;
+                    for i in 0..added {
+                        indices.push(start + i);
+                    }
+                }
+            }
+        }
+    }
+
+    for child in node.children() {
+        accumulate_node_colored(&child, world, buffers, fallback_color, vertices, indices);
+    }
+}
+
+// Fetch the URDF + every referenced per-link glb and build the articulated robot
+// on `state`. Returns true on success (at least one renderable link installed). On
+// any failure it leaves `robot_links` empty so the caller uses the single-mesh /
+// box fallback. Each unique mesh part is fetched once and shared across links that
+// reference it (e.g. four legs share thigh/calf parts).
+async fn load_articulated_robot(state: &Rc<RefCell<State>>) -> bool {
+    let xml = match fetch_bytes(GO2_URDF_URL).await {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("Go2 URDF fetch failed ({e:?})");
+            return false;
+        }
+    };
+    let xml = match std::str::from_utf8(&xml) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn!("Go2 URDF is not valid UTF-8");
+            return false;
+        }
+    };
+    let urdf = match parse_urdf(xml) {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!("Go2 URDF parse failed ({e})");
+            return false;
+        }
+    };
+
+    // Collect the unique mesh parts and the fallback color to use for each (decided
+    // by the FIRST link that references the part — body vs leg).
+    let mut part_color: HashMap<String, [f32; 3]> = HashMap::new();
+    for l in &urdf {
+        if let Some(part) = &l.mesh_part {
+            part_color
+                .entry(part.clone())
+                .or_insert_with(|| fallback_link_color(&l.name));
+        }
+    }
+
+    // Fetch + parse each unique per-link mesh once. ALL referenced parts must load:
+    // a partial set would render a robot with missing limbs and, worse, would drop a
+    // revolute joint whose link mesh is missing (its descendants would then pose
+    // incorrectly). On any failure we abort the articulated path so the caller uses
+    // the single go2_full.glb fallback instead.
+    let mut meshes: HashMap<String, (Vec<SolidVertex>, Vec<u32>)> = HashMap::new();
+    for (part, color) in &part_color {
+        let url = format!("{GO2_ASSET_BASE}{part}.glb");
+        let bytes = match fetch_bytes(&url).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("Go2 link mesh fetch failed for {part} ({e:?})");
+                return false;
+            }
+        };
+        match parse_glb_mesh_colored(&bytes, *color) {
+            Ok(geo) => {
+                meshes.insert(part.clone(), geo);
+            }
+            Err(e) => {
+                log::warn!("Go2 link mesh parse failed for {part} ({e})");
+                return false;
+            }
+        }
+    }
+
+    if meshes.is_empty() {
+        return false;
+    }
+
+    state.borrow_mut().build_robot_links(&urdf, &meshes)
 }
 
 // Parse a binary glTF (.glb) byte buffer into a single merged flat-colored triangle

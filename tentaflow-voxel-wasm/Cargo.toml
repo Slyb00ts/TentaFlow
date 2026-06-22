@@ -25,6 +25,9 @@ web-sys = { version = "0.3", features = [
     "Event",
     "EventTarget",
     "AddEventListenerOptions",
+    "Request",
+    "RequestInit",
+    "Response",
 ] }
 
 # wgpu with the webgl backend so the renderer works on browsers without native
@@ -33,6 +36,15 @@ wgpu = { version = "0.20", default-features = false, features = ["webgl", "wgsl"
 
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.27", features = ["bytemuck"] }
+
+# Pure-Rust glTF 2.0 parser for the real Go2 body mesh. Default features (import +
+# utils) are fine; parsing happens from in-memory bytes via Glb::from_slice, so no
+# native/filesystem deps are pulled into the wasm build.
+gltf = "1.4"
+
+# Pure-Rust, allocation-only XML parser for the Go2 URDF (links/joints/visual
+# origins). No filesystem or platform deps, so it builds clean for wasm.
+roxmltree = "0.20"
 
 # getrandom with `js` — wgpu pulls transitive deps that need an RNG on wasm.
 getrandom = { version = "0.2", features = ["js"] }

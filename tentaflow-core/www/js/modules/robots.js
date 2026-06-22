@@ -1253,6 +1253,11 @@ function applyRobotPose(id) {
   if (!Array.isArray(p) || p.length < 3) return;
   const o = Array.isArray(q) && q.length >= 4 ? q : [0, 0, 0, 1];
   try { voxelView.setRobotPose(p[0], p[1], p[2], o[0], o[1], o[2], o[3]); } catch { /* ignore */ }
+  // Push live leg joint angles so the viewer robot articulates like the real one.
+  const j = t.joints;
+  if (Array.isArray(j) && j.length >= 12 && voxelView.setRobotJoints) {
+    try { voxelView.setRobotJoints(new Float32Array(j)); } catch { /* ignore */ }
+  }
 }
 
 async function ensureVoxel(container) {

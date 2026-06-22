@@ -313,8 +313,18 @@
   overflow: hidden;
 }
 
+/* Full-screen Kamera / LiDAR tab: fill the remaining viewport height instead of a
+   fixed box. The toolbar + KPIs + action row + tabs take ~280px above. */
 .robots-tile-full {
-  min-height: 540px;
+  height: calc(100vh - 280px);
+  min-height: 380px;
+}
+
+/* In a full tile the media (video / voxel canvas) flexes to fill the height. */
+.robots-tile-full tf-video-stream {
+  flex: 1;
+  min-height: 0;
+  --tf-video-stream-height: 100%;
 }
 
 .robots-tile-empty {
@@ -379,7 +389,7 @@
 }
 
 .robots-tile-full .robots-voxel {
-  min-height: 480px;
+  min-height: 0;
 }
 
 .robots-voxel-canvas {
