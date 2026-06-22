@@ -99,13 +99,20 @@ struct VsOut {
     @location(0) color: vec3<f32>,
 };
 
-// Map a normalized depth [0,1] to a near=red -> mid=green/yellow -> far=blue ramp.
-fn heatmap(t: f32) -> vec3<f32> {
+// Compact HSV->RGB (h,s,v in [0,1]). Used for an elevation colormap so the floor
+// and obstacles read like a height field, the way occupancy-grid viewers show it.
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let k = vec3<f32>(5.0, 3.0, 1.0) / 6.0;
+    let p = abs(fract(vec3<f32>(h) + k) * 6.0 - 3.0);
+    return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
+}
+
+// Elevation colormap: low (floor) = warm orange/red, rising through yellow/green/
+// cyan to high (tall obstacles) = blue/violet. t is normalized height [0,1].
+fn heightcolor(t: f32) -> vec3<f32> {
     let c = clamp(t, 0.0, 1.0);
-    let r = clamp(1.5 - abs(c - 0.0) * 3.0, 0.0, 1.0);
-    let g = clamp(1.5 - abs(c - 0.5) * 3.0, 0.0, 1.0);
-    let b = clamp(1.5 - abs(c - 1.0) * 3.0, 0.0, 1.0);
-    return vec3<f32>(r, g, b);
+    let h = 0.08 + c * 0.62; // ~orange at the floor -> ~blue/violet at the top
+    return hsv2rgb(h, 0.92, 1.0);
 }
 
 @vertex
@@ -114,9 +121,10 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = in.translation + in.position * u.voxel_size;
     out.clip_position = u.view_proj * vec4<f32>(world, 1.0);
 
-    let dist = length(in.translation - u.heatmap_origin);
-    let t = dist * u.inv_heatmap_range;
-    out.color = heatmap(t);
+    // Color by HEIGHT (Z): heatmap_origin.z carries the floor (min Z) and
+    // inv_heatmap_range = 1 / height-extent.
+    let t = (in.translation.z - u.heatmap_origin.z) * u.inv_heatmap_range;
+    out.color = heightcolor(t);
     return out;
 }
 
@@ -588,11 +596,11 @@ impl VoxelView {
         if min.is_finite() && max.is_finite() {
             let center = (min + max) * 0.5;
             let extent = (max - min).length().max(0.5);
-            // Depth heatmap measured from the cloud CENTER (≈ the robot/sensor):
-            // near the robot = red, far = blue. Range tracks the cloud radius so
-            // the full palette is used regardless of room size.
-            st.heatmap_origin = center;
-            st.heatmap_range = (extent * 0.5).max(0.5);
+            // Elevation colormap: floor (min Z) = warm, top = cool. heatmap_origin
+            // carries the floor height in .z; the range is the height extent so the
+            // full palette spans floor..tallest obstacle.
+            st.heatmap_origin = Vec3::new(0.0, 0.0, min.z);
+            st.heatmap_range = (max.z - min.z).max(0.3);
             if !st.framed {
                 st.camera.target = center;
                 st.camera.distance = extent * 1.2;
