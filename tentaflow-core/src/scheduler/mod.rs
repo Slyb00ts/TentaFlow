@@ -38,6 +38,9 @@ pub struct ScheduledJob {
     pub retry_policy_json: String,
     pub concurrency_policy: String,
     pub created_by_user_id: Option<String>,
+    // org_id instancji addona, ktorej dotyczy job. None => default org (joby sprzed R4).
+    // Niesie tozsamosc najemcy do start_addon, by host-fns dzialaly na danych wlasciwej org.
+    pub org_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -77,6 +80,12 @@ pub struct UpsertJobRequest {
     pub max_runtime_seconds: Option<i64>,
     pub retry_policy_json: Option<String>,
     pub concurrency_policy: Option<String>,
+    // org_id instancji addona dla tego joba. None => default org (zgodnie z dotychczasowym
+    // zachowaniem). Wymagane dla jobow multi-tenant (np. conflict_scan addonu RAG).
+    // serde(default): dashboard wysyla job_json bez tego pola (admin UI nie ustawia org),
+    // wiec brak pola = None, a nie blad deserializacji.
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 pub fn start(db: DbPool, addon_manager: Option<Arc<AddonManager>>) {
@@ -103,7 +112,7 @@ pub fn list_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
                 max_runtime_seconds, retry_policy_json, concurrency_policy, created_by_user_id, \
-                created_at, updated_at \
+                org_id, created_at, updated_at \
          FROM scheduled_jobs ORDER BY enabled DESC, next_run_at IS NULL, next_run_at, name",
     )?;
     let rows = stmt.query_map([], read_job)?;
@@ -188,8 +197,8 @@ pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<S
         "INSERT INTO scheduled_jobs \
              (id, name, enabled, target_type, target_addon_id, target_action_id, payload_json, \
               schedule_kind, schedule_expr, timezone, next_run_at, max_runtime_seconds, \
-              retry_policy_json, concurrency_policy, created_by_user_id, updated_at) \
-         VALUES (?1, ?2, ?3, 'addon_action', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now')) \
+              retry_policy_json, concurrency_policy, created_by_user_id, org_id, updated_at) \
+         VALUES (?1, ?2, ?3, 'addon_action', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, datetime('now')) \
          ON CONFLICT(id) DO UPDATE SET \
               name = excluded.name, enabled = excluded.enabled, target_type = excluded.target_type, \
               target_addon_id = excluded.target_addon_id, target_action_id = excluded.target_action_id, \
@@ -197,7 +206,7 @@ pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<S
               schedule_expr = excluded.schedule_expr, timezone = excluded.timezone, \
               next_run_at = excluded.next_run_at, max_runtime_seconds = excluded.max_runtime_seconds, \
               retry_policy_json = excluded.retry_policy_json, concurrency_policy = excluded.concurrency_policy, \
-              updated_at = datetime('now')",
+              org_id = excluded.org_id, updated_at = datetime('now')",
         params![
             id,
             req.name,
@@ -213,6 +222,7 @@ pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<S
             retry_policy,
             concurrency_policy,
             user_id,
+            req.org_id,
         ],
     )?;
     drop(conn);
@@ -275,6 +285,10 @@ async fn execute_job(
         .map_err(|e| anyhow::anyhow!("invalid payload_json: {e}"))?;
     let addon_id = job.target_addon_id.clone();
     let action_id = job.target_action_id.clone();
+    // org_id instancji niesiony przez job (R4). None => default org (joby sprzed R4
+    // zachowuja zachowanie). Przekazany do start_addon, by host-fns addonu (graf/SQL)
+    // dzialaly na danych wlasciwego najemcy, a nie domyslnej organizacji.
+    let job_org_id = job.org_id.clone();
     let timeout_seconds = job.max_runtime_seconds.max(1) as u64;
     let actor_user_id = if !user_id.is_empty() {
         user_id.to_string()
@@ -290,10 +304,34 @@ async fn execute_job(
             }
             if !addon_manager.has_running_instance(&addon_id) {
                 addon_manager
-                    .start_addon(&addon_id, Some(actor_user_id.clone()), None)
+                    .start_addon(&addon_id, Some(actor_user_id.clone()), job_org_id.clone())
                     .map_err(|e| {
                         anyhow::anyhow!("nie udalo sie uruchomic addonu '{}': {e}", addon_id)
                     })?;
+            } else if let Some(job_org) = job_org_id.as_deref() {
+                // Izolacja multi-tenant (blocker 3). `addon_id` jest GLOBALNIE UNIKALNY per
+                // zainstalowana instancja (lifecycle::install_instance -> unique_instance_id
+                // dokleja uuid i przepisuje [addon].id), wiec pula `instances` keyowana po
+                // addon_id NIGDY nie miesza organizacji — wszystkie workery danego addon_id
+                // dziedzicza org instancji glownej (acquire_instance: instance_org_id z first).
+                // Gdy instancja JUZ dziala (start_addon pominiety), jej org jest USTALONA przy
+                // starcie i moze sie roznic od job_org_id, jesli wystartowal ja boot/system
+                // (org=None) albo inny najemca. call_tool nie przyjmuje org_id, wiec wykonalby
+                // sie na danych org dzialajacej instancji. Zamiast cichej rozbieznosci ASERTUJEMY
+                // zgodnosc i przerywamy run bledem (audyt scheduled_runs.failed) — to wymusza
+                // start instancji we wlasciwej org, a nie wykonanie na cudzych danych.
+                match addon_manager.instance_org_id(&addon_id) {
+                    Some(inst_org) if inst_org == job_org => {}
+                    other => {
+                        bail!(
+                            "izolacja multi-tenant: addon '{}' dziala w org {:?}, a job zada org '{}' \
+                             — przerywam (zatrzymaj instancje albo uruchom ja w org joba)",
+                            addon_id,
+                            other,
+                            job_org
+                        );
+                    }
+                }
             }
             addon_manager.call_tool(&addon_id, &action_id, params, &actor_user_id)
         })
@@ -459,7 +497,7 @@ fn due_jobs(db: &DbPool) -> Result<Vec<ScheduledJob>> {
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
                 max_runtime_seconds, retry_policy_json, concurrency_policy, created_by_user_id, \
-                created_at, updated_at \
+                org_id, created_at, updated_at \
          FROM scheduled_jobs \
          WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1 \
          ORDER BY next_run_at LIMIT 20",
@@ -475,7 +513,7 @@ fn get_job(db: &DbPool, job_id: &str) -> Result<Option<ScheduledJob>> {
         "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
                 payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
                 max_runtime_seconds, retry_policy_json, concurrency_policy, created_by_user_id, \
-                created_at, updated_at \
+                org_id, created_at, updated_at \
          FROM scheduled_jobs WHERE id = ?1",
         params![job_id],
         read_job,
@@ -582,8 +620,9 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledJob> {
         retry_policy_json: row.get(12)?,
         concurrency_policy: row.get(13)?,
         created_by_user_id: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        org_id: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -633,6 +672,7 @@ mod tests {
             max_runtime_seconds: Some(300),
             retry_policy_json: None,
             concurrency_policy: Some("skip".to_string()),
+            org_id: None,
         }
     }
 
@@ -654,6 +694,48 @@ mod tests {
         let mut req = eureka_job("sync_new");
         req.target_addon_id = "eureka;drop".to_string();
         assert!(validate_job_request(&req).is_err());
+    }
+
+    // org_id (R4): job niesie org_id instancji i jest on odczytywany przez read_job, a
+    // execute_job przekazuje go do start_addon. Test buduje schemat scheduled_jobs +
+    // migracje v89 (ALTER ADD org_id) WPROST na :memory: (bez pelnego init-chaina, ktory
+    // w tym srodowisku ma niezalezny problem z tabela addons), i sprawdza ze:
+    //   - job z org_id zapisany i odczytany zachowuje org_id (propagacja tozsamosci),
+    //   - job bez org_id (sprzed R4 / dashboard) ma org_id=None (default org zachowany).
+    #[test]
+    fn scheduled_job_round_trips_org_id() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(crate::db::migrations::scheduled_jobs_schema_for_test())
+            .expect("base scheduled_jobs schema");
+        conn.execute_batch("ALTER TABLE scheduled_jobs ADD COLUMN org_id TEXT;")
+            .expect("v89 org_id column");
+
+        let insert = "INSERT INTO scheduled_jobs \
+             (id, name, enabled, target_type, target_addon_id, target_action_id, payload_json, \
+              schedule_kind, schedule_expr, timezone, next_run_at, max_runtime_seconds, \
+              retry_policy_json, concurrency_policy, created_by_user_id, org_id, updated_at) \
+             VALUES (?1, 'n', 1, 'addon_action', 'rag', 'conflict_scan', '{}', 'interval', '5m', \
+              'UTC', NULL, 300, '{}', 'skip', 'u1', ?2, datetime('now'))";
+        conn.execute(insert, params!["job-with-org", "org-tenant-7"])
+            .expect("insert job with org");
+        conn.execute(insert, params!["job-no-org", Option::<String>::None])
+            .expect("insert legacy job without org");
+
+        let select = "SELECT id, name, enabled, target_type, target_addon_id, target_action_id, \
+                payload_json, schedule_kind, schedule_expr, timezone, next_run_at, \
+                max_runtime_seconds, retry_policy_json, concurrency_policy, created_by_user_id, \
+                org_id, created_at, updated_at FROM scheduled_jobs WHERE id = ?1";
+
+        let with_org = conn
+            .query_row(select, params!["job-with-org"], read_job)
+            .expect("read job with org");
+        assert_eq!(with_org.org_id.as_deref(), Some("org-tenant-7"));
+
+        let no_org = conn
+            .query_row(select, params!["job-no-org"], read_job)
+            .expect("read legacy job");
+        assert_eq!(no_org.org_id, None, "job bez org_id => None (default org)");
     }
 
     #[test]

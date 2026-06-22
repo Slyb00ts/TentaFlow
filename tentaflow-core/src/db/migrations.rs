@@ -482,7 +482,24 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "roles_add_document_permissions",
             MigrationStep::Rust(roles_add_document_permissions),
         ),
+        (
+            89,
+            "scheduled_jobs_org_id",
+            MigrationStep::Rust(scheduled_jobs_add_org_id_column),
+        ),
     ]
+}
+
+/// v89 — `org_id` na scheduled_jobs (MemGraphRAG D3 / R4). Scheduled job musi niesc
+/// org_id instancji addona, by `execute_job` przekazal go do `start_addon` i host-fns
+/// (graf/SQL) trafialy w dane WLASCIWEGO najemcy zamiast default org (luka multi-tenant
+/// — `start_addon(..., None)`). Kolumna NULLABLE: istniejace joby maja org_id=NULL =>
+/// zachowuja dotychczasowe zachowanie (default org), wiec migracja nie lamie ich biegu.
+fn scheduled_jobs_add_org_id_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "scheduled_jobs", "org_id")? {
+        conn.execute_batch("ALTER TABLE scheduled_jobs ADD COLUMN org_id TEXT;")?;
+    }
+    Ok(())
 }
 
 /// v87 — kolumna limitu document/blob store (RAG E1.3) w `addon_resource_limits`.
@@ -5242,6 +5259,13 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job
 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_status
     ON scheduled_runs(status);
 "#;
+
+/// Bazowy schemat scheduled_jobs (sprzed v89, bez kolumny org_id) — udostepniony testom
+/// schedulera, by mogly zbudowac tabele bez calego init-chaina migracji.
+#[cfg(test)]
+pub fn scheduled_jobs_schema_for_test() -> &'static str {
+    SCHEDULED_JOBS
+}
 
 const COMPLIANCE_CORE_FOUNDATION: &str = r#"
 CREATE TABLE IF NOT EXISTS compliance_data_categories (

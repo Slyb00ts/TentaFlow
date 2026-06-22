@@ -127,6 +127,21 @@ pub extern "C" fn on_start() -> i32 {
         }),
     );
 
+    // A_det (MemGraphRAG D3): asynchroniczny skan konfliktow. Rejestrowany jako tool,
+    // by Scheduler mogl go wolac jako scheduled job (interval) ORAZ by byl wolalny
+    // recznie do testow/debugu. Parametry odpowiadaja payloadowi scheduled joba (R4).
+    register_tool(
+        "conflict_scan",
+        "A_det (0 LLM): skanuje nowo-aktywne fakty i wykrywa symbolicznie kandydatow konfliktu (ten sam head+rel, rozny tail), zapisujac otwarte konflikty. Asynchroniczny, wznawialny po kursorze, idempotentny.",
+        json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "batch_size": {"type": "integer"}
+            }
+        }),
+    );
+
     // Minimalny panel — lista kolekcji renderowana z SQL. Pelne GUI to osobny slice.
     if let Err(e) = render_main_panel() {
         log::warn(&format!("rag: nie udalo sie wyrenderowac panelu: {e}"));
@@ -179,6 +194,7 @@ pub extern "C" fn on_request(
         "ingest_document" => handle_ingest_document(&params),
         "list_documents" => handle_list_documents(&params),
         "ingest_status" => handle_ingest_status(&params),
+        "conflict_scan" => handle_conflict_scan(&params),
         _ => json!({"ok": false, "error": format!("Nieznane narzedzie: {tool_name}")}),
     };
 
@@ -1282,12 +1298,21 @@ fn reconcile_schemas() -> Result<(), String> {
             let op = outbox_upsert_edge(head_id, rel, tail_id, &prov);
             push_outbox_if_inactive(&mut tx, &op, fact_key, batch_now);
 
-            // Flip WARUNKOWY active=0 -> 1 + updated_at bump (kursor A_det/D3: nowo-aktywny
-            // fakt musi byc widoczny ponad kursorem przyszlego skanu konfliktow). WHERE
-            // active=0 sprawia, ze drugi rownolegly reconcile (widzacy juz active=1) zmienia
-            // 0 wierszy — symetrycznie do zerowego enqueue powyzej.
+            // Flip WARUNKOWY active=0 -> 1 + MONOTONICZNY activation_seq (kursor A_det/D3).
+            // activation_seq = MAX(activation_seq)+1 podselect W TYM SAMYM UPDATE: poniewaz
+            // reconcile dziala pod BEGIN IMMEDIATE (serializacja per-instancja), kolejne flipy
+            // dostaja scisle rosnace numery, a kursor skanu po activation_seq lapie KAZDA
+            // aktywacje niezaleznie od fact_seq (kolejnosci ingestu) — fakt wstawiony wczesnie
+            // a aktywowany pozno dostaje wysoki seq. updated_at bumpujemy nadal (audyt/diagnoza),
+            // ale NIE jest juz kursorem. WHERE active=0 sprawia, ze drugi rownolegly reconcile
+            // (widzacy juz active=1) zmienia 0 wierszy => nie marnuje numeru seq (lustro zerowego
+            // enqueue powyzej).
             tx.push((
-                "UPDATE fact_state SET active = 1, updated_at = ? WHERE fact_key = ? AND active = 0"
+                "UPDATE fact_state \
+                 SET active = 1, \
+                     activation_seq = (SELECT COALESCE(MAX(activation_seq), 0) + 1 FROM fact_state), \
+                     updated_at = ? \
+                 WHERE fact_key = ? AND active = 0"
                     .to_string(),
                 vec![
                     SqlValue::I64(batch_now),
@@ -1332,6 +1357,476 @@ fn reconcile_schemas() -> Result<(), String> {
 
     // (3) Materializacja krawedzi (i ewentualnych zaleglych wezlow) z trwalej kolejki.
     drain_graph_outbox()
+}
+
+// =============================================================================
+// A_det — asynchroniczna detekcja konfliktow (MemGraphRAG D3, 0 LLM, 0 embeddingow)
+// =============================================================================
+
+/// Domyslny rozmiar partii skanu A_det: ile nowo-aktywnych faktow conflict_scan
+/// pobiera w jednej iteracji. Mala partia => krotka transakcja i szybkie wznawianie
+/// po kursorze przy rownoleglym ingescie.
+const CONFLICT_SCAN_BATCH: usize = 256;
+
+/// Twardy limit iteracji petli skanu (anty-DoS, jak przy reconcile/drain): BATCH*ITER
+/// = gorne ograniczenie pracy na jedno wywolanie. Reszta zaleglosci domknie sie przy
+/// nastepnym uruchomieniu conflict_scan (kursor jest trwaly i monotoniczny).
+const CONFLICT_SCAN_MAX_ITERS: usize = 4096;
+
+/// Czas trwania blokady per-kolekcja (sekundy). Skan ustawia scan_lock_until = now+TTL
+/// na starcie i zwalnia (=0) na koncu. Rownolegly start widzacy lock w przyszlosci
+/// pomija przebieg (jeden skan naraz). TTL zapobiega trwalemu zablokowaniu po crashu
+/// w srodku skanu (lock wygasa sam, nastepny przebieg wznawia od trwalego kursora).
+const CONFLICT_SCAN_LOCK_TTL_SECS: i64 = 600;
+
+/// Twardy cap liczby wspol-faktow (peerow) branych do JEDNEJ grupy konfliktowej w jednym
+/// rozpoznaniu. Popularny head_id+rel (np. encja z setkami sprzecznych tail-i) nie moze
+/// wygenerowac O(n^2) pracy. Po przekroczeniu logujemy warn (zakaz cichego capu) i bierzemy
+/// pierwsze MAX_CONFLICT_PEERS wspol-faktow (deterministycznie ORDER BY fact_key).
+const MAX_CONFLICT_PEERS: usize = 64;
+
+/// Twardy cap LICZBY CZLONKOW (wierszy conflict_members) per grupa konfliktowa. Czlonkostwo
+/// jest znormalizowane i rosnie INSERT OR IGNORE przez wiele skanow, wiec niezaleznie od
+/// MAX_CONFLICT_PEERS (cap pojedynczego rozpoznania) trzeba ograniczyc CALKOWITY rozmiar grupy
+/// — inaczej encja z setkami sprzecznych tail-i akumulowalaby nieograniczona liczbe wierszy.
+/// Po przekroczeniu NIE dopisujemy nowych czlonkow + log::warn (deterministycznie, bez O(n)
+/// blow-up). A_res (D4) adjudykuje grupe head+rel i nie potrzebuje wszystkich faktow —
+/// capowana, reprezentatywna proba wystarcza do decyzji.
+const MAX_CONFLICT_MEMBERS: i64 = 64;
+
+/// Kursor skanu jest per-INSTANCJA, nie per-kolekcja-logiczna: graf 'kg_active' i wszystkie
+/// fakty (fact_state) sa wspoldzielone w obrebie jednej instancji addona (jeden SQLite,
+/// jeden graf), a fakt moze pochodzic z dokumentow wielu kolekcji. Konflikty wykrywamy
+/// wiec na calej instancji. collection_id z payloadu joba odwzorowujemy na ten jeden
+/// wiersz kursora (sentinel), zeby zachowac ksztalt tabeli i blokade per-strumien-skanu.
+const CONFLICT_SCAN_CURSOR_KEY: &str = "__instance__";
+
+/// Typ konfliktu wynikajacy z reguly kardynalnosci relacji (relation_cardinality.kind):
+/// functional -> twardy 'mutual_exclusive', temporal -> miekki 'temporal',
+/// hierarchical -> 'granularity' (kandydat). Relacja bez reguly -> None (NIE konflikt).
+fn conflict_type_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "functional" => Some("mutual_exclusive"),
+        "temporal" => Some("temporal"),
+        "hierarchical" => Some("granularity"),
+        // Relacja spoza relation_cardinality (kind nieznany) NIE tworzy konfliktu:
+        // brak reguly = brak pewnosci, wiec nie zalewamy systemu false-positive.
+        // Similarity-gate (D5/A_res) i tak odsialaby pozorne konflikty; tu zostaje
+        // czysta detekcja symboliczna ograniczona do relacji z jawna kardynalnoscia.
+        _ => None,
+    }
+}
+
+/// Kanoniczny dedup_key GRUPY konfliktowej: (conflict_type, head_id, rel), length-prefixed
+/// (jak schema_id/outbox dedup_key — bezkolizyjny). TOZSAMOSCIA konfliktu jest GRUPA (head,rel),
+/// NIE pelny zbior faktow: A_res (D4) oczekuje jednego konfliktu na grupe. Dlatego dojscie
+/// nowego faktu do grupy z istniejacym open konfliktem DOPISUJE wiersz do conflict_members
+/// (INSERT OR IGNORE), a nie tworzy drugiego open. Partial-unique ux_conflicts_open(dedup_key)
+/// gwarantuje najwyzej JEDEN open per grupa. dedup_key wiaze tez czlonkow (conflict_members)
+/// z grupa — niezalezny od conflicts.id, bo open zamyka sie i otwiera ponownie pod tym samym
+/// dedup_key. conflict_type wchodzi do klucza, bo ta sama (head,rel) nie da dwoch roznych
+/// typow (typ wynika z kardynalnosci rel), ale trzymanie go w kluczu jest jednoznaczne i
+/// odporne na ewentualna zmiane reguly kardynalnosci.
+fn conflict_dedup_key(conflict_type: &str, head_id: &str, rel: &str) -> String {
+    canonical_key(&[conflict_type, head_id, rel])
+}
+
+/// Czy fakt jest za kursorem activation_seq — czysta regula odpowiadajaca predykatowi SQL
+/// `activation_seq > cursor`. W produkcji predykat zyje WPROST w SQL scan_conflicts_locked /
+/// write_scan_cursor; tu jest wylacznie referencyjna, testowalna bez hosta forma tej reguly.
+/// Monotonicznosc activation_seq (nadawany sekwencyjnie przy aktywacji) gwarantuje, ze fakt
+/// aktywowany pozno — choc wstawiony wczesnie (niski fact_seq) — ma WYZSZY seq i nie ucieka
+/// kursorowi (czego sekundowy kursor czasowy nie zapewnial).
+#[cfg(test)]
+fn cursor_advances(cursor: i64, activation_seq: i64) -> bool {
+    activation_seq > cursor
+}
+
+/// Handler tool conflict_scan (A_det). Asynchroniczny skan nowo-aktywnych faktow:
+///  1. Bierze blokade per-instancja (jeden skan naraz; pomija gdy inny trwa).
+///  2. Petla batchowa po fact_state.active=1 ponad kursorem (updated_at, fact_seq).
+///  3. Dla kazdego faktu szuka wspol-faktow (ten sam head_id+rel, rozny tail_id),
+///     klasyfikuje typ wg relation_cardinality i INSERT OR IGNORE do conflicts(open).
+///  4. Advance trwalego kursora do max (updated_at, fact_seq) batcha.
+/// Zwraca licznik wykrytych konfliktow i przeskanowanych faktow (do testow/dashboardu).
+fn handle_conflict_scan(params: &Value) -> Value {
+    let batch = params
+        .get("batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, CONFLICT_SCAN_BATCH))
+        .unwrap_or(CONFLICT_SCAN_BATCH);
+
+    match run_conflict_scan(batch) {
+        Ok(stats) => json!({
+            "ok": true,
+            "scanned": stats.scanned,
+            "conflicts_detected": stats.detected,
+            "cap_hit": stats.cap_hit,
+        }),
+        Err(e) => err(&format!("conflict_scan: {e}")),
+    }
+}
+
+/// Wynik jednego przebiegu skanu A_det (do raportu tool/dashboardu i testow).
+struct ConflictScanStats {
+    scanned: u64,
+    detected: u64,
+    cap_hit: bool,
+}
+
+/// Rdzen A_det. Patrz handle_conflict_scan. Wszystkie odczyty/decyzje WYLACZNIE z SQLite
+/// (R1) — graf nie jest pytany. Blokada, kursor i zapis konfliktow ida przez ledger addona.
+fn run_conflict_scan(batch: usize) -> Result<ConflictScanStats, String> {
+    // (1) Blokada per-instancja: jeden skan naraz. Token wlasciciela UNIKALNY na wywolanie
+    // (new_id: now_unix_ms + monotoniczny licznik atomowy) — pozwala release zwolnic TYLKO
+    // wlasny lock, wiec stary skan po TTL nie wyzeruje locka nowego, ktory tymczasem przejal
+    // blokade. Acquire jest ATOMOWY (warunkowy UPDATE + rows_affected==1), nie read-after.
+    let now = now_unix();
+    let lock_until = now + CONFLICT_SCAN_LOCK_TTL_SECS;
+    let owner = new_id("scan");
+    let acquired = acquire_scan_lock(now, lock_until, &owner)?;
+    if !acquired {
+        log::info("rag: conflict_scan pominiety — inny skan trzyma blokade per-instancja");
+        return Ok(ConflictScanStats {
+            scanned: 0,
+            detected: 0,
+            cap_hit: false,
+        });
+    }
+
+    let result = scan_conflicts_locked(batch);
+
+    // (5) Zwolnij blokade niezaleznie od wyniku (skan moze byc czesciowy — kursor jest
+    // trwaly, wiec nastepny przebieg wznowi od miejsca, do ktorego udalo sie dojsc).
+    // Zwalniamy TYLKO wlasny lock (owner) — gdyby ten skan przekroczyl TTL i inny skan
+    // tymczasem przejal blokade, nie wolno nam jej wyzerowac.
+    if let Err(e) = release_scan_lock(&owner) {
+        log::warn(&format!(
+            "rag: conflict_scan nie zwolnil blokady (wygasnie po TTL): {e}"
+        ));
+    }
+
+    result
+}
+
+/// Atomowo bierze blokade skanu. Zwraca true gdy przyznana, false gdy inny skan ja trzyma.
+///
+/// ATOMOWOSC bez read-after-update (blocker 2): seed wiersza (idempotentny) + JEDEN warunkowy
+/// UPDATE ustawiajacy lock_until ORAZ scan_lock_owner WHERE lock wygasl (scan_lock_until IS
+/// NULL OR < :now). O przyznaniu swiadczy rows_affected==1 tego UPDATE — dwa skany w TEJ SAMEJ
+/// sekundzie nie moga oba zmienic wiersza (UPDATE jest serializowany, drugi widzi juz swiezy
+/// lock_until >= now i zmienia 0 wierszy). Dawny wariant czytal lock_until po update i porownywal
+/// — dwa skany z tym samym lock_until oba "potwierdzaly" sukces (oba widzialy te sama wartosc).
+fn acquire_scan_lock(now: i64, lock_until: i64, owner: &str) -> Result<bool, String> {
+    // Seed wiersza w osobnym exec: INSERT OR IGNORE nie zaklamuje rows_affected warunkowego
+    // UPDATE (gdyby byly w jednej tx, sql_transaction sumowalby zmienione wiersze).
+    sql_exec(
+        "INSERT OR IGNORE INTO conflict_scan_cursor (collection_id) VALUES (?)",
+        &[SqlValue::String(CONFLICT_SCAN_CURSOR_KEY.to_string())],
+    )
+    .map_err(|e| format!("seed kursora skanu: {e}"))?;
+
+    let res = sql_exec(
+        "UPDATE conflict_scan_cursor \
+         SET scan_lock_until = ?, scan_lock_owner = ? \
+         WHERE collection_id = ? \
+           AND (scan_lock_until IS NULL OR scan_lock_until < ?)",
+        &[
+            SqlValue::I64(lock_until),
+            SqlValue::String(owner.to_string()),
+            SqlValue::String(CONFLICT_SCAN_CURSOR_KEY.to_string()),
+            SqlValue::I64(now),
+        ],
+    )
+    .map_err(|e| format!("blokada skanu: {e}"))?;
+
+    Ok(res.rows_affected == 1)
+}
+
+/// Zwalnia blokade skanu (lock_until=0), zostawiajac kursor (last_activation_seq) nietkniety.
+/// WHERE scan_lock_owner=? — zwalniamy WYLACZNIE wlasny lock, nigdy cudzy (chroni przed
+/// wyzerowaniem locka nowego skanu przez stary, ktory przekroczyl TTL).
+fn release_scan_lock(owner: &str) -> Result<(), String> {
+    sql_exec(
+        "UPDATE conflict_scan_cursor SET scan_lock_until = 0, scan_lock_owner = NULL \
+         WHERE collection_id = ? AND scan_lock_owner = ?",
+        &[
+            SqlValue::String(CONFLICT_SCAN_CURSOR_KEY.to_string()),
+            SqlValue::String(owner.to_string()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("zwolnienie blokady skanu: {e}"))
+}
+
+/// Petla skanu pod trzymana blokada. Patrz run_conflict_scan.
+fn scan_conflicts_locked(batch: usize) -> Result<ConflictScanStats, String> {
+    let mut cursor = read_scan_cursor()?;
+    let mut scanned: u64 = 0;
+    let mut detected: u64 = 0;
+    let mut cap_hit = true;
+
+    for _ in 0..CONFLICT_SCAN_MAX_ITERS {
+        // Batch nowo-aktywnych faktow ponad kursorem activation_seq. active=1: skanujemy
+        // tylko fakty wpuszczone do aktywnego widoku (po denoisingu). ORDER BY activation_seq
+        // => deterministyczna kolejnosc i kursor = max(activation_seq) batcha. activation_seq
+        // jest nadawany przy AKTYWACJI (reconcile), wiec lapie fakty aktywowane pozno, mimo
+        // niskiego fact_seq (kolejnosc ingestu) — sedno blockera 1.
+        let rows = sql_query(
+            "SELECT activation_seq, fact_key, schema_id, head_id, rel, tail_id \
+             FROM fact_state \
+             WHERE active = 1 AND activation_seq > ? \
+             ORDER BY activation_seq LIMIT ?",
+            &[SqlValue::I64(cursor), SqlValue::I64(batch as i64)],
+        )
+        .map_err(|e| format!("odczyt nowo-aktywnych faktow: {e}"))?;
+
+        if rows.is_empty() {
+            cap_hit = false;
+            break;
+        }
+
+        for row in &rows {
+            let activation_seq = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let fact_key = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            let schema_id = row.get(2).and_then(|v| v.as_str()).unwrap_or_default();
+            let head_id = row.get(3).and_then(|v| v.as_str()).unwrap_or_default();
+            let rel = row.get(4).and_then(|v| v.as_str()).unwrap_or_default();
+            let tail_id = row.get(5).and_then(|v| v.as_str()).unwrap_or_default();
+
+            // Advance kursora ZAWSZE (nawet gdy fakt nie ma konfliktu), inaczej skan
+            // utknalby na tym samym wierszu. Kursor = max activation_seq batcha.
+            cursor = activation_seq;
+            scanned += 1;
+
+            if fact_key.is_empty() || head_id.is_empty() || rel.is_empty() {
+                continue;
+            }
+
+            // Typ konfliktu z reguly kardynalnosci relacji. Relacja bez reguly -> brak
+            // konfliktu (conflict_type_for_kind zwraca None) -> nie pytamy nawet o
+            // wspol-fakty (oszczednosc + zero false-positive).
+            let kind = relation_kind(rel)?;
+            let Some(conflict_type) = kind.as_deref().and_then(conflict_type_for_kind) else {
+                continue;
+            };
+
+            // Wspol-fakty SYMBOLICZNIE: aktywne fakty o TYM SAMYM head_id i rel, ale ROZNYM
+            // tail_id. Indeks ix_fact_state_peer(active,head_id,rel,tail_id) zaweza do grupy.
+            // TWARDY cap (LIMIT MAX_CONFLICT_PEERS+1): wykryty nadmiar (zwrocono >cap) loguje
+            // warn i bierze pierwsze MAX_CONFLICT_PEERS (ORDER BY fact_key deterministyczne) —
+            // popularny head_id+rel nie robi O(n^2). Calkowity rozmiar grupy ogranicza dodatkowo
+            // MAX_CONFLICT_MEMBERS przy dopisywaniu czlonkow (upsert_group_conflict).
+            let peers = sql_query(
+                "SELECT fact_key FROM fact_state \
+                 WHERE active = 1 AND head_id = ? AND rel = ? AND tail_id <> ? \
+                 ORDER BY fact_key LIMIT ?",
+                &[
+                    SqlValue::String(head_id.to_string()),
+                    SqlValue::String(rel.to_string()),
+                    SqlValue::String(tail_id.to_string()),
+                    SqlValue::I64(MAX_CONFLICT_PEERS as i64 + 1),
+                ],
+            )
+            .map_err(|e| format!("odczyt wspol-faktow: {e}"))?;
+
+            if peers.is_empty() {
+                continue;
+            }
+
+            let peers_capped = peers.len() > MAX_CONFLICT_PEERS;
+            if peers_capped {
+                log::warn(&format!(
+                    "rag: conflict_scan cap MAX_CONFLICT_PEERS={MAX_CONFLICT_PEERS} \
+                     trafiony dla head_id={head_id} rel={rel}; biore pierwsze {MAX_CONFLICT_PEERS} \
+                     wspol-faktow (A_res zdecyduje na probie)"
+                ));
+            }
+
+            // Zbior konfliktowy = biezacy fakt + wspol-fakty (rozny tail), do capu.
+            let mut fact_keys: Vec<String> = Vec::with_capacity(MAX_CONFLICT_PEERS + 1);
+            fact_keys.push(fact_key.to_string());
+            for p in peers.iter().take(MAX_CONFLICT_PEERS) {
+                if let Some(k) = p.first().and_then(|v| v.as_str()) {
+                    fact_keys.push(k.to_string());
+                }
+            }
+
+            // TOZSAMOSC = GRUPA (conflict_type, head_id, rel), NIE pelny zbior faktow.
+            // Upsert po grupie: zapewnia JEDEN open konflikt grupy (conflicts) i dopisuje
+            // czlonkow (conflict_members) atomowym INSERT OR IGNORE — rosnacy zbior nie
+            // tworzy drugiego open ani nie robi read-modify-write union (blocker 2).
+            let dedup_key = conflict_dedup_key(conflict_type, head_id, rel);
+            if upsert_group_conflict(
+                conflict_type,
+                schema_id,
+                head_id,
+                rel,
+                &dedup_key,
+                &fact_keys,
+            )? {
+                detected += 1;
+            }
+        }
+
+        // Trwaly advance kursora po KAZDYM batchu (wznawialnosc przy crashu/cap).
+        write_scan_cursor(cursor)?;
+
+        if rows.len() < batch {
+            cap_hit = false;
+            break;
+        }
+    }
+
+    if cap_hit {
+        // Cichy cap zabroniony (CLAUDE.md): petla wyczerpala CONFLICT_SCAN_MAX_ITERS z
+        // pelnymi batchami — reszta nowo-aktywnych faktow zostanie przeskanowana przy
+        // nastepnym uruchomieniu (kursor trwaly), ale ucięcie musi byc widoczne w logu.
+        log::warn(&format!(
+            "rag: conflict_scan osiagnal cap CONFLICT_SCAN_MAX_ITERS={CONFLICT_SCAN_MAX_ITERS} \
+             (batch={batch}); przeskanowano {scanned}, wykryto {detected} \
+             — reszte domknie nastepny skan (kursor trwaly)"
+        ));
+    }
+
+    Ok(ConflictScanStats {
+        scanned,
+        detected,
+        cap_hit,
+    })
+}
+
+/// Czyta last_activation_seq kursora skanu. Brak wiersza -> 0 (skan od poczatku) —
+/// acquire_scan_lock seeduje wiersz, wiec normalnie istnieje.
+fn read_scan_cursor() -> Result<i64, String> {
+    let row = sql_query_one(
+        "SELECT last_activation_seq FROM conflict_scan_cursor WHERE collection_id = ?",
+        &[SqlValue::String(CONFLICT_SCAN_CURSOR_KEY.to_string())],
+    )
+    .map_err(|e| format!("odczyt kursora skanu: {e}"))?;
+    Ok(row
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0))
+}
+
+/// Trwaly advance kursora skanu do activation_seq. Monotoniczny: zapisujemy WYLACZNIE gdy
+/// nowy seq jest scisle za dotychczasowym (zabezpieczenie przed cofnieciem przy rownoleglych
+/// przebiegach — choc blokada juz to wyklucza, predykat jest tani).
+fn write_scan_cursor(activation_seq: i64) -> Result<(), String> {
+    sql_exec(
+        "UPDATE conflict_scan_cursor SET last_activation_seq = ? \
+         WHERE collection_id = ? AND ? > last_activation_seq",
+        &[
+            SqlValue::I64(activation_seq),
+            SqlValue::String(CONFLICT_SCAN_CURSOR_KEY.to_string()),
+            SqlValue::I64(activation_seq),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("zapis kursora skanu: {e}"))
+}
+
+/// Upsert konfliktu PO GRUPIE (dedup_key = conflict_type+head_id+rel) ze ZNORMALIZOWANYM
+/// czlonkostwem (conflict_members). Zwraca true gdy powstal NOWY otwarty konflikt (do licznika
+/// detected), false gdy tylko dopisano czlonkow do istniejacego open. Logika:
+///  1. INSERT OR IGNORE do conflicts(...,'open') — partial-unique ux_conflicts_open(dedup_key)
+///     gwarantuje DOKLADNIE jeden open per grupa. rows_affected==1 => NOWY konflikt.
+///  2. Dla kazdego faktu w konflikcie: INSERT OR IGNORE do conflict_members(dedup_key,fact_key).
+///     ATOMOWE i IDEMPOTENTNE (PRIMARY KEY) — bez read-modify-write union, wiec znika wyscig,
+///     w ktorym dwa rownolegle skany nadpisywaly sobie wiekszy zbior (blocker 2).
+///  3. Cap czlonkow: przed dopisaniem sprawdzamy COUNT(*) grupy; po MAX_CONFLICT_MEMBERS NIE
+///     dodajemy nowych + log::warn (deterministycznie, bez O(n) blow-up). A_res adjudykuje
+///     grupe head+rel na reprezentatywnej probie — nie potrzebuje wszystkich faktow.
+///
+/// Idempotencja: ponowny skan tej samej grupy z tymi samymi faktami => INSERT OR IGNORE bez
+/// zmian (zero nowych wierszy). Spojne z oczekiwaniem A_res (D4): jeden open per grupa,
+/// czlonkowie odczytywani po dedup_key.
+fn upsert_group_conflict(
+    conflict_type: &str,
+    schema_id: &str,
+    head_id: &str,
+    rel: &str,
+    dedup_key: &str,
+    fact_keys: &[String],
+) -> Result<bool, String> {
+    let now = now_unix();
+    // (1) Tozsamosc grupy. INSERT OR IGNORE + partial-unique => max 1 open per dedup_key.
+    let ins = sql_exec(
+        "INSERT OR IGNORE INTO conflicts \
+           (conflict_type, schema_id, head_id, rel, dedup_key, status, created_at) \
+         VALUES (?, ?, ?, ?, ?, 'open', ?)",
+        &[
+            SqlValue::String(conflict_type.to_string()),
+            SqlValue::String(schema_id.to_string()),
+            SqlValue::String(head_id.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(dedup_key.to_string()),
+            SqlValue::I64(now),
+        ],
+    )
+    .map_err(|e| format!("zapis konfliktu grupy: {e}"))?;
+    let is_new = ins.rows_affected == 1;
+
+    // (3) Cap czlonkow grupy: jednorazowy COUNT przed dopisywaniem. Powyzej capu nie dodajemy.
+    let member_count = sql_query_one(
+        "SELECT COUNT(*) FROM conflict_members WHERE conflict_dedup_key = ?",
+        &[SqlValue::String(dedup_key.to_string())],
+    )
+    .map_err(|e| format!("odczyt liczby czlonkow konfliktu: {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_i64()))
+    .unwrap_or(0);
+
+    if member_count >= MAX_CONFLICT_MEMBERS {
+        log::warn(&format!(
+            "rag: conflict_members cap MAX_CONFLICT_MEMBERS={MAX_CONFLICT_MEMBERS} \
+             osiagniety dla dedup_key={dedup_key} (head_id={head_id} rel={rel}); \
+             nie dodaje nowych czlonkow (A_res zdecyduje na probie)"
+        ));
+        return Ok(is_new);
+    }
+
+    // (2) Czlonkostwo: atomowy, idempotentny INSERT OR IGNORE per fakt. Cap egzekwowany
+    // narastajaco (member_count + dotychczas dopisani w tym wywolaniu) — nie przekraczamy
+    // MAX_CONFLICT_MEMBERS nawet gdy biezacy zbior faktow jest wiekszy niz wolne miejsce.
+    let mut room = MAX_CONFLICT_MEMBERS - member_count;
+    for fk in fact_keys {
+        if room <= 0 {
+            log::warn(&format!(
+                "rag: conflict_members cap MAX_CONFLICT_MEMBERS={MAX_CONFLICT_MEMBERS} \
+                 wyczerpany w trakcie dopisywania dla dedup_key={dedup_key}; \
+                 pomijam pozostale fakty biezacego zbioru"
+            ));
+            break;
+        }
+        let res = sql_exec(
+            "INSERT OR IGNORE INTO conflict_members (conflict_dedup_key, fact_key, added_at) \
+             VALUES (?, ?, ?)",
+            &[
+                SqlValue::String(dedup_key.to_string()),
+                SqlValue::String(fk.to_string()),
+                SqlValue::I64(now),
+            ],
+        )
+        .map_err(|e| format!("dopisanie czlonka konfliktu: {e}"))?;
+        // Tylko realnie wstawiony wiersz (rows_affected==1) zmniejsza wolne miejsce —
+        // ponowny czlonek (IGNORE) nie liczy sie do capu (idempotencja).
+        if res.rows_affected == 1 {
+            room -= 1;
+        }
+    }
+
+    Ok(is_new)
+}
+
+/// Reguła kardynalnosci relacji z tabeli konfiguracyjnej relation_cardinality. None =
+/// relacja spoza tabeli (A_det jej nie klasyfikuje -> brak konfliktu).
+fn relation_kind(rel: &str) -> Result<Option<String>, String> {
+    let row = sql_query_one(
+        "SELECT kind FROM relation_cardinality WHERE relation = ?",
+        &[SqlValue::String(rel.to_string())],
+    )
+    .map_err(|e| format!("odczyt kardynalnosci relacji: {e}"))?;
+    Ok(row.and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string)))
 }
 
 /// Czy wynik ekstrakcji chunku ma oznaczyc graf jako czesciowy. KAZDY blad
@@ -3274,5 +3769,289 @@ mod tests {
         ];
         let kept = dedupe_keep_min_id(&rows);
         assert_eq!(kept, vec![1, 2, 3], "bez duplikatow nic nie znika");
+    }
+
+    // --- A_det (MemGraphRAG D3): klasyfikacja, dedup, kursor (czyste funkcje) ---
+
+    #[test]
+    fn conflict_type_maps_each_cardinality_kind() {
+        // functional -> twardy mutual_exclusive; temporal -> miekki temporal;
+        // hierarchical -> granularity-kandydat. To rdzen klasyfikacji A_det.
+        assert_eq!(conflict_type_for_kind("functional"), Some("mutual_exclusive"));
+        assert_eq!(conflict_type_for_kind("temporal"), Some("temporal"));
+        assert_eq!(conflict_type_for_kind("hierarchical"), Some("granularity"));
+    }
+
+    #[test]
+    fn conflict_type_unknown_relation_yields_no_conflict() {
+        // Relacja spoza relation_cardinality (kind nieznany/pusty) NIE tworzy konfliktu:
+        // brak reguly = brak pewnosci, wiec zero false-positive (decyzja D3).
+        assert_eq!(conflict_type_for_kind("likes"), None);
+        assert_eq!(conflict_type_for_kind(""), None);
+        assert_eq!(conflict_type_for_kind("unknown_kind"), None);
+    }
+
+    #[test]
+    fn conflict_dedup_key_identifies_group_not_fact_set() {
+        // TOZSAMOSC = GRUPA (conflict_type, head_id, rel). Ten sam (head,rel,typ) daje TEN SAM
+        // dedup_key NIEZALEZNIE od zbioru faktow — dlatego rosnacy zbior aktualizuje JEDEN open,
+        // nie tworzy drugiego. Partial-unique ux_conflicts_open(dedup_key) => max 1 open per grupa.
+        let two = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        let three = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        assert_eq!(two, three, "ta sama grupa => ten sam dedup_key niezaleznie od liczby faktow");
+    }
+
+    #[test]
+    fn conflict_dedup_key_distinguishes_group_dimensions() {
+        // Rozny typ / head_id / rel -> rozny dedup_key (rozne grupy konfliktowe).
+        let base = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        assert_ne!(base, conflict_dedup_key("temporal", "Alice", "born_in"), "typ rozroznia grupe");
+        assert_ne!(base, conflict_dedup_key("mutual_exclusive", "Bob", "born_in"), "head rozroznia");
+        assert_ne!(base, conflict_dedup_key("mutual_exclusive", "Alice", "died_in"), "rel rozroznia");
+    }
+
+    #[test]
+    fn cursor_advances_on_activation_seq() {
+        // Kursor = activation_seq (monotoniczny, nadawany przy AKTYWACJI). Fakt jest "za"
+        // kursorem gdy ma scisle wiekszy activation_seq. To lapie fakt aktywowany pozno mimo
+        // niskiego fact_seq: dostaje WYSOKI activation_seq, wiec nie ucieka kursorowi.
+        assert!(cursor_advances(5, 6), "wiekszy seq -> dalej");
+        assert!(!cursor_advances(5, 5), "ten sam seq -> juz przeskanowany");
+        assert!(!cursor_advances(5, 4), "mniejszy seq -> juz przeskanowany");
+        // Fakt o niskim fact_seq (ingest wczesny), aktywowany pozno => wysoki activation_seq.
+        // Kursor na 5 (fakty aktywowane wczesniej) NIE pomija seq=100 (pozna aktywacja).
+        assert!(cursor_advances(5, 100), "pozna aktywacja (wysoki seq) zlapana");
+    }
+
+    // Model monotonicznosci activation_seq: lustro flipu reconcile
+    // (activation_seq = MAX(activation_seq)+1 przy active 0->1) + kursora skanu po seq.
+    // Sprawdza inwariant blockera 1: KAZDA aktywacja dostaje rosnacy seq i kursor jej nie gubi,
+    // niezaleznie od kolejnosci INGESTU (fact_seq).
+    #[derive(Default)]
+    struct ActivationModel {
+        // fact_key -> (fact_seq ingestu, Option<activation_seq>). None = nieaktywny.
+        facts: std::collections::BTreeMap<String, (i64, Option<i64>)>,
+        next_activation_seq: i64,
+    }
+    impl ActivationModel {
+        // Ingest faktu w kolejnosci ingestu (rosnacy fact_seq), nieaktywny (activation_seq=None).
+        fn ingest(&mut self, fact_key: &str, fact_seq: i64) {
+            self.facts.entry(fact_key.to_string()).or_insert((fact_seq, None));
+        }
+        // Aktywacja (active 0->1): przydziel MONOTONICZNY activation_seq = MAX+1.
+        fn activate(&mut self, fact_key: &str) {
+            if let Some(e) = self.facts.get_mut(fact_key) {
+                if e.1.is_none() {
+                    self.next_activation_seq += 1;
+                    e.1 = Some(self.next_activation_seq);
+                }
+            }
+        }
+        // Skan od kursora: zwraca fact_keys aktywowane z activation_seq>cursor (rosnaco),
+        // i nowy kursor = max activation_seq zwroconych. Lustro scan_conflicts_locked.
+        fn scan_from(&self, cursor: i64) -> (Vec<String>, i64) {
+            let mut hits: Vec<(i64, String)> = self
+                .facts
+                .iter()
+                .filter_map(|(k, (_, a))| a.filter(|s| *s > cursor).map(|s| (s, k.clone())))
+                .collect();
+            hits.sort_unstable();
+            let new_cursor = hits.last().map(|(s, _)| *s).unwrap_or(cursor);
+            (hits.into_iter().map(|(_, k)| k).collect(), new_cursor)
+        }
+    }
+
+    #[test]
+    fn late_activation_with_low_fact_seq_is_caught_by_cursor() {
+        // SEDNO blockera 1: fA wstawiony WCZESNIE (fact_seq=1), aktywowany PO fB/fC.
+        let mut m = ActivationModel::default();
+        m.ingest("fA", 1);
+        m.ingest("fB", 2);
+        m.ingest("fC", 3);
+        // Aktywujemy w kolejnosci B, C (fA jeszcze nie) -> activation_seq 1,2.
+        m.activate("fB");
+        m.activate("fC");
+        let (first, cursor) = m.scan_from(0);
+        assert_eq!(first, vec!["fB".to_string(), "fC".into()], "pierwszy skan: B,C");
+        assert_eq!(cursor, 2);
+        // Teraz aktywujemy fA (niski fact_seq=1, ale activation_seq=3 bo aktywowany NAJPOZNIEJ).
+        m.activate("fA");
+        let (second, cursor2) = m.scan_from(cursor);
+        assert_eq!(second, vec!["fA".to_string()], "pozna aktywacja fA ZLAPANA mimo fact_seq=1");
+        assert_eq!(cursor2, 3);
+        // Kolejny skan: brak nowych aktywacji.
+        let (third, cursor3) = m.scan_from(cursor2);
+        assert!(third.is_empty(), "brak nowych aktywacji");
+        assert_eq!(cursor3, 3, "kursor stabilny");
+    }
+
+    #[test]
+    fn activation_seq_strictly_monotonic_regardless_of_ingest_order() {
+        // activation_seq rosnie scisle w kolejnosci AKTYWACJI, nie ingestu.
+        let mut m = ActivationModel::default();
+        m.ingest("fX", 10);
+        m.ingest("fY", 1); // nizszy fact_seq, ale aktywowany pierwszy
+        m.activate("fY");
+        m.activate("fX");
+        assert_eq!(m.facts["fY"].1, Some(1), "fY aktywowany pierwszy -> seq 1");
+        assert_eq!(m.facts["fX"].1, Some(2), "fX aktywowany drugi -> seq 2 (mimo fact_seq=10)");
+        // Ponowna aktywacja fY (active juz 1) NIE marnuje numeru (warunek active=0).
+        m.activate("fY");
+        assert_eq!(m.next_activation_seq, 2, "powtorna aktywacja nie zwieksza licznika");
+    }
+
+    // Model blokady skanu: lustro acquire (rows_affected==1) + release (WHERE owner).
+    struct LockModel {
+        lock_until: i64,
+        owner: Option<String>,
+    }
+    impl LockModel {
+        fn new() -> Self {
+            LockModel { lock_until: 0, owner: None }
+        }
+        // Atomowy warunkowy UPDATE: przejmuje lock TYLKO gdy wygasl (lock_until<now).
+        // Zwraca rows_affected (1=przyznano, 0=zajete) — lustro acquire_scan_lock.
+        fn acquire(&mut self, now: i64, lock_until: i64, owner: &str) -> u64 {
+            if self.lock_until < now {
+                self.lock_until = lock_until;
+                self.owner = Some(owner.to_string());
+                1
+            } else {
+                0
+            }
+        }
+        // Release zwalnia TYLKO wlasny lock (WHERE owner=?). Lustro release_scan_lock.
+        fn release(&mut self, owner: &str) {
+            if self.owner.as_deref() == Some(owner) {
+                self.lock_until = 0;
+                self.owner = None;
+            }
+        }
+    }
+
+    #[test]
+    fn lock_grants_exactly_one_in_same_second() {
+        // Blocker 2: dwa skany w TEJ SAMEJ sekundzie (ten sam now, ten sam lock_until)
+        // — dokladnie JEDEN dostaje blokade (rows_affected==1), drugi 0.
+        let mut lock = LockModel::new();
+        let now = 1000;
+        let lock_until = now + 600;
+        assert_eq!(lock.acquire(now, lock_until, "scan_A"), 1, "pierwszy bierze lock");
+        assert_eq!(lock.acquire(now, lock_until, "scan_B"), 0, "drugi w tej samej sek odrzucony");
+    }
+
+    #[test]
+    fn release_only_frees_own_lock() {
+        // Blocker 2: stary skan (po TTL) nie wyzeruje locka nowego, ktory tymczasem przejal.
+        let mut lock = LockModel::new();
+        // scan_A bierze lock na [1000, 1600).
+        assert_eq!(lock.acquire(1000, 1600, "scan_A"), 1);
+        // scan_A przekracza TTL; scan_B po wygasnieciu (now=1601) przejmuje lock.
+        assert_eq!(lock.acquire(1601, 2201, "scan_B"), 1, "B przejmuje po TTL");
+        // scan_A probuje zwolnic SWOJ lock — ale wlascicielem jest juz scan_B => no-op.
+        lock.release("scan_A");
+        assert_eq!(lock.owner.as_deref(), Some("scan_B"), "lock scan_B nietkniety");
+        assert_eq!(lock.lock_until, 2201, "TTL scan_B zachowany");
+        // scan_B zwalnia wlasny lock poprawnie.
+        lock.release("scan_B");
+        assert!(lock.owner.is_none(), "scan_B zwolnil wlasny lock");
+        assert_eq!(lock.lock_until, 0);
+    }
+
+    #[test]
+    fn lock_owner_token_is_unique_per_call() {
+        // Token wlasciciela (new_id) musi byc unikalny na wywolanie, inaczej release
+        // moglby zwolnic cudzy lock. new_id laczy now_unix_ms z monotonicznym licznikiem.
+        let a = new_id("scan");
+        let b = new_id("scan");
+        assert_ne!(a, b, "kolejne tokeny wlasciciela sa rozne");
+        assert!(a.starts_with("scan_") && b.starts_with("scan_"));
+    }
+
+    // Model tozsamosci grupowej + ZNORMALIZOWANEGO czlonkostwa: lustro upsert_group_conflict.
+    // conflicts: jeden open per dedup_key (BTreeSet open). conflict_members: BTreeSet wierszy
+    // (dedup_key, fact_key) — INSERT OR IGNORE = wstaw do zbioru (idempotentne, atomowe,
+    // bez read-modify-write union). Cap czlonkow per grupa egzekwowany jak w kodzie.
+    #[derive(Default)]
+    struct ConflictGroupModel {
+        // dedup_key -> {fact_key}. Tylko jeden 'open' per dedup_key (partial-unique).
+        members: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        open_keys: std::collections::BTreeSet<String>,
+        inserts: u32,
+        capped: u32,
+    }
+    impl ConflictGroupModel {
+        // Lustro upsert_group_conflict: zwraca true gdy NOWY open (detected++).
+        // Czlonkowie dopisywani INSERT OR IGNORE z capem MAX_CONFLICT_MEMBERS.
+        fn upsert(&mut self, dedup_key: &str, fact_keys: &[String]) -> bool {
+            let is_new = self.open_keys.insert(dedup_key.to_string());
+            if is_new {
+                self.inserts += 1;
+            }
+            let set = self.members.entry(dedup_key.to_string()).or_default();
+            let mut room = MAX_CONFLICT_MEMBERS - set.len() as i64;
+            for fk in fact_keys {
+                if room <= 0 {
+                    self.capped += 1;
+                    break;
+                }
+                // INSERT OR IGNORE: nowy czlonek zmniejsza wolne miejsce; powtorny nie liczy sie.
+                if set.insert(fk.clone()) {
+                    room -= 1;
+                }
+            }
+            is_new
+        }
+        fn member_count(&self, dedup_key: &str) -> usize {
+            self.members.get(dedup_key).map(|s| s.len()).unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn group_conflict_growing_set_appends_members_single_open() {
+        // Ważne 4: open[A,B] + nowy fakt C -> DOPISANIE czlonka C do tej samej grupy,
+        // NIE drugi open. Jeden konflikt per grupa (head,rel) — wymaganie D4 (A_res).
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        assert!(m.upsert(&dk, &["fA".into(), "fB".into()]), "pierwszy zbior -> NOWY open");
+        assert!(!m.upsert(&dk, &["fA".into(), "fB".into(), "fC".into()]), "rosnacy zbior -> dopisanie");
+        assert_eq!(m.inserts, 1, "DOKLADNIE jeden open dla grupy");
+        assert_eq!(
+            m.members[&dk],
+            ["fA", "fB", "fC"].iter().map(|s| s.to_string()).collect(),
+            "czlonkowie = union [A,B,C]"
+        );
+    }
+
+    #[test]
+    fn group_conflict_member_insert_is_idempotent() {
+        // Blocker 2: ponowny skan tej samej grupy z tym samym zbiorem -> brak nowej detekcji
+        // i ZERO nowych czlonkow (INSERT OR IGNORE jest idempotentny, bez read-modify-write).
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("temporal", "Acme", "ceo_of");
+        assert!(m.upsert(&dk, &["f1".into(), "f2".into()]));
+        assert!(!m.upsert(&dk, &["f1".into(), "f2".into()]), "ten sam zbior -> brak detekcji");
+        assert!(!m.upsert(&dk, &["f2".into(), "f1".into()]), "kolejnosc bez znaczenia");
+        assert_eq!(m.inserts, 1);
+        assert_eq!(m.member_count(&dk), 2, "zero zdublowanych czlonkow (idempotencja)");
+    }
+
+    #[test]
+    fn group_conflict_member_cap_is_enforced() {
+        // Wazne 4: liczba czlonkow per grupa nie przekracza MAX_CONFLICT_MEMBERS niezaleznie
+        // od liczby skanow. Po wypelnieniu capu nowe fakty sa pomijane (deterministycznie).
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Hub", "born_in");
+        // Wstaw wiecej unikalnych faktow niz cap, w kilku skanach.
+        for batch in 0..4 {
+            let facts: Vec<String> = (0..40).map(|i| format!("f{}", batch * 40 + i)).collect();
+            m.upsert(&dk, &facts);
+        }
+        assert_eq!(
+            m.member_count(&dk),
+            MAX_CONFLICT_MEMBERS as usize,
+            "liczba czlonkow ograniczona twardym capem"
+        );
+        assert!(m.capped > 0, "cap zostal trafiony i odnotowany (log::warn w kodzie)");
     }
 }

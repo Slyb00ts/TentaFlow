@@ -5892,8 +5892,25 @@ pub fn scheduler_job_upsert(
         }
     };
     let user_id = user_id_to_uuid(&require_user_id(ctx)?);
-    let input: crate::scheduler::UpsertJobRequest = serde_json::from_str(&payload.job_json)
+    let mut input: crate::scheduler::UpsertJobRequest = serde_json::from_str(&payload.job_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid scheduler job json: {}", e)))?;
+    // Stempel org_id z kontekstu uwierzytelnionego admina (blocker 1, R4): KAZDY job
+    // tworzony przez dashboard dostaje org tworcy, a nie None. Dashboard nie wysyla org_id
+    // (admin UI go nie zna), wiec bez tego stempla conflict_scan RAG biegnie z org_id=None
+    // i omija asercje izolacji w execute_job — call_tool wykonalby sie na dzialajacej
+    // (mozliwie cudzej/boot/default) instancji. org_context jest snapshotem org sesji,
+    // wymagany dla tej sciezki (handler #[policy(Admin)] => zawsze ma sesje uzytkownika).
+    let org_id = ctx
+        .org_context
+        .as_ref()
+        .map(|o| o.org_id.clone())
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::AuthRequired,
+                "scheduler job upsert requires an org context",
+            )
+        })?;
+    input.org_id = Some(org_id);
     let job = crate::scheduler::upsert_job(&ctx.state.db, input, &user_id).map_err(db_err)?;
     let job_json = serde_json::to_string(&job)
         .map_err(|e| ProtocolError::internal(format!("scheduler job encode failed: {}", e)))?;
