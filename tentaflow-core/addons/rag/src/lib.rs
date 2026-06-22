@@ -43,8 +43,10 @@ const CHUNK_OVERLAP_CHARS: usize = 200;
 
 // --- Ekstrakcja encji/relacji do grafu wiedzy (GraphRAG, Etap 2 / slice E3.0) ---
 
-/// Nazwa kolekcji grafowej (zgodna z [[graph_collection]] w manifescie).
-const KG_COLLECTION: &str = "kg";
+/// Nazwa kolekcji grafowej aktywnego widoku (zgodna z [[graph_collection]] w
+/// manifescie). 'kg_active' zawiera TYLKO aktywne fakty (w D1 = wszystkie); jest
+/// odtwarzalna materializacja outboxu, a zrodlem prawdy jest SQLite addona (R1/R2).
+const KG_COLLECTION: &str = "kg_active";
 
 /// Wersja ekstraktora — wpisywana w provenance kazdego wezla/krawedzi, by mozna
 /// bylo pozniej (re)ekstrahowac i odroznic generacje faktow.
@@ -534,6 +536,16 @@ fn run_ingest_pipeline(
     let mut doc_triples = 0usize;
     let mut graph_partial = false;
 
+    // Re-drain zaleglosci outboxu sprzed ewentualnego crashu poprzedniego ingestu
+    // (R3): TRWALE intencje applied=0 musza domknac sie zanim dolozymy nowe. Best-effort
+    // — nieudany re-drain nie wywala ingestu wektorowego, tylko znaczy graf jako czesciowy.
+    if let Err(e) = drain_graph_outbox() {
+        graph_partial = true;
+        log::warn(&format!(
+            "rag: re-drain outboxu na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
+        ));
+    }
+
     for (index, chunk_text) in chunks.iter().enumerate() {
         let step = ingest_one_chunk(collection_id, document_id, index, chunk_text, now, &mut upserted);
         if let Err(msg) = step {
@@ -744,20 +756,27 @@ fn count_other_edge_refs(src: &str, rel: &str, dst: &str, exclude_document_id: &
     .unwrap_or(1)
 }
 
-/// Kasuje artefakty grafu dokumentu (kolekcja 'kg') po rejestrze graph_artifacts z
-/// REFCOUNTEM i czysci wlasne wiersze rejestru. Idempotentny — wolany przy
+/// Kasuje artefakty grafu dokumentu (kolekcja 'kg_active') po rejestrze graph_artifacts
+/// z REFCOUNTEM i czysci wlasne wiersze rejestru. Idempotentny — wolany przy
 /// re-ingescie i cleanup-on-failure.
 ///
 /// Wezly/krawedzie maja id = znormalizowana nazwa, wiec sa WSPOLDZIELONE miedzy
 /// dokumentami. Kasujemy je z grafu TYLKO gdy zaden inny dokument ich juz nie
 /// referuje (refcount po rejestrze == 0). Inaczej zostawiamy je w grafie, bo nalezą
 /// tez do innego dokumentu (multi-doc GraphRAG). Refcount liczymy PRZED usunieciem
-/// wlasnych wierszy (z warunkiem document_id != self), a usuniecie rejestru robimy
-/// na koncu.
+/// wlasnych wierszy (z warunkiem document_id != self).
 ///
-/// Best-effort: pojedyncze bledy host graph API sa logowane, nie przerywaja reszty
-/// (graf nie moze blokowac cleanupu wektorow).
+/// R1: graf jest mutowany WYLACZNIE przez outbox. Cleanup NIE wola graph_delete_*
+/// wprost — enqueue'uje intencje delete_node/delete_edge do graph_outbox (applied=0)
+/// w TEJ SAMEJ transakcji SQLite co usuniecie wierszy graph_artifacts (atomowo), a
+/// nastepnie woła drain. Logika refcountu jest bez zmian — zmienia sie tylko SPOSOB
+/// usuniecia z grafu (outbox zamiast direct). Bez tego direct-delete kasowal graf z
+/// pominieciem outboxu, wiec re-ingest tego samego faktu (partial-unique dedup) nie
+/// tworzyl nowego pending i graf nie wracal — łamało R1/R3.
 fn cleanup_document_graph(document_id: &str) {
+    let now = now_unix();
+    let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
+
     // Najpierw krawedzie, potem wezly (patrz komentarz w callerze). Distinct, bo ten
     // sam klucz moze pojawic sie w rejestrze dokumentu wielokrotnie (rozne chunki).
     if let Ok(rows) = sql_query(
@@ -773,9 +792,7 @@ fn cleanup_document_graph(document_id: &str) {
             }
             let remaining = count_other_edge_refs(src, rel, dst, document_id);
             if should_delete_from_graph(remaining) {
-                if let Err(e) = graph_delete_edge(KG_COLLECTION, src, rel, dst) {
-                    log::warn(&format!("rag: cleanup krawedzi '{src}-{rel}-{dst}' nieudany: {e}"));
-                }
+                push_outbox(&mut tx, &outbox_delete_edge(src, rel, dst), now);
             }
         }
     }
@@ -790,17 +807,30 @@ fn cleanup_document_graph(document_id: &str) {
             }
             let remaining = count_other_node_refs(id, document_id);
             if should_delete_from_graph(remaining) {
-                if let Err(e) = graph_delete_node(KG_COLLECTION, id) {
-                    log::warn(&format!("rag: cleanup wezla '{id}' nieudany: {e}"));
-                }
+                push_outbox(&mut tx, &outbox_delete_node(id), now);
             }
         }
     }
 
-    let _ = sql_exec(
-        "DELETE FROM graph_artifacts WHERE document_id = ?",
-        &[SqlValue::String(document_id.to_string())],
-    );
+    // Usuniecie rejestru w TEJ SAMEJ transakcji co enqueue intencji delete — atomowo:
+    // albo i rejestr znika, i intencja delete jest trwala, albo nic (brak rozjazdu).
+    tx.push((
+        "DELETE FROM graph_artifacts WHERE document_id = ?".to_string(),
+        vec![SqlValue::String(document_id.to_string())],
+    ));
+
+    let stmts: Vec<(&str, &[SqlValue])> =
+        tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    if let Err(e) = sql_transaction(&stmts) {
+        log::warn(&format!("rag: cleanup grafu dokumentu '{document_id}' (zapis outboxu) nieudany: {e}"));
+        return;
+    }
+
+    // Materializacja delete'ow z trwalej kolejki. Crash przed/podczas drainu jest
+    // odtwarzalny (re-drain domknie applied=0).
+    if let Err(e) = drain_graph_outbox() {
+        log::warn(&format!("rag: drain cleanupu dokumentu '{document_id}' nieudany: {e}"));
+    }
 }
 
 /// Lista dokumentow w kolekcji.
@@ -1112,17 +1142,153 @@ fn chunk_extraction_marks_partial(result: &Result<(usize, usize), String>) -> bo
     result.is_err()
 }
 
-/// Ekstrakcja grafu dla jednego chunku: wola rag-llm, parsuje, upsertuje wezly +
-/// krawedzie do 'kg' z provenance i rejestruje artefakty (graph_artifacts) do
-/// odwracalnego cleanupu. Zwraca `(liczba_encji, liczba_relacji)` realnie
-/// zapisanych. BEST-EFFORT: kazdy blad (LLM/parsowanie/upsert) zwraca Err, ktory
-/// caller loguje i traktuje jako graf czesciowy — NIE przerywa ingestu wektorowego.
+/// Etykieta wezla konca relacji, gdy LLM nie wymienil go w liscie encji — placeholder
+/// typ, by krawedz nie wisiala. Spojny z label uzytym przy materializacji wezla.
+const FALLBACK_ENTITY_TYPE: &str = "Entity";
+
+/// Kanoniczne, length-prefixed kodowanie listy pol w jeden bezkolizyjny klucz tekstowy.
+/// Kazdy segment to "{dlugosc_w_bajtach}:{wartosc}" sklejone bez separatora. Bo dlugosc
+/// poprzedza tresc, granice pol sa JEDNOZNACZNE — ("A","BC") i ("AB","C") koduja sie
+/// rozn ie ("1:A2:BC" vs "2:AB1:C"), czego sklejanie przez '|' nie gwarantuje (wartosc
+/// z '|' w srodku). Bez hasha => zero kolizji (addon nie ma crate'a sha, tylko sdk+serde).
+fn canonical_key(parts: &[&str]) -> String {
+    let mut out = String::new();
+    for p in parts {
+        out.push_str(&p.len().to_string());
+        out.push(':');
+        out.push_str(p);
+    }
+    out
+}
+
+/// schema_id z trojki typow (head_type, relation, tail_type). Deterministyczny =
+/// ten sam schemat z roznych dokumentow trafia w ten sam wiersz schema_registry.
+/// Kanoniczne kodowanie length-prefixed (bezkolizyjne granice typow).
+fn derive_schema_id(head_type: &str, relation: &str, tail_type: &str) -> String {
+    canonical_key(&[head_type, relation, tail_type])
+}
+
+/// Globalnie JEDNOZNACZNY klucz faktu z trojki (src, rel, dst) — kanoniczny,
+/// length-prefixed (jak schema_id/dedup_key), NIE goly join przez '|'. Join '|' byl
+/// dwuznaczny: id encji albo nazwa relacji moga ZAWIERAC '|' (parser ekstrakcji ich
+/// nie ucieka), wiec `(a, "b|c", d)` i `(a|b, c, d)` sklejaly sie do tego samego
+/// "a|b|c|d" => kolizja fact_key w fact_schema/fact_evidence/fact_state ORAZ w
+/// dedup_key outboxu. Length-prefix czyni granice pol jednoznacznymi -> klucz jest
+/// bezkolizyjny globalnie i propaguje sie spojnie do wszystkich tabel D1 i outboxu.
+/// graph_artifacts trzyma OSOBNE kolumny src/rel/dst (nie fact_key), wiec refcount
+/// cleanup jest nietkniety i NIE rozbija tego klucza po '|'.
+fn fact_key_for(src: &str, rel: &str, dst: &str) -> String {
+    canonical_key(&[src, rel, dst])
+}
+
+/// dedup_key outboxu: kanoniczny, length-prefixed klucz z (op, collection, klucz obiektu).
+/// Bezkolizyjny i jednoznaczny => ponowny ingest tego samego faktu probuje wstawic ten
+/// sam dedup_key (INSERT OR IGNORE po PARTIAL-UNIQUE applied=0), wiec kolejka nie puchnie
+/// duplikatami PENDING, a re-drain jest bezpieczny. Po applied=1 klucz sie zwalnia
+/// (re-materializacja po cleanupie) — patrz migracja 003.
+fn outbox_dedup_key(op: &str, collection: &str, key: &str) -> String {
+    canonical_key(&[op, collection, key])
+}
+
+/// Operacja outboxu czekajaca na materializacje do grafu: jeden wiersz graph_outbox.
+struct OutboxOp {
+    dedup_key: String,
+    op: &'static str,
+    payload: Value,
+}
+
+/// Serializuje pola Provenance do plaskiego JSON-a payloadu. Provenance ze sdk-spec
+/// ma tylko derive Encode/Decode (CBOR), NIE serde — wiec zamiast serializowac strukture
+/// trzymamy w payloadzie pola, ktorych drain potrzebuje do jej odtworzenia.
+fn provenance_to_json(provenance: &Provenance) -> Value {
+    json!({
+        "doc_id": provenance.doc_id,
+        "chunk_id": provenance.chunk_id,
+        "confidence": provenance.confidence,
+        "extractor_version": provenance.extractor_version,
+    })
+}
+
+/// Odtwarza Provenance z plaskiego JSON-a payloadu (lustro `provenance_to_json`).
+/// page/span nie sa niesione w D1 (build_provenance ich nie ustawia).
+fn provenance_from_json(p: &Value) -> Provenance {
+    Provenance {
+        chunk_id: p.get("chunk_id").and_then(|v| v.as_str()).map(str::to_string),
+        doc_id: p.get("doc_id").and_then(|v| v.as_str()).map(str::to_string),
+        page: None,
+        span: None,
+        confidence: p.get("confidence").and_then(|v| v.as_f64()).map(|c| c as f32),
+        extractor_version: p
+            .get("extractor_version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    }
+}
+
+/// Buduje wpis outboxu upsert_node dla wezla. payload niesie wszystko, czego drain
+/// potrzebuje do `graph_upsert_node` bez ponownego siegania do innych tabel.
+fn outbox_upsert_node(id: &str, label: &str, name: &str, provenance: &Provenance) -> OutboxOp {
+    OutboxOp {
+        dedup_key: outbox_dedup_key("upsert_node", KG_COLLECTION, id),
+        op: "upsert_node",
+        payload: json!({
+            "id": id,
+            "label": label,
+            "name": name,
+            "provenance": provenance_to_json(provenance),
+        }),
+    }
+}
+
+/// Buduje wpis outboxu upsert_edge dla krawedzi (klucz = kanoniczny fact_key z src/rel/dst).
+fn outbox_upsert_edge(src: &str, rel: &str, dst: &str, provenance: &Provenance) -> OutboxOp {
+    OutboxOp {
+        dedup_key: outbox_dedup_key("upsert_edge", KG_COLLECTION, &fact_key_for(src, rel, dst)),
+        op: "upsert_edge",
+        payload: json!({
+            "src": src,
+            "rel": rel,
+            "dst": dst,
+            "confidence": DEFAULT_CONFIDENCE as f64,
+            "provenance": provenance_to_json(provenance),
+        }),
+    }
+}
+
+/// Buduje wpis outboxu delete_node. Cleanup (refcount->0) NIE kasuje grafu wprost —
+/// enqueue'uje te intencje, by graf byl mutowany WYLACZNIE przez outbox (R1).
+fn outbox_delete_node(id: &str) -> OutboxOp {
+    OutboxOp {
+        dedup_key: outbox_dedup_key("delete_node", KG_COLLECTION, id),
+        op: "delete_node",
+        payload: json!({ "id": id }),
+    }
+}
+
+/// Buduje wpis outboxu delete_edge (klucz = kanoniczny fact_key z src/rel/dst).
+fn outbox_delete_edge(src: &str, rel: &str, dst: &str) -> OutboxOp {
+    OutboxOp {
+        dedup_key: outbox_dedup_key("delete_edge", KG_COLLECTION, &fact_key_for(src, rel, dst)),
+        op: "delete_edge",
+        payload: json!({ "src": src, "rel": rel, "dst": dst }),
+    }
+}
+
+/// Ekstrakcja grafu dla jednego chunku: wola rag-llm, parsuje i — zamiast pisac WPROST
+/// do grafu — zapisuje stan do SQLite-ledgera (R1: schema_registry/fact_schema/
+/// fact_evidence/fact_state) ORAZ TRWALA INTENCJE materializacji do graph_outbox (R3),
+/// wszystko w JEDNEJ transakcji SQLite (sql_transaction). Dopiero osobny, idempotentny
+/// drain_graph_outbox aplikuje intencje do 'kg_active' host-fnami. graph_artifacts
+/// zostaje (refcount cleanup nadal kluczowany do kg_active). Zwraca `(encje, relacje)`.
+/// BEST-EFFORT: kazdy blad (LLM/parsowanie/zapis SQL/drain) -> Err -> graph_partial.
+///
+/// W D1 KAZDY fakt jest aktywny (fact_state.active=1) i materializowany od razu —
+/// gate progu tau (Candidate->Stable) wchodzi dopiero w D2; tu budujemy fundament.
 ///
 /// `doc_triples_so_far` to licznik triple'ow juz zapisanych dla calego dokumentu
 /// (cap MAX_TRIPLES_PER_DOC) — aktualizowany o realnie wstawione krawedzie.
 /// `truncated` jest ustawiane na TRUE gdy jakikolwiek cap (per-chunk, per-doc) lub
-/// pominiecie za-dlugiej relacji obcie dane — caller propaguje to do graph_partial
-/// (bug 5/6).
+/// pominiecie za-dlugiej relacji obcie dane — caller propaguje to do graph_partial.
 fn extract_chunk_graph(
     document_id: &str,
     chunk_index: usize,
@@ -1142,39 +1308,45 @@ fn extract_chunk_graph(
 
     let provenance = build_provenance(document_id, chunk_index);
     let now = now_unix();
+    let chunk_id = chunk_index.to_string();
 
-    // Wezly encji. Tylko encje z tego chunku staja sie "znane" do walidacji relacji.
-    // INWARIANT (bug 4): rejestr graph_artifacts MUSI byc nadzbiorem grafu — co w
-    // grafie, to w rejestrze, inaczej cleanup pominie artefakt (rozjazd refcountu).
-    // Dlatego rejestrujemy PRZED upsertem grafu i propagujemy blad rejestru jako Err
-    // (caller traktuje to best-effort: graph_partial, wektory niezmienione). Gdyby
-    // padl upsert grafu PO udanym rejestrze, rejestr ma "nadmiarowy" wiersz — cleanup
-    // sprobuje skasowac nieistniejacy wezel (idempotentnie, bez szkody).
+    // Typ encji po znormalizowanym id — pod wyprowadzenie schema_id krawedzi. Encje
+    // spoza listy (konce relacji) maja typ fallback "Entity", jak dotad.
+    let mut entity_types: Vec<(String, String)> = Vec::with_capacity(extraction.entities.len());
+    let type_of = |id: &str, types: &[(String, String)]| -> String {
+        types
+            .iter()
+            .find(|(eid, _)| eid == id)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| FALLBACK_ENTITY_TYPE.to_string())
+    };
+
+    // Statementy ledgera+outboxu zbierane do JEDNEJ transakcji SQLite. Atomowosc:
+    // wybralismy sql_transaction (prawdziwy BEGIN/COMMIT po stronie hosta) zamiast
+    // outbox-first ordering, bo SDK go udostepnia — caly stan faktu (ledger + intencja
+    // grafu) jest commitowany lub rollbackowany razem. Materializacja do grafu jest
+    // poza ta transakcja (osobny silnik, R3) i odtwarzalna z TRWALEJ kolejki (drain
+    // czyta applied=0 z SQLite), wiec crash po commicie a przed drainem domyka re-drain.
+    let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
+
+    // Wezly encji. INWARIANT (bug 4): graph_artifacts MUSI byc nadzbiorem grafu, wiec
+    // rejestr i intencja outboxu sa w tej samej transakcji co reszta ledgera.
     let mut known: Vec<String> = Vec::with_capacity(extraction.entities.len());
     let mut entity_count = 0usize;
     for entity in &extraction.entities {
-        record_graph_node(document_id, &entity.id, now)
-            .map_err(|e| format!("rejestr wezla '{}': {e}", entity.id))?;
-        let node = GraphNode {
-            id: entity.id.clone(),
-            label: entity.entity_type.clone(),
-            props: vec![GraphProp {
-                name: "name".to_string(),
-                value: VectorFieldValue::Str(entity.name.clone()),
-            }],
-            provenance: Some(provenance.clone()),
-        };
-        graph_upsert_node(KG_COLLECTION, node)
-            .map_err(|e| format!("upsert wezla '{}': {e}", entity.id))?;
+        entity_types.push((entity.id.clone(), entity.entity_type.clone()));
+        push_node_artifact(&mut tx, document_id, &entity.id, now);
+        let op = outbox_upsert_node(&entity.id, &entity.entity_type, &entity.name, &provenance);
+        push_outbox(&mut tx, &op, now);
         if !known.contains(&entity.id) {
             known.push(entity.id.clone());
         }
         entity_count += 1;
     }
 
-    // Krawedzie relacji. head/tail musza byc znanymi encjami tego chunku; gdy
-    // brakuje wezla konca, upsertujemy go (placeholder label "Entity"), by krawedz
-    // nie wisiala. Respektujemy globalny cap triple'ow na dokument.
+    // Krawedzie relacji. head/tail musza byc znanymi encjami tego chunku; gdy brakuje
+    // wezla konca, materializujemy go (label fallback "Entity"). Respektujemy cap
+    // triple'ow na dokument.
     let mut relation_count = 0usize;
     for rel in &extraction.relations {
         if *doc_triples_so_far >= MAX_TRIPLES_PER_DOC {
@@ -1184,76 +1356,312 @@ fn extract_chunk_graph(
         }
         for endpoint in [&rel.head_id, &rel.tail_id] {
             if !known.contains(endpoint) {
-                record_graph_node(document_id, endpoint, now)
-                    .map_err(|e| format!("rejestr wezla konca '{endpoint}': {e}"))?;
-                let node = GraphNode {
-                    id: endpoint.clone(),
-                    label: "Entity".to_string(),
-                    props: vec![GraphProp {
-                        name: "name".to_string(),
-                        value: VectorFieldValue::Str(endpoint.clone()),
-                    }],
-                    provenance: Some(provenance.clone()),
-                };
-                graph_upsert_node(KG_COLLECTION, node)
-                    .map_err(|e| format!("upsert wezla konca '{endpoint}': {e}"))?;
+                push_node_artifact(&mut tx, document_id, endpoint, now);
+                let op = outbox_upsert_node(endpoint, FALLBACK_ENTITY_TYPE, endpoint, &provenance);
+                push_outbox(&mut tx, &op, now);
                 known.push(endpoint.clone());
             }
         }
-        record_graph_edge(document_id, &rel.head_id, &rel.relation, &rel.tail_id, now)
-            .map_err(|e| {
-                format!("rejestr krawedzi '{}-{}-{}': {e}", rel.head_id, rel.relation, rel.tail_id)
-            })?;
-        graph_upsert_edge(
-            KG_COLLECTION,
-            &rel.head_id,
-            &rel.relation,
-            &rel.tail_id,
-            Some(DEFAULT_CONFIDENCE as f64),
-            Vec::new(),
-            Some(provenance.clone()),
-        )
-        .map_err(|e| format!("upsert krawedzi '{}-{}-{}': {e}", rel.head_id, rel.relation, rel.tail_id))?;
+
+        let fact_key = fact_key_for(&rel.head_id, &rel.relation, &rel.tail_id);
+        let head_type = type_of(&rel.head_id, &entity_types);
+        let tail_type = type_of(&rel.tail_id, &entity_types);
+        let schema_id = derive_schema_id(&head_type, &rel.relation, &tail_type);
+
+        push_schema_registry(&mut tx, &schema_id, &head_type, &rel.relation, &tail_type, now);
+        push_fact_schema(&mut tx, &fact_key, &schema_id, document_id);
+        push_fact_evidence(&mut tx, &fact_key, document_id, &chunk_id, &provenance);
+        push_fact_state(&mut tx, &fact_key, &schema_id, &rel.head_id, &rel.relation, &rel.tail_id, now);
+        push_edge_artifact(&mut tx, document_id, &rel.head_id, &rel.relation, &rel.tail_id, now);
+        let op = outbox_upsert_edge(&rel.head_id, &rel.relation, &rel.tail_id, &provenance);
+        push_outbox(&mut tx, &op, now);
+
         relation_count += 1;
         *doc_triples_so_far += 1;
     }
 
+    // Jedna atomowa transakcja: ledger + outbox + graph_artifacts. Borrow statementow
+    // jako &str tuz przed wywolaniem (sql_transaction bierze &[(&str, &[SqlValue])]).
+    let stmts: Vec<(&str, &[SqlValue])> =
+        tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    sql_transaction(&stmts).map_err(|e| format!("zapis ledgera grafu: {e}"))?;
+
+    // Materializacja PO commicie SQLite: drain czyta TRWALA kolejke (applied=0), nie
+    // pamiec biezacego wywolania, wiec crash miedzy commitem a drainem jest odtwarzalny
+    // (re-drain domyka zaleglosc). Idempotentny: applied=1 chroni przed powtorka.
+    drain_graph_outbox()?;
+
     Ok((entity_count, relation_count))
 }
 
-/// Rejestruje wezel grafu utworzony dla dokumentu (do odwracalnego cleanupu +
-/// refcountu). Blad INSERT jest PROPAGOWANY (bug 4): bez wiersza rejestru cleanup
-/// nie znalby tego wezla i refcount bylby rozjechany, wiec lepiej oznaczyc graf
-/// jako czesciowy niz zostawic artefakt-sierote.
-fn record_graph_node(document_id: &str, node_id: &str, now: i64) -> Result<(), String> {
-    sql_exec(
-        "INSERT INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)",
-        &[
+/// Dokleja INSERT wezla do graph_artifacts (refcount cleanupu) do transakcji.
+fn push_node_artifact(tx: &mut Vec<(String, Vec<SqlValue>)>, document_id: &str, node_id: &str, now: i64) {
+    tx.push((
+        "INSERT INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)"
+            .to_string(),
+        vec![
             SqlValue::String(document_id.to_string()),
             SqlValue::String(node_id.to_string()),
             SqlValue::I64(now),
         ],
-    )
-    .map(|_| ())
-    .map_err(|e| format!("{e}"))
+    ));
 }
 
-/// Rejestruje krawedz grafu utworzona dla dokumentu (do odwracalnego cleanupu +
-/// refcountu). Blad INSERT propagowany — patrz `record_graph_node` (bug 4).
-fn record_graph_edge(document_id: &str, src: &str, rel: &str, dst: &str, now: i64) -> Result<(), String> {
-    sql_exec(
+/// Dokleja INSERT krawedzi do graph_artifacts (refcount cleanupu) do transakcji.
+fn push_edge_artifact(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    document_id: &str,
+    src: &str,
+    rel: &str,
+    dst: &str,
+    now: i64,
+) {
+    tx.push((
         "INSERT INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
-         VALUES (?, 'edge', ?, ?, ?, ?)",
-        &[
+         VALUES (?, 'edge', ?, ?, ?, ?)"
+            .to_string(),
+        vec![
             SqlValue::String(document_id.to_string()),
             SqlValue::String(src.to_string()),
             SqlValue::String(rel.to_string()),
             SqlValue::String(dst.to_string()),
             SqlValue::I64(now),
         ],
-    )
-    .map(|_| ())
-    .map_err(|e| format!("{e}"))
+    ));
+}
+
+/// UPSERT schematu: pierwsze wystapienie ustawia first_seen, kolejne tylko freq+1.
+/// status pozostaje 'candidate' (promocja do 'stable' to D2).
+fn push_schema_registry(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    schema_id: &str,
+    head_type: &str,
+    relation: &str,
+    tail_type: &str,
+    now: i64,
+) {
+    tx.push((
+        "INSERT INTO schema_registry (schema_id, head_type, relation, tail_type, freq, first_seen) \
+         VALUES (?, ?, ?, ?, 1, ?) \
+         ON CONFLICT(schema_id) DO UPDATE SET freq = freq + 1"
+            .to_string(),
+        vec![
+            SqlValue::String(schema_id.to_string()),
+            SqlValue::String(head_type.to_string()),
+            SqlValue::String(relation.to_string()),
+            SqlValue::String(tail_type.to_string()),
+            SqlValue::I64(now),
+        ],
+    ));
+}
+
+/// Phi (fakt->schemat) per dokument. Idempotentne po (fact_key, document_id).
+fn push_fact_schema(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    fact_key: &str,
+    schema_id: &str,
+    document_id: &str,
+) {
+    tx.push((
+        "INSERT INTO fact_schema (fact_key, schema_id, document_id) VALUES (?, ?, ?) \
+         ON CONFLICT(fact_key, document_id) DO UPDATE SET schema_id = excluded.schema_id"
+            .to_string(),
+        vec![
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::String(schema_id.to_string()),
+            SqlValue::String(document_id.to_string()),
+        ],
+    ));
+}
+
+/// Psi (fakt->pasaz) — evidence chunku. Idempotentne po (fact_key, document_id, chunk_id):
+/// re-ingest tego samego chunku TEGO SAMEGO dokumentu nadpisuje dowod, nie duplikuje.
+/// document_id MUSI byc w kluczu konfliktu, bo chunk_id = chunk_index jest lokalny dla
+/// dokumentu — bez niego docA/chunk0 i docB/chunk0 nadpisywalyby sobie evidence.
+fn push_fact_evidence(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    fact_key: &str,
+    document_id: &str,
+    chunk_id: &str,
+    provenance: &Provenance,
+) {
+    // span nie jest niesiony w D1 (ekstrakcja LLM nie zwraca offsetow) -> NULL.
+    let confidence = provenance.confidence.unwrap_or(DEFAULT_CONFIDENCE) as f64;
+    tx.push((
+        "INSERT INTO fact_evidence (fact_key, document_id, chunk_id, span, confidence) \
+         VALUES (?, ?, ?, NULL, ?) \
+         ON CONFLICT(fact_key, document_id, chunk_id) DO UPDATE SET \
+           confidence = excluded.confidence"
+            .to_string(),
+        vec![
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::String(document_id.to_string()),
+            SqlValue::String(chunk_id.to_string()),
+            SqlValue::F64(confidence),
+        ],
+    ));
+}
+
+/// Stan faktu (zrodlo prawdy o krawedzi). active=1 w D1; ponowny ingest aktualizuje
+/// schema_id/updated_at, ale NIE rusza fact_seq (kursor A_det) ani created_at.
+fn push_fact_state(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    fact_key: &str,
+    schema_id: &str,
+    head_id: &str,
+    rel: &str,
+    tail_id: &str,
+    now: i64,
+) {
+    tx.push((
+        "INSERT INTO fact_state (fact_key, schema_id, head_id, rel, tail_id, active, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?) \
+         ON CONFLICT(fact_key) DO UPDATE SET \
+           schema_id = excluded.schema_id, active = 1, updated_at = excluded.updated_at"
+            .to_string(),
+        vec![
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::String(schema_id.to_string()),
+            SqlValue::String(head_id.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(tail_id.to_string()),
+            SqlValue::I64(now),
+            SqlValue::I64(now),
+        ],
+    ));
+}
+
+/// Dokleja INSERT intencji outboxu. INSERT OR IGNORE po dedup_key z PARTIAL-UNIQUE
+/// (ux_graph_outbox_pending WHERE applied=0): dedup obejmuje tylko PENDING, wiec ten
+/// sam fakt z innego chunku/dokumentu nie tworzy drugiego wiersza dopoki poprzedni
+/// czeka. Po applied=1 klucz sie zwalnia, wiec re-ingest/re-delete tworzy NOWY pending
+/// (re-materializacja po cleanupie) — patrz migracja 003.
+fn push_outbox(tx: &mut Vec<(String, Vec<SqlValue>)>, op: &OutboxOp, now: i64) {
+    let payload = serde_json::to_string(&op.payload).unwrap_or_else(|_| "{}".to_string());
+    tx.push((
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         VALUES (?, ?, ?, ?, 0, ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(op.dedup_key.clone()),
+            SqlValue::String(op.op.to_string()),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload),
+            SqlValue::I64(now),
+        ],
+    ));
+}
+
+/// Maks. liczba wierszy outboxu przetwarzanych w jednej iteracji drainu — chroni przed
+/// DoS/OOM przy duzej zaleglosci (np. wiele nieprzetworzonych dokumentow po crashu).
+const OUTBOX_DRAIN_BATCH: usize = 256;
+
+/// Twardy limit iteracji petli drainu (BATCH * ITER = gorne ograniczenie pracy na
+/// jedno wywolanie). Reszta zaleglosci domknie sie przy nastepnym drainie.
+const OUTBOX_DRAIN_MAX_ITERS: usize = 4096;
+
+/// Materializuje TRWALE intencje outboxu (graph_outbox WHERE applied=0) do grafu
+/// 'kg_active' i po sukcesie znacza je applied=1. Zrodlem jest SQLite (R3), NIE pamiec
+/// biezacego wywolania — dzieki temu crash po commicie SQLite a przed/podczas drainu
+/// jest ODTWARZALNY: nastepny drain (start kolejnego ingestu lub re-ingest) dokonczy
+/// applied=0. Idempotentny: upsert grafu jest bezstanowy (ponowny upsert nieszkodliwy),
+/// a flaga applied chroni przed powtorka w normalnym biegu.
+///
+/// Batch + cap iteracji chronia przed DoS przy duzej zaleglosci. Pierwszy blad host-fn
+/// -> przerwij drain, zostaw applied=0 (domknie sie nastepnym razem), zwroc Err
+/// (caller: graph_partial). Semantyka best-effort zachowana.
+fn drain_graph_outbox() -> Result<(), String> {
+    for _ in 0..OUTBOX_DRAIN_MAX_ITERS {
+        let rows = sql_query(
+            "SELECT id, op, collection, payload FROM graph_outbox \
+             WHERE applied = 0 ORDER BY id LIMIT ?",
+            &[SqlValue::I64(OUTBOX_DRAIN_BATCH as i64)],
+        )
+        .map_err(|e| format!("odczyt graph_outbox: {e}"))?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for row in &rows {
+            let id = row.first().and_then(|v| v.as_i64()).unwrap_or_default();
+            let op = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            let collection = row
+                .get(2)
+                .and_then(|v| v.as_str())
+                .unwrap_or(KG_COLLECTION);
+            let payload_raw = row.get(3).and_then(|v| v.as_str()).unwrap_or("{}");
+            let payload: Value = serde_json::from_str(payload_raw)
+                .map_err(|e| format!("deserializacja payloadu outboxu id={id}: {e}"))?;
+
+            apply_outbox_op(op, collection, &payload)?;
+
+            sql_exec(
+                "UPDATE graph_outbox SET applied = 1, applied_at = ? WHERE id = ?",
+                &[SqlValue::I64(now_unix()), SqlValue::I64(id)],
+            )
+            .map_err(|e| format!("oznaczenie applied dla outboxu id={id}: {e}"))?;
+        }
+
+        // Mniej niz pelny batch => kolejka opadla; nie ma sensu pytac ponownie.
+        if rows.len() < OUTBOX_DRAIN_BATCH {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Aplikuje pojedyncza operacje outboxu do grafu przez host-fn. Wydzielone z petli
+/// drainu, by deserializacja/IO byly rozdzielone od materializacji do grafu.
+fn apply_outbox_op(op: &str, collection: &str, payload: &Value) -> Result<(), String> {
+    match op {
+        "upsert_node" => {
+            let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let label = payload.get("label").and_then(|v| v.as_str()).unwrap_or(FALLBACK_ENTITY_TYPE);
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+            let provenance = payload.get("provenance").map(provenance_from_json);
+            let node = GraphNode {
+                id: id.to_string(),
+                label: label.to_string(),
+                props: vec![GraphProp {
+                    name: "name".to_string(),
+                    value: VectorFieldValue::Str(name.to_string()),
+                }],
+                provenance,
+            };
+            graph_upsert_node(collection, node)
+                .map(|_| ())
+                .map_err(|e| format!("upsert wezla '{id}': {e}"))
+        }
+        "upsert_edge" => {
+            let src = payload.get("src").and_then(|v| v.as_str()).unwrap_or_default();
+            let rel = payload.get("rel").and_then(|v| v.as_str()).unwrap_or_default();
+            let dst = payload.get("dst").and_then(|v| v.as_str()).unwrap_or_default();
+            let confidence = payload.get("confidence").and_then(|v| v.as_f64());
+            let provenance = payload.get("provenance").map(provenance_from_json);
+            graph_upsert_edge(collection, src, rel, dst, confidence, Vec::new(), provenance)
+                .map(|_| ())
+                .map_err(|e| format!("upsert krawedzi '{src}-{rel}-{dst}': {e}"))
+        }
+        // delete_* sa idempotentne: host-fn delete = tombstone, wiec ponowne usuniecie
+        // nieistniejacego wezla/krawedzi jest nieszkodliwe. Drain stosuje ops ORDER BY id
+        // (FIFO), wiec delete po wczesniejszym upsercie tego samego klucza nie wyprzedzi go.
+        "delete_node" => {
+            let id = payload.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            graph_delete_node(collection, id)
+                .map(|_| ())
+                .map_err(|e| format!("delete wezla '{id}': {e}"))
+        }
+        "delete_edge" => {
+            let src = payload.get("src").and_then(|v| v.as_str()).unwrap_or_default();
+            let rel = payload.get("rel").and_then(|v| v.as_str()).unwrap_or_default();
+            let dst = payload.get("dst").and_then(|v| v.as_str()).unwrap_or_default();
+            graph_delete_edge(collection, src, rel, dst)
+                .map(|_| ())
+                .map_err(|e| format!("delete krawedzi '{src}-{rel}-{dst}': {e}"))
+        }
+        other => Err(format!("nieznana operacja outboxu '{other}'")),
+    }
 }
 
 // =============================================================================
@@ -2040,10 +2448,10 @@ mod tests {
 
     #[test]
     fn registry_failure_marks_graph_partial() {
-        // Blad rejestru (record_graph_node/edge) wraca z extract_chunk_graph jako Err
-        // i MUSI oznaczyc graf jako czesciowy — bez tego byl cichy rozjazd
+        // Blad zapisu ledgera/outboxu (sql_transaction) wraca z extract_chunk_graph jako
+        // Err i MUSI oznaczyc graf jako czesciowy — bez tego byl cichy rozjazd
         // "w grafie ale nie w rejestrze" i cleanup nie usunalby artefaktu.
-        let err: Result<(usize, usize), String> = Err("rejestr wezla 'x': zapis sql padl".into());
+        let err: Result<(usize, usize), String> = Err("zapis ledgera grafu: sql padl".into());
         assert!(chunk_extraction_marks_partial(&err), "blad rejestru -> graph_partial (bug 4)");
     }
 
@@ -2093,5 +2501,127 @@ mod tests {
         assert_eq!(p.chunk_id.as_deref(), Some("7"));
         assert_eq!(p.extractor_version.as_deref(), Some(EXTRACTOR_VERSION));
         assert!(p.confidence.is_some());
+    }
+
+    // --- MemGraphRAG D1: derywacja schema_id / fact_key / dedup_key, outbox, drain ---
+
+    #[test]
+    fn canonical_key_field_boundaries_are_unambiguous() {
+        // Length-prefixed: granice pol jednoznaczne, brak kolizji ("A","BC") vs ("AB","C").
+        assert_eq!(canonical_key(&["A", "BC"]), "1:A2:BC");
+        assert_eq!(canonical_key(&["AB", "C"]), "2:AB1:C");
+        assert_ne!(canonical_key(&["A", "BC"]), canonical_key(&["AB", "C"]));
+        // Wartosc z separatorem '|' w srodku nie psuje kodowania (length-prefixed).
+        assert_ne!(canonical_key(&["a|b", "c"]), canonical_key(&["a", "b|c"]));
+    }
+
+    #[test]
+    fn schema_id_is_deterministic_and_typed() {
+        // Ta sama trojka typow -> ten sam schema_id (wiersz schema_registry wspoldzielony).
+        let a = derive_schema_id("Person", "KNOWS", "Person");
+        let b = derive_schema_id("Person", "KNOWS", "Person");
+        assert_eq!(a, b, "derywacja schema_id musi byc deterministyczna");
+        // Rozna trojka -> inny schema_id (length-prefixed chroni przed kolizja sklejania).
+        assert_ne!(a, derive_schema_id("Person", "KNOWS", "City"));
+        assert_ne!(
+            derive_schema_id("A", "BC", "D"),
+            derive_schema_id("AB", "C", "D"),
+            "granice pol nie moga byc dwuznaczne"
+        );
+    }
+
+    #[test]
+    fn fact_key_is_canonical_and_unambiguous() {
+        // fact_key = kanoniczny length-prefixed klucz z (src, rel, dst).
+        assert_eq!(fact_key_for("ada", "knows", "babbage"), canonical_key(&["ada", "knows", "babbage"]));
+        // KLUCZOWE: '|' w id encji albo nazwie relacji NIE moze powodowac kolizji.
+        // Goly join "a|b|c|d" mial te dwie trojki nierozroznialne; kanoniczny je rozdziela.
+        let a = fact_key_for("a", "b|c", "d");
+        let b = fact_key_for("a|b", "c", "d");
+        assert_ne!(a, b, "rozne fakty z '|' w segmentach musza miec rozne fact_key");
+    }
+
+    #[test]
+    fn dedup_key_is_deterministic_per_object() {
+        // Idempotencja outboxu: ten sam (op, collection, klucz) -> ten sam dedup_key.
+        let n1 = outbox_dedup_key("upsert_node", KG_COLLECTION, "ada");
+        let n2 = outbox_dedup_key("upsert_node", KG_COLLECTION, "ada");
+        assert_eq!(n1, n2);
+        // Rozny obiekt albo rozna operacja -> inny dedup_key.
+        assert_ne!(n1, outbox_dedup_key("upsert_node", KG_COLLECTION, "babbage"));
+        assert_ne!(n1, outbox_dedup_key("delete_node", KG_COLLECTION, "ada"));
+    }
+
+    #[test]
+    fn outbox_edge_op_keyed_by_fact_key() {
+        // dedup_key krawedzi liczony z kanonicznego fact_key -> stabilny dla tej samej krawedzi.
+        let prov = build_provenance("doc1", 0);
+        let op = outbox_upsert_edge("ada", "knows", "babbage", &prov);
+        assert_eq!(op.op, "upsert_edge");
+        assert_eq!(
+            op.dedup_key,
+            outbox_dedup_key("upsert_edge", KG_COLLECTION, &fact_key_for("ada", "knows", "babbage"))
+        );
+        assert_eq!(op.payload["src"].as_str(), Some("ada"));
+        assert_eq!(op.payload["dst"].as_str(), Some("babbage"));
+    }
+
+    #[test]
+    fn outbox_node_payload_carries_label_and_name() {
+        let prov = build_provenance("doc1", 3);
+        let op = outbox_upsert_node("ada", "Person", "Ada", &prov);
+        assert_eq!(op.op, "upsert_node");
+        assert_eq!(op.payload["id"].as_str(), Some("ada"));
+        assert_eq!(op.payload["label"].as_str(), Some("Person"));
+        assert_eq!(op.payload["name"].as_str(), Some("Ada"));
+    }
+
+    #[test]
+    fn provenance_json_round_trips_carried_fields() {
+        // doc_id/chunk_id/confidence/extractor_version przezywaja serializacje do payloadu.
+        // (Provenance ma tylko CBOR Encode/Decode, wiec drain odtwarza ja z plaskiego JSON.)
+        let p = build_provenance("docX", 9);
+        let json = provenance_to_json(&p);
+        let back = provenance_from_json(&json);
+        assert_eq!(back.doc_id, p.doc_id);
+        assert_eq!(back.chunk_id, p.chunk_id);
+        assert_eq!(back.extractor_version, p.extractor_version);
+        assert_eq!(back.confidence, p.confidence);
+        // page/span nie sa niesione w D1.
+        assert!(back.page.is_none() && back.span.is_none());
+    }
+
+    #[test]
+    fn outbox_delete_ops_keyed_and_payloaded() {
+        // Cleanup enqueue'uje delete (R1: graf mutowany WYLACZNIE przez outbox).
+        let dn = outbox_delete_node("ada");
+        assert_eq!(dn.op, "delete_node");
+        assert_eq!(dn.dedup_key, outbox_dedup_key("delete_node", KG_COLLECTION, "ada"));
+        assert_eq!(dn.payload["id"].as_str(), Some("ada"));
+
+        let de = outbox_delete_edge("ada", "knows", "babbage");
+        assert_eq!(de.op, "delete_edge");
+        assert_eq!(
+            de.dedup_key,
+            outbox_dedup_key("delete_edge", KG_COLLECTION, &fact_key_for("ada", "knows", "babbage"))
+        );
+        assert_eq!(de.payload["src"].as_str(), Some("ada"));
+        assert_eq!(de.payload["rel"].as_str(), Some("knows"));
+        assert_eq!(de.payload["dst"].as_str(), Some("babbage"));
+
+        // delete i upsert tego samego obiektu maja ROZNY dedup_key -> partial-unique nie
+        // myli ich: oba moga byc pending rownoczesnie i drain stosuje je FIFO (upsert, potem delete).
+        assert_ne!(de.dedup_key, outbox_upsert_edge("ada", "knows", "babbage", &build_provenance("d", 0)).dedup_key);
+    }
+
+    #[test]
+    fn outbox_dedup_key_across_documents() {
+        // Idempotencja miedzy dokumentami: ten sam fakt z dwoch dokumentow daje JEDEN
+        // dedup_key -> INSERT OR IGNORE nie tworzy duplikatu w graph_outbox.
+        let p1 = build_provenance("docA", 0);
+        let p2 = build_provenance("docB", 5);
+        let a = outbox_upsert_edge("x", "rel", "y", &p1);
+        let b = outbox_upsert_edge("x", "rel", "y", &p2);
+        assert_eq!(a.dedup_key, b.dedup_key, "ten sam fakt -> ten sam dedup_key niezaleznie od dokumentu");
     }
 }

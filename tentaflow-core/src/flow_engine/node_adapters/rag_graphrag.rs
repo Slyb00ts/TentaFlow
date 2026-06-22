@@ -26,8 +26,10 @@ use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
-/// Kolekcja grafowa wiedzy (zgodna z ingestem E3.0 — `KG_COLLECTION="kg"`).
-const KG_COLLECTION: &str = "kg";
+/// Kolekcja grafowa aktywnego widoku MemGraphRAG. MUSI byc identyczna z kolekcja, do
+/// ktorej pisze ingest addona RAG (`KG_COLLECTION="kg_active"` w addons/rag/src/lib.rs
+/// i `[[graph_collection]]` w manifescie) — inaczej retrieval czyta pusty graf.
+const KG_COLLECTION: &str = "kg_active";
 
 /// Meta-klucz: biezace pod-pytanie hopu (ustawiane przez `rag_query_seed`).
 const META_CURRENT_QUERY: &str = "rag_current_query";
