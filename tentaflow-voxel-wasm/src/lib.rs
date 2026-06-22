@@ -90,6 +90,17 @@ struct SolidVertex {
     color: [f32; 3],
 }
 
+// Robot-mesh vertex: position + real glTF vertex normal + per-link flat color.
+// Drawn through the dedicated robot pipeline for smooth normal-based Lambert
+// shading (unlike the grid's flat-colored LineVertex).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RobotVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    color: [f32; 3],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -111,6 +122,20 @@ struct Uniforms {
 struct ModelUniforms {
     view_proj: [[f32; 4]; 4],
     model: [[f32; 4]; 4],
+}
+
+// Robot-mesh uniform: the shared view_proj, the link's world model matrix, and the
+// normal matrix used to transform vertex normals into world space. Go2 joints are
+// pure rotations + translations, so the model's upper-3×3 is orthonormal and can be
+// used directly as the normal matrix — we still pass it explicitly (as a mat4 whose
+// upper-3×3 is the rotation, translation column zeroed) so the shader never has to
+// reconstruct it. A mat4 keeps the std140 alignment trivial.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RobotModelUniforms {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+    normal_mat: [[f32; 4]; 4],
 }
 
 // Unit cube centered at origin, edge length 1 (scaled by voxel_size in shader).
@@ -226,8 +251,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-// Shared shader for per-vertex-colored line and solid geometry (grid, robot
-// marker). The robot draw applies a model matrix; grid bind an identity model.
+// Shader for per-vertex-colored line geometry (the ground grid). Flat color, no
+// lighting — the grid is a wireframe overlay and the robot now has its own pipeline.
 const COLORED_SHADER_SRC: &str = r#"
 struct ModelUniforms {
     view_proj: mat4x4<f32>,
@@ -244,33 +269,68 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
-    @location(1) world_pos: vec3<f32>,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    let world = u.model * vec4<f32>(in.position, 1.0);
-    out.clip_position = u.view_proj * world;
+    out.clip_position = u.view_proj * (u.model * vec4<f32>(in.position, 1.0));
     out.color = in.color;
-    out.world_pos = world.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Flat per-face directional shading for solid geometry (the robot), giving it
-    // 3D relief instead of a flat silhouette. Lines (grid) have degenerate screen
-    // derivatives, so guard on the face-normal length and leave them unlit.
-    let fn_raw = cross(dpdx(in.world_pos), dpdy(in.world_pos));
-    let nlen = length(fn_raw);
-    if (nlen < 1e-8) {
-        return vec4<f32>(in.color, 1.0);
-    }
-    let n = fn_raw / nlen;
+    return vec4<f32>(in.color, 1.0);
+}
+"#;
+
+// Dedicated robot-mesh shader: smooth Lambert shading from the meshes' real glTF
+// vertex normals (transformed by the link's normal matrix), so the articulated Go2
+// reads as a smoothly shaded model instead of the faceted derivative-lit hack.
+const ROBOT_SHADER_SRC: &str = r#"
+struct RobotUniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+    normal_mat: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: RobotUniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) world_normal: vec3<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let world_pos = u.model * vec4<f32>(in.position, 1.0);
+    out.clip_position = u.view_proj * world_pos;
+    // normal_mat is the model's upper-3×3 (orthonormal for the Go2's pure
+    // rotation+translation joints), padded into a mat4 with a zeroed translation.
+    let n = (u.normal_mat * vec4<f32>(in.normal, 0.0)).xyz;
+    out.world_normal = n;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.world_normal);
     let light_dir = normalize(vec3<f32>(0.4, 0.5, 0.85));
-    let diffuse = abs(dot(n, light_dir));
-    let lit = 0.5 + 0.5 * diffuse;
+    let diffuse = max(dot(n, light_dir), 0.0);
+    // Directional Lambert + ambient, plus a faint hemispheric term keyed off the
+    // up-facing component so the dark body never reads as pure black.
+    let hemi = 0.5 + 0.5 * n.z;
+    let lit = 0.35 + 0.65 * diffuse + 0.08 * hemi;
     return vec4<f32>(in.color * lit, 1.0);
 }
 "#;
@@ -388,9 +448,12 @@ struct State {
     instance_capacity: u32,
     instance_count: u32,
 
-    // Shared pipeline for colored line/solid geometry (grid, robot).
+    // Pipeline for colored solid geometry on ModelUniforms (box-marker fallback).
     colored_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    // Dedicated robot-mesh pipeline: smooth normal-based Lambert shading.
+    robot_pipeline: wgpu::RenderPipeline,
+    robot_model_bind_group_layout: wgpu::BindGroupLayout,
 
     // view_proj-only uniform (identity model) for world-space grid.
     world_uniform_buffer: wgpu::Buffer,
@@ -408,13 +471,15 @@ struct State {
     robot_model: Mat4,
     robot_visible: bool,
 
-    // Real Go2 body mesh loaded from /assets/go2/base.glb at init. When present it
+    // Real Go2 body mesh loaded from /assets/go2/go2_full.glb. When present it
     // replaces the box marker; on a fetch/parse failure these stay None and the box
-    // marker is used as the fallback. The mesh reuses the robot bind group (and thus
-    // `robot_model`) so it tracks the pose exactly like the box did.
+    // marker is used as the fallback. Drawn on the robot pipeline (positions+normals+
+    // color) with its own RobotModelUniforms bind group tracking `robot_model`.
     mesh_buffer: Option<wgpu::Buffer>,
     mesh_index_buffer: Option<wgpu::Buffer>,
     mesh_index_count: u32,
+    mesh_uniform_buffer: wgpu::Buffer,
+    mesh_bind_group: wgpu::BindGroup,
 
     // Articulated robot: one GPU link per URDF link with a visual mesh, plus the
     // bind-group layout needed to allocate each link's per-frame model uniform.
@@ -423,7 +488,6 @@ struct State {
     // stored as a flat list ordered parents-before-children so a single forward
     // pass computes every world transform.
     robot_links: Vec<RobotLink>,
-    model_bind_group_layout: wgpu::BindGroupLayout,
     // Current 12 leg-joint angles in radians (Go2 order), defaulting to 0.
     joint_angles: [f32; 12],
 
@@ -534,6 +598,15 @@ impl State {
         self.queue
             .write_buffer(&self.robot_uniform_buffer, 0, bytemuck::bytes_of(&robot));
 
+        // Single-mesh Go2 fallback: same world placement, on the robot pipeline.
+        let mesh_u = RobotModelUniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            model: self.robot_model.to_cols_array_2d(),
+            normal_mat: normal_matrix(&self.robot_model).to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.mesh_uniform_buffer, 0, bytemuck::bytes_of(&mesh_u));
+
         // Articulated robot: forward kinematics from the body pose down the tree,
         // writing each link's per-frame model uniform (view_proj + world transform).
         self.update_robot_links(&view_proj);
@@ -565,9 +638,10 @@ impl State {
             link_world.push(world);
 
             let model = world * link.visual_origin;
-            let u = ModelUniforms {
+            let u = RobotModelUniforms {
                 view_proj: vp,
                 model: model.to_cols_array_2d(),
+                normal_mat: normal_matrix(&model).to_cols_array_2d(),
             };
             self.queue
                 .write_buffer(&link.uniform_buffer, 0, bytemuck::bytes_of(&u));
@@ -638,7 +712,7 @@ impl State {
             // visible even if the URDF/mesh load failed.
             if self.robot_visible {
                 if !self.robot_links.is_empty() {
-                    pass.set_pipeline(&self.colored_pipeline);
+                    pass.set_pipeline(&self.robot_pipeline);
                     for link in &self.robot_links {
                         if link.index_count == 0 {
                             continue;
@@ -654,8 +728,8 @@ impl State {
                 } else {
                     match (self.mesh_buffer.as_ref(), self.mesh_index_buffer.as_ref()) {
                         (Some(vbuf), Some(ibuf)) if self.mesh_index_count > 0 => {
-                            pass.set_pipeline(&self.colored_pipeline);
-                            pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                            pass.set_pipeline(&self.robot_pipeline);
+                            pass.set_bind_group(0, &self.mesh_bind_group, &[]);
                             pass.set_vertex_buffer(0, vbuf.slice(..));
                             pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
@@ -821,7 +895,7 @@ impl State {
     // replacing the box marker. Reuses the colored pipeline + robot bind group, so the
     // mesh follows the pose via `robot_model` exactly like the box. Indexed to keep the
     // upload compact.
-    fn install_robot_mesh(&mut self, vertices: &[SolidVertex], indices: &[u32]) {
+    fn install_robot_mesh(&mut self, vertices: &[RobotVertex], indices: &[u32]) {
         if vertices.is_empty() || indices.is_empty() {
             return;
         }
@@ -855,7 +929,7 @@ impl State {
     fn build_robot_links(
         &mut self,
         urdf: &[UrdfLink],
-        meshes: &HashMap<String, (Vec<SolidVertex>, Vec<u32>)>,
+        meshes: &HashMap<String, (Vec<RobotVertex>, Vec<u32>)>,
     ) -> bool {
         // Resolve link name -> URDF index and verify a single root (parent None).
         let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
@@ -954,13 +1028,13 @@ impl State {
                 });
             let ubuf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("go2-link-uniforms"),
-                size: std::mem::size_of::<ModelUniforms>() as u64,
+                size: std::mem::size_of::<RobotModelUniforms>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("go2-link-bg"),
-                layout: &self.model_bind_group_layout,
+                layout: &self.robot_model_bind_group_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: ubuf.as_entire_binding(),
@@ -1437,6 +1511,88 @@ pub async fn init_voxel_view(
         multiview: None,
     });
 
+    // --- Dedicated robot-mesh pipeline (positions + normals + color) ---
+    let robot_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("robot-shader"),
+        source: wgpu::ShaderSource::Wgsl(ROBOT_SHADER_SRC.into()),
+    });
+    let robot_model_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("robot-model-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let robot_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("robot-pl"),
+        bind_group_layouts: &[&robot_model_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let robot_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("robot-pipeline"),
+        layout: Some(&robot_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &robot_shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<RobotVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &robot_shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let mesh_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("go2-mesh-uniforms"),
+        size: std::mem::size_of::<RobotModelUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mesh_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("go2-mesh-bg"),
+        layout: &robot_model_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: mesh_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
     let world_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("world-uniforms"),
         size: std::mem::size_of::<ModelUniforms>() as u64,
@@ -1511,6 +1667,8 @@ pub async fn init_voxel_view(
         instance_count: 0,
         colored_pipeline,
         line_pipeline,
+        robot_pipeline,
+        robot_model_bind_group_layout,
         world_uniform_buffer,
         world_bind_group,
         robot_uniform_buffer,
@@ -1525,8 +1683,9 @@ pub async fn init_voxel_view(
         mesh_buffer: None,
         mesh_index_buffer: None,
         mesh_index_count: 0,
+        mesh_uniform_buffer,
+        mesh_bind_group,
         robot_links: Vec::new(),
-        model_bind_group_layout,
         joint_angles: [0.0; 12],
         depth_view,
         camera,
@@ -2060,12 +2219,12 @@ fn fallback_link_color(link_name: &str) -> [f32; 3] {
 fn parse_glb_mesh_colored(
     bytes: &[u8],
     fallback_color: [f32; 3],
-) -> Result<(Vec<SolidVertex>, Vec<u32>), String> {
+) -> Result<(Vec<RobotVertex>, Vec<u32>), String> {
     let document = gltf::Gltf::from_slice(bytes).map_err(|e| format!("gltf parse: {e}"))?;
     let bin = document.blob.as_deref().unwrap_or(&[]);
     let buffers: Vec<&[u8]> = vec![bin];
 
-    let mut vertices: Vec<SolidVertex> = Vec::new();
+    let mut vertices: Vec<RobotVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     for scene in document.scenes() {
         for node in scene.nodes() {
@@ -2092,11 +2251,14 @@ fn accumulate_node_colored(
     parent: Mat4,
     buffers: &[&[u8]],
     fallback_color: [f32; 3],
-    vertices: &mut Vec<SolidVertex>,
+    vertices: &mut Vec<RobotVertex>,
     indices: &mut Vec<u32>,
 ) {
     let local = Mat4::from_cols_array_2d(&node.transform().matrix());
     let world = parent * local;
+    // Normals transform by the inverse-transpose of the upper-3×3; for the Go2's
+    // rigid node transforms that equals the rotation part, which we apply directly.
+    let normal_world = normal_matrix(&world);
 
     if let Some(mesh) = node.mesh() {
         for prim in mesh.primitives() {
@@ -2109,28 +2271,72 @@ fn accumulate_node_colored(
             let color = fallback_color;
 
             let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
-            let positions = match reader.read_positions() {
-                Some(p) => p,
+            let positions: Vec<[f32; 3]> = match reader.read_positions() {
+                Some(p) => p.collect(),
                 None => continue,
             };
-            let start = vertices.len() as u32;
-            for p in positions {
-                let wp = world.transform_point3(Vec3::from_array(p));
-                vertices.push(SolidVertex {
-                    position: wp.to_array(),
-                    color,
-                });
-            }
-            match reader.read_indices() {
-                Some(idx) => {
-                    for i in idx.into_u32() {
-                        indices.push(start + i);
+            // World-space positions for this primitive.
+            let world_pos: Vec<Vec3> = positions
+                .iter()
+                .map(|p| world.transform_point3(Vec3::from_array(*p)))
+                .collect();
+            // The primitive's triangle index list (the synthesized 0..n when the
+            // primitive is non-indexed).
+            let tri_idx: Vec<u32> = match reader.read_indices() {
+                Some(idx) => idx.into_u32().collect(),
+                None => (0..world_pos.len() as u32).collect(),
+            };
+
+            // Real per-vertex normals from the glTF are the source of smooth shading.
+            // When absent we split each triangle into three fresh vertices carrying
+            // that face's normal, so the fallback is genuinely FLAT shaded (shared
+            // indexed corners would otherwise average into smooth shading).
+            match reader.read_normals() {
+                Some(norm_it) => {
+                    let normals: Vec<[f32; 3]> = norm_it.collect();
+                    let start = vertices.len() as u32;
+                    for (i, wp) in world_pos.iter().enumerate() {
+                        let raw = normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                        let n = normal_world
+                            .transform_vector3(Vec3::from_array(raw))
+                            .normalize_or_zero();
+                        vertices.push(RobotVertex {
+                            position: wp.to_array(),
+                            normal: if n.length_squared() > 0.0 {
+                                n.to_array()
+                            } else {
+                                [0.0, 0.0, 1.0]
+                            },
+                            color,
+                        });
+                    }
+                    for i in &tri_idx {
+                        indices.push(start + *i);
                     }
                 }
                 None => {
-                    let added = vertices.len() as u32 - start;
-                    for i in 0..added {
-                        indices.push(start + i);
+                    let mut t = 0;
+                    while t + 3 <= tri_idx.len() {
+                        let a = tri_idx[t] as usize;
+                        let b = tri_idx[t + 1] as usize;
+                        let c = tri_idx[t + 2] as usize;
+                        let (pa, pb, pc) = (world_pos[a], world_pos[b], world_pos[c]);
+                        let fn_ = (pb - pa).cross(pc - pa).normalize_or_zero();
+                        let n = if fn_.length_squared() > 0.0 {
+                            fn_.to_array()
+                        } else {
+                            [0.0, 0.0, 1.0]
+                        };
+                        for p in [pa, pb, pc] {
+                            let base = vertices.len() as u32;
+                            vertices.push(RobotVertex {
+                                position: p.to_array(),
+                                normal: n,
+                                color,
+                            });
+                            indices.push(base);
+                        }
+                        t += 3;
                     }
                 }
             }
@@ -2141,6 +2347,19 @@ fn accumulate_node_colored(
         accumulate_node_colored(&child, world, buffers, fallback_color, vertices, indices);
     }
 }
+
+// World-space normal matrix for a model transform. Go2 joints/visual origins are
+// rigid (rotation + translation, no scale/shear), so the upper-3×3 is orthonormal
+// and is itself the correct normal transform; we just zero the translation column.
+fn normal_matrix(model: &Mat4) -> Mat4 {
+    let mut m = *model;
+    m.w_axis = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+    m.x_axis.w = 0.0;
+    m.y_axis.w = 0.0;
+    m.z_axis.w = 0.0;
+    m
+}
+
 
 // Fetch the URDF + every referenced per-link glb and build the articulated robot
 // on `state`. Returns true on success (at least one renderable link installed). On
@@ -2186,7 +2405,7 @@ async fn load_articulated_robot(state: &Rc<RefCell<State>>) -> bool {
     // revolute joint whose link mesh is missing (its descendants would then pose
     // incorrectly). On any failure we abort the articulated path so the caller uses
     // the single go2_full.glb fallback instead.
-    let mut meshes: HashMap<String, (Vec<SolidVertex>, Vec<u32>)> = HashMap::new();
+    let mut meshes: HashMap<String, (Vec<RobotVertex>, Vec<u32>)> = HashMap::new();
     for (part, color) in &part_color {
         let url = format!("{GO2_ASSET_BASE}{part}.glb");
         let bytes = match fetch_bytes(&url).await {
@@ -2219,7 +2438,7 @@ async fn load_articulated_robot(state: &Rc<RefCell<State>>) -> bool {
 // node's world transform), indices are offset and concatenated. Materials and
 // textures are intentionally ignored — the body renders flat. Returns the merged
 // (vertices, indices) or an error if the file has no usable triangle geometry.
-fn parse_glb_mesh(bytes: &[u8]) -> Result<(Vec<SolidVertex>, Vec<u32>), String> {
+fn parse_glb_mesh(bytes: &[u8]) -> Result<(Vec<RobotVertex>, Vec<u32>), String> {
     // Gltf::from_slice parses the glb container and exposes its binary chunk as
     // `blob`; that single embedded buffer holds all buffer data for a self-contained
     // file, so map it to the one internal buffer the primitive reader expects.
@@ -2227,14 +2446,22 @@ fn parse_glb_mesh(bytes: &[u8]) -> Result<(Vec<SolidVertex>, Vec<u32>), String> 
     let bin = document.blob.as_deref().unwrap_or(&[]);
     let buffers: Vec<&[u8]> = vec![bin];
 
-    let mut vertices: Vec<SolidVertex> = Vec::new();
+    let mut vertices: Vec<RobotVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    // Walk every node in every scene and accumulate world-space geometry so a model
-    // built from several nodes/primitives merges into one mesh.
+    // Walk every node in every scene and accumulate world-space geometry (with real
+    // normals) so a model built from several nodes/primitives merges into one mesh.
+    // The single-mesh fallback uses one flat body color for all primitives.
     for scene in document.scenes() {
         for node in scene.nodes() {
-            accumulate_node(&node, Mat4::IDENTITY, &buffers, &mut vertices, &mut indices);
+            accumulate_node_colored(
+                &node,
+                Mat4::IDENTITY,
+                &buffers,
+                GO2_MESH_COLOR,
+                &mut vertices,
+                &mut indices,
+            );
         }
     }
 
@@ -2242,59 +2469,6 @@ fn parse_glb_mesh(bytes: &[u8]) -> Result<(Vec<SolidVertex>, Vec<u32>), String> 
         return Err("glb contained no triangle geometry".to_string());
     }
     Ok((vertices, indices))
-}
-
-// Recursively append a node's mesh primitives (and its children) to the merged
-// vertex/index buffers, applying the cumulative world transform.
-fn accumulate_node(
-    node: &gltf::Node,
-    parent: Mat4,
-    buffers: &[&[u8]],
-    vertices: &mut Vec<SolidVertex>,
-    indices: &mut Vec<u32>,
-) {
-    let local = Mat4::from_cols_array_2d(&node.transform().matrix());
-    let world = parent * local;
-
-    if let Some(mesh) = node.mesh() {
-        for prim in mesh.primitives() {
-            // Only triangle lists carry renderable body geometry here.
-            if prim.mode() != gltf::mesh::Mode::Triangles {
-                continue;
-            }
-            let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
-            let positions = match reader.read_positions() {
-                Some(p) => p,
-                None => continue,
-            };
-            let base = vertices.len() as u32;
-            for p in positions {
-                let wp = world.transform_point3(Vec3::from_array(p));
-                vertices.push(SolidVertex {
-                    position: wp.to_array(),
-                    color: GO2_MESH_COLOR,
-                });
-            }
-            match reader.read_indices() {
-                Some(idx) => {
-                    for i in idx.into_u32() {
-                        indices.push(base + i);
-                    }
-                }
-                // Non-indexed primitive: emit a sequential index per appended vertex.
-                None => {
-                    let added = vertices.len() as u32 - base;
-                    for i in 0..added {
-                        indices.push(base + i);
-                    }
-                }
-            }
-        }
-    }
-
-    for child in node.children() {
-        accumulate_node(&child, world, buffers, vertices, indices);
-    }
 }
 
 fn request_animation_frame(cb: &Closure<dyn FnMut()>) -> i32 {
