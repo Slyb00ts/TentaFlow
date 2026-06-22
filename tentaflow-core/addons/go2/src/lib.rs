@@ -780,6 +780,10 @@ std::thread_local! {
 
 const LIDAR_TOPIC: &str = "rt/utlidar/voxel_map_compressed";
 const LIDAR_SWITCH_TOPIC: &str = "rt/utlidar/switch";
+// Lidar-derived robot odometry pose (position + orientation quaternion). Unlike
+// `rt/sportmodestate` (not published over WebRTC on this firmware), go2_ros2_sdk
+// sources its /odom from this topic, so it should carry world pose on the Air too.
+const POSE_TOPIC: &str = "rt/utlidar/robot_pose";
 // Upstream decoder buffers the decompressed occupancy grid at exactly 80_000 bytes
 // (go2_webrtc_connect `decompressBuffer`). The grid addresses z*0x800 + y*0x10 +
 // x_byte: z-stride 0x800 (2048), y-stride 0x10 (16), 16 x-bytes => 128 x-voxels.
@@ -870,6 +874,8 @@ std::thread_local! {
     // declared src_size EXACTLY ONCE per worker, confirming the (2,0) auto-detect
     // picked the correct boundary on real firmware without flooding the stream.
     static VOXEL_FRAMING_LOGGED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    // Throttle counter for the robot_pose probe log.
+    static POSE_LOG: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
     // DIAGNOSTIC (R2 / 0e-live probe): distinct WebRTC topics seen this session +
     // one-shot lowstate-shape dump. Tells us what data is actually available over
     // WebRTC (joints? position?) so we know whether option-B pose is possible here.
@@ -1506,6 +1512,39 @@ fn json_f64_array(v: Option<&JsonValue>) -> Vec<f64> {
     out
 }
 
+/// Probe handler for `rt/utlidar/robot_pose`: parse the world pose
+/// (`data.pose.position` {x,y,z} + `data.pose.orientation` {x,y,z,w}) and log it
+/// throttled. Confirms whether the Go2 Air actually streams pose over WebRTC
+/// (go2_ros2_sdk sources /odom from this topic) and whether it tracks motion,
+/// before wiring odometry + map accumulation.
+fn ingest_robot_pose(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    let pose = data.get("pose").unwrap_or(data);
+    let getf = |o: Option<&JsonValue>, k: &str| {
+        o.and_then(|m| m.get(k)).and_then(JsonValue::as_f64)
+    };
+    let pos = pose.get("position");
+    let ori = pose.get("orientation");
+    let (px, py, pz) = (getf(pos, "x"), getf(pos, "y"), getf(pos, "z"));
+    if px.is_none() && py.is_none() && pz.is_none() {
+        return;
+    }
+    let (ox, oy, oz, ow) = (getf(ori, "x"), getf(ori, "y"), getf(ori, "z"), getf(ori, "w"));
+    POSE_LOG.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        // ~1 in 25 frames keeps the log readable while still showing motion.
+        if n % 25 == 1 {
+            log::info(&alloc::format!(
+                "go2 DIAG robot_pose: pos=({px:?},{py:?},{pz:?}) quat=({ox:?},{oy:?},{oz:?},{ow:?})"
+            ));
+        }
+    });
+}
+
 /// Parse a `rt/sportmodestate` message body into the latest-telemetry snapshot,
 /// overwriting ONLY the fields actually present (an absent field keeps the prior
 /// value rather than clobbering it to None — the stream sometimes omits sub-blocks
@@ -2043,6 +2082,7 @@ fn tick() {
                                 Ok(true) => {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
+                                    let _ = wc_send_text(&robot.channel_id, &subscribe_msg(POSE_TOPIC));
                                     // Go2 only starts publishing the camera RTP after this
                                     // app-level command; the recvonly transceiver alone is silent.
                                     if !cam_id.is_empty() {
@@ -2218,6 +2258,10 @@ fn tick() {
                         // High-rate motion/IMU stream: keep only the latest values
                         // in memory; never advertise at this raw rate.
                         ingest_sportmodestate(raw);
+                    } else if find_sub(raw, b"robot_pose", 0).is_some() {
+                        // Lidar-derived world pose (probe: confirm the Air streams it
+                        // and whether it tracks motion before wiring odometry/mapping).
+                        ingest_robot_pose(raw);
                     }
                 }
                 // Telemetry watchdog FIRST: record real lowstate receipt before any
