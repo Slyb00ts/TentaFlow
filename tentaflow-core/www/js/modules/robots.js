@@ -184,12 +184,16 @@ const PAD_AXIS_DEADZONE = 0.3;
 // owner / mesh control plane. Matches the "~10 Hz" continuous-move budget.
 const PAD_MOVE_INTERVAL_MS = 100;
 
-// Speed gears (m/s) cycled by the gear button / tf-select. The active gear is the
-// CAP the time-ramp climbs toward; the owner re-clamps to its own safety cap.
-const PAD_SPEED_GEARS = [0.2, 0.35, 0.6];
+// Continuous max-speed (m/s) bounds. The active max is the CAP the time-ramp
+// climbs toward; the owner re-clamps to its own safety cap. Gamepad buttons 4/5
+// and the UI +/- nudge it by PAD_SPEED_STEP within [PAD_SPEED_MIN, PAD_SPEED_MAX].
+const PAD_SPEED_MIN = 0.1;
+const PAD_SPEED_MAX = 1.0;
+const PAD_SPEED_STEP = 0.1;
+const PAD_SPEED_DEFAULT = 0.3;
 
 // Time-ramp: while a direction is held the speed climbs from this floor up to the
-// active gear cap over PAD_RAMP_TIME_MS, so holding longer = faster from a digital
+// current max over PAD_RAMP_TIME_MS, so holding longer = faster from a digital
 // (on/off) lever. Returning to neutral resets the ramp to the floor.
 const PAD_SPEED_FLOOR = 0.12;
 const PAD_RAMP_TIME_MS = 1000;
@@ -203,23 +207,31 @@ const PAD_BUTTONS = {
   standUp: 3,     // Y / north — stand up / recover
   lieDown: 0,     // A / south — lie down / sit
   hello: 2,       // X / west — hello wave
-  gearCycle: 9,   // start — cycle to the next speed gear
+  speedDown: 4,   // gamepad button INDEX 4 — decrease max speed by PAD_SPEED_STEP
+  speedUp: 5,     // gamepad button INDEX 5 — increase max speed by PAD_SPEED_STEP
 };
 
 // Standard-gamepad d-pad button indices (when the lever surfaces as buttons, not
 // axes). Up/Down/Left/Right.
 const PAD_DPAD = { up: 12, down: 13, left: 14, right: 15 };
 
-// Per-detail gamepad runtime. Exists only while a detail is open AND the pad
-// toggle is ON. Mirrors the lidar loop lifecycle: every start has a matching stop,
-// so the rAF loop + listeners never leak past detail close / unmount.
+// Per-detail gamepad runtime. Exists only while a detail is open AND the pad is
+// enabled. Mirrors the lidar loop lifecycle: every start has a matching stop, so
+// the rAF loop + listeners never leak past detail close / unmount.
 // Shape: { enabled, rafId, rampStartMs, rampActive, lastMoveAtMs, lastMoveZero,
 //          prevButtons:Set, connected, padId, lastAxes:number[], lastButtons:number[] }
 let padState = null;
 
-// Active speed-gear index, kept OUTSIDE padState so a gear chosen before enabling
-// the pad (or across a toggle off/on) survives — padState is destroyed on stop.
-let padGearIndex = 0;
+// Whether the pad is ON. Default true (DEFAULT ENABLED): the loop auto-starts when
+// a detail opens; the toggle can turn it OFF and that off state persists while the
+// detail stays open. Kept OUTSIDE padState so it survives the loop being destroyed.
+let padEnabled = true;
+
+// Current continuous max-speed (m/s) the time-ramp climbs toward. Adjusted by
+// gamepad buttons 4/5 and the UI +/- in PAD_SPEED_STEP increments, clamped to
+// [PAD_SPEED_MIN, PAD_SPEED_MAX]. Kept at module level so it survives a toggle
+// off/on and the loop being destroyed.
+let padMaxSpeed = PAD_SPEED_DEFAULT;
 
 const RobotsScreen = {
   get title() { return 'Roboty'; },
@@ -246,6 +258,9 @@ const RobotsScreen = {
     stopLidarLoop();
     disposeVoxel();
     stopPadLoop();
+    // Pad is ON by default for the next visit; a toggle-off must not leak across a
+    // full screen unmount. padMaxSpeed intentionally persists as a user preference.
+    padEnabled = true;
     robots = [];
     inFlightRefresh = false;
     cardEls = new Map();
@@ -440,6 +455,10 @@ function openDetail(id) {
   cardEls = new Map();
   detailLog = [];
   renderActiveView();
+  // The pad runs at the DETAIL level (across ALL tabs), not just Sterowanie, so the
+  // user can watch the camera/lidar while steering. Start it here when enabled; the
+  // loop self-gates (only actuates when armed: enabled + detail open + online).
+  if (padEnabled) startPadLoop(id);
 }
 
 // Returns to the list view, closing the detail's subscriptions + voxel view.
@@ -456,6 +475,9 @@ function closeDetail() {
   stopLidarLoop();
   disposeVoxel();
   stopPadLoop();
+  // Pad is ON by default for each freshly opened detail; a per-session toggle-off
+  // does not carry across to a different robot. padMaxSpeed intentionally persists.
+  padEnabled = true;
 }
 
 // =============================================================================
@@ -984,9 +1006,10 @@ function renderDetailPanel(shell, tabId) {
   // the visible surface holds a GPU context.
   if (tabId !== 'overview' && tabId !== 'lidar') disposeVoxel();
 
-  // The gamepad loop lives only on the Sterowanie tab; leaving it stops the rAF
-  // loop + listeners so nothing polls in the background.
-  if (tabId !== 'control') stopPadLoop();
+  // The gamepad loop runs at the DETAIL level (every tab), NOT just Sterowanie, so
+  // switching tabs must NOT stop it — it is started in openDetail and stopped only
+  // in closeDetail / unmount. The Pad UI/readout live in the Sterowanie tab; the
+  // readout only updates when that section is present in the DOM.
 
   panel.innerHTML = '';
 
@@ -1131,7 +1154,7 @@ function mountCameraTile(host, r, full) {
   host.classList.remove('robots-tile-empty');
   const h = full ? 520 : 280;
   host.innerHTML = `
-    <div class="robots-tile-top"><span class="robots-tile-title">Kamera</span><span class="robots-tile-rec">● na żywo</span></div>
+    <div class="robots-tile-top"><span class="robots-tile-title">Kamera</span><span class="robots-tile-rec">● na żywo</span><span class="robots-speed-badge" data-speed-badge>—</span></div>
     <tf-video-stream stream-id="camera:${escapeAttr(cam)}" label="${escapeAttr(id)}" height-px="${h}"></tf-video-stream>
     <div class="robots-tile-bottom">
       <tf-button variant="outline" size="sm" icon="image" data-share-camera="${escapeAttr(cam)}" data-robot="${escapeAttr(id)}">Dodaj do TentaVision</tf-button>
@@ -1140,6 +1163,7 @@ function mountCameraTile(host, r, full) {
     const btn = e.currentTarget;
     handleShareCamera(btn.dataset.robot, btn.dataset.shareCamera, btn);
   });
+  updateSpeedOverlays();
 }
 
 // Keyed camera reconcile across polls: rebuild the tile (and its live MSE element)
@@ -1179,6 +1203,7 @@ function mountLidarTile(host, r) {
     <div class="robots-tile-top">
       <span class="robots-tile-title">LiDAR — głębia</span>
       <span class="robots-tile-rec" data-lidar-rec>● —</span>
+      <span class="robots-speed-badge" data-speed-badge>—</span>
     </div>
     <div class="robots-voxel" data-field="voxel">
       <div class="robots-voxel-ph" data-voxel-ph>renderer się uruchamia…</div>
@@ -1197,6 +1222,7 @@ function mountLidarTile(host, r) {
   });
 
   updateLidarTile(host, r);
+  updateSpeedOverlays();
   // Kick off the voxel renderer for the now-visible canvas.
   ensureVoxel(host.querySelector('[data-field="voxel"]'));
 }
@@ -2146,11 +2172,12 @@ async function handleLidarToggle(id, on, toggle) {
 // Gamepad (browser controller) — Pad / Kontroler section in the Sterowanie tab
 // =============================================================================
 
-// Builds the "Pad / Kontroler" UI: an enable toggle, a speed-gear select, and a
-// LIVE RAW READOUT (connection status, gamepad id, every axis value, pressed
-// button indices) so we can see exactly what the arcade stick reports. The rAF
-// poll loop is owned by startPadLoop/stopPadLoop; this only renders the UI and
-// binds the toggle/gear controls.
+// Builds the "Pad / Kontroler" UI: an enable toggle (ON by default), a continuous
+// max-speed control (value chip + +/- buttons, primary path is gamepad buttons
+// 4/5), and a LIVE RAW READOUT (connection status, gamepad id, every axis value,
+// pressed button indices) so we can see exactly what the arcade stick reports. The
+// rAF poll loop is owned by startPadLoop/stopPadLoop; this only renders the UI and
+// binds the toggle/speed controls.
 function buildPadSection(host, r) {
   if (!host) return;
   const id = robotId(r);
@@ -2161,13 +2188,18 @@ function buildPadSection(host, r) {
         <tf-toggle data-pad-toggle></tf-toggle>
         <span class="robots-pad-label">Sterowanie padem</span>
         <span class="robots-pad-spacer"></span>
-        <tf-select data-pad-gear label="Bieg prędkości"></tf-select>
-        <tf-button variant="outline" size="sm" icon="zap" data-pad-gear-cycle>Następny bieg</tf-button>
+        <div class="robots-pad-speed">
+          <span class="robots-pad-speed-lbl">Maks. prędkość</span>
+          <tf-button variant="outline" size="sm" data-pad-speed-down aria-label="Zmniejsz prędkość">−</tf-button>
+          <span class="robots-pad-speed-val" data-pad-speed-val>—</span>
+          <tf-button variant="outline" size="sm" icon="plus" data-pad-speed-up aria-label="Zwiększ prędkość"></tf-button>
+        </div>
       </div>
       <div class="robots-pad-hint">
         Ruch: góra/dół = przód/tył, lewo/prawo = obrót. Przytrzymanie kierunku
-        płynnie rozpędza robota (rampa do wybranego biegu). Przyciski: E-STOP,
-        Wstań, Połóż się, Hello, następny bieg.
+        płynnie rozpędza robota (rampa do maks. prędkości). Przyciski na padzie:
+        E-STOP, Wstań, Połóż się, Hello, a przyciski 4/5 zmieniają maks. prędkość
+        o ${PAD_SPEED_STEP.toFixed(1)} m/s.
       </div>
       <div class="robots-pad-readout" data-pad-readout>
         <div class="robots-pad-conn" data-pad-conn>
@@ -2175,7 +2207,7 @@ function buildPadSection(host, r) {
         </div>
         <dl class="robots-kv robots-pad-kv">
           <dt>Urządzenie</dt><dd data-pad-rd-id>—</dd>
-          <dt>Bieg</dt><dd data-pad-rd-gear>—</dd>
+          <dt>Maks. prędkość</dt><dd data-pad-rd-max>—</dd>
           <dt>Prędkość (rampa)</dt><dd data-pad-rd-speed>—</dd>
           <dt>Osie</dt><dd data-pad-rd-axes>—</dd>
           <dt>Wciśnięte przyciski</dt><dd data-pad-rd-buttons>—</dd>
@@ -2183,49 +2215,53 @@ function buildPadSection(host, r) {
       </div>
     </div>`;
 
-  const gear = host.querySelector('[data-pad-gear]');
-  gear.setOptions(
-    PAD_SPEED_GEARS.map((v, i) => ({ value: String(i), label: `${v.toFixed(2)} m/s` })),
-    String(currentGearIndex()),
-  );
-  gear.addEventListener('change', (e) => {
-    const idx = Number(e?.detail?.value ?? gear.value);
-    if (Number.isInteger(idx) && idx >= 0 && idx < PAD_SPEED_GEARS.length) {
-      setGearIndex(idx);
-    }
-  });
-
-  host.querySelector('[data-pad-gear-cycle]')?.addEventListener('click', () => {
-    cycleGear();
-    gear.value = String(currentGearIndex());
-    renderPadReadout();
-  });
+  host.querySelector('[data-pad-speed-down]')?.addEventListener('click', () => adjustMaxSpeed(-PAD_SPEED_STEP));
+  host.querySelector('[data-pad-speed-up]')?.addEventListener('click', () => adjustMaxSpeed(PAD_SPEED_STEP));
 
   const toggle = host.querySelector('[data-pad-toggle]');
   toggle.addEventListener('change', (e) => {
     const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
-    if (on) startPadLoop(id);
+    padEnabled = !!on;
+    if (padEnabled) startPadLoop(id);
     else stopPadLoop();
+    renderPadReadout();
   });
 
-  // Reflect any already-running loop (e.g. returning to the tab is a fresh build,
-  // but the loop is stopped on tab leave, so this is normally OFF).
-  if (padState && padState.enabled) toggle.setAttribute('checked', '');
+  // Reflect the persisted enabled state (ON by default; OFF persists while open).
+  if (padEnabled) toggle.setAttribute('checked', '');
 
+  syncSpeedUi();
+}
+
+// Nudges the continuous max-speed by `delta` m/s, clamped to [MIN, MAX] and snapped
+// to the PAD_SPEED_STEP grid so float drift can't accumulate. Refreshes the readout
+// and the camera/lidar speed overlays so the displayed value tracks live.
+function adjustMaxSpeed(delta) {
+  const next = Math.round((padMaxSpeed + delta) / PAD_SPEED_STEP) * PAD_SPEED_STEP;
+  padMaxSpeed = Math.min(PAD_SPEED_MAX, Math.max(PAD_SPEED_MIN, Number(next.toFixed(2))));
+  syncSpeedUi();
+}
+
+// Pushes the current max-speed everywhere it is shown: the Pad readout (if open),
+// the Pad +/- value chip, and the camera/lidar speed overlays.
+function syncSpeedUi() {
   renderPadReadout();
+  updateSpeedOverlays();
+  const shell = byId('robots-detail');
+  const valEl = shell?.querySelector('[data-pad-speed-val]');
+  if (valEl) valEl.textContent = `${padMaxSpeed.toFixed(2)} m/s`;
 }
 
-function currentGearIndex() {
-  return padGearIndex;
-}
-
-function setGearIndex(idx) {
-  padGearIndex = idx;
-  renderPadReadout();
-}
-
-function cycleGear() {
-  padGearIndex = (padGearIndex + 1) % PAD_SPEED_GEARS.length;
+// Writes the current max-speed into every speed badge overlaid on the open detail's
+// media tiles (camera + lidar, on the Przegląd tiles and the full-size tabs). The
+// badges only exist while a media tile is mounted; missing badges are skipped.
+function updateSpeedOverlays() {
+  const shell = byId('robots-detail');
+  if (!shell) return;
+  const text = `${padMaxSpeed.toFixed(2)} m/s`;
+  shell.querySelectorAll('[data-speed-badge]').forEach((el) => {
+    el.textContent = text;
+  });
 }
 
 // Starts the rAF poll loop + connect/disconnect listeners (idempotent). The loop
@@ -2400,9 +2436,12 @@ function handlePadMovement(pad) {
 
   if (now - padState.lastMoveAtMs < PAD_MOVE_INTERVAL_MS) return;
 
-  const cap = PAD_SPEED_GEARS[padGearIndex] ?? PAD_SPEED_GEARS[0];
+  // The ramp climbs from the floor to the current max; if the max is below the
+  // floor (min clamp), the floor itself is capped so we never exceed the max.
+  const cap = padMaxSpeed;
+  const floor = Math.min(PAD_SPEED_FLOOR, cap);
   const held = Math.min(1, (now - padState.rampStartMs) / PAD_RAMP_TIME_MS);
-  const speed = PAD_SPEED_FLOOR + (cap - PAD_SPEED_FLOOR) * held;
+  const speed = floor + (cap - floor) * held;
 
   const vx = fwd * speed;
   const vyaw = turn * speed;
@@ -2445,11 +2484,11 @@ function handlePadButtons(pad, r) {
     return true;
   }
 
-  if (rising('gearCycle')) {
-    cycleGear();
-    const gearSel = document.querySelector('[data-pad-gear]');
-    if (gearSel) gearSel.value = String(padGearIndex);
-  }
+  // Buttons 4/5 are the primary path for the continuous max-speed (rising-edge so a
+  // hold steps once per press). adjustMaxSpeed clamps and refreshes the readout +
+  // the camera/lidar speed overlays.
+  if (rising('speedDown')) adjustMaxSpeed(-PAD_SPEED_STEP);
+  if (rising('speedUp')) adjustMaxSpeed(PAD_SPEED_STEP);
 
   if (rising('standUp')) {
     const a = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
@@ -2516,7 +2555,7 @@ function renderPadReadout() {
 
   const conn = section.querySelector('[data-pad-conn]');
   const idEl = section.querySelector('[data-pad-rd-id]');
-  const gearEl = section.querySelector('[data-pad-rd-gear]');
+  const maxEl = section.querySelector('[data-pad-rd-max]');
   const speedEl = section.querySelector('[data-pad-rd-speed]');
   const axesEl = section.querySelector('[data-pad-rd-axes]');
   const buttonsEl = section.querySelector('[data-pad-rd-buttons]');
@@ -2539,16 +2578,14 @@ function renderPadReadout() {
 
   if (idEl) idEl.textContent = padState && padState.padId ? padState.padId : '—';
 
-  const gearIdx = padGearIndex;
-  if (gearEl) {
-    gearEl.textContent = `${(PAD_SPEED_GEARS[gearIdx] ?? PAD_SPEED_GEARS[0]).toFixed(2)} m/s (#${gearIdx + 1})`;
-  }
+  if (maxEl) maxEl.textContent = `${padMaxSpeed.toFixed(2)} m/s`;
 
   if (speedEl) {
     if (padState && padState.rampActive) {
-      const cap = PAD_SPEED_GEARS[gearIdx] ?? PAD_SPEED_GEARS[0];
+      const cap = padMaxSpeed;
+      const floor = Math.min(PAD_SPEED_FLOOR, cap);
       const held = Math.min(1, (performance.now() - padState.rampStartMs) / PAD_RAMP_TIME_MS);
-      const speed = PAD_SPEED_FLOOR + (cap - PAD_SPEED_FLOOR) * held;
+      const speed = floor + (cap - floor) * held;
       speedEl.textContent = `${speed.toFixed(2)} m/s (${Math.round(held * 100)} %)`;
     } else {
       speedEl.textContent = 'neutralnie';
