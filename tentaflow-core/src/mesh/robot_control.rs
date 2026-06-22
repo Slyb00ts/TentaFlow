@@ -90,6 +90,12 @@ pub enum RobotAction {
     LidarOn,
     /// Disable the LiDAR sensor.
     LidarOff,
+    /// Enable on-board obstacle avoidance. When active the robot autonomously
+    /// avoids obstacles and may refuse manual turns — an actuator toggle, so it
+    /// needs `robot.command`.
+    ObstacleAvoidOn,
+    /// Disable on-board obstacle avoidance (manual-driving default).
+    ObstacleAvoidOff,
     /// Read-only fetch of the latest decoded LiDAR frame (points + metadata) for an
     /// on-demand renderer. Reports state only, never moves hardware.
     LidarFrame,
@@ -163,6 +169,8 @@ impl RobotAction {
             "status" => RobotAction::Status,
             "lidar_on" => RobotAction::LidarOn,
             "lidar_off" => RobotAction::LidarOff,
+            "obstacle_avoid_on" => RobotAction::ObstacleAvoidOn,
+            "obstacle_avoid_off" => RobotAction::ObstacleAvoidOff,
             "lidar_frame" => RobotAction::LidarFrame,
             _ => return None,
         })
@@ -219,6 +227,8 @@ impl RobotAction {
             RobotAction::Status => "Status",
             RobotAction::LidarOn => "LidarOn",
             RobotAction::LidarOff => "LidarOff",
+            RobotAction::ObstacleAvoidOn => "ObstacleAvoidOn",
+            RobotAction::ObstacleAvoidOff => "ObstacleAvoidOff",
             RobotAction::LidarFrame => "LidarFrame",
         }
     }
@@ -372,6 +382,8 @@ impl RobotAction {
             RobotAction::Status => tool("go2.status"),
             RobotAction::LidarOn => tool("go2.lidar_on"),
             RobotAction::LidarOff => tool("go2.lidar_off"),
+            RobotAction::ObstacleAvoidOn => tool("go2.obstacle_avoid_on"),
+            RobotAction::ObstacleAvoidOff => tool("go2.obstacle_avoid_off"),
             RobotAction::LidarFrame => tool("go2.lidar_frame"),
         }
     }
@@ -733,6 +745,8 @@ mod tests {
             ("status", RobotAction::Status),
             ("lidar_on", RobotAction::LidarOn),
             ("lidar_off", RobotAction::LidarOff),
+            ("obstacle_avoid_on", RobotAction::ObstacleAvoidOn),
+            ("obstacle_avoid_off", RobotAction::ObstacleAvoidOff),
             ("lidar_frame", RobotAction::LidarFrame),
         ];
         for (kind, want) in cases {
@@ -925,6 +939,10 @@ mod tests {
         assert_eq!(RobotAction::LidarFrame.required_permission(), "robot.telemetry");
         assert!(RobotAction::LidarFrame.is_read_only());
         assert!(!RobotAction::LidarOn.is_read_only());
+        // Obstacle-avoidance toggle is an actuator toggle → robot.command, never read-only.
+        assert_eq!(RobotAction::ObstacleAvoidOn.required_permission(), "robot.command");
+        assert_eq!(RobotAction::ObstacleAvoidOff.required_permission(), "robot.command");
+        assert!(!RobotAction::ObstacleAvoidOn.is_read_only());
     }
 
     #[test]
@@ -936,6 +954,8 @@ mod tests {
         assert_eq!(tool_of(RobotAction::LidarOn), "go2.lidar_on");
         assert_eq!(tool_of(RobotAction::LidarOff), "go2.lidar_off");
         assert_eq!(tool_of(RobotAction::LidarFrame), "go2.lidar_frame");
+        assert_eq!(tool_of(RobotAction::ObstacleAvoidOn), "go2.obstacle_avoid_on");
+        assert_eq!(tool_of(RobotAction::ObstacleAvoidOff), "go2.obstacle_avoid_off");
     }
 
     #[test]

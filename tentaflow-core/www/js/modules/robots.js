@@ -86,7 +86,12 @@ const LOG_MAX_ENTRIES = 200;
 // Kinds the control surface must NOT render as a button: read-only telemetry, the
 // camera tag, and the e-stop family (a dedicated, always-present STOP button owns
 // safety so it can't depend on advertised metadata).
-const NON_CONTROL_KINDS = new Set(['status', 'camera', 'estop', 'stop', 'reset_estop']);
+const NON_CONTROL_KINDS = new Set([
+  'status', 'camera', 'estop', 'stop', 'reset_estop',
+  // Obstacle avoidance is rendered as a dedicated toggle in buildControls, not a
+  // generic action button, so exclude it from the generic control surface.
+  'obstacle_avoid_on', 'obstacle_avoid_off',
+]);
 
 // Authoritative client-side set of known dangerous kinds. Defense-in-depth: the
 // confirm dialog is required if a kind is in this set REGARDLESS of advertised
@@ -1440,7 +1445,11 @@ function disposeVoxel() {
 function buildControls(host, r) {
   if (!host) return;
   const meta = actionsMeta(r);
-  const sig = controlsSignature(meta);
+  // Fold online state into the signature so a connect/reconnect rebuilds the panel.
+  // The addon forces obstacle avoidance OFF on every connect, so rebuilding resets
+  // the (non-authoritative) toggle to its unchecked default instead of leaving a
+  // stale ON from a previous session.
+  const sig = `${controlsSignature(meta)}|online:${isOnlineStatus(r.status || '') ? 1 : 0}`;
   if (host.dataset.controlsSig === sig) return;
   host.dataset.controlsSig = sig;
   host.innerHTML = '';
@@ -1470,11 +1479,85 @@ function buildControls(host, r) {
     host.appendChild(buildGroup('Akrobacje — wymagają potwierdzenia', acrobatic.map((a) => buildSimpleButton(id, a))));
   }
 
+  if (meta.some((a) => a.kind === 'obstacle_avoid_on')) {
+    host.appendChild(buildObstacleAvoidGroup(id));
+  }
+
   if (!host.children.length) {
     const ph = document.createElement('div');
     ph.className = 'robots-controls-empty';
     ph.textContent = 'Robot nie zgłasza żadnych sterowalnych akcji.';
     host.appendChild(ph);
+  }
+}
+
+// Dedicated obstacle-avoidance toggle, mirroring the LiDAR enable toggle. Default
+// UNCHECKED: the addon turns obstacle avoidance OFF on every connect (manual-driving
+// default), so the UI starts off too. Sends obstacle_avoid_on/off via the standard
+// robot control path.
+function buildObstacleAvoidGroup(id) {
+  const wrap = document.createElement('div');
+  wrap.className = 'robots-control-group';
+  wrap.innerHTML = `
+    <div class="robots-control-group-title">Omijanie przeszkód</div>
+    <div class="robots-pad-bar">
+      <tf-toggle data-obstacle-avoid-toggle></tf-toggle>
+      <span class="robots-pad-label">Autonomiczne omijanie przeszkód</span>
+    </div>
+    <div class="robots-pad-hint">
+      Wyłącz, aby robot mógł się obracać; włączone = robot sam unika przeszkód
+      (może blokować skręt).
+    </div>`;
+  const toggle = wrap.querySelector('[data-obstacle-avoid-toggle]');
+  toggle.addEventListener('change', (e) => {
+    const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
+    handleObstacleAvoidToggle(id, !!on, toggle);
+  });
+  return wrap;
+}
+
+// Reflect a boolean onto the obstacle-avoid toggle's `checked` attribute (same
+// programmatic-set pattern as the LiDAR/pad toggles).
+function setObstacleAvoidToggle(toggle, on) {
+  if (on) toggle.setAttribute('checked', '');
+  else toggle.removeAttribute('checked');
+}
+
+// Sends an obstacle-avoidance enable/disable through the standard robot control
+// path (obstacle_avoid_on / obstacle_avoid_off → go2.obstacle_avoid_on/off).
+// There is no obstacle-avoid status field on the robot (the addon forces it OFF on
+// every connect), so the toggle is non-authoritative: on any failed/rejected
+// command we revert it to its pre-click state so the displayed state never claims a
+// success that did not reach the robot.
+async function handleObstacleAvoidToggle(id, on, toggle) {
+  if (!id) return;
+  const prev = !on;
+  toggle.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.action('robotControlRequest', {
+      robotId: id,
+      kind: on ? 'obstacle_avoid_on' : 'obstacle_avoid_off',
+      vx: 0, vy: 0, vyaw: 0, p1: 0, p2: 0, p3: 0, p4: 0,
+    });
+    if (resp.ok) {
+      setObstacleAvoidToggle(toggle, on);
+      pushLog('success', `Omijanie przeszkód ${on ? 'włączone' : 'wyłączone'}`);
+      toast(`Omijanie przeszkód ${on ? 'włączone' : 'wyłączone'} ✓`, 'success');
+    } else if (resp.rejected) {
+      setObstacleAvoidToggle(toggle, prev);
+      pushLog('error', `Omijanie przeszkód odrzucone: ${resp.rejected}`);
+      toast(`Omijanie przeszkód: odrzucono — ${resp.rejected}`, 'error');
+    } else {
+      setObstacleAvoidToggle(toggle, prev);
+      pushLog('error', `Omijanie przeszkód błąd: ${resp.error || 'nieznany'}`);
+      toast(`Omijanie przeszkód: błąd — ${resp.error || 'nieznany'}`, 'error');
+    }
+  } catch (err) {
+    setObstacleAvoidToggle(toggle, prev);
+    pushLog('error', `Omijanie przeszkód: ${err.message}`);
+    toast(`Omijanie przeszkód: ${err.message}`, 'error');
+  } finally {
+    toggle.removeAttribute('disabled');
   }
 }
 
