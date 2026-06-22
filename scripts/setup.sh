@@ -1218,33 +1218,105 @@ install_android_gradle_runner() {
 
 # --- CUDA ---
 
+# Minimalna wersja CUDA dla najnowszych architektur Blackwell sm_100/sm_103
+# (B200/B300/GB300). 12.9 wprowadza sm_103; celujemy w 13.x. Dystrybucyjny
+# `nvidia-cuda-toolkit` (Ubuntu pakietuje 12.0/11.x) NIE zna sm_103 i wywala
+# build llama.cpp na `Unsupported gpu architecture 'compute_103'`.
+CUDA_MIN_MAJOR=12
+CUDA_MIN_MINOR=9
+CUDA_TARGET_PKG="cuda-toolkit-13-0"
+
+# Wypisuje "MAJOR MINOR" zainstalowanego nvcc (PATH oraz /usr/local/cuda), nic gdy brak.
+detect_nvcc_version() {
+    local nvcc_bin=""
+    if command -v nvcc &>/dev/null; then
+        nvcc_bin="$(command -v nvcc)"
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+        nvcc_bin="/usr/local/cuda/bin/nvcc"
+    else
+        return 1
+    fi
+    local v
+    v=$("$nvcc_bin" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')
+    [[ -n "$v" ]] || return 1
+    echo "${v%%.*} ${v##*.}"
+}
+
+# Zwraca 0 gdy zainstalowany nvcc >= CUDA_MIN (czyli zna Blackwell sm_103).
+cuda_new_enough() {
+    local mm maj min
+    mm=$(detect_nvcc_version) || return 1
+    maj=${mm%% *}; min=${mm##* }
+    if (( maj > CUDA_MIN_MAJOR )); then return 0; fi
+    if (( maj == CUDA_MIN_MAJOR && min >= CUDA_MIN_MINOR )); then return 0; fi
+    return 1
+}
+
 install_cuda() {
     log_section "NVIDIA CUDA toolkit"
 
-    if command -v nvcc &>/dev/null; then
-        log_ok "CUDA juz zainstalowane: $(nvcc --version 2>/dev/null | tail -1)"
+    # /usr/local/cuda/bin (instalacja z repo NVIDIA) ma pierwszenstwo nad starym
+    # /usr/bin/nvcc z dystrybucyjnego pakietu.
+    [[ -x /usr/local/cuda/bin/nvcc ]] && export PATH="/usr/local/cuda/bin:$PATH"
+
+    if cuda_new_enough; then
+        log_ok "CUDA wystarczajaca dla Blackwell: $(nvcc --version 2>/dev/null | grep release)"
         return
+    fi
+
+    if local mm; mm=$(detect_nvcc_version); then
+        log_warn "Wykryto za stary CUDA toolkit (${mm// /.}) — nie zna sm_103 (B300). Aktualizuje do ${CUDA_TARGET_PKG}."
     fi
 
     case "$DISTRO" in
         arch)
+            # Arch (rolling) ma aktualny pakiet `cuda`.
             log_info "Instalacja pakietu cuda z pacman..."
             run_privileged pacman -S --needed --noconfirm cuda
             INSTALLED+=("cuda")
             ;;
         debian)
-            log_info "Instalacja nvidia-cuda-toolkit..."
-            run_privileged apt-get install -y nvidia-cuda-toolkit
-            INSTALLED+=("nvidia-cuda-toolkit")
+            # Dystrybucyjny nvidia-cuda-toolkit jest za stary na Blackwell —
+            # bierzemy toolkit z repo NVIDIA (network repo) w wersji 13.x.
+            if dpkg -l nvidia-cuda-toolkit 2>/dev/null | grep -q '^ii'; then
+                log_warn "Usuwam dystrybucyjny nvidia-cuda-toolkit (za stary, przyslania nowy nvcc w /usr/bin)"
+                run_privileged apt-get remove -y nvidia-cuda-toolkit || true
+            fi
+            local ubuntu_ver="${VERSION_ID//./}"   # 24.04 -> 2404
+            local cuda_arch
+            case "$(uname -m)" in
+                x86_64)        cuda_arch="x86_64" ;;
+                aarch64|arm64) cuda_arch="sbsa" ;;   # Grace/ARM server (GB200/GB300)
+                *)             cuda_arch="x86_64" ;;
+            esac
+            local repo_base="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${ubuntu_ver}/${cuda_arch}"
+            local keyring="/tmp/cuda-keyring_1.1-1_all.deb"
+            log_info "Dodaje repo NVIDIA CUDA (ubuntu${ubuntu_ver}/${cuda_arch}) i instaluje ${CUDA_TARGET_PKG}..."
+            if curl -fsSL "${repo_base}/cuda-keyring_1.1-1_all.deb" -o "$keyring"; then
+                run_privileged dpkg -i "$keyring"
+                run_privileged apt-get update
+                # Najpierw celowana 13.0; jak brak dla tej wersji Ubuntu — najnowszy meta-pakiet.
+                if run_privileged apt-get install -y "${CUDA_TARGET_PKG}"; then
+                    INSTALLED+=("${CUDA_TARGET_PKG}")
+                elif run_privileged apt-get install -y cuda-toolkit; then
+                    INSTALLED+=("cuda-toolkit")
+                else
+                    log_warn "Nie udalo sie zainstalowac CUDA z repo NVIDIA. Zainstaluj recznie: https://developer.nvidia.com/cuda-downloads"
+                fi
+                export PATH="/usr/local/cuda/bin:$PATH"
+                log_warn "Dodaj do PATH na stale: echo 'export PATH=/usr/local/cuda/bin:\$PATH' >> ~/.bashrc"
+            else
+                log_warn "Nie pobrano cuda-keyring (ubuntu${ubuntu_ver}/${cuda_arch}). Sprawdz wersje Ubuntu/arch i zainstaluj CUDA 13 recznie: https://developer.nvidia.com/cuda-downloads"
+            fi
             ;;
         fedora)
-            log_warn "CUDA na Fedorze wymaga recznie dodanego repo NVIDIA."
-            log_warn "Instrukcja: https://developer.nvidia.com/cuda-downloads"
-            log_info "Probuje zainstalowac z istniejacych repo..."
+            log_warn "CUDA na Fedorze wymaga recznie dodanego repo NVIDIA (https://developer.nvidia.com/cuda-downloads)."
+            log_info "Probuje zainstalowac cuda-toolkit z istniejacych repo..."
             if run_privileged dnf install -y cuda-toolkit 2>/dev/null; then
                 INSTALLED+=("cuda-toolkit")
+                export PATH="/usr/local/cuda/bin:$PATH"
             else
-                log_warn "Nie udalo sie zainstalowac CUDA. Dodaj repo NVIDIA i uruchom ponownie."
+                log_warn "Nie udalo sie zainstalowac CUDA. Dodaj repo NVIDIA (>= 12.9 dla sm_103) i uruchom ponownie."
             fi
             ;;
     esac
