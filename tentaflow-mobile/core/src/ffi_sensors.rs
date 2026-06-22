@@ -25,7 +25,7 @@ use jni::JNIEnv;
 /// Wspólna ścieżka: zbuforuj jedną zakodowaną próbkę. `false` gdy `kind` nieznany
 /// lub bufor pusty (próbka odrzucona, nic nie trafia do silnika).
 fn push_sensor_bytes(kind: i32, bytes: Vec<u8>) -> bool {
-    if bytes.is_empty() || !(1..=4).contains(&kind) {
+    if bytes.is_empty() || !(1..=5).contains(&kind) {
         return false;
     }
     MobileSensorQueue::global().push_vec(kind as u8, bytes);

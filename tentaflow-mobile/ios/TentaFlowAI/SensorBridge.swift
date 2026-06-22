@@ -19,6 +19,7 @@ private let KIND_IMU: Int32 = 1
 private let KIND_GNSS: Int32 = 2
 private let KIND_BARO: Int32 = 3
 private let KIND_DEPTH: Int32 = 4
+private let KIND_POSE: Int32 = 5
 
 private let ACCEL_NOISE: Float = 0.02
 private let GYRO_NOISE: Float = 0.002
@@ -162,6 +163,18 @@ final class SensorBridge: NSObject, CLLocationManagerDelegate, ARSessionDelegate
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        // AR device pose (ARKit world frame, Y-up) → engine Z-up: pos [x,-z,y],
+        // orientation rotated +90° about X. Drives marker + map frame + AR↔ENU align.
+        let tf = frame.camera.transform
+        let q = simd_quatf(angle: .pi / 2, axis: SIMD3<Float>(1, 0, 0)) * simd_quatf(tf)
+        let p = tf.columns.3
+        var pb = LE()
+        pb.u8(1); pb.u8(0); pb.u8(0); pb.u8(0)
+        pb.i64(nowUs())
+        pb.f32(p.x); pb.f32(-p.z); pb.f32(p.y)
+        pb.f32(q.vector.x); pb.f32(q.vector.y); pb.f32(q.vector.z); pb.f32(q.vector.w)
+        push(KIND_POSE, pb.data)
+
         guard let depth = frame.sceneDepth else { return }
         let map = depth.depthMap
         CVPixelBufferLockBaseAddress(map, .readOnly)
@@ -195,7 +208,8 @@ final class SensorBridge: NSObject, CLLocationManagerDelegate, ARSessionDelegate
                     let yc = -(Float(v) - cy) * z / fy
                     let zc = -z
                     let p = view * simd_float4(xc, yc, zc, 1)
-                    bodyLE.f32(p.x); bodyLE.f32(p.y); bodyLE.f32(p.z)
+                    // Y-up (ARKit) → engine Z-up: [x, -z, y].
+                    bodyLE.f32(p.x); bodyLE.f32(-p.z); bodyLE.f32(p.y)
                     count += 1
                 }
                 u += depthStride
