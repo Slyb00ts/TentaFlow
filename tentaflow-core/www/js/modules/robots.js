@@ -291,6 +291,13 @@ function isControllable(status) {
   return s !== 'offline' && s !== 'lost' && s !== 'error';
 }
 
+// "Gotowy" (ready) is only true when the robot is actually connected — NOT while
+// it is still connecting/pairing (those are controllable-ish but not ready).
+function isOnlineStatus(status) {
+  const s = String(status || '').toLowerCase();
+  return s === 'online' || s === 'ready' || s === 'ok';
+}
+
 function findRobot(id) {
   return robots.find((x) => robotId(x) === id) || null;
 }
@@ -623,8 +630,9 @@ function updateCard(el, r) {
   setKpi(el, 'rtt', rttMs(r), (v) => `${Math.round(Number(v))}<small>ms</small>`);
   const statusKpi = el.querySelector('[data-kpi="status"]');
   if (statusKpi) {
-    statusKpi.textContent = offline ? statusLabel(status) : 'Gotowy';
-    statusKpi.dataset.tone = offline ? 'warning' : 'success';
+    const ready = isOnlineStatus(status);
+    statusKpi.textContent = ready ? 'Gotowy' : statusLabel(status);
+    statusKpi.dataset.tone = statusTone(status);
   }
 
   updateCaps(el, r);
@@ -874,10 +882,11 @@ function updateDetailHeader(shell, r) {
 
   const modeEl = shell.querySelector('[data-dkpi="mode"]');
   if (modeEl) {
-    modeEl.textContent = offline ? statusLabel(status) : 'Gotowy';
-    modeEl.dataset.tone = offline ? 'warning' : 'success';
+    const ready = isOnlineStatus(status);
+    modeEl.textContent = ready ? 'Gotowy' : statusLabel(status);
+    modeEl.dataset.tone = statusTone(status);
   }
-  setDkpi(shell, 'mode-sub', 'e-stop zwolniony');
+  setDkpi(shell, 'mode-sub', isOnlineStatus(status) ? 'e-stop zwolniony' : '—');
 
   // Keep the action row in sync with capability changes (signature compare).
   const arHost = shell.querySelector('[data-field="actionrow"]');
@@ -1727,14 +1736,9 @@ function kvRow(label, value) {
 function updateRobot3d(host, r) {
   if (!host) return;
   const t = telemetry(r);
-  const joints = t && Array.isArray(t.joints) ? t.joints : null;
-  const offline = !isControllable(r.status || '');
-  if (!joints || joints.length < 12 || offline) {
-    if (host.firstChild) host.replaceChildren();
-    host.innerHTML = '<div class="robots-controls-empty">Model 3D pojawi się, gdy robot zgłosi kąty stawów.</div>';
-    host.dataset.has3d = '';
-    return;
-  }
+  const joints = t && Array.isArray(t.joints) && t.joints.length >= 12 ? t.joints : null;
+  // Mount the model whenever the robot exists so the real Go2 is visible even
+  // offline (rest pose); it animates only once joint angles arrive.
   let view = host.querySelector('tf-robot-view');
   if (!view) {
     host.innerHTML = '';
@@ -1743,9 +1747,11 @@ function updateRobot3d(host, r) {
     host.appendChild(view);
     host.dataset.has3d = '1';
   }
-  const imu = t.imu || {};
-  const rpy = [Number(imu.roll) || 0, Number(imu.pitch) || 0, Number(imu.yaw) || 0];
-  view.setPose({ joints, rpy });
+  if (joints) {
+    const imu = (t && t.imu) || {};
+    const rpy = [Number(imu.roll) || 0, Number(imu.pitch) || 0, Number(imu.yaw) || 0];
+    view.setPose({ joints, rpy });
+  }
 }
 
 // =============================================================================
