@@ -378,6 +378,130 @@ param_type = "string"
 description = "Identyfikator joba ingestu."
 required = true
 
+# --- Read-side tooly GUI (kolekcje/dokumenty/konflikty/graf) ---
+# Czyste odczyty (poza delete/resolve, ktore mutuja ODWRACALNIE). Parametryzowany SQL,
+# capy, paginacja, izolacja per-instancja. Konsumowane przez panel main i wolalne recznie.
+
+[[tool]]
+id = "delete_collection"
+display_name = "Usun kolekcje"
+description = "Usuwa kolekcje kaskadowo (dokumenty, chunki, wektory, graf przez odwracalny cleanup outboxu)."
+keywords = ["rag", "collection", "delete", "usun"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji do usuniecia."
+required = true
+
+[[tool]]
+id = "delete_document"
+display_name = "Usun dokument"
+description = "Usuwa pojedynczy dokument: chunki, wektory 'passages' i jego wklad do grafu."
+keywords = ["rag", "document", "delete", "usun"]
+
+[[tool.parameter]]
+name = "document_id"
+param_type = "string"
+description = "Identyfikator dokumentu do usuniecia."
+required = true
+
+[[tool]]
+id = "collection_ingest_status"
+display_name = "Status ingestu kolekcji"
+description = "Zagregowany status ingestu kolekcji: liczniki dokumentow per status + ile ma graph_partial."
+keywords = ["rag", "ingest", "status", "collection"]
+
+[[tool.parameter]]
+name = "collection_id"
+param_type = "string"
+description = "Identyfikator kolekcji."
+required = true
+
+[[tool]]
+id = "list_conflicts"
+display_name = "Lista konfliktow"
+description = "Listuje konflikty MemGraphRAG z opcjonalnym filtrem statusu i paginacja."
+keywords = ["rag", "conflict", "list", "konflikt"]
+
+[[tool.parameter]]
+name = "status"
+param_type = "string"
+description = "Filtr statusu (open/resolving/escalated/resolved_auto/resolved_merge_pending). Brak = wszystkie."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "integer"
+description = "Rozmiar strony (cap 200, domyslnie 50)."
+required = false
+
+[[tool.parameter]]
+name = "offset"
+param_type = "integer"
+description = "Przesuniecie strony."
+required = false
+
+[[tool]]
+id = "conflict_detail"
+display_name = "Szczegoly konfliktu"
+description = "Szczegoly konfliktu po dedup_key: grupa, czlonkowie (fakty), dowody zrodlowe i decyzja A_res."
+keywords = ["rag", "conflict", "detail", "evidence"]
+
+[[tool.parameter]]
+name = "dedup_key"
+param_type = "string"
+description = "Klucz grupy konfliktowej."
+required = true
+
+[[tool]]
+id = "resolve_escalated"
+display_name = "Rozstrzygnij eskalowany konflikt"
+description = "Reczne rozstrzygniecie konfliktu 'escalated': keep_winner (tombstone przegranych odwracalnie) albo dismiss."
+keywords = ["rag", "conflict", "resolve", "escalated", "admin"]
+
+[[tool.parameter]]
+name = "conflict_id"
+param_type = "integer"
+description = "Identyfikator konfliktu."
+required = true
+
+[[tool.parameter]]
+name = "action"
+param_type = "string"
+description = "keep_winner albo dismiss."
+required = true
+
+[[tool.parameter]]
+name = "winner_fact_key"
+param_type = "string"
+description = "Klucz zwycieskiego faktu (wymagany dla keep_winner)."
+required = false
+
+[[tool]]
+id = "graph_explore"
+display_name = "Eksplorator grafu"
+description = "Sasiedztwo encji w 'kg_active' (po node_id albo nazwie) z faktami i provenance. Cap wezlow/krawedzi."
+keywords = ["rag", "graph", "explore", "graf", "encja"]
+
+[[tool.parameter]]
+name = "entity_query"
+param_type = "string"
+description = "Nazwa encji do dopasowania (alternatywa dla node_id)."
+required = false
+
+[[tool.parameter]]
+name = "node_id"
+param_type = "string"
+description = "Znormalizowane id wezla (alternatywa dla entity_query)."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "integer"
+description = "Cap liczby sasiadow/faktow (max 60)."
+required = false
+
 # A_uni (MemGraphRAG D5): Structural Unification — skan kandydatow merge encji + scalanie.
 # Wolalny przez Scheduler (interval) ORAZ recznie. Konsumuje tez konflikty
 # 'resolved_merge_pending' z A_res (D4).
