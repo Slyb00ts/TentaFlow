@@ -244,6 +244,7 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -252,12 +253,25 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = u.model * vec4<f32>(in.position, 1.0);
     out.clip_position = u.view_proj * world;
     out.color = in.color;
+    out.world_pos = world.xyz;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+    // Flat per-face directional shading for solid geometry (the robot), giving it
+    // 3D relief instead of a flat silhouette. Lines (grid) have degenerate screen
+    // derivatives, so guard on the face-normal length and leave them unlit.
+    let fn_raw = cross(dpdx(in.world_pos), dpdy(in.world_pos));
+    let nlen = length(fn_raw);
+    if (nlen < 1e-8) {
+        return vec4<f32>(in.color, 1.0);
+    }
+    let n = fn_raw / nlen;
+    let light_dir = normalize(vec3<f32>(0.4, 0.5, 0.85));
+    let diffuse = abs(dot(n, light_dir));
+    let lit = 0.5 + 0.5 * diffuse;
+    return vec4<f32>(in.color * lit, 1.0);
 }
 "#;
 
@@ -2089,18 +2103,10 @@ fn accumulate_node_colored(
             if prim.mode() != gltf::mesh::Mode::Triangles {
                 continue;
             }
-            let base_color = prim.material().pbr_metallic_roughness().base_color_factor();
-            // Only use the material color when it is meaningfully set (glTF defaults
-            // to white [1,1,1,1]); a pure-white factor reads as "no authored color"
-            // for these CAD-exported meshes, so fall back to the Go2 scheme.
-            let color = if base_color[0] >= 0.999
-                && base_color[1] >= 0.999
-                && base_color[2] >= 0.999
-            {
-                fallback_color
-            } else {
-                [base_color[0], base_color[1], base_color[2]]
-            };
+            // The Go2 CAD meshes carry near-white, meaningless base-color factors,
+            // so always use the link-name Go2 scheme (dark body / lighter legs) for
+            // a realistic look rather than a flat white robot.
+            let color = fallback_color;
 
             let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
             let positions = match reader.read_positions() {
