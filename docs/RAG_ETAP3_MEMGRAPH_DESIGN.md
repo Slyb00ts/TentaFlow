@@ -179,3 +179,5 @@ manifest kg_active; ingest pisze SQLite+outbox; materializacja outbox→kg_activ
 bezpośredniego zapisu kg na outbox) → D2 (Candidate→Stable: τ, promocja przez outbox, kg_active =
 tylko stable) → D3 (A_det async, fact_seq, lock per-collection, org_id) → D4 (A_res LLM+limity R8) →
 D5 (merge wg R5) → D6 (memory-guided + ppr ważone R6). Każdy slice: codex review realnego kodu.
+
+## STATUS: D1 ✅ (c82ab056), D2 ✅ — denoising przez idempotentny reconcile po commicie (promocja z COUNT≥τ, exactly-once aktywacja przez warunkowy enqueue WHERE active=0 + BEGIN IMMEDIATE, migracja 004 dedupe+unique, COUNT(DISTINCT) refcount). Codex GO. Następne: D3 (A_det async).
