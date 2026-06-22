@@ -584,3 +584,64 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Pad / Kontroler (gamepad control + live raw readout). */
+.robots-pad {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.robots-pad-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.robots-pad-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.robots-pad-spacer {
+  flex: 1 1 auto;
+}
+
+.robots-pad-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.robots-pad-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+}
+
+.robots-pad-conn {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-3);
+}
+
+.robots-pad-conn[data-state="live"] {
+  color: var(--success);
+}
+
+.robots-pad-conn[data-state="wait"] {
+  color: var(--warning);
+}
+
+.robots-pad-kv dd {
+  text-align: left;
+  font-weight: 500;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  word-break: break-word;
+}

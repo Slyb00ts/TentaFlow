@@ -165,6 +165,62 @@ let voxelInitToken = 0;
 // detail changes robot or closes. Each entry: { atMs, level, text }.
 let detailLog = [];
 
+// =============================================================================
+// Gamepad (browser controller) tuning + mapping — all in one place
+// =============================================================================
+//
+// Hardware target is an 8BitDo Arcade Stick: the big lever is DIGITAL (8-way
+// on/off) and there are NO analog mini-sticks. Depending on the stick's mode the
+// lever surfaces EITHER as axes 0/1 (reported as discrete -1/0/1) OR as the
+// standard-gamepad d-pad buttons 12–15. We read BOTH and OR them together.
+
+// Axis deadzone: a digital lever reports ~±1 when pushed and ~0 at rest, but
+// loose centering / drift can leave small non-zero values — anything under this
+// magnitude counts as neutral.
+const PAD_AXIS_DEADZONE = 0.3;
+
+// Continuous move dispatch cadence. The poll runs at the display rAF rate
+// (~60 Hz) but we only send a move at most this often so we don't flood the
+// owner / mesh control plane. Matches the "~10 Hz" continuous-move budget.
+const PAD_MOVE_INTERVAL_MS = 100;
+
+// Speed gears (m/s) cycled by the gear button / tf-select. The active gear is the
+// CAP the time-ramp climbs toward; the owner re-clamps to its own safety cap.
+const PAD_SPEED_GEARS = [0.2, 0.35, 0.6];
+
+// Time-ramp: while a direction is held the speed climbs from this floor up to the
+// active gear cap over PAD_RAMP_TIME_MS, so holding longer = faster from a digital
+// (on/off) lever. Returning to neutral resets the ramp to the floor.
+const PAD_SPEED_FLOOR = 0.12;
+const PAD_RAMP_TIME_MS = 1000;
+
+// Standard-gamepad button indices we ACT on. These are defaults — this unit's real
+// indices are unknown until we read the live raw readout, so they live here as the
+// single place to change. E-STOP has priority over every other mapped button.
+// (Standard mapping: 0=A/south, 1=B/east, 2=X/west, 3=Y/north, 9=start.)
+const PAD_BUTTONS = {
+  estop: 1,       // B / east — emergency stop (priority)
+  standUp: 3,     // Y / north — stand up / recover
+  lieDown: 0,     // A / south — lie down / sit
+  hello: 2,       // X / west — hello wave
+  gearCycle: 9,   // start — cycle to the next speed gear
+};
+
+// Standard-gamepad d-pad button indices (when the lever surfaces as buttons, not
+// axes). Up/Down/Left/Right.
+const PAD_DPAD = { up: 12, down: 13, left: 14, right: 15 };
+
+// Per-detail gamepad runtime. Exists only while a detail is open AND the pad
+// toggle is ON. Mirrors the lidar loop lifecycle: every start has a matching stop,
+// so the rAF loop + listeners never leak past detail close / unmount.
+// Shape: { enabled, rafId, rampStartMs, rampActive, lastMoveAtMs, lastMoveZero,
+//          prevButtons:Set, connected, padId, lastAxes:number[], lastButtons:number[] }
+let padState = null;
+
+// Active speed-gear index, kept OUTSIDE padState so a gear chosen before enabling
+// the pad (or across a toggle off/on) survives — padState is destroyed on stop.
+let padGearIndex = 0;
+
 const RobotsScreen = {
   get title() { return 'Roboty'; },
 
@@ -189,6 +245,7 @@ const RobotsScreen = {
     }
     stopLidarLoop();
     disposeVoxel();
+    stopPadLoop();
     robots = [];
     inFlightRefresh = false;
     cardEls = new Map();
@@ -398,6 +455,7 @@ function backToList() {
 function closeDetail() {
   stopLidarLoop();
   disposeVoxel();
+  stopPadLoop();
 }
 
 // =============================================================================
@@ -926,6 +984,10 @@ function renderDetailPanel(shell, tabId) {
   // the visible surface holds a GPU context.
   if (tabId !== 'overview' && tabId !== 'lidar') disposeVoxel();
 
+  // The gamepad loop lives only on the Sterowanie tab; leaving it stops the rAF
+  // loop + listeners so nothing polls in the background.
+  if (tabId !== 'control') stopPadLoop();
+
   panel.innerHTML = '';
 
   if (tabId === 'overview') {
@@ -964,8 +1026,10 @@ function renderDetailPanel(shell, tabId) {
     panel.innerHTML = `<div class="robots-section">
         <div class="robots-section-head"><h3>Pełne sterowanie</h3></div>
         <div class="robots-controls" data-field="controls"></div>
-      </div>`;
+      </div>
+      <div class="robots-section" data-field="pad-section"></div>`;
     buildControls(panel.querySelector('[data-field="controls"]'), r);
+    buildPadSection(panel.querySelector('[data-field="pad-section"]'), r);
     return;
   }
 
@@ -1020,6 +1084,7 @@ function updateDetailPanel(shell, r) {
   } else if (tabId === 'control') {
     buildControls(panel.querySelector('[data-field="controls"]'), r);
     refreshOfflineDisable(panel, r);
+    syncPadOnlineState(r);
   } else if (tabId === 'info') {
     updateTelemetryFull(panel.querySelector('[data-field="telemetry-full"]'), r);
     updateRobot3d(panel.querySelector('[data-field="robot3d"]'), r);
@@ -2074,6 +2139,435 @@ async function handleLidarToggle(id, on, toggle) {
     toast(`LiDAR: ${err.message}`, 'error');
   } finally {
     toggle.removeAttribute('disabled');
+  }
+}
+
+// =============================================================================
+// Gamepad (browser controller) — Pad / Kontroler section in the Sterowanie tab
+// =============================================================================
+
+// Builds the "Pad / Kontroler" UI: an enable toggle, a speed-gear select, and a
+// LIVE RAW READOUT (connection status, gamepad id, every axis value, pressed
+// button indices) so we can see exactly what the arcade stick reports. The rAF
+// poll loop is owned by startPadLoop/stopPadLoop; this only renders the UI and
+// binds the toggle/gear controls.
+function buildPadSection(host, r) {
+  if (!host) return;
+  const id = robotId(r);
+  host.innerHTML = `
+    <div class="robots-section-head"><h3>Pad / Kontroler</h3></div>
+    <div class="robots-pad">
+      <div class="robots-pad-bar">
+        <tf-toggle data-pad-toggle></tf-toggle>
+        <span class="robots-pad-label">Sterowanie padem</span>
+        <span class="robots-pad-spacer"></span>
+        <tf-select data-pad-gear label="Bieg prędkości"></tf-select>
+        <tf-button variant="outline" size="sm" icon="zap" data-pad-gear-cycle>Następny bieg</tf-button>
+      </div>
+      <div class="robots-pad-hint">
+        Ruch: góra/dół = przód/tył, lewo/prawo = obrót. Przytrzymanie kierunku
+        płynnie rozpędza robota (rampa do wybranego biegu). Przyciski: E-STOP,
+        Wstań, Połóż się, Hello, następny bieg.
+      </div>
+      <div class="robots-pad-readout" data-pad-readout>
+        <div class="robots-pad-conn" data-pad-conn>
+          Brak pada — naciśnij dowolny przycisk, aby wykryć pada.
+        </div>
+        <dl class="robots-kv robots-pad-kv">
+          <dt>Urządzenie</dt><dd data-pad-rd-id>—</dd>
+          <dt>Bieg</dt><dd data-pad-rd-gear>—</dd>
+          <dt>Prędkość (rampa)</dt><dd data-pad-rd-speed>—</dd>
+          <dt>Osie</dt><dd data-pad-rd-axes>—</dd>
+          <dt>Wciśnięte przyciski</dt><dd data-pad-rd-buttons>—</dd>
+        </dl>
+      </div>
+    </div>`;
+
+  const gear = host.querySelector('[data-pad-gear]');
+  gear.setOptions(
+    PAD_SPEED_GEARS.map((v, i) => ({ value: String(i), label: `${v.toFixed(2)} m/s` })),
+    String(currentGearIndex()),
+  );
+  gear.addEventListener('change', (e) => {
+    const idx = Number(e?.detail?.value ?? gear.value);
+    if (Number.isInteger(idx) && idx >= 0 && idx < PAD_SPEED_GEARS.length) {
+      setGearIndex(idx);
+    }
+  });
+
+  host.querySelector('[data-pad-gear-cycle]')?.addEventListener('click', () => {
+    cycleGear();
+    gear.value = String(currentGearIndex());
+    renderPadReadout();
+  });
+
+  const toggle = host.querySelector('[data-pad-toggle]');
+  toggle.addEventListener('change', (e) => {
+    const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
+    if (on) startPadLoop(id);
+    else stopPadLoop();
+  });
+
+  // Reflect any already-running loop (e.g. returning to the tab is a fresh build,
+  // but the loop is stopped on tab leave, so this is normally OFF).
+  if (padState && padState.enabled) toggle.setAttribute('checked', '');
+
+  renderPadReadout();
+}
+
+function currentGearIndex() {
+  return padGearIndex;
+}
+
+function setGearIndex(idx) {
+  padGearIndex = idx;
+  renderPadReadout();
+}
+
+function cycleGear() {
+  padGearIndex = (padGearIndex + 1) % PAD_SPEED_GEARS.length;
+}
+
+// Starts the rAF poll loop + connect/disconnect listeners (idempotent). The loop
+// only ACTS while enabled, a detail is open and the robot is online; otherwise it
+// just keeps the raw readout live so the user can identify the device's inputs.
+function startPadLoop(id) {
+  if (padState && padState.enabled) {
+    padState.robotId = id;
+    return;
+  }
+  padState = {
+    enabled: true,
+    robotId: id,
+    rafId: null,
+    rampStartMs: 0,
+    rampActive: false,
+    lastMoveAtMs: 0,
+    lastMoveZero: true,
+    prevButtons: new Set(),
+    connected: false,
+    padId: '',
+    lastAxes: [],
+    lastButtons: [],
+  };
+  window.addEventListener('gamepadconnected', onGamepadConnected);
+  window.addEventListener('gamepaddisconnected', onGamepadDisconnected);
+  padState.rafId = window.requestAnimationFrame(padTick);
+  renderPadReadout();
+}
+
+// Stops the loop, removes listeners and sends a single stop if the robot was still
+// being driven. Safe to call when no loop is running.
+function stopPadLoop() {
+  if (!padState) return;
+  const wasDriving = !padState.lastMoveZero && padState.robotId;
+  if (padState.rafId != null) {
+    window.cancelAnimationFrame(padState.rafId);
+    padState.rafId = null;
+  }
+  window.removeEventListener('gamepadconnected', onGamepadConnected);
+  window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
+  const id = padState.robotId;
+  padState.enabled = false;
+  padState = null;
+  if (wasDriving && id) sendPadStop(id);
+}
+
+function onGamepadConnected(e) {
+  if (!padState) return;
+  padState.connected = true;
+  padState.padId = e?.gamepad?.id || '';
+  renderPadReadout();
+}
+
+function onGamepadDisconnected() {
+  if (!padState) return;
+  // Another pad may remain; padTick() re-derives `connected` from the live list.
+  padState.connected = false;
+  padState.padId = '';
+  // Stop the robot if a disconnect happens mid-drive.
+  if (!padState.lastMoveZero && padState.robotId) sendPadStop(padState.robotId);
+  padState.lastMoveZero = true;
+  padState.rampActive = false;
+  renderPadReadout();
+}
+
+// Returns the first connected gamepad, or null. navigator.getGamepads() returns a
+// sparse array with null holes; the API only populates entries after a button
+// press (hence the "naciśnij dowolny przycisk" hint).
+function firstGamepad() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const p of pads) {
+    if (p) return p;
+  }
+  return null;
+}
+
+// One rAF tick: reads the live pad, updates the raw readout every frame, and (when
+// armed: enabled + detail open + robot online) translates input into a rate-limited
+// continuous move plus discrete button actions.
+function padTick() {
+  if (!padState || !padState.enabled) return;
+  const pad = firstGamepad();
+
+  if (pad) {
+    padState.connected = true;
+    padState.padId = pad.id || '';
+    padState.lastAxes = Array.from(pad.axes || []);
+    padState.lastButtons = Array.from(pad.buttons || []).map((b) => (b ? b.value : 0));
+  } else {
+    padState.connected = false;
+    padState.lastAxes = [];
+    padState.lastButtons = [];
+  }
+
+  const r = padState.robotId ? findRobot(padState.robotId) : null;
+  const armed = !!(
+    pad &&
+    selectedRobotId &&
+    padState.robotId === selectedRobotId &&
+    r &&
+    isControllable(r.status || '')
+  );
+
+  if (armed) {
+    // E-STOP takes the whole tick: when it fires, motion is already cut inside
+    // handlePadButtons and no other action / move may run the same frame.
+    const estopped = handlePadButtons(pad, r);
+    if (!estopped) handlePadMovement(pad);
+  } else if (!padState.lastMoveZero) {
+    // Disarmed (offline / detail changed) while driving → send one stop.
+    if (padState.robotId) sendPadStop(padState.robotId);
+    padState.lastMoveZero = true;
+    padState.rampActive = false;
+  }
+
+  renderPadReadout();
+  padState.rafId = window.requestAnimationFrame(padTick);
+}
+
+// Reads the directional intent from BOTH axes (digital lever as -1/0/1, deadzoned)
+// and the standard d-pad buttons, OR'd together. Returns {fwd, turn} each in
+// {-1, 0, 1}: fwd +1 = forward, turn +1 = turn left (counter-clockwise).
+function readPadDirection(pad) {
+  const axes = pad.axes || [];
+  const ax = (i) => (typeof axes[i] === 'number' ? axes[i] : 0);
+  const dz = PAD_AXIS_DEADZONE;
+
+  // Axis 1 = vertical (up is negative in the standard mapping); axis 0 = horizontal.
+  let fwd = 0;
+  let turn = 0;
+  if (ax(1) <= -dz) fwd = 1;
+  else if (ax(1) >= dz) fwd = -1;
+  if (ax(0) <= -dz) turn = 1;
+  else if (ax(0) >= dz) turn = -1;
+
+  // D-pad buttons override / supplement when the lever surfaces as buttons.
+  if (buttonPressed(pad, PAD_DPAD.up)) fwd = 1;
+  else if (buttonPressed(pad, PAD_DPAD.down)) fwd = -1;
+  if (buttonPressed(pad, PAD_DPAD.left)) turn = 1;
+  else if (buttonPressed(pad, PAD_DPAD.right)) turn = -1;
+
+  return { fwd, turn };
+}
+
+function buttonPressed(pad, idx) {
+  const b = pad.buttons && pad.buttons[idx];
+  return !!(b && (b.pressed || b.value > 0.5));
+}
+
+// Time-ramp continuous move at PAD_MOVE_INTERVAL_MS. While a direction is held the
+// magnitude climbs from PAD_SPEED_FLOOR to the active gear cap over PAD_RAMP_TIME_MS;
+// neutral resets the ramp and sends a single stop (no stop spam).
+function handlePadMovement(pad) {
+  const { fwd, turn } = readPadDirection(pad);
+  const now = performance.now();
+
+  if (fwd === 0 && turn === 0) {
+    padState.rampActive = false;
+    if (!padState.lastMoveZero) {
+      sendPadMove(padState.robotId, 0, 0, 0);
+      padState.lastMoveZero = true;
+      padState.lastMoveAtMs = now;
+    }
+    return;
+  }
+
+  if (!padState.rampActive) {
+    padState.rampActive = true;
+    padState.rampStartMs = now;
+  }
+
+  if (now - padState.lastMoveAtMs < PAD_MOVE_INTERVAL_MS) return;
+
+  const cap = PAD_SPEED_GEARS[padGearIndex] ?? PAD_SPEED_GEARS[0];
+  const held = Math.min(1, (now - padState.rampStartMs) / PAD_RAMP_TIME_MS);
+  const speed = PAD_SPEED_FLOOR + (cap - PAD_SPEED_FLOOR) * held;
+
+  const vx = fwd * speed;
+  const vyaw = turn * speed;
+  sendPadMove(padState.robotId, vx, 0, vyaw);
+  padState.lastMoveZero = false;
+  padState.lastMoveAtMs = now;
+}
+
+// Discrete button actions on the rising edge only (press, not hold). E-STOP has
+// PRIORITY: when its rising edge is seen it cuts motion, dispatches the safety
+// stop and RETURNS TRUE so the caller suppresses movement / other actions this
+// tick. The rest route through handleControl so confirm/toast/log still work, and
+// are skipped gracefully when the kind isn't advertised. Returns whether e-stop
+// consumed the tick.
+function handlePadButtons(pad, r) {
+  const pressed = new Set();
+  for (const [name, idx] of Object.entries(PAD_BUTTONS)) {
+    if (buttonPressed(pad, idx)) pressed.add(name);
+  }
+
+  const rising = (name) => pressed.has(name) && !padState.prevButtons.has(name);
+
+  const id = robotId(r);
+  const meta = actionsMeta(r).filter((a) => !actionReadOnly(a));
+  const byKind = (k) => meta.find((a) => a.kind === k);
+
+  // E-STOP — priority, always works (independent of advertised metadata). Cut
+  // motion at once and consume the whole tick. We dispatch the safety stop only on
+  // the rising edge (no per-frame e-stop spam), but suppress ALL movement / other
+  // actions for as long as the e-stop input stays pressed — a held panic button
+  // must never let a non-zero move slip through on a later frame.
+  if (pressed.has('estop')) {
+    if (!padState.lastMoveZero) {
+      sendPadMove(id, 0, 0, 0);
+      padState.lastMoveZero = true;
+      padState.rampActive = false;
+    }
+    if (rising('estop')) handleControl(id, 'estop', makeVirtualButton());
+    padState.prevButtons = pressed;
+    return true;
+  }
+
+  if (rising('gearCycle')) {
+    cycleGear();
+    const gearSel = document.querySelector('[data-pad-gear]');
+    if (gearSel) gearSel.value = String(padGearIndex);
+  }
+
+  if (rising('standUp')) {
+    const a = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+  }
+
+  if (rising('lieDown')) {
+    const a = byKind('stand_down') || byKind('sit') || byKind('lie_down');
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+  }
+
+  if (rising('hello')) {
+    const a = byKind('hello');
+    if (a) handleControl(id, a.kind, makeVirtualButton(), null, a.label, isHighRisk(a));
+  }
+
+  padState.prevButtons = pressed;
+  return false;
+}
+
+// handleControl() toggles `loading` on the passed button element; gamepad actions
+// have no real DOM button, so give it a detached throwaway that safely absorbs
+// the attribute mutations.
+function makeVirtualButton() {
+  return document.createElement('span');
+}
+
+// Continuous move sent DIRECTLY (no toast/log/confirm) so the poll loop can stream
+// at 10 Hz without spamming. Rate limiting + neutral-stop logic live in the caller.
+function sendPadMove(id, vx, vy, vyaw) {
+  if (!id) return;
+  ApiBinary.action('robotControlRequest', {
+    robotId: id,
+    kind: 'move',
+    vx, vy, vyaw,
+    p1: 0, p2: 0, p3: 0, p4: 0,
+  }).catch(() => { /* transient control-plane errors are non-fatal for a stream */ });
+}
+
+function sendPadStop(id) {
+  sendPadMove(id, 0, 0, 0);
+}
+
+// Re-derives whether the pad loop is armed when the poll reports a status change
+// (e.g. robot goes offline mid-session): if driving while now offline, stop.
+function syncPadOnlineState(r) {
+  if (!padState || !padState.enabled) return;
+  const offline = !isControllable(r.status || '');
+  if (offline && !padState.lastMoveZero && padState.robotId) {
+    sendPadStop(padState.robotId);
+    padState.lastMoveZero = true;
+    padState.rampActive = false;
+  }
+}
+
+// Writes the LIVE RAW READOUT into the Pad section (if it's in the DOM): connection
+// status + hint, the gamepad id, every axis value (numeric) and the indices of
+// currently-pressed buttons. Drives the active gear + ramped-speed display too.
+function renderPadReadout() {
+  const shell = byId('robots-detail');
+  if (!shell) return;
+  const section = shell.querySelector('[data-pad-readout]');
+  if (!section) return;
+
+  const conn = section.querySelector('[data-pad-conn]');
+  const idEl = section.querySelector('[data-pad-rd-id]');
+  const gearEl = section.querySelector('[data-pad-rd-gear]');
+  const speedEl = section.querySelector('[data-pad-rd-speed]');
+  const axesEl = section.querySelector('[data-pad-rd-axes]');
+  const buttonsEl = section.querySelector('[data-pad-rd-buttons]');
+
+  const on = !!(padState && padState.enabled);
+  const connected = !!(padState && padState.connected);
+
+  if (conn) {
+    if (!on) {
+      conn.textContent = 'Sterowanie padem wyłączone.';
+      conn.dataset.state = 'off';
+    } else if (connected) {
+      conn.textContent = '● Pad podłączony';
+      conn.dataset.state = 'live';
+    } else {
+      conn.textContent = 'Brak pada — naciśnij dowolny przycisk, aby wykryć pada.';
+      conn.dataset.state = 'wait';
+    }
+  }
+
+  if (idEl) idEl.textContent = padState && padState.padId ? padState.padId : '—';
+
+  const gearIdx = padGearIndex;
+  if (gearEl) {
+    gearEl.textContent = `${(PAD_SPEED_GEARS[gearIdx] ?? PAD_SPEED_GEARS[0]).toFixed(2)} m/s (#${gearIdx + 1})`;
+  }
+
+  if (speedEl) {
+    if (padState && padState.rampActive) {
+      const cap = PAD_SPEED_GEARS[gearIdx] ?? PAD_SPEED_GEARS[0];
+      const held = Math.min(1, (performance.now() - padState.rampStartMs) / PAD_RAMP_TIME_MS);
+      const speed = PAD_SPEED_FLOOR + (cap - PAD_SPEED_FLOOR) * held;
+      speedEl.textContent = `${speed.toFixed(2)} m/s (${Math.round(held * 100)} %)`;
+    } else {
+      speedEl.textContent = 'neutralnie';
+    }
+  }
+
+  if (axesEl) {
+    const axes = (padState && padState.lastAxes) || [];
+    axesEl.textContent = axes.length
+      ? axes.map((v, i) => `[${i}] ${Number(v).toFixed(3)}`).join('   ')
+      : '—';
+  }
+
+  if (buttonsEl) {
+    const btns = (padState && padState.lastButtons) || [];
+    const downIdx = btns
+      .map((v, i) => (v > 0.5 ? i : -1))
+      .filter((i) => i >= 0);
+    buttonsEl.textContent = downIdx.length ? downIdx.join(', ') : '—';
   }
 }
 
