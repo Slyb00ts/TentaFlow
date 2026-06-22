@@ -1003,6 +1003,7 @@ mod capability_axes {
             speculator_method: None,
             speculator_num_tokens: None,
             vllm: None,
+            checkpoint_file: None,
         }
     }
 

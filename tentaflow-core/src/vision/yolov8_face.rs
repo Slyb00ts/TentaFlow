@@ -2,11 +2,13 @@
 // Plik: vision/yolov8_face.rs
 // Opis: YOLOv8/v11-face detector. Pure Rust ONNX inference przez tract-onnx.
 //
-//       Output YOLOv8/v11-face: jeden tensor (1, 4+1+15, 8400) dla 640x640:
-//         - 4 = bbox (cx, cy, w, h) w pikselach input image
-//         - 1 = obj/cls score (0..1)
-//         - 15 = 5 keypointow * 3 (x, y, visibility)
-//       (Niektore exporty maja transponowane (1, 8400, 20) — sprawdzamy heurystyka.)
+//       Output YOLOv8/v11-face: jeden tensor (1, attrs, 8400) dla 640x640:
+//         - 4    = bbox (cx, cy, w, h) w pikselach input image
+//         - 1    = cls score (0..1) dla jedynej klasy "face"
+//         - 5*3  = 5 keypointow * (x, y, visibility) — TYLKO w eksportach -pose
+//       Czysty detektor 1-klasowy daje attrs=5 (bez keypointow), wariant
+//       z keypointami attrs=20. Niektore exporty transponuja na (1, 8400, attrs)
+//       — layout wykrywamy heurystyka po osi rownej attrs.
 //
 //       Decode:
 //         1. Filter score >= 0.5
@@ -28,6 +30,13 @@ use super::{FaceDetection, FaceDetector};
 const YOLO_INPUT_SIZE: u32 = 640;
 const SCORE_THRESHOLD: f32 = 0.5;
 const NMS_IOU_THRESHOLD: f32 = 0.45;
+
+/// Liczba atrybutow per anchor dla 1-klasowego eksportu YOLOv8/v11-face:
+/// 5 = 4 bbox + 1 score (bez keypointow), 20 = 4 + 1 + 5*3 (z keypointami).
+#[inline]
+fn is_attrs(n: usize) -> bool {
+    n == 5 || n == 20
+}
 
 type RunnableYolo = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
@@ -70,13 +79,18 @@ impl FaceDetector for Yolov8FaceEngine {
         let shape = out.shape().to_vec();
         let data = out.as_slice::<f32>().context("YOLO: output nie jest f32")?;
 
-        // YOLOv8/v11-face zwraca (1, attrs, anchors) lub (1, anchors, attrs).
-        // attrs = 4 (bbox) + 1 (score) + 5*3 (kps) = 20. anchors = 8400 dla 640.
+        // YOLOv8/v11 zwraca (1, attrs, anchors) lub transponowane (1, anchors, attrs).
+        // attrs zalezy od eksportu:
+        //   - czysty detektor 1-klasowy ("face") -> 5  = 4 bbox + 1 score
+        //   - wariant z keypointami (-pose, 5 punktow) -> 20 = 4 bbox + 1 score + 5*3
+        // 8400 anchorow dla wejscia 640. Os z attrs to ta, ktora == 5 lub 20;
+        // druga (wieksza) to liczba anchorow.
         let (attrs, anchors, transposed) = match shape.as_slice() {
-            [1, a, b] if *a == 20 => (*a, *b, false),
-            [1, a, b] if *b == 20 => (*b, *a, true),
+            [1, a, b] if is_attrs(*a) => (*a, *b, false),
+            [1, a, b] if is_attrs(*b) => (*b, *a, true),
             _ => return Err(anyhow!("YOLO: nieoczekiwany output shape {:?}", shape)),
         };
+        let has_kps = attrs >= 20;
 
         let mut detections: Vec<FaceDetection> = Vec::with_capacity(64);
 
@@ -103,18 +117,21 @@ impl FaceDetector for Yolov8FaceEngine {
             let (x1, y1) = unletterbox_xy(cx - w * 0.5, cy - h * 0.5, &meta);
             let (x2, y2) = unletterbox_xy(cx + w * 0.5, cy + h * 0.5, &meta);
 
-            // 5 keypointow * 3 (x, y, visibility). Visibility ignorujemy.
-            let mut kps = [(0f32, 0f32); 5];
-            for k in 0..5 {
-                let base = 5 + k * 3;
-                let (kx, ky) = unletterbox_xy(get(base), get(base + 1), &meta);
-                kps[k] = (kx, ky);
-            }
+            // Keypointy tylko gdy eksport je niesie (5 punktow * (x, y, visibility);
+            // visibility ignorujemy). Inaczej zwracamy sam bbox.
+            let keypoints = has_kps.then(|| {
+                let mut kps = [(0f32, 0f32); 5];
+                for (k, kp) in kps.iter_mut().enumerate() {
+                    let base = 5 + k * 3;
+                    *kp = unletterbox_xy(get(base), get(base + 1), &meta);
+                }
+                kps
+            });
 
             detections.push(FaceDetection {
                 bbox: (x1, y1, x2, y2),
                 score,
-                keypoints: Some(kps),
+                keypoints,
             });
         }
 

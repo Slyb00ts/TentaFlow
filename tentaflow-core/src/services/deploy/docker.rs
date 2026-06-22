@@ -1107,7 +1107,7 @@ impl DeployStrategy for DockerDeploy {
         // with the `VLLM_CACHE_ROOT` env from `standard_engine_env`.
         let vllm_cache_host = crate::paths::vllm_cache_dir();
         let _ = std::fs::create_dir_all(&vllm_cache_host);
-        let binds = vec![
+        let mut binds = vec![
             (
                 models_host,
                 crate::paths::CONTAINER_MODELS_PATH.to_string(),
@@ -1119,6 +1119,74 @@ impl DeployStrategy for DockerDeploy {
                 false,
             ),
         ];
+
+        // ComfyUI nie pobiera wag sam: bez checkpointu w `models/checkpoints`
+        // kazda generacja konczy sie `ckpt_name not in []`. Sciagamy plik
+        // presetu na host (idempotentnie) PRZED startem kontenera i montujemy
+        // katalog do `models/checkpoints`, zeby `/object_info` widzial go od
+        // razu po wstaniu kontenera.
+        if self.manifest.engine.id == "comfyui" {
+            if let Some(preset) =
+                super::resolve_selected_preset(&self.manifest, &self.user_config)
+            {
+                if let Some(file) = preset
+                    .checkpoint_file
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let ckpt_dir = crate::paths::image_gen_checkpoints_dir();
+                    std::fs::create_dir_all(&ckpt_dir).map_err(|e| {
+                        DeployError::Manifest(format!(
+                            "create checkpoints dir {}: {e}",
+                            ckpt_dir.display()
+                        ))
+                    })?;
+                    let dest = ckpt_dir.join(file);
+                    let url = format!(
+                        "https://huggingface.co/{}/resolve/main/{}",
+                        preset.repo, file
+                    );
+                    if let Some(s) = &self.log_sink {
+                        s.info(&format!(
+                            "[docker] comfyui checkpoint: ensuring {file} (repo={})",
+                            preset.repo
+                        ));
+                    }
+                    let sink = self.log_sink.clone();
+                    let label = file.to_string();
+                    let progress: Option<crate::services::model_download::ProgressFn> =
+                        sink.map(|s| {
+                            let label = label.clone();
+                            Box::new(move |done: u64, total: u64, _l: &str| {
+                                let pct = if total > 0 {
+                                    (done as f64 / total as f64 * 100.0) as u64
+                                } else {
+                                    0
+                                };
+                                s.info(&format!(
+                                    "[docker] checkpoint {label}: {} / {} MB ({pct}%)",
+                                    done / 1_048_576,
+                                    total / 1_048_576
+                                ));
+                            })
+                                as Box<dyn Fn(u64, u64, &str) + Send + Sync>
+                        });
+                    crate::services::model_download::download_with_progress(
+                        &url, &dest, file, progress,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DeployError::Manifest(format!("download comfyui checkpoint {file}: {e}"))
+                    })?;
+                    binds.push((
+                        ckpt_dir,
+                        crate::paths::COMFYUI_CHECKPOINTS_PATH.to_string(),
+                        false,
+                    ));
+                }
+            }
+        }
 
         let gpu = resolve_gpu_selection(
             &self.user_config,

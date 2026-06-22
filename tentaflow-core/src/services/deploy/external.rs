@@ -233,6 +233,7 @@ mod tests {
                 speculator_method: None,
                 speculator_num_tokens: None,
                 vllm: None,
+                checkpoint_file: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),
