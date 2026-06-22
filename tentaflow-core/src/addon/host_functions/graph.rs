@@ -6,7 +6,7 @@
 //   * graph_upsert_node_v1(collection, node)            — insert/replace a node    (graph.write)
 //   * graph_upsert_edge_v1(collection, src,rel,dst,...) — insert/replace an edge   (graph.write)
 //   * graph_neighbors_v1(collection, node, dir, rel)    — adjacency traversal      (graph.read)
-//   * graph_pagerank_v1(collection, top_n, ...)         — built-in Cozo PageRank   (graph.read)
+//   * graph_pagerank_v1(collection, top_n, ...)         — global PageRank (Rust CSR) (graph.read)
 //   * graph_ppr_v1(collection, seeds, top_n, ...)       — Personalized PageRank    (graph.read)
 //   * graph_delete_v1(collection, target)               — node/edge/tombstone      (graph.write)
 //

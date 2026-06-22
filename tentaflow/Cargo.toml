@@ -17,7 +17,7 @@ gpu-metal = ["tentaflow-core/gpu-metal"]
 # Wspolna baza dla WSZYSTKICH platform (Apple tez). default-features = false,
 # whisper.cpp dokladany per-target ponizej (zawsze na nie-Apple, nigdy na Apple).
 # `camera` re-dodane jawnie.
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "inference-diarization", "inference-sherpa", "inference-supertonic", "camera", "vector-milvus", "inference-vision-gpu"] }
+tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "inference-diarization", "inference-sherpa", "inference-supertonic", "camera", "vector-milvus", "inference-vision-gpu", "graph"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"
