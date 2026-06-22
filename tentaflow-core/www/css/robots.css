@@ -363,6 +363,26 @@
 .robots-tile-rec[data-tone="warning"] { color: var(--warning); }
 .robots-tile-rec[data-tone="muted"] { color: var(--text-3); }
 
+/* Live max-speed badge overlaid on the camera / lidar media, top-right corner, so
+   it stays visible over the stream while steering. Pulled out of the header's
+   normal flow and anchored to the tile (position: relative on .robots-tile). */
+.robots-speed-badge {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 2;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
 .robots-tile tf-video-stream {
   display: block;
   width: 100%;
@@ -607,6 +627,28 @@
 
 .robots-pad-spacer {
   flex: 1 1 auto;
+}
+
+/* Continuous max-speed control: a label, -/+ buttons and the live value chip. The
+   gamepad buttons 4/5 are the primary path; this mirrors / sets the same value. */
+.robots-pad-speed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.robots-pad-speed-lbl {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.robots-pad-speed-val {
+  min-width: 64px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
 }
 
 .robots-pad-hint {
