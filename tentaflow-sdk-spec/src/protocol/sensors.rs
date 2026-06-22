@@ -278,6 +278,59 @@ impl MagSample {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Device pose — the device's own local 6DoF pose (e.g. ARKit/ARCore world
+// tracking), used to build the map in a smooth local frame AND to align that
+// frame to ENU/WGS84 against the ESKF's global estimate.
+// ----------------------------------------------------------------------------
+
+pub const POSE_SAMPLE_VERSION: u8 = 1;
+pub const POSE_SAMPLE_LEN: usize = 40;
+
+/// One device-local pose: position (m) + orientation quaternion (xyzw) in the
+/// device's own tracking world frame (gravity-aligned, arbitrary origin/yaw).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoseSample {
+    pub version: u8,
+    pub flags: u8,
+    pub timestamp_us: i64,
+    pub position: [f32; 3],
+    pub quat_xyzw: [f32; 4],
+}
+
+impl PoseSample {
+    pub fn encode(&self) -> [u8; POSE_SAMPLE_LEN] {
+        let mut b = [0u8; POSE_SAMPLE_LEN];
+        b[0] = self.version;
+        b[1] = self.flags;
+        b[4..12].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        for (i, v) in self.position.iter().enumerate() {
+            b[12 + i * 4..16 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in self.quat_xyzw.iter().enumerate() {
+            b[24 + i * 4..28 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Option<PoseSample> {
+        if b.len() < POSE_SAMPLE_LEN || b[0] != POSE_SAMPLE_VERSION || b[2] != 0 || b[3] != 0 {
+            return None;
+        }
+        Some(PoseSample {
+            version: b[0],
+            flags: b[1],
+            timestamp_us: rd_i64(b, 4),
+            position: [rd_f32(b, 12), rd_f32(b, 16), rd_f32(b, 20)],
+            quat_xyzw: [rd_f32(b, 24), rd_f32(b, 28), rd_f32(b, 32), rd_f32(b, 36)],
+        })
+    }
+
+    pub fn is_finite(&self) -> bool {
+        self.position.iter().chain(self.quat_xyzw.iter()).all(|v| v.is_finite())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +393,23 @@ mod tests {
         let mut bad = f;
         bad.lat_deg = 91.0;
         assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn pose_sample_round_trips() {
+        let p = PoseSample {
+            version: POSE_SAMPLE_VERSION,
+            flags: 0,
+            timestamp_us: 123,
+            position: [1.0, -2.0, 0.5],
+            quat_xyzw: [0.0, 0.0, 0.3826, 0.9239],
+        };
+        assert_eq!(PoseSample::decode(&p.encode()), Some(p));
+        assert!(p.is_finite());
+        assert_eq!(POSE_SAMPLE_LEN, 40);
+        let mut b = p.encode();
+        b[2] = 1;
+        assert!(PoseSample::decode(&b).is_none());
     }
 
     #[test]

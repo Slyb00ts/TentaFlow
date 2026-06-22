@@ -112,6 +112,51 @@ pub fn enu_to_geodetic(
     ecef_to_geodetic(ecef)
 }
 
+/// Gravity-aligned rigid alignment between two metric frames from corresponding
+/// position pairs `(a, b)` where `b ≈ R(yaw)·a + t`. BOTH frames are Z-up (a device
+/// AR-world frame and the ENU nav frame are each gravity-aligned), so the rotation is
+/// yaw-only — solved in closed form (2-D Procrustes on the horizontal plane) and the
+/// Up offset as the mean Δz. Returns `(yaw_rad, t)` or `None` if the points are
+/// degenerate (too few, or no horizontal spread → yaw unobservable). The caller
+/// gates on enough motion before trusting it.
+pub fn align_yaw_translation(pairs: &[([f64; 3], [f64; 3])]) -> Option<(f64, [f64; 3])> {
+    let n = pairs.len();
+    if n < 2 {
+        return None;
+    }
+    let nf = n as f64;
+    // Centroids.
+    let mut ca = [0.0; 3];
+    let mut cb = [0.0; 3];
+    for (a, b) in pairs {
+        for k in 0..3 {
+            ca[k] += a[k] / nf;
+            cb[k] += b[k] / nf;
+        }
+    }
+    // Horizontal cross-covariance terms for the yaw (Kabsch in 2-D):
+    //   yaw = atan2(Σ(ax·by − ay·bx), Σ(ax·bx + ay·by)) on centered points.
+    let mut s = 0.0; // Σ (ax·by − ay·bx)
+    let mut c = 0.0; // Σ (ax·bx + ay·by)
+    let mut spread = 0.0;
+    for (a, b) in pairs {
+        let (ax, ay) = (a[0] - ca[0], a[1] - ca[1]);
+        let (bx, by) = (b[0] - cb[0], b[1] - cb[1]);
+        s += ax * by - ay * bx;
+        c += ax * bx + ay * by;
+        spread += ax * ax + ay * ay;
+    }
+    if spread < 1.0 {
+        return None; // <1 m² horizontal spread → yaw not observable yet
+    }
+    let yaw = s.atan2(c);
+    // t = cb − R(yaw)·ca  (Up component is a plain mean offset).
+    let (sin, cos) = yaw.sin_cos();
+    let rax = cos * ca[0] - sin * ca[1];
+    let ray = sin * ca[0] + cos * ca[1];
+    Some((yaw, [cb[0] - rax, cb[1] - ray, cb[2] - ca[2]]))
+}
+
 /// A manual georeference: the scene origin pinned to a real-world position + heading.
 /// `heading_deg` is the compass BEARING (degrees clockwise from true North) of the
 /// scene's +X axis. With heading 0, scene +X points North and scene +Y points West
@@ -176,6 +221,22 @@ impl GeoAnchor {
     /// Scene-local point (Z-up metres) → real-world WGS84 `(lat°, lon°, alt m)`.
     pub fn scene_to_wgs84(&self, scene: [f64; 3]) -> (f64, f64, f64) {
         ecef_to_geodetic(self.scene_to_ecef(scene))
+    }
+
+    /// Build the anchor for a device-local (e.g. ARKit/ARCore world) scene from an
+    /// AR→ENU alignment (`align_yaw_translation`) and the ENU nav origin's geodetic
+    /// position (the ESKF's first-GNSS fix). `yaw_rad` + `t` satisfy
+    /// `enu = R(yaw)·scene + t` (t in metres relative to `gnss_origin`).
+    /// Heading is `90° − yaw` so the GeoAnchor's `scene_to_enu` reproduces `R(yaw)`,
+    /// and the anchor's geodetic origin is where the scene origin (0,0,0) lands.
+    pub fn from_alignment(
+        yaw_rad: f64,
+        t: [f64; 3],
+        gnss_origin: (f64, f64, f64),
+    ) -> GeoAnchor {
+        let (lat0, lon0, alt0) = gnss_origin;
+        let (lat, lon, alt) = enu_to_geodetic(t, lat0, lon0, alt0);
+        GeoAnchor::new(lat, lon, alt, 90.0 - yaw_rad.to_degrees())
     }
 }
 
@@ -279,6 +340,53 @@ mod tests {
         assert!(lat_n > lat0, "+N raises latitude");
         let enu_n = geodetic_to_enu(lat_n, lon_n, alt_n, lat0, lon0, alt0);
         assert!((enu_n[1] - 100.0).abs() < 1e-3 && enu_n[0].abs() < 1e-3);
+    }
+
+    #[test]
+    fn align_recovers_known_yaw_and_translation() {
+        // Synthesize ENU points from AR points via a known yaw + translation, then
+        // recover them. enu = R(yaw)·ar + t.
+        let yaw = 0.7_f64; // rad
+        let t = [12.0, -5.0, 1.5];
+        let (s, c) = yaw.sin_cos();
+        let ars = [[0.0, 0.0, 0.0], [3.0, 0.0, 0.2], [0.0, 4.0, -0.3], [2.0, 2.0, 0.1]];
+        let pairs: Vec<_> = ars
+            .iter()
+            .map(|a| {
+                let e = [c * a[0] - s * a[1] + t[0], s * a[0] + c * a[1] + t[1], a[2] + t[2]];
+                (*a, e)
+            })
+            .collect();
+        let (ry, rt) = align_yaw_translation(&pairs).expect("aligns");
+        assert!((ry - yaw).abs() < 1e-6, "yaw {ry} vs {yaw}");
+        for k in 0..3 {
+            assert!((rt[k] - t[k]).abs() < 1e-6, "t[{k}] {} vs {}", rt[k], t[k]);
+        }
+    }
+
+    #[test]
+    fn align_rejects_degenerate() {
+        assert!(align_yaw_translation(&[([0.0; 3], [0.0; 3])]).is_none()); // <2 points
+        // All AR points identical → no horizontal spread → yaw unobservable.
+        let same = vec![([1.0, 1.0, 0.0], [2.0, 2.0, 0.0]); 5];
+        assert!(align_yaw_translation(&same).is_none());
+    }
+
+    #[test]
+    fn from_alignment_places_ar_origin_at_gnss_plus_t() {
+        // AR origin (0,0,0) must land at the geodetic point `t` metres (ENU) from the
+        // GNSS origin, and an AR +X step must map east-ish per the yaw.
+        let origin = (52.0, 21.0, 100.0);
+        let yaw = 0.0; // AR +X aligned with ENU East
+        let t = [10.0, 20.0, 3.0];
+        let a = GeoAnchor::from_alignment(yaw, t, origin);
+        let (lat, lon, alt) = a.scene_to_wgs84([0.0, 0.0, 0.0]);
+        let expect = enu_to_geodetic(t, origin.0, origin.1, origin.2);
+        assert!((lat - expect.0).abs() < 1e-9 && (lon - expect.1).abs() < 1e-9);
+        assert!((alt - expect.2).abs() < 1e-3);
+        // yaw 0 → heading 90 → scene +X = East → lon increases.
+        let east = a.scene_to_wgs84([10.0, 0.0, 0.0]);
+        assert!(east.1 > lon, "AR +X maps east");
     }
 
     #[test]
