@@ -299,6 +299,7 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     reasoning_delta: reasoning_cleaned,
                                     tool_calls: chunk.tool_calls,
                                     usage: chunk.usage,
+                                    perf: chunk.perf,
                                     finish_reason: chunk.finish_reason,
                                     error: chunk.error,
                                 };
@@ -394,7 +395,7 @@ mod tests {
     async fn pii_filter_replaces_email_pattern() {
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "email".into(),
             category: "contact".into(),
             pattern: r"[a-z]+@[a-z]+\.com".into(),
@@ -417,7 +418,7 @@ mod tests {
     async fn pii_filter_updates_last_user_message_in_context() {
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "email".into(),
             category: "contact".into(),
             pattern: r"[a-z]+@[a-z]+\.com".into(),
@@ -469,7 +470,7 @@ mod tests {
 
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "full_name".into(),
             category: "pii".into(),
             pattern: r"Jan Kowalski".into(),
@@ -583,7 +584,7 @@ mod tests {
 
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "secret".into(),
             category: "pii".into(),
             pattern: r"top_secret".into(),
@@ -631,7 +632,7 @@ mod tests {
 
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "secret".into(),
             category: "pii".into(),
             pattern: r"top_secret".into(),
@@ -670,7 +671,7 @@ mod tests {
 
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "secret".into(),
             category: "pii".into(),
             pattern: r"top_secret".into(),
@@ -710,7 +711,7 @@ mod tests {
     async fn pii_filter_invalid_regex_skipped_with_warning() {
         let mut ctx = stub_ctx();
         ctx.pii_rules = Arc::new(FakePiiRules(vec![PiiRule {
-            id: 1,
+            id: "1".into(),
             name: "bad".into(),
             category: "x".into(),
             pattern: "[unclosed".into(), // niepoprawny regex

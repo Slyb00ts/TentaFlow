@@ -2773,11 +2773,17 @@ pub fn pii_rule_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let rules = repository::list_pii_rules(&ctx.state.db, 0, 1000).map_err(db_err)?;
+    let rules = repository::list_pii_rules(
+        &ctx.state.db,
+        crate::services::org::DEFAULT_ORG_ID,
+        0,
+        1000,
+    )
+    .map_err(db_err)?;
     let summaries: Vec<tentaflow_protocol::PiiRule> = rules
         .into_iter()
         .map(|r| tentaflow_protocol::PiiRule {
-            id: r.id.to_string(),
+            id: r.id,
             kind: r.category,
             regex: r.pattern,
             action: r.replacement,

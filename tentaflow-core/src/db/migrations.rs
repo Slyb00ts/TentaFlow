@@ -462,7 +462,246 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_state_table",
             MigrationStep::Sql(ADDON_STATE_TABLE),
         ),
+        (
+            85,
+            "pii_rules_uuid_org_v2",
+            MigrationStep::RustSelfManaged(pii_rules_uuid_org_v2),
+        ),
+        (
+            86,
+            "token_metrics_tables",
+            MigrationStep::Sql(TOKEN_METRICS_SCHEMA),
+        ),
+        (
+            87,
+            "token_metrics_permissions",
+            MigrationStep::Rust(token_metrics_add_permissions),
+        ),
+        (
+            88,
+            "token_metrics_modalities",
+            MigrationStep::Sql(TOKEN_METRICS_MODALITIES),
+        ),
     ]
+}
+
+// v88 — rozszerza per-dzienny licznik o pozostale modalnosci poza chatem LLM:
+// STT (milisekundy audio), generacja obrazow (sztuki) i embeddingi (tokeny).
+// Liczniki kumulatywne w zakresie i64 (audio_ms moze byc bardzo duze).
+const TOKEN_METRICS_MODALITIES: &str = r#"
+ALTER TABLE token_usage_daily ADD COLUMN audio_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN images INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN embedding_tokens INTEGER NOT NULL DEFAULT 0;
+"#;
+
+// v87 — RBAC dla metryk tokenów. Admin/DPO dostają odczyt i zapis, operator
+// oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`.
+fn token_metrics_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["tokens.read", "tokens.write"],
+    )?;
+    roles_add_permissions(
+        conn,
+        &["org_operator", "org_viewer"],
+        &["tokens.read"],
+    )?;
+    Ok(())
+}
+
+// v86 — per-model/per-user/per-group token accounting that rides the Sync Ledger.
+// All three tables use TEXT primary keys (deterministic synthetic or UUID) so the
+// same logical row minted on different nodes never collides under an autoincrement
+// INTEGER. `token_usage_daily` is single-writer-per-row (only the owning node
+// mutates its own rows; the sum across all node rows is the global usage), while
+// quotas and leases are admin/coordinator edited and replicate LWW.
+const TOKEN_METRICS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    id                TEXT PRIMARY KEY,
+    node_id           TEXT NOT NULL,
+    org_id            TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id           TEXT NOT NULL,
+    model_id          TEXT NOT NULL,
+    usage_day         TEXT NOT NULL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    request_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_token_usage_user ON token_usage_daily(org_id, user_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage_daily(org_id, model_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_updated ON token_usage_daily(updated_at);
+
+CREATE TABLE IF NOT EXISTS token_quota (
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    scope_type       TEXT NOT NULL,
+    subject_id       TEXT,
+    model_id         TEXT,
+    period           TEXT NOT NULL,
+    max_total_tokens INTEGER NOT NULL,
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, scope_type, subject_id, model_id, period)
+);
+
+CREATE TABLE IF NOT EXISTS token_lease (
+    id                  TEXT PRIMARY KEY,
+    org_id              TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    quota_id            TEXT NOT NULL,
+    node_id             TEXT NOT NULL,
+    period_key          TEXT NOT NULL,
+    base_used           INTEGER NOT NULL,
+    granted_tokens      INTEGER NOT NULL,
+    coordinator_node_id TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, quota_id, node_id, period_key)
+);
+"#;
+
+// v85 — rebuild pii_rules with a TEXT UUID primary key and an org_id column so
+// it can replicate as a per-org core sync resource. Existing INTEGER rows get a
+// fresh UUID and default to DEFAULT_ORG_ID; the name-unique index becomes a
+// (org_id, name)-unique index. Modeled on `api_keys_access_v2`.
+fn pii_rules_uuid_org_v2(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let already_done: bool = conn
+        .query_row(
+            "SELECT instr(sql, 'org_id') > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'pii_rules'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if already_done {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_pii_rules_active;
+            DROP INDEX IF EXISTS idx_pii_rules_name_unique;
+            CREATE TABLE pii_rules_new (
+                id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                replacement TEXT NOT NULL DEFAULT '[UKRYTY]',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER DEFAULT 0,
+                description TEXT,
+                test_examples TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(org_id, name)
+            );
+            ",
+        )?;
+
+        // Carry over every existing row with a fresh UUID id and the default org.
+        let legacy: Vec<(
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = {
+            let mut stmt = tx.prepare(
+                "SELECT name, category, pattern, replacement, is_active, priority, \
+                        description, test_examples, created_at FROM pii_rules",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, String>(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (
+            rule_name,
+            category,
+            pattern,
+            replacement,
+            is_active,
+            priority,
+            description,
+            test_examples,
+            created_at,
+        ) in legacy
+        {
+            tx.execute(
+                "INSERT INTO pii_rules_new \
+                 (id, org_id, name, category, pattern, replacement, is_active, priority, description, test_examples, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::services::org::DEFAULT_ORG_ID,
+                    rule_name,
+                    category,
+                    pattern,
+                    replacement,
+                    is_active,
+                    priority,
+                    description,
+                    test_examples,
+                    created_at,
+                ],
+            )?;
+        }
+
+        tx.execute_batch(
+            "
+            DROP TABLE pii_rules;
+            ALTER TABLE pii_rules_new RENAME TO pii_rules;
+            CREATE INDEX idx_pii_rules_active ON pii_rules(is_active, priority);
+            ",
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "pii_rules_uuid_org_v2: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 // Write-behind backing store for the in-RAM `AddonStateStore` Durable tier

@@ -162,9 +162,10 @@ impl PairingHandler {
                         .security
                         .get_all_trusted_keys()
                         .into_iter()
-                        .map(|(node_id, public_key_hex)| PairingTrustedKeyEntry {
+                        .map(|(node_id, public_key_hex, approved_at)| PairingTrustedKeyEntry {
                             node_id,
                             public_key_hex,
+                            approved_at,
                         })
                         .collect(),
                 },
@@ -386,6 +387,7 @@ pub async fn initiate_pairing_over_iroh(
                         &entry.node_id,
                         &entry.public_key_hex,
                         "mesh-sync",
+                        Some(&entry.approved_at),
                     );
                 }
             }

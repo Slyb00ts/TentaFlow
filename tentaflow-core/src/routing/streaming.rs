@@ -182,12 +182,19 @@ struct ComplianceAuditStream {
     usage: Option<crate::api::openai::types::Usage>,
     tool_calls: Vec<ToolCall>,
     finished: bool,
+    // Gdy compliance jest aktywne, strumień jest budowany z usage-tail NIEZALEŻNIE
+    // od tego czy klient prosił o include_usage — token accounting (AiGateway
+    // bump) musi widzieć realne usage także dla zwykłego streamingu z dashboardu.
+    // Jeśli klient NIE prosił o usage, ten tail jest wewnętrzny: zbieramy z niego
+    // usage, ale nie przepuszczamy go do klienta.
+    emit_usage_to_client: bool,
 }
 
 impl ComplianceAuditStream {
     fn new(
         inner: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
         event: AiEventHandle,
+        emit_usage_to_client: bool,
     ) -> Self {
         Self {
             inner,
@@ -196,6 +203,7 @@ impl ComplianceAuditStream {
             usage: None,
             tool_calls: Vec::new(),
             finished: false,
+            emit_usage_to_client,
         }
     }
 
@@ -232,33 +240,44 @@ impl Stream for ComplianceAuditStream {
     type Item = Result<ChatCompletionChunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                for choice in &chunk.choices {
-                    if let Some(content) = choice.delta.content.as_deref() {
-                        self.response_text.push_str(content);
-                    }
-                    if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
-                        for delta in tool_calls {
-                            absorb_tool_call_delta(&mut self.tool_calls, delta);
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    for choice in &chunk.choices {
+                        if let Some(content) = choice.delta.content.as_deref() {
+                            self.response_text.push_str(content);
+                        }
+                        if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
+                            for delta in tool_calls {
+                                absorb_tool_call_delta(&mut self.tool_calls, delta);
+                            }
                         }
                     }
+                    if let Some(usage) = chunk.usage.as_ref() {
+                        self.usage = Some(usage.clone());
+                        // Usage-tail wymuszony wewnętrznie dla token accountingu:
+                        // gdy klient nie prosił o include_usage, nie przepuszczamy
+                        // tego tail-chunku (nie niesie treści) dalej.
+                        let content_free = chunk.choices.iter().all(|c| {
+                            c.delta.content.is_none() && c.delta.tool_calls.is_none()
+                        });
+                        if !self.emit_usage_to_client && content_free {
+                            continue;
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(chunk)));
                 }
-                if let Some(usage) = chunk.usage.as_ref() {
-                    self.usage = Some(usage.clone());
+                Poll::Ready(Some(Err(error))) => {
+                    let error_message = error.to_string();
+                    self.finish_failed(&error_message);
+                    return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(Some(Ok(chunk)))
+                Poll::Ready(None) => {
+                    self.finish_success();
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(error))) => {
-                let error_message = error.to_string();
-                self.finish_failed(&error_message);
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(None) => {
-                self.finish_success();
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -383,6 +402,13 @@ fn make_chunk(
         speaker_id: None,
         speaker_name: None,
         usage: None,
+        // Metryki wydajnosci jada na finalnym chunku (trailer LlmStreamChunk
+        // niesie perf razem z usage); regular delty maja None.
+        perf: c.perf.map(|p| crate::api::openai::types::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
     }
 }
 
@@ -410,6 +436,11 @@ fn build_flow_tail_chunk(
             prompt_tokens: outcome.usage.prompt_tokens as u32,
             completion_tokens: outcome.usage.completion_tokens as u32,
             total_tokens: outcome.usage.total_tokens as u32,
+        }),
+        perf: outcome.perf.map(|p| crate::api::openai::types::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
         }),
     }
 }
@@ -659,13 +690,22 @@ impl Router {
         };
 
         let compliance_event = if let Some(db) = self.db.as_ref() {
-            let gateway = AiGateway::new(db.clone(), self.local_node_id());
+            let gateway = AiGateway::new(
+                db.clone(),
+                self.local_node_id(),
+                crate::compliance::ai_gateway::token_quota_enabled(),
+            );
             Some(
                 gateway
                     .start_chat_event(&request, user.as_ref(), compliance_context.as_ref())
-                    .map_err(|e| crate::error::CoreError::InternalError {
-                        message: "compliance AI audit stream start failed".to_string(),
-                        source: Some(e),
+                    // Zachowaj realny błąd domenowy (np. RateLimitExceeded z limitu
+                    // tokenów) — inaczej klient widzi mylące „błąd wewnętrzny".
+                    .map_err(|e| match e.downcast::<crate::error::CoreError>() {
+                        Ok(core) => core,
+                        Err(e) => crate::error::CoreError::InternalError {
+                            message: "compliance AI audit stream start failed".to_string(),
+                            source: Some(e),
+                        },
                     })?,
             )
         } else {
@@ -726,10 +766,15 @@ impl Router {
                         .as_ref()
                         .map(|so| so.include_usage)
                         .unwrap_or(false);
+                    // Token accounting (AiGateway bump) potrzebuje realnego usage
+                    // także gdy klient nie prosił o include_usage. Gdy compliance
+                    // jest aktywne, wymuszamy wewnętrzny usage-tail; ComplianceAuditStream
+                    // go zbierze i — jeśli klient nie prosił — nie przepuszcza dalej.
+                    let need_usage = include_usage || compliance_event.is_some();
                     let chunk_stream = envelope_stream_to_chunk_stream(
                         stream_exec,
                         model_for_stream,
-                        include_usage,
+                        need_usage,
                     );
                     // PII cleaning idzie teraz przez `pii_filter`
                     // StreamingNodeAdapter wewnątrz flow_engine — wire
@@ -759,7 +804,7 @@ impl Router {
                                 > + Send,
                         >,
                     > = if let Some(event) = compliance_event {
-                        Box::pin(ComplianceAuditStream::new(filtered, event))
+                        Box::pin(ComplianceAuditStream::new(filtered, event, include_usage))
                     } else {
                         filtered
                     };
@@ -975,7 +1020,7 @@ mod compliance_stream_tests {
     #[tokio::test]
     async fn compliance_stream_zapisuje_scalona_odpowiedz() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {
@@ -1012,7 +1057,7 @@ mod compliance_stream_tests {
             Ok(chunk("pierwsza ", None)),
             Ok(chunk("druga", Some(usage))),
         ]);
-        let mut stream = ComplianceAuditStream::new(Box::pin(inner), handle);
+        let mut stream = ComplianceAuditStream::new(Box::pin(inner), handle, true);
         while stream
             .next()
             .await

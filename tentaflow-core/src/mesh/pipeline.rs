@@ -69,6 +69,8 @@ pub struct MeshPipelineConfig {
     pub role: String,
     /// Konfiguracja mesh z pliku config
     pub mesh_config: MeshConfig,
+    /// Konfiguracja metryk tokenow — bramkuje flushera i koordynatora dzierzaw.
+    pub token_metrics: crate::config::TokenMetricsConfig,
 }
 
 /// Wynik uruchomienia mesh pipeline — trzeba trzymac alive do konca zycia aplikacji
@@ -423,6 +425,34 @@ pub async fn start_mesh_pipeline(
             );
             spawn_pairing_cleanup(mesh_security.clone());
             spawn_sync_repair_scheduler(quic_mesh.clone(), mesh_security.clone());
+            spawn_trust_expiry_prune(
+                quic_mesh.clone(),
+                mesh_peer_store.clone(),
+                mesh_security.clone(),
+                mesh_config.trust_expiry_days,
+            );
+
+            if config.token_metrics.enabled {
+                if let Some(ref pool) = db_pool {
+                    spawn_token_usage_flusher(
+                        pool.clone(),
+                        local_node_id.clone(),
+                        config.token_metrics.flush_secs,
+                        background_shutdown.clone(),
+                    );
+                    spawn_token_lease_coordinator(
+                        quic_mesh.clone(),
+                        mesh_security.clone(),
+                        pool.clone(),
+                        local_node_id.clone(),
+                        config.token_metrics.lease_secs,
+                        config.token_metrics.lease_ttl_secs,
+                        background_shutdown.clone(),
+                    );
+                } else {
+                    warn!("token-metrics wlaczone, ale brak db_pool — taski tokenow pominiete");
+                }
+            }
 
             info!("Mesh networking uruchomiony (iroh transport)");
 
@@ -669,9 +699,10 @@ async fn handle_peer_connected(
                 if !all_keys.is_empty() {
                     let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                         .iter()
-                        .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                        .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                             node_id: nid.clone(),
                             public_key_hex: pk.clone(),
+                            approved_at: approved_at.clone(),
                         })
                         .collect();
                     let payload =
@@ -1641,9 +1672,10 @@ fn spawn_quic_event_handler(
                         if !all_keys.is_empty() {
                             let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                                 .iter()
-                                .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                                     node_id: nid.clone(),
                                     public_key_hex: pk.clone(),
+                                    approved_at: approved_at.clone(),
                                 })
                                 .collect();
                             let payload =
@@ -1748,10 +1780,11 @@ fn spawn_quic_event_handler(
                                             tentaflow_protocol::mesh::TrustedKeyEntry,
                                         > = all_keys
                                             .iter()
-                                            .map(|(nid, pk)| {
+                                            .map(|(nid, pk, approved_at)| {
                                                 tentaflow_protocol::mesh::TrustedKeyEntry {
                                                     node_id: nid.clone(),
                                                     public_key_hex: pk.clone(),
+                                                    approved_at: approved_at.clone(),
                                                 }
                                             })
                                             .collect();
@@ -1781,10 +1814,11 @@ fn spawn_quic_event_handler(
                                             tentaflow_protocol::mesh::TrustedKeyEntry,
                                         > = updated_keys
                                             .iter()
-                                            .map(|(nid, pk)| {
+                                            .map(|(nid, pk, approved_at)| {
                                                 tentaflow_protocol::mesh::TrustedKeyEntry {
                                                     node_id: nid.clone(),
                                                     public_key_hex: pk.clone(),
+                                                    approved_at: approved_at.clone(),
                                                 }
                                             })
                                             .collect();
@@ -1857,7 +1891,7 @@ fn spawn_quic_event_handler(
                         // Przypadek 1: ja zostalam odlaczony z mesh — usun WSZYSTKIE klucze
                         if i_am_revoked && sender_trusted {
                             let all_trusted = sec.get_all_trusted_keys();
-                            for (trusted_id, _) in &all_trusted {
+                            for (trusted_id, _, _) in &all_trusted {
                                 let _ = sec.unpair(trusted_id);
                                 // F1b P3.B — drop the peer's mirrored HMAC keys
                                 // so their tokens stop verifying immediately.
@@ -1949,11 +1983,16 @@ fn spawn_quic_event_handler(
 
                     if let Some(ref sec) = mesh_security {
                         let mut added = 0u32;
-                        for (remote_node_id, public_key_hex) in &keys {
+                        for (remote_node_id, public_key_hex, approved_at) in &keys {
                             if sec.is_trusted(remote_node_id) {
                                 continue;
                             }
-                            match sec.add_trusted_key(remote_node_id, public_key_hex, "") {
+                            match sec.add_trusted_key(
+                                remote_node_id,
+                                public_key_hex,
+                                "",
+                                Some(approved_at),
+                            ) {
                                 Ok(()) => {
                                     peer_store.ensure_trusted_peer(
                                         remote_node_id,
@@ -3395,6 +3434,330 @@ fn spawn_pairing_cleanup(mesh_security: Arc<MeshSecurity>) {
             }
         }
     });
+}
+
+/// Parses a SQLite `datetime('now')` timestamp (`YYYY-MM-DD HH:MM:SS`, UTC) or an
+/// RFC3339 string into a UNIX epoch in milliseconds. Used as the activity floor for
+/// trust-expiry: a freshly paired peer that never connected has only `approved_at`,
+/// so it must not be pruned before the TTL elapses since pairing.
+fn approved_at_to_ms(approved_at: &str) -> Option<i64> {
+    let trimmed = approved_at.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.timestamp_millis());
+    }
+    chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc().timestamp_millis())
+}
+
+/// Time-based trust expiry. Walks the trusted-node set and auto-removes any peer that
+/// has neither connected nor been (re)paired within `trust_expiry_days`. This self-cleans
+/// dead identities: a wiped/re-provisioned node gets a NEW ed25519 key, so its OLD identity
+/// would otherwise sit `trusted` forever and the mesh would burn reconnect cycles dialing it.
+///
+/// A peer that is currently connected, or whose persisted `last_seen_ms` (last successful
+/// connection, survives restart) is within the TTL, is NEVER pruned — only long-unreachable
+/// identities are removed. `trust_expiry_days == 0` disables the prune entirely.
+fn spawn_trust_expiry_prune(
+    qm: Arc<IrohMeshManager>,
+    peer_store: MeshPeerStore,
+    mesh_security: Arc<MeshSecurity>,
+    trust_expiry_days: u64,
+) {
+    if trust_expiry_days == 0 {
+        info!("trust-expiry prune wylaczony (trust_expiry_days=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let ttl_ms = (trust_expiry_days as i64).saturating_mul(86_400_000);
+        // Daily cadence is far finer than a 30-day TTL, so the check is cheap and a node
+        // crossing the threshold is removed within a day without spamming the DB/log.
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("trust-expiry prune: nie udalo sie odczytac trusted_nodes: {}", e);
+                    continue;
+                }
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            for node in &trusted {
+                // Reachable peers are never candidates — guards against revoking a healthy
+                // node whose persisted last_seen happens to lag (bucketed every 30s).
+                if qm.is_connected(&node.node_id).await {
+                    continue;
+                }
+                let last_seen = crate::db::repository::get_peer_last_seen_ms(
+                    &mesh_security.db,
+                    &node.node_id,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+                // Floor activity at pairing time so a just-paired peer that has not yet
+                // connected is not pruned before the TTL elapses.
+                let approved_ms = approved_at_to_ms(&node.approved_at).unwrap_or(0);
+                let last_activity = last_seen.max(approved_ms);
+                if last_activity == 0 || now_ms.saturating_sub(last_activity) <= ttl_ms {
+                    continue;
+                }
+
+                let idle_days = now_ms.saturating_sub(last_activity) / 86_400_000;
+                info!(
+                    peer = %node.node_id,
+                    idle_days,
+                    "trust-expiry prune: usuwam martwa zaufana tozsamosc (brak polaczenia w oknie TTL)"
+                );
+                let _ = crate::db::repository::log_audit(
+                    &mesh_security.db,
+                    None,
+                    None,
+                    "trust_expired",
+                    None,
+                    Some(&format!(
+                        "Auto-revoke zaufania dla {} — brak polaczenia od {} dni",
+                        node.node_id, idle_days
+                    )),
+                    None,
+                    Some(&node.node_id),
+                );
+                // Drop trusted_nodes row + in-memory keys + rebuild snapshot.
+                if let Err(e) = mesh_security.unpair(&node.node_id) {
+                    warn!(peer = %node.node_id, "trust-expiry prune: unpair nieudany: {}", e);
+                    continue;
+                }
+                // Remove from the sync target set (sync_nodes filtered on trust_status).
+                let _ = crate::db::repository::delete_sync_node(&mesh_security.db, &node.node_id);
+                // Clear persisted contact hints + peer_persisted row, so the reconnect
+                // manager stops dialing the dead identity.
+                let _ = crate::net::iroh::pairing::delete_trusted_contact_hints(
+                    &mesh_security.db,
+                    &node.node_id,
+                );
+                // Forget the in-memory registry entry so liveness/reconnect drop it now.
+                if let Some(registry) = peer_store.registry() {
+                    if let Ok(id_bytes) = hex_to_node_id(&node.node_id) {
+                        registry.forget(&id_bytes);
+                    }
+                }
+                peer_store.remove(&node.node_id);
+            }
+        }
+    });
+}
+
+/// Flusher capture'ow zuzycia tokenow. Co `flush_secs` przepisuje swieze wiersze
+/// `token_usage_daily` (po watermarku) do Sync Ledger. Kazdy wezel flushuje
+/// WLASNE wiersze, wiec task biegnie wszedzie (nie tylko na koordynatorze).
+/// Watermark trzymany lokalnie w pamieci — po restarcie startuje od pustego
+/// (flush jest idempotentny po stronie ledgera).
+fn spawn_token_usage_flusher(
+    pool: crate::db::DbPool,
+    self_node_id: String,
+    flush_secs: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut watermark = String::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(flush_secs.max(1)));
+        interval.tick().await; // pierwszy tick natychmiast — pomin
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("token-usage flusher: shutdown");
+                    return;
+                }
+                _ = interval.tick() => {
+                    match crate::db::repository::flush_token_usage_captures(&pool, &self_node_id, &watermark) {
+                        Ok(new_watermark) => {
+                            debug!(watermark = %new_watermark, "token-usage flusher: flush ok");
+                            watermark = new_watermark;
+                        }
+                        Err(e) => warn!("token-usage flusher: flush nieudany: {}", e),
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Koordynator dzierzaw tokenow. Co `lease_secs` liczy zbior kandydatow
+/// (self + zaufane, osiagalne wezly), a nastepnie dla kazdej organizacji z
+/// aktywnymi limitami wybiera koordynatora metoda HRW (`elect_coordinator`).
+/// Tylko wybrany koordynator danej organizacji zapisuje dzierzawy — pozostale
+/// wezly pomijaja te organizacje. Pula tokenow jest dzielona rowno miedzy
+/// kandydatow; reszta z dzielenia trafia do koordynatora, wiec suma przydzialow
+/// nigdy nie przekracza pozostalego limitu.
+fn spawn_token_lease_coordinator(
+    qm: Arc<IrohMeshManager>,
+    mesh_security: Arc<MeshSecurity>,
+    pool: crate::db::DbPool,
+    self_node_id: String,
+    lease_secs: u64,
+    lease_ttl_secs: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(lease_secs.max(1)));
+        interval.tick().await; // pierwszy tick natychmiast — pomin
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("token-lease coordinator: shutdown");
+                    return;
+                }
+                _ = interval.tick() => {
+                    run_token_lease_coordinator_tick(
+                        &qm,
+                        &mesh_security,
+                        &pool,
+                        &self_node_id,
+                        lease_ttl_secs,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+async fn run_token_lease_coordinator_tick(
+    qm: &Arc<IrohMeshManager>,
+    mesh_security: &Arc<MeshSecurity>,
+    pool: &crate::db::DbPool,
+    self_node_id: &str,
+    lease_ttl_secs: u64,
+) {
+    // Kandydaci: self (zawsze) + zaufane wezly polaczone LUB ostatnio widziane.
+    // Liveness identyczny jak w spawn_trust_expiry_prune: is_connected albo
+    // niezerowy last_seen w peer_persisted.
+    let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("token-lease coordinator: odczyt trusted_nodes nieudany: {}", e);
+            return;
+        }
+    };
+    let mut candidates: Vec<String> = vec![self_node_id.to_string()];
+    for node in &trusted {
+        if node.node_id == self_node_id || candidates.contains(&node.node_id) {
+            continue;
+        }
+        let reachable = qm.is_connected(&node.node_id).await || {
+            crate::db::repository::get_peer_last_seen_ms(&mesh_security.db, &node.node_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                > 0
+        };
+        if reachable {
+            candidates.push(node.node_id.clone());
+        }
+    }
+
+    let quotas = match crate::db::repository::list_all_active_token_quotas(pool) {
+        Ok(q) => q,
+        Err(e) => {
+            warn!("token-lease coordinator: odczyt limitow nieudany: {}", e);
+            return;
+        }
+    };
+
+    // Grupowanie po org_id — koordynator jest wybierany per organizacja.
+    let mut by_org: std::collections::HashMap<String, Vec<crate::db::models::TokenQuota>> =
+        std::collections::HashMap::new();
+    for quota in quotas {
+        by_org.entry(quota.org_id.clone()).or_default().push(quota);
+    }
+
+    let n = candidates.len() as i64;
+    for (org_id, org_quotas) in &by_org {
+        let coordinator = crate::mesh::token_coordinator::elect_coordinator(
+            &format!("token-coord|{org_id}"),
+            &candidates,
+        );
+        if coordinator.as_deref() != Some(self_node_id) {
+            continue;
+        }
+        for quota in org_quotas {
+            let period_key = token_period_key(&quota.period);
+            let global_used =
+                match crate::db::repository::global_usage_for_quota(pool, quota, &period_key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(quota = %quota.id, "token-lease: global_usage nieudany: {}", e);
+                        continue;
+                    }
+                };
+            let remaining = (quota.max_total_tokens - global_used).max(0);
+            let per_node = remaining / n;
+            // Reszta z dzielenia idzie do koordynatora — suma(granted) == remaining,
+            // nigdy ponad limit.
+            let remainder = remaining - per_node * n;
+            let expires_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(lease_ttl_secs as i64))
+            .to_rfc3339();
+
+            for node in &candidates {
+                let base_used = match crate::db::repository::node_usage_for_quota(
+                    pool,
+                    node,
+                    quota,
+                    &period_key,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(quota = %quota.id, node = %node, "token-lease: node_usage nieudany: {}", e);
+                        continue;
+                    }
+                };
+                let granted = if node == self_node_id {
+                    per_node + remainder
+                } else {
+                    per_node
+                };
+                let params = crate::db::models::TokenLeaseUpsert {
+                    org_id: &quota.org_id,
+                    quota_id: &quota.id,
+                    node_id: node,
+                    period_key: &period_key,
+                    base_used,
+                    granted_tokens: granted,
+                    coordinator_node_id: self_node_id,
+                    expires_at: &expires_at,
+                };
+                if let Err(e) = crate::db::repository::upsert_token_lease(pool, &params) {
+                    warn!(quota = %quota.id, node = %node, "token-lease: upsert nieudany: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Klucz okresu dla dzierzawy: dzienny `YYYY-MM-DD`, miesieczny `YYYY-MM`.
+fn token_period_key(period: &str) -> String {
+    let now = chrono::Utc::now();
+    if period == "monthly" {
+        now.format("%Y-%m").to_string()
+    } else {
+        now.format("%Y-%m-%d").to_string()
+    }
+}
+
+/// Decodes a hex node_id into the 32-byte key shape the peer registry uses.
+fn hex_to_node_id(node_id_hex: &str) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(node_id_hex, &mut out)
+        .map_err(|e| anyhow::anyhow!("invalid node_id hex: {e}"))?;
+    Ok(out)
 }
 
 fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<MeshSecurity>) {

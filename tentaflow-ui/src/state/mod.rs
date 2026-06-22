@@ -316,7 +316,7 @@ pub struct FlowInfo {
 /// Regula PII
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PiiRule {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub category: String,
     pub pattern: String,
@@ -474,8 +474,8 @@ pub enum UiCommand {
 
     // --- PII Rules ---
     CreatePiiRule { name: String, category: String, pattern: String, replacement: String, priority: i64 },
-    UpdatePiiRule { id: i64, name: String, category: String, pattern: String, replacement: String, is_active: bool, priority: i64 },
-    DeletePiiRule(i64),
+    UpdatePiiRule { id: String, name: String, category: String, pattern: String, replacement: String, is_active: bool, priority: i64 },
+    DeletePiiRule(String),
 
     // --- TTS Cleaning Rules ---
     CreateTtsRule { rule_type: String, pattern: String, replacement: String, language: String, priority: i64 },

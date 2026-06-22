@@ -663,7 +663,7 @@ pub struct ChatStreamChunk {
     pub delta: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatStreamEnd {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -672,6 +672,14 @@ pub struct ChatStreamEnd {
     /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami.
     #[serde(default)]
     pub text: Option<String>,
+    /// Per-message metryki wydajnosci inferencji. `#[serde(default)]` zachowuje
+    /// kompatybilnosc ze starszymi peerami (0 gdy nieznane).
+    #[serde(default)]
+    pub ttft_ms: u32,
+    #[serde(default)]
+    pub prefill_tps: f32,
+    #[serde(default)]
+    pub decode_tps: f32,
 }
 
 // =============================================================================
@@ -6561,6 +6569,10 @@ pub enum MessageBody {
     // Appended AFTER the API-key variants so origin's variant indices stay
     // wire-stable across the fleet; RobotsBody takes the new highest index.
     RobotsBody(RobotsPayload),
+    // Token metrics admin: usage summary, quota CRUD, lease coordinator status.
+    // Appended at the END so existing variant indices stay wire-stable across
+    // the fleet (ciborium 0.8 encodes variants by index).
+    TokenUsageBody(crate::token_usage::TokenUsagePayload),
 }
 
 // =============================================================================
@@ -6861,6 +6873,9 @@ mod tests {
             prompt_tokens: 12,
             completion_tokens: 34,
             text: Some("Hello".to_string()),
+            ttft_ms: 50,
+            prefill_tps: 120.0,
+            decode_tps: 45.5,
         });
         assert_eq!(round_trip(end.clone()), end);
     }

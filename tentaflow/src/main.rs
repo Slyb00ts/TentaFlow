@@ -200,6 +200,10 @@ async fn run_server(args: Args) -> Result<()> {
 
     info!("Konfiguracja wczytana pomyslnie");
 
+    tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
+        config.token_metrics.enabled,
+    );
+
     // Inicjalizacja bazy danych
     info!("Inicjalizacja bazy danych: {:?}", db_path);
     let db = db::init(&db_path).map_err(|e| {
@@ -358,7 +362,7 @@ async fn run_server(args: Args) -> Result<()> {
         let _writer_handle = writer.spawn();
     }
 
-    for (node_id, public_key_hex) in mesh_security.get_all_trusted_keys() {
+    for (node_id, public_key_hex, _approved_at) in mesh_security.get_all_trusted_keys() {
         if node_id != local_node_id_str {
             mesh_peer_store.ensure_trusted_peer(&node_id, &public_key_hex, "");
         }
@@ -654,6 +658,7 @@ async fn run_server(args: Args) -> Result<()> {
                 node_id: node_id.clone(),
                 role: "router".to_string(),
                 mesh_config: mesh_config.clone(),
+                token_metrics: config.token_metrics.clone(),
             };
 
             match start_mesh_pipeline(

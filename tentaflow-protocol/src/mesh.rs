@@ -1011,6 +1011,12 @@ pub struct KeyRotationResponsePayload {
 pub struct TrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at` (the time the key was FIRST locally paired on the
+    /// origin node), carried so a mirror re-add does not reset the trust-expiry TTL
+    /// clock to "now". Empty when received from an un-upgraded peer (serde default),
+    /// in which case the receiver falls back to its own current time.
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 /// Minimal payload dla `MESH_MSG_HELLO` — tylko hostname + platform + OS.
@@ -1159,6 +1165,11 @@ pub struct PairingFirstContactRequest {
 pub struct PairingTrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at`, same purpose as `TrustedKeyEntry::approved_at`:
+    /// a key propagated during first-contact pairing must not reset the receiver's
+    /// trust-expiry TTL clock. Empty from un-upgraded peers (serde default).
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -1453,6 +1464,14 @@ pub struct BaselineElect {
     pub node_id: String,
     pub proposed_donor: String,
     pub epoch_seen: u64,
+    /// Number of ledger operations the sender (the dialing node) currently holds.
+    /// The donor side uses it to settle the role data-aware: the node with MORE
+    /// content is the donor, so an empty node that dials a data-holder is told it
+    /// is the joiner (it adopts), never the other way round — which would wipe the
+    /// data-holder. `serde(default)` keeps the frame readable from peers that
+    /// predate this field (they decode as `0` = "no content advertised").
+    #[serde(default)]
+    pub sender_op_count: u64,
 }
 
 /// Odpowiedz donora na `BaselineElect` — akceptacja albo odrzucenie roli donora.
@@ -1898,12 +1917,14 @@ mod tests {
             node_id: "joiner-1".to_string(),
             proposed_donor: "donor-1".to_string(),
             epoch_seen: 7,
+            sender_op_count: 42,
         };
         let bytes = crate::cbor::encode(&elect).expect("encode");
         let decoded = crate::cbor::decode::<BaselineElect>(&bytes).expect("decode");
         assert_eq!(decoded.node_id, "joiner-1");
         assert_eq!(decoded.proposed_donor, "donor-1");
         assert_eq!(decoded.epoch_seen, 7);
+        assert_eq!(decoded.sender_op_count, 42);
 
         let ack = BaselineAck {
             accepted: true,
