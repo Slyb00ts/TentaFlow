@@ -7,11 +7,13 @@
 //       to osobne slice'y. Komentarze po polsku.
 // =============================================================================
 
+mod ui;
+
 use tentaflow_addon_sdk::prelude::*;
 use tentaflow_addon_sdk::{
-    doc_parse, document_get, graph_delete_edge, graph_delete_node, graph_upsert_edge,
-    graph_upsert_node, vector_delete, vector_upsert, GraphNode, GraphProp, Provenance, VectorField,
-    VectorFieldValue,
+    doc_parse, document_get, graph_delete_edge, graph_delete_node, graph_neighbors,
+    graph_upsert_edge, graph_upsert_node, vector_delete, vector_upsert, GraphDirection, GraphNode,
+    GraphProp, Provenance, VectorField, VectorFieldValue,
 };
 
 // Niskopoziomowy binding llm_generate z pelnym ABI (model + opcje) — dokladnie
@@ -187,12 +189,33 @@ pub extern "C" fn on_start() -> i32 {
         }),
     );
 
-    // Minimalny panel — lista kolekcji renderowana z SQL. Pelne GUI to osobny slice.
-    if let Err(e) = render_main_panel() {
-        log::warn(&format!("rag: nie udalo sie wyrenderowac panelu: {e}"));
-    }
+    // Rejestracja narzedzi read-side konsumowanych przez panel GUI (i wolalnych
+    // recznie/przez LLM). Same odczyty (poza create/delete/resolve) — parametryzowany
+    // SQL, capy, paginacja, izolacja per-instancja.
+    register_read_side_tools();
+
+    // Pelny panel GUI (NavTabs: kolekcje, dokumenty, czat, graf, konflikty) przez
+    // binarny protokol CBOR (sdk-runtime). Zastepuje dawny minimalny panel JSON.
+    ui::send_panel_shell();
+    ui::send_tab_content(ui::DEFAULT_TAB);
 
     log::info("rag: uruchomiony");
+    0
+}
+
+/// Reopen panelu: host nadaje swiezy epoch i resetuje oczekiwana rewizje stanu do 0,
+/// wiec addon adoptuje nowy epoch, restartuje wlasny licznik rewizji i re-rejestruje
+/// shell (wzor sdk-showcase).
+#[no_mangle]
+pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64) -> i32 {
+    let panel_id = read_string(panel_id_ptr, panel_id_len);
+    if panel_id != ui::PANEL_ID {
+        log::warn(&format!("rag: on_panel_open nieznany panel '{panel_id}'"));
+        return 0;
+    }
+    ui::reset_for_open(epoch as u64);
+    ui::send_panel_shell();
+    ui::send_tab_content(ui::DEFAULT_TAB);
     0
 }
 
@@ -232,13 +255,40 @@ pub extern "C" fn on_request(
     let tool_name = request.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(json!({}));
 
+    // Akcje UI (panel main) jada przez ui_channel hosta jako tool "ui.<panel>.<action>".
+    // Obsluguje je modul ui — wola odpowiedni read/write tool ponizej i odswieza panel.
+    if let Some(action_id) = tool_name.strip_prefix("ui.main.") {
+        // Tozsamosc usera (per-call z hosta) musi byc ustawiona PRZED akcja, bo
+        // wartosci pol formularza sa kluczowane per-sesja (`f:{user}:{epoch}:{field}`),
+        // inaczej KV (scope = addon_id) przeciekalby miedzy userami tej instancji.
+        let user_id = request.get("user_id").and_then(|v| v.as_str());
+        ui::set_session_user(user_id);
+        // Adopcja HOST-zwalidowanego `panel_epoch` z akcji (params.__panel_epoch). Instancja
+        // WASM jest pulowana/reuzywana, wiec statyk PANEL_EPOCH moze byc cudzy/stale — epoch
+        // z akcji jest ZRODLEM PRAWDY dla tego wywolania (session_key + emisja StatePatch/
+        // SlotContent), zeby host nie odrzucil odpowiedzi jako stale i nie bylo kolizji pol
+        // miedzy dwiema kartami tego samego usera (rozne epoch z akcji).
+        if let Some(epoch) = params.get("__panel_epoch").and_then(|v| v.as_u64()) {
+            ui::adopt_action_epoch(epoch);
+        }
+        let result = ui::handle_ui_action(action_id, &params);
+        return write_response(out_ptr, out_cap, out_len_ptr, &result);
+    }
+
     let result = match tool_name {
         "create_collection" => handle_create_collection(&params),
         "list_collections" => handle_list_collections(),
+        "delete_collection" => handle_delete_collection(&params),
         "ask" => handle_ask(&params),
         "ingest_document" => handle_ingest_document(&params),
         "list_documents" => handle_list_documents(&params),
+        "delete_document" => handle_delete_document(&params),
         "ingest_status" => handle_ingest_status(&params),
+        "collection_ingest_status" => handle_collection_ingest_status(&params),
+        "list_conflicts" => handle_list_conflicts(&params),
+        "conflict_detail" => handle_conflict_detail(&params),
+        "resolve_escalated" => handle_resolve_escalated(&params),
+        "graph_explore" => handle_graph_explore(&params),
         "conflict_scan" => handle_conflict_scan(&params),
         "conflict_resolve" => handle_conflict_resolve(&params),
         "entity_merge_scan" => handle_entity_merge_scan(&params),
@@ -521,7 +571,12 @@ fn handle_ingest_document(params: &Value) -> Value {
             // ukonczony, to realny blad — wyczysc artefakty i zglos failed zamiast
             // udawac sukces przy niespojnym statusie.
             if let Err(e) = mark_ingested(&document_id, &job_id) {
-                cleanup_document_artifacts(&document_id, &[]);
+                // Sciezka bledu: czyscimy artefakty best-effort. Ewentualny blad cleanupu
+                // tylko logujemy (juz raportujemy 'failed') — nie nadpisujemy pierwotnej
+                // przyczyny, ale partial graf jest wychwytywany przez status failed.
+                if let Err(ce) = cleanup_document_artifacts(&document_id, &[]) {
+                    log::warn(&format!("rag: cleanup po nieudanym mark_ingested dokumentu '{document_id}' nieudany: {ce}"));
+                }
                 let msg = format!("Ingest zakonczony, ale zapis statusu sie nie powiodl: {e}");
                 fail_job(&document_id, &job_id, &msg);
                 return json!({
@@ -568,7 +623,10 @@ fn run_ingest_pipeline(
 ) -> Result<usize, String> {
     // Re-ingest tego samego document_id: czysty start — kasujemy ewentualne
     // wczesniejsze artefakty zanim cokolwiek zapiszemy (cleanup-then-reingest).
-    cleanup_document_artifacts(document_id, &[]);
+    // Blad cleanupu przerywa pipeline: ingest na niespojnym stanie (stare artefakty
+    // grafu/wektorow) dalby graf z duplikatami i orphanami.
+    cleanup_document_artifacts(document_id, &[])
+        .map_err(|e| format!("Cleanup przed re-ingestem nieudany: {e}"))?;
 
     // 1. Pobierz surowe bajty pliku z document store.
     let (bytes, _stored_mime) =
@@ -635,7 +693,10 @@ fn run_ingest_pipeline(
         let step = ingest_one_chunk(collection_id, document_id, index, chunk_text, now, &mut upserted);
         if let Err(msg) = step {
             // Cleanup-on-failure: skasuj wszystkie wektory + chunki + graf dokumentu.
-            cleanup_document_artifacts(document_id, &upserted);
+            // Blad samego cleanupu doklejamy do komunikatu (ingest i tak konczy sie Err).
+            if let Err(ce) = cleanup_document_artifacts(document_id, &upserted) {
+                return Err(format!("Blad chunka {index}: {msg}; dodatkowo cleanup nieudany: {ce}"));
+            }
             return Err(format!("Blad chunka {index}: {msg}"));
         }
 
@@ -772,25 +833,32 @@ fn ingest_one_chunk(
 /// Kasuje wszystkie artefakty dokumentu: wektory (po przekazanej liscie ref_id
 /// oraz po vector_ref chunkow z bazy) i chunki. Idempotentny — wolany przy
 /// czystym starcie (re-ingest) i przy cleanup-on-failure.
-fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) {
+fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) -> Result<(), String> {
+    // Inwariant: nic nie znika z metadanych dopoki artefakty (wektory+graf+chunki)
+    // nie sa bezpiecznie usuniete/zakolejkowane. Blad KTOREGOKOLWIEK kroku => Err =>
+    // caller (handle_delete_document) NIE usuwa wiersza dokumentu, wiec nie zostaje
+    // osierocony wektor. Dlatego bledy vector_delete i odczytu chunks propagujemy.
+
     // Najpierw skasuj wektory po juz-upsertowanych ref_id (znane z biezacego biegu).
     for &ref_id in known_refs {
         if ref_id > 0 {
-            let _ = vector_delete(PASSAGES_NS, ref_id);
+            vector_delete(PASSAGES_NS, ref_id)
+                .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
         }
     }
 
     // Dodatkowo skasuj wektory po vector_ref zapisanych w chunkach (np. z
     // wczesniejszego ingestu przy re-ingescie) — pokrywa refy spoza known_refs.
-    if let Ok(rows) = sql_query(
+    let rows = sql_query(
         "SELECT vector_ref FROM chunks WHERE document_id = ? AND vector_ref > 0",
         &[SqlValue::String(document_id.to_string())],
-    ) {
-        for row in &rows {
-            if let Some(ref_id) = row.first().and_then(|v| v.as_i64()) {
-                if ref_id > 0 && !known_refs.contains(&(ref_id as u64)) {
-                    let _ = vector_delete(PASSAGES_NS, ref_id as u64);
-                }
+    )
+    .map_err(|e| format!("odczyt vector_ref chunkow '{document_id}': {e}"))?;
+    for row in &rows {
+        if let Some(ref_id) = row.first().and_then(|v| v.as_i64()) {
+            if ref_id > 0 && !known_refs.contains(&(ref_id as u64)) {
+                vector_delete(PASSAGES_NS, ref_id as u64)
+                    .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
             }
         }
     }
@@ -799,13 +867,19 @@ fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) {
     // wg rejestru graph_artifacts. Krawedzie kasujemy PRZED wezlami (kasowanie wezla
     // i tak usuwa incydentne krawedzie, ale jawne usuniecie krawedzi czysci te,
     // ktorych konce wspoldziela inny dokument i nie powinny zniknac).
-    cleanup_document_graph(document_id);
+    // Cleanup grafu jest KRYTYCZNY dla spojnosci (graf TYLKO przez outbox, refcount):
+    // jego blad przerywa cala operacje, by caller nie usunal wiersza dokumentu nad
+    // osieroconym grafem.
+    cleanup_document_graph(document_id)?;
 
-    // Na koncu usun chunki dokumentu.
-    let _ = sql_exec(
+    // Na koncu usun chunki dokumentu. Blad tego DELETE tez przerywa — chunki bez
+    // dokumentu to osierocone wiersze wskazujace nieistniejacy dokument.
+    sql_exec(
         "DELETE FROM chunks WHERE document_id = ?",
         &[SqlValue::String(document_id.to_string())],
-    );
+    )
+    .map_err(|e| format!("usuniecie chunkow dokumentu '{document_id}' nieudane: {e}"))?;
+    Ok(())
 }
 
 /// Kasuje artefakty grafu dokumentu (kolekcja 'kg_active') po rejestrze graph_artifacts
@@ -825,7 +899,7 @@ fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) {
 /// usuniecia z grafu (outbox zamiast direct). Bez tego direct-delete kasowal graf z
 /// pominieciem outboxu, wiec re-ingest tego samego faktu (partial-unique dedup) nie
 /// tworzyl nowego pending i graf nie wracal — łamało R1/R3.
-fn cleanup_document_graph(document_id: &str) {
+fn cleanup_document_graph(document_id: &str) -> Result<(), String> {
     let now = now_unix();
     let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
 
@@ -891,15 +965,23 @@ fn cleanup_document_graph(document_id: &str) {
     let stmts: Vec<(&str, &[SqlValue])> =
         tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
     if let Err(e) = sql_transaction(&stmts) {
-        log::warn(&format!("rag: cleanup grafu dokumentu '{document_id}' (zapis outboxu) nieudany: {e}"));
-        return;
+        // Zapis intencji delete do outboxu jest atomowy z usunieciem rejestru
+        // graph_artifacts; gdy padnie, NIC nie zostalo zmienione — zwracamy blad,
+        // by caller PRZERWAL usuwanie dokumentu (inaczej powstalyby osierocone
+        // artefakty grafu wzgledem skasowanego wiersza dokumentu).
+        let msg = format!("cleanup grafu dokumentu '{document_id}' (zapis outboxu) nieudany: {e}");
+        log::warn(&format!("rag: {msg}"));
+        return Err(msg);
     }
 
     // Materializacja delete'ow z trwalej kolejki. Crash przed/podczas drainu jest
-    // odtwarzalny (re-drain domknie applied=0).
+    // odtwarzalny (re-drain domknie applied=0) — drain NIE jest blokujacy dla
+    // spojnosci (intencje sa juz trwale w outboxie), wiec jego blad logujemy, ale
+    // NIE przerywamy usuwania dokumentu (kolejny drain domknie zaleglosci).
     if let Err(e) = drain_graph_outbox() {
-        log::warn(&format!("rag: drain cleanupu dokumentu '{document_id}' nieudany: {e}"));
+        log::warn(&format!("rag: drain cleanupu dokumentu '{document_id}' nieudany (domknie nastepny drain): {e}"));
     }
+    Ok(())
 }
 
 /// Lista dokumentow w kolekcji.
@@ -966,6 +1048,817 @@ fn handle_ingest_status(params: &Value) -> Value {
         Ok(None) => err("Job nie istnieje"),
         Err(e) => err(&format!("Blad odczytu joba: {e}")),
     }
+}
+
+// =============================================================================
+// Read-side tooly dla GUI (kolekcje/dokumenty/konflikty/graf)
+//
+// Wszystkie sa CZYSTYMI ODCZYTAMI (poza delete_collection/delete_document/
+// resolve_escalated, ktore mutuja swiadomie i ODWRACALNIE). Parametryzowany SQL
+// (zero interpolacji wejscia), twarde capy LIMIT/OFFSET (anty-DoS), izolacja
+// per-instancja (host wiaze SQLite + graf z tozsamoscia instancji — addon nie
+// podaje addon_id, operuje tylko na danych SWOJEJ instancji).
+// =============================================================================
+
+/// Twardy cap stronicowania (LIMIT) dla list dokumentow/konfliktow.
+const LIST_MAX_LIMIT: i64 = 200;
+/// Domyslny LIMIT gdy klient nie poda.
+const LIST_DEFAULT_LIMIT: i64 = 50;
+/// Cap wezlow/krawedzi zwracanych przez graph_explore (anty-DoS na duzym grafie).
+const GRAPH_EXPLORE_MAX_NODES: u32 = 60;
+/// Cap czlonkow/dowodow w conflict_detail.
+const CONFLICT_DETAIL_MAX_EVIDENCE: i64 = 40;
+
+/// Sanityzuje (limit, offset) do bezpiecznych granic: limit 1..=LIST_MAX_LIMIT
+/// (domyslnie LIST_DEFAULT_LIMIT), offset >= 0.
+fn sanitize_page(params: &Value) -> (i64, i64) {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .map(|n| n.clamp(1, LIST_MAX_LIMIT))
+        .unwrap_or(LIST_DEFAULT_LIMIT);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .map(|n| n.max(0))
+        .unwrap_or(0);
+    (limit, offset)
+}
+
+/// Rejestruje read-side tooly dla LLM tool-callingu / Schedulera. Panel GUI wola te
+/// same tooly przez ui_channel, wiec rejestr trzyma jeden kontrakt.
+fn register_read_side_tools() {
+    register_tool(
+        "delete_collection",
+        "Usuwa kolekcje wraz z dokumentami, chunkami, wektorami i artefaktami grafu (kaskada, odwracalny cleanup grafu przez outbox).",
+        json!({"type": "object", "properties": {"collection_id": {"type": "string"}}, "required": ["collection_id"]}),
+    );
+    register_tool(
+        "delete_document",
+        "Usuwa pojedynczy dokument: chunki, wektory 'passages' i jego wklad do grafu (cleanup przez istniejaca sciezke).",
+        json!({"type": "object", "properties": {"document_id": {"type": "string"}}, "required": ["document_id"]}),
+    );
+    register_tool(
+        "collection_ingest_status",
+        "Zwraca zagregowany status ingestu kolekcji: liczniki dokumentow per status + ile dokumentow ma graph_partial.",
+        json!({"type": "object", "properties": {"collection_id": {"type": "string"}}, "required": ["collection_id"]}),
+    );
+    register_tool(
+        "list_conflicts",
+        "Listuje konflikty MemGraphRAG (D3/D4) z opcjonalnym filtrem statusu (open/resolving/resolved_auto/resolved_merge_pending/escalated). Paginacja.",
+        json!({"type": "object", "properties": {"status": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}}}),
+    );
+    register_tool(
+        "conflict_detail",
+        "Szczegoly konfliktu po dedup_key: typ, grupa (head,rel), czlonkowie (fakty z conflict_members) + dowody (fact_evidence -> chunks) + decyzja A_res.",
+        json!({"type": "object", "properties": {"dedup_key": {"type": "string"}}, "required": ["dedup_key"]}),
+    );
+    register_tool(
+        "resolve_escalated",
+        "Reczne rozstrzygniecie eskalowanego konfliktu (escalated -> resolved): keep_winner (winner_fact_key) tombstone'uje przegranych ODWRACALNIE przez outbox, albo dismiss (zamyka bez zmiany faktow).",
+        json!({"type": "object", "properties": {"conflict_id": {"type": "integer"}, "action": {"type": "string", "enum": ["keep_winner", "dismiss"]}, "winner_fact_key": {"type": "string"}}, "required": ["conflict_id", "action"]}),
+    );
+    register_tool(
+        "graph_explore",
+        "Eksplorator grafu: sasiedztwo encji w 'kg_active' (po node_id albo zapytaniu tekstowym dopasowanym do nazwy wezla), z faktami i provenance. Cap wezlow/krawedzi.",
+        json!({"type": "object", "properties": {"entity_query": {"type": "string"}, "node_id": {"type": "string"}, "depth": {"type": "integer"}, "limit": {"type": "integer"}}}),
+    );
+}
+
+/// Usuwa kolekcje kaskadowo: najpierw cleanup KAZDEGO dokumentu (wektory + chunki +
+/// graf przez istniejaca, odwracalna sciezke cleanup_document_artifacts), potem joby,
+/// dokumenty i sam wiersz kolekcji. Zwraca liczbe usunietych dokumentow.
+fn handle_delete_collection(params: &Value) -> Value {
+    let collection_id = match params.get("collection_id").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c,
+        _ => return err("Brak wymaganego parametru 'collection_id'"),
+    };
+
+    // Kolekcja musi istniec (czytelny blad zamiast cichego no-op).
+    match sql_query_one(
+        "SELECT id FROM collections WHERE id = ?",
+        &[SqlValue::String(collection_id.to_string())],
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err("Kolekcja nie istnieje"),
+        Err(e) => return err(&format!("Blad weryfikacji kolekcji: {e}")),
+    }
+
+    // Cleanup grafu/wektorow/chunkow per dokument (musi przejsc przez logike refcountu
+    // i outboxu — bezposrednie DELETE z SQL zostawiloby orphan wektory i graf).
+    let doc_ids: Vec<String> = match sql_query(
+        "SELECT id FROM documents WHERE collection_id = ?",
+        &[SqlValue::String(collection_id.to_string())],
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+            .collect(),
+        Err(e) => return err(&format!("Blad odczytu dokumentow kolekcji: {e}")),
+    };
+
+    let doc_count = doc_ids.len();
+    for doc_id in &doc_ids {
+        // Per-dokument: blad cleanupu grafu/outboxu PRZERYWA kaskade z jasnym bledem.
+        // Nie usuwamy wiersza dokumentu (ani kolekcji) jesli graf/outbox nie zostal
+        // spojnie wyczyszczony — inaczej zostalyby osierocone artefakty grafu. Juz
+        // usuniete (wczesniejsze) dokumenty pozostaja usuniete; kolekcja zostaje, bo
+        // jej DELETE jest na koncu — admin moze ponowic.
+        if let Err(e) = cleanup_document_artifacts(doc_id, &[]) {
+            return err(&format!("Cleanup dokumentu '{doc_id}' nieudany; usuwanie kolekcji przerwane: {e}"));
+        }
+        if let Err(e) = sql_exec(
+            "DELETE FROM ingest_jobs WHERE document_id = ?",
+            &[SqlValue::String(doc_id.clone())],
+        ) {
+            return err(&format!("Blad usuniecia jobow dokumentu '{doc_id}': {e}"));
+        }
+        if let Err(e) = sql_exec(
+            "DELETE FROM documents WHERE id = ?",
+            &[SqlValue::String(doc_id.clone())],
+        ) {
+            return err(&format!("Blad usuniecia dokumentu '{doc_id}': {e}"));
+        }
+    }
+
+    match sql_exec(
+        "DELETE FROM collections WHERE id = ?",
+        &[SqlValue::String(collection_id.to_string())],
+    ) {
+        Ok(_) => json!({"ok": true, "data": {"collection_id": collection_id, "deleted_documents": doc_count}}),
+        Err(e) => err(&format!("Blad usuniecia kolekcji: {e}")),
+    }
+}
+
+/// Usuwa pojedynczy dokument: cleanup wektorow + chunkow + grafu (istniejaca sciezka),
+/// potem job(y) i wiersz dokumentu.
+fn handle_delete_document(params: &Value) -> Value {
+    let document_id = match params.get("document_id").and_then(|v| v.as_str()) {
+        Some(d) if !d.is_empty() => d,
+        _ => return err("Brak wymaganego parametru 'document_id'"),
+    };
+
+    match sql_query_one(
+        "SELECT id FROM documents WHERE id = ?",
+        &[SqlValue::String(document_id.to_string())],
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err("Dokument nie istnieje"),
+        Err(e) => return err(&format!("Blad weryfikacji dokumentu: {e}")),
+    }
+
+    // Blad cleanupu grafu/outboxu PRZERYWA usuwanie — nie usuwamy wiersza dokumentu
+    // nad osieroconymi artefaktami grafu (inwariant: graf TYLKO przez outbox, spojny
+    // refcount). Admin moze ponowic po usunieciu przyczyny.
+    if let Err(e) = cleanup_document_artifacts(document_id, &[]) {
+        return err(&format!("Cleanup dokumentu nieudany; usuwanie przerwane: {e}"));
+    }
+    if let Err(e) = sql_exec(
+        "DELETE FROM ingest_jobs WHERE document_id = ?",
+        &[SqlValue::String(document_id.to_string())],
+    ) {
+        return err(&format!("Blad usuniecia jobow dokumentu: {e}"));
+    }
+    match sql_exec(
+        "DELETE FROM documents WHERE id = ?",
+        &[SqlValue::String(document_id.to_string())],
+    ) {
+        Ok(_) => json!({"ok": true, "data": {"document_id": document_id}}),
+        Err(e) => err(&format!("Blad usuniecia dokumentu: {e}")),
+    }
+}
+
+/// Zagregowany status ingestu kolekcji: liczniki dokumentow per status (pending/
+/// ingested/failed) + ile dokumentow oznaczono jako graph_partial.
+fn handle_collection_ingest_status(params: &Value) -> Value {
+    let collection_id = match params.get("collection_id").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c,
+        _ => return err("Brak wymaganego parametru 'collection_id'"),
+    };
+
+    let row = match sql_query_one(
+        "SELECT \
+           COUNT(*), \
+           SUM(CASE WHEN status = 'ingested' THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN status = 'pending'  THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN status = 'failed'   THEN 1 ELSE 0 END), \
+           SUM(CASE WHEN graph_partial = 1   THEN 1 ELSE 0 END) \
+         FROM documents WHERE collection_id = ?",
+        &[SqlValue::String(collection_id.to_string())],
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return err("Brak danych statusu"),
+        Err(e) => return err(&format!("Blad odczytu statusu: {e}")),
+    };
+
+    json!({
+        "ok": true,
+        "data": {
+            "collection_id": collection_id,
+            "total": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            "ingested": row.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            "pending": row.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            "failed": row.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+            "graph_partial": row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+        }
+    })
+}
+
+/// Lista konfliktow z opcjonalnym filtrem statusu i paginacja. Liczbe czlonkow grupy
+/// liczymy podzapytaniem po conflict_members (jeden wiersz = jeden fakt w grupie).
+fn handle_list_conflicts(params: &Value) -> Value {
+    let (limit, offset) = sanitize_page(params);
+    let status = params
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let members_subq = "(SELECT COUNT(*) FROM conflict_members m WHERE m.conflict_dedup_key = c.dedup_key)";
+    let rows = if let Some(s) = status.as_deref() {
+        sql_query(
+            &format!(
+                "SELECT c.id, c.conflict_type, c.schema_id, c.head_id, c.rel, c.dedup_key, \
+                   c.status, c.decision, c.resolver, c.created_at, c.resolved_at, {members_subq} \
+                 FROM conflicts c WHERE c.status = ? \
+                 ORDER BY c.created_at DESC LIMIT ? OFFSET ?"
+            ),
+            &[
+                SqlValue::String(s.to_string()),
+                SqlValue::I64(limit),
+                SqlValue::I64(offset),
+            ],
+        )
+    } else {
+        sql_query(
+            &format!(
+                "SELECT c.id, c.conflict_type, c.schema_id, c.head_id, c.rel, c.dedup_key, \
+                   c.status, c.decision, c.resolver, c.created_at, c.resolved_at, {members_subq} \
+                 FROM conflicts c \
+                 ORDER BY c.created_at DESC LIMIT ? OFFSET ?"
+            ),
+            &[SqlValue::I64(limit), SqlValue::I64(offset)],
+        )
+    };
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return err(&format!("Blad odczytu konfliktow: {e}")),
+    };
+
+    let conflicts: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            // decision jest JSON-em w TEXT — parsujemy, by GUI dostalo akcje/reason
+            // strukturalnie; przy niesparsowalnej tresci zwracamy null (bez wywalania).
+            let decision = row
+                .get(7)
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+            json!({
+                "id": row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                "conflict_type": row.get(1).and_then(|v| v.as_str()).unwrap_or(""),
+                "schema_id": row.get(2).and_then(|v| v.as_str()).unwrap_or(""),
+                "head_id": row.get(3).and_then(|v| v.as_str()).unwrap_or(""),
+                "rel": row.get(4).and_then(|v| v.as_str()).unwrap_or(""),
+                "dedup_key": row.get(5).and_then(|v| v.as_str()).unwrap_or(""),
+                "status": row.get(6).and_then(|v| v.as_str()).unwrap_or(""),
+                "decision": decision,
+                "resolver": row.get(8).and_then(|v| v.as_str()),
+                "created_at": row.get(9).and_then(|v| v.as_i64()).unwrap_or(0),
+                "resolved_at": row.get(10).and_then(|v| v.as_i64()),
+                "member_count": row.get(11).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
+    json!({"ok": true, "data": {"conflicts": conflicts, "limit": limit, "offset": offset}})
+}
+
+/// Szczegoly konfliktu po dedup_key: glowka konfliktu + czlonkowie (fakty z
+/// conflict_members zlaczone z fact_state) + dowody (fact_evidence -> chunks) per fakt.
+fn handle_conflict_detail(params: &Value) -> Value {
+    let dedup_key = match params.get("dedup_key").and_then(|v| v.as_str()) {
+        Some(d) if !d.is_empty() => d,
+        _ => return err("Brak wymaganego parametru 'dedup_key'"),
+    };
+
+    let head = match sql_query_one(
+        "SELECT id, conflict_type, schema_id, head_id, rel, status, decision, resolver, \
+           created_at, resolved_at \
+         FROM conflicts WHERE dedup_key = ? ORDER BY id DESC LIMIT 1",
+        &[SqlValue::String(dedup_key.to_string())],
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return err("Konflikt nie istnieje"),
+        Err(e) => return err(&format!("Blad odczytu konfliktu: {e}")),
+    };
+
+    // Czlonkowie = fakty grupy. fact_state trzyma aktualny tail/active/conflict_state.
+    let member_rows = match sql_query(
+        "SELECT m.fact_key, fs.head_id, fs.rel, fs.tail_id, fs.active, fs.conflict_state, m.added_at \
+         FROM conflict_members m \
+         LEFT JOIN fact_state fs ON fs.fact_key = m.fact_key \
+         WHERE m.conflict_dedup_key = ? ORDER BY m.added_at ASC",
+        &[SqlValue::String(dedup_key.to_string())],
+    ) {
+        Ok(r) => r,
+        Err(e) => return err(&format!("Blad odczytu czlonkow konfliktu: {e}")),
+    };
+
+    let members: Vec<Value> = member_rows
+        .iter()
+        .map(|row| {
+            let fact_key = row.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Dowody zrodlowe per fakt: pasaze z chunkow wskazanych przez fact_evidence.
+            let evidence = collect_fact_evidence_passages(fact_key);
+            json!({
+                "fact_key": fact_key,
+                "head_id": row.get(1).and_then(|v| v.as_str()).unwrap_or(""),
+                "rel": row.get(2).and_then(|v| v.as_str()).unwrap_or(""),
+                "tail_id": row.get(3).and_then(|v| v.as_str()).unwrap_or(""),
+                "active": row.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                "conflict_state": row.get(5).and_then(|v| v.as_str()),
+                "added_at": row.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                "evidence": evidence,
+            })
+        })
+        .collect();
+
+    let decision = head
+        .get(6)
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+
+    json!({
+        "ok": true,
+        "data": {
+            "id": head.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            "conflict_type": head.get(1).and_then(|v| v.as_str()).unwrap_or(""),
+            "schema_id": head.get(2).and_then(|v| v.as_str()).unwrap_or(""),
+            "head_id": head.get(3).and_then(|v| v.as_str()).unwrap_or(""),
+            "rel": head.get(4).and_then(|v| v.as_str()).unwrap_or(""),
+            "status": head.get(5).and_then(|v| v.as_str()).unwrap_or(""),
+            "decision": decision,
+            "resolver": head.get(7).and_then(|v| v.as_str()),
+            "created_at": head.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+            "resolved_at": head.get(9).and_then(|v| v.as_i64()),
+            "dedup_key": dedup_key,
+            "members": members,
+        }
+    })
+}
+
+/// Zbiera pasaze dowodowe jednego faktu: fact_evidence -> chunks.text. Cap na liczbe
+/// dowodow (anty-DoS) i obciecie samej tresci pasazu do rozsadnej dlugosci podgladu.
+fn collect_fact_evidence_passages(fact_key: &str) -> Vec<Value> {
+    if fact_key.is_empty() {
+        return Vec::new();
+    }
+    // fact_evidence.chunk_id przechowuje chunk_index jako TEXT (nie chunks.id) —
+    // join musi isc po (document_id, chunk_index), jak istniejacy collect_evidence.
+    let rows = sql_query(
+        "SELECT e.document_id, e.confidence, c.chunk_index, c.text \
+         FROM fact_evidence e \
+         JOIN chunks c ON c.document_id = e.document_id \
+                       AND c.chunk_index = CAST(e.chunk_id AS INTEGER) \
+         WHERE e.fact_key = ? ORDER BY e.confidence DESC, e.chunk_id LIMIT ?",
+        &[
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::I64(CONFLICT_DETAIL_MAX_EVIDENCE),
+        ],
+    );
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.iter()
+        .map(|row| {
+            let text = row.get(3).and_then(|v| v.as_str()).unwrap_or("");
+            let preview: String = text.chars().take(400).collect();
+            // confidence to REAL — sql_query mapuje calkowite na I64, ulamkowe na F64.
+            let confidence = match row.get(1) {
+                Some(SqlValue::F64(c)) => Some(*c),
+                Some(SqlValue::I64(i)) => Some(*i as f64),
+                _ => None,
+            };
+            json!({
+                "document_id": row.first().and_then(|v| v.as_str()).unwrap_or(""),
+                "confidence": confidence,
+                "chunk_index": row.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                "passage": preview,
+            })
+        })
+        .collect()
+}
+
+/// Reczne rozstrzygniecie ESKALOWANEGO konfliktu (panel D7). Dwie akcje:
+/// - keep_winner: zwyciezca = winner_fact_key; przegranych (czlonkowie != winner)
+///   dezaktywujemy (active=0, conflict_state='resolved_loser') i tombstone'ujemy ich
+///   krawedzie przez graph_outbox (ODWRACALNE — jak A_res). Status -> 'resolved_auto'.
+/// - dismiss: zamkniecie bez zmiany faktow (status -> 'resolved_auto', decision z
+///   action='dismiss') — admin uznaje, ze konflikt nie wymaga zmiany grafu.
+///
+/// Konflikt musi byc 'escalated' (reczna sciezka dotyczy WYLACZNIE eskalacji).
+///
+/// Czy TA proba domknela konflikt: po atomowej tx (finalize + tombstone w jednej
+/// sql_transaction, kazdy guard na status='escalated' AND members_rev=:rev0) suma
+/// rows_affected w `run_escalated_apply` rozstrzyga sukces (affected>0 => TA proba
+/// zastosowala; affected==0 => no-op cudzej proby/zmiany zbioru). Audit TYLKO gdy
+/// zastosowala (affected>0) — nigdy na podstawie re-readu cudzego wyniku.
+fn handle_resolve_escalated(params: &Value) -> Value {
+    let conflict_id = match params.get("conflict_id").and_then(|v| v.as_i64()) {
+        Some(id) if id > 0 => id,
+        _ => return err("Brak/nieprawidlowy parametr 'conflict_id'"),
+    };
+    let action = match params.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a,
+        _ => return err("Brak wymaganego parametru 'action'"),
+    };
+
+    // rev0: snapshot members_rev odczytany RAZEM ze stanem konfliktu. Wszystkie
+    // writy (tombstone przegranych + finalize) warunkujemy na members_rev=:rev0,
+    // wiec gdy zbior czlonkow zmieni sie miedzy odczytem a apply (D3 doklejil
+    // czlonka), apply jest NO-OPem i konflikt zostaje 'escalated' do ponownego
+    // recznego rozstrzygniecia na pelnym zbiorze (wzor D4 run_owned_apply).
+    let row = match sql_query_one(
+        "SELECT dedup_key, head_id, rel, status, members_rev FROM conflicts WHERE id = ?",
+        &[SqlValue::I64(conflict_id)],
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return err("Konflikt nie istnieje"),
+        Err(e) => return err(&format!("Blad odczytu konfliktu: {e}")),
+    };
+    let dedup_key = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let head_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let rel = row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let status = row.get(3).and_then(|v| v.as_str()).unwrap_or("");
+    let rev0 = row.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
+    if status != "escalated" {
+        return err("Reczne rozstrzygniecie dotyczy tylko konfliktow 'escalated'");
+    }
+
+    // Fakty grupy (z fact_state) — potrzebne do tombstone'u przegranych i audytu.
+    let facts = match collect_conflict_facts(&dedup_key) {
+        Ok(f) => f,
+        Err(e) => return err(&format!("Blad odczytu faktow konfliktu: {e}")),
+    };
+    let members: Vec<String> = facts.iter().map(|f| f.fact_key.clone()).collect();
+    let now = now_unix();
+
+    match action {
+        "keep_winner" => {
+            let winner = match params.get("winner_fact_key").and_then(|v| v.as_str()) {
+                Some(w) if facts.iter().any(|f| f.fact_key == w) => w.to_string(),
+                _ => return err("keep_winner wymaga 'winner_fact_key' bedacego czlonkiem grupy konfliktu"),
+            };
+            let losers: Vec<&ConflictFact> =
+                facts.iter().filter(|f| f.fact_key != winner).collect();
+
+            let decision = json!({
+                "action": "keep_winner",
+                "winner_fact_key": winner,
+                "losers": losers.iter().map(|f| f.fact_key.clone()).collect::<Vec<_>>(),
+                "members": members,
+                "manual": true,
+            });
+
+            // ATOMOWO (jedna sql_transaction, BEGIN IMMEDIATE): deaktywacja przegranych +
+            // enqueue tombstone (delete_edge, outbox applied=0) + finalize escalated->
+            // resolved_auto. KAZDY write warunkowany EXISTS(status='escalated' AND
+            // members_rev=:rev0), wiec albo wszystko sie aplikuje (zwyciezca CAS), albo
+            // nic (rollback). Eliminuje wczesniejszy split (osobny finalize + osobna tx
+            // tombstone), w ktorym blad tombstone zostawial konflikt resolved_auto BEZ
+            // tombstone (zlamany inwariant loser-active=0 <=> tombstone enqueued, a retry
+            // odrzucal bo status!=escalated). Inwariant trzyma teraz transakcyjnosc.
+            let mut stmts: Vec<(String, Vec<SqlValue>)> = Vec::new();
+            for loser in &losers {
+                stmts.push(escalated_deactivate_loser_stmt(
+                    conflict_id, rev0, &loser.fact_key, now,
+                ));
+                stmts.push(escalated_enqueue_tombstone_stmt(
+                    conflict_id, rev0, &loser.head_id, &loser.rel, &loser.tail_id, now,
+                ));
+            }
+            stmts.push(escalated_finalize_stmt(conflict_id, rev0, &decision, now));
+
+            match run_escalated_apply(conflict_id, rev0, &stmts) {
+                Ok(true) => {
+                    // TA proba domknela konflikt — materializuj tombstone'y (idempotentna,
+                    // re-drain domknie po crashu) i audytuj WLASNA decyzje.
+                    if let Err(e) = drain_graph_outbox() {
+                        log::warn(&format!(
+                            "rag: resolve_escalated drain tombstone'ow konfliktu id={conflict_id} nieudany (domknie nastepny drain): {e}"
+                        ));
+                    }
+                    audit_decision(conflict_id, "keep_winner_manual", &head_id, &rel, false, &members);
+                    json!({"ok": true, "data": {"conflict_id": conflict_id, "status": "resolved_auto", "action": "keep_winner"}})
+                }
+                // No-op: inny resolver wygral wczesniej ALBO zbior czlonkow sie zmienil
+                // (members_rev != rev0). Nic nie zastosowano (rollback) => brak audytu
+                // CUDZEJ decyzji; konflikt zostaje escalated do ponownego rozstrzygniecia.
+                Ok(false) => json!({
+                    "ok": false,
+                    "error": "Konflikt zostal juz rozstrzygniety przez innego resolvera lub jego zbior czlonkow sie zmienil",
+                    "data": {"conflict_id": conflict_id, "status": "escalated"}
+                }),
+                Err(e) => err(&format!("Blad zastosowania decyzji: {e}")),
+            }
+        }
+        "dismiss" => {
+            let decision = json!({"action": "dismiss", "members": members, "manual": true});
+            // dismiss: jeden warunkowy finalize w jednej tx (guard status='escalated' AND
+            // members_rev=:rev0). Atomowe i idempotentne jak keep_winner — bez zmian faktow.
+            let stmts = [escalated_finalize_stmt(conflict_id, rev0, &decision, now)];
+            match run_escalated_apply(conflict_id, rev0, &stmts) {
+                Ok(true) => {
+                    audit_decision(conflict_id, "dismiss_manual", &head_id, &rel, false, &members);
+                    json!({"ok": true, "data": {"conflict_id": conflict_id, "status": "resolved_auto", "action": "dismiss"}})
+                }
+                Ok(false) => err("Konflikt nie jest juz eskalowany lub jego zbior czlonkow sie zmienil"),
+                Err(e) => err(&format!("Blad zamkniecia konfliktu: {e}")),
+            }
+        }
+        other => err(&format!("Nieobslugiwana akcja: {other}")),
+    }
+}
+
+/// Statement deaktywacji przegranego dla RECZNEJ sciezki (escalated), warunkowany na
+/// status='escalated' AND members_rev=:rev0 (kotwica CAS recznego rozstrzygniecia — bez
+/// resolve_owner, ktory dotyczy sciezki A_res). active=0 + conflict_state='resolved_loser'.
+fn escalated_deactivate_loser_stmt(
+    id: i64,
+    rev0: i64,
+    fact_key: &str,
+    now: i64,
+) -> (String, Vec<SqlValue>) {
+    (
+        "UPDATE fact_state SET active = 0, conflict_state = 'resolved_loser', updated_at = ? \
+         WHERE fact_key = ? AND active = 1 \
+           AND EXISTS (SELECT 1 FROM conflicts WHERE id = ? AND status = 'escalated' AND members_rev = ?)"
+            .to_string(),
+        vec![
+            SqlValue::I64(now),
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::I64(id),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// Statement enqueue tombstone (delete_edge) przegranego dla recznej sciezki, warunkowany
+/// na status='escalated' AND members_rev=:rev0 (mirror deaktywacji — inwariant loser-active=0
+/// <=> tombstone enqueued trzyma sie w obrebie jednej transakcji). ODWRACALNE: outbox
+/// applied=0, INSERT OR IGNORE idempotentny; ponowny upsert_edge ozywia krawedz (D1).
+fn escalated_enqueue_tombstone_stmt(
+    id: i64,
+    rev0: i64,
+    src: &str,
+    rel: &str,
+    dst: &str,
+    now: i64,
+) -> (String, Vec<SqlValue>) {
+    let edge_dedup = outbox_dedup_key(
+        "delete_edge",
+        KG_COLLECTION,
+        &canonical_key(&[src, rel, dst]),
+    );
+    let payload = json!({ "src": src, "rel": rel, "dst": dst });
+    (
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         SELECT ?, 'delete_edge', ?, ?, 0, ? \
+         WHERE EXISTS (SELECT 1 FROM conflicts WHERE id = ? AND status = 'escalated' AND members_rev = ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(edge_dedup),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload.to_string()),
+            SqlValue::I64(now),
+            SqlValue::I64(id),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// Statement finalize recznej sciezki: escalated -> resolved_auto, warunkowany na
+/// status='escalated' AND members_rev=:rev0. To kotwica CAS — w jednej tx z deaktywacja/
+/// tombstone gwarantuje atomowosc (finalize <=> tombstone enqueued).
+fn escalated_finalize_stmt(
+    id: i64,
+    rev0: i64,
+    decision: &Value,
+    now: i64,
+) -> (String, Vec<SqlValue>) {
+    (
+        "UPDATE conflicts SET status = 'resolved_auto', decision = ?, resolver = 'human', \
+           resolved_at = ?, updated_at = ? \
+         WHERE id = ? AND status = 'escalated' AND members_rev = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(decision.to_string()),
+            SqlValue::I64(now),
+            SqlValue::I64(now),
+            SqlValue::I64(id),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// Atomowy apply recznej sciezki (mirror D4 `run_owned_apply`, ale kotwica to
+/// status='escalated' zamiast resolve_owner): wykonuje WSZYSTKIE statementy w JEDNEJ
+/// sql_transaction (BEGIN IMMEDIATE serializuje wspolbiezne proby). O tym, czy TA proba
+/// zastosowala decyzje, decyduje WYLACZNIE suma rows_affected zwrocona przez tx — NIE
+/// re-read statusu. DLACZEGO: kazdy write jest warunkowany guardem EXISTS(status=
+/// 'escalated' AND members_rev=:rev0), wiec fire'uje tylko dla zwycieskiej proby CAS;
+/// affected>0 oznacza wprost "TA proba cos zmienila". Re-read statusu jest BLEDNYM
+/// dowodem przy rownoleglych resolverach na tym samym rev0: przegrany robi NO-OP
+/// (guard odrzuca writy, affected==0), ale post-commit widzi resolved_auto && rev==rev0
+/// zapisane przez ZWYCIEZCE i falszywie raportuje Ok(true) => audyt CUDZEJ decyzji.
+/// Zwraca:
+///  - Ok(true)  => affected>0: TA proba zastosowala decyzje (audyt WLASNEJ decyzji),
+///  - Ok(false) => affected==0: no-op TEJ proby (inny resolver wygral wczesniej ALBO
+///    members_rev sie zmienil => guard odrzucil wszystkie writy => rollback, BEZ audytu),
+///  - Err        => blad SQL transakcji (retriable: konflikt pozostaje escalated, bo
+///    przy bledzie tx jest rolled back — inwariant nie jest zlamany).
+/// Klasyfikuje wynik atomowej tx recznej sciezki: TA proba zastosowala decyzje wtw.
+/// gdy guardowane writy zmienily co najmniej jeden wiersz. To jedyne zrodlo prawdy o
+/// "applied" — re-read statusu konfliktu jest mylacy przy rownoleglych resolverach (widzi
+/// stan zwyciezcy). Wydzielone, by testowac decyzje na samym rows_affected bez host ABI.
+fn escalated_apply_applied(affected: u64) -> bool {
+    affected > 0
+}
+
+fn run_escalated_apply(
+    id: i64,
+    rev0: i64,
+    stmts: &[(String, Vec<SqlValue>)],
+) -> Result<bool, String> {
+    let refs: Vec<(&str, &[SqlValue])> =
+        stmts.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    let affected = sql_transaction(&refs)
+        .map_err(|e| format!("atomowy apply recznego rozstrzygniecia konfliktu id={id}: {e}"))?;
+    if !escalated_apply_applied(affected) {
+        // Guard odrzucil wszystkie writy (inny resolver wygral lub members_rev sie zmienil)
+        // => rollback, konflikt wciaz escalated. Brak audytu cudzej decyzji.
+        return Ok(false);
+    }
+
+    // affected>0 => TA proba zastosowala decyzje. Re-read jako defensywny sanity-check
+    // (NIE jako wyrocznia "applied"): po wlasnym finalize status MUSI byc resolved_auto na
+    // rev0. Rozbieznosc sygnalizuje uszkodzenie inwariantu, ale nie odbiera audytu — affected
+    // jest zrodlem prawdy.
+    // Re-read jest BEST-EFFORT: jego blad NIE moze zmienic wyniku na Err (affected>0 juz
+    // dowiodlo, ze ta proba zastosowala decyzje — audyt wlasnej decyzji musi pojsc). Blad
+    // odczytu logujemy i mimo to zwracamy Ok(true).
+    match sql_query_one(
+        "SELECT status, members_rev FROM conflicts WHERE id = ?",
+        &[SqlValue::I64(id)],
+    ) {
+        Ok(row) => {
+            let cur_status = row
+                .as_ref()
+                .and_then(|r| r.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let cur_rev = row
+                .as_ref()
+                .and_then(|r| r.get(1))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(rev0);
+            if cur_status != "resolved_auto" || cur_rev != rev0 {
+                log::warn(&format!(
+                    "rag: run_escalated_apply id={id} affected={affected} ale stan po commicie status={cur_status} rev={cur_rev} (oczekiwano resolved_auto/{rev0}) — inwariant podejrzany"
+                ));
+            }
+        }
+        Err(e) => {
+            log::warn(&format!(
+                "rag: run_escalated_apply id={id} affected={affected} — sanity re-read nie powiodl sie ({e}); affected jest zrodlem prawdy, zwracam applied"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Eksplorator grafu: sasiedztwo encji w 'kg_active'. Wejscie to node_id (wprost)
+/// albo entity_query (tekst -> znormalizowane id przez normalize_entity_name, z
+/// fallbackiem dopasowania po nazwie wezla z graph_artifacts). Zwraca centralny wezel,
+/// jego sasiadow (graph_neighbors, kierunek Both) i fakty (head -rel-> tail) z provenance.
+fn handle_graph_explore(params: &Value) -> Value {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as u32).clamp(1, GRAPH_EXPLORE_MAX_NODES))
+        .unwrap_or(GRAPH_EXPLORE_MAX_NODES);
+
+    // Rozwiaz centralny node_id: node_id wprost, albo zapytanie tekstowe.
+    let node_id = match resolve_explore_node(params) {
+        Some(id) => id,
+        None => return err("Podaj 'node_id' albo 'entity_query' dopasowane do encji w grafie"),
+    };
+
+    let neighbors = match graph_neighbors(KG_COLLECTION, &node_id, GraphDirection::Both, None, limit) {
+        Ok(n) => n,
+        Err(e) => return err(&format!("Blad odczytu sasiedztwa grafu: {e}")),
+    };
+
+    let neighbor_json: Vec<Value> = neighbors
+        .iter()
+        .map(|n| {
+            json!({
+                "id": n.id,
+                "rel": n.rel,
+                "weight": n.weight,
+                "name": graph_node_display_name(&n.id),
+            })
+        })
+        .collect();
+
+    // Fakty wokol encji (aktywne) z provenance — z fact_state (zrodlo prawdy R1) +
+    // pierwszy dowod (document_id/chunk_index) jako provenance pokazowe.
+    let facts = collect_entity_facts(&node_id, limit as i64);
+
+    json!({
+        "ok": true,
+        "data": {
+            "center": {"id": node_id, "name": graph_node_display_name(&node_id)},
+            "neighbors": neighbor_json,
+            "facts": facts,
+        }
+    })
+}
+
+/// Rozwiazuje centralny wezel eksploracji. Priorytet: jawny node_id; potem
+/// entity_query -> znormalizowane id (gdy istnieje jako wezel w graph_artifacts),
+/// a w razie braku dokladnego trafienia dopasowanie po fragmencie nazwy (LIKE) do
+/// n_id istniejacego, aktywnego wezla.
+fn resolve_explore_node(params: &Value) -> Option<String> {
+    if let Some(id) = params.get("node_id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    let query = params.get("entity_query").and_then(|v| v.as_str())?;
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let normalized = normalize_entity_name(query);
+    // Dokladne trafienie znormalizowanego id jako wezla.
+    if let Ok(Some(_)) = sql_query_one(
+        "SELECT n_id FROM graph_artifacts WHERE kind = 'node' AND n_id = ? LIMIT 1",
+        &[SqlValue::String(normalized.clone())],
+    ) {
+        return Some(normalized);
+    }
+    // Fallback: fragment nazwy (LIKE) — parametryzowany wzorzec (zero interpolacji).
+    let pattern = format!("%{normalized}%");
+    sql_query_one(
+        "SELECT n_id FROM graph_artifacts WHERE kind = 'node' AND n_id LIKE ? ORDER BY n_id LIMIT 1",
+        &[SqlValue::String(pattern)],
+    )
+    .ok()
+    .flatten()
+    .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Nazwa wyswietlana wezla. node_id to znormalizowana nazwa encji (lowercase+trim,
+/// patrz normalize_entity_name), wiec jest sama w sobie czytelna; oryginalna nazwa
+/// (z wielkimi literami) zyje w props wezla grafu, ktorych graph_artifacts nie kopiuje.
+/// Dla GUI normalizowane id jest wystarczajaco czytelne (np. "albert einstein").
+fn graph_node_display_name(node_id: &str) -> String {
+    node_id.to_string()
+}
+
+/// Aktywne fakty incydentne do encji (jako head LUB tail) z fact_state + provenance
+/// (pierwszy dowod). Cap LIMIT (anty-DoS).
+fn collect_entity_facts(node_id: &str, limit: i64) -> Vec<Value> {
+    let rows = sql_query(
+        "SELECT fs.fact_key, fs.head_id, fs.rel, fs.tail_id, \
+           (SELECT e.document_id FROM fact_evidence e WHERE e.fact_key = fs.fact_key LIMIT 1) \
+         FROM fact_state fs \
+         WHERE fs.active = 1 AND (fs.head_id = ? OR fs.tail_id = ?) \
+         ORDER BY fs.fact_seq DESC LIMIT ?",
+        &[
+            SqlValue::String(node_id.to_string()),
+            SqlValue::String(node_id.to_string()),
+            SqlValue::I64(limit),
+        ],
+    );
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.iter()
+        .map(|row| {
+            json!({
+                "fact_key": row.first().and_then(|v| v.as_str()).unwrap_or(""),
+                "source": row.get(1).and_then(|v| v.as_str()).unwrap_or(""),
+                "rel": row.get(2).and_then(|v| v.as_str()).unwrap_or(""),
+                "target": row.get(3).and_then(|v| v.as_str()).unwrap_or(""),
+                "provenance_document_id": row.get(4).and_then(|v| v.as_str()),
+            })
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -5827,32 +6720,6 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 // =============================================================================
 
 /// Renderuje minimalny panel: naglowek + lista nazw kolekcji.
-fn render_main_panel() -> Result<(), String> {
-    let names: Vec<String> = sql_query("SELECT name FROM collections ORDER BY created_at DESC", &[])
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let items: Vec<Value> = names
-        .iter()
-        .map(|n| json!({"type": "text", "props": {"text": n}}))
-        .collect();
-
-    let panel = json!({
-        "type": "stack",
-        "props": {"direction": "vertical", "gap": "md"},
-        "children": [
-            {"type": "text", "props": {"text": "RAG — kolekcje", "variant": "heading"}},
-            {"type": "stack", "props": {"direction": "vertical", "gap": "sm"}, "children": items}
-        ]
-    });
-
-    render_panel("main", panel)
-}
-
 // =============================================================================
 // Helpery
 // =============================================================================
@@ -5994,6 +6861,42 @@ fn write_response(out_ptr: i32, out_cap: i32, out_len_ptr: i32, value: &Value) -
 // MIME, twardy split nadwymiarowych segmentow, chunking.
 // =============================================================================
 
+// Stuby host-fn pod testy NATYWNE (cargo test). SDK deklaruje importy WASM
+// (#[link(wasm_import_module="tentaflow")]) bez gate'u na target_arch, wiec natywny
+// linker testu wymaga tych symboli. Stuby zwracaja kod bledu (-1) / pusta dlugosc —
+// testy w tym crate dotykaja WYLACZNIE czystych funkcji (walidacja parametrow,
+// formatowanie, mapowanie), wiec host-fn nie sa realnie wolane. Definiujemy DOKLADNIE
+// te symbole, ktorych zada linker (read-tooly + ingest referuja graf/sql/wektory).
+// WYLACZNIE test-harness: host-fn nie linkuja sie w `cargo test` (poza wasm nie ma
+// importow hosta), wiec testy jednostkowe wymagaja zaslepek symboli `*_v1`/log_*, by
+// crate w ogole zlinkowal. To NIE jest produkcyjny stub logiki — kazda z tych funkcji
+// zwraca blad (-1), a sciezki ich uzywajace sa testowane z prawdziwym hostem (e2e core).
+#[cfg(test)]
+mod host_stubs {
+    #[no_mangle]
+    extern "C" fn log_info(_p: i32, _l: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn log_warn(_p: i32, _l: i32) -> i32 { 0 }
+    #[no_mangle]
+    extern "C" fn sql_exec_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn sql_query_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn sql_query_one_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32, _f: i32, _g: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn sql_transaction_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn graph_neighbors_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn graph_delete_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn graph_upsert_node_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn graph_upsert_edge_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+    #[no_mangle]
+    extern "C" fn vector_delete_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { -1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6002,6 +6905,73 @@ mod tests {
     fn array_response(len: usize) -> String {
         let arr: Vec<f32> = (0..len).map(|i| i as f32 * 0.001).collect();
         serde_json::to_string(&arr).unwrap()
+    }
+
+    /// Dwie proby recznego apply na TYM SAMYM rev0: tylko zwycieska tx (guardowane writy
+    /// fire'uja) ma affected>0 i jest "applied"; przegrana ma affected==0 i NIE jest applied
+    /// (mimo ze re-read widzialby resolved_auto zwyciezcy). Audyt biegnie wylacznie za
+    /// applied — wiec drugi resolver nie audytuje cudzej decyzji.
+    #[test]
+    fn escalated_apply_uses_affected_not_reread() {
+        // Mock kolejnych wynikow sql_transaction dla dwoch prob na tym samym rev0.
+        let winner_affected: u64 = 3; // deactivate + tombstone + finalize
+        let loser_affected: u64 = 0; // guard EXISTS(status='escalated') odrzucil wszystko
+
+        // Zwyciezca: applied => audyt WLASNEJ decyzji.
+        assert!(escalated_apply_applied(winner_affected));
+        // Przegrany na tym samym rev0: NO-OP => brak audytu cudzej decyzji.
+        assert!(!escalated_apply_applied(loser_affected));
+
+        // Dismiss (jeden warunkowy finalize): applied tylko gdy finalize zmienil wiersz.
+        assert!(escalated_apply_applied(1));
+        assert!(!escalated_apply_applied(0));
+    }
+
+    #[test]
+    fn sanitize_page_applies_defaults() {
+        // Brak parametrow -> domyslny limit, offset 0.
+        let (limit, offset) = sanitize_page(&json!({}));
+        assert_eq!(limit, LIST_DEFAULT_LIMIT);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn sanitize_page_caps_limit_and_floors_offset() {
+        // Limit ponad cap przyciety do LIST_MAX_LIMIT; ujemny offset podniesiony do 0.
+        let (limit, offset) = sanitize_page(&json!({"limit": 100_000, "offset": -50}));
+        assert_eq!(limit, LIST_MAX_LIMIT);
+        assert_eq!(offset, 0);
+
+        // Limit ponizej 1 podniesiony do 1.
+        let (limit, _) = sanitize_page(&json!({"limit": 0}));
+        assert_eq!(limit, 1);
+
+        // Wartosci w zakresie przechodza bez zmian.
+        let (limit, offset) = sanitize_page(&json!({"limit": 25, "offset": 10}));
+        assert_eq!(limit, 25);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn read_tools_reject_missing_required_params() {
+        // Walidacja parametrow read/write tooli BEZ host-fn (czysta sciezka bledu).
+        assert_eq!(handle_delete_collection(&json!({}))["ok"], json!(false));
+        assert_eq!(handle_delete_document(&json!({}))["ok"], json!(false));
+        assert_eq!(handle_collection_ingest_status(&json!({}))["ok"], json!(false));
+        assert_eq!(handle_conflict_detail(&json!({}))["ok"], json!(false));
+        assert_eq!(
+            handle_resolve_escalated(&json!({"action": "keep_winner"}))["ok"],
+            json!(false)
+        );
+        // graph_explore bez node_id i bez entity_query -> blad walidacji (zanim dotknie host-fn).
+        assert_eq!(handle_graph_explore(&json!({}))["ok"], json!(false));
+    }
+
+    #[test]
+    fn resolve_escalated_rejects_unknown_action_shape() {
+        // Brak conflict_id -> blad walidacji przed jakimkolwiek SQL.
+        let res = handle_resolve_escalated(&json!({"action": "dismiss"}));
+        assert_eq!(res["ok"], json!(false));
     }
 
     #[test]
@@ -7891,6 +8861,157 @@ mod tests {
         let rev0 = m.claim("res_1");
         let (applied, reverted) = m.apply("res_1", rev0);
         assert!(applied && !reverted);
+        assert_eq!(m.status, "resolved_auto");
+    }
+
+    // --- Blocker C: cleanup zwraca Result, delete PRZERYWA na bledzie cleanupu ---
+
+    /// Lustro sekwencji delete_document/delete_collection: cleanup grafu/artefaktow zwraca
+    /// Result; gdy zawiedzie, wiersz dokumentu NIE jest usuwany (inaczej osierocone artefakty
+    /// grafu wzgledem skasowanego dokumentu). Modeluje inwariant kolejnosci: cleanup-then-row.
+    struct DeleteModel {
+        cleanup_ok: bool,
+        row_deleted: bool,
+    }
+    impl DeleteModel {
+        fn new(cleanup_ok: bool) -> Self {
+            Self { cleanup_ok, row_deleted: false }
+        }
+        // Lustro handle_delete_document: if cleanup Err -> return early (row NIE usuniety).
+        fn delete(&mut self) -> Result<(), String> {
+            if !self.cleanup_ok {
+                return Err("cleanup grafu nieudany".into());
+            }
+            self.row_deleted = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delete_aborts_and_keeps_row_when_cleanup_fails() {
+        // Cleanup grafu/outboxu zawiodl -> delete przerwany, wiersz dokumentu ZOSTAJE,
+        // wiec nie powstaja osierocone artefakty grafu nad skasowanym dokumentem.
+        let mut m = DeleteModel::new(false);
+        assert!(m.delete().is_err(), "blad cleanupu -> delete zwraca Err");
+        assert!(!m.row_deleted, "wiersz dokumentu NIE usuniety przy bledzie cleanupu");
+    }
+
+    #[test]
+    fn delete_removes_row_when_cleanup_succeeds() {
+        // Cleanup spojny (graf przez outbox, refcount) -> wiersz dokumentu usuniety.
+        let mut m = DeleteModel::new(true);
+        assert!(m.delete().is_ok());
+        assert!(m.row_deleted, "udany cleanup -> wiersz usuniety");
+    }
+
+    #[test]
+    fn delete_collection_cascade_stops_on_first_failure() {
+        // Lustro kaskady delete_collection: per-dokument cleanup; pierwszy blad PRZERYWA
+        // kaskade. Dokumenty przed bledem usuniete, dokument z bledem i dalsze NIE usuniete.
+        let cleanup_ok = [true, true, false, true];
+        let mut deleted = Vec::new();
+        let mut aborted = false;
+        for (i, ok) in cleanup_ok.iter().enumerate() {
+            let mut m = DeleteModel::new(*ok);
+            if m.delete().is_err() {
+                aborted = true;
+                break;
+            }
+            deleted.push(i);
+        }
+        assert!(aborted, "kaskada przerwana na pierwszym bledzie cleanupu");
+        assert_eq!(deleted, vec![0, 1], "tylko dokumenty przed bledem usuniete");
+    }
+
+    // --- Blocker D: reczny resolve_escalated strazy members_rev (D4) ---
+
+    /// Lustro recznego rozstrzygniecia eskalowanego konfliktu (handle_resolve_escalated).
+    /// Inaczej niz A_res: brak ownera, status='escalated', a writy (tombstone przegranych
+    /// + finalize) warunkowane sa na `status='escalated' AND members_rev=:rev0`. Gdy zbior
+    /// czlonkow zmieni sie miedzy odczytem (rev0) a apply, KAZDY write to no-op -> konflikt
+    /// ZOSTAJE 'escalated' (NIE revert-do-open jak A_res). ODWRACALNE: tombstone'y nie wchodza.
+    struct ManualEscalatedModel {
+        status: String,
+        members_rev: i64,
+        members: std::collections::BTreeSet<String>,
+        deactivated: usize,
+        tombstones: usize,
+    }
+    impl ManualEscalatedModel {
+        fn escalated(members: &[&str]) -> Self {
+            Self {
+                status: "escalated".into(),
+                members_rev: 0,
+                members: members.iter().map(|s| s.to_string()).collect(),
+                deactivated: 0,
+                tombstones: 0,
+            }
+        }
+        // Lustro D3 dopisania czlonka do grupy (bump TYLKO przy realnie nowym).
+        fn add_member(&mut self, fk: &str) {
+            if self.members.insert(fk.to_string()) {
+                self.members_rev += 1;
+            }
+        }
+        // Snapshot rev przy odczycie konfliktu (jak SELECT members_rev w handle_resolve_escalated).
+        fn read_rev(&self) -> i64 {
+            self.members_rev
+        }
+        // Lustro apply keep_winner: deaktywacja przegranych + tombstone + finalize, KAZDY
+        // warunkowany na status='escalated' AND members_rev=:rev0. Inwariant: deact == tombstone.
+        // Zwraca true gdy konflikt domkniety (finalize), false gdy no-op (zbior sie zmienil).
+        fn apply_keep_winner(&mut self, rev0: i64, losers: usize) -> bool {
+            let guard_ok = self.status == "escalated" && self.members_rev == rev0;
+            if !guard_ok {
+                return false;
+            }
+            self.deactivated += losers;
+            self.tombstones += losers;
+            self.status = "resolved_auto".into();
+            true
+        }
+    }
+
+    #[test]
+    fn manual_escalated_applies_when_set_unchanged() {
+        // Zbior bez zmian miedzy odczytem a apply -> rozstrzygniecie przechodzi, tombstone'y
+        // przegranych wchodza (deact == tombstone), konflikt domkniety.
+        let mut m = ManualEscalatedModel::escalated(&["fA", "fB", "fC"]);
+        let rev0 = m.read_rev();
+        let applied = m.apply_keep_winner(rev0, 2);
+        assert!(applied, "stabilny zbior -> apply przechodzi");
+        assert_eq!(m.status, "resolved_auto");
+        assert_eq!(m.deactivated, m.tombstones, "loser active=0 <=> tombstone (inwariant)");
+        assert_eq!(m.deactivated, 2);
+    }
+
+    #[test]
+    fn manual_escalated_noop_when_member_set_changed_and_stays_escalated() {
+        // TOCTOU: po odczycie rev0 D3 dokleja nowego czlonka (bump). Apply MUSI byc no-op
+        // (guard members_rev=:rev0 falszywy), konflikt ZOSTAJE 'escalated' do ponownego
+        // recznego rozstrzygniecia na pelnym zbiorze. ODWRACALNE: zero tombstone'ow.
+        let mut m = ManualEscalatedModel::escalated(&["fA", "fB"]);
+        let rev0 = m.read_rev();
+        m.add_member("fC"); // zbior urosl po odczycie
+        let applied = m.apply_keep_winner(rev0, 1);
+        assert!(!applied, "zmieniony zbior -> apply no-op");
+        assert_eq!(m.status, "escalated", "konflikt zostaje eskalowany (NIE revert-do-open)");
+        assert_eq!(m.deactivated, 0, "zaden przegrany nie zdeaktywowany");
+        assert_eq!(m.tombstones, 0, "zaden tombstone nie enqueued (odwracalnie)");
+    }
+
+    #[test]
+    fn manual_escalated_reresolution_succeeds_on_fresh_set() {
+        // Po no-opie (zbior sie zmienil) admin ponawia: nowy odczyt widzi swiezy rev, apply
+        // domyka pelny zbior {fA,fB,fC}. Re-rozstrzygniecie zaadjudykowane.
+        let mut m = ManualEscalatedModel::escalated(&["fA", "fB"]);
+        let rev0 = m.read_rev();
+        m.add_member("fC");
+        assert!(!m.apply_keep_winner(rev0, 1), "pierwsza proba no-op");
+        // Ponowienie: swiezy odczyt rev.
+        let rev1 = m.read_rev();
+        assert_eq!(rev1, 1, "swiezy odczyt widzi zaktualizowany members_rev");
+        assert!(m.apply_keep_winner(rev1, 2), "re-rozstrzygniecie na pelnym zbiorze przechodzi");
         assert_eq!(m.status, "resolved_auto");
     }
 
