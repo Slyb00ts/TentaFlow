@@ -5947,6 +5947,55 @@ pub enum IamPayload {
     ResOk,
 }
 
+/// Jeden fragment pliku wgrywanego z panelu UI addona do JEGO document store.
+/// Generyczny most uploadu: renderer FileInput w panelu addona emituje tylko
+/// metadane wybranych plików (`files_selected`), a HOST (frontend) dzieli plik
+/// na fragmenty `seq` (0..total_chunks) o wspólnym `upload_id` i wysyła je tu.
+/// Core akumuluje fragmenty per `(org_usera, addon_id, upload_id)` i po ostatnim
+/// fragmencie finalizuje content-addressed blob w document store instancji
+/// `addon_id` — DOKŁADNIE tam, skąd addon czyta przez `document_get`. `org_id`
+/// NIE jest polem requestu: serwer bierze org z uwierzytelnionej sesji i waliduje
+/// własność `addon_id` (izolacja multi-tenant), więc klient nie może wskazać
+/// cudzego store.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonDocumentUploadChunkRequest {
+    pub addon_id: String,
+    pub upload_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    /// Surowe bajty fragmentu. `serde_bytes` wymusza w ciborium kodowanie jako CBOR
+    /// byte-string (length-prefixed, zero narzutu per-bajt) — goły `Vec<u8>` przez
+    /// serde+ciborium dałby array-of-integers (~2× rozmiar), co zabiło wydajność
+    /// przy LIDAR. Dla uploadu plików (do setek MiB) to różnica krytyczna.
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+/// Odpowiedź na fragment uploadu dokumentu addona. Dla fragmentów pośrednich
+/// `doc_ref` jest `None` i zwracamy postęp; po ostatnim fragmencie `doc_ref`
+/// zawiera id bloba (doc_id) w document store instancji — addon przekazuje go do
+/// `ingest_document`/`document_get`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonDocumentUploadChunkResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub doc_ref: Option<String>,
+}
+
+/// Ładunek wewnętrzny dla `MessageBody::AddonDocumentBody`. Jeden top-level
+/// wariant `MessageBody` na całą rodzinę uploadu dokumentów addona (wzorzec jak
+/// `MlStudioPayload` / `RobotsPayload`), bo `MessageBody` dobił do limitu 256
+/// wariantów. Nowe warianty TYLKO dopisuj na KOŃCU — ciborium koduje wariant po
+/// indeksie liczbowym, więc wstawienie w środku zerwałoby zgodność wire.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub enum AddonDocumentPayload {
+    UploadChunkRequest(AddonDocumentUploadChunkRequest),
+    UploadChunkResponse(AddonDocumentUploadChunkResponse),
+}
+
 /// policy table (`#[policy]` proc-macro z #26).
 ///
 /// Kazda zmiana layoutu wymaga bump `SCHEMA_VERSION`.
@@ -6547,6 +6596,14 @@ pub enum MessageBody {
     // Appended AFTER the API-key variants so origin's variant indices stay
     // wire-stable across the fleet; RobotsBody takes the new highest index.
     RobotsBody(RobotsPayload),
+
+    // ----- Addon UI document upload (generic FileInput → addon document store) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym):
+    // wstawienie w środku przesunęłoby indeksy ~200 kolejnych wariantów i zerwało
+    // zgodność wire ze starszymi peerami/zapisanymi ramkami. Najwyższy indeks =
+    // bezpieczny dopisek. JEDEN wariant na całą rodzinę (request+response w
+    // `AddonDocumentPayload`), bo `MessageBody` dobił do limitu 256 wariantów.
+    AddonDocumentBody(AddonDocumentPayload),
 }
 
 // =============================================================================
@@ -7794,5 +7851,50 @@ mod tests {
         let decoded_body: MessageBody =
             crate::cbor::decode::<MessageBody>(&decoded_env.body).expect("decode body");
         assert_eq!(decoded_body, body);
+    }
+
+    /// DOWÓD wydajności: pole `bytes` MUSI trafiać na wire jako CBOR byte-string
+    /// (major type 2), a NIE jako array-of-integers (major type 4). Goły `Vec<u8>`
+    /// przez serde+ciborium dałby array (każdy bajt osobnym itemem ⇒ ~2× rozmiar);
+    /// `#[serde(with = "serde_bytes")]` wymusza byte-string. Test koduje 1000 bajtów
+    /// i sprawdza: (1) brak markera array-of-1000 w strumieniu, (2) obecność
+    /// length-prefiksu byte-stringu 1000, (3) rozmiar ~1000+kilka B (nie ~2000+).
+    #[test]
+    fn upload_chunk_bytes_encode_as_cbor_byte_string_not_array() {
+        let payload = AddonDocumentUploadChunkRequest {
+            addon_id: "a".to_string(),
+            upload_id: "u".to_string(),
+            filename: "f".to_string(),
+            mime: "m".to_string(),
+            seq: 0,
+            total_chunks: 1,
+            bytes: vec![0xABu8; 1000],
+        };
+        // Kodujemy SAMĄ strukturę (bez owijki MessageBody), żeby zmierzyć narzut pola.
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut buf).expect("encode");
+
+        // Array-of-1000 zakodowałby się jako major type 4 z prefiksem 0x99 0x03 0xE8
+        // (array, długość 1000) — taki ciąg NIE może wystąpić.
+        let array_1000_prefix = [0x99u8, 0x03, 0xE8];
+        assert!(
+            !buf.windows(3).any(|w| w == array_1000_prefix),
+            "bytes zakodowane jako CBOR array-of-integers (regresja LIDAR) — brak serde_bytes?"
+        );
+
+        // Byte-string długości 1000 ma prefiks 0x59 0x03 0xE8 (major type 2, u16 len).
+        let bstr_1000_prefix = [0x59u8, 0x03, 0xE8];
+        assert!(
+            buf.windows(3).any(|w| w == bstr_1000_prefix),
+            "brak prefiksu CBOR byte-string dla 1000 bajtów"
+        );
+
+        // Rozmiar całości: 1000 bajtów ładunku + drobny narzut pól/prefiksów,
+        // znacznie poniżej 2000 (array dałby ~2000+ przez kodowanie 0xAB per-bajt).
+        assert!(
+            buf.len() < 1100,
+            "zakodowany rozmiar {} B sugeruje array-of-ints zamiast byte-string",
+            buf.len()
+        );
     }
 }

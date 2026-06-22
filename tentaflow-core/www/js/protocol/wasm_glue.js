@@ -442,6 +442,39 @@ export function encodeAddonDetailRequest(addon_id) {
 }
 
 /**
+ * MessageBody::AddonDocumentUploadChunkRequestBody — jeden fragment pliku
+ * wgrywanego z panelu UI addona do jego document store. `org_id` NIE jest tu —
+ * serwer bierze org z sesji. `bytes` to surowy fragment (Uint8Array).
+ * @param {string} addon_id
+ * @param {string} upload_id
+ * @param {string} filename
+ * @param {string} mime
+ * @param {number} seq
+ * @param {number} total_chunks
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function encodeAddonDocumentUploadChunkRequest(addon_id, upload_id, filename, mime, seq, total_chunks, bytes) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(upload_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(filename, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(mime, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonDocumentUploadChunkRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, seq, total_chunks, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
  * @param {string} filename
  * @param {Uint8Array} content
  * @returns {Uint8Array}

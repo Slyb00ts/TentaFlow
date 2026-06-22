@@ -418,9 +418,11 @@ pub fn current_storage_bytes(conn: &rusqlite::Connection) -> i64 {
 }
 
 /// Limit `document_storage_mb` dla addona z `addon_resource_limits` (globalna DB
-/// core, nie rejestr). `0` = brak limitu (spójne z `storage_limit_mb`).
-fn storage_limit_mb(state: &AddonState, addon_id: &str) -> i64 {
-    match state.db.read() {
+/// core, nie rejestr). `0` = brak limitu. Bierze `&DbPool` wprost, więc ten sam
+/// helper obsługuje ścieżkę WASM (`AddonState.db`) i host/dispatch (`AppState.db`)
+/// — jeden punkt prawdy o limicie storage dla document store.
+pub fn document_storage_limit_mb(db: &crate::db::DbPool, addon_id: &str) -> i64 {
+    match db.read() {
         Ok(conn) => conn
             .query_row(
                 "SELECT document_storage_mb FROM addon_resource_limits WHERE addon_id = ?1",
@@ -562,7 +564,7 @@ enum PutOutcome {
 #[allow(clippy::too_many_arguments)]
 fn start_new_upload(
     map: &mut PendingMap,
-    state: &AddonState,
+    limit_mb: i64,
     dir: &Path,
     acc_key: &PendingKey,
     part_path: &Path,
@@ -583,7 +585,6 @@ fn start_new_upload(
         return Err(("upload_too_large", AbiError::QuotaExceeded));
     }
     // Rezerwacja quoty PRZED akceptacją: minimalny projektowany rozmiar.
-    let limit_mb = storage_limit_mb(state, addon_id);
     let pre = open_registry(dir).and_then(|conn| precheck_quota(&conn, doc_id, chunk_len_u64, limit_mb));
     match pre {
         Err(AbiError::QuotaExceeded) => return Err(("storage_limit_exceeded", AbiError::QuotaExceeded)),
@@ -615,6 +616,255 @@ fn start_new_upload(
     } else {
         Ok(PutOutcome::Buffered)
     }
+}
+
+/// Finalizacja partiala → opublikowany content-addressed blob + wiersz rejestru.
+/// Wspólna dla ABI (`document_put_v1`) i hosta (`accept_upload_chunk_host`), żeby
+/// NIE duplikować publikacji bloba ani inwariantu „blob PRZED wierszem". Trzyma
+/// te same gwarancje co dawniej: (1) atomowo zdejmij pending + rename partial →
+/// `<doc_id>.finalizing` (GC sweepuje tylko `*.partial`), (2) strumieniowy
+/// sha256, (3) rename finalizing → blob NAJPIERW, (4) DOPIERO POTEM commit
+/// wiersza. Czytelnik widzący wiersz ZAWSZE ma istniejący blob. Wołać pod
+/// mutexem instancji. Zwraca sha256 albo `(reason, AbiError)`.
+fn finalize_partial(
+    dir: &Path,
+    acc_key: &PendingKey,
+    part_path: &Path,
+    doc_id: &str,
+    mime: &str,
+    size_bytes: u64,
+    limit_mb: i64,
+) -> Result<String, (&'static str, AbiError)> {
+    let final_path = finalizing_path(dir, doc_id);
+    {
+        let mut map = pending_uploads().lock().unwrap_or_else(|e| e.into_inner());
+        if std::fs::rename(part_path, &final_path).is_err() {
+            map.remove(acc_key);
+            drop(map);
+            let _ = std::fs::remove_file(part_path);
+            return Err(("finalizing_rename_failed", AbiError::Operation));
+        }
+        map.remove(acc_key);
+    }
+
+    let sha256 = match hash_file_streaming(&final_path) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = std::fs::remove_file(&final_path);
+            return Err(("hash_failed", AbiError::Operation));
+        }
+    };
+
+    let conn = match open_registry(dir) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::remove_file(&final_path);
+            return Err(("registry_open_failed", AbiError::Operation));
+        }
+    };
+
+    let blob = blob_path(dir, &sha256);
+    if let Some(parent) = blob.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            let _ = std::fs::remove_file(&final_path);
+            return Err(("blob_mkdir_failed", AbiError::Operation));
+        }
+    }
+    if blob.exists() {
+        let _ = std::fs::remove_file(&final_path);
+    } else if std::fs::rename(&final_path, &blob).is_err() && !blob.exists() {
+        let _ = std::fs::remove_file(&final_path);
+        return Err(("blob_rename_failed", AbiError::Operation));
+    }
+
+    let created_at = chrono::Utc::now().to_rfc3339();
+    match commit_document_row(&conn, doc_id, &sha256, mime, size_bytes, &created_at, limit_mb) {
+        Ok(()) => Ok(sha256),
+        Err(AbiError::QuotaExceeded) => {
+            cleanup_unreferenced_blob(&conn, dir, &sha256);
+            Err(("storage_limit_exceeded", AbiError::QuotaExceeded))
+        }
+        Err(_) => {
+            cleanup_unreferenced_blob(&conn, dir, &sha256);
+            Err(("registry_insert_failed", AbiError::Operation))
+        }
+    }
+}
+
+/// Wynik akceptacji fragmentu uploadu po stronie hosta (panel UI, nie WASM).
+#[derive(Debug)]
+pub enum HostUploadOutcome {
+    /// Fragment zbuforowany — czekamy na kolejne. `doc_id` jest stabilny dla
+    /// całego uploadu (generowany na chunk-0), zwracamy go żeby klient mógł go
+    /// powtarzać w polach (spójność akumulatora).
+    Buffered { doc_id: String },
+    /// Ostatni fragment przyjęty i sfinalizowany — `doc_ref` to id bloba w
+    /// document store instancji (czytelny przez `document_get`/`ingest_document`).
+    Finalized { doc_ref: String, size_bytes: u64 },
+}
+
+/// Host-side akceptacja JEDNEGO fragmentu uploadu z panelu UI addona do document
+/// store instancji `addon_id`. Reużywa DOKŁADNIE tę samą warstwę co
+/// `document_put_v1` (akumulator partiali na dysku, mutex instancji, finalizacja
+/// blob-przed-wierszem), więc upload z panelu i odczyt addona przez
+/// `document_get_v1` współdzielą jeden store i jedną serializację — zero
+/// duplikacji zapisu blobów.
+///
+/// Izolacja: wołający (handler dispatch) MUSI przekazać `org_id` z
+/// UWIERZYTELNIONEJ sesji oraz zwalidowane `addon_id` (własność instancji). Tu
+/// `org_id`/`addon_id` wyznaczają fizyczny katalog store — nie ma sposobu, by
+/// dosięgnąć cudzego store. `seq` jest sekwencją monotoniczną 0..total_chunks;
+/// `upload_id` izoluje równoległe uploady tej samej instancji.
+///
+/// `upload_id` jest mieszany do `doc_id` (deterministyczny, walidowany), żeby
+/// dwa równoległe uploady tej samej instancji miały rozłączne partiale i wiersze.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_upload_chunk_host(
+    org_id: &str,
+    addon_id: &str,
+    upload_id: &str,
+    mime: &str,
+    seq: u32,
+    total_chunks: u32,
+    chunk: &[u8],
+    limit_mb: i64,
+) -> Result<HostUploadOutcome, (&'static str, AbiError)> {
+    if total_chunks == 0 || total_chunks > MAX_TOTAL_CHUNKS {
+        return Err(("invalid_total_chunks", AbiError::Operation));
+    }
+    if seq >= total_chunks {
+        return Err(("chunk_index_out_of_range", AbiError::Operation));
+    }
+    if mime.len() > MAX_MIME_LEN {
+        return Err(("mime_too_long", AbiError::Operation));
+    }
+    if chunk.len() > MAX_PUT_CHUNK_BYTES {
+        return Err(("chunk_too_large", AbiError::PayloadTooLarge));
+    }
+
+    // doc_id deterministyczny z upload_id — stabilny przez cały upload i unikalny
+    // per równoległy upload tej samej instancji. Walidacja jako segment ścieżki.
+    let doc_id = format!("up-{}", sanitize_upload_id(upload_id));
+    if validate_doc_id(&doc_id).is_err() {
+        return Err(("invalid_upload_id", AbiError::Operation));
+    }
+
+    let dir = documents_dir(org_id, addon_id).map_err(|_| ("documents_dir_failed", AbiError::Operation))?;
+    tmp_dir(&dir).map_err(|_| ("tmp_dir_failed", AbiError::Operation))?;
+
+    let inst_lock = instance_lock(org_id, addon_id);
+    let _inst_guard = inst_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    sweep_abandoned_pending();
+    purge_orphans_once(&dir);
+
+    let acc_key = (org_id.to_string(), addon_id.to_string(), doc_id.clone());
+    let part_path = partial_path(&dir, &doc_id);
+    let chunk_len_u64 = chunk.len() as u64;
+
+    let input = DocumentPutInput {
+        doc_id: doc_id.clone(),
+        mime: mime.to_string(),
+        chunk_index: seq,
+        total_chunks,
+    };
+
+    let outcome: Result<PutOutcome, (&'static str, AbiError)> = {
+        let mut map = pending_uploads().lock().unwrap_or_else(|e| e.into_inner());
+        if seq == 0 {
+            let existing_fresh = matches!(
+                map.get(&acc_key),
+                Some(p) if now_unix().saturating_sub(p.last_activity) <= PENDING_TTL_SECS
+            );
+            if existing_fresh {
+                Err(("upload_already_in_progress", AbiError::Operation))
+            } else {
+                if let Some(stale) = map.remove(&acc_key) {
+                    let _ = std::fs::remove_file(&stale.path);
+                }
+                start_new_upload(
+                    &mut map, limit_mb, &dir, &acc_key, &part_path,
+                    &input, chunk, chunk_len_u64, addon_id, &doc_id,
+                )
+            }
+        } else {
+            let total_pending = total_pending_bytes(&map);
+            let matches_seq = matches!(
+                map.get(&acc_key),
+                Some(p) if p.next_index == seq && p.total_chunks == total_chunks
+            );
+            if !matches_seq {
+                if let Some(p) = map.remove(&acc_key) {
+                    let _ = std::fs::remove_file(&p.path);
+                }
+                Err(("chunk_sequence_mismatch", AbiError::Operation))
+            } else {
+                let p = map.get_mut(&acc_key).expect("sprawdzone wyżej");
+                let projected = p.bytes_so_far.saturating_add(chunk_len_u64);
+                if projected > MAX_PENDING_UPLOAD_BYTES {
+                    let path = p.path.clone();
+                    map.remove(&acc_key);
+                    let _ = std::fs::remove_file(&path);
+                    Err(("upload_too_large", AbiError::QuotaExceeded))
+                } else if total_pending.saturating_add(chunk_len_u64) > MAX_TOTAL_PENDING_BYTES {
+                    let path = p.path.clone();
+                    map.remove(&acc_key);
+                    let _ = std::fs::remove_file(&path);
+                    Err(("total_pending_bytes_limit", AbiError::QuotaExceeded))
+                } else {
+                    let append = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&p.path)
+                        .and_then(|mut f| f.write_all(chunk));
+                    match append {
+                        Ok(()) => {
+                            p.next_index += 1;
+                            p.bytes_so_far = projected;
+                            p.last_activity = now_unix();
+                            if seq + 1 == total_chunks {
+                                Ok(PutOutcome::Finalize { mime: p.mime.clone(), size_bytes: p.bytes_so_far })
+                            } else {
+                                Ok(PutOutcome::Buffered)
+                            }
+                        }
+                        Err(_) => {
+                            let path = p.path.clone();
+                            map.remove(&acc_key);
+                            let _ = std::fs::remove_file(&path);
+                            Err(("partial_append_failed", AbiError::Operation))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match outcome? {
+        PutOutcome::Buffered => Ok(HostUploadOutcome::Buffered { doc_id }),
+        PutOutcome::Finalize { mime, size_bytes } => {
+            let sha = finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb)?;
+            let _ = sha;
+            Ok(HostUploadOutcome::Finalized { doc_ref: doc_id, size_bytes })
+        }
+    }
+}
+
+/// Mapuje surowy `upload_id` (klient, dowolny string) na bezpieczny segment
+/// (małe litery/cyfry/myślnik), bez `..`/`/`. Walidacja końcowa i tak w
+/// `validate_doc_id` — to redukcja typowego UUID/`up-...` do dozwolonego alfabetu.
+fn sanitize_upload_id(upload_id: &str) -> String {
+    upload_id
+        .chars()
+        .map(|c| {
+            let lc = c.to_ascii_lowercase();
+            if lc.is_ascii_alphanumeric() || lc == '-' {
+                lc
+            } else {
+                '-'
+            }
+        })
+        .take(96)
+        .collect()
 }
 
 // =============================================================================
@@ -744,6 +994,7 @@ pub fn document_put_v1(
     let acc_key = (org_id.clone(), addon_id.clone(), doc_id.clone());
     let part_path = partial_path(&dir, &doc_id);
     let chunk_len_u64 = chunk.len() as u64;
+    let limit_mb = document_storage_limit_mb(&caller.data().db, &addon_id);
 
     // Faza dopisania kawałka do partiala (pod lockiem pending: spójność stanu).
     let outcome: Result<PutOutcome, (&'static str, AbiError)> = {
@@ -764,7 +1015,7 @@ pub fn document_put_v1(
                 let _ = std::fs::remove_file(&stale.path);
                 start_new_upload(
                     &mut map,
-                    caller.data(),
+                    limit_mb,
                     &dir,
                     &acc_key,
                     &part_path,
@@ -777,7 +1028,7 @@ pub fn document_put_v1(
             } else {
                 start_new_upload(
                     &mut map,
-                    caller.data(),
+                    limit_mb,
                     &dir,
                     &acc_key,
                     &part_path,
@@ -890,78 +1141,14 @@ pub fn document_put_v1(
     //     (4) DOPIERO POTEM commit_document_row. Skutek: czytelnik widzący wiersz
     //     ZAWSZE ma istniejący blob (B); overwrite nie zostawia okna wiszącego.
     // -------------------------------------------------------------------------
-    let final_path = finalizing_path(&dir, &doc_id);
-    {
-        // Atomowo: zdejmij pending z mapy i przenieś partial → finalizing pod
-        // lockiem mapy, żeby równoległy GC ani get nie widziały stanu pośredniego.
-        let mut map = pending_uploads().lock().unwrap_or_else(|e| e.into_inner());
-        if std::fs::rename(&part_path, &final_path).is_err() {
-            map.remove(&acc_key);
-            drop(map);
-            let _ = std::fs::remove_file(&part_path);
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("finalizing_rename_failed"));
-            return AbiError::Operation.as_i32();
-        }
-        map.remove(&acc_key);
-    }
-
-    let sha256 = match hash_file_streaming(&final_path) {
+    let sha256 = match finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb) {
         Ok(s) => s,
-        Err(_) => {
-            let _ = std::fs::remove_file(&final_path);
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("hash_failed"));
-            return AbiError::Operation.as_i32();
+        Err((reason, err)) => {
+            let result = if err == AbiError::QuotaExceeded { "denied" } else { "error" };
+            audit(caller.data(), "document.put", Some(&doc_id), result, Some(reason));
+            return err.as_i32();
         }
     };
-
-    let conn = match open_registry(&dir) {
-        Ok(c) => c,
-        Err(_) => {
-            let _ = std::fs::remove_file(&final_path);
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("registry_open_failed"));
-            return AbiError::Operation.as_i32();
-        }
-    };
-    let limit_mb = storage_limit_mb(caller.data(), &addon_id);
-
-    // Publikacja bloba PRZED wierszem: blob jest content-addressed po sha, więc
-    // materializacja przed commitem nie zaśmieca rejestru — przy fail commitu
-    // zostaje niereferowany blob, który GC orphanów może sprzątnąć.
-    let blob = blob_path(&dir, &sha256);
-    if let Some(parent) = blob.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            let _ = std::fs::remove_file(&final_path);
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("blob_mkdir_failed"));
-            return AbiError::Operation.as_i32();
-        }
-    }
-    if blob.exists() {
-        // Dedup wewnątrz instancji — blob już opublikowany, sprzątamy finalizing.
-        let _ = std::fs::remove_file(&final_path);
-    } else if std::fs::rename(&final_path, &blob).is_err() && !blob.exists() {
-        let _ = std::fs::remove_file(&final_path);
-        audit(caller.data(), "document.put", Some(&doc_id), "error", Some("blob_rename_failed"));
-        return AbiError::Operation.as_i32();
-    }
-
-    // Blob istnieje. Teraz commit wiersza. Stary wiersz (overwrite) wskazuje stary
-    // blob (istnieje) aż do podmiany na nowy (którego blob już istnieje) — brak
-    // okna wiszącego. Przy fail commitu NIE kasujemy starego wiersza/bloba; nowy
-    // blob jest niereferowany — kasujemy go tylko gdy ŻADEN wiersz nie ma tego sha.
-    let created_at = chrono::Utc::now().to_rfc3339();
-    match commit_document_row(&conn, &doc_id, &sha256, &mime, size_bytes, &created_at, limit_mb) {
-        Ok(()) => {}
-        Err(AbiError::QuotaExceeded) => {
-            cleanup_unreferenced_blob(&conn, &dir, &sha256);
-            audit(caller.data(), "document.put", Some(&doc_id), "denied", Some("storage_limit_exceeded"));
-            return AbiError::QuotaExceeded.as_i32();
-        }
-        Err(_) => {
-            cleanup_unreferenced_blob(&conn, &dir, &sha256);
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("registry_insert_failed"));
-            return AbiError::Operation.as_i32();
-        }
-    }
 
     let out = DocumentPutOutput {
         doc_id: doc_id.clone(),
@@ -1473,9 +1660,10 @@ pub fn document_list_v1(
 #[doc(hidden)]
 pub mod test_api {
     pub use super::{
-        blob_path, commit_document_row, current_storage_bytes, documents_dir, forget_instance_lock,
-        hash_file_streaming, open_registry, partial_path, purge_orphan_partials, set_root_override,
-        sweep_abandoned_pending, tmp_dir, validate_doc_id, DOCUMENT_CHUNK_BYTES,
+        accept_upload_chunk_host, blob_path, commit_document_row, current_storage_bytes,
+        document_storage_limit_mb, documents_dir, forget_instance_lock, hash_file_streaming,
+        open_registry, partial_path, purge_orphan_partials, set_root_override,
+        sweep_abandoned_pending, tmp_dir, validate_doc_id, HostUploadOutcome, DOCUMENT_CHUNK_BYTES,
         MAX_PENDING_UPLOADS_PER_INSTANCE, MAX_PENDING_UPLOAD_BYTES, PENDING_TTL_SECS,
     };
 }
@@ -2147,6 +2335,193 @@ mod tests {
                 .unwrap_or_else(|| panic!("{doc_id} ma wiersz i blob"));
             assert_eq!(chunk0[0], i as u8, "bajty {doc_id} poprawne");
         }
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    // =========================================================================
+    // Host-side upload (panel UI → document store) — accept_upload_chunk_host
+    // =========================================================================
+
+    /// Host-side upload wielu fragmentów: po ostatnim fragmencie zwraca doc_ref,
+    /// a bajty są czytelne przez tę samą ścieżkę co `document_get_v1` (seek).
+    #[test]
+    fn host_upload_accumulates_and_finalizes_readable_doc_ref() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let dir = documents_dir("org-default", "alpha").unwrap();
+
+        // 1.3 MB → 6 fragmentów po 256 KiB (ostatni krótszy). Niemożliwe w KV.
+        let data: Vec<u8> = (0..1_300_000u32).map(|i| (i % 251) as u8).collect();
+        let upload_id = "abc-123";
+        let total_chunks = data.len().div_ceil(DOCUMENT_CHUNK_BYTES) as u32;
+
+        let mut doc_ref = None;
+        for seq in 0..total_chunks {
+            let start = seq as usize * DOCUMENT_CHUNK_BYTES;
+            let end = (start + DOCUMENT_CHUNK_BYTES).min(data.len());
+            let out = accept_upload_chunk_host(
+                "org-default", "alpha", upload_id, "application/pdf",
+                seq, total_chunks, &data[start..end], 0,
+            )
+            .unwrap();
+            match out {
+                HostUploadOutcome::Buffered { .. } => assert!(seq + 1 < total_chunks),
+                HostUploadOutcome::Finalized { doc_ref: r, size_bytes } => {
+                    assert_eq!(seq + 1, total_chunks, "finalizacja na ostatnim fragmencie");
+                    assert_eq!(size_bytes, data.len() as u64);
+                    doc_ref = Some(r);
+                }
+            }
+        }
+        let doc_ref = doc_ref.expect("doc_ref po ostatnim fragmencie");
+
+        // doc_ref czytelny przez seek (ścieżka document_get) — pełny roundtrip.
+        let mut assembled = Vec::new();
+        let (_c0, total) = get_chunk_seek(&dir, &doc_ref, 0).unwrap();
+        for i in 0..total as usize {
+            let (c, _t) = get_chunk_seek(&dir, &doc_ref, i).unwrap();
+            assembled.extend_from_slice(&c);
+        }
+        assert_eq!(assembled, data, "bajty wgrane = bajty czytane przez doc_ref");
+
+        // Brak osieroconego partiala po finalizacji.
+        assert!(!partial_path(&dir, &doc_ref).exists(), "partial skasowany");
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    /// Pojedynczy fragment (total_chunks=1) finalizuje od razu.
+    #[test]
+    fn host_upload_single_chunk_finalizes_immediately() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let dir = documents_dir("org-default", "alpha").unwrap();
+
+        let data = b"maly plik";
+        let out = accept_upload_chunk_host(
+            "org-default", "alpha", "u1", "text/plain", 0, 1, data, 0,
+        )
+        .unwrap();
+        let doc_ref = match out {
+            HostUploadOutcome::Finalized { doc_ref, size_bytes } => {
+                assert_eq!(size_bytes, data.len() as u64);
+                doc_ref
+            }
+            HostUploadOutcome::Buffered { .. } => panic!("1 fragment → finalizacja od razu"),
+        };
+        let (chunk, total) = get_chunk_seek(&dir, &doc_ref, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(chunk, data);
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    /// Izolacja multi-tenant: doc_ref wgrany przez (org-a, alpha) NIE jest
+    /// widoczny w store innej instancji/org (osobny rejestr + katalog).
+    #[test]
+    fn host_upload_isolated_per_instance_and_org() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let out = accept_upload_chunk_host(
+            "org-a", "alpha", "u-iso", "text/plain", 0, 1, b"sekret", 0,
+        )
+        .unwrap();
+        let doc_ref = match out {
+            HostUploadOutcome::Finalized { doc_ref, .. } => doc_ref,
+            _ => panic!("finalized"),
+        };
+
+        // Inna instancja tego samego org — brak wiersza.
+        let other_inst = documents_dir("org-a", "beta").unwrap();
+        assert!(get_chunk_seek(&other_inst, &doc_ref, 0).is_none(), "inna instancja nie widzi doc_ref");
+        // Inny org, ta sama nazwa instancji — brak wiersza.
+        let other_org = documents_dir("org-b", "alpha").unwrap();
+        assert!(get_chunk_seek(&other_org, &doc_ref, 0).is_none(), "inny org nie widzi doc_ref");
+        // Właściwa instancja — widzi.
+        let own = documents_dir("org-a", "alpha").unwrap();
+        assert!(get_chunk_seek(&own, &doc_ref, 0).is_some(), "właściciel widzi doc_ref");
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    /// Cap: niemonotoniczna sekwencja (skok seq) odrzucona i czyści partial.
+    #[test]
+    fn host_upload_rejects_sequence_gap() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 0, 3, b"aaa", 0).unwrap();
+        // Skok do seq=2 (pominięty 1) → mismatch.
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 2, 3, b"ccc", 0);
+        assert!(matches!(err, Err(("chunk_sequence_mismatch", AbiError::Operation))));
+        // Partial skasowany po mismatch.
+        let doc_id = format!("up-{}", sanitize_upload_id("u-seq"));
+        assert!(!partial_path(&documents_dir("org-default", "alpha").unwrap(), &doc_id).exists());
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    /// Cap: za duży pojedynczy fragment (> MAX_PUT_CHUNK_BYTES) odrzucony.
+    #[test]
+    fn host_upload_rejects_oversized_chunk() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let huge = vec![0u8; MAX_PUT_CHUNK_BYTES + 1];
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-big", "text/plain", 0, 1, &huge, 0);
+        assert!(matches!(err, Err(("chunk_too_large", AbiError::PayloadTooLarge))));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
+    /// Cap: invalid total_chunks i seq poza zakresem odrzucone wcześnie.
+    #[test]
+    fn host_upload_rejects_bad_seq_total() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        assert!(matches!(
+            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 0, 0, b"x", 0),
+            Err(("invalid_total_chunks", _))
+        ));
+        assert!(matches!(
+            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 5, 3, b"x", 0),
+            Err(("chunk_index_out_of_range", _))
+        ));
+        set_root_override(None);
+    }
+
+    /// Storage quota (limit_mb) egzekwowana przy finalizacji.
+    #[test]
+    fn host_upload_enforces_storage_quota() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        // limit_mb=0 w precheck (start), ale finalizacja dostaje realny limit. Tu
+        // 1 MB limit, plik 1 fragment ~9 bajtów → mieści się; potem duży > limit.
+        let data = vec![7u8; 2 * 1024 * 1024];
+        // 1 fragment 2 MB przekracza MAX_PUT_CHUNK_BYTES? Nie (8 MiB). limit 1 MB.
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-q", "text/plain", 0, 1, &data, 1);
+        assert!(
+            matches!(err, Err(("storage_limit_exceeded", AbiError::QuotaExceeded))),
+            "2MB plik przy limicie 1MB odrzucony, dostałem {err:?}"
+        );
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
         set_root_override(None);
     }

@@ -21,6 +21,7 @@ use tentaflow_protocol::{
     envelope::{Envelope, EnvelopeFlags, Routing, message_kind},
     message_body::{
         AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
+        AddonDocumentPayload, AddonDocumentUploadChunkRequest,
         AddonInstallRequest, AddonInstanceDuplicateRequest, AddonInstanceInstallRequest,
         AddonInstancePayload, AddonInstanceUpdateRequest, AddonInstanceVersionsRequest,
         AddonLogsRequest, AddonNetworkRulesGetRequest, AddonStoragePayload,
@@ -1745,6 +1746,33 @@ pub fn encode_ml_studio_dataset_upload_chunk_request(
                 bytes,
             },
         ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::AddonDocumentUploadChunkRequestBody — jeden fragment pliku
+/// wgrywanego z panelu UI addona do jego document store. `org_id` NIE jest tu —
+/// serwer bierze org z sesji. `bytes` to surowy fragment (Uint8Array).
+#[wasm_bindgen(js_name = encodeAddonDocumentUploadChunkRequest)]
+pub fn encode_addon_document_upload_chunk_request(
+    addon_id: String,
+    upload_id: String,
+    filename: String,
+    mime: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonDocumentBody(
+        AddonDocumentPayload::UploadChunkRequest(AddonDocumentUploadChunkRequest {
+            addon_id,
+            upload_id,
+            filename,
+            mime,
+            seq,
+            total_chunks,
+            bytes,
+        }),
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -7824,6 +7852,37 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "cbor", js_sys::Uint8Array::from(&bytes[..]).into());
         }
         MessageBody::MlStudioBody(payload) => decode_ml_studio_payload(&obj, payload),
+        MessageBody::AddonDocumentBody(AddonDocumentPayload::UploadChunkRequest(req)) => {
+            set(&obj, "variant", "AddonDocumentUploadChunkRequest".into());
+            set(&obj, "addonId", req.addon_id.clone().into());
+            set(&obj, "addon_id", req.addon_id.into());
+            set(&obj, "uploadId", req.upload_id.clone().into());
+            set(&obj, "upload_id", req.upload_id.into());
+            set(&obj, "filename", req.filename.into());
+            set(&obj, "mime", req.mime.into());
+            set(&obj, "seq", req.seq.into());
+            set(&obj, "totalChunks", req.total_chunks.into());
+            set(&obj, "total_chunks", req.total_chunks.into());
+        }
+        MessageBody::AddonDocumentBody(AddonDocumentPayload::UploadChunkResponse(resp)) => {
+            set(&obj, "variant", "AddonDocumentUploadChunkResponse".into());
+            set(&obj, "uploadId", resp.upload_id.clone().into());
+            set(&obj, "upload_id", resp.upload_id.into());
+            set(&obj, "receivedChunks", resp.received_chunks.into());
+            set(&obj, "received_chunks", resp.received_chunks.into());
+            set(&obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(&obj, "received_bytes", (resp.received_bytes as f64).into());
+            match resp.doc_ref {
+                Some(r) => {
+                    set(&obj, "docRef", r.clone().into());
+                    set(&obj, "doc_ref", r.into());
+                }
+                None => {
+                    set(&obj, "docRef", JsValue::NULL);
+                    set(&obj, "doc_ref", JsValue::NULL);
+                }
+            }
+        }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
     }
     Ok(obj.into())

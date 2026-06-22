@@ -281,6 +281,15 @@ impl SessionState {
         Some(&self.open_panels[idx].ownership)
     }
 
+    /// Czy ta sesja (połączenie) ma OTWARTY jakikolwiek panel danego addona.
+    /// Generyczny upload plików z panelu nie zna panel_id w protokole, więc
+    /// autoryzacja sprawdza, że połączenie faktycznie ma otwarty panel tego
+    /// addona — ten sam model własności co ścieżka `Action` (panel musi być
+    /// otwarty na tym socketcie), bez wiązania uploadu do konkretnego panel_id.
+    pub fn has_open_panel_for_addon(&self, addon_id: &str) -> bool {
+        self.open_panels.iter().any(|p| p.addon_id == addon_id)
+    }
+
     pub fn get_panel_mut(&mut self, addon_id: &str, panel_id: &str) -> Option<&mut PanelOwnership> {
         let idx = self.find_panel(addon_id, panel_id)?;
         Some(&mut self.open_panels[idx].ownership)

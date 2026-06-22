@@ -20,7 +20,7 @@ use super::HandlerContext;
 /// addon start / `on_panel_open` no longer parks a worker and stalls unrelated
 /// requests. Off-runtime (unit tests) or on a current-thread runtime it runs
 /// inline (block_in_place would panic there).
-fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
             tokio::task::block_in_place(f)
@@ -318,6 +318,27 @@ fn cbor_map_to_json(map: &tentaflow_sdk_spec::protocol::control::CborMap) -> ser
     serde_json::Value::Object(m)
 }
 
+/// Builds the addon tool params for a UI action, injecting the HOST-validated
+/// `panel_epoch` under the reserved key `__panel_epoch`. WASM instances are pooled /
+/// reused, so the addon's static panel-epoch can be stale/foreign — the addon MUST adopt
+/// the action's epoch as the source of truth (per-panel field keying + emitting
+/// StatePatch/SlotContent with the correct epoch, else the host rejects them as stale).
+/// The epoch is validated before this call (ownership.panel_epoch == action.panel_epoch),
+/// and carried the same way as `user_id` (request JSON), so the addon reads it inline.
+fn action_params_with_epoch(
+    params: &tentaflow_sdk_spec::protocol::control::CborMap,
+    panel_epoch: u64,
+) -> serde_json::Value {
+    let mut params_json = cbor_map_to_json(params);
+    if let serde_json::Value::Object(map) = &mut params_json {
+        map.insert(
+            "__panel_epoch".to_string(),
+            serde_json::Value::from(panel_epoch),
+        );
+    }
+    params_json
+}
+
 /// Action: validate session, delegate to addon, return ActionAck.
 fn handle_action(
     ctx: &HandlerContext,
@@ -367,7 +388,7 @@ fn handle_action(
 
     let user_id = extract_user_id(ctx).unwrap_or_default();
     let tool_name = format!("ui.{}.{}", action.panel_id, action.action_id);
-    let params_json = cbor_map_to_json(&action.params);
+    let params_json = action_params_with_epoch(&action.params, action.panel_epoch);
     tracing::info!(tool = %tool_name, params = %params_json, "UI action calling addon tool");
 
     // call_tool runs the addon's WASM synchronously — off-load from the async
@@ -723,6 +744,26 @@ mod tests {
         let err = ui_channel_dispatch(&MessageBody::UiChannelCbor(action_cbor), &ctx).unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert!(err.message.contains("delete"));
+    }
+
+    #[test]
+    fn action_params_inject_validated_panel_epoch() {
+        use tentaflow_sdk_spec::protocol::control::CborMap;
+        use tentaflow_sdk_spec::protocol::value::Value as SV;
+
+        // params nioslo wlasne pole (field) — wstrzykniety epoch nie nadpisuje go.
+        let params = CborMap(vec![("field".into(), SV::Text("chat_question".into()))]);
+        let out = action_params_with_epoch(&params, 7);
+        assert_eq!(out.get("field").and_then(|v| v.as_str()), Some("chat_question"));
+        assert_eq!(
+            out.get("__panel_epoch").and_then(|v| v.as_u64()),
+            Some(7),
+            "epoch z akcji musi trafic do params jako __panel_epoch (zrodlo prawdy addona)"
+        );
+
+        // Pusty params: addon i tak dostaje epoch.
+        let empty = action_params_with_epoch(&CborMap(vec![]), 42);
+        assert_eq!(empty.get("__panel_epoch").and_then(|v| v.as_u64()), Some(42));
     }
 
     #[test]
