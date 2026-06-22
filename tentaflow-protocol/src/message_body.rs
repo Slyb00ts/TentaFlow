@@ -2138,6 +2138,42 @@ pub struct RobotCameraShareResponse {
     pub note: Option<String>,
 }
 
+/// Manual georeference for a robot's scene (the "set map origin" operation): pins the
+/// scene origin to a real-world WGS84 position + heading. `lat/lon/alt/heading` all
+/// `Some` = set; all `None` = clear the anchor. Heading is the compass bearing
+/// (degrees clockwise from true North) of the scene's +X axis.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorSetRequest {
+    pub robot_id: String,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub alt: Option<f64>,
+    pub heading: Option<f64>,
+}
+
+/// Read a robot's current geo anchor + live real-world position.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorGetRequest {
+    pub robot_id: String,
+}
+
+/// The robot's geo anchor + (when anchored and a pose is known) its current WGS84
+/// position. `anchored` is the applied-anchor flag; `*_deg`/`alt`/`heading` describe
+/// it; `pose_*` carry the live global position (None until the robot has a pose).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub anchored: bool,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub alt: Option<f64>,
+    pub heading: Option<f64>,
+    pub pose_lat: Option<f64>,
+    pub pose_lon: Option<f64>,
+    pub pose_alt: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum RobotsPayload {
     ListRequest(RobotsListRequest),
@@ -2146,6 +2182,9 @@ pub enum RobotsPayload {
     ControlResponse(RobotControlResponse),
     CameraShareRequest(RobotCameraShareRequest),
     CameraShareResponse(RobotCameraShareResponse),
+    GeoAnchorSetRequest(RobotGeoAnchorSetRequest),
+    GeoAnchorGetRequest(RobotGeoAnchorGetRequest),
+    GeoAnchorResponse(RobotGeoAnchorResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----

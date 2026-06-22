@@ -8293,6 +8293,36 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
                 None => set(obj, "note", JsValue::NULL),
             }
         }
+        P::GeoAnchorSetRequest(req) => {
+            set(obj, "variant", "RobotGeoAnchorSetRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+        }
+        P::GeoAnchorGetRequest(req) => {
+            set(obj, "variant", "RobotGeoAnchorGetRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+        }
+        P::GeoAnchorResponse(resp) => {
+            set(obj, "variant", "RobotGeoAnchorResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            set(obj, "anchored", resp.anchored.into());
+            let num = |o: &js_sys::Object, k: &str, v: Option<f64>| match v {
+                Some(x) => set(o, k, x.into()),
+                None => set(o, k, JsValue::NULL),
+            };
+            num(obj, "lat", resp.lat);
+            num(obj, "lon", resp.lon);
+            num(obj, "alt", resp.alt);
+            num(obj, "heading", resp.heading);
+            num(obj, "poseLat", resp.pose_lat);
+            num(obj, "poseLon", resp.pose_lon);
+            num(obj, "poseAlt", resp.pose_alt);
+        }
     }
 }
 
@@ -14369,6 +14399,34 @@ pub fn encode_robot_camera_share_request(
             robot_id,
             camera_id,
         },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(GeoAnchorSetRequest) — pin the robot's scene origin to a
+/// real-world lat/lon/alt + heading (all `Some` = set; all `None` = clear).
+#[wasm_bindgen(js_name = encodeRobotGeoAnchorSetRequest)]
+pub fn encode_robot_geo_anchor_set_request(
+    robot_id: String,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt: Option<f64>,
+    heading: Option<f64>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotGeoAnchorSetRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorSetRequest(
+        RobotGeoAnchorSetRequest { robot_id, lat, lon, alt, heading },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(GeoAnchorGetRequest) — read a robot's geo anchor + live
+/// real-world position.
+#[wasm_bindgen(js_name = encodeRobotGeoAnchorGetRequest)]
+pub fn encode_robot_geo_anchor_get_request(robot_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotGeoAnchorGetRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorGetRequest(
+        RobotGeoAnchorGetRequest { robot_id },
     )))
     .map_err(|e| JsError::new(&e))
 }

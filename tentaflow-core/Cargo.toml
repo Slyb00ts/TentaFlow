@@ -76,6 +76,9 @@ tentaflow-protocol = { path = "../tentaflow-protocol" }
 # subsequent chunks.
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
 
+# Unified SLAM core: server-side shared scene map + GlobalPose from robot poses.
+tentaflow-slam = { path = "../tentaflow-slam" }
+
 # Direct CBOR codec for the mesh::ufp2 wire bytes (encode/decode of
 # Envelope between iroh streams and sdk-spec types).
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }

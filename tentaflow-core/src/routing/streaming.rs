@@ -543,6 +543,7 @@ where
                         speaker_id: None,
                         speaker_name: None,
                         usage: metrics,
+                        perf: None,
                     };
                     Some((
                         Ok(finish_chunk),
@@ -894,6 +895,7 @@ mod include_usage_tests {
             speaker_id: None,
             speaker_name: None,
             usage,
+            perf: None,
         }
     }
 
@@ -1014,6 +1016,7 @@ mod compliance_stream_tests {
             speaker_id: None,
             speaker_name: None,
             usage,
+            perf: None,
         }
     }
 

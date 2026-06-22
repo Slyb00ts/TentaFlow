@@ -20,15 +20,24 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
-    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotImuSnapshot,
-    RobotLidarStatus, RobotTelemetrySnapshot, RobotsListResponse,
+    RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotGeoAnchorResponse,
+    RobotImuSnapshot, RobotLidarStatus, RobotTelemetrySnapshot, RobotsListResponse,
     RobotsPayload,
 };
+use tentaflow_sdk_spec::POSE_STATE_GLOBAL;
+use tentaflow_slam::GeoAnchor;
 
 use super::HandlerContext;
+use crate::db::DbPool;
 use crate::mesh::robot_control::{RejectReason, RobotAction};
 use crate::mesh::robot_dispatch::{self, AdvertisedRobot};
 use crate::services::rbac::OrgContext;
+use crate::services::slam_scene::SlamSceneManager;
+
+/// Settings key holding ALL robots' geo anchors as a JSON object
+/// `{robot_id: {lat,lon,alt,heading}}`. One key keeps load/save trivial (no
+/// prefix-scan) and is read once at startup into the in-memory manager.
+const GEO_ANCHORS_SETTING: &str = "robot_geo_anchors";
 
 /// The TentaVision package base id; its enabled instances are the grantees for a
 /// local robot camera share so the feed appears in the TentaVision app.
@@ -306,6 +315,205 @@ pub fn robots_camera_share(
         &org.user_id,
     );
     Ok(MessageBody::RobotsBody(RobotsPayload::CameraShareResponse(resp)))
+}
+
+/// Permission gating geo-anchor read/write — the SAME grant the LiDAR/scene streams
+/// and lidar status require, so the real-world position + anchor are not exposed to an
+/// org member without robot access.
+const PERM_ROBOT_TELEMETRY: &str = "robot.telemetry";
+
+/// True only if `robot_id` is advertised in the caller's org AND owned by THIS node.
+/// Geo anchors are applied to the LOCAL `SlamSceneManager` (the node that ingests the
+/// robot's frames + pose), so a remote robot's anchor must be set on its owner — a
+/// local write would silently no-op on the real scene.
+fn local_robot_in_org(org_id: &str, robot_id: &str, local_node_id: &str) -> bool {
+    robot_dispatch::global()
+        .all()
+        .into_iter()
+        .any(|r| r.org_id == org_id && r.robot_id == robot_id && r.node_id == local_node_id)
+}
+
+/// A GeoAnchorResponse carrying only an error (robot not local/in-org).
+fn geo_anchor_error(msg: &str) -> MessageBody {
+    MessageBody::RobotsBody(RobotsPayload::GeoAnchorResponse(RobotGeoAnchorResponse {
+        ok: false,
+        error: Some(msg.to_string()),
+        anchored: false,
+        lat: None,
+        lon: None,
+        alt: None,
+        heading: None,
+        pose_lat: None,
+        pose_lon: None,
+        pose_alt: None,
+    }))
+}
+
+/// Build the current geo-anchor + live-position response for a robot.
+fn geo_anchor_response(robot_id: &str) -> RobotGeoAnchorResponse {
+    let mgr = SlamSceneManager::global();
+    let anchor = mgr.geo_anchor(robot_id);
+    // Live WGS84 position only when an anchor is ACTIVE and the latest pose is Global.
+    // The active-anchor gate prevents reporting a stale cached Global pose right after
+    // a clear (the manager also re-emits the pose on anchor change, so this is belt +
+    // suspenders).
+    let (pose_lat, pose_lon, pose_alt) = match mgr.latest_pose(robot_id) {
+        Some(p) if anchor.is_some() && p.state == POSE_STATE_GLOBAL => {
+            (Some(p.position[0]), Some(p.position[1]), Some(p.position[2]))
+        }
+        _ => (None, None, None),
+    };
+    RobotGeoAnchorResponse {
+        ok: true,
+        error: None,
+        anchored: anchor.is_some(),
+        lat: anchor.map(|a| a.lat_deg),
+        lon: anchor.map(|a| a.lon_deg),
+        alt: anchor.map(|a| a.alt_m),
+        heading: anchor.map(|a| a.heading_deg),
+        pose_lat,
+        pose_lon,
+        pose_alt,
+    }
+}
+
+/// Serialize every in-memory geo anchor to the single settings key so they survive a
+/// restart. Best-effort: a write failure is logged, not fatal (the live anchor still
+/// works this session).
+fn persist_geo_anchors(db: &DbPool) {
+    let map: serde_json::Map<String, serde_json::Value> = SlamSceneManager::global()
+        .all_anchors()
+        .into_iter()
+        .map(|(id, a)| {
+            (
+                id,
+                serde_json::json!({
+                    "lat": a.lat_deg, "lon": a.lon_deg,
+                    "alt": a.alt_m, "heading": a.heading_deg,
+                }),
+            )
+        })
+        .collect();
+    let json = serde_json::Value::Object(map).to_string();
+    if let Err(e) = crate::db::repository::set_setting(db, GEO_ANCHORS_SETTING, &json) {
+        tracing::warn!("robots: persisting geo anchors failed: {}", e);
+    }
+}
+
+/// Restore persisted geo anchors into the manager at startup (called once after the DB
+/// is ready). Robots are created lazily on first frame; the manager applies the
+/// restored anchor when each robot's SlamService is built.
+pub fn load_geo_anchors(db: &DbPool) {
+    let Ok(Some(s)) = crate::db::repository::get_setting(db, GEO_ANCHORS_SETTING) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return;
+    };
+    let mgr = SlamSceneManager::global();
+    let mut n = 0;
+    for (robot_id, v) in &obj {
+        if let (Some(lat), Some(lon), Some(alt), Some(heading)) = (
+            v.get("lat").and_then(|x| x.as_f64()),
+            v.get("lon").and_then(|x| x.as_f64()),
+            v.get("alt").and_then(|x| x.as_f64()),
+            v.get("heading").and_then(|x| x.as_f64()),
+        ) {
+            if mgr.set_geo_anchor(robot_id, GeoAnchor::new(lat, lon, alt, heading)) {
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        tracing::info!("robots: restored {} geo anchor(s)", n);
+    }
+}
+
+#[handler(variant = "RobotGeoAnchorSetRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn robots_geo_anchor_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::RobotsBody(RobotsPayload::GeoAnchorSetRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected RobotGeoAnchorSetRequest")),
+    };
+    let org = require_org(ctx)?;
+    if !org.has(PERM_ROBOT_TELEMETRY) {
+        return Err(ProtocolError::new(
+            tentaflow_protocol::ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry permission required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+    if !local_robot_in_org(&org.org_id, &payload.robot_id, &local_node_id) {
+        return Ok(geo_anchor_error(
+            "robot not found locally in this organization (set the geo-anchor on its owning node)",
+        ));
+    }
+    let mgr = SlamSceneManager::global();
+    let fields = (payload.lat, payload.lon, payload.alt, payload.heading);
+    match fields {
+        (Some(lat), Some(lon), Some(alt), Some(heading)) => {
+            if !mgr.set_geo_anchor(&payload.robot_id, GeoAnchor::new(lat, lon, alt, heading)) {
+                return Ok(MessageBody::RobotsBody(RobotsPayload::GeoAnchorResponse(
+                    RobotGeoAnchorResponse {
+                        ok: false,
+                        error: Some("invalid anchor (lat/lon out of range or non-finite)".to_string()),
+                        anchored: mgr.geo_anchor(&payload.robot_id).is_some(),
+                        lat: None,
+                        lon: None,
+                        alt: None,
+                        heading: None,
+                        pose_lat: None,
+                        pose_lon: None,
+                        pose_alt: None,
+                    },
+                )));
+            }
+        }
+        (None, None, None, None) => mgr.clear_geo_anchor(&payload.robot_id),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "geo anchor requires all of lat/lon/alt/heading (set) or none (clear)",
+            ))
+        }
+    }
+    persist_geo_anchors(&ctx.state.db);
+    Ok(MessageBody::RobotsBody(RobotsPayload::GeoAnchorResponse(
+        geo_anchor_response(&payload.robot_id),
+    )))
+}
+
+#[handler(variant = "RobotGeoAnchorGetRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn robots_geo_anchor_get(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::RobotsBody(RobotsPayload::GeoAnchorGetRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected RobotGeoAnchorGetRequest")),
+    };
+    let org = require_org(ctx)?;
+    if !org.has(PERM_ROBOT_TELEMETRY) {
+        return Err(ProtocolError::new(
+            tentaflow_protocol::ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry permission required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+    if !local_robot_in_org(&org.org_id, &payload.robot_id, &local_node_id) {
+        return Ok(geo_anchor_error(
+            "robot not found locally in this organization (read the geo-anchor on its owning node)",
+        ));
+    }
+    Ok(MessageBody::RobotsBody(RobotsPayload::GeoAnchorResponse(
+        geo_anchor_response(&payload.robot_id),
+    )))
 }
 
 /// Grant `read` on a node-local robot camera to every enabled TentaVision

@@ -1071,6 +1071,44 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::RobotsBody(GeoAnchorSetRequest) — pin/clear the robot's scene
+   * origin in the real world. payload: { robotId, lat, lon, alt, heading } (all
+   * present = set; all null/undefined = clear).
+   */
+  robotGeoAnchorSetRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const num = (v) => (v == null ? undefined : Number(v));
+    const body = _wasm.encodeRobotGeoAnchorSetRequest(
+      payload.robotId,
+      num(payload.lat),
+      num(payload.lon),
+      num(payload.alt),
+      num(payload.heading),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::RobotsBody(GeoAnchorGetRequest) — read the robot's geo anchor +
+   * live real-world position. payload: { robotId }
+   */
+  robotGeoAnchorGetRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotGeoAnchorGetRequest(payload.robotId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------

@@ -1895,6 +1895,62 @@ impl VoxelView {
         st.framed = false;
     }
 
+    /// Render the AUTHORITATIVE server scene map: a full REPLACE of the occupied set
+    /// with `points` (interleaved world XYZ, length = `count` * 3 — the
+    /// `decodeLidarFrame(...).points` of a `scene:<robot_id>` frame). Unlike
+    /// `setPoints` (which UNIONs live frames), this drops the current set and renders
+    /// exactly the server's deduplicated map, so the server stays the single source of
+    /// truth and stale cells never linger. Live `lidar:` frames may still `setPoints`
+    /// on top between snapshots for low-latency feel; the next `setMapPoints` reconciles
+    /// back to the authoritative map. Camera framing is preserved across replaces (only
+    /// the first non-empty map frames the camera) so the 1 Hz snapshot never fights the
+    /// user's orbit/zoom.
+    #[wasm_bindgen(js_name = setMapPoints)]
+    pub fn set_map_points(&self, points: &[f32], count: u32) {
+        let state = match self.state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut st = state.borrow_mut();
+
+        // Full replace: drop the prior set + bounds, but KEEP `framed` so the camera
+        // is not re-framed on every snapshot.
+        st.cells.clear();
+        st.cell_order.clear();
+        st.accum_min = Vec3::splat(f32::INFINITY);
+        st.accum_max = Vec3::splat(f32::NEG_INFINITY);
+        st.capped_logged = false;
+
+        let usable = (count as usize).min(points.len() / 3);
+        if usable == 0 {
+            // An empty authoritative map clears the render (server says nothing yet).
+            st.instance_count = 0;
+            st.cells_dirty = false;
+            st.grid_vertex_count = 0;
+            st.grid_bounds = None;
+            return;
+        }
+
+        st.accumulate_cells(points, usable);
+        st.rebuild_instance_buffer();
+        st.cells_dirty = false;
+
+        if !st.accum_min.is_finite() || !st.accum_max.is_finite() {
+            return;
+        }
+        let min = st.accum_min;
+        let max = st.accum_max;
+        let center = (min + max) * 0.5;
+        let extent = (max - min).length().max(0.5);
+        st.refresh_color_field();
+        st.update_grid(min, max);
+        if !st.framed {
+            st.camera.target = center;
+            st.camera.distance = extent * 1.2;
+            st.framed = true;
+        }
+    }
+
     /// Reconfigure the surface and depth buffer for a new backing size in
     /// physical pixels. Pass the device-pixel-ratio-scaled canvas dimensions.
     #[wasm_bindgen]

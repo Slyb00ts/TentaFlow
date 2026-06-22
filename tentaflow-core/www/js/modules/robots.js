@@ -1103,9 +1103,11 @@ function renderDetailPanel(shell, tabId) {
           <div class="robots-section-head"><h3>Model 3D — stawy na żywo</h3></div>
           <div class="robots-robot3d" data-field="robot3d"></div>
         </div>
+        <div class="robots-section" data-field="geo-anchor"></div>
       </div>`;
     updateTelemetryFull(panel.querySelector('[data-field="telemetry-full"]'), r);
     updateRobot3d(panel.querySelector('[data-field="robot3d"]'), r);
+    buildGeoAnchor(panel.querySelector('[data-field="geo-anchor"]'), r);
     return;
   }
 
@@ -1117,6 +1119,99 @@ function renderDetailPanel(shell, tabId) {
     renderLog(panel.querySelector('[data-field="log"]'));
     return;
   }
+}
+
+// Geo-anchor panel: pin the robot's scene origin to a real-world lat/lon/alt +
+// heading so the whole map (and every robot sharing the scene) gets TRUE-world
+// coordinates. Shows the live WGS84 position once anchored. The server holds the
+// anchor (persisted), so this is a thin set/get over the binary protocol.
+function buildGeoAnchor(el, r) {
+  if (!el) return;
+  const id = robotId(r);
+  el.innerHTML = `
+    <div class="robots-section-head"><h3>Pozycja w świecie (geo-anchor)</h3></div>
+    <p class="robots-geo-hint">Przypnij początek mapy do rzeczywistych współrzędnych. Kierunek = azymut osi +X sceny (° od północy, zgodnie z ruchem wskazówek).</p>
+    <div class="robots-geo-form">
+      <tf-input type="number" label="Szerokość (lat °)" data-geo="lat" placeholder="52.2297"></tf-input>
+      <tf-input type="number" label="Długość (lon °)" data-geo="lon" placeholder="21.0122"></tf-input>
+      <tf-input type="number" label="Wysokość (m)" data-geo="alt" placeholder="118.5"></tf-input>
+      <tf-input type="number" label="Kierunek (°)" data-geo="heading" placeholder="0"></tf-input>
+    </div>
+    <div class="robots-geo-actions">
+      <tf-button variant="primary" size="sm" data-geo-set>Ustaw kotwicę</tf-button>
+      <tf-button variant="ghost" size="sm" data-geo-clear>Wyczyść</tf-button>
+    </div>
+    <div class="robots-geo-readout" data-geo-readout>—</div>`;
+
+  const readout = el.querySelector('[data-geo-readout]');
+  const val = (k) => {
+    const v = el.querySelector(`tf-input[data-geo="${k}"]`)?.value;
+    return v == null || v === '' ? null : Number(v);
+  };
+  const applyResp = (resp) => {
+    if (!resp || !resp.ok) {
+      readout.textContent = `Błąd: ${resp?.error || 'nieznany'}`;
+      return;
+    }
+    if (resp.anchored) {
+      for (const k of ['lat', 'lon', 'alt', 'heading']) {
+        const inp = el.querySelector(`tf-input[data-geo="${k}"]`);
+        if (inp && resp[k] != null) inp.value = String(resp[k]);
+      }
+    }
+    if (resp.poseLat != null && resp.poseLon != null) {
+      readout.textContent = `Pozycja: ${resp.poseLat.toFixed(6)}, ${resp.poseLon.toFixed(6)}`
+        + (resp.poseAlt != null ? ` · ${resp.poseAlt.toFixed(1)} m n.p.m.` : '');
+    } else if (resp.anchored) {
+      readout.textContent = 'Kotwica ustawiona — czekam na pozycję robota…';
+    } else {
+      readout.textContent = 'Brak kotwicy — pozycja lokalna (metry sceny).';
+    }
+  };
+
+  // Seed from the server's current anchor + live position.
+  ApiBinary.action('robotGeoAnchorGetRequest', { robotId: id }).then(applyResp).catch(() => {
+    readout.textContent = 'Nie udało się odczytać kotwicy.';
+  });
+
+  el.querySelector('[data-geo-set]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const lat = val('lat'); const lon = val('lon'); const alt = val('alt'); const heading = val('heading');
+    if (lat == null || lon == null || alt == null || heading == null) {
+      toast('Podaj lat, lon, wysokość i kierunek', 'error');
+      return;
+    }
+    btn.setAttribute('loading', '');
+    try {
+      const resp = await ApiBinary.action('robotGeoAnchorSetRequest', { robotId: id, lat, lon, alt, heading });
+      applyResp(resp);
+      toast(resp.ok ? 'Kotwica ustawiona' : `Błąd: ${resp.error || 'nieznany'}`, resp.ok ? 'success' : 'error');
+    } catch (err) {
+      toast(`Błąd: ${err.message}`, 'error');
+    } finally {
+      btn.removeAttribute('loading');
+    }
+  });
+
+  el.querySelector('[data-geo-clear]')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.setAttribute('loading', '');
+    try {
+      const resp = await ApiBinary.action('robotGeoAnchorSetRequest', {
+        robotId: id, lat: null, lon: null, alt: null, heading: null,
+      });
+      for (const k of ['lat', 'lon', 'alt', 'heading']) {
+        const inp = el.querySelector(`tf-input[data-geo="${k}"]`);
+        if (inp) inp.value = '';
+      }
+      applyResp(resp);
+      toast('Kotwica wyczyszczona', 'success');
+    } catch (err) {
+      toast(`Błąd: ${err.message}`, 'error');
+    } finally {
+      btn.removeAttribute('loading');
+    }
+  });
 }
 
 // Refreshes the open panel in place from the latest poll — never rebuilds the
@@ -1425,11 +1520,15 @@ async function ensureVoxel(container) {
     voxelResizeObs = new ResizeObserver(() => resizeVoxel());
     voxelResizeObs.observe(container);
     resizeVoxel();
-    // Push the last decoded frame immediately so the view isn't blank until the
-    // next push lands.
+    // Seed immediately so the view isn't blank until the next push. Prefer the
+    // authoritative server map (full replace); fall back to the last live frame.
     const live = lidarLive.get(selectedRobotId);
-    if (live && live.lastPoints && voxelView) {
-      try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
+    if (live && voxelView) {
+      if (live.lastScenePoints && voxelView.setMapPoints) {
+        try { voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount); } catch { /* ignore */ }
+      } else if (live.lastPoints) {
+        try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
+      }
     }
     applyRobotPose(selectedRobotId);
   } catch (err) {
@@ -2001,6 +2100,7 @@ function startRobotLidar(id) {
   if (lidarLive.has(id)) return;
   const live = {
     unsub: null,
+    sceneUnsub: null,
     closed: false,
     resubTimer: null,
     resubUsed: false,
@@ -2009,6 +2109,8 @@ function startRobotLidar(id) {
     lastFrameAtMs: 0,
     lastRaw: null,
     lastPoints: null,
+    lastScenePoints: null,
+    lastSceneCount: 0,
     timing: [],
   };
   lidarLive.set(id, live);
@@ -2016,6 +2118,10 @@ function startRobotLidar(id) {
     lidarTimer = window.setInterval(sweepLidarStaleness, LIDAR_STALE_SWEEP_MS);
   }
   openLidarSubscription(id, live);
+  // The server-side SHARED MAP is the source of truth: subscribe to `scene:<id>`
+  // and render its full snapshots via setMapPoints. The live `lidar:` frames above
+  // still union on top between snapshots for low-latency feel.
+  openSceneSubscription(id, live);
 }
 
 // Subscribes to `lidar:<id>` and wires the per-frame / end / error handlers.
@@ -2047,6 +2153,69 @@ function openLidarSubscription(id, live) {
     .catch((err) => {
       console.warn('[robots] lidar subscribe failed:', err?.message ?? err);
     });
+}
+
+// Subscribes to `scene:<id>` (the server-side accumulated shared map) and renders
+// each full snapshot via the renderer's authoritative replace. Mirrors
+// openLidarSubscription's deferred-unsub guard.
+function openSceneSubscription(id, live) {
+  const pending = { disposed: false };
+  live.sceneUnsub = () => {
+    pending.disposed = true;
+  };
+  ApiBinary.subscribe(
+    'streamSubscribeRequest',
+    { streamId: `scene:${id}` },
+    {
+      onChunk: (body) => onSceneChunk(id, live, body),
+      onEnd: () => { live.sceneUnsub = null; },
+      onError: (err) => {
+        console.warn('[robots] scene subscribe error:', err?.message ?? err);
+      },
+    },
+  )
+    .then((unsub) => {
+      if (pending.disposed || !lidarLive.has(id) || lidarLive.get(id) !== live) {
+        try { unsub(); } catch { /* ignore */ }
+        return;
+      }
+      live.sceneUnsub = () => {
+        try { unsub(); } catch (e) { console.warn('[robots] scene unsub threw:', e); }
+      };
+    })
+    .catch((err) => {
+      console.warn('[robots] scene subscribe failed:', err?.message ?? err);
+    });
+}
+
+// A server scene-map snapshot: decode the canonical bytes and REPLACE the rendered
+// map with the authoritative deduplicated set (server is the source of truth).
+function onSceneChunk(id, live, body) {
+  if (!body || typeof body !== 'object') return;
+  if (body.variant !== 'StreamFrame') return;
+  const data = body.data;
+  if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
+  if (lidarLive.get(id) !== live) return;
+  let f;
+  try {
+    f = decodeLidarFrame(data);
+  } catch (e) {
+    console.warn('[robots] scene decode failed:', e?.message ?? e);
+    return;
+  }
+  if (!f || !(f.hasFrame ?? f.has_frame)) return;
+  // Stash the authoritative map so a view that mounts AFTER this snapshot (renderer
+  // init is async, and the server skips re-sending an unchanged map) can replay it.
+  live.lastScenePoints = f.points ?? null;
+  live.lastSceneCount = Number(f.pointCount ?? f.point_count ?? 0);
+  if (voxelView && id === selectedRobotId && live.lastScenePoints && voxelView.setMapPoints) {
+    try {
+      voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount);
+      applyRobotPose(id);
+    } catch (e) {
+      console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
+    }
+  }
 }
 
 // A pushed frame: decode the RAW canonical bytes, update live counters + timing,
@@ -2212,6 +2381,10 @@ function closeLidarSubscription(id, live) {
   if (live.unsub) {
     try { live.unsub(); } catch { /* ignore */ }
     live.unsub = null;
+  }
+  if (live.sceneUnsub) {
+    try { live.sceneUnsub(); } catch { /* ignore */ }
+    live.sceneUnsub = null;
   }
 }
 

@@ -51,7 +51,7 @@ use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
 /// we always build an owned buffer here — mutating the shared frame in place would
 /// corrupt the hub's retained copy for other subscribers / late joiners. Frames
 /// shorter than the header (should never happen) are passed through unchanged.
-fn prepare_wire_frame(frame: &Bytes) -> Bytes {
+pub(crate) fn prepare_wire_frame(frame: &Bytes) -> Bytes {
     if frame.len() < LIDAR_HEADER_LEN {
         return frame.clone();
     }

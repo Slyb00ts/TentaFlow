@@ -27,6 +27,7 @@ pub mod oauth;
 pub mod recording;
 pub mod robot;
 pub mod secrets;
+pub mod sensors;
 pub mod service;
 pub mod services;
 pub mod sql;
@@ -561,6 +562,22 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "lidar_publish_v1", lidar::lidar_publish_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja lidar_publish_v1: {e}"))?;
+    }
+
+    // --- Positioning sensors (device addon → per-device fusion engine) ---
+    {
+        linker
+            .func_wrap("tentaflow", "imu_publish_v1", sensors::imu_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja imu_publish_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "gnss_publish_v1", sensors::gnss_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja gnss_publish_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "baro_publish_v1", sensors::baro_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja baro_publish_v1: {e}"))?;
+        linker
+            .func_wrap("tentaflow", "mobile_sensor_drain_v1", sensors::mobile_sensor_drain_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja mobile_sensor_drain_v1: {e}"))?;
     }
 
     Ok(())

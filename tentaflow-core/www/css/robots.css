@@ -687,3 +687,30 @@
   font-family: var(--font-mono, ui-monospace, monospace);
   word-break: break-word;
 }
+
+/* Geo-anchor panel (Informacje) — pin the scene to real-world coordinates. */
+.robots-geo-hint {
+  margin: 0 0 12px;
+  color: var(--tf-text-muted, #8a93a6);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.robots-geo-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.robots-geo-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.robots-geo-readout {
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  color: var(--tf-text, #e6e9f0);
+  padding: 8px 12px;
+  background: var(--tf-surface-2, rgba(255, 255, 255, 0.04));
+  border-radius: 8px;
+}

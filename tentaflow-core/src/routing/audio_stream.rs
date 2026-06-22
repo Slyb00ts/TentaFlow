@@ -168,6 +168,7 @@ mod tests {
             usage: None,
             finish_reason: None,
             error: None,
+            perf: None,
         })]);
         let frames = collect_frames(envelope_stream_to_audio_chunks(exec)).await;
         assert_eq!(frames.len(), 2);

@@ -33,6 +33,9 @@ const CAMERA_PREFIX: &str = "camera:";
 const PERM_CAMERA_READ: &str = "camera.read";
 /// Stream-id prefix for a robot's pushed LiDAR point cloud (`lidar:<robot_id>`).
 const LIDAR_PREFIX: &str = "lidar:";
+/// Stream-id prefix for a robot's server-side accumulated SHARED MAP
+/// (`scene:<robot_id>`). Gated by the same `robot.telemetry` grant as `lidar:`.
+const SCENE_PREFIX: &str = "scene:";
 /// Permission required for `lidar:` stream ids. Reuses the SAME read grant the
 /// `RobotAction::LidarFrame` capability requires, so the pushed point cloud is
 /// gated exactly like the small lidar status — there is no separate `lidar.read`.
@@ -228,7 +231,7 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         // So for `lidar:` we coalesce to the newest buffered frame and drop on
         // backpressure. Camera fMP4 stays strictly lossless (MSE byte-stream
         // continuity breaks if a media segment is skipped).
-        let lossy = stream_id.starts_with(LIDAR_PREFIX);
+        let lossy = stream_id.starts_with(LIDAR_PREFIX) || stream_id.starts_with(SCENE_PREFIX);
         let final_reason = loop {
             match receiver.recv().await {
                 Ok(mut chunk) => {
@@ -465,6 +468,20 @@ fn register_local_lidar_source(robot_id: &str) -> String {
     hub_key
 }
 
+/// Idempotently register a `SceneMapStreamSource` factory under the bare hub key
+/// `scene:<robot_id>` for a LOCAL robot — the server-side shared-map source. Mirrors
+/// `register_local_lidar_source`; the factory builds a fresh source on cold subscribe.
+fn register_local_scene_source(robot_id: &str) -> String {
+    let hub_key = format!("{}{}", SCENE_PREFIX, robot_id);
+    let robot_id = robot_id.to_string();
+    let factory = Box::new(move || {
+        let source = crate::services::scene_push::SceneMapStreamSource::new(robot_id.clone());
+        Ok(source as Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
+    });
+    let _ = StreamHub::global().register_factory(hub_key.clone(), factory);
+    hub_key
+}
+
 /// Build the INTERNAL StreamHub key for a remote LiDAR relay. Scoped by owner node
 /// + org so a remote relay can never collide with a local `lidar:<robot_id>`
 /// source or with another owner's relay for the same robot id. Mirrors the camera
@@ -626,6 +643,42 @@ fn enforce_lidar_subscribe(
     Ok(register_local_lidar_source(robot_id))
 }
 
+/// Authorize a `scene:<robot_id>` subscribe (the server shared-map stream) and
+/// resolve the StreamHub key. Same org + `robot.telemetry` gate and org-scoped,
+/// NotFound-masked resolution as `enforce_lidar_subscribe`. The accumulated map
+/// lives on the OWNING node (it folds that node's robot frames), so a non-local
+/// robot is masked as NotFound for now — cross-node shared-map relay/fusion is a
+/// later phase; the live `lidar:` relay already serves the remote live view.
+fn enforce_scene_subscribe(ctx: &HandlerContext, robot_id: &str) -> Result<String, ProtocolError> {
+    if robot_id.is_empty() {
+        return Err(ProtocolError::bad_request("stream_id missing robot id"));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    if !org.has(PERM_ROBOT_TELEMETRY) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry permission required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+    let robot = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .find(|r| r.org_id == org.org_id && r.robot_id == robot_id)
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("stream_not_registered: {}{}", SCENE_PREFIX, robot_id))
+        })?;
+    if robot.node_id != local_node_id {
+        return Err(ProtocolError::not_found(format!(
+            "stream_not_registered: {}{}",
+            SCENE_PREFIX, robot_id
+        )));
+    }
+    Ok(register_local_scene_source(robot_id))
+}
+
 /// Authorize a subscribe and resolve the INTERNAL StreamHub key to subscribe
 /// under. For local cameras (and the no-camera build) this is the bare public
 /// `stream_id`; for a remote relay it is the org/owner-scoped key returned by
@@ -636,6 +689,9 @@ fn enforce_subscribe_permission(
 ) -> Result<String, ProtocolError> {
     if let Some(rest) = stream_id.strip_prefix(LIDAR_PREFIX) {
         return enforce_lidar_subscribe(ctx, rest);
+    }
+    if let Some(rest) = stream_id.strip_prefix(SCENE_PREFIX) {
+        return enforce_scene_subscribe(ctx, rest);
     }
     if let Some(rest) = stream_id.strip_prefix(CAMERA_PREFIX) {
         if rest.is_empty() {
