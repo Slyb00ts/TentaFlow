@@ -3,14 +3,21 @@
 // Live 3D view of a robot's LiDAR cloud (~30-47k points/frame) drawn as instanced
 // voxel cubes (Z-up) colored by horizontal radial distance from the robot (magenta
 // near -> green at the edges), each cube outlined with a dark Minecraft-style edge,
-// on top of a wireframe ground grid, with a small robot marker at the cloud center,
-// faint LiDAR rays and mouse orbit/zoom.
+// on top of a wireframe ground grid, with a small robot marker placed at the robot's
+// world pose, faint LiDAR rays and mouse orbit/zoom.
+//
+// The Go2 voxel_map arrives ALREADY in a fixed odom world frame (the grid origin is
+// constant across frames; the robot moves through it). We therefore accumulate the
+// map as the UNION of occupied voxel cells across frames — quantized to the voxel
+// resolution — so a partial single-frame cloud grows into a full map as the robot
+// moves. The robot's world pose comes from a separate topic via `setRobotPose`.
 // =============================================================================
 
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu::util::DeviceExt;
@@ -36,6 +43,11 @@ const HEATMAP_RANGE_METERS: f32 = 8.0;
 // `voxelSize` keeps its meaning (the true cell pitch); this fill factor is applied
 // internally to the rendered cube edge only.
 const VOXEL_FILL_FACTOR: f32 = 1.3;
+
+// Maximum number of accumulated occupied voxel cells. 400k instanced cubes draws
+// comfortably; past this we evict the oldest-inserted cells (FIFO) so the map stays
+// bounded as the robot explores. Also the hard cap on the instance buffer capacity.
+const MAX_ACCUMULATED_CELLS: usize = 400_000;
 
 // Ground grid: cell size and how far the grid is padded beyond the cloud's X-Y
 // extent, both in meters.
@@ -345,6 +357,33 @@ struct State {
     heatmap_origin: Vec3,
     heatmap_range: f32,
     framed: bool,
+
+    // Accumulated occupancy: the union of occupied voxel cells seen so far, keyed by
+    // integer cell coordinate (round(world / voxel_size)). The map value is the cell
+    // center in world meters, ready to upload as an instance. `cell_order` keeps the
+    // FIFO insertion order so we can evict the oldest cells once the cap is hit.
+    cells: HashMap<(i32, i32, i32), Vec3>,
+    cell_order: VecDeque<(i32, i32, i32)>,
+    // Set when the accumulated set changed since the last instance-buffer upload, so
+    // the buffer is only re-uploaded on real growth (not every frame).
+    cells_dirty: bool,
+    // World-space bounds of the accumulated cells, kept incrementally for the grid
+    // footprint and occasional re-framing.
+    accum_min: Vec3,
+    accum_max: Vec3,
+    // Latched once after the cap is first reached so the eviction log fires only once.
+    capped_logged: bool,
+
+    // Robot world pose from the separate pose topic. `robot_pose_set` gates the
+    // marker, the radial colormap origin and the ray origin: before the first pose
+    // arrives the marker stays hidden and the colormap falls back to cloud bounds.
+    robot_position: Vec3,
+    robot_orientation: Quat,
+    robot_pose_set: bool,
+    // Last frame's raw XYZ triples, kept so a pose-only update (no new cloud) can
+    // re-aim the LiDAR rays from the robot's new position.
+    last_points: Vec<f32>,
+    last_point_count: usize,
 }
 
 // Geometry of the robot marker, in the marker's local frame (Z-up): a low box
@@ -552,24 +591,27 @@ impl State {
     }
 
     // Build the robot marker geometry (triangle list) in its local frame and
-    // upload it. The marker is placed in world space via `robot_model`.
+    // upload it. The marker is placed in world space via `robot_model`. The body is
+    // centered on the local origin in ALL axes (Z spans -hz..+hz), because the pose
+    // topic's `z` is the robot BODY CENTER (~0.31 m above the floor) — anchoring the
+    // box on local z=0 would lift the whole marker by half its height.
     fn build_robot_geometry() -> Vec<SolidVertex> {
         let hx = ROBOT_BODY_X * 0.5;
         let hy = ROBOT_BODY_Y * 0.5;
         let hz = ROBOT_BODY_Z * 0.5;
 
-        // Box corners (local frame, sitting on z = 0 .. ROBOT_BODY_Z).
+        // Box corners (local frame, centered on z = -hz .. +hz).
         let p = |x: f32, y: f32, z: f32| [x, y, z];
         let c = ROBOT_COLOR;
         let corners = [
-            p(-hx, -hy, 0.0),
-            p(hx, -hy, 0.0),
-            p(hx, hy, 0.0),
-            p(-hx, hy, 0.0),
-            p(-hx, -hy, ROBOT_BODY_Z),
-            p(hx, -hy, ROBOT_BODY_Z),
-            p(hx, hy, ROBOT_BODY_Z),
-            p(-hx, hy, ROBOT_BODY_Z),
+            p(-hx, -hy, -hz),
+            p(hx, -hy, -hz),
+            p(hx, hy, -hz),
+            p(-hx, hy, -hz),
+            p(-hx, -hy, hz),
+            p(hx, -hy, hz),
+            p(hx, hy, hz),
+            p(-hx, hy, hz),
         ];
         // CCW faces (matches the cube pipeline's Ccw + back-cull).
         let faces: [[usize; 6]; 6] = [
@@ -590,12 +632,12 @@ impl State {
             }
         }
 
-        // Triangular nose pointing +X (heading indicator). We have no robot yaw
-        // here, so the nose always points +X; once yaw is available, fold it into
-        // `robot_model`.
-        let tip = [hx + ROBOT_NOSE_LEN, 0.0, hz];
-        let left = [hx, -hy, hz];
-        let right = [hx, hy, hz];
+        // Triangular nose pointing +X (heading indicator). The robot's yaw is folded
+        // into `robot_model` (translate * quaternion) from the pose topic, so the
+        // local nose always points +X here.
+        let tip = [hx + ROBOT_NOSE_LEN, 0.0, 0.0];
+        let left = [hx, -hy, 0.0];
+        let right = [hx, hy, 0.0];
         let nc = ROBOT_NOSE_COLOR;
         // Two-sided so the nose is visible regardless of cull winding.
         for tri in [[tip, left, right], [tip, right, left]] {
@@ -634,6 +676,128 @@ impl State {
         self.queue
             .write_buffer(&self.ray_buffer, 0, bytemuck::cast_slice(&verts));
         self.ray_vertex_count = verts.len() as u32;
+    }
+
+    // Quantize a world point to its voxel cell coordinate (round to the nearest
+    // multiple of the voxel pitch). Two points in the same cell collapse to one key,
+    // so re-observing the same surface across frames does not grow the set.
+    fn cell_key(&self, p: Vec3) -> (i32, i32, i32) {
+        let inv = 1.0 / self.voxel_size;
+        (
+            (p.x * inv).round() as i32,
+            (p.y * inv).round() as i32,
+            (p.z * inv).round() as i32,
+        )
+    }
+
+    // Cell center in world meters from its integer key.
+    fn cell_center(&self, key: (i32, i32, i32)) -> Vec3 {
+        Vec3::new(
+            key.0 as f32 * self.voxel_size,
+            key.1 as f32 * self.voxel_size,
+            key.2 as f32 * self.voxel_size,
+        )
+    }
+
+    // Insert one frame's cells into the accumulated union. New cells extend the FIFO
+    // order and the world bounds; once the cap is exceeded the oldest cells are
+    // evicted. Returns true if the set changed (so the instance buffer needs a
+    // re-upload).
+    fn accumulate_cells(&mut self, points: &[f32], n: usize) -> bool {
+        let mut changed = false;
+        for i in 0..n {
+            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+            let key = self.cell_key(p);
+            let center = self.cell_center(key);
+            if self.cells.insert(key, center).is_none() {
+                self.cell_order.push_back(key);
+                self.accum_min = self.accum_min.min(center);
+                self.accum_max = self.accum_max.max(center);
+                changed = true;
+            }
+        }
+
+        // FIFO eviction once over the cap. Removing oldest cells does not shrink the
+        // cached bounds (recomputing them every eviction is not worth it); the grid
+        // footprint may stay slightly larger than the live set, which is harmless.
+        while self.cells.len() > MAX_ACCUMULATED_CELLS {
+            if let Some(old) = self.cell_order.pop_front() {
+                // Skip stale order entries whose cell was already replaced/removed.
+                if self.cells.remove(&old).is_some() {
+                    changed = true;
+                }
+            } else {
+                break;
+            }
+            if !self.capped_logged {
+                log::warn!(
+                    "voxel accumulation reached cap of {} cells; evicting oldest (FIFO)",
+                    MAX_ACCUMULATED_CELLS
+                );
+                self.capped_logged = true;
+            }
+        }
+
+        changed
+    }
+
+    // Re-upload the instance buffer from the full accumulated set. Grows the buffer
+    // if the cell count outpaced the current capacity. Only called when the set
+    // actually changed (the dirty flag), so a static scene never re-uploads.
+    fn rebuild_instance_buffer(&mut self) {
+        let count = self.cells.len();
+        if count == 0 {
+            self.instance_count = 0;
+            return;
+        }
+        let mut instances: Vec<Instance> = Vec::with_capacity(count);
+        for center in self.cells.values() {
+            instances.push(Instance {
+                translation: center.to_array(),
+            });
+        }
+
+        if count as u32 > self.instance_capacity {
+            let new_cap = (count as u32).next_power_of_two();
+            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("voxel-instances"),
+                size: (new_cap as u64) * std::mem::size_of::<Instance>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = new_cap;
+        }
+
+        self.queue
+            .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        self.instance_count = count as u32;
+    }
+
+    // Recompute the radial colormap origin + adaptive range from the current robot
+    // pose (or the accumulated-cloud center when no pose is set yet) and over the
+    // accumulated cells. Called both when a new frame arrives and when the pose
+    // advances on its own, so colors keep radiating from the live robot position.
+    fn refresh_color_field(&mut self) {
+        if self.cells.is_empty() || !self.accum_min.is_finite() || !self.accum_max.is_finite() {
+            return;
+        }
+        let center = (self.accum_min + self.accum_max) * 0.5;
+        let color_origin = if self.robot_pose_set {
+            self.robot_position
+        } else {
+            center
+        };
+        self.heatmap_origin = color_origin;
+        let mut max_radius = 0.0f32;
+        for c in self.cells.values() {
+            let dx = c.x - color_origin.x;
+            let dy = c.y - color_origin.y;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r > max_radius {
+                max_radius = r;
+            }
+        }
+        self.heatmap_range = max_radius.max(0.3);
     }
 
     fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
@@ -1062,6 +1226,17 @@ pub async fn init_voxel_view(
         heatmap_origin: Vec3::ZERO,
         heatmap_range: HEATMAP_RANGE_METERS,
         framed: false,
+        cells: HashMap::new(),
+        cell_order: VecDeque::new(),
+        cells_dirty: false,
+        accum_min: Vec3::splat(f32::INFINITY),
+        accum_max: Vec3::splat(f32::NEG_INFINITY),
+        capped_logged: false,
+        robot_position: Vec3::ZERO,
+        robot_orientation: Quat::IDENTITY,
+        robot_pose_set: false,
+        last_points: Vec::new(),
+        last_point_count: 0,
     }));
 
     let raf_handle: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
@@ -1102,11 +1277,20 @@ pub async fn init_voxel_view(
 
 #[wasm_bindgen]
 impl VoxelView {
-    /// Upload a new point cloud. `points` is interleaved world-space XYZ
-    /// (length = `count` * 3), exactly the `Float32Array` that the dashboard's
-    /// `decodeLidarFrame(...).points` returns. On the first non-empty cloud the
-    /// camera auto-frames the cloud bounds; the ground grid, robot marker and
-    /// LiDAR rays follow the cloud bounds on every update.
+    /// Accumulate a new LiDAR frame into the persistent occupancy map. `points` is
+    /// interleaved ODOM-FRAME world XYZ in meters (length = `count` * 3), exactly the
+    /// `Float32Array` the dashboard's `decodeLidarFrame(...).points` returns.
+    ///
+    /// The Go2 voxel_map is already in a fixed odom frame, so accumulation is the
+    /// UNION of occupied voxel cells across frames (no per-frame transform): each
+    /// point is quantized to its voxel cell and inserted into the persistent set, then
+    /// ALL accumulated cells are rendered. The single-frame partial cloud thus grows
+    /// into a full map as the robot moves through the fixed grid. The set is capped at
+    /// `MAX_ACCUMULATED_CELLS` with FIFO eviction; call `clearAccumulation` to reset.
+    ///
+    /// On the first non-empty frame the camera auto-frames the accumulated bounds; it
+    /// does NOT re-frame on every subsequent growth. The radial colormap, robot marker
+    /// and LiDAR rays are driven by the robot world pose set via `setRobotPose`.
     #[wasm_bindgen(js_name = setPoints)]
     pub fn set_points(&self, points: &[f32], count: u32) {
         let state = match self.state.as_ref() {
@@ -1117,72 +1301,125 @@ impl VoxelView {
 
         let usable = (count as usize).min(points.len() / 3);
         if usable == 0 {
-            st.instance_count = 0;
-            st.ray_vertex_count = 0;
-            st.robot_visible = false;
+            // An empty frame does not erase the accumulated map; nothing to do.
             return;
         }
 
-        let n = usable.min(st.instance_capacity as usize);
+        // Cache this frame's points so a later pose-only update can re-aim the rays.
+        st.last_points.clear();
+        st.last_points.extend_from_slice(&points[..usable * 3]);
+        st.last_point_count = usable;
 
-        // Compute bounds for auto-framing, the height colormap and the grid.
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for i in 0..n {
-            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
-            min = min.min(p);
-            max = max.max(p);
+        // Merge this frame's cells into the accumulated union.
+        if st.accumulate_cells(points, usable) {
+            st.cells_dirty = true;
         }
 
-        // The instance buffer is laid out identically to the incoming XYZ
-        // triples, so the leading `n*3` floats can be uploaded directly.
-        let bytes = bytemuck::cast_slice(&points[..n * 3]);
-        st.queue.write_buffer(&st.instance_buffer, 0, bytes);
-        st.instance_count = n as u32;
-
-        if min.is_finite() && max.is_finite() {
-            let center = (min + max) * 0.5;
-            let extent = (max - min).length().max(0.5);
-            // Radial-distance colormap: color is keyed to the horizontal distance
-            // from the cloud center. heatmap_origin carries the full center, but
-            // the shader measures distance in X-Y only (Z ignored), so the floor
-            // reads as one radial field. The range is the cloud's max horizontal
-            // radius so green reaches the outer edge.
-            st.heatmap_origin = center;
-            let mut max_radius = 0.0f32;
-            for i in 0..n {
-                let dx = points[i * 3] - center.x;
-                let dy = points[i * 3 + 1] - center.y;
-                let r = (dx * dx + dy * dy).sqrt();
-                if r > max_radius {
-                    max_radius = r;
-                }
-            }
-            st.heatmap_range = max_radius.max(0.3);
-
-            // Ground grid follows the floor footprint (rebuilt only on material
-            // change). Robot marker sits at the horizontal center on the floor.
-            st.update_grid(min, max);
-
-            // The robot sits at the horizontal center of the cloud near the floor
-            // (min Z). No yaw is available, so the marker's +X nose is a fixed
-            // heading; fold yaw into this transform once it is provided.
-            let robot_origin = Vec3::new(center.x, center.y, min.z);
-            st.robot_model = Mat4::from_translation(robot_origin);
-            st.robot_visible = true;
-
-            // Faint rays from the robot origin to a subset of points. The robot
-            // body is ~0.12 m tall; cast from mid-body so rays read as emitted by
-            // the marker rather than the floor.
-            let ray_origin = robot_origin + Vec3::new(0.0, 0.0, ROBOT_BODY_Z * 0.5);
-            st.update_rays(points, n, ray_origin);
-
-            if !st.framed {
-                st.camera.target = center;
-                st.camera.distance = extent * 1.2;
-                st.framed = true;
-            }
+        if st.cells_dirty {
+            st.rebuild_instance_buffer();
+            st.cells_dirty = false;
         }
+
+        if !st.accum_min.is_finite() || !st.accum_max.is_finite() {
+            return;
+        }
+        let min = st.accum_min;
+        let max = st.accum_max;
+        let center = (min + max) * 0.5;
+        let extent = (max - min).length().max(0.5);
+
+        // Radial-distance colormap origin (robot pose, or cloud center fallback) and
+        // adaptive range over the accumulated cells.
+        st.refresh_color_field();
+
+        // Ground grid follows the accumulated floor footprint (rebuilt only on
+        // material change).
+        st.update_grid(min, max);
+
+        // Faint rays cast from the robot's actual position to a subset of THIS frame's
+        // points. `robot_position.z` is already the body center, so no extra offset.
+        // Only shown once a pose is known.
+        if st.robot_pose_set {
+            let ray_origin = st.robot_position;
+            st.update_rays(points, usable, ray_origin);
+        } else {
+            st.ray_vertex_count = 0;
+        }
+
+        // Auto-frame once on the first accumulated cloud; do not re-frame as the map
+        // grows so the user's orbit/zoom is preserved.
+        if !st.framed {
+            st.camera.target = center;
+            st.camera.distance = extent * 1.2;
+            st.framed = true;
+        }
+    }
+
+    /// Set the robot's world pose (odom frame, meters + unit quaternion) from the
+    /// separate pose topic. Drives the robot marker placement (translate * quaternion),
+    /// the radial colormap origin (color radiates from the robot) and the LiDAR ray
+    /// origin. Until this is called the marker stays hidden so it is never drawn at a
+    /// wrong spot. `pose.z` already reflects the body center (~0.31 m above the floor).
+    #[wasm_bindgen(js_name = setRobotPose)]
+    pub fn set_robot_pose(&self, x: f32, y: f32, z: f32, qx: f32, qy: f32, qz: f32, qw: f32) {
+        let state = match self.state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut st = state.borrow_mut();
+        st.robot_position = Vec3::new(x, y, z);
+        // Normalize defensively; a zero/denormalized quaternion would otherwise wipe
+        // the marker. Fall back to identity if the input is degenerate.
+        let q = Quat::from_xyzw(qx, qy, qz, qw);
+        st.robot_orientation = if q.length_squared() > 1e-6 {
+            q.normalize()
+        } else {
+            Quat::IDENTITY
+        };
+        st.robot_model =
+            Mat4::from_rotation_translation(st.robot_orientation, st.robot_position);
+        st.robot_visible = true;
+        st.robot_pose_set = true;
+
+        // Pose-driven visuals must follow the robot even when the pose advances
+        // between cloud frames: recompute the colormap origin and re-aim the rays from
+        // the new position using the last cached frame.
+        st.refresh_color_field();
+        if st.last_point_count > 0 {
+            let pts = std::mem::take(&mut st.last_points);
+            let n = st.last_point_count;
+            let origin = st.robot_position;
+            st.update_rays(&pts, n, origin);
+            st.last_points = pts;
+        }
+    }
+
+    /// Reset the accumulated occupancy map: clears the cell set, the FIFO order and the
+    /// rendered instance buffer, and lets the next frame re-frame the camera. The robot
+    /// pose and camera orientation are left untouched.
+    #[wasm_bindgen(js_name = clearAccumulation)]
+    pub fn clear_accumulation(&self) {
+        let state = match self.state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut st = state.borrow_mut();
+        st.cells.clear();
+        st.cell_order.clear();
+        st.cells_dirty = false;
+        st.instance_count = 0;
+        st.ray_vertex_count = 0;
+        st.last_points.clear();
+        st.last_point_count = 0;
+        st.accum_min = Vec3::splat(f32::INFINITY);
+        st.accum_max = Vec3::splat(f32::NEG_INFINITY);
+        st.capped_logged = false;
+        // Drop the stale ground grid so the previous map's footprint stops rendering;
+        // the next non-empty frame rebuilds it for the fresh map.
+        st.grid_vertex_count = 0;
+        st.grid_bounds = None;
+        // Allow the next accumulated cloud to re-frame the camera to the fresh map.
+        st.framed = false;
     }
 
     /// Reconfigure the surface and depth buffer for a new backing size in

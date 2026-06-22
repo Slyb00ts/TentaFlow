@@ -39,7 +39,8 @@ export class VoxelView {
      * Upload a new point cloud. `points` is interleaved world-space XYZ
      * (length = `count` * 3), exactly the `Float32Array` that the dashboard's
      * `decodeLidarFrame(...).points` returns. On the first non-empty cloud the
-     * camera auto-frames the cloud bounds.
+     * camera auto-frames the cloud bounds; the ground grid, robot marker and
+     * LiDAR rays follow the cloud bounds on every update.
      * @param {Float32Array} points
      * @param {number} count
      */
@@ -53,9 +54,9 @@ if (Symbol.dispose) VoxelView.prototype[Symbol.dispose] = VoxelView.prototype.fr
 
 /**
  * Initialize the voxel renderer on `canvas`. Requests a wgpu adapter/device,
- * configures the surface, builds the instanced pipeline, installs orbit/zoom
- * pointer handlers and starts the render loop. `voxelSize` is the cube edge
- * length in meters (the LiDAR resolution, ~0.05).
+ * configures the surface, builds the instanced + grid + robot pipelines, installs
+ * orbit/zoom pointer handlers and starts the render loop. `voxelSize` is the cube
+ * edge length in meters (the LiDAR resolution, ~0.05).
  * @param {HTMLCanvasElement} canvas
  * @param {number} voxel_size
  * @returns {Promise<VoxelView>}
