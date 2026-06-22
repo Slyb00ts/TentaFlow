@@ -86,6 +86,22 @@ class DepthCapture(
     private fun processFrame(frame: Frame) {
         val camera = frame.camera
         if (camera.trackingState != com.google.ar.core.TrackingState.TRACKING) return
+        // AR device pose (ARCore world frame, Y-up) → engine Z-up: pos [x,-z,y],
+        // orientation rotated +90° about X. Drives marker + map frame + AR↔ENU align.
+        val cp = camera.pose
+        // q_zup = q_conv * q_ar, q_conv = (sin45,0,0,cos45) about +X.
+        val s = 0.70710677f
+        val qx = cp.qx(); val qy = cp.qy(); val qz = cp.qz(); val qw = cp.qw()
+        sensorBridge.pushDevicePose(
+            SystemClock.elapsedRealtimeNanos() / 1000,
+            floatArrayOf(cp.tx(), -cp.tz(), cp.ty()),
+            floatArrayOf(
+                s * (qx + qw),   // x
+                s * (qy - qz),   // y
+                s * (qy + qz),   // z
+                s * (qw - qx),   // w
+            ),
+        )
         val depth: Image = try {
             frame.acquireDepthImage16Bits()
         } catch (e: NotYetAvailableException) {
@@ -131,7 +147,8 @@ class DepthCapture(
                             val xw = pose[0] * xc + pose[4] * yc + pose[8] * zc + pose[12]
                             val yw = pose[1] * xc + pose[5] * yc + pose[9] * zc + pose[13]
                             val zw = pose[2] * xc + pose[6] * yc + pose[10] * zc + pose[14]
-                            out.add(xw); out.add(yw); out.add(zw)
+                            // Y-up (ARCore) → engine Z-up: [x, -z, y].
+                            out.add(xw); out.add(-zw); out.add(yw)
                         }
                     }
                     u += stride

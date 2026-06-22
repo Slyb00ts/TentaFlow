@@ -37,6 +37,7 @@ class SensorBridge(private val context: Context) : SensorEventListener {
         const val KIND_GNSS = 2
         const val KIND_BARO = 3
         const val KIND_DEPTH = 4
+        const val KIND_POSE = 5
 
         // Domyślne modele szumu MEMS (1σ). Addon/silnik mogą je później dostroić.
         const val ACCEL_NOISE = 0.02f   // m/s²
@@ -174,6 +175,17 @@ class SensorBridge(private val context: Context) : SensorEventListener {
      * punktów świata (transform przez pozę kamery — robione w DepthCapture, tu tylko
      * pakowanie). `worldXyz` = spłaszczone [x,y,z,x,y,z,...] w metrach.
      */
+    /** Publikuje pozę urządzenia (AR world frame): pozycja [x,y,z] + kwaternion
+     *  [x,y,z,w] → znacznik + układ mapy + wyrównanie AR↔ENU. PoseSample (40 B). */
+    fun pushDevicePose(tsUs: Long, pos: FloatArray, quat: FloatArray) {
+        val b = buf(40)
+        b.put(1).put(0).put(0).put(0)
+        b.putLong(tsUs)
+        b.putFloat(pos[0]); b.putFloat(pos[1]); b.putFloat(pos[2])
+        b.putFloat(quat[0]); b.putFloat(quat[1]); b.putFloat(quat[2]); b.putFloat(quat[3])
+        NativeLib.pushSensor(KIND_POSE, b.array())
+    }
+
     fun pushDepth(tsUs: Long, frameSeq: Int, resolution: Float, worldXyz: FloatArray) {
         val n = worldXyz.size / 3
         val b = buf(44 + n * 12)
