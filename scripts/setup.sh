@@ -1291,6 +1291,10 @@ install_cuda() {
             esac
             local repo_base="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${ubuntu_ver}/${cuda_arch}"
             local keyring="/tmp/cuda-keyring_1.1-1_all.deb"
+            # curl jest potrzebny do pobrania keyringa — na czystej maszynie moze go brakowac.
+            if ! command -v curl &>/dev/null; then
+                run_privileged apt-get install -y curl ca-certificates
+            fi
             log_info "Dodaje repo NVIDIA CUDA (ubuntu${ubuntu_ver}/${cuda_arch}) i instaluje ${CUDA_TARGET_PKG}..."
             if curl -fsSL "${repo_base}/cuda-keyring_1.1-1_all.deb" -o "$keyring"; then
                 run_privileged dpkg -i "$keyring"
@@ -1304,7 +1308,12 @@ install_cuda() {
                     log_warn "Nie udalo sie zainstalowac CUDA z repo NVIDIA. Zainstaluj recznie: https://developer.nvidia.com/cuda-downloads"
                 fi
                 export PATH="/usr/local/cuda/bin:$PATH"
-                log_warn "Dodaj do PATH na stale: echo 'export PATH=/usr/local/cuda/bin:\$PATH' >> ~/.bashrc"
+                # Trwały PATH dla przyszłych powłok — inaczej build nie znajdzie nvcc
+                # po usunięciu starego /usr/bin/nvcc (build-all.sh w nowej powłoce).
+                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                    echo 'export PATH=/usr/local/cuda/bin:$PATH' | run_privileged tee /etc/profile.d/zz-cuda.sh >/dev/null
+                    log_ok "CUDA w PATH: /etc/profile.d/zz-cuda.sh (nowe powloki). W BIEZACEJ sesji: export PATH=/usr/local/cuda/bin:\$PATH"
+                fi
             else
                 log_warn "Nie pobrano cuda-keyring (ubuntu${ubuntu_ver}/${cuda_arch}). Sprawdz wersje Ubuntu/arch i zainstaluj CUDA 13 recznie: https://developer.nvidia.com/cuda-downloads"
             fi
