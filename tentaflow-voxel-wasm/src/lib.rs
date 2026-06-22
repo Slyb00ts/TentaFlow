@@ -2265,10 +2265,21 @@ fn accumulate_node_colored(
             if prim.mode() != gltf::mesh::Mode::Triangles {
                 continue;
             }
-            // The Go2 CAD meshes carry near-white, meaningless base-color factors,
-            // so always use the link-name Go2 scheme (dark body / lighter legs) for
-            // a realistic look rather than a flat white robot.
-            let color = fallback_color;
+            // The Go2 meshes carry real per-primitive materials (black body/feet,
+            // light gray-blue legs/panels, white accents) — the authentic two-tone
+            // look. Use each primitive's assigned material base-color; only fall back
+            // to the link scheme when a primitive has no material at all (gltf returns
+            // the default white material with index None).
+            let mat = prim.material();
+            let color = if mat.index().is_some() {
+                let c = mat.pbr_metallic_roughness().base_color_factor();
+                // Lift very-dark materials off pure black so the Go2's black body
+                // stays visible against the dark viewer background (still clearly
+                // darker than the light gray-blue panels).
+                [c[0].max(0.07), c[1].max(0.07), c[2].max(0.08)]
+            } else {
+                fallback_color
+            };
 
             let reader = prim.reader(|buffer| buffers.get(buffer.index()).copied());
             let positions: Vec<[f32; 3]> = match reader.read_positions() {
