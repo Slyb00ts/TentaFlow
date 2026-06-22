@@ -1252,6 +1252,8 @@ impl AddonManager {
         // analog of the state store re-resolving a fresh, orphaned shard). It is
         // bounded — at most one latest-wins frame (≤4 MiB) until the tick dies.
         crate::services::lidar_hub::LidarStreamHub::global().remove(addon_id);
+        crate::services::slam_scene::SlamSceneManager::global().remove(addon_id);
+        crate::services::localization::LocalizationEngine::global().remove(addon_id);
         if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
             warn!(
                 "addon state: purge on uninstall failed for '{}': {}",
@@ -2375,6 +2377,8 @@ impl AddonManager {
             // instance, is the correct granularity: a single pooled-worker stop
             // must NOT wipe a slot the still-live service instance keeps feeding.
             crate::services::lidar_hub::LidarStreamHub::global().remove(&addon_id);
+            crate::services::slam_scene::SlamSceneManager::global().remove(&addon_id);
+            crate::services::localization::LocalizationEngine::global().remove(&addon_id);
 
             // A2: the addon is fully stopped — flush any durable writes that
             // have not yet hit the periodic flush so a stop+exit before the next

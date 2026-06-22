@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod eskf;
 pub mod frame;
+pub mod geo;
 pub mod graph;
 pub mod lidar;
 pub mod loop_closure;
@@ -17,12 +19,17 @@ pub mod optimize;
 pub mod pose;
 pub mod service;
 pub mod submap;
+pub mod voxel_map;
 
 pub use graph::{
     Constraint, ConstraintId, ConstraintKind, ConstraintSource, ConstraintStatus, PoseGraph,
     PoseNode, Scene, SceneMergeError,
 };
+pub use eskf::{EskfConfig, EskfEngine};
 pub use frame::{decode_lidar_frame, DecodedLidar};
+pub use geo::{
+    ecef_to_geodetic, enu_to_geodetic, geodetic_to_ecef, geodetic_to_enu, GeoAnchor,
+};
 pub use loop_closure::{verify_loop_closure, LoopGate, LoopVerification};
 pub use mapping::{MapStep, MappingFrontend, SealPolicy};
 pub use optimize::{optimize, OptConfig, OptReport};
@@ -32,6 +39,7 @@ pub use lidar::{
 };
 pub use pose::{rotation_pose, translation_pose, Pose};
 pub use submap::{LocalPoint, Submap, SubmapBuilder, SubmapGeometry, SubmapId};
+pub use voxel_map::{Cell, SceneVoxelMap};
 
 #[cfg(test)]
 mod tests {

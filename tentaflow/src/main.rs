@@ -247,6 +247,10 @@ async fn run_server(args: Args) -> Result<()> {
         _ => {}
     }
 
+    // Restore persisted robot geo anchors into the SLAM scene manager so robots keep
+    // their real-world georeference across restarts.
+    tentaflow_core::dispatch::robots::load_geo_anchors(&db);
+
     // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");

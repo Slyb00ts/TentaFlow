@@ -44,6 +44,25 @@ export class VoxelView {
         wasm.voxelview_resize(this.__wbg_ptr, width, height);
     }
     /**
+     * Render the AUTHORITATIVE server scene map: a full REPLACE of the occupied set
+     * with `points` (interleaved world XYZ, length = `count` * 3 — the
+     * `decodeLidarFrame(...).points` of a `scene:<robot_id>` frame). Unlike
+     * `setPoints` (which UNIONs live frames), this drops the current set and renders
+     * exactly the server's deduplicated map, so the server stays the single source of
+     * truth and stale cells never linger. Live `lidar:` frames may still `setPoints`
+     * on top between snapshots for low-latency feel; the next `setMapPoints` reconciles
+     * back to the authoritative map. Camera framing is preserved across replaces (only
+     * the first non-empty map frames the camera) so the 1 Hz snapshot never fights the
+     * user's orbit/zoom.
+     * @param {Float32Array} points
+     * @param {number} count
+     */
+    setMapPoints(points, count) {
+        const ptr0 = passArrayF32ToWasm0(points, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.voxelview_setMapPoints(this.__wbg_ptr, ptr0, len0, count);
+    }
+    /**
      * Accumulate a new LiDAR frame into the persistent occupancy map. `points` is
      * interleaved ODOM-FRAME world XYZ in meters (length = `count` * 3), exactly the
      * `Float32Array` the dashboard's `decodeLidarFrame(...).points` returns.

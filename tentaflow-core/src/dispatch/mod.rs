@@ -722,6 +722,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::RobotsPayload::ControlResponse(_) => "RobotControlResponse",
             tentaflow_protocol::RobotsPayload::CameraShareRequest(_) => "RobotCameraShareRequest",
             tentaflow_protocol::RobotsPayload::CameraShareResponse(_) => "RobotCameraShareResponse",
+            tentaflow_protocol::RobotsPayload::GeoAnchorSetRequest(_) => "RobotGeoAnchorSetRequest",
+            tentaflow_protocol::RobotsPayload::GeoAnchorGetRequest(_) => "RobotGeoAnchorGetRequest",
+            tentaflow_protocol::RobotsPayload::GeoAnchorResponse(_) => "RobotGeoAnchorResponse",
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",

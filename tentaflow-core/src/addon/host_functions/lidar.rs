@@ -121,6 +121,11 @@ pub fn lidar_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_
     // relevant deny + malformed-frame cases above. Hand the single owned copy to
     // the latest-wins hub keyed by addon_id (== robot_id) and return.
     let addon_id = caller.data().addon_id.clone();
+    // Fold the same world-frame frame into the server-side SHARED scene map (one
+    // source of truth, persists across viewers/refresh, ready for cross-robot
+    // fusion). Sync + lock-light (per-robot mutex, dedup grid) — safe at frame rate.
+    // Done before `publish` consumes the buffer; `Bytes` clone for the hub is O(1).
+    crate::services::slam_scene::SlamSceneManager::global().on_lidar_frame(&addon_id, &frame);
     LidarStreamHub::global().publish(&addon_id, header.frame_seq, frame);
     ABI_OK
 }

@@ -464,6 +464,19 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             .camera_id
             .clone()
             .or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
+        // Feed the robot's world pose into the shared SLAM scene (option B: the
+        // device's own odometry, trusted). Drives GlobalPose + marker placement; the
+        // map itself accumulates from the lidar frames at their own (faster) cadence.
+        if let Some(t) = telemetry.telemetry.as_ref() {
+            if t.pose_position.len() == 3 && t.pose_orientation.len() == 4 {
+                crate::services::slam_scene::SlamSceneManager::global().on_pose(
+                    &c.addon_id,
+                    &t.pose_position,
+                    &t.pose_orientation,
+                    now_us(),
+                );
+            }
+        }
         // Tenant of this robot, read from the running addon instance's
         // `AddonState`. A service/boot-started instance has no user org context
         // (`instance_org_id` is None), and an unscoped install carries an empty
@@ -1083,6 +1096,14 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Wall-clock microseconds since the epoch (GlobalPose / pose-adopt timestamp).
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
 }
 
