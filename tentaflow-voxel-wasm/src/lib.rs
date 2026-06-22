@@ -42,7 +42,7 @@ const HEATMAP_RANGE_METERS: f32 = 8.0;
 // merge into solid blocks like the reference occupancy grid. The JS-passed
 // `voxelSize` keeps its meaning (the true cell pitch); this fill factor is applied
 // internally to the rendered cube edge only.
-const VOXEL_FILL_FACTOR: f32 = 1.3;
+const VOXEL_FILL_FACTOR: f32 = 1.0;
 
 // Maximum number of accumulated occupied voxel cells. 400k instanced cubes draws
 // comfortably; past this we evict the oldest-inserted cells (FIFO) so the map stays
@@ -157,6 +157,9 @@ struct VsOut {
     // Cube-local position in [-0.5, 0.5]; the fragment uses it to draw a dark
     // edge outline on every voxel without extra geometry.
     @location(1) local_pos: vec3<f32>,
+    // World position; the fragment derives a flat per-face normal from its screen
+    // derivatives for cheap directional shading (no per-vertex normals needed).
+    @location(2) world_pos: vec3<f32>,
 };
 
 // Compact HSV->RGB (h,s,v in [0,1]). Used for the radial-distance colormap so
@@ -190,6 +193,7 @@ fn vs_main(in: VsIn) -> VsOut {
     let t = length(dxy) * u.inv_heatmap_range;
     out.color = radialcolor(t);
     out.local_pos = in.position;
+    out.world_pos = world;
     return out;
 }
 
@@ -202,11 +206,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let m0 = max(a.x, max(a.y, a.z));   // largest (always ~0.5 on a face)
     let m2 = min(a.x, min(a.y, a.z));   // smallest
     let mid = (a.x + a.y + a.z) - m0 - m2; // middle component
-    // Edge band: darken a WIDE border on every voxel so each cube is clearly
-    // separated (smoothstep gives a clean anti-aliased outline). ~16% of the cube
-    // half-extent on the second axis, darkened hard toward black.
-    let edge = smoothstep(0.5 - 0.10, 0.5 - 0.04, mid);
-    let shade = mix(1.0, 0.15, edge);
+    // Edge band: a subtle darkened border so each cube is separated without the
+    // heavy hollow-box look. Narrow band, gently darkened.
+    let edge = smoothstep(0.5 - 0.06, 0.5 - 0.03, mid);
+    let edge_shade = mix(1.0, 0.55, edge);
+
+    // Flat per-face directional shading: derive the face normal from the world
+    // position's screen derivatives (each cube face is planar, so this is exact).
+    // Gives the voxels solid 3D relief instead of flat stickers.
+    let n = normalize(cross(dpdx(in.world_pos), dpdy(in.world_pos)));
+    let light_dir = normalize(vec3<f32>(0.4, 0.5, 0.85));
+    // abs() so shading is independent of the derivative-normal sign (which flips
+    // with the backend's fragment-Y convention) — each face is relit by its angle
+    // to the light, no dead black side.
+    let diffuse = abs(dot(n, light_dir));
+    let lit = 0.45 + 0.55 * diffuse; // ambient + diffuse
+    let shade = edge_shade * lit;
     return vec4<f32>(in.color * shade, 1.0);
 }
 "#;
@@ -401,7 +416,7 @@ const ROBOT_NOSE_COLOR: [f32; 3] = [1.0, 0.85, 0.45];
 // URL of the decimated Go2 body glTF binary served by the dashboard. Authored in
 // the URDF base_link frame (Z-up, X-forward), real scale in meters, body at the
 // origin — the same convention as our odom Z-up frame, so no axis fixup is needed.
-const GO2_MESH_URL: &str = "/assets/go2/base.glb";
+const GO2_MESH_URL: &str = "/assets/go2/go2_full.glb";
 
 // Flat light-gray the Go2 body is rendered with (materials/textures are ignored),
 // matching the near-white box marker it replaces.
