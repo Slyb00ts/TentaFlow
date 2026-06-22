@@ -832,6 +832,87 @@ pub(crate) fn materialize_addon_derived_state(
     // świeżego wpisu. NIE kasuje danych na dysku, tylko uchwyty (DashMap).
     #[cfg(feature = "graph")]
     crate::services::graph_manager(db).invalidate_addon(&manifest.addon_id);
+    materialize_addon_aliases(db, manifest)?;
+    Ok(())
+}
+
+/// Materializuje wystawiane przez addon `[[alias]]` do globalnej tabeli
+/// `model_aliases` (+ owner/visibility/methods). Wywolywane z KAZDEJ sciezki
+/// odbudowy stanu addona (install_core ORAZ mesh-sync reconcile), zeby addon z
+/// `[[alias]]` byl samowystarczalny: instalacja tworzy aliasy z `suggested_default`
+/// jako hint-targetem, a admin pozniej przepina je na realny model. Bez tego
+/// panel addona nie ma jak wolac modeli (alias nie istnieje / nie resolwuje).
+///
+/// IDEMPOTENTNE i nieniszczace bindowan admina: `create_or_reactivate_model_alias_within_tx`
+/// dla istniejacego aliasu tylko reaktywuje wiersz i NIE nadpisuje jego
+/// `target_model` — re-install / upgrade / mesh reconcile zachowuja model
+/// podpiety recznie przez admina. Cala petla idzie w jednej transakcji: bledny
+/// alias rolluje sie razem z wpisami owner/audit (audit nie ma FK na alias).
+pub(crate) fn materialize_addon_aliases(db: &DbPool, manifest: &AddonManifest) -> Result<()> {
+    if manifest.aliases.is_empty() {
+        return Ok(());
+    }
+    use crate::db::repository::{
+        create_or_reactivate_model_alias_within_tx, set_alias_methods_within_tx,
+        set_alias_visibility_within_tx, set_model_alias_active_audited_within_tx,
+    };
+    let mut conn = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("db write for alias materialization: {e}"))?;
+    let tx = conn.transaction()?;
+    for alias_spec in &manifest.aliases {
+        let alias_id = create_or_reactivate_model_alias_within_tx(
+            &tx,
+            &alias_spec.id,
+            &alias_spec.suggested_default,
+            "first_available",
+            "addon",
+            Some(&manifest.addon_id),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "addon '{}' alias '{}' registration failed: {e}",
+                manifest.addon_id,
+                alias_spec.id
+            )
+        })?;
+
+        set_alias_visibility_within_tx(&tx, alias_id, alias_spec.visibility.as_db_str(), None)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' alias '{}' visibility write failed: {e}",
+                    manifest.addon_id,
+                    alias_spec.id
+                )
+            })?;
+
+        set_alias_methods_within_tx(&tx, alias_id, &alias_spec.methods).map_err(|e| {
+            anyhow::anyhow!(
+                "addon '{}' alias '{}' methods write failed: {e}",
+                manifest.addon_id,
+                alias_spec.id
+            )
+        })?;
+
+        // Gated alias zostaje zaparkowany (is_active=0) az policy engine / admin
+        // go aktywuje — router nigdy nie widzi aktywnego gated aliasu.
+        if alias_spec.gate.is_some() {
+            set_model_alias_active_audited_within_tx(
+                &tx,
+                &alias_spec.id,
+                false,
+                Some(&manifest.addon_id),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' gated alias '{}' deactivate failed: {e}",
+                    manifest.addon_id,
+                    alias_spec.id
+                )
+            })?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 

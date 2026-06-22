@@ -108,7 +108,7 @@ risk = "low"
 id = "rag-embeddings"
 display_name = "RAG — embeddingi"
 methods = ["embed"]
-suggested_default = "llama-nemotron-embed-1b-v2"
+suggested_default = "llama-nemotron-embed-vl-1b-v2"
 visibility = "private"
 
 [[alias]]
@@ -122,14 +122,14 @@ visibility = "private"
 id = "rag-reranker"
 display_name = "RAG — reranker"
 methods = ["rerank"]
-suggested_default = "llama-nemotron-rerank-1b-v2"
+suggested_default = "llama-nemotron-rerank-vl-1b-v2"
 visibility = "private"
 
 [[alias]]
 id = "rag-parse"
 display_name = "RAG — parsowanie dokumentow"
 methods = ["parse"]
-suggested_default = "nemotron-parse"
+suggested_default = "nemotron-parse-v1-2"
 visibility = "private"
 
 # --- Aliasy konsumowane przez addon ---

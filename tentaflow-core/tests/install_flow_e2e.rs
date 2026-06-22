@@ -181,6 +181,100 @@ async fn owner_install_writes_alias_owner_and_visibility_rows() {
 }
 
 // =============================================================================
+// 1b. Materializacja [[alias]] tworzy wiersz w model_aliases z methods +
+//     suggested_default jako target, jest idempotentna przy reinstall i NIE
+//     nadpisuje targetu, ktory admin podpial recznie (regresja: addon z
+//     [[alias]] nie tworzyl aliasu -> panel nie mogl wolac modeli).
+// =============================================================================
+
+// Czytamy przez writera, nie `db.read()`: dla `:memory:` r2d2 read-pool otwiera
+// OSOBNE puste polaczenie in-memory (file-based memory nie wspoldzieli stanu),
+// wiec zapisy widac tylko na connectionie pisarza.
+fn alias_target(db: &DbPool, name: &str) -> Option<String> {
+    let conn = db.write().unwrap();
+    conn.query_row(
+        "SELECT target_model FROM model_aliases WHERE alias = ?1",
+        rusqlite::params![name],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+fn alias_methods(db: &DbPool, name: &str) -> Option<String> {
+    let conn = db.write().unwrap();
+    conn.query_row(
+        "SELECT methods FROM model_aliases WHERE alias = ?1",
+        rusqlite::params![name],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+fn count_via_writer(db: &DbPool, sql: &str) -> i64 {
+    let conn = db.write().unwrap();
+    conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_creates_alias_and_preserves_admin_target() {
+    let (mgr, db) = make_manager();
+
+    let mut spec = alias(
+        "rag-embeddings",
+        "llama-nemotron-embed-vl-1b-v2",
+        AliasVisibility::Private,
+        vec![],
+    );
+    spec.methods = vec!["embed".to_string()];
+    let manifest = manifest_with("rag", vec![spec.clone()], vec![], vec![]);
+
+    // Install -> alias istnieje z suggested_default jako target + methods.
+    mgr.install_manifest_aliases(&manifest).expect("install ok");
+    assert_eq!(
+        alias_target(&db, "rag-embeddings").as_deref(),
+        Some("llama-nemotron-embed-vl-1b-v2")
+    );
+    assert_eq!(
+        alias_methods(&db, "rag-embeddings").as_deref(),
+        Some("[\"embed\"]")
+    );
+
+    // Admin przepina alias na realnie wdrozony model.
+    let alias_id: i64 = {
+        let conn = db.write().unwrap();
+        conn.query_row(
+            "SELECT id FROM model_aliases WHERE alias = 'rag-embeddings'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    tentaflow_core::db::repository::update_model_alias_with_chain_check(
+        &db,
+        alias_id,
+        "rag-embeddings",
+        "my-real-embed-model",
+        true,
+        None,
+        None,
+    )
+    .expect("admin rebind");
+
+    // Reinstall (upgrade / mesh reconcile) — idempotentne: alias zostaje,
+    // target admina NIE jest nadpisywany przez suggested_default.
+    mgr.install_manifest_aliases(&manifest).expect("reinstall ok");
+    assert_eq!(
+        alias_target(&db, "rag-embeddings").as_deref(),
+        Some("my-real-embed-model")
+    );
+    let n = count_via_writer(
+        &db,
+        "SELECT COUNT(*) FROM model_aliases WHERE alias = 'rag-embeddings'",
+    );
+    assert_eq!(n, 1, "reinstall must not duplicate the alias row");
+}
+
+// =============================================================================
 // 2. uses_alias against an unknown alias stays pending.
 // =============================================================================
 
