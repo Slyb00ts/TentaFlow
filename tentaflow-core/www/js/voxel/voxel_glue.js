@@ -67,6 +67,20 @@ export class VoxelView {
         wasm.voxelview_setPoints(this.__wbg_ptr, ptr0, len0, count);
     }
     /**
+     * Set the 12 live leg-joint angles (radians) that articulate the robot. Order is
+     * the Go2 convention: idx 0-2 = FR(hip,thigh,calf), 3-5 = FL, 6-8 = RR, 9-11 = RL,
+     * matching `GO2_JOINT_ORDER`. Fewer than 12 values leaves the remaining joints at
+     * their last value; extra values are ignored. The next rendered frame recomputes
+     * every link's world transform from these angles. No-op until the articulated
+     * robot has loaded (the single-mesh / box fallback has no joints).
+     * @param {Float32Array} joints
+     */
+    setRobotJoints(joints) {
+        const ptr0 = passArrayF32ToWasm0(joints, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.voxelview_setRobotJoints(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
      * Set the robot's world pose (odom frame, meters + unit quaternion) from the
      * separate pose topic. Drives the robot marker placement (translate * quaternion),
      * and the radial colormap origin (color radiates from the robot). Until this is
@@ -1205,18 +1219,18 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 66, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 68, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__heb8c20cc65b5e0e7);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 5, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1684df0fc77ac7b9);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h7ab1256255811701);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h7aedc4f4f6379cd6);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hfd3e84cb33c3cdc9);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0) {
@@ -1280,12 +1294,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h7aedc4f4f6379cd6(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h7aedc4f4f6379cd6(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__hfd3e84cb33c3cdc9(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hfd3e84cb33c3cdc9(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h1684df0fc77ac7b9(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h1684df0fc77ac7b9(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h7ab1256255811701(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h7ab1256255811701(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__heb8c20cc65b5e0e7(arg0, arg1, arg2) {
