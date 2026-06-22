@@ -7940,6 +7940,18 @@ fn robot_telemetry_to_js(t: &tentaflow_protocol::RobotTelemetrySnapshot) -> JsVa
         joints.push(&JsValue::from(*v));
     }
     set(&obj, "joints", joints.into());
+    let pose_position = js_sys::Array::new();
+    for v in &t.pose_position {
+        pose_position.push(&JsValue::from(*v));
+    }
+    set(&obj, "posePosition", pose_position.clone().into());
+    set(&obj, "pose_position", pose_position.into());
+    let pose_orientation = js_sys::Array::new();
+    for v in &t.pose_orientation {
+        pose_orientation.push(&JsValue::from(*v));
+    }
+    set(&obj, "poseOrientation", pose_orientation.clone().into());
+    set(&obj, "pose_orientation", pose_orientation.into());
     match t.vx {
         Some(vx) => set(&obj, "vx", vx.into()),
         None => set(&obj, "vx", JsValue::NULL),

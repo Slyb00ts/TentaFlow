@@ -195,6 +195,13 @@ pub struct RobotTelemetrySnapshot {
     /// APPENDED LAST for wire back-compat (new fields go at the end).
     #[serde(default)]
     pub joints: Vec<f64>,
+    /// World pose (odom frame) from the robot's lidar odometry: position [x,y,z] m.
+    /// APPENDED for wire back-compat — keep new fields after this.
+    #[serde(default)]
+    pub pose_position: Vec<f64>,
+    /// World orientation quaternion [x,y,z,w] paired with `pose_position`.
+    #[serde(default)]
+    pub pose_orientation: Vec<f64>,
 }
 
 /// One numeric parameter of a parametered robot action, with the inclusive range
@@ -712,6 +719,8 @@ fn parse_telemetry_snapshot(status: &serde_json::Value) -> Option<RobotTelemetry
         position: arr("position"),
         foot_force: arr("foot_force"),
         joints: arr("joints"),
+        pose_position: arr("pose_position"),
+        pose_orientation: arr("pose_orientation"),
         imu,
         battery,
     };

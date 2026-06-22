@@ -2008,6 +2008,13 @@ pub struct RobotTelemetrySnapshot {
     /// wire back-compat (ciborium positional fields — new fields go at the end).
     #[serde(default)]
     pub joints: Vec<f64>,
+    /// World pose (odom frame) from lidar odometry: position [x,y,z] meters.
+    /// APPENDED for wire back-compat — keep new fields after this.
+    #[serde(default)]
+    pub pose_position: Vec<f64>,
+    /// World orientation quaternion [x,y,z,w] paired with `pose_position`.
+    #[serde(default)]
+    pub pose_orientation: Vec<f64>,
 }
 
 /// SMALL LiDAR availability snapshot — NEVER the point cloud (which would be far

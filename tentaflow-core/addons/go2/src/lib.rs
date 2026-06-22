@@ -764,6 +764,11 @@ struct Telemetry {
     // Leg joint angles (radians) from lowstate `motor_state[i].q`, Go2 order:
     // 0-2 FR, 3-5 FL, 6-8 RR, 9-11 RL. Drives the dashboard robot animation (R2).
     joints: Vec<f64>,
+    // World pose from `rt/utlidar/robot_pose` (lidar odometry frame): position
+    // [x,y,z] meters and orientation quaternion [x,y,z,w]. Drives robot placement
+    // + map accumulation in the 3D viewer.
+    pose_position: Vec<f64>,
+    pose_orientation: Vec<f64>,
     bat_soc: Option<f64>,
     bat_voltage: Option<f64>,
     bat_current: Option<f64>,
@@ -1533,6 +1538,15 @@ fn ingest_robot_pose(raw: &[u8]) {
         return;
     }
     let (ox, oy, oz, ow) = (getf(ori, "x"), getf(ori, "y"), getf(ori, "z"), getf(ori, "w"));
+    if let (Some(x), Some(y), Some(z)) = (px, py, pz) {
+        TELEMETRY.with(|cell| {
+            let mut t = cell.borrow_mut();
+            t.pose_position = alloc::vec![x, y, z];
+            if let (Some(a), Some(b), Some(c), Some(d)) = (ox, oy, oz, ow) {
+                t.pose_orientation = alloc::vec![a, b, c, d];
+            }
+        });
+    }
     POSE_LOG.with(|c| {
         let n = c.get().wrapping_add(1);
         c.set(n);
@@ -1732,6 +1746,13 @@ fn telemetry_json() -> JsonValue {
         // 12 leg joint angles (rad) for the dashboard robot animation (R2).
         if !t.joints.is_empty() {
             obj.insert("joints".into(), json!(t.joints));
+        }
+        // World pose (odom frame) for robot placement + map accumulation in the viewer.
+        if !t.pose_position.is_empty() {
+            obj.insert("pose_position".into(), json!(t.pose_position));
+        }
+        if !t.pose_orientation.is_empty() {
+            obj.insert("pose_orientation".into(), json!(t.pose_orientation));
         }
 
         let mut imu = serde_json::Map::new();

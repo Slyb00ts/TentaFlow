@@ -111,6 +111,8 @@ fn to_telemetry(
         position: t.position,
         foot_force: t.foot_force,
         joints: t.joints,
+        pose_position: t.pose_position,
+        pose_orientation: t.pose_orientation,
         imu: t.imu.map(|i| RobotImuSnapshot {
             roll: i.roll,
             pitch: i.pitch,
