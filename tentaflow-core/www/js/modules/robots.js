@@ -2527,7 +2527,10 @@ function handlePadMovement(pad) {
   const speed = floor + (cap - floor) * held;
 
   const vx = fwd * speed;
-  const vyaw = turn * speed;
+  // Invert the turn while REVERSING so left/right matches the operator's view
+  // (RC-car style). The robot yaws in its own body frame, so driving backward the
+  // steering otherwise feels mirrored. Pure in-place turn (fwd == 0) is unchanged.
+  const vyaw = (fwd < 0 ? -turn : turn) * speed;
   sendPadMove(padState.robotId, vx, 0, vyaw);
   padState.lastMoveZero = false;
   padState.lastMoveAtMs = now;
