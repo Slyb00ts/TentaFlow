@@ -1019,12 +1019,15 @@ impl AddonManager {
     pub fn install_manifest_aliases(&self, manifest: &AddonManifest) -> Result<()> {
         use crate::db::repository::{
             add_alias_consumer_within_tx, audit_consumer_revoked_by_manifest_within_tx,
-            audit_reconcile_uses_alias_within_tx, create_or_reactivate_model_alias_within_tx,
-            lookup_alias_visibility_within_tx, reconcile_uses_alias_for_alias_within_tx,
-            revoke_obsolete_manifest_consumers_within_tx, set_alias_visibility_within_tx,
-            set_model_alias_active_audited_within_tx, upsert_uses_alias_within_tx,
-            upsert_uses_model_within_tx,
+            audit_reconcile_uses_alias_within_tx, lookup_alias_visibility_within_tx,
+            reconcile_uses_alias_for_alias_within_tx, revoke_obsolete_manifest_consumers_within_tx,
+            upsert_uses_alias_within_tx, upsert_uses_model_within_tx,
         };
+
+        // 1. Owned [[alias]] rows (model_aliases + owner + visibility + methods +
+        //    gate). Shared with install_core / mesh-sync reconcile so the alias
+        //    exists no matter which path materializes the addon.
+        crate::addon::lifecycle::materialize_addon_aliases(&self.db, manifest)?;
 
         let mut conn = self
             .db
@@ -1032,56 +1035,15 @@ impl AddonManager {
             .map_err(|e| anyhow::anyhow!("db write for alias install: {}", e))?;
         let tx = conn.transaction()?;
 
-        // 1. Register owned [[alias]] entries: model_aliases + ownership +
-        //    visibility + consumer whitelist for `restricted`.
+        // 1b. Consumer whitelist for `restricted` aliases (manager-only — the
+        //     materializer creates the alias rows, this reconciles who may
+        //     consume them). Drop manifest-granted consumers no longer listed;
+        //     admin-granted rows (`granted_by_user_id IS NOT NULL`) are kept.
         for alias_spec in &manifest.aliases {
-            let alias_id = create_or_reactivate_model_alias_within_tx(
-                &tx,
-                &alias_spec.id,
-                &alias_spec.suggested_default,
-                "first_available",
-                "addon",
-                Some(&manifest.addon_id),
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "addon '{}' alias '{}' registration failed: {}",
-                    manifest.addon_id,
-                    alias_spec.id,
-                    e
-                )
-            })?;
-
-            set_alias_visibility_within_tx(&tx, alias_id, alias_spec.visibility.as_db_str(), None)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "addon '{}' alias '{}' visibility write failed: {}",
-                        manifest.addon_id,
-                        alias_spec.id,
-                        e
-                    )
-                })?;
-
-            crate::db::repository::set_alias_methods_within_tx(
-                &tx,
-                alias_id,
-                &alias_spec.methods,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "addon '{}' alias '{}' methods write failed: {}",
-                    manifest.addon_id,
-                    alias_spec.id,
-                    e
-                )
-            })?;
-
-            // Revoke manifest-granted consumers that were dropped from the
-            // current manifest (reinstall path). Admin-granted rows
-            // (`granted_by_user_id IS NOT NULL`) are preserved — only the
-            // operator can revoke those. Each revoke is audited so the
-            // downstream `addon_uses_alias` reconcile transition has a
-            // recorded upstream cause.
+            let alias_id = match lookup_alias_visibility_within_tx(&tx, &alias_spec.id)? {
+                Some((id, _)) => id,
+                None => continue,
+            };
             let desired_consumers: &[String] = match alias_spec.visibility {
                 crate::addon::manifest::AliasVisibility::Restricted => {
                     &alias_spec.allowed_consumers
@@ -1114,23 +1076,6 @@ impl AddonManager {
                         manifest.addon_id,
                         alias_spec.id,
                         consumer,
-                        e
-                    )
-                })?;
-            }
-
-            if alias_spec.gate.is_some() {
-                set_model_alias_active_audited_within_tx(
-                    &tx,
-                    &alias_spec.id,
-                    false,
-                    Some(&manifest.addon_id),
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "addon '{}' gated alias '{}' deactivate failed: {}",
-                        manifest.addon_id,
-                        alias_spec.id,
                         e
                     )
                 })?;
