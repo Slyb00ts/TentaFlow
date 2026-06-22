@@ -36,6 +36,10 @@
     <string>TentaFlow uses the camera for QR pairing and local live vision features such as pose overlays.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>TentaFlow may use the microphone for voice interactions with local AI models.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>TentaFlow uses your location (GPS) to anchor the map it builds to real-world coordinates.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>TentaFlow uses motion sensors (accelerometer, gyroscope, barometer) for device positioning and mapping.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_irohv1._udp</string>

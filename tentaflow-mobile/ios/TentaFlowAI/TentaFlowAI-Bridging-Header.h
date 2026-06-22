@@ -30,6 +30,18 @@ _Bool tentaflow_mobile_add_discovered_peer(const char* endpoint_id,
                                            unsigned short port);
 
 // =============================================================================
+// Czujniki pozycjonowania — Swift CoreMotion/CoreLocation/ARKit -> Rust fuzja
+// =============================================================================
+
+// Wpycha jedną KANONICZNĄ próbkę czujnika (little-endian, layout z
+// tentaflow-sdk-spec) do hostowej kolejki; addon `phone` opróżnia ją do silnika
+// fuzji (ESKF) + wspólnej mapy. kind: 1=IMU, 2=GNSS, 3=BARO, 4=DEPTH(LidarFrame).
+_Bool tentaflow_mobile_push_sensor(int kind, const unsigned char* ptr, int len);
+
+// Czyści bufor czujników (rozłączenie / pauza).
+void tentaflow_mobile_clear_sensors(void);
+
+// =============================================================================
 // Swift MLX bridge — typy callbackow i rejestracja
 // =============================================================================
 

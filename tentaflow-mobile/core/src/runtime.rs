@@ -98,7 +98,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
         let services_runtime_cfg = config.services_runtime.clone();
 
         let mut excluded: HashSet<u16> = HashSet::new();
-        if let Ok(conn) = db.lock() {
+        if let Ok(conn) = db.read() {
             if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
                 for row in rows {
                     if let Some(p) = row.runtime_port {
