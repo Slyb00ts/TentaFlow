@@ -556,7 +556,15 @@ pub fn transaction_for_addon(
     let pool = acquire_pool(org_id, addon_id)?;
     let mut conn = pool.get().map_err(abi_to_storage)?;
     let _timeout = QueryTimeoutGuard::new(&conn, QUERY_TIMEOUT_MS);
-    let mut tx = conn.transaction().map_err(|e| map_sqlite_error(&e))?;
+    // BEGIN IMMEDIATE (nie domyslny DEFERRED): bierze write-lock juz na starcie tx, wiec
+    // dwie rownolegle transakcje tej instancji serializuja sie OD POCZATKU, a nie dopiero
+    // na pierwszym zapisie. To jest fundament exactly-once aktywacji w reconcile_schemas:
+    // warunkowany enqueue (INSERT ... WHERE EXISTS active=0) i warunkowany flip
+    // (UPDATE ... WHERE active=0) drugiego reconcile widza juz active=1 i nie powtarzaja
+    // materializacji. Bez IMMEDIATE oba reconcile czytalyby active=0 przed kolizja.
+    let mut tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| map_sqlite_error(&e))?;
     tx.set_drop_behavior(rusqlite::DropBehavior::Rollback);
     let mut total: i64 = 0;
     let mut captures = Vec::with_capacity(statements.len());
