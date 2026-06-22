@@ -20,6 +20,14 @@ export class VoxelView {
         wasm.__wbg_voxelview_free(ptr, 0);
     }
     /**
+     * Reset the accumulated occupancy map: clears the cell set, the FIFO order and the
+     * rendered instance buffer, and lets the next frame re-frame the camera. The robot
+     * pose and camera orientation are left untouched.
+     */
+    clearAccumulation() {
+        wasm.voxelview_clearAccumulation(this.__wbg_ptr);
+    }
+    /**
      * Stop the render loop and release GPU resources. Safe to call once when
      * the dashboard leaves the view.
      */
@@ -36,11 +44,20 @@ export class VoxelView {
         wasm.voxelview_resize(this.__wbg_ptr, width, height);
     }
     /**
-     * Upload a new point cloud. `points` is interleaved world-space XYZ
-     * (length = `count` * 3), exactly the `Float32Array` that the dashboard's
-     * `decodeLidarFrame(...).points` returns. On the first non-empty cloud the
-     * camera auto-frames the cloud bounds; the ground grid, robot marker and
-     * LiDAR rays follow the cloud bounds on every update.
+     * Accumulate a new LiDAR frame into the persistent occupancy map. `points` is
+     * interleaved ODOM-FRAME world XYZ in meters (length = `count` * 3), exactly the
+     * `Float32Array` the dashboard's `decodeLidarFrame(...).points` returns.
+     *
+     * The Go2 voxel_map is already in a fixed odom frame, so accumulation is the
+     * UNION of occupied voxel cells across frames (no per-frame transform): each
+     * point is quantized to its voxel cell and inserted into the persistent set, then
+     * ALL accumulated cells are rendered. The single-frame partial cloud thus grows
+     * into a full map as the robot moves through the fixed grid. The set is capped at
+     * `MAX_ACCUMULATED_CELLS` with FIFO eviction; call `clearAccumulation` to reset.
+     *
+     * On the first non-empty frame the camera auto-frames the accumulated bounds; it
+     * does NOT re-frame on every subsequent growth. The radial colormap, robot marker
+     * and LiDAR rays are driven by the robot world pose set via `setRobotPose`.
      * @param {Float32Array} points
      * @param {number} count
      */
@@ -48,6 +65,23 @@ export class VoxelView {
         const ptr0 = passArrayF32ToWasm0(points, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.voxelview_setPoints(this.__wbg_ptr, ptr0, len0, count);
+    }
+    /**
+     * Set the robot's world pose (odom frame, meters + unit quaternion) from the
+     * separate pose topic. Drives the robot marker placement (translate * quaternion),
+     * the radial colormap origin (color radiates from the robot) and the LiDAR ray
+     * origin. Until this is called the marker stays hidden so it is never drawn at a
+     * wrong spot. `pose.z` already reflects the body center (~0.31 m above the floor).
+     * @param {number} x
+     * @param {number} y
+     * @param {number} z
+     * @param {number} qx
+     * @param {number} qy
+     * @param {number} qz
+     * @param {number} qw
+     */
+    setRobotPose(x, y, z, qx, qy, qz, qw) {
+        wasm.voxelview_setRobotPose(this.__wbg_ptr, x, y, z, qx, qy, qz, qw);
     }
 }
 if (Symbol.dispose) VoxelView.prototype[Symbol.dispose] = VoxelView.prototype.free;
