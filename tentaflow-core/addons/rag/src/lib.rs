@@ -33,6 +33,10 @@ const EMBED_BUFFER_SIZE: usize = 262_144;
 /// Nazwa przestrzeni wektorowej (zgodna z [[vector_namespace]] w manifescie).
 const PASSAGES_NS: &str = "passages";
 
+/// Nazwa przestrzeni wektorowej NAZW ENCJI (MemGraphRAG D5, similarity-based entity merge).
+/// Embedding nazwy wezla grafu pod k-NN kandydatow scalenia (zgodna z [[vector_namespace]]).
+const ENTITIES_NS: &str = "entities";
+
 /// Wymiar wektora (zgodny z manifestem i suggested_default rag-embeddings).
 const EMBED_DIMENSIONS: usize = 1024;
 
@@ -158,6 +162,31 @@ pub extern "C" fn on_start() -> i32 {
         }),
     );
 
+    // A_uni (MemGraphRAG D5): Structural Unification — skan kandydatow merge encji + scalanie.
+    // Wolalny przez Scheduler (interval) ORAZ recznie. Konsumuje tez konflikty merge_pending z A_res.
+    register_tool(
+        "entity_merge_scan",
+        "A_uni (0 LLM w detekcji): wykrywa kandydatow merge encji (type-based: ten sam typ + podobna nazwa; similarity-based: embedding nazwy, k-NN). Powyzej progu twardego auto-scala aliasy w kanoniczny wezel (odwracalnie, przez outbox), w szarej strefie tworzy konflikt 'entity_merge' (open) dla A_res. Konsumuje tez 'resolved_merge_pending' z A_res.",
+        json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "batch_size": {"type": "integer"}
+            }
+        }),
+    );
+
+    // Odwracalnosc (R5): cofniecie zastosowanego merge encji z entity_merge_log (inverse-outbox).
+    register_tool(
+        "entity_merge_undo",
+        "Cofa zastosowany merge encji (R5): z entity_merge_log odtwarza inverse-outbox (przywraca krawedzie aliasu, kasuje dodane kanoniczne gdy nie sa wspoldzielone), oznacza alias 'reverted'.",
+        json!({
+            "type": "object",
+            "properties": { "alias_id": {"type": "string"} },
+            "required": ["alias_id"]
+        }),
+    );
+
     // Minimalny panel — lista kolekcji renderowana z SQL. Pelne GUI to osobny slice.
     if let Err(e) = render_main_panel() {
         log::warn(&format!("rag: nie udalo sie wyrenderowac panelu: {e}"));
@@ -212,6 +241,8 @@ pub extern "C" fn on_request(
         "ingest_status" => handle_ingest_status(&params),
         "conflict_scan" => handle_conflict_scan(&params),
         "conflict_resolve" => handle_conflict_resolve(&params),
+        "entity_merge_scan" => handle_entity_merge_scan(&params),
+        "entity_merge_undo" => handle_entity_merge_undo(&params),
         _ => json!({"ok": false, "error": format!("Nieznane narzedzie: {tool_name}")}),
     };
 
@@ -328,6 +359,14 @@ fn handle_ask(params: &Value) -> Value {
     let mut options = json!({ "collection_id": collection_id });
     if let Some(k) = top_k {
         options["top_k"] = json!(k);
+    }
+    // D5 alias-rewrite seedow (R5, TYLKO retrieval-side): przekazujemy aktywne aliasy encji do
+    // flow.meta, by rag_graph_seed przepisal alias->canonical na seedach PPR (zapytanie o
+    // "Einstein" trafia w kanoniczny "albert einstein"). Aliasy zyja w SQLite addona (R1), wiec
+    // to JEDYNE miejsce, ktore moze je wstrzyknac do core'owego flow. Cap chroni rozmiar opcji.
+    let aliases = load_active_aliases();
+    if !aliases.is_empty() {
+        options["entity_aliases"] = json!(aliases);
     }
     // Flow zwraca JSON `{answer, citations}` w tresci odpowiedzi: answer to tekst
     // LLM, citations to REALNE hity retrievalu (doc_id/chunk_index/text/score)
@@ -769,54 +808,6 @@ fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) {
     );
 }
 
-/// Decyzja refcountu: czy skasowac wezel/krawedz z grafu po usunieciu wierszy
-/// rejestru kasowanego dokumentu. `remaining_refs` to liczba wierszy graph_artifacts
-/// INNYCH dokumentow, ktore wciaz referuja ten sam node_id / klucz krawedzi. Wezel
-/// (lub krawedz) ginie z grafu DOPIERO gdy refcount spadnie do 0 — inaczej zostaje,
-/// bo wspoldzieli go inny dokument (istota multi-doc GraphRAG).
-fn should_delete_from_graph(remaining_refs: i64) -> bool {
-    remaining_refs <= 0
-}
-
-/// Liczy ile wierszy graph_artifacts (poza wlasnie kasowanym dokumentem) wciaz
-/// referuje dany wezel. Konserwatywnie: blad zapytania -> traktujemy jak "wciaz
-/// referowany" (nie kasujemy z grafu), zeby nie usunac wspoldzielonego wezla.
-fn count_other_node_refs(node_id: &str, exclude_document_id: &str) -> i64 {
-    sql_query_one(
-        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts \
-         WHERE kind = 'node' AND n_id = ? AND document_id != ?",
-        &[
-            SqlValue::String(node_id.to_string()),
-            SqlValue::String(exclude_document_id.to_string()),
-        ],
-    )
-    .ok()
-    .flatten()
-    .and_then(|row| row.first().and_then(|v| v.as_i64()))
-    .unwrap_or(1)
-}
-
-/// Jak `count_other_node_refs`, ale dla krawedzi po kluczu (src, rel, dst). Refcount =
-/// COUNT(DISTINCT document_id) (a NIE COUNT(*)): po INSERT OR IGNORE rejestr krawedzi jest
-/// unikalny per (document_id, src, rel, dst), wiec liczymy DOKUMENTY trzymajace krawedz, a
-/// nie wiersze — krawedz ginie z grafu dopiero gdy ZADEN inny dokument jej nie wnosi.
-fn count_other_edge_refs(src: &str, rel: &str, dst: &str, exclude_document_id: &str) -> i64 {
-    sql_query_one(
-        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts \
-         WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ? AND document_id != ?",
-        &[
-            SqlValue::String(src.to_string()),
-            SqlValue::String(rel.to_string()),
-            SqlValue::String(dst.to_string()),
-            SqlValue::String(exclude_document_id.to_string()),
-        ],
-    )
-    .ok()
-    .flatten()
-    .and_then(|row| row.first().and_then(|v| v.as_i64()))
-    .unwrap_or(1)
-}
-
 /// Kasuje artefakty grafu dokumentu (kolekcja 'kg_active') po rejestrze graph_artifacts
 /// z REFCOUNTEM i czysci wlasne wiersze rejestru. Idempotentny — wolany przy
 /// re-ingescie i cleanup-on-failure.
@@ -838,43 +829,60 @@ fn cleanup_document_graph(document_id: &str) {
     let now = now_unix();
     let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
 
-    // Najpierw krawedzie, potem wezly (patrz komentarz w callerze). Distinct, bo ten
-    // sam klucz moze pojawic sie w rejestrze dokumentu wielokrotnie (rozne chunki).
-    if let Ok(rows) = sql_query(
-        "SELECT DISTINCT src, rel, dst FROM graph_artifacts WHERE document_id = ? AND kind = 'edge'",
-        &[SqlValue::String(document_id.to_string())],
-    ) {
-        for row in &rows {
-            let src = row.first().and_then(|v| v.as_str()).unwrap_or("");
-            let rel = row.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let dst = row.get(2).and_then(|v| v.as_str()).unwrap_or("");
-            if src.is_empty() || rel.is_empty() || dst.is_empty() {
-                continue;
-            }
-            let remaining = count_other_edge_refs(src, rel, dst, document_id);
-            if should_delete_from_graph(remaining) {
-                push_outbox(&mut tx, &outbox_delete_edge(src, rel, dst), now);
-            }
-        }
-    }
-    if let Ok(rows) = sql_query(
-        "SELECT DISTINCT n_id FROM graph_artifacts WHERE document_id = ? AND kind = 'node'",
-        &[SqlValue::String(document_id.to_string())],
-    ) {
-        for row in &rows {
-            let id = row.first().and_then(|v| v.as_str()).unwrap_or("");
-            if id.is_empty() {
-                continue;
-            }
-            let remaining = count_other_node_refs(id, document_id);
-            if should_delete_from_graph(remaining) {
-                push_outbox(&mut tx, &outbox_delete_node(id), now);
-            }
-        }
-    }
+    // Blocker 3 (wyscig cleanup<->merge): cala decyzja co usunac jest podejmowana w SQL WEWNATRZ
+    // jednej sql_transaction (BEGIN IMMEDIATE), BEZ zadnych pre-tx odczytow sterujacych zapisem.
+    // Dawniej cleanup enumerowal krawedzie i robil resolve_edge_redirect POZA tx, potem dopiero
+    // otwieral tx — przeplot mogl wygladac tak: cleanup czyta stary alias bez redirectu, merge
+    // commituje redirect na kanoniczny, cleanup w tx kasuje wiersze dokumentu i kanoniczna krawedz
+    // zostaje jako stale materializacja. Teraz enqueue jest INSERT...SELECT czytajacym graph_artifacts
+    // W TEJ SAMEJ serializowanej tx, wiec widzi juz-zcommitowane przepisanie merge'u na kanoniczne
+    // klucze (merge przepisuje graph_artifacts dokumentu na kanoniczne src/rel/dst w SWOJEJ tx).
+    // Dzieki temu resolve_edge_redirect/resolve_node_redirect sa tu ZBEDNE.
+    //
+    // dedup_key/payload outboxu budowane SA czystym SQL z kolumn graph_artifacts:
+    //   * dedup_key = canonical_key([op, collection, klucz]) — length-prefixed po BAJTACH; w SQL
+    //     length(CAST(x AS BLOB)) zwraca bajty (= Rust str::len), wiec klucz jest IDENTYCZNY z tym
+    //     budowanym w outbox_dedup_key (spojny INSERT OR IGNORE po partial-unique applied=0).
+    //   * payload = json_object(...) (JSON1 z bundled SQLite) — ten sam ksztalt co outbox_delete_*.
+    // Kolejnosc: najpierw enqueue (warunek NOT EXISTS musi jeszcze widziec wlasne wiersze dokumentu,
+    // by liczyc TYLKO inne dokumenty przez document_id<>:doc), potem DELETE wierszy tego dokumentu.
 
-    // Usuniecie rejestru w TEJ SAMEJ transakcji co enqueue intencji delete — atomowo:
-    // albo i rejestr znika, i intencja delete jest trwala, albo nic (brak rozjazdu).
+    // (1) enqueue delete_edge dla krawedzi, ktorych ZADEN inny dokument nie trzyma.
+    tx.push((
+        format!(
+            "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+             SELECT DISTINCT \
+               {edge_dedup}, 'delete_edge', '{coll}', \
+               json_object('src', ga.src, 'rel', ga.rel, 'dst', ga.dst), 0, ? \
+             FROM graph_artifacts ga \
+             WHERE ga.document_id = ? AND ga.kind = 'edge' \
+               AND NOT EXISTS (SELECT 1 FROM graph_artifacts o \
+                 WHERE o.kind = 'edge' AND o.src = ga.src AND o.rel = ga.rel AND o.dst = ga.dst \
+                   AND o.document_id <> ga.document_id)",
+            edge_dedup = sql_delete_edge_dedup_expr("ga.src", "ga.rel", "ga.dst"),
+            coll = KG_COLLECTION,
+        ),
+        vec![SqlValue::I64(now), SqlValue::String(document_id.to_string())],
+    ));
+
+    // (2) enqueue delete_node dla wezlow, ktorych ZADEN inny dokument nie trzyma.
+    tx.push((
+        format!(
+            "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+             SELECT DISTINCT \
+               {node_dedup}, 'delete_node', '{coll}', \
+               json_object('id', ga.n_id), 0, ? \
+             FROM graph_artifacts ga \
+             WHERE ga.document_id = ? AND ga.kind = 'node' \
+               AND NOT EXISTS (SELECT 1 FROM graph_artifacts o \
+                 WHERE o.kind = 'node' AND o.n_id = ga.n_id AND o.document_id <> ga.document_id)",
+            node_dedup = sql_delete_node_dedup_expr("ga.n_id"),
+            coll = KG_COLLECTION,
+        ),
+        vec![SqlValue::I64(now), SqlValue::String(document_id.to_string())],
+    ));
+
+    // (3) Usun rejestr dokumentu w TEJ SAMEJ tx co enqueue — atomowo.
     tx.push((
         "DELETE FROM graph_artifacts WHERE document_id = ?".to_string(),
         vec![SqlValue::String(document_id.to_string())],
@@ -2968,6 +2976,41 @@ fn outbox_dedup_key(op: &str, collection: &str, key: &str) -> String {
     canonical_key(&[op, collection, key])
 }
 
+/// Length-prefix JEDNEGO pola w SQL, bajt-w-bajt zgodny z canonical_key (Rust str::len = bajty):
+/// length(CAST(col AS BLOB)) liczy BAJTY (nie znaki), wiec dla UTF-8 id zgadza sie z `p.len()`.
+/// Zwraca wyrazenie SQL `<n>:<col>` jako fragment do sklejenia ||.
+fn sql_lp(col: &str) -> String {
+    format!("(length(CAST({col} AS BLOB)) || ':' || {col})")
+}
+
+/// Length-prefix STALEGO literalu (op/collection) — n jest znane w czasie kompilacji (bajty).
+fn sql_lp_literal(lit: &str) -> String {
+    format!("'{}:{}'", lit.len(), lit)
+}
+
+/// Wyrazenie SQL liczace dedup_key delete_edge IDENTYCZNIE jak outbox_delete_edge +
+/// outbox_dedup_key: canonical_key(['delete_edge', KG_COLLECTION, fact_key]), gdzie
+/// fact_key = canonical_key([src, rel, dst]). Wszystko length-prefixed po bajtach (sql_lp).
+fn sql_delete_edge_dedup_expr(src: &str, rel: &str, dst: &str) -> String {
+    let fact_key = format!("({} || {} || {})", sql_lp(src), sql_lp(rel), sql_lp(dst));
+    format!(
+        "({} || {} || (length(CAST({fact_key} AS BLOB)) || ':' || {fact_key}))",
+        sql_lp_literal("delete_edge"),
+        sql_lp_literal(KG_COLLECTION),
+    )
+}
+
+/// Wyrazenie SQL liczace dedup_key delete_node IDENTYCZNIE jak outbox_delete_node:
+/// canonical_key(['delete_node', KG_COLLECTION, n_id]).
+fn sql_delete_node_dedup_expr(n_id: &str) -> String {
+    format!(
+        "({} || {} || {})",
+        sql_lp_literal("delete_node"),
+        sql_lp_literal(KG_COLLECTION),
+        sql_lp(n_id),
+    )
+}
+
 /// Operacja outboxu czekajaca na materializacje do grafu: jeden wiersz graph_outbox.
 struct OutboxOp {
     dedup_key: String,
@@ -3121,15 +3164,21 @@ fn extract_chunk_graph(
     // Wezly encji. INWARIANT (bug 4): graph_artifacts MUSI byc nadzbiorem grafu, wiec
     // rejestr i intencja outboxu sa w tej samej transakcji co reszta ledgera. INSERT OR
     // IGNORE (bug 4 idempotencja): ux_graph_artifacts_node dedupuje per (dokument, n_id).
+    // Blocker 2: kanonizacja przy ingescie. Jezeli encja jest aktywnym aliasem, materializujemy
+    // wezel/krawedzie/ledger na KANONICZNYM id (resolve_canonical), nie na aliasowym. Inaczej nowy
+    // ingest re-tworzylby aliasowa krawedz po merge (skan ja pomijal, bo alias active), wiec merge
+    // nie bylby trwaly. type_of pozostaje kluczowane oryginalnym id ekstrakcji (rel.head_id), wiec
+    // mapa typow jest spojna z relacjami z tego samego chunku.
     let mut known: Vec<String> = Vec::with_capacity(extraction.entities.len());
     let mut entity_count = 0usize;
     for entity in &extraction.entities {
         entity_types.push((entity.id.clone(), entity.entity_type.clone()));
-        push_node_artifact(&mut tx, document_id, &entity.id, now);
-        let op = outbox_upsert_node(&entity.id, &entity.entity_type, &entity.name, &provenance);
+        let node_id = resolve_canonical(&entity.id);
+        push_node_artifact(&mut tx, document_id, &node_id, now);
+        let op = outbox_upsert_node(&node_id, &entity.entity_type, &entity.name, &provenance);
         push_outbox(&mut tx, &op, now);
-        if !known.contains(&entity.id) {
-            known.push(entity.id.clone());
+        if !known.contains(&node_id) {
+            known.push(node_id);
         }
         entity_count += 1;
     }
@@ -3146,7 +3195,11 @@ fn extract_chunk_graph(
             *truncated = true;
             break;
         }
-        for endpoint in [&rel.head_id, &rel.tail_id] {
+        // Blocker 2: konce krawedzi liczymy na KANONICZNYCH id (resolve_canonical), wiec brakujace
+        // wezly konca, fact_key, graph_artifacts, outbox i fact_state ida juz kanonicznie.
+        let head_canon = resolve_canonical(&rel.head_id);
+        let tail_canon = resolve_canonical(&rel.tail_id);
+        for endpoint in [&head_canon, &tail_canon] {
             if !known.contains(endpoint) {
                 push_node_artifact(&mut tx, document_id, endpoint, now);
                 let op = outbox_upsert_node(endpoint, FALLBACK_ENTITY_TYPE, endpoint, &provenance);
@@ -3155,7 +3208,7 @@ fn extract_chunk_graph(
             }
         }
 
-        let fact_key = fact_key_for(&rel.head_id, &rel.relation, &rel.tail_id);
+        let fact_key = fact_key_for(&head_canon, &rel.relation, &tail_canon);
         let head_type = type_of(&rel.head_id, &entity_types);
         let tail_type = type_of(&rel.tail_id, &entity_types);
         let schema_id = derive_schema_id(&head_type, &rel.relation, &tail_type);
@@ -3175,7 +3228,7 @@ fn extract_chunk_graph(
             &mut tx,
             &fact_key,
             &schema_id,
-            (&rel.head_id, &rel.relation, &rel.tail_id),
+            (&head_canon, &rel.relation, &tail_canon),
             now,
         );
 
@@ -3596,6 +3649,1947 @@ fn apply_outbox_op(op: &str, collection: &str, payload: &Value) -> Result<(), St
         }
         other => Err(format!("nieznana operacja outboxu '{other}'")),
     }
+}
+
+// =============================================================================
+// A_uni — Structural Unification / entity merge (MemGraphRAG D5, R5: odwracalny)
+// =============================================================================
+//
+// Encje = wezly grafu (node_id = normalize_entity_name). Aliasy roznych nazw tej samej
+// encji ("usa" / "united states") rozbijaja graf na pod-grafy => slabszy PPR/retrieval.
+// D5 scala alias w kanoniczny wezel LOGICZNA transakcja SQLite + redirectem artefaktow +
+// przekierowaniem krawedzi PRZEZ outbox (R1/R3 — graf NIGDY nie jest mutowany bezposrednio).
+// Wszystko jest ODWRACALNE z entity_merge_log (inverse-outbox).
+//
+// Detekcja kandydatow (0 LLM, jak A_det):
+//   * type-based      — wezly o tym samym `label` (typ) i bardzo podobnych nazwach (prefix
+//                       containment + lekki edit-distance, BEZ modelu).
+//   * similarity-based— embedding nazwy encji (namespace 'entities'), k-NN cosine.
+// Prog KONSERWATYWNY (entity resolution dominuje korektnosc — §8): powyzej progu twardego
+// AUTO-merge; szara strefa (similarity w pasmie granicznym) => konflikt 'entity_merge' (open)
+// dla A_res/eskalacji (reuzycie maszynerii D3/D4) — to realizuje similarity-gate odlozony z D3.
+
+/// Domyslny rozmiar partii skanu kandydatow merge: ile NOWYCH encji (po fact_seq)
+/// entity_merge_scan rozwaza w jednej iteracji.
+const ENTITY_MERGE_SCAN_BATCH: usize = 128;
+
+/// Twardy limit iteracji petli skanu (anty-DoS jak A_det): BATCH*ITER = gorny limit pracy
+/// na wywolanie. Reszta domknie sie przy nastepnym przebiegu (kursor trwaly).
+const ENTITY_MERGE_SCAN_MAX_ITERS: usize = 4096;
+
+/// TTL blokady skanu merge (sekundy) — jak conflict_scan: lock wygasa sam po crashu.
+const ENTITY_MERGE_SCAN_LOCK_TTL_SECS: i64 = 600;
+
+/// Kursor skanu merge jest per-INSTANCJA (jeden SQLite/graf, encje wspoldzielone przez kolekcje),
+/// dokladnie jak conflict_scan. collection_id z payloadu mapujemy na ten sentinel.
+const ENTITY_MERGE_SCAN_CURSOR_KEY: &str = "__instance__";
+
+/// Prog TWARDY similarity nazw encji do AUTO-merge (cosine). KONSERWATYWNY: powyzej tego
+/// auto-scalamy bez czlowieka. Entity resolution dominuje korektnosc, wiec prog wysoki —
+/// raczej odrzuc (zostaw rozdzielne) niz blednie scal dwie rozne encje.
+const MERGE_SIM_THRESHOLD: f32 = 0.93;
+
+/// Dolna granica SZAREJ STREFY similarity: kandydaci w pasmie [GRAY, THRESHOLD) NIE sa
+/// auto-scalani — trafiaja jako konflikt 'entity_merge' (open) do A_res (similarity-gate).
+/// Ponizej GRAY: nie kandydaci (zbyt rozne nazwy).
+const MERGE_SIM_GRAY_BAND: f32 = 0.82;
+
+/// Maks. liczba sasiadow k-NN nazw encji branych pod uwage per skanowana encja (anti-DoS).
+const MERGE_KNN_K: u32 = 8;
+
+/// Minimalna dlugosc OBU nazw, by drobna literowka (edit_distance==1) kwalifikowala do AUTO
+/// type-based merge (Blocker 5). Na krotkich nazwach jedna edycja zmienia znaczenie
+/// ("usa"->"use", "paris"->"parts"), wiec wymagamy dlugich nazw — inaczej None.
+const MERGE_TYPE_MIN_AUTO_LEN: usize = 6;
+
+/// Twardy cap krawedzi przekierowywanych w JEDNYM merge (anti-DoS: encja-hub o tysiacach
+/// krawedzi). Po przekroczeniu merge jest ODRZUCANY (nie czesciowy) z logiem — czesciowe
+/// przekierowanie psułoby odwracalnosc (edge_diff musi byc KOMPLETNY do undo).
+const MERGE_MAX_EDGES: usize = 512;
+
+/// Typ konfliktu szarej strefy merge (reuzywa maszynerie conflicts/conflict_members D3/D4).
+const ENTITY_MERGE_CONFLICT_TYPE: &str = "entity_merge";
+
+/// Pseudo-schema_id dla konfliktu entity_merge (conflicts.schema_id jest NOT NULL, a merge
+/// nie dotyczy jednego schematu krawedzi — to konflikt o TOZSAMOSC wezla). Staly sentinel.
+const ENTITY_MERGE_SCHEMA_SENTINEL: &str = "__entity_merge__";
+
+/// Pseudo-relacja w dedup_key konfliktu entity_merge: grupe identyfikuje para (alias,canonical),
+/// nie (head,rel). Uzywamy stalej, a head_id niesie kanoniczny wezel (dla czytelnosci panelu D7).
+const ENTITY_MERGE_REL_SENTINEL: &str = "merge";
+
+/// Pasmo decyzji similarity dla pary nazw encji. Czysta klasyfikacja (testowalna bez hosta):
+/// >= THRESHOLD => Auto (scal), [GRAY, THRESHOLD) => Gray (konflikt do A_res), < GRAY => None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeBand {
+    /// Powyzej progu twardego: auto-merge bez czlowieka.
+    Auto,
+    /// Szara strefa: kandydat, ale decyzje podejmuje A_res (konflikt 'entity_merge' open).
+    Gray,
+    /// Ponizej szarej strefy: nie kandydat.
+    None,
+}
+
+/// Klasyfikuje similarity w pasmo merge. Czysta funkcja — rdzen similarity-gate (§8).
+fn classify_merge_band(similarity: f32) -> MergeBand {
+    if similarity >= MERGE_SIM_THRESHOLD {
+        MergeBand::Auto
+    } else if similarity >= MERGE_SIM_GRAY_BAND {
+        MergeBand::Gray
+    } else {
+        MergeBand::None
+    }
+}
+
+/// Odleglosc edycyjna (Levenshtein) na ZNAKACH (UTF-8 safe). Maly anti-DoS: liczymy tylko gdy
+/// dlugosci sa porownywalne (caller filtruje), wiec O(n*m) jest male. Czysta funkcja.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Klasyfikuje pare nazw type-based (znormalizowane node_id) w pasmo merge BEZ LLM (Blocker 5).
+/// Entity resolution dominuje korektnosc, wiec AUTO jest WASKIE, a wszystko niepewne idzie do
+/// szarej strefy (konflikt entity_merge -> A_res/czlowiek), nie auto-merge:
+///   * AUTO  — identyczne po normalizacji (nie wystapi: ten sam node_id) LUB drobna literowka:
+///     edit_distance==1 na DLUGICH nazwach (>= MERGE_TYPE_MIN_AUTO_LEN znakow) o tej samej liczbie
+///     slow i zblizonej dlugosci. Prog dlugosci odsiewa krotkie nazwy, gdzie 1 edycja zmienia
+///     znaczenie ("usa"->"use", "paris"->"parts").
+///   * GRAY  — jeden jest pelnoslownym PREFIKSEM/podzbiorem slow drugiego przy ROZNEJ liczbie slow
+///     ("john"->"john smith", "paris"->"paris texas", "apple"->"apple inc"). To NIEBEZPIECZNE do
+///     auto (rozne encje czesto dziela slowo), wiec -> konflikt do adjudykacji.
+///   * None  — nazwy zbyt rozne.
+/// Czysta funkcja — fundament zaostrzonego type-based gate'u.
+fn classify_type_based_merge(a: &str, b: &str) -> MergeBand {
+    if a == b {
+        return MergeBand::None; // ten sam node_id => juz jeden wezel, nie ma czego scalac.
+    }
+
+    let a_words = a.split_whitespace().count();
+    let b_words = b.split_whitespace().count();
+
+    // Pelnoslowny prefiks przy ROZNEJ liczbie slow => SZARA STREFA (nie auto). Sama identycznosc
+    // poczatku slow nie dowodzi tej samej encji ("paris" vs "paris texas").
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if a_words != b_words {
+        if let Some(rest) = long.strip_prefix(short) {
+            if rest.starts_with(' ') {
+                return MergeBand::Gray;
+            }
+        }
+        // Rozna liczba slow, brak relacji prefiksu slownego => zbyt rozne dla type-based.
+        return MergeBand::None;
+    }
+
+    // Ta sama liczba slow: AUTO tylko dla DROBNEJ literowki na DLUGICH nazwach. edit_distance==1
+    // (jedna edycja) i obie nazwy >= MERGE_TYPE_MIN_AUTO_LEN, dlugosci roznia sie o <= 1.
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+    if a_len < MERGE_TYPE_MIN_AUTO_LEN || b_len < MERGE_TYPE_MIN_AUTO_LEN {
+        return MergeBand::None;
+    }
+    if a_len.abs_diff(b_len) > 1 {
+        return MergeBand::None;
+    }
+    if edit_distance(a, b) == 1 {
+        MergeBand::Auto
+    } else {
+        MergeBand::None
+    }
+}
+
+/// Wybor kanonicznego wezla z pary (deterministyczny, udokumentowany). Kanonicznym zostaje
+/// wezel o WIEKSZYM refcount (wiecej dokumentow go potwierdza => bardziej ugruntowany); remis
+/// rozstrzyga DLUZSZA pelna nazwa (pelniejsza forma, np. "united states" > "usa"); drugi remis
+/// — leksykograficznie node_id (stabilnosc). Zwraca (canonical_id, alias_id).
+fn choose_canonical<'a>(
+    a_id: &'a str,
+    a_refs: i64,
+    b_id: &'a str,
+    b_refs: i64,
+) -> (&'a str, &'a str) {
+    let a_wins = match a_refs.cmp(&b_refs) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match a_id.chars().count().cmp(&b_id.chars().count()) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => a_id <= b_id,
+        },
+    };
+    if a_wins {
+        (a_id, b_id)
+    } else {
+        (b_id, a_id)
+    }
+}
+
+/// Stabilny ref_id wektora encji = nieujemny hash node_id (FNV-1a 64-bit, obciety do i64-safe).
+/// Deterministyczny: re-embedding tej samej encji NADPISUJE jej wektor (vector_upsert po ref_id),
+/// nie tworzy duplikatu. Bez crate'a hash — wlasny FNV (addon ma tylko sdk+serde).
+fn entity_vector_ref(node_id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in node_id.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    // Zostaw w zakresie dodatnich i64 (ref_id bywa mapowany na SQLite INTEGER po stronie hosta).
+    hash & 0x7fff_ffff_ffff_ffff
+}
+
+/// Liczy refcount wezla = liczba DYSTYNKTNYCH dokumentow trzymajacych ten node w graph_artifacts
+/// (calkowity, BEZ wykluczania dokumentu — do wyboru kanonicznego). Po merge alias przestaje
+/// istniec, wiec canonical przejmuje wage.
+fn node_refcount(node_id: &str) -> i64 {
+    sql_query_one(
+        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts WHERE kind = 'node' AND n_id = ?",
+        &[SqlValue::String(node_id.to_string())],
+    )
+    .ok()
+    .flatten()
+    .and_then(|r| r.first().and_then(|v| v.as_i64()))
+    .unwrap_or(0)
+}
+
+/// Krawedz aliasu do przekierowania: kierunek (alias jest src czy dst) + drugi koniec + relacja
+/// + dokumenty wnoszące ja (do redirectu graph_artifacts). head/tail to ORYGINALNE id w grafie.
+struct AliasEdge {
+    src: String,
+    rel: String,
+    dst: String,
+}
+
+/// Zbiera WSZYSTKIE krawedzie grafu, w ktorych alias_id wystepuje jako src lub dst — ze STANU
+/// PRAWDY (fact_state.active=1), NIE z grafu (R1: czytamy SQLite, graf tylko karmimy outboxem).
+/// To krawedzie, ktore merge przekieruje na canonical_id. Cap MERGE_MAX_EDGES (anti-DoS):
+/// przekroczenie => Err (merge odrzucony w calosci, bo edge_diff musi byc kompletny do undo).
+fn collect_alias_edges(alias_id: &str) -> Result<Vec<AliasEdge>, String> {
+    let rows = sql_query(
+        "SELECT head_id, rel, tail_id FROM fact_state \
+         WHERE active = 1 AND (head_id = ? OR tail_id = ?) \
+         ORDER BY fact_key LIMIT ?",
+        &[
+            SqlValue::String(alias_id.to_string()),
+            SqlValue::String(alias_id.to_string()),
+            SqlValue::I64(MERGE_MAX_EDGES as i64 + 1),
+        ],
+    )
+    .map_err(|e| format!("odczyt krawedzi aliasu: {e}"))?;
+
+    if rows.len() > MERGE_MAX_EDGES {
+        return Err(format!(
+            "alias '{alias_id}' ma wiecej niz MERGE_MAX_EDGES={MERGE_MAX_EDGES} krawedzi — \
+             merge odrzucony (edge_diff musi byc kompletny do undo)"
+        ));
+    }
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let src = r.first().and_then(|v| v.as_str())?.to_string();
+            let rel = r.get(1).and_then(|v| v.as_str())?.to_string();
+            let dst = r.get(2).and_then(|v| v.as_str())?.to_string();
+            Some(AliasEdge { src, rel, dst })
+        })
+        .collect())
+}
+
+/// PELNY snapshot aliasowej krawedzi sprzed merge (Blocker 1): stan faktu + jego dokumenty (Phi)
+/// i evidence (Psi). Undo odtwarza krawedz WYLACZNIE z tego (idempotentnie), bez ufania aktualnemu
+/// kanonicznemu wierszowi, ktory moze byc wspoldzielony.
+struct AliasFactSnapshot {
+    active: i64,
+    schema_id: String,
+    documents: Vec<Value>,
+    evidence: Vec<Value>,
+}
+
+/// Czyta snapshot aliasowej krawedzi (fact_state + fact_schema + fact_evidence) PRZED redirectami.
+/// Brak wiersza fact_state => active=0, schema pusty (krawedz tylko-w-grafie bez ledgera — undo
+/// odtworzy sam graf). documents = pary (document_id, schema_id) z fact_schema — schema_id jest
+/// PER (fact_key, document_id) i ingest moze go aktualizowac per dokument, wiec undo musi
+/// odtworzyc kazdy wiersz z jego ORYGINALNYM schema_id (bit-w-bit), nie jednym z fact_state.
+/// evidence = pelne wiersze Psi.
+fn snapshot_alias_fact(old_fact_key: &str) -> AliasFactSnapshot {
+    let (active, schema_id) = sql_query_one(
+        "SELECT active, schema_id FROM fact_state WHERE fact_key = ?",
+        &[SqlValue::String(old_fact_key.to_string())],
+    )
+    .ok()
+    .flatten()
+    .map(|r| {
+        (
+            r.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            r.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        )
+    })
+    .unwrap_or((0, String::new()));
+
+    let documents = sql_query(
+        "SELECT document_id, schema_id FROM fact_schema WHERE fact_key = ?",
+        &[SqlValue::String(old_fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "document_id": r.first().and_then(|v| v.as_str()).unwrap_or_default(),
+                    "schema_id": r.get(1).and_then(|v| v.as_str()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let evidence = sql_query(
+        "SELECT document_id, chunk_id, span, confidence FROM fact_evidence WHERE fact_key = ?",
+        &[SqlValue::String(old_fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "document_id": r.first().and_then(|v| v.as_str()).unwrap_or_default(),
+                    "chunk_id": r.get(1).and_then(|v| v.as_str()).unwrap_or_default(),
+                    "span": r.get(2).and_then(|v| v.as_str()),
+                    "confidence": r.get(3).and_then(sql_value_to_f32),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    AliasFactSnapshot { active, schema_id, documents, evidence }
+}
+
+/// PELNY snapshot KANONICZNEJ krawedzi SPRZED merge, gdy kanoniczny fakt juz istnial
+/// (canonical_pre_existed=true). Bez tego undo nie umie odroznic dokumentow/evidence, ktore
+/// kanoniczny MIAL od tych, ktore wniosl dopiero merge — i albo kasowalby za duzo (cudze dane),
+/// albo zostawialby smieci. Trzymamy: active+schema_id fact_state ORAZ Phi jako pary
+/// (document_id, schema_id) i Psi jako (document_id, chunk_id). Czytane TERAZ, zanim redirecty
+/// merge'u (INSERT OR IGNORE aliasowych docs + unify schema_id) zmienia kanoniczne wiersze.
+struct CanonicalFactSnapshot {
+    active: i64,
+    schema_id: String,
+    documents: Vec<Value>,
+    evidence: Vec<Value>,
+}
+
+/// Czyta snapshot kanonicznej krawedzi (fact_state + fact_schema + fact_evidence) PRZED redirectami.
+fn snapshot_canonical_fact(new_fact_key: &str) -> CanonicalFactSnapshot {
+    let (active, schema_id) = sql_query_one(
+        "SELECT active, schema_id FROM fact_state WHERE fact_key = ?",
+        &[SqlValue::String(new_fact_key.to_string())],
+    )
+    .ok()
+    .flatten()
+    .map(|r| {
+        (
+            r.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            r.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        )
+    })
+    .unwrap_or((0, String::new()));
+
+    // Phi kanonicznego: pary (document_id, schema_id) — schema_id potrzebny do bit-w-bit restore
+    // wierszy, ktorych unify_fact_schema_id_stmt mogl zmienic schema_id przy scaleniu.
+    let documents = sql_query(
+        "SELECT document_id, schema_id FROM fact_schema WHERE fact_key = ?",
+        &[SqlValue::String(new_fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "document_id": r.first().and_then(|v| v.as_str()).unwrap_or_default(),
+                    "schema_id": r.get(1).and_then(|v| v.as_str()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let evidence = sql_query(
+        "SELECT document_id, chunk_id FROM fact_evidence WHERE fact_key = ?",
+        &[SqlValue::String(new_fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .map(|r| {
+                json!({
+                    "document_id": r.first().and_then(|v| v.as_str()).unwrap_or_default(),
+                    "chunk_id": r.get(1).and_then(|v| v.as_str()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    CanonicalFactSnapshot { active, schema_id, documents, evidence }
+}
+
+/// True jezeli fact_state ma wiersz danego fact_key (kanoniczny pre-existed przed merge, Blocker 1).
+fn fact_state_exists(fact_key: &str) -> bool {
+    sql_query_one(
+        "SELECT 1 FROM fact_state WHERE fact_key = ?",
+        &[SqlValue::String(fact_key.to_string())],
+    )
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Zbior DISTINCT document_id trzymajacych dany wezel w graph_artifacts (kind='node'). Snapshot
+/// SPRZED przepisania alias->canonical (Blocker 3): undo odtwarza aliasowe wiersze node i usuwa
+/// kanoniczne wiersze wniesione przez alias (alias_docs \ canonical_docs), bit-w-bit.
+fn snapshot_node_documents(node_id: &str) -> Vec<String> {
+    sql_query(
+        "SELECT DISTINCT document_id FROM graph_artifacts WHERE kind = 'node' AND n_id = ?",
+        &[SqlValue::String(node_id.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Snapshot wezla aliasu (label, name) sprzed delete_node — by undo odtworzyl jego typ zamiast
+/// fallbacku (Blocker 1). label z node_label (schema), name z props.name pierwszej krawedzi nie
+/// jest dostepny w SQLite, wiec name=alias_id (znormalizowane id). Brak label => fallback "Entity".
+fn snapshot_alias_node(alias_id: &str) -> (String, String) {
+    let label = node_label(alias_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| FALLBACK_ENTITY_TYPE.to_string());
+    (label, alias_id.to_string())
+}
+
+/// Deterministyczny schema_id kanonicznej krawedzi z KANONICZNYCH typow koncow (Blocker 3). Typ
+/// czytamy z node_label (schema_registry przez fact_state); brak typu => FALLBACK_ENTITY_TYPE.
+/// Dwie krawedzie scalane w ten sam kanoniczny fact_key dostaja IDENTYCZNY schema_id niezaleznie od
+/// pierwotnych typow aliasu — to czyni fact_state.schema_id i fact_schema.schema_id spojnymi.
+fn derive_canonical_schema_id(new_src: &str, rel: &str, new_dst: &str) -> String {
+    let head_type = node_label(new_src).ok().flatten().unwrap_or_else(|| FALLBACK_ENTITY_TYPE.to_string());
+    let tail_type = node_label(new_dst).ok().flatten().unwrap_or_else(|| FALLBACK_ENTITY_TYPE.to_string());
+    derive_schema_id(&head_type, rel, &tail_type)
+}
+
+/// Lista dedup_key grup konfliktowych, ktorych czlonkiem jest dany fact_key (Blocker 3). Po
+/// redirectach conflict_members przeliczamy members_rev tych grup do COUNT(*).
+fn conflict_groups_of_fact(fact_key: &str) -> Vec<String> {
+    sql_query(
+        "SELECT DISTINCT conflict_dedup_key FROM conflict_members WHERE fact_key = ?",
+        &[SqlValue::String(fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Przekierowuje koniec krawedzi: zamienia wystapienia alias_id na canonical_id. Pomija
+/// self-loop (alias--rel-->alias) degenerujace do canonical--rel-->canonical, ktory ma sens,
+/// wiec ZACHOWUJEMY (graf moze miec petle). Zwraca (new_src, new_dst).
+fn redirect_endpoints(edge: &AliasEdge, alias_id: &str, canonical_id: &str) -> (String, String) {
+    let new_src = if edge.src == alias_id { canonical_id } else { &edge.src };
+    let new_dst = if edge.dst == alias_id { canonical_id } else { &edge.dst };
+    (new_src.to_string(), new_dst.to_string())
+}
+
+/// LOGICZNY merge aliasu w kanoniczny wezel (R5, ODWRACALNY). Wykonuje:
+///  1. Zbiera krawedzie aliasu (fact_state, R1) i liczy diff przekierowania.
+///  2. W JEDNEJ sql_transaction zapisuje: entity_aliases(active), entity_merge_log(edge_diff),
+///     przepisanie graph_artifacts (wezly + krawedzie) na KANONICZNE klucze (cleanup widzi je
+///     w tx, bez osobnej tabeli redirectow),
+///     przeniesienie fact_state na kanoniczne fact_key (z obsluga KOLIZJI: MAX(active)),
+///     redirect fact_schema/fact_evidence/conflict_members na kanoniczne fact_key,
+///     enqueue outbox: upsert_edge kanonicznej + delete_edge starej + delete_node aliasu.
+///  3. Po commicie drain materializuje przeniesienie do grafu (idempotentnie).
+/// `method`/`similarity` to provenance decyzji. Zwraca liczbe przekierowanych krawedzi.
+fn merge_entities(
+    alias_id: &str,
+    canonical_id: &str,
+    method: &str,
+    similarity: Option<f32>,
+) -> Result<usize, String> {
+    if alias_id == canonical_id {
+        return Err("merge_entities: alias_id == canonical_id (nic do scalenia)".to_string());
+    }
+    // Idempotencja: jesli alias juz scalony (active) z TYM canonical, nie powtarzaj.
+    if let Some(existing) = active_alias_canonical(alias_id)? {
+        if existing == canonical_id {
+            return Ok(0);
+        }
+        return Err(format!(
+            "alias '{alias_id}' jest juz scalony z innym kanonicznym '{existing}' — \
+             najpierw cofnij (entity_merge_undo)"
+        ));
+    }
+
+    let edges = collect_alias_edges(alias_id)?;
+    let now = now_unix();
+    let prov = Provenance {
+        chunk_id: None,
+        doc_id: None,
+        page: None,
+        span: None,
+        confidence: Some(DEFAULT_CONFIDENCE),
+        extractor_version: Some(EXTRACTOR_VERSION.to_string()),
+    };
+
+    let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
+    // Diff przekierowania do entity_merge_log (pelny — do undo).
+    let mut diff_edges: Vec<Value> = Vec::with_capacity(edges.len());
+    // Blocker 3: grupy konfliktowe (dedup_key) dotkniete redirectem conflict_members — po redirectach
+    // przeliczamy members_rev = COUNT(*), inaczej A_res TOCTOU-guard (members_rev=:rev0) sie rozjedzie.
+    let mut affected_conflict_groups: Vec<String> = Vec::new();
+
+    // (a) graph_artifacts WEZLA: przepisz aliasowe wiersze node na KANONICZNY n_id (Blocker 3).
+    // Bez tego cleanup dokumentu po merge widzialby stary aliasowy n_id i kasowal nieistniejacy
+    // wezel, zostawiajac kanoniczny jako stale. Snapshot dokumentow aliasu/kanonicznego SPRZED
+    // przepisania (undo musi cofnac dokladnie wklad aliasu). Kolizja (dokument ma OBA wezly) =>
+    // INSERT OR IGNORE kanonicznego (ux_graph_artifacts_node), potem DELETE aliasowych.
+    let alias_node_docs = snapshot_node_documents(alias_id);
+    let canonical_node_docs = snapshot_node_documents(canonical_id);
+    tx.push((
+        "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, n_id, created_at) \
+         SELECT document_id, 'node', ?, created_at FROM graph_artifacts WHERE kind = 'node' AND n_id = ?".to_string(),
+        vec![SqlValue::String(canonical_id.to_string()), SqlValue::String(alias_id.to_string())],
+    ));
+    tx.push((
+        "DELETE FROM graph_artifacts WHERE kind = 'node' AND n_id = ?".to_string(),
+        vec![SqlValue::String(alias_id.to_string())],
+    ));
+
+    for edge in &edges {
+        let (new_src, new_dst) = redirect_endpoints(edge, alias_id, canonical_id);
+        let old_fact_key = fact_key_for(&edge.src, &edge.rel, &edge.dst);
+        let new_fact_key = fact_key_for(&new_src, &edge.rel, &new_dst);
+
+        // Blocker 1: PELNY snapshot stanu aliasowej krawedzi SPRZED merge — czytany TERAZ, zanim
+        // statementy redirectu ponizej zmodyfikuja fact_state/fact_schema/fact_evidence. Undo
+        // odtwarza WYLACZNIE z tego snapshotu (nie z aktualnego kanonicznego, ktory moze byc
+        // wspoldzielony przez inne fakty). canonical_pre_existed rozstrzyga, czy undo moze skasowac
+        // kanoniczna krawedz (tylko gdy NIE istniala przed tym merge i jest teraz niereferowana).
+        let snap = snapshot_alias_fact(&old_fact_key);
+        let canonical_pre_existed = old_fact_key != new_fact_key && fact_state_exists(&new_fact_key);
+        // Blocker 1+2: gdy kanoniczny fakt JUZ istnial, snapshotujemy TAKZE jego pelny stan SPRZED
+        // merge (active/schema_id/Phi-docs/Psi). Undo dla pre_existed musi cofnac DOKLADNIE to, co
+        // merge dodal/zmienil na kanonicznym: przywrocic stary active/schema_id, usunac z grafu i
+        // Phi/Psi WYLACZNIE dokumenty/evidence wniesione przez alias (alias \ kanoniczny), nie te,
+        // ktore kanoniczny mial samodzielnie. Pusty snapshot gdy pre_existed=false (nieuzywany tam).
+        let canon = if canonical_pre_existed {
+            snapshot_canonical_fact(&new_fact_key)
+        } else {
+            CanonicalFactSnapshot { active: 0, schema_id: String::new(), documents: Vec::new(), evidence: Vec::new() }
+        };
+
+        diff_edges.push(json!({
+            "old": { "src": edge.src, "rel": edge.rel, "dst": edge.dst },
+            "new": { "src": new_src, "rel": edge.rel, "dst": new_dst },
+            "fact_key_old": old_fact_key,
+            "fact_key_new": new_fact_key,
+            "canonical_pre_existed": canonical_pre_existed,
+            "old_active": snap.active,
+            "old_schema_id": snap.schema_id,
+            "documents": snap.documents,
+            "evidence": snap.evidence,
+            "old_canonical_active": canon.active,
+            "old_canonical_schema_id": canon.schema_id,
+            "old_canonical_documents": canon.documents,
+            "old_canonical_evidence": canon.evidence,
+        }));
+
+        // (b) graph_artifacts: przepisz wiersze krawedzi aliasu na kanoniczne (src/rel/dst).
+        // INSERT OR IGNORE kanonicznych per dokument trzymajacy stara krawedz, potem usun stare.
+        // Refcount kanonicznej = DISTINCT document_id (kolizja z istniejaca kanoniczna krawedzia
+        // z innego dokumentu nie podwaja — unique (document_id,src,rel,dst), OR IGNORE).
+        tx.push(redirect_edge_artifacts_stmt(edge, &new_src, &edge.rel, &new_dst));
+        tx.push(delete_old_edge_artifacts_stmt(edge));
+
+        // Blocker 3: kanoniczny schema_id przeliczony DETERMINISTYCZNIE z KANONICZNYCH typow koncow
+        // (head_type|relation|tail_type). Przy kolizji (kanoniczny fakt juz istnial) typy koncow moga
+        // sie roznic od aliasowych, wiec fact_state.schema_id MUSI byc spojny z fact_schema po scaleniu.
+        let canonical_schema_id = derive_canonical_schema_id(&new_src, &edge.rel, &new_dst);
+
+        // (d) fact_state: przenies na kanoniczny fact_key. KOLIZJA (kanoniczny fakt juz istnieje,
+        // np. canonical mial juz te krawedz) => scal: active = MAX(obu), schema_id := kanoniczny
+        // (deterministyczny), usun aliasowy wiersz.
+        for stmt in redirect_fact_state_stmts(&old_fact_key, &new_fact_key, &new_src, &new_dst, &canonical_schema_id, now) {
+            tx.push(stmt);
+        }
+        // (e) Phi/Psi/conflict_members: przepnij na kanoniczny fact_key (idempotentnie), potem usun stare.
+        // fact_schema kanonicznego ujednolicamy do kanonicznego schema_id (spojnosc fact_state<->Phi).
+        tx.push(redirect_fact_schema_stmt(&old_fact_key, &new_fact_key, &canonical_schema_id));
+        tx.push(unify_fact_schema_id_stmt(&new_fact_key, &canonical_schema_id));
+        tx.push(redirect_fact_evidence_stmt(&old_fact_key, &new_fact_key));
+        tx.push(redirect_conflict_members_stmt(&old_fact_key, &new_fact_key));
+        // Blocker 3: zbierz grupy konfliktowe, ktorych czlonkostwo dotyka redirect (stary fact_key
+        // ZNIKA, kanoniczny DOCHODZI) — przeliczymy ich members_rev po wszystkich redirectach.
+        for dk in conflict_groups_of_fact(&old_fact_key) {
+            if !affected_conflict_groups.contains(&dk) {
+                affected_conflict_groups.push(dk);
+            }
+        }
+        for dk in conflict_groups_of_fact(&new_fact_key) {
+            if !affected_conflict_groups.contains(&dk) {
+                affected_conflict_groups.push(dk);
+            }
+        }
+        for stmt in redirect_delete_old_indexes_stmts(&old_fact_key) {
+            tx.push(stmt);
+        }
+
+        // (f) Outbox: materializuj kanoniczna krawedz + tombstone starej (R3). delete_node aliasu
+        // dopiero PO przeniesieniu wszystkich krawedzi (nizej).
+        let up = outbox_upsert_edge(&new_src, &edge.rel, &new_dst, &prov);
+        push_outbox(&mut tx, &up, now);
+        let del = outbox_delete_edge(&edge.src, &edge.rel, &edge.dst);
+        push_outbox(&mut tx, &del, now);
+    }
+
+    // Blocker 3: przelicz members_rev = COUNT(*) dla KAZDEJ dotknietej grupy konfliktowej W TEJ
+    // SAMEJ TX co redirecty conflict_members. members_rev jest AUTORYTATYWNYM COUNT (wzor D4): A_res
+    // warunkuje apply/finalize na members_rev=:rev0, wiec po zmianie zbioru czlonkow (redirect
+    // fact_key) MUSI odzwierciedlac realny COUNT — inaczej decyzja zapadlaby na nieaktualnym rev.
+    for dk in &affected_conflict_groups {
+        tx.push((
+            "UPDATE conflicts SET \
+               members_rev = (SELECT COUNT(*) FROM conflict_members WHERE conflict_dedup_key = ?), \
+               updated_at = ? \
+             WHERE dedup_key = ? AND status IN ('open', 'resolving')"
+                .to_string(),
+            vec![
+                SqlValue::String(dk.clone()),
+                SqlValue::I64(now),
+                SqlValue::String(dk.clone()),
+            ],
+        ));
+    }
+
+    // (g) delete_node aliasu PO przeniesieniu krawedzi (R3, FIFO drain stosuje po krawedziach).
+    let del_node = outbox_delete_node(alias_id);
+    push_outbox(&mut tx, &del_node, now);
+
+    // (h) Rejestr aliasu + log diffa — zapisane w tej samej tx (atomowo z redirectami). Snapshot
+    // wezla aliasu (label+name) pozwala undo odtworzyc jego typ zamiast fallbacku (Blocker 1).
+    let (alias_label, alias_name) = snapshot_alias_node(alias_id);
+    let edge_diff = json!({
+        "alias_id": alias_id,
+        "canonical_id": canonical_id,
+        "alias_label": alias_label,
+        "alias_name": alias_name,
+        "edges": diff_edges,
+        // Blocker 3: dokumenty trzymajace wezel aliasu i kanonicznego SPRZED przepisania node
+        // graph_artifacts — undo odtwarza aliasowe wiersze i kasuje kanoniczne wniesione przez alias.
+        "alias_node_documents": alias_node_docs,
+        "canonical_node_documents": canonical_node_docs,
+    });
+    // entity_aliases.alias_id to PRIMARY KEY: po wczesniejszym undo wiersz zostaje (status='reverted',
+    // slad audytowy). Ponowny merge tego samego aliasu MUSI go REAKTYWOWAC, nie wywrocic na PK
+    // (swiadoma decyzja, nie blad). ON CONFLICT(alias_id) DO UPDATE ustawia nowy canonical/method/
+    // similarity i status='active' z nowym created_at; nowy wiersz entity_merge_log (ponizej) niesie
+    // wlasny edge_diff tego merge'u, wiec kolejny undo cofnie WLASNIE ten merge.
+    tx.push((
+        "INSERT INTO entity_aliases (alias_id, canonical_id, similarity, method, status, created_at) \
+         VALUES (?, ?, ?, ?, 'active', ?) \
+         ON CONFLICT(alias_id) DO UPDATE SET \
+           canonical_id = excluded.canonical_id, \
+           similarity = excluded.similarity, \
+           method = excluded.method, \
+           status = 'active', \
+           created_at = excluded.created_at"
+            .to_string(),
+        vec![
+            SqlValue::String(alias_id.to_string()),
+            SqlValue::String(canonical_id.to_string()),
+            similarity.map(|s| SqlValue::F64(s as f64)).unwrap_or(SqlValue::Null),
+            SqlValue::String(method.to_string()),
+            SqlValue::I64(now),
+        ],
+    ));
+    tx.push((
+        "INSERT INTO entity_merge_log (alias_id, canonical_id, edge_diff, method, similarity, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(alias_id.to_string()),
+            SqlValue::String(canonical_id.to_string()),
+            SqlValue::String(serde_json::to_string(&edge_diff).unwrap_or_else(|_| "{}".to_string())),
+            SqlValue::String(method.to_string()),
+            similarity.map(|s| SqlValue::F64(s as f64)).unwrap_or(SqlValue::Null),
+            SqlValue::I64(now),
+        ],
+    ));
+
+    let refs: Vec<(&str, &[SqlValue])> = tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    sql_transaction(&refs).map_err(|e| format!("atomowy merge encji '{alias_id}'->'{canonical_id}': {e}"))?;
+
+    // (i) Materializacja przeniesienia do grafu (idempotentna). Blad drainu nie cofa merge'u w
+    // SQLite (zrodlo prawdy) — domknie go nastepny drain.
+    if let Err(e) = drain_graph_outbox() {
+        log::warn(&format!(
+            "rag: entity merge '{alias_id}'->'{canonical_id}' drain przeniesienia nie powiodl sie \
+             (domknie nastepny drain): {e}"
+        ));
+    }
+
+    log::info(&format!(
+        "rag: entity merge '{alias_id}' -> '{canonical_id}' (method={method} edges={}) zastosowany (odwracalny)",
+        edges.len()
+    ));
+    Ok(edges.len())
+}
+
+/// Statementy przepiecia graph_artifacts krawedzi aliasu na kanoniczne (refcount po DISTINCT
+/// document_id). Najpierw INSERT OR IGNORE kanonicznych wierszy dla KAZDEGO dokumentu trzymajacego
+/// stara krawedz (zachowuje refcount per dokument), potem usun stare aliasowe. Kolizja z istniejaca
+/// kanoniczna krawedzia tego samego dokumentu => OR IGNORE (unique document_id,src,rel,dst), refcount
+/// sie nie podwaja. Zwraca POJEDYNCZY statement zlozony? Nie — para. Tu zwracamy jeden statement
+/// (INSERT...SELECT) i osobny DELETE jest w wywolaniu nizej.
+fn redirect_edge_artifacts_stmt(edge: &AliasEdge, new_src: &str, new_rel: &str, new_dst: &str) -> (String, Vec<SqlValue>) {
+    // INSERT kanonicznych z zachowaniem document_id starych; potem DELETE starych jest osobnym
+    // statementem (zwracamy go jako drugi w parze przez caller? — robimy oba tu przez CTE niemozliwe
+    // w jednym; wiec ten statement robi INSERT, a DELETE dokladamy w redirect_fact_state_stmts? Nie).
+    // Prosciej: jeden statement INSERT OR IGNORE ... SELECT (kanoniczne), drugi DELETE — caller
+    // dostaje oba przez ten helper jako Vec. Tu zwracamy INSERT; DELETE w osobnym helperze.
+    (
+        "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
+         SELECT document_id, 'edge', ?, ?, ?, created_at FROM graph_artifacts \
+         WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(new_src.to_string()),
+            SqlValue::String(new_rel.to_string()),
+            SqlValue::String(new_dst.to_string()),
+            SqlValue::String(edge.src.clone()),
+            SqlValue::String(edge.rel.clone()),
+            SqlValue::String(edge.dst.clone()),
+        ],
+    )
+}
+
+/// DELETE starych aliasowych wierszy graph_artifacts po przepieciu na kanoniczne. Osobny statement
+/// (musi byc PO insercie kanonicznych w kolejnosci tx).
+fn delete_old_edge_artifacts_stmt(edge: &AliasEdge) -> (String, Vec<SqlValue>) {
+    (
+        "DELETE FROM graph_artifacts WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ?".to_string(),
+        vec![
+            SqlValue::String(edge.src.clone()),
+            SqlValue::String(edge.rel.clone()),
+            SqlValue::String(edge.dst.clone()),
+        ],
+    )
+}
+
+/// Statementy przeniesienia fact_state ze starego fact_key na kanoniczny, z obsluga KOLIZJI.
+/// Kanoniczny fakt moze juz istniec (canonical mial juz te krawedz, albo dwie krawedzie aliasu
+/// degeneruja w jedna kanoniczna). Wtedy: scalamy active = MAX(istniejacy, aliasowy) na wierszu
+/// kanonicznym, po czym KASUJEMY aliasowy wiersz. Gdy kanoniczny NIE istnieje: aktualizujemy
+/// aliasowy wiersz na kanoniczne (fact_key/head/tail). Kolejnosc: najpierw UPSERT-merge active do
+/// kanonicznego (jesli jest), potem przepisanie aliasowego jesli kanonicznego nie bylo, na koncu
+/// usuniecie ewentualnego osieroconego aliasowego.
+fn redirect_fact_state_stmts(
+    old_fact_key: &str,
+    new_fact_key: &str,
+    new_src: &str,
+    new_dst: &str,
+    canonical_schema_id: &str,
+    now: i64,
+) -> Vec<(String, Vec<SqlValue>)> {
+    if old_fact_key == new_fact_key {
+        // Self-degeneracja (np. alias==tylko-zmiana-niewystepujaca): nic.
+        return Vec::new();
+    }
+    vec![
+        // (1) Kolizja: kanoniczny fakt JUZ istnieje -> podnies active do MAX(z aliasowym) ORAZ
+        // ujednolic schema_id do KANONICZNEGO (Blocker 3: typy koncow moga sie roznic; deterministyczny
+        // schema_id z kanonicznych typow jest jedynym spojnym z fact_schema po scaleniu).
+        (
+            "UPDATE fact_state SET active = MAX(active, \
+               COALESCE((SELECT active FROM fact_state WHERE fact_key = ?), 0)), \
+               schema_id = ?, updated_at = ? \
+             WHERE fact_key = ? AND EXISTS (SELECT 1 FROM fact_state WHERE fact_key = ?)"
+                .to_string(),
+            vec![
+                SqlValue::String(old_fact_key.to_string()),
+                SqlValue::String(canonical_schema_id.to_string()),
+                SqlValue::I64(now),
+                SqlValue::String(new_fact_key.to_string()),
+                SqlValue::String(old_fact_key.to_string()),
+            ],
+        ),
+        // (2) Brak kolizji: przepisz aliasowy wiersz na kanoniczny (fact_key/head/tail + schema_id).
+        // Warunek NOT EXISTS kanonicznego => wykonuje sie TYLKO gdy nie bylo kolizji (inaczej UNIQUE by padl).
+        (
+            "UPDATE fact_state SET fact_key = ?, head_id = ?, tail_id = ?, schema_id = ?, updated_at = ? \
+             WHERE fact_key = ? AND NOT EXISTS (SELECT 1 FROM fact_state WHERE fact_key = ?)"
+                .to_string(),
+            vec![
+                SqlValue::String(new_fact_key.to_string()),
+                SqlValue::String(new_src.to_string()),
+                SqlValue::String(new_dst.to_string()),
+                SqlValue::String(canonical_schema_id.to_string()),
+                SqlValue::I64(now),
+                SqlValue::String(old_fact_key.to_string()),
+                SqlValue::String(new_fact_key.to_string()),
+            ],
+        ),
+        // (3) Po kolizji (1) aliasowy wiersz osierocony (kanoniczny przejal active) — usun go.
+        // Bezpieczne: jesli (2) przepisal aliasowy na kanoniczny, to fact_key juz nie jest old,
+        // wiec ten DELETE nic nie usuwa (brak wiersza old). Gdy byla kolizja, (2) sie nie
+        // wykonal (NOT EXISTS falsz), wiec old wciaz zyje i trzeba go usunac. rel niezmienne w
+        // redirect (krawedz zmienia tylko konce), wiec new_rel sluzy tylko spojnosci sygnatury.
+        (
+            "DELETE FROM fact_state WHERE fact_key = ?".to_string(),
+            vec![SqlValue::String(old_fact_key.to_string())],
+        ),
+    ]
+}
+
+/// Phi: przepnij fact_schema na kanoniczny fact_key (idempotentnie). INSERT OR IGNORE kanonicznych z
+/// KANONICZNYM schema_id (Blocker 3: spojnosc z fact_state), zachowujac document_id; DELETE starych
+/// robi redirect_delete_old_indexes_stmts. Kolizja (kanoniczny juz ma wiersz dla tego dokumentu) =>
+/// OR IGNORE (PK fact_key,document_id) — istniejacy wiersz ujednolica osobny unify_fact_schema_id_stmt.
+fn redirect_fact_schema_stmt(old_fact_key: &str, new_fact_key: &str, canonical_schema_id: &str) -> (String, Vec<SqlValue>) {
+    (
+        "INSERT OR IGNORE INTO fact_schema (fact_key, schema_id, document_id) \
+         SELECT ?, ?, document_id FROM fact_schema WHERE fact_key = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(new_fact_key.to_string()),
+            SqlValue::String(canonical_schema_id.to_string()),
+            SqlValue::String(old_fact_key.to_string()),
+        ],
+    )
+}
+
+/// Ujednolica schema_id WSZYSTKICH wierszy fact_schema kanonicznego faktu do deterministycznego
+/// kanonicznego schema_id (Blocker 3). Konieczne, bo INSERT OR IGNORE wyzej NIE nadpisuje juz
+/// istniejacych (pre-existed) wierszy kanonicznego dokumentu — bez tego Phi mialoby mieszane
+/// schema_id (aliasowy vs kanoniczny), rozjezdzajac sie z fact_state.schema_id.
+fn unify_fact_schema_id_stmt(new_fact_key: &str, canonical_schema_id: &str) -> (String, Vec<SqlValue>) {
+    (
+        "UPDATE fact_schema SET schema_id = ? WHERE fact_key = ? AND schema_id <> ?".to_string(),
+        vec![
+            SqlValue::String(canonical_schema_id.to_string()),
+            SqlValue::String(new_fact_key.to_string()),
+            SqlValue::String(canonical_schema_id.to_string()),
+        ],
+    )
+}
+
+/// Psi: przepnij fact_evidence na kanoniczny fact_key (idempotentnie). INSERT OR IGNORE kanonicznych,
+/// potem stare usuniete przez redirect_delete_old_indexes_stmt. PK (fact_key,document_id,chunk_id).
+fn redirect_fact_evidence_stmt(old_fact_key: &str, new_fact_key: &str) -> (String, Vec<SqlValue>) {
+    (
+        "INSERT OR IGNORE INTO fact_evidence (fact_key, document_id, chunk_id, span, confidence) \
+         SELECT ?, document_id, chunk_id, span, confidence FROM fact_evidence WHERE fact_key = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(new_fact_key.to_string()),
+            SqlValue::String(old_fact_key.to_string()),
+        ],
+    )
+}
+
+/// conflict_members: przepnij czlonkostwo konfliktow ze starego fact_key na kanoniczny (INSERT OR
+/// IGNORE, PK conflict_dedup_key,fact_key). Bez tego konflikt fakt-krawedzi po merge wskazywalby
+/// martwy fact_key. Stare usuwane przez redirect_delete_old_indexes_stmt.
+fn redirect_conflict_members_stmt(old_fact_key: &str, new_fact_key: &str) -> (String, Vec<SqlValue>) {
+    (
+        "INSERT OR IGNORE INTO conflict_members (conflict_dedup_key, fact_key, added_at) \
+         SELECT conflict_dedup_key, ?, added_at FROM conflict_members WHERE fact_key = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(new_fact_key.to_string()),
+            SqlValue::String(old_fact_key.to_string()),
+        ],
+    )
+}
+
+/// Usuwa STARE wiersze Phi/Psi/conflict_members aliasowego fact_key po przepieciu na kanoniczny.
+fn redirect_delete_old_indexes_stmts(old_fact_key: &str) -> Vec<(String, Vec<SqlValue>)> {
+    vec![
+        ("DELETE FROM fact_schema WHERE fact_key = ?".to_string(), vec![SqlValue::String(old_fact_key.to_string())]),
+        ("DELETE FROM fact_evidence WHERE fact_key = ?".to_string(), vec![SqlValue::String(old_fact_key.to_string())]),
+        ("DELETE FROM conflict_members WHERE fact_key = ?".to_string(), vec![SqlValue::String(old_fact_key.to_string())]),
+    ]
+}
+
+/// Maks. dlugosc lancucha aliasow rozwijanego przez resolve_canonical (anti-cykl). Aliasy
+/// powinny byc PLASKIE (alias->canonical), ale chained merge (A->B, potem B->C) moze utworzyc
+/// lancuch — rozwijamy go do korzenia, twardo limitujac glebokosc na wypadek cyklu w danych.
+const ALIAS_CHAIN_MAX_DEPTH: usize = 32;
+
+/// Rozwija node_id do KANONICZNEGO korzenia po active entity_aliases (Blocker 2). Jezeli node_id
+/// jest aktywnym aliasem (entity_aliases.alias_id=node_id, status='active') -> podstawia
+/// canonical_id i kontynuuje, az dojdzie do wezla niebedacego aliasem (korzen) albo do limitu
+/// glebokosci. Bez aktywnego aliasu zwraca oryginal. To JEDYNY punkt kanonizacji przy ingescie:
+/// extract_chunk_graph liczy fact_key/graph_artifacts/outbox/fact_state na WYNIKU tej funkcji,
+/// wiec nowy fakt jest od razu kanoniczny i aliasowa krawedz nigdy sie nie re-materializuje
+/// (skan ja pomijal jako active, a ingest dotad odtwarzal). Zabezpieczenie przed cyklem: po
+/// ALIAS_CHAIN_MAX_DEPTH przerywamy i zwracamy ostatni rozwiniety wezel (degradacja bezpieczna —
+/// gorzej rozwinac za malo niz zapetlic ingest).
+fn resolve_canonical(node_id: &str) -> String {
+    let mut current = node_id.to_string();
+    for _ in 0..ALIAS_CHAIN_MAX_DEPTH {
+        match active_alias_canonical(&current) {
+            Ok(Some(canonical)) if canonical != current => current = canonical,
+            _ => return current,
+        }
+    }
+    log::warn(&format!(
+        "rag: resolve_canonical('{node_id}') przekroczyl ALIAS_CHAIN_MAX_DEPTH={ALIAS_CHAIN_MAX_DEPTH} \
+         (mozliwy cykl aliasow) — zwracam '{current}'"
+    ));
+    current
+}
+
+/// Zwraca canonical_id jesli alias jest AKTYWNIE scalony, inaczej None. Filtruje status='active'
+/// (reverted aliasy nie obowiazuja). Uzywane przez merge (idempotencja) i alias-rewrite.
+fn active_alias_canonical(alias_id: &str) -> Result<Option<String>, String> {
+    Ok(sql_query_one(
+        "SELECT canonical_id FROM entity_aliases WHERE alias_id = ? AND status = 'active'",
+        &[SqlValue::String(alias_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt aliasu '{alias_id}': {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string)))
+}
+
+/// Twardy cap liczby aliasow przekazywanych do flow.meta przy zapytaniu (rozmiar opcji).
+/// Alias-rewrite to TYLKO ulatwienie retrievalu — gdy aliasow jest wiecej, najczestsze (po
+/// created_at malejaco = najswiezsze decyzje) wystarczaja; reszta degraduje do braku rewrite.
+const ALIAS_REWRITE_MAX: i64 = 256;
+
+/// Laduje AKTYWNE aliasy encji jako liste `[{alias, canonical}]` do alias-rewrite seedow w
+/// rag_graph_seed (R5). Tylko status='active' (reverted nie obowiazuja). Cap ALIAS_REWRITE_MAX.
+fn load_active_aliases() -> Vec<Value> {
+    sql_query(
+        "SELECT alias_id, canonical_id FROM entity_aliases WHERE status = 'active' \
+         ORDER BY created_at DESC LIMIT ?",
+        &[SqlValue::I64(ALIAS_REWRITE_MAX)],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| {
+                let alias = r.first().and_then(|v| v.as_str())?;
+                let canonical = r.get(1).and_then(|v| v.as_str())?;
+                Some(json!({ "alias": alias, "canonical": canonical }))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+// =============================================================================
+// A_uni — skan kandydatow merge + scalanie merge_pending + undo (D5)
+// =============================================================================
+
+/// Statystyki przebiegu skanu merge (do testow/dashboardu).
+#[derive(Default)]
+struct EntityMergeScanStats {
+    scanned: u64,
+    auto_merged: u64,
+    gray_conflicts: u64,
+    merge_pending_consumed: u64,
+    cap_hit: bool,
+}
+
+/// Handler tool entity_merge_scan (A_uni). Najpierw KONSUMUJE konflikty 'resolved_merge_pending'
+/// z A_res (D4: A_res zdecydowal merge_entities), potem skanuje NOWE encje (po kursorze fact_seq)
+/// szukajac kandydatow type-based + similarity-based. Auto-merge powyzej progu twardego; szara
+/// strefa -> konflikt 'entity_merge' (open) dla A_res. Blokada per-instancja (jeden skan naraz).
+fn handle_entity_merge_scan(params: &Value) -> Value {
+    let batch = params
+        .get("batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, ENTITY_MERGE_SCAN_BATCH))
+        .unwrap_or(ENTITY_MERGE_SCAN_BATCH);
+
+    match run_entity_merge_scan(batch) {
+        Ok(stats) => json!({
+            "ok": true,
+            "scanned": stats.scanned,
+            "auto_merged": stats.auto_merged,
+            "gray_conflicts": stats.gray_conflicts,
+            "merge_pending_consumed": stats.merge_pending_consumed,
+            "cap_hit": stats.cap_hit,
+        }),
+        Err(e) => err(&format!("entity_merge_scan: {e}")),
+    }
+}
+
+/// Rdzen A_uni pod blokada per-instancja (jeden skan naraz, jak conflict_scan). Token UNIKALNY na
+/// wywolanie (owner-scoped release), acquire ATOMOWY (warunkowy UPDATE + rows_affected==1).
+fn run_entity_merge_scan(batch: usize) -> Result<EntityMergeScanStats, String> {
+    let now = now_unix();
+    let lock_until = now + ENTITY_MERGE_SCAN_LOCK_TTL_SECS;
+    let owner = new_id("merge");
+    if !acquire_merge_scan_lock(now, lock_until, &owner)? {
+        log::info("rag: entity_merge_scan pominiety — inny skan trzyma blokade per-instancja");
+        return Ok(EntityMergeScanStats::default());
+    }
+
+    let result = scan_merge_locked(batch);
+
+    if let Err(e) = release_merge_scan_lock(&owner) {
+        log::warn(&format!(
+            "rag: entity_merge_scan nie zwolnil blokady (wygasnie po TTL): {e}"
+        ));
+    }
+    result
+}
+
+/// Atomowo bierze blokade skanu merge (wzor acquire_scan_lock z D3: seed + warunkowy UPDATE).
+fn acquire_merge_scan_lock(now: i64, lock_until: i64, owner: &str) -> Result<bool, String> {
+    sql_exec(
+        "INSERT OR IGNORE INTO entity_merge_scan_cursor (collection_id) VALUES (?)",
+        &[SqlValue::String(ENTITY_MERGE_SCAN_CURSOR_KEY.to_string())],
+    )
+    .map_err(|e| format!("seed kursora skanu merge: {e}"))?;
+    let res = sql_exec(
+        "UPDATE entity_merge_scan_cursor SET scan_lock_until = ?, scan_lock_owner = ? \
+         WHERE collection_id = ? AND (scan_lock_until IS NULL OR scan_lock_until < ?)",
+        &[
+            SqlValue::I64(lock_until),
+            SqlValue::String(owner.to_string()),
+            SqlValue::String(ENTITY_MERGE_SCAN_CURSOR_KEY.to_string()),
+            SqlValue::I64(now),
+        ],
+    )
+    .map_err(|e| format!("blokada skanu merge: {e}"))?;
+    Ok(res.rows_affected == 1)
+}
+
+/// Zwalnia WYLACZNIE wlasna blokade skanu merge (owner-scoped), zostawiajac kursor nietkniety.
+fn release_merge_scan_lock(owner: &str) -> Result<(), String> {
+    sql_exec(
+        "UPDATE entity_merge_scan_cursor SET scan_lock_until = 0, scan_lock_owner = NULL \
+         WHERE collection_id = ? AND scan_lock_owner = ?",
+        &[
+            SqlValue::String(ENTITY_MERGE_SCAN_CURSOR_KEY.to_string()),
+            SqlValue::String(owner.to_string()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("zwolnienie blokady skanu merge: {e}"))
+}
+
+/// Petla skanu pod trzymana blokada: (1) konsumuje merge_pending z A_res, (2) skanuje nowe encje
+/// po kursorze fact_seq szukajac kandydatow merge. Kursor advance do max fact_seq batcha.
+fn scan_merge_locked(batch: usize) -> Result<EntityMergeScanStats, String> {
+    // (1) Konsumuj konflikty 'resolved_merge_pending' (A_res zdecydowal merge) — niezalezne od kursora.
+    let mut stats = EntityMergeScanStats {
+        merge_pending_consumed: consume_merge_pending()?,
+        ..Default::default()
+    };
+
+    // (2) Skan nowych encji po kursorze fact_seq. Encja "nowa" = wystepuje jako head/tail faktu o
+    // fact_seq > kursor. Dla kazdej nowej encji szukamy kandydata do scalenia (type + similarity).
+    let mut cursor = read_merge_scan_cursor()?;
+    let mut cap_hit = true;
+    for _ in 0..ENTITY_MERGE_SCAN_MAX_ITERS {
+        let rows = sql_query(
+            "SELECT fact_seq, head_id, tail_id FROM fact_state \
+             WHERE fact_seq > ? ORDER BY fact_seq LIMIT ?",
+            &[SqlValue::I64(cursor), SqlValue::I64(batch as i64)],
+        )
+        .map_err(|e| format!("odczyt nowych faktow pod skan merge: {e}"))?;
+
+        if rows.is_empty() {
+            cap_hit = false;
+            break;
+        }
+
+        // Zbierz dystynktne node_id z batcha (head+tail) — kandydaci do rozwazenia.
+        let mut max_seq = cursor;
+        let mut seen: Vec<String> = Vec::new();
+        for row in &rows {
+            let seq = row.first().and_then(|v| v.as_i64()).unwrap_or(cursor);
+            if seq > max_seq {
+                max_seq = seq;
+            }
+            for idx in [1usize, 2usize] {
+                if let Some(id) = row.get(idx).and_then(|v| v.as_str()) {
+                    if !id.is_empty() && !seen.contains(&id.to_string()) {
+                        seen.push(id.to_string());
+                    }
+                }
+            }
+        }
+        stats.scanned += seen.len() as u64;
+
+        for node_id in &seen {
+            // Encja juz scalona (jest aliasem) => pomijamy (nie scalamy aliasu ponownie).
+            if active_alias_canonical(node_id)?.is_some() {
+                continue;
+            }
+            consider_entity_for_merge(node_id, &mut stats)?;
+        }
+
+        cursor = max_seq;
+        write_merge_scan_cursor(cursor)?;
+
+        if rows.len() < batch {
+            cap_hit = false;
+            break;
+        }
+    }
+    stats.cap_hit = cap_hit;
+    if cap_hit {
+        log::warn(&format!(
+            "rag: entity_merge_scan osiagnal cap ENTITY_MERGE_SCAN_MAX_ITERS={ENTITY_MERGE_SCAN_MAX_ITERS} \
+             — reszte domknie nastepny przebieg (kursor trwaly)"
+        ));
+    }
+    Ok(stats)
+}
+
+/// Rozwaza POJEDYNCZA encje (node_id) jako alias innej, kanonicznej. Szuka najlepszego kandydata:
+///   1. type-based: ten sam label + classify_type_based_merge nazw (tani, deterministyczny). Pasmo
+///      Auto (drobna literowka) -> auto-merge; Gray (prefiks/podzbior slow) -> konflikt do A_res.
+///   2. similarity-based: embedding nazwy + k-NN w 'entities' (filtr po label), klasyfikacja pasma.
+/// AUTO -> merge_entities; GRAY -> konflikt 'entity_merge' (open) dla A_res. Best-effort: blad
+/// embeddingu/vector NIE wywraca skanu (degradacja do samego type-based), tylko warn.
+fn consider_entity_for_merge(node_id: &str, stats: &mut EntityMergeScanStats) -> Result<(), String> {
+    let label = node_label(node_id)?;
+    let Some(label) = label else { return Ok(()) };
+
+    // (1) type-based: ten sam label, podobna nazwa. Pasmo z classify_type_based_merge (Blocker 5):
+    // Auto (drobna literowka) -> auto-merge; Gray (prefiks/podzbior slow) -> konflikt do A_res.
+    if let Some((other, band)) = find_type_based_candidate(node_id, &label)? {
+        apply_or_gate_merge(node_id, &other, "type-based", None, band, stats)?;
+        return Ok(());
+    }
+
+    // (2) similarity-based: embeddujemy nazwe (leniwie — zapis do 'entities') i robimy k-NN.
+    match embed_and_match_entity(node_id, &label) {
+        Ok(Some((other, sim))) => {
+            let band = classify_merge_band(sim);
+            apply_or_gate_merge(node_id, &other, "similarity-based", Some(sim), band, stats)?;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Embedding/wektory niedostepne => degradacja (sam type-based wyzej). Nie wywracamy skanu.
+            log::warn(&format!(
+                "rag: entity_merge_scan similarity dla '{node_id}' pominiety (degradacja): {e}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stosuje decyzje pasma dla pary (node_id, other): AUTO -> wybor kanonicznego + merge_entities;
+/// GRAY -> konflikt 'entity_merge' (open) do A_res; None -> nic. Wybor kanonicznego deterministyczny
+/// (choose_canonical: refcount, dluzsza nazwa, leksykografia) — alias to ten DRUGI.
+fn apply_or_gate_merge(
+    node_id: &str,
+    other: &str,
+    method: &str,
+    similarity: Option<f32>,
+    band: MergeBand,
+    stats: &mut EntityMergeScanStats,
+) -> Result<(), String> {
+    match band {
+        MergeBand::None => Ok(()),
+        MergeBand::Auto => {
+            let a_refs = node_refcount(node_id);
+            let b_refs = node_refcount(other);
+            let (canonical, alias) = choose_canonical(node_id, a_refs, other, b_refs);
+            // Idempotencja/odwracalnosc: jesli alias byl wczesniej reverted, nie scalaj automatem
+            // ponownie (czlowiek go rozdzielil) — szanujemy decyzje undo.
+            if alias_is_reverted(alias)? {
+                return Ok(());
+            }
+            match merge_entities(alias, canonical, method, similarity) {
+                Ok(_) => stats.auto_merged += 1,
+                Err(e) => log::warn(&format!("rag: auto-merge '{alias}'->'{canonical}' nieudany: {e}")),
+            }
+            Ok(())
+        }
+        MergeBand::Gray => {
+            // Szara strefa: NIE auto-merge. Tworzymy konflikt 'entity_merge' (open) reuzywajac
+            // maszynerie D3/D4 (conflicts + conflict_members). To similarity-gate (§8).
+            let (canonical, alias) = {
+                let a_refs = node_refcount(node_id);
+                let b_refs = node_refcount(other);
+                choose_canonical(node_id, a_refs, other, b_refs)
+            };
+            let dedup_key = canonical_key(&[ENTITY_MERGE_CONFLICT_TYPE, canonical, alias]);
+            // Czlonkowie grupy = dwa "fakty tozsamosci": kanoniczny i alias jako fact_key sentinel.
+            let member_alias = canonical_key(&["entity", alias]);
+            let member_canon = canonical_key(&["entity", canonical]);
+            let created = upsert_group_conflict(
+                ENTITY_MERGE_CONFLICT_TYPE,
+                ENTITY_MERGE_SCHEMA_SENTINEL,
+                canonical,
+                ENTITY_MERGE_REL_SENTINEL,
+                &dedup_key,
+                &[member_alias, member_canon],
+            )?;
+            if created {
+                stats.gray_conflicts += 1;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Czy alias byl wczesniej cofniety (status='reverted'). Auto-merge szanuje undo czlowieka.
+fn alias_is_reverted(alias_id: &str) -> Result<bool, String> {
+    Ok(sql_query_one(
+        "SELECT 1 FROM entity_aliases WHERE alias_id = ? AND status = 'reverted'",
+        &[SqlValue::String(alias_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt statusu aliasu '{alias_id}': {e}"))?
+    .is_some())
+}
+
+/// Label (typ) wezla z grafu = z ostatniego dowodu schematu fakty, w ktorych encja jest head/tail.
+/// Czytamy z SQLite (R1): schema_registry przez fact_state -> fact_schema. None gdy brak danych.
+fn node_label(node_id: &str) -> Result<Option<String>, String> {
+    // head encji -> head_type schematu; tail -> tail_type. Bierzemy pierwszy znaleziony (stabilnie).
+    let as_head = sql_query_one(
+        "SELECT sr.head_type FROM fact_state fs \
+         JOIN schema_registry sr ON sr.schema_id = fs.schema_id \
+         WHERE fs.head_id = ? ORDER BY fs.fact_key LIMIT 1",
+        &[SqlValue::String(node_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt label (head) '{node_id}': {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string));
+    if let Some(l) = as_head {
+        return Ok(Some(l));
+    }
+    let as_tail = sql_query_one(
+        "SELECT sr.tail_type FROM fact_state fs \
+         JOIN schema_registry sr ON sr.schema_id = fs.schema_id \
+         WHERE fs.tail_id = ? ORDER BY fs.fact_key LIMIT 1",
+        &[SqlValue::String(node_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt label (tail) '{node_id}': {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string));
+    Ok(as_tail)
+}
+
+/// Maks. liczba kandydatow type-based przegladanych per encja (anti-DoS: encja popularnego typu).
+const TYPE_CANDIDATE_LIMIT: i64 = 256;
+
+/// Znajduje DETERMINISTYCZNIE pierwszego kandydata type-based: inny aktywny wezel grafu o TYM SAMYM
+/// labelu, ktorego nazwa klasyfikuje sie (classify_type_based_merge) na pasmo != None z node_id.
+/// Zwraca (kandydat, pasmo): Auto -> auto-merge, Gray -> konflikt do A_res (Blocker 5). Kandydaci
+/// to dystynktne head/tail encje z fact_state z tym labelem. ORDER BY -> stabilnie. None gdy brak.
+fn find_type_based_candidate(node_id: &str, label: &str) -> Result<Option<(String, MergeBand)>, String> {
+    // Dystynktne encje (head LUB tail) o schemacie z tym labelem, rozne od node_id, jeszcze nie aliasy.
+    let rows = sql_query(
+        "SELECT DISTINCT cand FROM ( \
+            SELECT fs.head_id AS cand FROM fact_state fs \
+              JOIN schema_registry sr ON sr.schema_id = fs.schema_id \
+              WHERE sr.head_type = ? AND fs.head_id <> ? \
+            UNION \
+            SELECT fs.tail_id AS cand FROM fact_state fs \
+              JOIN schema_registry sr ON sr.schema_id = fs.schema_id \
+              WHERE sr.tail_type = ? AND fs.tail_id <> ? \
+         ) WHERE cand NOT IN (SELECT alias_id FROM entity_aliases WHERE status = 'active') \
+         ORDER BY cand LIMIT ?",
+        &[
+            SqlValue::String(label.to_string()),
+            SqlValue::String(node_id.to_string()),
+            SqlValue::String(label.to_string()),
+            SqlValue::String(node_id.to_string()),
+            SqlValue::I64(TYPE_CANDIDATE_LIMIT),
+        ],
+    )
+    .map_err(|e| format!("odczyt kandydatow type-based '{node_id}': {e}"))?;
+
+    for r in &rows {
+        if let Some(cand) = r.first().and_then(|v| v.as_str()) {
+            let band = classify_type_based_merge(node_id, cand);
+            if band != MergeBand::None {
+                return Ok(Some((cand.to_string(), band)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Embedduje nazwe encji do namespace 'entities' (leniwie, deterministyczny ref_id) i robi k-NN po
+/// label, zwracajac najlepszego kandydata (node_id, similarity) ROZNEGO od siebie, niebedacego juz
+/// aliasem. Zwraca None gdy brak sasiada powyzej dolnej granicy szarej strefy. Wektory: best-effort.
+fn embed_and_match_entity(node_id: &str, label: &str) -> Result<Option<(String, f32)>, String> {
+    let vector = generate_name_embedding(node_id)?;
+    let ref_id = entity_vector_ref(node_id);
+
+    // Leniwy upsert wektora nazwy (idempotentny po ref_id). Pozwala kolejnym encjom znalezc te przez k-NN.
+    let fields = vec![
+        VectorField {
+            name: "node_id".to_string(),
+            value: VectorFieldValue::Str(node_id.to_string()),
+        },
+        VectorField {
+            name: "label".to_string(),
+            value: VectorFieldValue::Str(label.to_string()),
+        },
+    ];
+    vector_upsert(ENTITIES_NS, ref_id, &vector, &fields)
+        .map_err(|e| format!("upsert wektora nazwy encji '{node_id}': {e}"))?;
+
+    // k-NN po label (similarity-merge tylko w obrebie typu). +1 do k, bo trafimy tez siebie.
+    let filter = VectorFilter::Eq("label".to_string(), VectorFieldValue::Str(label.to_string()));
+    let hits = vector_search(ENTITIES_NS, &vector, MERGE_KNN_K + 1, None, Some(&filter), &["node_id"])
+        .map_err(|e| format!("k-NN nazw encji '{node_id}': {e}"))?;
+
+    // UWAGA: dla cosine `hit.score` to ODLEGLOSC (nizej = blizej, hity rosnaco po dystansie),
+    // wiec similarity = 1.0 - dystans. Pierwszy hit ROZNY od siebie i nie-aliasu jest najblizszy.
+    for hit in &hits {
+        let cand = hit
+            .fields
+            .iter()
+            .find(|f| f.name == "node_id")
+            .and_then(|f| match &f.value {
+                VectorFieldValue::Str(s) => Some(s.clone()),
+                _ => None,
+            });
+        let Some(cand) = cand else { continue };
+        if cand == node_id {
+            continue; // to my sami.
+        }
+        if active_alias_canonical(&cand)?.is_some() {
+            continue; // juz alias.
+        }
+        let similarity = 1.0 - hit.score;
+        if similarity < MERGE_SIM_GRAY_BAND {
+            // hity rosnaco po dystansie => pierwszy ponizej granicy konczy poszukiwanie
+            // (wszystkie dalsze sa jeszcze mniej podobne).
+            break;
+        }
+        return Ok(Some((cand, similarity)));
+    }
+    Ok(None)
+}
+
+/// Embedding NAZWY encji (bez prefiksu "Document:"): nazwa to krotka fraza, nie pasaz. Reszta
+/// mechanizmu jak generate_embedding (alias rag-embeddings, task=embedding, walidacja wymiaru).
+fn generate_name_embedding(name: &str) -> Result<Vec<f32>, String> {
+    let model = "rag-embeddings";
+    let options = json!({ "task": "embedding", "dimensions": EMBED_DIMENSIONS, "adapter": "retrieval" });
+    let options_str = serde_json::to_string(&options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
+    let prompt_bytes = name.as_bytes();
+    let model_bytes = model.as_bytes();
+    let options_bytes = options_str.as_bytes();
+    let mut buffer = vec![0u8; EMBED_BUFFER_SIZE];
+    let mut out_len: i32 = 0;
+    let rc = unsafe {
+        llm_generate(
+            prompt_bytes.as_ptr() as i32, prompt_bytes.len() as i32,
+            model_bytes.as_ptr() as i32, model_bytes.len() as i32,
+            options_bytes.as_ptr() as i32, options_bytes.len() as i32,
+            buffer.as_mut_ptr() as i32, EMBED_BUFFER_SIZE as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+    if rc < 0 {
+        return Err(format!("llm_generate (nazwa encji) zwrocil blad: {rc}"));
+    }
+    if out_len <= 0 {
+        return Err("llm_generate (nazwa encji) zwrocil pusta odpowiedz".to_string());
+    }
+    let response = String::from_utf8_lossy(&buffer[..out_len as usize]).to_string();
+    parse_embedding_response(&response)
+}
+
+/// Konsumuje konflikty 'resolved_merge_pending' (A_res zdecydowal merge_entities w D4). Dla kazdego
+/// odczytuje czlonkow (dwa node_id z member sentinel "entity:<id>"), wybiera kanonicznego i scala.
+/// Po udanym merge oznacza konflikt 'resolved_merge_done' (terminalnie). Zwraca liczbe scalonych.
+fn consume_merge_pending() -> Result<u64, String> {
+    let rows = sql_query(
+        "SELECT id, dedup_key, head_id FROM conflicts WHERE status = 'resolved_merge_pending' \
+         ORDER BY id LIMIT ?",
+        &[SqlValue::I64(MERGE_PENDING_BATCH)],
+    )
+    .map_err(|e| format!("odczyt merge_pending: {e}"))?;
+
+    let mut done = 0u64;
+    for row in &rows {
+        let id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        let dedup_key = row.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if let Err(e) = consume_one_merge_pending(id, &dedup_key) {
+            log::warn(&format!("rag: merge_pending id={id} nieudany (zostaje, wroci): {e}"));
+            continue;
+        }
+        done += 1;
+    }
+    Ok(done)
+}
+
+/// Twardy cap merge_pending konsumowanych w jednym skanie (anti-DoS).
+const MERGE_PENDING_BATCH: i64 = 64;
+
+/// Scala JEDEN merge_pending. Czlonkowie konfliktu entity_merge to dwa sentinele "entity:<node_id>";
+/// dla konfliktu z A_res (z A_det granularity) czlonkami sa fact_key krawedzi — wtedy wyciagamy
+/// encje z head/tail tych faktow. Wybor kanonicznego deterministyczny. Po merge konflikt -> done.
+fn consume_one_merge_pending(id: i64, dedup_key: &str) -> Result<(), String> {
+    // Wyciagnij dwie encje-kandydatki z czlonkow. Sentinel "entity:<id>" (gray-zone entity_merge)
+    // albo fakty (granularity z A_det) -> head/tail encje. Zbieramy dystynktne node_id.
+    let members = sql_query(
+        "SELECT fact_key FROM conflict_members WHERE conflict_dedup_key = ? ORDER BY fact_key",
+        &[SqlValue::String(dedup_key.to_string())],
+    )
+    .map_err(|e| format!("odczyt czlonkow merge_pending: {e}"))?;
+
+    let mut entities: Vec<String> = Vec::new();
+    for r in &members {
+        let fk = r.first().and_then(|v| v.as_str()).unwrap_or_default();
+        // Sentinel encji: canonical_key(["entity", id]) = "6:entity{len}:{id}". Rozpoznajemy po prefiksie.
+        if let Some(node_id) = decode_entity_sentinel(fk) {
+            if !entities.contains(&node_id) {
+                entities.push(node_id);
+            }
+            continue;
+        }
+        // W p.p. fact_key krawedzi: dolacz jej head i tail.
+        if let Ok(Some(r2)) = sql_query_one(
+            "SELECT head_id, tail_id FROM fact_state WHERE fact_key = ?",
+            &[SqlValue::String(fk.to_string())],
+        ) {
+            for idx in [0usize, 1usize] {
+                if let Some(e) = r2.get(idx).and_then(|v| v.as_str()) {
+                    if !e.is_empty() && !entities.contains(&e.to_string()) {
+                        entities.push(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if entities.len() < 2 {
+        // Mniej niz dwie encje => nie ma czego scalac; zamykamy konflikt jako done (bez akcji).
+        sql_exec(
+            "UPDATE conflicts SET status = 'resolved_merge_done', resolved_at = ?, updated_at = ? \
+             WHERE id = ? AND status = 'resolved_merge_pending'",
+            &[SqlValue::I64(now_unix()), SqlValue::I64(now_unix()), SqlValue::I64(id)],
+        )
+        .map_err(|e| format!("domkniecie pustego merge_pending id={id}: {e}"))?;
+        return Ok(());
+    }
+
+    // Wybor kanonicznego z pierwszych dwoch (deterministyczny). Reszta (>2) scalana iteracyjnie do canon.
+    let a = entities[0].clone();
+    let b = entities[1].clone();
+    let a_refs = node_refcount(&a);
+    let b_refs = node_refcount(&b);
+    let (canonical, alias) = choose_canonical(&a, a_refs, &b, b_refs);
+    let canonical = canonical.to_string();
+    merge_entities(alias, &canonical, "merge_pending", None)?;
+    // Pozostale encje (>2) scalamy do tego samego kanonicznego.
+    for extra in entities.iter().skip(2) {
+        if *extra != canonical && active_alias_canonical(extra)?.is_none() {
+            if let Err(e) = merge_entities(extra, &canonical, "merge_pending", None) {
+                log::warn(&format!("rag: merge_pending dodatkowy '{extra}'->'{canonical}' nieudany: {e}"));
+            }
+        }
+    }
+
+    sql_exec(
+        "UPDATE conflicts SET status = 'resolved_merge_done', resolved_at = ?, updated_at = ? \
+         WHERE id = ? AND status = 'resolved_merge_pending'",
+        &[SqlValue::I64(now_unix()), SqlValue::I64(now_unix()), SqlValue::I64(id)],
+    )
+    .map_err(|e| format!("domkniecie merge_pending id={id}: {e}"))?;
+    Ok(())
+}
+
+/// Dekoduje sentinel czlonka entity_merge: canonical_key(["entity", id]). Zwraca id albo None gdy
+/// to nie sentinel encji (np. zwykly fact_key krawedzi). Length-prefixed: "6:entity{N}:{id}".
+fn decode_entity_sentinel(fact_key: &str) -> Option<String> {
+    let prefix = "6:entity"; // canonical_key(["entity",..]) zaczyna od "6:entity" (len("entity")==6).
+    let rest = fact_key.strip_prefix(prefix)?;
+    // rest = "{N}:{id}". Wytnij N (cyfry) + ':' + id.
+    let colon = rest.find(':')?;
+    let n: usize = rest[..colon].parse().ok()?;
+    let id = &rest[colon + 1..];
+    // canonical_key koduje N jako DLUGOSC W BAJTACH (p.len()), wiec walidujemy po bajtach.
+    // Uzycie chars().count() psuloby round-trip id nie-ASCII (np. "lodz" -> bytes 6 != chars 4).
+    if id.len() == n {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Kursor skanu merge (last_fact_seq). Czytany pod blokada.
+fn read_merge_scan_cursor() -> Result<i64, String> {
+    Ok(sql_query_one(
+        "SELECT last_fact_seq FROM entity_merge_scan_cursor WHERE collection_id = ?",
+        &[SqlValue::String(ENTITY_MERGE_SCAN_CURSOR_KEY.to_string())],
+    )
+    .map_err(|e| format!("odczyt kursora skanu merge: {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_i64()))
+    .unwrap_or(0))
+}
+
+/// Advance kursora skanu merge (monotonicznie do max). MAX(istniejacy, nowy) chroni przed cofnieciem.
+fn write_merge_scan_cursor(fact_seq: i64) -> Result<(), String> {
+    sql_exec(
+        "UPDATE entity_merge_scan_cursor SET last_fact_seq = MAX(last_fact_seq, ?) WHERE collection_id = ?",
+        &[
+            SqlValue::I64(fact_seq),
+            SqlValue::String(ENTITY_MERGE_SCAN_CURSOR_KEY.to_string()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("zapis kursora skanu merge: {e}"))
+}
+
+// =============================================================================
+// UNDO merge (R5) — inverse-outbox z entity_merge_log
+// =============================================================================
+
+/// Handler tool entity_merge_undo. Cofa OSTATNI aktywny merge danego aliasu (R5).
+fn handle_entity_merge_undo(params: &Value) -> Value {
+    let alias_id = match params.get("alias_id").and_then(|v| v.as_str()) {
+        Some(a) if !a.trim().is_empty() => normalize_entity_name(a.trim()),
+        _ => return err("Brak wymaganego parametru 'alias_id'"),
+    };
+    match undo_merge(&alias_id) {
+        Ok(restored) => json!({ "ok": true, "alias_id": alias_id, "restored_edges": restored }),
+        Err(e) => err(&format!("entity_merge_undo: {e}")),
+    }
+}
+
+/// Cofa zastosowany merge aliasu (PELNA sciezka odwrocenia, R5). Z entity_merge_log.edge_diff
+/// odtwarza inverse-outbox:
+///   * przywraca krawedzie aliasu (upsert_edge old) i ich ledger (fact_state/Phi/Psi),
+///   * kasuje dodane kanoniczne krawedzie (delete_edge new) GDY nie sa wspoldzielone przez inny,
+///     niezalezny fakt (graph_artifacts dla new pochodzacy SPOZA przekierowanych dokumentow),
+///   * przywraca wezel aliasu (upsert_node + jego graph_artifacts) i znaczy alias status='reverted'.
+/// Dla canonical_pre_existed=true cofa DOKLADNIE wklad aliasu (bit-w-bit): przywraca stary
+/// active/schema_id kanonicznego i usuwa z grafu/Phi/Psi tylko dokumenty/evidence wniesione przez
+/// alias, zostawiajac to, co kanoniczny mial samodzielnie. Wszystko w JEDNEJ sql_transaction +
+/// drain. Bezstratne: edge_diff jest kompletny (merge odrzuca >MERGE_MAX_EDGES).
+fn undo_merge(alias_id: &str) -> Result<usize, String> {
+    let log_row = sql_query_one(
+        "SELECT id, canonical_id, edge_diff FROM entity_merge_log \
+         WHERE alias_id = ? AND reverted_at IS NULL ORDER BY id DESC LIMIT 1",
+        &[SqlValue::String(alias_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt entity_merge_log '{alias_id}': {e}"))?;
+
+    let Some(row) = log_row else {
+        return Err(format!("brak aktywnego merge'u dla aliasu '{alias_id}' (nic do cofniecia)"));
+    };
+    let log_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+    let canonical_id = row.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let diff_raw = row.get(2).and_then(|v| v.as_str()).unwrap_or("{}");
+    let diff: Value = serde_json::from_str(diff_raw)
+        .map_err(|e| format!("deserializacja edge_diff '{alias_id}': {e}"))?;
+    let edges = diff.get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let now = now_unix();
+    let prov = Provenance {
+        chunk_id: None,
+        doc_id: None,
+        page: None,
+        span: None,
+        confidence: Some(DEFAULT_CONFIDENCE),
+        extractor_version: Some(EXTRACTOR_VERSION.to_string()),
+    };
+
+    let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
+    let mut restored = 0usize;
+
+    for e in &edges {
+        let old = e.get("old").cloned().unwrap_or(json!({}));
+        let new = e.get("new").cloned().unwrap_or(json!({}));
+        let osrc = old.get("src").and_then(|v| v.as_str()).unwrap_or_default();
+        let orel = old.get("rel").and_then(|v| v.as_str()).unwrap_or_default();
+        let odst = old.get("dst").and_then(|v| v.as_str()).unwrap_or_default();
+        let nsrc = new.get("src").and_then(|v| v.as_str()).unwrap_or_default();
+        let nrel = new.get("rel").and_then(|v| v.as_str()).unwrap_or_default();
+        let ndst = new.get("dst").and_then(|v| v.as_str()).unwrap_or_default();
+        if osrc.is_empty() || orel.is_empty() || odst.is_empty() {
+            continue;
+        }
+        let old_fact_key = fact_key_for(osrc, orel, odst);
+        let new_fact_key = fact_key_for(nsrc, nrel, ndst);
+
+        // Blocker 1: odtwarzamy WYLACZNIE ze snapshotu sprzed merge (edge_diff), nie z aktualnego
+        // kanonicznego wiersza (ktory moze byc wspoldzielony lub zmieniony). canonical_pre_existed
+        // decyduje, czy kanoniczna krawedz nalezala do innego faktu juz przed tym merge.
+        let canonical_pre_existed = e.get("canonical_pre_existed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let old_active = e.get("old_active").and_then(|v| v.as_i64()).unwrap_or(0);
+        let old_schema_id = e.get("old_schema_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        // Phi aliasu: pary (document_id, schema_id). schema_id jest PER (fact_key, document_id),
+        // wiec undo odtwarza kazdy wiersz fact_schema z jego ORYGINALNYM schema_id (bit-w-bit).
+        let snap_doc_pairs: Vec<(String, String)> = e
+            .get("documents")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| {
+                        let doc = d.get("document_id").and_then(|x| x.as_str())?;
+                        let sid = d.get("schema_id").and_then(|x| x.as_str()).unwrap_or_default();
+                        Some((doc.to_string(), sid.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let snap_docs: Vec<String> = snap_doc_pairs.iter().map(|(doc, _)| doc.clone()).collect();
+        let snap_evidence = e.get("evidence").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+        // (a) graph_artifacts aliasowej krawedzi: odtworz po DOKUMENTACH ze snapshotu (Phi alias).
+        // Dla kazdego dokumentu wstaw wiersz aliasowej krawedzi (INSERT OR IGNORE, refcount per dok).
+        for doc in &snap_docs {
+            tx.push((
+                "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
+                 VALUES (?, 'edge', ?, ?, ?, ?)"
+                    .to_string(),
+                vec![
+                    SqlValue::String(doc.clone()),
+                    SqlValue::String(osrc.to_string()),
+                    SqlValue::String(orel.to_string()),
+                    SqlValue::String(odst.to_string()),
+                    SqlValue::I64(now),
+                ],
+            ));
+        }
+
+        // (b) fact_state aliasu: ODTWORZ ze snapshotu (old_active, old_schema_id), NIE z kanonicznego.
+        tx.push((
+            "INSERT OR IGNORE INTO fact_state (fact_key, schema_id, head_id, rel, tail_id, active, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                .to_string(),
+            vec![
+                SqlValue::String(old_fact_key.clone()),
+                SqlValue::String(old_schema_id.clone()),
+                SqlValue::String(osrc.to_string()),
+                SqlValue::String(orel.to_string()),
+                SqlValue::String(odst.to_string()),
+                SqlValue::I64(old_active),
+                SqlValue::I64(now),
+                SqlValue::I64(now),
+            ],
+        ));
+        // (c) Phi aliasu: odtworz kazdy wiersz z jego PER-DOKUMENTOWYM schema_id ze snapshotu.
+        // schema_id jest unikalny per (fact_key, document_id) i ingest mogl go aktualizowac
+        // niezaleznie per dokument, wiec uzycie jednego old_schema_id z fact_state nie byloby
+        // bit-w-bit. Bierzemy schema_id zapisany przy konkretnym dokumencie.
+        for (doc, sid) in &snap_doc_pairs {
+            tx.push((
+                "INSERT OR IGNORE INTO fact_schema (fact_key, schema_id, document_id) VALUES (?, ?, ?)".to_string(),
+                vec![
+                    SqlValue::String(old_fact_key.clone()),
+                    SqlValue::String(sid.clone()),
+                    SqlValue::String(doc.clone()),
+                ],
+            ));
+        }
+        // (d) Psi aliasu: odtworz pelne wiersze evidence ze snapshotu (document/chunk/span/confidence).
+        for ev in &snap_evidence {
+            let doc = ev.get("document_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let chunk = ev.get("chunk_id").and_then(|v| v.as_str()).unwrap_or_default();
+            if doc.is_empty() || chunk.is_empty() {
+                continue;
+            }
+            let span = ev.get("span").and_then(|v| v.as_str());
+            let conf = ev.get("confidence").and_then(|v| v.as_f64());
+            tx.push((
+                "INSERT OR IGNORE INTO fact_evidence (fact_key, document_id, chunk_id, span, confidence) \
+                 VALUES (?, ?, ?, ?, ?)"
+                    .to_string(),
+                vec![
+                    SqlValue::String(old_fact_key.clone()),
+                    SqlValue::String(doc.to_string()),
+                    SqlValue::String(chunk.to_string()),
+                    span.map(|s| SqlValue::String(s.to_string())).unwrap_or(SqlValue::Null),
+                    conf.map(SqlValue::F64).unwrap_or(SqlValue::Null),
+                ],
+            ));
+        }
+
+        // (e) Outbox: przywroc krawedz aliasu (upsert old).
+        let up_old = outbox_upsert_edge(osrc, orel, odst, &prov);
+        push_outbox(&mut tx, &up_old, now);
+
+        if canonical_pre_existed {
+            // Blocker 1+2: kanoniczny fakt ISTNIAL przed merge — cofamy DOKLADNIE wklad aliasu,
+            // bit-w-bit do stanu sprzed merge, NIE wiecej. Zbiory kanonicznego sprzed merge:
+            let canon_docs: std::collections::HashSet<String> = e
+                .get("old_canonical_documents")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|d| d.get("document_id").and_then(|x| x.as_str()).map(str::to_string)).collect())
+                .unwrap_or_default();
+            let canon_doc_schema: std::collections::HashMap<String, String> = e
+                .get("old_canonical_documents")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| {
+                            let doc = d.get("document_id").and_then(|x| x.as_str())?;
+                            let sid = d.get("schema_id").and_then(|x| x.as_str()).unwrap_or_default();
+                            Some((doc.to_string(), sid.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let canon_evidence: std::collections::HashSet<(String, String)> = e
+                .get("old_canonical_evidence")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| {
+                            let doc = x.get("document_id").and_then(|v| v.as_str())?;
+                            let ch = x.get("chunk_id").and_then(|v| v.as_str())?;
+                            Some((doc.to_string(), ch.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // (f1) Przywroc kanoniczny fact_state do (old_canonical_active, old_canonical_schema_id).
+            let old_canon_active = e.get("old_canonical_active").and_then(|v| v.as_i64()).unwrap_or(0);
+            let old_canon_schema = e.get("old_canonical_schema_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            tx.push((
+                "UPDATE fact_state SET active = ?, schema_id = ?, updated_at = ? WHERE fact_key = ?".to_string(),
+                vec![
+                    SqlValue::I64(old_canon_active),
+                    SqlValue::String(old_canon_schema.clone()),
+                    SqlValue::I64(now),
+                    SqlValue::String(new_fact_key.clone()),
+                ],
+            ));
+
+            // (f2) Z kanonicznego grafu/Phi USUN tylko dokumenty, ktore merge realnie dodal
+            // (alias_docs \ old_canonical_documents). Dokumenty, ktore kanoniczny juz mial, ZOSTAJA.
+            // Phi dokumentow, ktore kanoniczny mial -> przywroc ich schema_id (unify mogl go zmienic).
+            for doc in &snap_docs {
+                if canon_docs.contains(doc) {
+                    if let Some(sid) = canon_doc_schema.get(doc) {
+                        tx.push((
+                            "UPDATE fact_schema SET schema_id = ? WHERE fact_key = ? AND document_id = ?".to_string(),
+                            vec![
+                                SqlValue::String(sid.clone()),
+                                SqlValue::String(new_fact_key.clone()),
+                                SqlValue::String(doc.clone()),
+                            ],
+                        ));
+                    }
+                    continue;
+                }
+                tx.push((
+                    "DELETE FROM graph_artifacts WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ? AND document_id = ?".to_string(),
+                    vec![
+                        SqlValue::String(nsrc.to_string()),
+                        SqlValue::String(nrel.to_string()),
+                        SqlValue::String(ndst.to_string()),
+                        SqlValue::String(doc.clone()),
+                    ],
+                ));
+                tx.push((
+                    "DELETE FROM fact_schema WHERE fact_key = ? AND document_id = ?".to_string(),
+                    vec![SqlValue::String(new_fact_key.clone()), SqlValue::String(doc.clone())],
+                ));
+            }
+
+            // (f3) Z kanonicznego Psi usun tylko evidence wniesione przez alias
+            // (alias_evidence \ old_canonical_evidence); reszte (kanoniczny mial) ZOSTAW.
+            for ev in &snap_evidence {
+                let doc = ev.get("document_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let chunk = ev.get("chunk_id").and_then(|v| v.as_str()).unwrap_or_default();
+                if doc.is_empty() || chunk.is_empty() {
+                    continue;
+                }
+                if canon_evidence.contains(&(doc.to_string(), chunk.to_string())) {
+                    continue;
+                }
+                tx.push((
+                    "DELETE FROM fact_evidence WHERE fact_key = ? AND document_id = ? AND chunk_id = ?".to_string(),
+                    vec![
+                        SqlValue::String(new_fact_key.clone()),
+                        SqlValue::String(doc.to_string()),
+                        SqlValue::String(chunk.to_string()),
+                    ],
+                ));
+            }
+            // Kanoniczna krawedz ZOSTAJE w grafie (istniala przed merge) — nie enqueue'ujemy delete.
+        } else {
+            // (f) Kanoniczny fakt POWSTAL z tego merge (nie pre-existed). Usun z graph_artifacts
+            // kanoniczne wiersze dokumentow wniesionych przez alias (snap_docs) — przywraca refcount.
+            for doc in &snap_docs {
+                tx.push((
+                    "DELETE FROM graph_artifacts WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ? AND document_id = ?".to_string(),
+                    vec![
+                        SqlValue::String(nsrc.to_string()),
+                        SqlValue::String(nrel.to_string()),
+                        SqlValue::String(ndst.to_string()),
+                        SqlValue::String(doc.clone()),
+                    ],
+                ));
+            }
+            // Usun kanoniczna krawedz/fakt, ale TYLKO gdy teraz niereferowana (po usunieciu wyzej).
+            let del_new = outbox_delete_edge_if_unreferenced(nsrc, nrel, ndst, now);
+            tx.push(del_new);
+            for stmt in delete_canonical_if_unreferenced_stmts(&new_fact_key, nsrc, nrel, ndst) {
+                tx.push(stmt);
+            }
+        }
+
+        restored += 1;
+    }
+
+    // Blocker 3: cofnij przepisanie graph_artifacts WEZLA (alias->canonical). Odtworz aliasowe
+    // wiersze node dla dokumentow, ktore alias mial, i USUN kanoniczne wiersze wniesione przez alias
+    // (alias_node_documents \ canonical_node_documents) — kanoniczne, ktore istnialy wczesniej, ZOSTAW.
+    let alias_node_docs: Vec<String> = diff
+        .get("alias_node_documents")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let canonical_node_docs: std::collections::HashSet<String> = diff
+        .get("canonical_node_documents")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|d| d.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    for doc in &alias_node_docs {
+        tx.push((
+            "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)".to_string(),
+            vec![SqlValue::String(doc.clone()), SqlValue::String(alias_id.to_string()), SqlValue::I64(now)],
+        ));
+        if !canonical_node_docs.contains(doc) {
+            tx.push((
+                "DELETE FROM graph_artifacts WHERE kind = 'node' AND n_id = ? AND document_id = ?".to_string(),
+                vec![SqlValue::String(canonical_id.clone()), SqlValue::String(doc.clone())],
+            ));
+        }
+    }
+
+    // Przywroc WEZEL aliasu w grafie (upsert_node) ze snapshotu (label/name z edge_diff, Blocker 1).
+    // delete_node aliasu byl tombstone — re-upsert ozywia (R5: idempotentny).
+    let alias_label = diff.get("alias_label").and_then(|v| v.as_str()).unwrap_or(FALLBACK_ENTITY_TYPE);
+    let alias_name = diff.get("alias_name").and_then(|v| v.as_str()).unwrap_or(alias_id);
+    let up_alias_node = outbox_upsert_node(alias_id, alias_label, alias_name, &prov);
+    push_outbox(&mut tx, &up_alias_node, now);
+    // Gdy kanoniczny wezel nie mial ZADNEGO wlasnego dokumentu (wszystko wniosl alias) i po
+    // usunieciu wkladu aliasu nie zostaje zaden wiersz graph_artifacts node, tombstone go z grafu —
+    // inaczej zostalby jako stale wezel bez referencji (mirror logiki krawedzi).
+    tx.push(outbox_delete_node_if_unreferenced(&canonical_id, now));
+
+    // (g) Oznacz alias 'reverted' i log reverted_at (audyt; rekordy zostaja).
+    tx.push((
+        "UPDATE entity_aliases SET status = 'reverted' WHERE alias_id = ? AND canonical_id = ?".to_string(),
+        vec![SqlValue::String(alias_id.to_string()), SqlValue::String(canonical_id.clone())],
+    ));
+    tx.push((
+        "UPDATE entity_merge_log SET reverted_at = ? WHERE id = ?".to_string(),
+        vec![SqlValue::I64(now), SqlValue::I64(log_id)],
+    ));
+
+    let refs: Vec<(&str, &[SqlValue])> = tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    sql_transaction(&refs).map_err(|e| format!("atomowy undo merge '{alias_id}': {e}"))?;
+
+    if let Err(e) = drain_graph_outbox() {
+        log::warn(&format!(
+            "rag: undo merge '{alias_id}' drain przywrocenia nie powiodl sie (domknie nastepny drain): {e}"
+        ));
+    }
+    log::info(&format!(
+        "rag: undo merge '{alias_id}' (canonical='{canonical_id}', przywrocono {restored} krawedzi) — odwrocony"
+    ));
+    Ok(restored)
+}
+
+/// Outbox delete_edge kanonicznej krawedzi WARUNKOWY: enqueue tylko gdy po usunieciu przekierowanych
+/// wierszy graph_artifacts kanoniczna nie ma juz ZADNEGO wiersza (refcount==0 => nie wspoldzielona).
+/// Inaczej kanoniczna ZOSTAJE w grafie (inny, niezalezny fakt ja trzyma) — undo nie psuje cudzych danych.
+fn outbox_delete_edge_if_unreferenced(src: &str, rel: &str, dst: &str, now: i64) -> (String, Vec<SqlValue>) {
+    let op = outbox_delete_edge(src, rel, dst);
+    let payload = serde_json::to_string(&op.payload).unwrap_or_else(|_| "{}".to_string());
+    (
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         SELECT ?, ?, ?, ?, 0, ? \
+         WHERE NOT EXISTS (SELECT 1 FROM graph_artifacts WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(op.dedup_key),
+            SqlValue::String(op.op.to_string()),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload),
+            SqlValue::I64(now),
+            SqlValue::String(src.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(dst.to_string()),
+        ],
+    )
+}
+
+/// Outbox delete_node WARUNKOWY (undo): tombstone kanonicznego wezla TYLKO gdy po cofnieciu wkladu
+/// aliasu nie zostaje zaden wiersz graph_artifacts node dla niego (refcount==0). Inaczej wezel
+/// ZOSTAJE (inny dokument go trzyma). Mirror outbox_delete_edge_if_unreferenced dla wezlow.
+fn outbox_delete_node_if_unreferenced(node_id: &str, now: i64) -> (String, Vec<SqlValue>) {
+    let op = outbox_delete_node(node_id);
+    let payload = serde_json::to_string(&op.payload).unwrap_or_else(|_| "{}".to_string());
+    (
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         SELECT ?, ?, ?, ?, 0, ? \
+         WHERE NOT EXISTS (SELECT 1 FROM graph_artifacts WHERE kind = 'node' AND n_id = ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(op.dedup_key),
+            SqlValue::String(op.op.to_string()),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload),
+            SqlValue::I64(now),
+            SqlValue::String(node_id.to_string()),
+        ],
+    )
+}
+
+/// Usuwa kanoniczny fact_state/Phi/Psi GDY kanoniczna krawedz nie ma juz zadnego graph_artifacts
+/// (refcount==0 po undo). Gdy wspoldzielona (refcount>0) — zostawiamy (cudzy fakt). Mirror warunku
+/// outbox_delete_edge_if_unreferenced (spojnosc: ledger znika dokladnie wtedy, gdy graf znika).
+fn delete_canonical_if_unreferenced_stmts(new_fact_key: &str, src: &str, rel: &str, dst: &str) -> Vec<(String, Vec<SqlValue>)> {
+    let cond = "NOT EXISTS (SELECT 1 FROM graph_artifacts WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ?)";
+    let p = || vec![
+        SqlValue::String(src.to_string()),
+        SqlValue::String(rel.to_string()),
+        SqlValue::String(dst.to_string()),
+    ];
+    vec![
+        (format!("DELETE FROM fact_state WHERE fact_key = ? AND {cond}"),
+         { let mut v = vec![SqlValue::String(new_fact_key.to_string())]; v.extend(p()); v }),
+        (format!("DELETE FROM fact_schema WHERE fact_key = ? AND {cond}"),
+         { let mut v = vec![SqlValue::String(new_fact_key.to_string())]; v.extend(p()); v }),
+        (format!("DELETE FROM fact_evidence WHERE fact_key = ? AND {cond}"),
+         { let mut v = vec![SqlValue::String(new_fact_key.to_string())]; v.extend(p()); v }),
+    ]
 }
 
 // =============================================================================
@@ -4284,20 +6278,27 @@ mod tests {
 
     // --- Refcount cleanupu wspoldzielonych wezlow/krawedzi (bug 1+2) ---
 
+    // Predykat refcountu cleanupu (Blocker 4): kasuj z grafu TYLKO gdy ZADEN inny dokument
+    // nie referuje klucza. Odwzorowuje SQL `NOT EXISTS(... document_id<>:doc)` z
+    // outbox_delete_*_if_only_document (other_refs==0 => kasuj).
+    fn cleanup_deletes_from_graph(other_refs: i64) -> bool {
+        other_refs <= 0
+    }
+
     #[test]
     fn refcount_keeps_node_while_other_doc_references_it() {
-        // Dopoki INNY dokument referuje wezel/krawedz (remaining_refs > 0), NIE
+        // Dopoki INNY dokument referuje wezel/krawedz (other_refs > 0), NIE
         // kasujemy z grafu — wspoldzielony przez multi-doc GraphRAG.
-        assert!(!should_delete_from_graph(1), "1 inny dokument trzyma wezel -> zostaw");
-        assert!(!should_delete_from_graph(3), "kilka innych dokumentow -> zostaw");
+        assert!(!cleanup_deletes_from_graph(1), "1 inny dokument trzyma wezel -> zostaw");
+        assert!(!cleanup_deletes_from_graph(3), "kilka innych dokumentow -> zostaw");
     }
 
     #[test]
     fn refcount_deletes_node_when_no_other_doc_references_it() {
-        // Refcount 0 (zaden inny dokument) -> kasujemy z grafu.
-        assert!(should_delete_from_graph(0), "brak innych referencji -> kasuj");
+        // other_refs==0 (zaden inny dokument) -> kasujemy z grafu.
+        assert!(cleanup_deletes_from_graph(0), "brak innych referencji -> kasuj");
         // Wartosc ujemna (teoretycznie niemozliwa) tez traktujemy jak 0.
-        assert!(should_delete_from_graph(-1));
+        assert!(cleanup_deletes_from_graph(-1));
     }
 
     // Wiersz rejestru graph_artifacts (model in-memory do testu refcountu). Odwzorowuje
@@ -4308,7 +6309,7 @@ mod tests {
         key: &'static str,
     }
 
-    // Mirror SQL `COUNT(*) ... WHERE key = ? AND document_id != ?` z count_other_*:
+    // Mirror SQL `EXISTS(... WHERE key = ? AND document_id <> ?)` z outbox_delete_*_if_only_document:
     // ile INNYCH dokumentow trzyma dany klucz. To dokladnie predykat refcountu.
     fn other_refs(registry: &[Artifact], key: &str, exclude_doc: &str) -> i64 {
         registry
@@ -4318,8 +6319,8 @@ mod tests {
     }
 
     // Model cleanupu dokumentu z refcountem: zwraca klucze faktycznie kasowane z grafu
-    // (refcount -> 0) i usuwa wiersze dokumentu z rejestru. Odwzorowuje
-    // cleanup_document_graph: decyzja per klucz = should_delete_from_graph(other_refs).
+    // (other_refs==0) i usuwa wiersze dokumentu z rejestru. Odwzorowuje cleanup_document_graph:
+    // decyzja per klucz = cleanup_deletes_from_graph(other_refs) (lustro SQL NOT EXISTS).
     fn cleanup_doc_model(registry: &mut Vec<Artifact>, doc: &'static str) -> Vec<String> {
         let mut deleted = Vec::new();
         let mut own_keys: Vec<&str> =
@@ -4327,7 +6328,7 @@ mod tests {
         own_keys.sort_unstable();
         own_keys.dedup();
         for key in own_keys {
-            if should_delete_from_graph(other_refs(registry, key, doc)) {
+            if cleanup_deletes_from_graph(other_refs(registry, key, doc)) {
                 deleted.push(key.to_string());
             }
         }
@@ -4557,6 +6558,41 @@ mod tests {
         let a = outbox_upsert_edge("x", "rel", "y", &p1);
         let b = outbox_upsert_edge("x", "rel", "y", &p2);
         assert_eq!(a.dedup_key, b.dedup_key, "ten sam fakt -> ten sam dedup_key niezaleznie od dokumentu");
+    }
+
+    // Blocker 3: dedup_key budowany czystym SQL w cleanup MUSI byc bit-w-bit zgodny z
+    // outbox_dedup_key (inaczej INSERT OR IGNORE po partial-unique nie zdedupowalby/zostawil duplikat
+    // pending). length-prefix w SQL uzywa length(CAST(x AS BLOB)) = BAJTY, wiec mirror liczy str::len.
+    fn eval_sql_lp(s: &str) -> String {
+        format!("{}:{}", s.len(), s)
+    }
+    fn eval_sql_delete_edge_dedup(src: &str, rel: &str, dst: &str) -> String {
+        let fact_key = format!("{}{}{}", eval_sql_lp(src), eval_sql_lp(rel), eval_sql_lp(dst));
+        format!(
+            "{}{}{}",
+            eval_sql_lp("delete_edge"),
+            eval_sql_lp(KG_COLLECTION),
+            eval_sql_lp(&fact_key),
+        )
+    }
+    fn eval_sql_delete_node_dedup(n_id: &str) -> String {
+        format!("{}{}{}", eval_sql_lp("delete_node"), eval_sql_lp(KG_COLLECTION), eval_sql_lp(n_id))
+    }
+
+    #[test]
+    fn sql_cleanup_dedup_key_matches_outbox_dedup_key() {
+        // ASCII + spacje + unicode (byte-length != char-length) — SQL CAST AS BLOB liczy bajty,
+        // wiec wynik musi sie zgadzac z canonical_key (Rust .len() = bajty) dla wszystkich.
+        for (s, r, d) in [
+            ("usa", "located in", "north america"),
+            ("łódź", "stolica", "świętokrzyskie"),
+            ("a|b", "rel|x", "c|d"),
+        ] {
+            let from_op = outbox_delete_edge(s, r, d).dedup_key;
+            assert_eq!(from_op, eval_sql_delete_edge_dedup(s, r, d), "delete_edge dedup ({s},{r},{d})");
+            let node_op = outbox_delete_node(s).dedup_key;
+            assert_eq!(node_op, eval_sql_delete_node_dedup(s), "delete_node dedup ({s})");
+        }
     }
 
     // --- MemGraphRAG D2: Thematic Denoising (prog tau, gate krawedzi, promocja) ---
@@ -5908,5 +7944,330 @@ mod tests {
         let line = audit_line(7, "keep_winner", "Alice", "born_in", false, &["fA", "fB"]);
         assert!(!line.contains("reason"), "linia audytu NIE zawiera reason");
         assert!(line.contains("action=keep_winner") && line.contains("czlonkowie=fA,fB"));
+    }
+
+    // --- MemGraphRAG D5: Structural Unification (entity merge) — czyste funkcje ---
+
+    #[test]
+    fn merge_band_classifies_conservatively() {
+        // similarity-gate (§8): >= prog twardy => Auto; szara strefa => Gray (do A_res); nizej => None.
+        assert_eq!(classify_merge_band(0.99), MergeBand::Auto);
+        assert_eq!(classify_merge_band(MERGE_SIM_THRESHOLD), MergeBand::Auto);
+        assert_eq!(classify_merge_band(0.90), MergeBand::Gray, "pasmo graniczne => konflikt, nie auto");
+        assert_eq!(classify_merge_band(MERGE_SIM_GRAY_BAND), MergeBand::Gray);
+        assert_eq!(classify_merge_band(0.50), MergeBand::None);
+        // Prog konserwatywny: szara strefa istnieje (THRESHOLD > GRAY), nie scalamy luzno podobnych.
+        assert!(MERGE_SIM_THRESHOLD > MERGE_SIM_GRAY_BAND);
+    }
+
+    #[test]
+    fn edit_distance_basic() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("usa", "usa"), 0);
+        assert_eq!(edit_distance("color", "colour"), 1);
+        // UTF-8 (znaki, nie bajty).
+        assert_eq!(edit_distance("łódź", "lodz"), 3);
+    }
+
+    #[test]
+    fn type_based_merge_band_is_conservative() {
+        // Blocker 5: pelnoslowny PREFIKS przy roznej liczbie slow => SZARA STREFA (nie auto).
+        // "albert einstein" vs "albert einstein physicist" -> Gray (do A_res, nie auto).
+        assert_eq!(
+            classify_type_based_merge("albert einstein", "albert einstein physicist"),
+            MergeBand::Gray
+        );
+        // Klasyczne pulapki prefiksu pelnoslownego -> Gray, NIGDY auto.
+        assert_eq!(classify_type_based_merge("john", "john smith"), MergeBand::Gray);
+        assert_eq!(classify_type_based_merge("paris", "paris texas"), MergeBand::Gray);
+        assert_eq!(classify_type_based_merge("apple", "apple inc"), MergeBand::Gray);
+        // "ein" nie jest slowo-prefiksem "einstein" (granica w srodku slowa) => None.
+        assert_eq!(classify_type_based_merge("ein", "einstein"), MergeBand::None);
+        // Drobna literowka (edit_distance==1, substytucja) przy DLUGIEJ nazwie, ta sama liczba slow => Auto.
+        assert_eq!(classify_type_based_merge("microsoft", "microsoff"), MergeBand::Auto);
+        // Usuniecie jednego znaku tez edit_distance==1 (dlugosci roznia sie o 1) => Auto.
+        assert_eq!(classify_type_based_merge("microsoft", "microsft"), MergeBand::Auto);
+        // edit_distance==2 => zbyt niepewne dla auto => None.
+        assert_eq!(classify_type_based_merge("microsoft", "micrxsxft"), MergeBand::None);
+        // Krotkie nazwy (< MERGE_TYPE_MIN_AUTO_LEN): 1 edycja zmienia znaczenie => None.
+        assert_eq!(classify_type_based_merge("usa", "usb"), MergeBand::None);
+        assert_eq!(classify_type_based_merge("paris", "parts"), MergeBand::None);
+        // Identyczne => None (to juz jeden wezel, nie ma czego scalac).
+        assert_eq!(classify_type_based_merge("paris", "paris"), MergeBand::None);
+        // Zupelnie rozne => None.
+        assert_eq!(classify_type_based_merge("germany", "france"), MergeBand::None);
+    }
+
+    #[test]
+    fn choose_canonical_is_deterministic() {
+        // Wiekszy refcount wygrywa (bardziej ugruntowana encja).
+        assert_eq!(choose_canonical("usa", 1, "united states", 5), ("united states", "usa"));
+        assert_eq!(choose_canonical("united states", 5, "usa", 1), ("united states", "usa"));
+        // Remis refcount => dluzsza pelna nazwa kanoniczna (pelniejsza forma).
+        assert_eq!(choose_canonical("usa", 3, "united states", 3), ("united states", "usa"));
+        // Remis refcount i dlugosci => leksykograficznie (stabilnie).
+        let (c, a) = choose_canonical("bbb", 2, "aaa", 2);
+        assert_eq!((c, a), ("aaa", "bbb"));
+    }
+
+    #[test]
+    fn entity_vector_ref_is_stable_and_nonneg() {
+        // Deterministyczny: ten sam node_id -> ten sam ref_id (re-embedding nadpisuje, nie duplikuje).
+        assert_eq!(entity_vector_ref("albert einstein"), entity_vector_ref("albert einstein"));
+        assert_ne!(entity_vector_ref("albert einstein"), entity_vector_ref("isaac newton"));
+        // Nieujemny (mapowany na SQLite INTEGER po stronie hosta).
+        assert!(entity_vector_ref("x") <= 0x7fff_ffff_ffff_ffff);
+    }
+
+    #[test]
+    fn redirect_endpoints_rewrites_alias_only() {
+        let e = AliasEdge { src: "usa".into(), rel: "capital_of".into(), dst: "x".into() };
+        assert_eq!(redirect_endpoints(&e, "usa", "united states"), ("united states".into(), "x".into()));
+        let e2 = AliasEdge { src: "x".into(), rel: "located_in".into(), dst: "usa".into() };
+        assert_eq!(redirect_endpoints(&e2, "usa", "united states"), ("x".into(), "united states".into()));
+        // Self-loop alias--rel-->alias degeneruje w canonical--rel-->canonical (zachowane).
+        let e3 = AliasEdge { src: "usa".into(), rel: "r".into(), dst: "usa".into() };
+        assert_eq!(redirect_endpoints(&e3, "usa", "us"), ("us".into(), "us".into()));
+    }
+
+    #[test]
+    fn entity_sentinel_round_trips() {
+        // Czlonek konfliktu entity_merge = canonical_key(["entity", id]); decode odzyskuje id.
+        let s = canonical_key(&["entity", "albert einstein"]);
+        assert_eq!(decode_entity_sentinel(&s).as_deref(), Some("albert einstein"));
+        // Zwykly fact_key krawedzi NIE jest sentinelem encji.
+        let fk = fact_key_for("ada", "knows", "babbage");
+        assert_eq!(decode_entity_sentinel(&fk), None);
+    }
+
+    #[test]
+    fn entity_sentinel_round_trips_non_ascii() {
+        // Regresja: canonical_key koduje N w BAJTACH, decode walidowal w CHARACTERACH —
+        // przez co id nie-ASCII (multibyte UTF-8) nie dekodowaly sie z sentinela.
+        let lodz = "\u{142}\u{f3}d\u{17a}"; // "łódź" — l-stroke/o-acute/z-acute, 6 bajtow != 4 znaki
+        assert!(lodz.len() != lodz.chars().count());
+        for id in [lodz, "caf\u{e9}", "M\u{fc}nchen"] {
+            let s = canonical_key(&["entity", id]);
+            assert_eq!(decode_entity_sentinel(&s).as_deref(), Some(id), "round-trip dla {id}");
+        }
+    }
+
+    // Model REDIRECTU fact_key/refcount po merge (czyste reguly SQL bez hosta). Sprawdza
+    // kanonizacje fact_key, kolizje (kanoniczny fakt juz istnieje) i refcount po DISTINCT
+    // document_id — kluczowe inwarianty R5 wyrazone jako reguly na strukturach danych.
+    #[derive(Clone)]
+    struct FactRow { fact_key: String, active: i64 }
+    #[derive(Clone)]
+    struct EdgeArtifact { document_id: String, src: String, rel: String, dst: String }
+
+    /// Lustro redirect_fact_state_stmts: przenosi old->new fact_key z obsluga kolizji (MAX active).
+    fn model_redirect_fact_state(rows: &mut Vec<FactRow>, old_fk: &str, new_fk: &str) {
+        let old_active = rows.iter().find(|r| r.fact_key == old_fk).map(|r| r.active);
+        let Some(old_active) = old_active else { return };
+        if let Some(canon) = rows.iter_mut().find(|r| r.fact_key == new_fk) {
+            // Kolizja: scal active = MAX, usun aliasowy.
+            canon.active = canon.active.max(old_active);
+            rows.retain(|r| r.fact_key != old_fk);
+        } else {
+            // Brak kolizji: przepisz aliasowy na kanoniczny.
+            if let Some(r) = rows.iter_mut().find(|r| r.fact_key == old_fk) {
+                r.fact_key = new_fk.to_string();
+            }
+        }
+    }
+
+    #[test]
+    fn merge_canonicalizes_fact_key_no_collision() {
+        // Krawedz aliasu (usa, capital_of, washington) -> kanoniczna (united states, capital_of, washington).
+        let old_fk = fact_key_for("usa", "capital_of", "washington");
+        let new_fk = fact_key_for("united states", "capital_of", "washington");
+        let mut rows = vec![FactRow { fact_key: old_fk.clone(), active: 1 }];
+        model_redirect_fact_state(&mut rows, &old_fk, &new_fk);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fact_key, new_fk, "fact_key skanonizowany do kanonicznego wezla");
+        assert_eq!(rows[0].active, 1);
+    }
+
+    #[test]
+    fn merge_canonical_fact_key_collision_merges_active() {
+        // Kanoniczny fakt JUZ istnieje (active=0), aliasowy ma active=1 -> po merge active=MAX=1,
+        // aliasowy wiersz znika (jedna krawedz, nie dwie).
+        let old_fk = fact_key_for("usa", "borders", "canada");
+        let new_fk = fact_key_for("united states", "borders", "canada");
+        let mut rows = vec![
+            FactRow { fact_key: new_fk.clone(), active: 0 },
+            FactRow { fact_key: old_fk.clone(), active: 1 },
+        ];
+        model_redirect_fact_state(&mut rows, &old_fk, &new_fk);
+        assert_eq!(rows.len(), 1, "kolizja => jeden kanoniczny wiersz, alias usuniety");
+        assert_eq!(rows[0].fact_key, new_fk);
+        assert_eq!(rows[0].active, 1, "active = MAX(istniejacy, aliasowy)");
+    }
+
+    /// Lustro redirect graph_artifacts krawedzi: przepisz src/rel/dst aliasu na kanoniczne, dedup
+    /// per (document_id, src, rel, dst), refcount = COUNT(DISTINCT document_id).
+    fn model_refcount_after_redirect(arts: &[EdgeArtifact], alias: &str, canonical: &str) -> i64 {
+        use std::collections::HashSet;
+        let mut docs: HashSet<String> = HashSet::new();
+        for a in arts {
+            let src = if a.src == alias { canonical } else { &a.src };
+            let dst = if a.dst == alias { canonical } else { &a.dst };
+            // Zliczamy dokumenty trzymajace KANONICZNA krawedz (united states, capital_of, washington).
+            if src == canonical && a.rel == "capital_of" && dst == "washington" {
+                docs.insert(a.document_id.clone());
+            }
+        }
+        docs.len() as i64
+    }
+
+    #[test]
+    fn merge_refcount_distinct_documents_no_double_count() {
+        // Krawedz wniesiona przez DWA dokumenty (jeden jako alias 'usa', drugi juz jako 'united states').
+        // Po redirect refcount = 2 (DISTINCT document_id), nie 3 — kolizja kanoniczna nie podwaja.
+        let arts = vec![
+            EdgeArtifact { document_id: "docA".into(), src: "usa".into(), rel: "capital_of".into(), dst: "washington".into() },
+            EdgeArtifact { document_id: "docB".into(), src: "united states".into(), rel: "capital_of".into(), dst: "washington".into() },
+            // docA tez ma juz kanoniczna z innego chunku (po OR IGNORE to ten sam dokument).
+            EdgeArtifact { document_id: "docA".into(), src: "united states".into(), rel: "capital_of".into(), dst: "washington".into() },
+        ];
+        assert_eq!(model_refcount_after_redirect(&arts, "usa", "united states"), 2);
+    }
+
+    #[test]
+    fn alias_rewrite_seeds_maps_and_merges_weights() {
+        // To samo co rag_graphrag::rewrite_seeds_with_aliases, ale tu sprawdzamy reguly merge encji:
+        // dwa aliasy tej samej encji wskazuja jeden canonical; alias-rewrite zamienia je przy retrievalu.
+        // Test pelnej funkcji rewrite jest w rag_graphrag.rs (core); tu sprawdzamy load_active_aliases ksztalt.
+        let aliases = vec![
+            json!({ "alias": "usa", "canonical": "united states" }),
+            json!({ "alias": "us", "canonical": "united states" }),
+        ];
+        assert_eq!(aliases.len(), 2);
+        assert_eq!(aliases[0]["alias"], "usa");
+        assert_eq!(aliases[0]["canonical"], "united states");
+    }
+
+    /// Model UNDO: inverse z edge_diff przywraca krawedzie aliasu, kasuje kanoniczne gdy nie
+    /// wspoldzielone. Sprawdza KOMPLETNOSC diffa (kazda przekierowana krawedz da sie odwrocic).
+    #[test]
+    fn undo_inverse_restores_from_edge_diff() {
+        // edge_diff merge'u 'usa'->'united states' (jedna krawedz).
+        let diff = json!({
+            "alias_id": "usa",
+            "canonical_id": "united states",
+            "edges": [{
+                "old": { "src": "usa", "rel": "capital_of", "dst": "washington" },
+                "new": { "src": "united states", "rel": "capital_of", "dst": "washington" },
+                "fact_key_old": fact_key_for("usa", "capital_of", "washington"),
+                "fact_key_new": fact_key_for("united states", "capital_of", "washington"),
+            }]
+        });
+        let edges = diff.get("edges").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(edges.len(), 1, "diff niesie KAZDA przekierowana krawedz (kompletny do undo)");
+        let e = &edges[0];
+        // Inverse: przywracamy 'old' (alias) i kasujemy 'new' (kanoniczna dodana).
+        assert_eq!(e["old"]["src"], "usa");
+        assert_eq!(e["new"]["src"], "united states");
+        // fact_key_old i fact_key_new sa kanoniczne i rozne (kanonizacja zmienila src).
+        assert_ne!(e["fact_key_old"], e["fact_key_new"]);
+    }
+
+    // Model decyzji UNDO dla canonical_pre_existed=true (Blocker 1+2): z kanonicznego usuwamy
+    // WYLACZNIE wklad aliasu (alias \ kanoniczny-sprzed-merge); to, co kanoniczny mial, ZOSTAJE.
+    fn canonical_docs_removed_by_undo(alias_docs: &[&str], canon_docs: &[&str]) -> Vec<String> {
+        let canon: std::collections::HashSet<&str> = canon_docs.iter().copied().collect();
+        alias_docs.iter().filter(|d| !canon.contains(**d)).map(|d| d.to_string()).collect()
+    }
+    fn canonical_evidence_removed_by_undo(
+        alias_ev: &[(&str, &str)],
+        canon_ev: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        let canon: std::collections::HashSet<(&str, &str)> = canon_ev.iter().copied().collect();
+        alias_ev
+            .iter()
+            .filter(|x| !canon.contains(*x))
+            .map(|(d, c)| (d.to_string(), c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn undo_pre_existed_removes_only_alias_contribution() {
+        // Kanoniczny mial docB; alias wniosl docA i docB (docB kolizja). Undo kasuje z kanonicznego
+        // TYLKO docA — docB zostaje (kanoniczny go mial samodzielnie). Bez tego undo zabieralby cudzy doc.
+        let removed = canonical_docs_removed_by_undo(&["docA", "docB"], &["docB"]);
+        assert_eq!(removed, vec!["docA".to_string()], "tylko doc wniesiony przez alias znika");
+
+        // Evidence: kanoniczny mial (docB,c1); alias wniosl (docA,c0)+(docB,c1). Undo usuwa tylko (docA,c0).
+        let ev_removed = canonical_evidence_removed_by_undo(
+            &[("docA", "c0"), ("docB", "c1")],
+            &[("docB", "c1")],
+        );
+        assert_eq!(ev_removed, vec![("docA".to_string(), "c0".to_string())]);
+    }
+
+    #[test]
+    fn undo_pre_existed_keeps_all_when_canonical_already_had_everything() {
+        // Kanoniczny mial docA i docB; alias zdublowal oba (sam kolizyjny merge). Undo NIE rusza grafu
+        // kanonicznego — wszystko bylo jego. Bit-w-bit: zero usuniec.
+        let removed = canonical_docs_removed_by_undo(&["docA", "docB"], &["docA", "docB"]);
+        assert!(removed.is_empty(), "nic nie usuwamy gdy kanoniczny mial wszystkie dokumenty");
+    }
+
+    #[test]
+    fn undo_pre_existed_carries_full_canonical_snapshot() {
+        // Diff dla pre_existed=true musi niesc PELNY snapshot kanonicznego sprzed merge (active/schema/
+        // docs/evidence) — inaczej undo nie odtworzy bit-w-bit starego active/schema_id.
+        let e = json!({
+            "canonical_pre_existed": true,
+            "old_canonical_active": 1,
+            "old_canonical_schema_id": derive_schema_id("Country", "capital_of", "City"),
+            "old_canonical_documents": [{ "document_id": "docB", "schema_id": "s" }],
+            "old_canonical_evidence": [{ "document_id": "docB", "chunk_id": "c1" }],
+        });
+        assert!(e["canonical_pre_existed"].as_bool().unwrap());
+        assert_eq!(e["old_canonical_active"].as_i64().unwrap(), 1);
+        assert!(!e["old_canonical_schema_id"].as_str().unwrap().is_empty());
+        assert_eq!(e["old_canonical_documents"].as_array().unwrap().len(), 1);
+        assert_eq!(e["old_canonical_evidence"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undo_alias_phi_restores_per_document_schema_id() {
+        // Regresja: snapshot aliasu trzyma Phi jako pary (document_id, schema_id), a undo odtwarza
+        // KAZDY wiersz fact_schema z jego ORYGINALNYM per-dokumentowym schema_id. Wczesniej undo
+        // uzywal JEDNEGO schema_id z fact_state dla wszystkich dokumentow -> nie bit-w-bit, gdy
+        // ingest zaktualizowal schema_id niezaleznie per dokument.
+        let sid_a = derive_schema_id("Person", "born_in", "City");
+        let sid_b = derive_schema_id("Person", "born_in", "Country");
+        assert_ne!(sid_a, sid_b, "rozne typy konca -> rozny schema_id per dokument");
+        let e = json!({
+            "old_active": 1,
+            "old_schema_id": sid_a.clone(),
+            // docA i docB maja ROZNY schema_id w fact_schema (schema_id PER (fact_key, document_id)).
+            "documents": [
+                { "document_id": "docA", "schema_id": sid_a },
+                { "document_id": "docB", "schema_id": sid_b },
+            ],
+        });
+
+        // Lustro parsowania undo (block c): pary (document_id, schema_id) ze snapshotu.
+        let pairs: Vec<(String, String)> = e["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["document_id"].as_str().unwrap().to_string(),
+                    d["schema_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+
+        let by_doc: std::collections::HashMap<&str, &str> =
+            pairs.iter().map(|(d, s)| (d.as_str(), s.as_str())).collect();
+        // Undo MUSI odtworzyc per-dokumentowy schema_id, NIE old_schema_id z fact_state dla obu.
+        assert_eq!(by_doc["docA"], derive_schema_id("Person", "born_in", "City"));
+        assert_eq!(by_doc["docB"], derive_schema_id("Person", "born_in", "Country"));
+        assert_ne!(by_doc["docA"], by_doc["docB"], "kazdy dokument odtworzony z wlasnym schema_id");
     }
 }

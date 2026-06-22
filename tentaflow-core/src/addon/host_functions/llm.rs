@@ -17,6 +17,11 @@ use super::{
 use crate::addon::rate_limiter::ResourceType;
 use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 
+/// MemGraphRAG D5 — twardy cap liczby par aliasow encji przepuszczanych z opcji wywolania do
+/// flow.meta (`entity_aliases`). Alias-rewrite seedow PPR to retrieval-side ulatwienie; addon
+/// nie moze wstrzyknac nieograniczonej listy do meta flow. Reszta degraduje do braku rewrite.
+const ENTITY_ALIASES_META_CAP: usize = 256;
+
 // =============================================================================
 // llm_generate — synchroniczne generowanie tekstu
 // =============================================================================
@@ -242,6 +247,29 @@ pub fn llm_generate(
         }
         if let Some(k) = opts.get("top_k").and_then(|v| v.as_u64()).filter(|n| *n > 0) {
             flow_meta.insert("top_k".to_string(), serde_json::Value::from(k));
+        }
+        // MemGraphRAG D5 — alias-rewrite seedow grafu (R5, TYLKO retrieval-side). Addon RAG
+        // przekazuje aktywne aliasy encji `[{alias, canonical}]`; `rag_graph_seed` przepisuje
+        // alias->canonical na seedach PPR. Twardy cap (ENTITY_ALIASES_META_CAP) chroni meta
+        // przed wstrzyknieciem ogromnej listy. Tylko poprawne pary str->str przechodza.
+        if let Some(arr) = opts.get("entity_aliases").and_then(|v| v.as_array()) {
+            let pairs: Vec<serde_json::Value> = arr
+                .iter()
+                .filter(|e| {
+                    e.get("alias").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                        && e.get("canonical").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                })
+                .take(ENTITY_ALIASES_META_CAP)
+                .map(|e| {
+                    serde_json::json!({
+                        "alias": e.get("alias").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "canonical": e.get("canonical").and_then(|v| v.as_str()).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            if !pairs.is_empty() {
+                flow_meta.insert("entity_aliases".to_string(), serde_json::Value::Array(pairs));
+            }
         }
     }
 
