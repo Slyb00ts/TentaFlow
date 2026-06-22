@@ -50,8 +50,13 @@ type GenerateFn = extern "C" fn(
 const MLX_ERR_OUT_OF_MEMORY: i32 = -10;
 
 /// Callback wolany przez Swift dla kazdego wygenerowanego tokena
-type TokenCallbackFn =
-    extern "C" fn(token_text: *const c_char, is_final: bool, callback_context: *mut c_void);
+type TokenCallbackFn = extern "C" fn(
+    token_text: *const c_char,
+    is_final: bool,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    callback_context: *mut c_void,
+);
 
 /// Callback: pobierz info o modelu (nazwa, backend, rozmiar). Zwraca JSON C string (caller musi zwolnic)
 type ModelInfoFn = extern "C" fn(context: *mut c_void) -> *mut c_char;
@@ -154,6 +159,8 @@ fn to_cstring(s: &str) -> CString {
 extern "C" fn rust_token_callback(
     token_text: *const c_char,
     is_final: bool,
+    prompt_tokens: u32,
+    completion_tokens: u32,
     callback_context: *mut c_void,
 ) {
     // SAFETY: callback_context to &mpsc::Sender<StreamToken> rzutowany na *mut c_void
@@ -172,14 +179,14 @@ extern "C" fn rust_token_callback(
     // Ignorujemy blad wyslania — moze sie zdarzyc jesli odbiorca zostal porzucony.
     // Swift nie przekazuje powodu zakonczenia w tym callbacku, wiec finish_reason
     // zostawiamy None (konsument mapuje finalny token bez bledu na EndOfText).
+    // Liczniki sa niezerowe tylko na tokenie finalnym (Swift liczy prompt/gen).
     let _ = tx.blocking_send(StreamToken {
         text,
         is_final,
+        prompt_tokens,
+        completion_tokens,
         finish_reason: None,
         error: None,
-        // Swift MLX bridge nie wystawia liczników w tym callbacku.
-        prompt_tokens: 0,
-        completion_tokens: 0,
     });
 }
 
