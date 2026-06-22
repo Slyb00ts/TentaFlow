@@ -4,7 +4,8 @@
 //       tract-onnx. Model `det_500m.onnx` z buffalo_s.
 //
 //       Architektura SCRFD: 3 FPN strides (8 / 16 / 32), 2 anchory per pozycja,
-//       3 heady (score / bbox / kps) — razem 9 output tensorow.
+//       3 heady (score / bbox / kps) — razem 9 output tensorow (eksport buffalo_s
+//       daje je jako 2D `(anchors, C)` bez wymiaru batcha).
 //       Dla input 640x640 liczba anchorow per stride:
 //         stride 8  → 80*80*2 = 12800
 //         stride 16 → 40*40*2 = 3200
@@ -45,8 +46,9 @@ pub struct ScrfdEngine {
 
 impl ScrfdEngine {
     pub fn new(model_path: &Path) -> Result<Self> {
+        let proto = patch_resize_to_static_scales(model_path)?;
         let model = tract_onnx::onnx()
-            .model_for_path(model_path)
+            .model_for_proto_model(&proto)
             .with_context(|| format!("tract: SCRFD ONNX z {}", model_path.display()))?
             .with_input_fact(
                 0,
@@ -61,6 +63,54 @@ impl ScrfdEngine {
             model: Arc::new(model),
         })
     }
+}
+
+/// Przepisuje wezly `Resize` modelu SCRFD na STALY upsampling 2x (scales
+/// `[1,1,2,2]`), eliminujac dynamiczny rozmiar wyjscia.
+///
+/// `det_500m.onnx` (buffalo_s) ma wejscie `[1,3,?,?]`, a FPN-owe `Resize`
+/// wyznaczaja rozmiar wyjscia z `sizes = Concat(Slice(Shape(wyzsza_mapa)), ...)`
+/// (puste `scales`). tract poprawnie zwija ten podgraf na stala TYLKO w buildzie
+/// release; w buildzie debug Resize ewaluuje dynamicznie i daje zly rozmiar
+/// (`Resize_108: expected 1,16,40,40, got 1,16,20,20`), bo nie aplikuje skali 2x.
+/// Sciezka FPN SCRFD zawsze podwaja rozdzielczosc (stride 32->16->8 przy stalym
+/// wejsciu 640), wiec podmieniamy `sizes` na puste i ustawiamy `scales=[1,1,2,2]`
+/// — wynik jest identyczny, a graf jest deterministyczny niezaleznie od profilu.
+fn patch_resize_to_static_scales(model_path: &Path) -> Result<tract_onnx::pb::ModelProto> {
+    use tract_onnx::pb::{tensor_proto::DataType, TensorProto};
+
+    let mut proto = tract_onnx::onnx()
+        .proto_model_for_path(model_path)
+        .with_context(|| format!("tract: odczyt proto SCRFD z {}", model_path.display()))?;
+
+    let graph = proto
+        .graph
+        .as_mut()
+        .ok_or_else(|| anyhow!("SCRFD: model bez grafu"))?;
+
+    const SCALES_NAME: &str = "tf_scrfd_resize_scales_2x";
+    graph.initializer.push(TensorProto {
+        dims: vec![4],
+        data_type: DataType::Float as i32,
+        float_data: vec![1.0, 1.0, 2.0, 2.0],
+        name: SCALES_NAME.to_string(),
+        ..Default::default()
+    });
+
+    for node in graph.node.iter_mut() {
+        if node.op_type != "Resize" {
+            continue;
+        }
+        // Resize ma wejscia [X, roi, scales, sizes]. Wymuszamy 4 sloty,
+        // ustawiamy `scales` na nasz staly tensor i czyscimy `sizes`.
+        while node.input.len() < 4 {
+            node.input.push(String::new());
+        }
+        node.input[2] = SCALES_NAME.to_string();
+        node.input[3] = String::new();
+    }
+
+    Ok(proto)
 }
 
 impl FaceDetector for ScrfdEngine {
@@ -89,16 +139,18 @@ impl FaceDetector for ScrfdEngine {
             .run(tvec!(input.into()))
             .context("SCRFD: tract forward failed")?;
 
-        // Sortujemy 9 wyjsc po heurystyce rozmiaru (3-cia oska): 1=score, 4=bbox, 10=kps.
-        // 1-sza oska (po batch) decyduje stride: 12800/3200/800 dla 640x640.
+        // Sortujemy 9 wyjsc po heurystyce: ostatnia oska to glowa (1=score, 4=bbox,
+        // 10=kps), przedostatnia to liczba anchorow (12800/3200/800 dla 640x640).
+        // buffalo_s `det_500m.onnx` eksportuje wyjscia jako 2D (N, C) — bez wymiaru
+        // batcha — wiec obslugujemy zarowno (N, C) jak i (1, N, C).
         let mut buckets: Vec<TensorBucket> = Vec::with_capacity(9);
         for t in outputs.iter() {
             let shape = t.shape();
-            if shape.len() < 3 {
-                continue;
-            }
-            let n = shape[1];
-            let c = shape[2];
+            let (n, c) = match shape.len() {
+                2 => (shape[0], shape[1]),
+                3 => (shape[1], shape[2]),
+                _ => continue,
+            };
             let head = match c {
                 1 => Head::Score,
                 4 => Head::Bbox,

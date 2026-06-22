@@ -586,6 +586,13 @@ pub struct ModelPreset {
     /// before serving. Ignored by non-vLLM engines.
     #[serde(default)]
     pub vllm: Option<VllmPreset>,
+    /// Nazwa pliku checkpointu (`.safetensors`) pobieranego z `repo` przy
+    /// deployu silnikow image-gen (ComfyUI). Bez tego ComfyUI startuje z pustym
+    /// `models/checkpoints` i kazda generacja konczy sie bledem `ckpt_name not
+    /// in []`. Deploy pobiera `repo/resolve/main/<checkpoint_file>` na host i
+    /// montuje go do kontenerowego katalogu checkpointow.
+    #[serde(default)]
+    pub checkpoint_file: Option<String>,
 }
 
 /// vLLM self-quantization knobs for a `[[model_preset]]`. When `quantize` is

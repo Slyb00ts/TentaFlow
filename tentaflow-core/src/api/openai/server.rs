@@ -1913,7 +1913,7 @@ async fn infer_embedded_vision(
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
-                format!("embedded OCR '{}': {}", model_name, e),
+                format!("embedded OCR '{}': {:#}", model_name, e),
             ),
         };
     }
@@ -1925,7 +1925,7 @@ async fn infer_embedded_vision(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
-                format!("embedded vision '{}': {}", model_name, e),
+                format!("embedded vision '{}': {:#}", model_name, e),
             );
         }
     };

@@ -166,6 +166,7 @@ mod tests {
             reasoning_delta: None,
             tool_calls: Vec::new(),
             usage: None,
+            perf: None,
             finish_reason: None,
             error: None,
         })]);

@@ -36,6 +36,42 @@ use super::OcrRunner;
 
 type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
+/// Laduje model ONNX PP-OCRv5 z USTALONYM rozmiarem wejscia (NCHW f32).
+///
+/// PP-OCRv5 (eksport z Paddle2ONNX) ma w pelni dynamiczne wejscie `[?,3,?,?]`
+/// i niesie `value_info` dla KAZDEGO posredniego tensora z symbolicznym
+/// wymiarem batcha (`DynamicDimension.0`). Gdy ustawimy konkretne wejscie
+/// `[1,3,H,W]`, analizator HIR tracta probuje zunifikowac WYLICZONY ksztalt
+/// wyjscia pierwszego konwolutu (`1,16,...`) z zapisanym w `value_info`
+/// (`DynamicDimension.0,16,...`) i pada na `Conv.0 ConvHir` — symboliczny batch
+/// nie unifikuje sie z `1`. Czyscimy wiec wszystkie fakty wyjsc posrednich
+/// (kasujac symboliczne podpowiedzi z `value_info`) i pozwalamy tractowi
+/// wywnioskowac ksztalty wylacznie z konkretnego wejscia.
+fn load_fixed_input(path: &Path, h: u32, w: u32) -> Result<Runnable> {
+    let mut model = tract_onnx::onnx()
+        .model_for_path(path)
+        .with_context(|| format!("tract: PP-OCRv5 ONNX z {}", path.display()))?;
+
+    let inputs: Vec<_> = model.input_outlets()?.to_vec();
+    let node_count = model.nodes().len();
+    for nid in 0..node_count {
+        let slots = model.node(nid).outputs.len();
+        for slot in 0..slots {
+            let outlet = OutletId::new(nid, slot);
+            if inputs.contains(&outlet) {
+                continue;
+            }
+            model.set_outlet_fact(outlet, InferenceFact::default())?;
+        }
+    }
+
+    model.set_input_fact(
+        0,
+        InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 3, h as i32, w as i32)),
+    )?;
+    Ok(model.into_optimized()?.into_runnable()?)
+}
+
 /// Nazwy plikow bundla PP-OCRv5 w `vision_models_dir()`. `cls` jest opcjonalny —
 /// bez niego pomijamy korekte kata. `dict` jest wymagany dla dekodowania rec.
 const DET_FILE: &str = "ppocrv5_det.onnx";
@@ -147,15 +183,8 @@ impl OnnxOcrEngine {
             return Ok(s.clone());
         }
         let side = DET_LIMIT_SIDE;
-        let model = tract_onnx::onnx()
-            .model_for_path(&self.det_path)
-            .with_context(|| format!("tract: PP-OCRv5 det z {}", self.det_path.display()))?
-            .with_input_fact(
-                0,
-                InferenceFact::dt_shape(f32::datum_type(), tvec!(1, 3, side as i32, side as i32)),
-            )?
-            .into_optimized()?
-            .into_runnable()?;
+        let model = load_fixed_input(&self.det_path, side, side)
+            .with_context(|| format!("tract: PP-OCRv5 det z {}", self.det_path.display()))?;
         let session = Arc::new(DetSession {
             model,
             input_side: side,
@@ -169,18 +198,8 @@ impl OnnxOcrEngine {
         if let Some(s) = slot.as_ref() {
             return Ok(s.clone());
         }
-        let model = tract_onnx::onnx()
-            .model_for_path(&self.rec_path)
-            .with_context(|| format!("tract: PP-OCRv5 rec z {}", self.rec_path.display()))?
-            .with_input_fact(
-                0,
-                InferenceFact::dt_shape(
-                    f32::datum_type(),
-                    tvec!(1, 3, REC_INPUT_H as i32, REC_INPUT_W as i32),
-                ),
-            )?
-            .into_optimized()?
-            .into_runnable()?;
+        let model = load_fixed_input(&self.rec_path, REC_INPUT_H, REC_INPUT_W)
+            .with_context(|| format!("tract: PP-OCRv5 rec z {}", self.rec_path.display()))?;
         let session = Arc::new(model);
         *slot = Some(session.clone());
         Ok(session)
@@ -194,18 +213,8 @@ impl OnnxOcrEngine {
         let built = match self.cls_path.as_ref() {
             None => None,
             Some(path) => {
-                let model = tract_onnx::onnx()
-                    .model_for_path(path)
-                    .with_context(|| format!("tract: PP-OCRv5 cls z {}", path.display()))?
-                    .with_input_fact(
-                        0,
-                        InferenceFact::dt_shape(
-                            f32::datum_type(),
-                            tvec!(1, 3, CLS_INPUT_H as i32, CLS_INPUT_W as i32),
-                        ),
-                    )?
-                    .into_optimized()?
-                    .into_runnable()?;
+                let model = load_fixed_input(path, CLS_INPUT_H, CLS_INPUT_W)
+                    .with_context(|| format!("tract: PP-OCRv5 cls z {}", path.display()))?;
                 Some(model)
             }
         };
