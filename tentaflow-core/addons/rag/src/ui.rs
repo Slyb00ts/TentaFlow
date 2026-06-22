@@ -84,6 +84,9 @@ const SP_CONFLICT_STATUS: &str = "conflict_status_filter";
 const SP_CONFLICT_ROWS: &str = "conflict_rows";
 const SP_CONFLICT_DETAIL: &str = "conflict_detail_text";
 const SP_STATUS_MESSAGE: &str = "status_message";
+/// Sciezka stanu panelu wiazaca Select przelacznika "Baza grafowa" w zakladce Kolekcje.
+/// Wartosc "1"/"0" (string) odzwierciedla aktualny config instancji (graph_enabled).
+const SP_GRAPH_ENABLED: &str = "graph_enabled_toggle";
 
 // =============================================================================
 // Stan modulu (epoch + rewizja stanu + aktywna zakladka)
@@ -220,13 +223,21 @@ fn bound(key: &str) -> BindRef {
 // =============================================================================
 
 fn nav_tab(id: &str, label: &str) -> NavTab {
+    nav_tab_locked(id, label, false)
+}
+
+/// Zakladka NavTabs z opcjonalnym zamkiem. Graf i Konflikty sa `locked` gdy warstwa
+/// grafu jest wylaczona (czysty RAG wektorowy nie ma grafu ani konfliktow do pokazania)
+/// — uzytkownik widzi, ze funkcja istnieje, ale jest niedostepna do czasu zalaczenia
+/// grafu w zakladce Kolekcje.
+fn nav_tab_locked(id: &str, label: &str, locked: bool) -> NavTab {
     NavTab {
         id: id.into(),
         label: lit(label),
         icon: None,
         badge: None,
         panel_id: None,
-        locked: false,
+        locked,
     }
 }
 
@@ -263,13 +274,16 @@ fn set_field_handler(event: EventKind, field_key: &str) -> (EventKind, Handler) 
 }
 
 pub fn send_panel_shell() {
+    // Zakladki grafowe sa zamknięte, dopoki graf jest wylaczony — czysty RAG wektorowy
+    // nie buduje grafu wiedzy ani nie wykrywa konfliktow.
+    let graph_on = ui_graph_enabled();
     let mut nav = NavTabs {
         items: vec![
             nav_tab(TAB_COLLECTIONS, "Kolekcje"),
             nav_tab(TAB_DOCUMENTS, "Dokumenty"),
             nav_tab(TAB_CHAT, "Czat"),
-            nav_tab(TAB_GRAPH, "Graf"),
-            nav_tab(TAB_CONFLICTS, "Konflikty"),
+            nav_tab_locked(TAB_GRAPH, "Graf", !graph_on),
+            nav_tab_locked(TAB_CONFLICTS, "Konflikty", !graph_on),
         ],
         active_id: bound(SP_ACTIVE_TAB),
         variant: NavTabsVariant::Underlined,
@@ -346,6 +360,10 @@ fn initial_state_entries() -> Vec<StateEntry> {
         StateEntry { path: state_path(SP_CONFLICT_ROWS), value: empty_arr() },
         StateEntry { path: state_path(SP_CONFLICT_DETAIL), value: empty_str() },
         StateEntry { path: state_path(SP_STATUS_MESSAGE), value: empty_str() },
+        StateEntry {
+            path: state_path(SP_GRAPH_ENABLED),
+            value: CborValue::Text(if ui_graph_enabled() { "1" } else { "0" }.into()),
+        },
     ]
 }
 
@@ -414,7 +432,15 @@ fn tab_field_overlay(tab: &str) -> Vec<StateEntry> {
         value: CborValue::Text(field_value(field).unwrap_or_else(|| default.to_string())),
     };
     match tab {
-        TAB_COLLECTIONS => vec![hydrate(SP_NEW_COLLECTION, "")],
+        TAB_COLLECTIONS => vec![
+            hydrate(SP_NEW_COLLECTION, ""),
+            // Przelacznik grafu czytamy z configu instancji (Durable), NIE z pola
+            // sesyjnego — to ustawienie instancji wspolne dla wszystkich userow panelu.
+            StateEntry {
+                path: state_path(SP_GRAPH_ENABLED),
+                value: CborValue::Text(if ui_graph_enabled() { "1" } else { "0" }.into()),
+            },
+        ],
         TAB_DOCUMENTS => {
             // Nazwa wybranej kolekcji (display) jest per-sesja — zhydratuj etykiete
             // w tym samym formacie co `action_open_collection` ("Kolekcja: {name}").
@@ -637,6 +663,44 @@ fn collections_tab() -> Component {
     );
     let refresh = action_button("col-refresh", "Odswiez", "refresh-collections", ButtonVariant::Secondary, Tone::Neutral);
 
+    // Przelacznik warstwy grafu (MemGraphRAG) per-instancja. Select on/off (renderer
+    // SDK), wartosc bind-owana do SP_GRAPH_ENABLED i hydratowana ze stanu instancji.
+    // Zmiana -> action `set-graph-enabled`, ktora utrwala config i przerenderowuje shell
+    // (zakladki Graf/Konflikty pojawiaja sie / znikaja).
+    let graph_on = ui_graph_enabled();
+    let mut graph_toggle = Select {
+        bind_path: state_path(SP_GRAPH_ENABLED),
+        options: graph_enabled_options(),
+        placeholder: None,
+        label: Some(lit("Baza grafowa (MemGraphRAG)")),
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Md,
+        groups: None,
+    }
+    .into_component("col-graph-toggle")
+    .expect("kodowanie Select graph");
+    graph_toggle.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Change,
+        "set-graph-enabled",
+    )]));
+
+    // Opis DLACZEGO graf jest opcjonalny + status ON/OFF + ostrzezenie o braku
+    // wstecznej ekstrakcji (graf buduje sie przy NOWYCH ingestach / po re-ingescie).
+    let graph_status = if graph_on { "WLACZONA" } else { "WYLACZONA" };
+    let graph_help = muted_caption(
+        "col-graph-help",
+        lit(&format!(
+            "Status: {graph_status}. Wlaczona warstwa grafu (MemGraphRAG) ekstrahuje encje i \
+             relacje z dokumentow (przez LLM) i daje lepsze odpowiedzi wielohopowe, ale spowalnia \
+             ingest. Wylaczona = czysty RAG wektorowy (szybszy ingest, retrieval po podobienstwie). \
+             Uwaga: wlaczenie grafu NIE ekstrahuje wstecznie juz zaingestowanych dokumentow — graf \
+             zbuduje sie przy nowych ingestach lub po ponownym wgraniu dokumentu.",
+        )),
+    );
+
     let tbl = table(
         "col-table",
         SP_COLLECTION_ROWS,
@@ -660,6 +724,8 @@ fn collections_tab() -> Component {
             new_name,
             create,
             refresh,
+            graph_toggle,
+            graph_help,
             tbl,
         ],
     )
@@ -977,6 +1043,23 @@ fn selected_collection() -> String {
         .unwrap_or_default()
 }
 
+/// Czy warstwa grafu (MemGraphRAG) jest wlaczona dla tej instancji. Czyta TEN SAM
+/// instancyjny klucz KV, ktorego uzywa `lib.rs::graph_enabled()` (config instancji, nie
+/// pole sesji — wiec BEZ session_key). UI bramkuje nim widocznosc zakladek Graf/Konflikty
+/// i stan przelacznika; backend (`graph_enabled()`) pozostaje jedynym zrodlem prawdy dla
+/// logiki ingest/query/tools.
+fn ui_graph_enabled() -> bool {
+    crate::state_get(crate::GRAPH_ENABLED_STATE_KEY)
+        .ok()
+        .flatten()
+        .map(|b| {
+            let s = String::from_utf8_lossy(&b);
+            let s = s.trim();
+            s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 fn conflict_status_filter() -> String {
     crate::state_get(&session_key(SP_CONFLICT_STATUS))
         .ok()
@@ -1157,6 +1240,23 @@ fn conflict_status_options() -> Vec<SelectOption> {
     ]
 }
 
+/// Opcje przelacznika warstwy grafu. Wartosci "1"/"0" odpowiadaja parsowaniu w
+/// `lib.rs::parse_graph_enabled` ("1"/"true" => on); zapisujemy "1"/"0" dla zwiezlosci.
+fn graph_enabled_options() -> Vec<SelectOption> {
+    let opt = |value: &str, label: &str| SelectOption {
+        value: SelectValue::Text(value.to_string()),
+        label: lit(label),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    };
+    vec![
+        opt("0", "Wylaczona (czysty RAG wektorowy)"),
+        opt("1", "Wlaczona (MemGraphRAG)"),
+    ]
+}
+
 /// Skrocony format znacznika czasu (sekundy uniksowe -> ISO-podobny tekst). Bez
 /// zewnetrznych crateow daty — w GUI wystarczy sekundowy epoch jako liczba dni/godzin.
 fn fmt_ts(unix: i64) -> String {
@@ -1209,6 +1309,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
             send_tab_content(TAB_COLLECTIONS);
             json!({"ok": true})
         }
+        "set-graph-enabled" => action_set_graph_enabled(params),
         "create-collection" => action_create_collection(params),
         "delete-collection" => action_delete_collection(params),
         "open-collection" => action_open_collection(params),
@@ -1233,6 +1334,29 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "run-entity-merge-scan" => action_run_agent(params, "entity_merge_scan", "A_uni scalanie"),
         other => json!({"ok": true, "ignored": other}),
     }
+}
+
+/// Akcja `set-graph-enabled`: utrwala config warstwy grafu (per-instancja) i
+/// przerenderowuje CALY shell, bo zmiana wlacza/wylacza zakladki Graf/Konflikty (locked).
+/// Wartosc "1"/"true" => on, reszta => off — `lib.rs::graph_enabled()` to JEDYNE zrodlo
+/// prawdy dla logiki; tu zapisujemy ten sam klucz instancyjny (Durable, NIE per-sesja:
+/// to ustawienie instancji, ma przetrwac restart i obowiazywac wszystkich userow panelu).
+fn action_set_graph_enabled(params: &JsonValue) -> JsonValue {
+    let raw = params.get("value").and_then(|v| v.as_str()).unwrap_or("0").trim();
+    let on = raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true");
+    let stored = if on { "1" } else { "0" };
+    if let Err(e) = crate::state_set(
+        crate::GRAPH_ENABLED_STATE_KEY,
+        stored.as_bytes(),
+        crate::StateTier::Durable,
+    ) {
+        return json!({"ok": false, "error": format!("Zapis ustawienia grafu nieudany: {e:?}")});
+    }
+    // Re-render shell: zakladki grafowe zmieniaja stan locked; po nim re-render zakladki
+    // Kolekcje, by przelacznik i opis statusu pokazaly nowa wartosc.
+    send_panel_shell();
+    send_tab_content(TAB_COLLECTIONS);
+    json!({"ok": true, "graph_enabled": on})
 }
 
 /// Zapis wartosci pola formularza do KV scope'owanego na biezaca sesje panelu

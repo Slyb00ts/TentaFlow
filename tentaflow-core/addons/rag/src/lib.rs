@@ -77,6 +77,14 @@ const DEFAULT_DENOISING_THRESHOLD: u64 = 2;
 /// DEFAULT_DENOISING_THRESHOLD. Nie budujemy tu osobnego systemu configu.
 const DENOISING_THRESHOLD_STATE_KEY: &str = "denoising_threshold";
 
+/// Klucz instancyjnego KV per-instancja, ktory WLACZA warstwe grafu (MemGraphRAG).
+/// DOMYSLNIE WYLACZONY: brak wpisu => czysty RAG wektorowy (zapis/odczyt chunkow +
+/// wektorow, zero ekstrakcji triple'ow). Wlaczamy go SWIADOMIE ("1"/"true"), bo graf
+/// kosztuje: wolniejszy ingest (LLM ekstrahuje encje/relacje per chunk) w zamian za
+/// lepsze odpowiedzi wielohopowe. Wzor configu jak DENOISING_THRESHOLD_STATE_KEY —
+/// jeden klucz state.read, zero osobnego systemu configu.
+pub(crate) const GRAPH_ENABLED_STATE_KEY: &str = "graph_enabled";
+
 // Capy anti-DoS — LLM moze halucynowac dlugie listy. Nadmiar przycinamy/odrzucamy.
 /// Max encji wziętych z jednego chunku.
 const MAX_ENTITIES_PER_CHUNK: usize = 30;
@@ -410,13 +418,25 @@ fn handle_ask(params: &Value) -> Value {
     if let Some(k) = top_k {
         options["top_k"] = json!(k);
     }
+    // Bramka grafu dla query-flow: graf moze zyc w osobnym procesie flow, ktory NIE
+    // czyta instancyjnego KV addona. Przekazujemy flage w options -> envelope.meta, by
+    // wezly grafowe (rag_graph_seed/PPR/fuzja faktow) wiedzialy, czy fuzja grafowa jest
+    // wlaczona. Gdy false -> retrieval degraduje do czysto wektorowego (rerank + LLM) —
+    // ta sama degradacja, ktora flow juz stosuje przy braku grafu/encji. NIE wysylamy
+    // tez aliasow encji przy grafie OFF (rewrite alias->canonical jest bez sensu, gdy
+    // fuzja grafowa nie dziala) — czysty RAG nie potrzebuje warstwy grafu.
+    let graph_on = graph_enabled();
+    options["graph_enabled"] = json!(graph_on);
     // D5 alias-rewrite seedow (R5, TYLKO retrieval-side): przekazujemy aktywne aliasy encji do
     // flow.meta, by rag_graph_seed przepisal alias->canonical na seedach PPR (zapytanie o
     // "Einstein" trafia w kanoniczny "albert einstein"). Aliasy zyja w SQLite addona (R1), wiec
     // to JEDYNE miejsce, ktore moze je wstrzyknac do core'owego flow. Cap chroni rozmiar opcji.
-    let aliases = load_active_aliases();
-    if !aliases.is_empty() {
-        options["entity_aliases"] = json!(aliases);
+    // Tylko przy grafie ON — bez fuzji grafowej alias-rewrite seedow PPR nie ma odbiorcy.
+    if graph_on {
+        let aliases = load_active_aliases();
+        if !aliases.is_empty() {
+            options["entity_aliases"] = json!(aliases);
+        }
     }
     // Flow zwraca JSON `{answer, citations}` w tresci odpowiedzi: answer to tekst
     // LLM, citations to REALNE hity retrievalu (doc_id/chunk_index/text/score)
@@ -678,15 +698,23 @@ fn run_ingest_pipeline(
     let mut doc_triples = 0usize;
     let mut graph_partial = false;
 
+    // Bramka grafu (per-instancja, JEDNO zrodlo prawdy): gdy graf wylaczony, robimy
+    // CZYSTY RAG wektorowy — zero ekstrakcji triple'ow, zero reconcile, zero zapisu do
+    // grafu/schema_registry/fact_state. Chunki + wektory leca normalnie. graph_partial
+    // pozostaje false: graf nie jest "czesciowy", tylko swiadomie wylaczony.
+    let graph_on = graph_enabled();
+
     // Reconcile na starcie ingestu (samonaprawa po crashu): domyka zalegle promocje/
     // aktywacje i re-drain outboxu (applied=0) sprzed ewentualnego crashu poprzedniego
     // ingestu (R3), zanim dolozymy nowe fakty. Best-effort — nieudany reconcile nie wywala
-    // ingestu wektorowego, tylko znaczy graf jako czesciowy.
-    if let Err(e) = reconcile_schemas() {
-        graph_partial = true;
-        log::warn(&format!(
-            "rag: reconcile na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
-        ));
+    // ingestu wektorowego, tylko znaczy graf jako czesciowy. Pomijany przy grafie OFF.
+    if graph_on {
+        if let Err(e) = reconcile_schemas() {
+            graph_partial = true;
+            log::warn(&format!(
+                "rag: reconcile na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
+            ));
+        }
     }
 
     for (index, chunk_text) in chunks.iter().enumerate() {
@@ -700,28 +728,30 @@ fn run_ingest_pipeline(
             return Err(format!("Blad chunka {index}: {msg}"));
         }
 
-        // Ekstrakcja grafu — BEST-EFFORT. Wektor chunku jest juz zapisany; blad
-        // ekstrakcji (LLM/parsowanie/upsert) NIE wywala ingestu, tylko oznacza graf
-        // jako czesciowy i leci dalej (wektory > graf).
+        // Ekstrakcja grafu — BEST-EFFORT, TYLKO przy grafie ON. Wektor chunku jest juz
+        // zapisany; blad ekstrakcji (LLM/parsowanie/upsert) NIE wywala ingestu, tylko
+        // oznacza graf jako czesciowy i leci dalej (wektory > graf).
         // graph_partial sluzy tu DWOM zrodlom niekompletnosci: blad ekstrakcji (Err)
         // ORAZ obciecie capem/za-dluga relacja (truncated, bug 5/6). Przekazujemy je
         // jako wspolna flage `truncated` ustawiana wewnatrz extract_chunk_graph.
-        let chunk_result =
-            extract_chunk_graph(document_id, index, chunk_text, &mut doc_triples, &mut graph_partial);
-        // Blad ekstrakcji chunku (w tym blad REJESTRU graph_artifacts, bug 4)
-        // oznacza graf jako czesciowy — nigdy nie ginie cicho.
-        if chunk_extraction_marks_partial(&chunk_result) {
-            graph_partial = true;
-        }
-        match chunk_result {
-            Ok((ents, rels)) => {
-                total_entities += ents;
-                total_relations += rels;
+        if graph_on {
+            let chunk_result =
+                extract_chunk_graph(document_id, index, chunk_text, &mut doc_triples, &mut graph_partial);
+            // Blad ekstrakcji chunku (w tym blad REJESTRU graph_artifacts, bug 4)
+            // oznacza graf jako czesciowy — nigdy nie ginie cicho.
+            if chunk_extraction_marks_partial(&chunk_result) {
+                graph_partial = true;
             }
-            Err(e) => {
-                log::warn(&format!(
-                    "rag: ekstrakcja grafu chunka {index} dok {document_id} nieudana (graf czesciowy): {e}"
-                ));
+            match chunk_result {
+                Ok((ents, rels)) => {
+                    total_entities += ents;
+                    total_relations += rels;
+                }
+                Err(e) => {
+                    log::warn(&format!(
+                        "rag: ekstrakcja grafu chunka {index} dok {document_id} nieudana (graf czesciowy): {e}"
+                    ));
+                }
             }
         }
 
@@ -734,12 +764,14 @@ fn run_ingest_pipeline(
     // ktore osiagnely prog tau w tym ingescie + aktywacja partiami WSZYSTKICH zalegych
     // krawedzi stabilnych schematow + materializacja do grafu. Idempotentny i globalny —
     // sprzata tez zaleglosci rownoleglych ingestow. Best-effort (graf < wektory): blad
-    // znaczy graf jako czesciowy, nie wywala ingestu.
-    if let Err(e) = reconcile_schemas() {
-        graph_partial = true;
-        log::warn(&format!(
-            "rag: reconcile po ingescie dok {document_id} nieudany (graf czesciowy): {e}"
-        ));
+    // znaczy graf jako czesciowy, nie wywala ingestu. Pomijany przy grafie OFF.
+    if graph_on {
+        if let Err(e) = reconcile_schemas() {
+            graph_partial = true;
+            log::warn(&format!(
+                "rag: reconcile po ingescie dok {document_id} nieudany (graf czesciowy): {e}"
+            ));
+        }
     }
 
     // Zapisz liczniki ekstrakcji + flage czesciowosci na dokumencie (best-effort
@@ -1744,6 +1776,13 @@ fn run_escalated_apply(
 /// fallbackiem dopasowania po nazwie wezla z graph_artifacts). Zwraca centralny wezel,
 /// jego sasiadow (graph_neighbors, kierunek Both) i fakty (head -rel-> tail) z provenance.
 fn handle_graph_explore(params: &Value) -> Value {
+    // Bramka toggle opcjonalnego grafu: przy OFF NIE czytamy `graph_neighbors` (zero
+    // zapytan do grafu). GUI lockuje zakladke explorera, ale bezposrednie wywolanie
+    // akcji lub stale UI moglyby tu trafic — backend musi bramkowac sam. NO-OP z jasnym
+    // komunikatem (jak conflict_scan), nie blad.
+    if !graph_enabled() {
+        return graph_disabled_tool_response();
+    }
     let limit = params
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -2115,6 +2154,39 @@ fn denoising_threshold() -> u64 {
     parse_denoising_threshold(raw.as_deref())
 }
 
+/// Parsuje flage `graph_enabled` z surowego stanu KV. Tylko "1"/"true" (po trim,
+/// case-insensitive) => true; brak wpisu, pusta lub inna wartosc => false. DOMYSLNIE
+/// OFF — wlasciciel chce, by addon dzialal jak zwykly RAG wektorowy az do swiadomego
+/// zalaczenia grafu. Czysta funkcja: testowalna bez hosta.
+fn parse_graph_enabled(raw: Option<&[u8]>) -> bool {
+    raw.and_then(|b| std::str::from_utf8(b).ok())
+        .map(|s| s.trim())
+        .map(|s| s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// JEDYNE zrodlo prawdy o tym, czy warstwa grafu (MemGraphRAG) jest aktywna dla tej
+/// instancji. Czytane z instancyjnego KV (state.read); brak wpisu/blad => false
+/// (czysty RAG wektorowy). Bramkuje ingest (ekstrakcja triple'ow), tooly konfliktow
+/// (skan/adjudykacja/merge) i GUI (zakladki Graf/Konflikty). Query-flow dostaje te
+/// flage przez meta requestu (handle_ask) — graf moze dzialac w osobnym procesie flow,
+/// wiec nie czyta tego KV bezposrednio.
+fn graph_enabled() -> bool {
+    let raw = state_get(GRAPH_ENABLED_STATE_KEY).ok().flatten();
+    parse_graph_enabled(raw.as_deref())
+}
+
+/// Jednolita odpowiedz tooli grafowych (conflict_scan/resolve/entity_merge_scan), gdy
+/// graf jest wylaczony: NO-OP, nie blad. `ok:true` + `graph_disabled:true`, by caller/UI
+/// odroznil "graf wylaczony" od realnego niepowodzenia. Zerowe liczniki — nic nie zrobiono.
+fn graph_disabled_tool_response() -> Value {
+    json!({
+        "ok": true,
+        "graph_disabled": true,
+        "message": "Baza grafowa (MemGraphRAG) jest wylaczona dla tej instancji — brak grafu, brak konfliktow do przetworzenia.",
+    })
+}
+
 /// Czysta regula promocji reconcile: schemat osiaga prog gdy freq >= tau. W produkcji ten
 /// predykat zyje WPROST w SQL reconcile_schemas (`COUNT(*) >= tau` wewnatrz UPDATE), wiec
 /// tu jest wylacznie referencyjna, testowalna bez hosta forma tej samej reguly. tau>=1
@@ -2377,6 +2449,12 @@ fn cursor_advances(cursor: i64, activation_seq: i64) -> bool {
 ///  4. Advance trwalego kursora do max (updated_at, fact_seq) batcha.
 /// Zwraca licznik wykrytych konfliktow i przeskanowanych faktow (do testow/dashboardu).
 fn handle_conflict_scan(params: &Value) -> Value {
+    // Bramka grafu: bez grafu nie ma faktow w grafie -> nie ma konfliktow do skanu.
+    // No-op z jasnym komunikatem zamiast bledu (admin uruchamiajacy agenta przy grafie
+    // OFF dostaje informacje, nie crash).
+    if !graph_enabled() {
+        return graph_disabled_tool_response();
+    }
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_u64())
@@ -2944,6 +3022,9 @@ struct ConflictResolveStats {
 
 /// Handler tool conflict_resolve (A_res). Patrz run_conflict_resolve.
 fn handle_conflict_resolve(params: &Value) -> Value {
+    if !graph_enabled() {
+        return graph_disabled_tool_response();
+    }
     let max_conflicts = params
         .get("max_conflicts")
         .and_then(|v| v.as_u64())
@@ -5522,6 +5603,9 @@ struct EntityMergeScanStats {
 /// szukajac kandydatow type-based + similarity-based. Auto-merge powyzej progu twardego; szara
 /// strefa -> konflikt 'entity_merge' (open) dla A_res. Blokada per-instancja (jeden skan naraz).
 fn handle_entity_merge_scan(params: &Value) -> Value {
+    if !graph_enabled() {
+        return graph_disabled_tool_response();
+    }
     let batch = params
         .get("batch_size")
         .and_then(|v| v.as_u64())
@@ -7579,6 +7663,22 @@ mod tests {
         assert_eq!(parse_denoising_threshold(Some(b"1")), 1);
         assert_eq!(parse_denoising_threshold(Some(b"3")), 3);
         assert_eq!(parse_denoising_threshold(Some(b"  5  ")), 5);
+    }
+
+    #[test]
+    fn parse_graph_enabled_defaults_off_and_overrides() {
+        // DOMYSLNIE OFF: brak wpisu / pusty / smieci / "0" / "false" -> false (czysty RAG).
+        assert!(!parse_graph_enabled(None), "brak wpisu => off");
+        assert!(!parse_graph_enabled(Some(b"")), "pusty => off");
+        assert!(!parse_graph_enabled(Some(b"abc")), "smieci => off");
+        assert!(!parse_graph_enabled(Some(b"0")), "0 => off");
+        assert!(!parse_graph_enabled(Some(b"false")), "false => off");
+        assert!(!parse_graph_enabled(Some(b"2")), "inna liczba => off");
+        // Wlaczenie: "1"/"true" (case-insensitive, z otaczajacymi spacjami) -> true.
+        assert!(parse_graph_enabled(Some(b"1")), "1 => on");
+        assert!(parse_graph_enabled(Some(b"true")), "true => on");
+        assert!(parse_graph_enabled(Some(b"TRUE")), "TRUE => on");
+        assert!(parse_graph_enabled(Some(b"  1  ")), "spacje wokol 1 => on");
     }
 
     #[test]

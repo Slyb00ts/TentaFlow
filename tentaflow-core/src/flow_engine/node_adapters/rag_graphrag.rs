@@ -35,6 +35,22 @@ const KG_COLLECTION: &str = "kg_active";
 const META_CURRENT_QUERY: &str = "rag_current_query";
 /// Meta-klucz: seedy grafu wyliczone z encji zapytania = `[{id, weight}]`.
 pub const META_GRAPH_SEEDS: &str = "graph_seeds";
+/// Meta-klucz (toggle opcjonalnego grafu): czy fuzja grafowa jest wlaczona dla tej
+/// instancji RAG. Addon RAG ZAWSZE wysyla te flage przy `ask` (host-fn allowlist).
+/// `false` => wezly grafowe robia NO-OP (degradacja do czysto wektorowego retrievalu).
+/// BRAK klucza => legacy/inny caller bez toggle => zachowanie dotychczasowe (graf ON),
+/// inaczej zlamalibysmy flowy uruchamiane bez addona RAG.
+pub const META_GRAPH_ENABLED: &str = "graph_enabled";
+
+/// Czy hop grafowy ma sie wykonac wg meta. Bramka toggle opcjonalnego grafu:
+/// jawne `graph_enabled=false` => pomin graf; brak klucza => legacy ON. JEDNO
+/// zrodlo prawdy dla `rag_graph_seed`/`rag_graph_facts`.
+fn graph_enabled_in_meta(envelope: &FlowEnvelope) -> bool {
+    match envelope.meta.get(META_GRAPH_ENABLED).and_then(|v| v.as_bool()) {
+        Some(enabled) => enabled,
+        None => true,
+    }
+}
 /// Meta-klucz (MemGraphRAG D5): mapa aktywnych aliasow encji `[{alias, canonical}]`, wstrzykiwana
 /// przez addon RAG do flow.meta (host-fn allowlist). `rag_graph_seed` uzywa jej do alias-rewrite
 /// seedow PPR (alias->canonical). Brak klucza => brak rewrite (degradacja).
@@ -482,6 +498,14 @@ impl NodeAdapter for RagGraphSeedNodeAdapter {
             .ok_or_else(|| anyhow!("rag_graph_seed: brak krawedzi wejsciowej"))?;
         let mut out: FlowEnvelope = (*input.envelope).clone();
 
+        // Bramka toggle opcjonalnego grafu: przy `graph_enabled=false` adapter jest
+        // NO-OP — przepuszcza envelope bez seedow PPR (zero zapytan do grafu), dokladnie
+        // jak istniejaca degradacja „brak pytania/encji". Retrieval degraduje do czysto
+        // wektorowego (rerank + LLM). Bez tej bramki query nadal fuzowalby istniejacy graf.
+        if !graph_enabled_in_meta(&out) {
+            return Ok(out);
+        }
+
         // Zrodlo pytania: biezace pod-pytanie hopu (meta), w pierwszym hopie =
         // payload Text (po `rag_query_seed`). Brak pytania => brak seedow
         // (degradacja: graf zostaje pominiety), NIE blad — RAG ma dzialac dalej.
@@ -652,6 +676,14 @@ impl NodeAdapter for RagGraphFactsNodeAdapter {
             .first()
             .ok_or_else(|| anyhow!("rag_graph_facts: brak krawedzi wejsciowej"))?;
         let mut out: FlowEnvelope = (*input.envelope).clone();
+
+        // Bramka toggle opcjonalnego grafu: przy `graph_enabled=false` adapter jest
+        // NO-OP — przepuszcza envelope z nietknietym kontekstem wektorowym, bez PPR i
+        // bez fuzji faktow grafowych (zero zapytan do grafu). Identyczne jak degradacja
+        // „brak seedow/grafu", gdzie `collect_facts` zwraca pusta liste i nic nie doklejamy.
+        if !graph_enabled_in_meta(&out) {
+            return Ok(out);
+        }
 
         // Wejsciowy payload = kontekst wektorowy zbudowany przez `rag_accumulate`
         // (pytanie + zakumulowane pasaze). Fakty grafowe dokleimy do niego.
@@ -973,6 +1005,69 @@ mod tests {
             out.meta.get(META_GRAPH_FACTS).and_then(|v| v.as_str()),
             Some("")
         );
+    }
+
+    // --- toggle opcjonalnego grafu (graph_enabled w meta) ------------------
+
+    #[tokio::test]
+    async fn graph_seed_noop_when_graph_disabled() {
+        // graph_enabled=false -> NO-OP: payload bez zmian, ZADNYCH seedow w meta
+        // (zero zapytan do grafu). Degradacja do czysto wektorowego retrievalu.
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("Albert Einstein".into());
+        env.meta
+            .insert(META_CURRENT_QUERY.into(), json!("Albert Einstein"));
+        env.meta.insert(META_GRAPH_ENABLED.into(), json!(false));
+        let out = RagGraphSeedNodeAdapter::new()
+            .execute(&node("rag_graph_seed"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.payload.as_text(), Some("Albert Einstein"));
+        // Klucz seedow w ogole nie powstaje — adapter wyszedl przed identyfikacja encji.
+        assert!(
+            out.meta.get(META_GRAPH_SEEDS).is_none(),
+            "OFF nie zapisuje seedow: {:?}",
+            out.meta.get(META_GRAPH_SEEDS)
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_seed_runs_when_flag_absent_legacy() {
+        // Brak flagi (legacy/inny caller bez toggle) -> zachowanie dotychczasowe:
+        // seedy sa wyliczane normalnie. Inaczej zlamalibysmy flowy bez addona RAG.
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("Albert Einstein".into());
+        env.meta
+            .insert(META_CURRENT_QUERY.into(), json!("Albert Einstein"));
+        let out = RagGraphSeedNodeAdapter::new()
+            .execute(&node("rag_graph_seed"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert!(
+            out.meta.get(META_GRAPH_SEEDS).and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()),
+            "brak flagi => graf ON => seedy wyliczone"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_facts_noop_when_graph_disabled() {
+        // graph_enabled=false -> NO-OP: kontekst wektorowy przechodzi bez zmian,
+        // brak sekcji faktow, brak meta faktow (zero zapytan do grafu). Identyczna
+        // degradacja wektorowa jak przy braku seedow, ale bez wchodzenia w PPR.
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("Pytanie: Q\n\npasaze...\n".into());
+        // Nawet z obecnymi seedami adapter ma byc NO-OP przy OFF.
+        env.meta.insert(META_GRAPH_SEEDS.into(), json!([{"id": "einstein", "weight": 1.0}]));
+        env.meta.insert(META_GRAPH_ENABLED.into(), json!(false));
+        let out = RagGraphFactsNodeAdapter::new()
+            .execute(&node("rag_graph_facts"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        let ctx_text = out.payload.as_text().unwrap();
+        assert_eq!(ctx_text, "Pytanie: Q\n\npasaze...\n", "kontekst bez zmian");
+        assert!(!ctx_text.contains("Fakty z grafu wiedzy"), "brak sekcji faktow");
+        // Adapter wyszedl przed fuzja -> nie zapisuje meta faktow.
+        assert!(out.meta.get(META_GRAPH_FACTS).is_none(), "OFF nie zapisuje faktow");
     }
 
     /// Pod feature `graph`: hop grafowy seeduje PPR realnymi encjami zapytania,

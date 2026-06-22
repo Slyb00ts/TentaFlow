@@ -248,6 +248,16 @@ pub fn llm_generate(
         if let Some(k) = opts.get("top_k").and_then(|v| v.as_u64()).filter(|n| *n > 0) {
             flow_meta.insert("top_k".to_string(), serde_json::Value::from(k));
         }
+        // Toggle opcjonalnego grafu: addon RAG wysyla `graph_enabled` (bool) przy ask,
+        // by wezly grafowe flow (rag_graph_seed/rag_graph_facts) wiedzialy, czy fuzja
+        // grafowa jest wlaczona. Bez przepuszczenia tej flagi do flow.meta query przy
+        // OFF nadal fuzowalby istniejacy graf (wyciek). Tylko jawny bool przechodzi.
+        if let Some(enabled) = opts.get("graph_enabled").and_then(|v| v.as_bool()) {
+            flow_meta.insert(
+                "graph_enabled".to_string(),
+                serde_json::Value::Bool(enabled),
+            );
+        }
         // MemGraphRAG D5 — alias-rewrite seedow grafu (R5, TYLKO retrieval-side). Addon RAG
         // przekazuje aktywne aliasy encji `[{alias, canonical}]`; `rag_graph_seed` przepisuje
         // alias->canonical na seedach PPR. Twardy cap (ENTITY_ALIASES_META_CAP) chroni meta
