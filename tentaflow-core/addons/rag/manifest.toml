@@ -45,13 +45,13 @@ risk = "medium"
 [[permission]]
 id = "graph.read"
 display_name = "Odczyt grafu wiedzy"
-description = "Odczyt encji i relacji z kolekcji grafowej 'kg' (Etap 2)."
+description = "Odczyt encji i relacji z kolekcji grafowej 'kg_active' (aktywny widok MemGraphRAG)."
 risk = "low"
 
 [[permission]]
 id = "graph.write"
 display_name = "Zapis grafu wiedzy"
-description = "Zapis encji i relacji do kolekcji grafowej 'kg' (Etap 2)."
+description = "Zapis encji i relacji do kolekcji grafowej 'kg_active' (aktywny widok MemGraphRAG)."
 risk = "medium"
 
 [[permission]]
@@ -216,10 +216,12 @@ path = "flows/retrieval_round.flow.json"
 service_type = "chat"
 description = "Cialo jednego hopu petli multi-hop: embed -> vector -> rerank -> akumulacja -> sedzia."
 
-# --- Kolekcja grafowa (struktura gotowa, wypelniana w Etapie 2) ---
+# --- Kolekcja grafowa: aktywny widok MemGraphRAG, materializowany z outboxu ---
+# 'kg_active' zawiera TYLKO aktywne fakty (w D1 = wszystkie); pelny ledger faktow
+# zyje w SQLite (zrodlo prawdy, R1/R2), graf jest odtwarzalna materializacja.
 
 [[graph_collection]]
-name = "kg"
+name = "kg_active"
 data_class = "C"
 
 [visibility]
