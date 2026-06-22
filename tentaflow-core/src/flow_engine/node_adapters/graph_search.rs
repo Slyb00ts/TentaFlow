@@ -236,9 +236,9 @@ impl GraphSearchNodeAdapter {
     /// → `{op, collection, ranked:[{id,score}]}`. Klucz seeda to `id` (zgodnie z
     /// SDK/host-fn `GraphSeed`), `node_id` akceptowany jako alias. Seedy obcinane
     /// do MAX_PPR_SEEDS.
-    /// Wagi seedów nie są dziś przekazywane do backendu (GraphManager::ppr bierze
-    /// równoważone id, jak host-fn), ale czytamy je strukturalnie dla zgodności
-    /// wejścia z host-fn `GraphPprInput`.
+    /// Wagi seedów (`weight`, brak => 1.0) PŁYNĄ do `GraphManager::ppr` jako wektor
+    /// personalizacji P_init (R6) — sterują rankingiem. Kształt wejścia zgodny z
+    /// host-fn `GraphPprInput`.
     fn op_ppr(
         envelope: &FlowEnvelope,
         ctx: &ExecutionContext,
@@ -259,7 +259,7 @@ impl GraphSearchNodeAdapter {
 
         // Cap liczby seedów host-side (`take`) — nie ufamy wejściu co do rozmiaru
         // wektora personalizacji (lustro MAX_PPR_SEEDS z host-fn).
-        let mut seeds: Vec<String> = Vec::with_capacity(seeds_raw.len().min(MAX_PPR_SEEDS));
+        let mut seeds: Vec<(String, f64)> = Vec::with_capacity(seeds_raw.len().min(MAX_PPR_SEEDS));
         for (i, item) in seeds_raw.iter().take(MAX_PPR_SEEDS).enumerate() {
             // Klucz seeda to `id` — zgodnie z SDK/host-fn `GraphSeed { id, weight }`
             // (tentaflow-sdk-spec). `node_id` przyjmujemy jako alias, żeby caller
@@ -270,7 +270,10 @@ impl GraphSearchNodeAdapter {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow!("graph_search adapter: ppr: seed[{i}] brak 'id'"))?;
-            seeds.push(seed_id.to_string());
+            // Waga seeda steruje personalizacją PPR (R6); brak `weight` => 1.0
+            // (kompatybilnie — dawniej wszystkie seedy ważyły tak samo).
+            let weight = item.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            seeds.push((seed_id.to_string(), weight));
         }
 
         let top_n = Self::clamped_u32(payload, "top_n", DEFAULT_RESULT_ROWS, MAX_RESULT_ROWS);

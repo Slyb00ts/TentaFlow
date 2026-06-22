@@ -21,12 +21,21 @@ pub type PprScores = Vec<(String, f64)>;
 
 /// Personalized PageRank power-iteration nad CSR.
 ///
-/// `seeds` to indeksy węzłów stanowiące wektor personalizacji (rozkład
-/// teleportacji). Powtórzone indeksy seedów są deduplikowane (każdy seed wnosi
-/// masę teleportu RAZ — inaczej duplikat zawyżałby wynik, poprawka codex pkt 7).
-/// Pusty zbiór seedów => jednostajna teleportacja po wszystkich węzłach
-/// (degeneruje do zwykłego PageRanku). `damping` w (0,1) (typowo 0.85), `iters`
-/// to liczba iteracji power-iteration.
+/// `seeds` to WAŻONE indeksy węzłów `(idx, weight)` stanowiące wektor
+/// personalizacji (rozkład teleportacji). Wagi seedów sterują rozkładem
+/// teleportu (MemGraphRAG §6.2, R6): kotwica o wyższej wadze przyciąga więcej
+/// masy, więc silniej kształtuje ranking. Reguły budowy wektora:
+///   * indeksy poza zakresem `< n` są ignorowane,
+///   * powtórzone indeksy są deduplikowane przez SUMOWANIE wag (ten sam węzeł
+///     podany dwa razy = jedna kotwica o połączonej wadze, nie podwójny teleport),
+///   * wagi `<= 0` (oraz NaN) są odfiltrowane — kotwica bez dodatniej masy nie
+///     personalizuje teleportu,
+///   * po czyszczeniu wagi są normalizowane do sumy 1 (zachowanie sumy
+///     prawdopodobieństwa).
+/// Gdy po czyszczeniu NIE zostaje żadna ważna kotwica (pusto, same nieznane
+/// indeksy, same niedodatnie wagi) => jednostajna teleportacja po wszystkich
+/// węzłach (degeneruje do zwykłego PageRanku). `damping` w (0,1) (typowo 0.85),
+/// `iters` to liczba iteracji power-iteration.
 ///
 /// UWAGA: ta funkcja jest niskopoziomowa i celowo NIE rozróżnia „seedów nie
 /// podano" od „podano same nieznane id" — z jej perspektywy oba to pusty wektor
@@ -38,7 +47,7 @@ pub type PprScores = Vec<(String, f64)>;
 /// warstwa wyżej (host-fn / retrieval).
 pub fn personalized_pagerank(
     csr: &Csr,
-    seeds: &[usize],
+    seeds: &[(usize, f64)],
     damping: f64,
     iters: usize,
 ) -> PprScores {
@@ -48,21 +57,24 @@ pub fn personalized_pagerank(
     }
     let damping = damping.clamp(0.0, 1.0);
 
-    // Wektor personalizacji (teleportacja). Seedy poza zakresem są ignorowane;
-    // brak prawidłowych seedów => rozkład jednostajny. Deduplikujemy indeksy —
-    // ten sam seed podany dwa razy NIE dostaje podwójnej masy teleportu.
+    // Wektor personalizacji (teleportacja) z WAG seedów. Dedup po indeksie
+    // SUMUJE wagi (ten sam węzeł = jedna kotwica), wagi niedodatnie/NaN odpadają,
+    // a sumę normalizujemy do 1. Brak ważnych kotwic => rozkład jednostajny.
     let mut teleport = vec![0.0f64; n];
-    let mut valid_seeds: Vec<usize> = seeds.iter().copied().filter(|&s| s < n).collect();
-    valid_seeds.sort_unstable();
-    valid_seeds.dedup();
-    if valid_seeds.is_empty() {
+    let mut weight_sum = 0.0f64;
+    for &(s, w) in seeds {
+        if s >= n || !(w > 0.0) {
+            continue;
+        }
+        teleport[s] += w;
+        weight_sum += w;
+    }
+    if weight_sum > 0.0 {
+        let inv = 1.0 / weight_sum;
+        teleport.iter_mut().for_each(|t| *t *= inv);
+    } else {
         let uniform = 1.0 / n as f64;
         teleport.iter_mut().for_each(|t| *t = uniform);
-    } else {
-        let w = 1.0 / valid_seeds.len() as f64;
-        for &s in &valid_seeds {
-            teleport[s] = w;
-        }
     }
 
     // Start od rozkładu teleportacji.

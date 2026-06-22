@@ -577,11 +577,13 @@ pub fn graph_ppr_v1(
     let damping = input.damping.unwrap_or(0.85).clamp(0.0, 1.0);
     let iterations = input.iterations.unwrap_or(20).clamp(1, MAX_RANK_ITERATIONS);
     // Cap liczby seedów: nie ufamy addonowi co do rozmiaru wektora personalizacji.
-    let seeds: Vec<String> = input
+    // Waga seeda steruje personalizacją PPR (R6); brak `weight` => 1.0 (kotwica
+    // o jednostkowej masie, kompatybilnie z dawnym uniform po seedach).
+    let seeds: Vec<(String, f64)> = input
         .seeds
         .iter()
         .take(MAX_PPR_SEEDS)
-        .map(|s| s.id.clone())
+        .map(|s| (s.id.clone(), s.weight.unwrap_or(1.0)))
         .collect();
 
     let addon_id = caller.data().addon_id.clone();
