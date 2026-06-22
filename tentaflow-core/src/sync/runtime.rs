@@ -304,6 +304,23 @@ pub fn core_epoch() -> BaselineEpoch {
     }
 }
 
+/// Number of operations the local ledger currently holds. Used by the
+/// auto-pairing baseline election to tell an EMPTY node (a freshly installed
+/// rig, near-zero ops) apart from a DATA-HOLDER (an established node with many
+/// content ops): the election must never let an empty node donate over a
+/// non-empty peer (it would wipe the peer's content). Returns `0` before the
+/// runtime exists, which correctly classifies a not-yet-synced node as empty.
+pub fn local_op_count() -> usize {
+    match SYNC_RUNTIME.get() {
+        Some(runtime) => runtime
+            .ledger
+            .list_all_operations()
+            .map(|ops| ops.len())
+            .unwrap_or(0),
+        None => 0,
+    }
+}
+
 /// Folds an incoming (remote) HLC into the local clock so the next locally
 /// minted stamp is strictly later than anything observed from the mesh.
 pub fn observe_core_hlc(remote: &HybridLogicalTimestamp) {
@@ -3848,6 +3865,7 @@ mod tests {
                 &receiver.local_node_id,
                 &receiver.signer.security.public_key_hex(),
                 "receiver",
+                None,
             )
             .expect("source trusts receiver");
         receiver
@@ -3857,6 +3875,7 @@ mod tests {
                 &source.local_node_id,
                 &source.signer.security.public_key_hex(),
                 "source",
+                None,
             )
             .expect("receiver trusts source");
     }
@@ -4236,6 +4255,7 @@ mod tests {
                     &receiver.runtime.local_node_id,
                     &receiver.runtime.signer.security.public_key_hex(),
                     "receiver",
+                    None,
                 )
                 .expect("trust receiver");
 

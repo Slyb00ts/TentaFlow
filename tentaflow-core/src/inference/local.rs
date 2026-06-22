@@ -7,8 +7,8 @@
 
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice, Delta,
-    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, Message,
-    MessageContent, Usage,
+    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, GenPerf,
+    Message, MessageContent, Usage,
 };
 use crate::inference::{
     EmbeddingParams, GenerateParams, GenerateResult, InferenceManager, StopReason, StreamToken,
@@ -16,6 +16,7 @@ use crate::inference::{
 use crate::routing::chat_template::{ChatMessage, ChatTemplate};
 
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -360,6 +361,11 @@ impl LocalInferenceHandler {
         model_name: String,
         created: u64,
     ) {
+        // Metryki wall-clock liczone w tym konsumencie: start przed pierwszym
+        // tokenem, znacznik pierwszego tokena z niepustym contentem.
+        let start = Instant::now();
+        let mut first_token_at: Option<Instant> = None;
+
         // Pierwszy chunk — wysyla role bez contentu.
         let first = ChatCompletionChunk {
             id: completion_id.clone(),
@@ -385,6 +391,7 @@ impl LocalInferenceHandler {
             speaker_id: None,
             speaker_name: None,
             usage: None,
+            perf: None,
         };
         if chunk_tx.send(first).await.is_err() {
             return;
@@ -414,6 +421,61 @@ impl LocalInferenceHandler {
             } else {
                 Some(token.text)
             };
+            // Pierwszy token z realnym contentem wyznacza TTFT.
+            if first_token_at.is_none()
+                && content.as_deref().map(|c| !c.is_empty()).unwrap_or(false)
+            {
+                first_token_at = Some(Instant::now());
+            }
+            // Usage jedzie na tokenie finalnym z realnymi licznikami silnika; tym
+            // chunkiem token accounting (AiGateway) zlicza zużycie. Silniki nie
+            // raportujące liczb (np. MLX) dają 0 → pomijamy, by nie wpisywać zer.
+            let usage = if token.is_final
+                && (token.prompt_tokens > 0 || token.completion_tokens > 0)
+            {
+                Some(Usage {
+                    prompt_tokens: token.prompt_tokens,
+                    completion_tokens: token.completion_tokens,
+                    total_tokens: token.prompt_tokens + token.completion_tokens,
+                })
+            } else {
+                None
+            };
+            // Metryki przepustowości: preferujemy pomiar silnika (realne granice faz
+            // prefill/dekodowanie), wall-clock jest tylko fallbackiem gdy silnik nie
+            // podał wartości (0.0). TTFT zostaje zawsze wall-clock — to realny,
+            // user-facing czas do pierwszego tokena.
+            let engine_prefill_tps = token.prefill_tps;
+            let engine_completion_tps = token.completion_tps;
+            let perf = usage.as_ref().map(|u| {
+                let ttft_ms = first_token_at
+                    .map(|t| t.duration_since(start).as_millis() as u32)
+                    .unwrap_or(0);
+                let now = Instant::now();
+                let decode_secs = first_token_at
+                    .map(|t| now.duration_since(t).as_secs_f32())
+                    .unwrap_or(0.0);
+                let prefill_secs = (ttft_ms as f32) / 1000.0;
+                let prefill_tps = if engine_prefill_tps > 0.0 {
+                    engine_prefill_tps
+                } else if prefill_secs > 0.0 {
+                    u.prompt_tokens as f32 / prefill_secs
+                } else {
+                    0.0
+                };
+                let decode_tps = if engine_completion_tps > 0.0 {
+                    engine_completion_tps
+                } else if decode_secs > 0.0 && u.completion_tokens > 1 {
+                    (u.completion_tokens - 1) as f32 / decode_secs
+                } else {
+                    0.0
+                };
+                GenPerf {
+                    ttft_ms,
+                    prefill_tps,
+                    decode_tps,
+                }
+            });
             let chunk = ChatCompletionChunk {
                 id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -437,7 +499,8 @@ impl LocalInferenceHandler {
                 transcribed_text: None,
                 speaker_id: None,
                 speaker_name: None,
-                usage: None,
+                usage,
+                perf,
             };
 
             if chunk_tx.send(chunk).await.is_err() {

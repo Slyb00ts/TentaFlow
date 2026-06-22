@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
 pub struct PiiRule {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub category: String,
     pub pattern: String,

@@ -371,6 +371,68 @@ fn dual_initiate_converges_to_single_donor() {
 }
 
 #[test]
+fn content_election_data_holder_is_donor_regardless_of_node_id() {
+    // Empty node has the LOWER id but the data-holder must still be donor, so the
+    // empty node adopts the content instead of wiping the peer.
+    let empty = "aaaa";
+    let holder = "bbbb";
+    let (donor, joiner) = decide_roles_by_content(empty, 0, holder, 500);
+    assert_eq!(donor, holder);
+    assert_eq!(joiner, empty);
+    // Same inputs from the holder's perspective converge on the same donor.
+    let (donor2, joiner2) = decide_roles_by_content(holder, 500, empty, 0);
+    assert_eq!(donor2, holder);
+    assert_eq!(joiner2, empty);
+}
+
+#[test]
+fn content_election_ties_break_on_lower_node_id() {
+    let (donor, joiner) = decide_roles_by_content("aaaa", 10, "bbbb", 10);
+    assert_eq!(donor, "aaaa");
+    assert_eq!(joiner, "bbbb");
+    let (donor2, joiner2) = decide_roles_by_content("bbbb", 10, "aaaa", 10);
+    assert_eq!(donor2, "aaaa");
+    assert_eq!(joiner2, "bbbb");
+}
+
+#[test]
+fn joiner_supersedes_armed_donor_slot_for_same_peer_epoch() {
+    let epoch = epoch(3, "peer");
+    let armed_donor = BaselineAdoptState {
+        role: BaselineRole::Donor,
+        peer: "peer".into(),
+        epoch: epoch.clone(),
+        phase: BaselinePhase::Elected,
+    };
+    // The local node legitimately decides to PULL from the same peer: the armed
+    // donor slot must yield, not wedge the single-flight gate.
+    assert!(!conflicts_with(
+        &armed_donor,
+        BaselineRole::Joiner,
+        "peer",
+        &epoch
+    ));
+    // But an ACTIVE donor transfer (past Elected) for the same peer still conflicts.
+    let active_donor = BaselineAdoptState {
+        phase: BaselinePhase::Receiving,
+        ..armed_donor.clone()
+    };
+    assert!(conflicts_with(
+        &active_donor,
+        BaselineRole::Joiner,
+        "peer",
+        &epoch
+    ));
+    // And an armed donor toward a DIFFERENT peer still conflicts.
+    assert!(conflicts_with(
+        &armed_donor,
+        BaselineRole::Joiner,
+        "other-peer",
+        &epoch
+    ));
+}
+
+#[test]
 fn validate_ack_agreement_rejects_mismatch() {
     let ok = BaselineAck {
         accepted: true,

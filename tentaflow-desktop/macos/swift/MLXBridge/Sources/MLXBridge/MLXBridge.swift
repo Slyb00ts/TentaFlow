@@ -97,7 +97,11 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         topP: Float,
         maxContextTokens: Int,
         memoryBudgetMB: Int,
-        tokenCallback: @escaping (String, Bool) -> Void
+        // (text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps).
+        // Liczniki i prędkości faz są niezerowe tylko na finalnym wywołaniu
+        // (isFinal=true). prefillTps/decodeTps pochodzą z realnych pomiarów MLX
+        // (GenerateCompletionInfo), nie z wall-clock TTFT.
+        tokenCallback: @escaping (String, Bool, Int, Int, Double, Double) -> Void
     ) -> Int32 {
         guard let container = modelContainer else {
             print("[MLXBridge] Brak zaladowanego modelu")
@@ -133,7 +137,7 @@ public final class MLXBridgeEngine: @unchecked Sendable {
 
         Task {
             do {
-                let _ = try await container.perform { context in
+                let counts = try await container.perform { context in
                     // Prompt juz jest sformatowany przez Rust (ChatML lub Mistral).
                     let tokenIds = context.tokenizer.encode(text: prompt)
                     // Sam prompt przekracza budzet kontekstu -> odmow zadania
@@ -151,6 +155,9 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                     // mutacji zmiennej func-scope w @Sendable token-closure.
                     var lastOutput = ""
                     var memExceeded = false
+                    // Licznik wygenerowanych tokenow (perform-scope, jak lastOutput)
+                    // — mutowany w @Sendable token-closure, zwracany na koncu.
+                    var genCount = 0
                     let info = try MLXLMCommon.generate(
                         input: input,
                         parameters: parameters,
@@ -168,9 +175,10 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                         let fullText = context.tokenizer.decode(tokenIds: tokens)
                         if fullText.count > lastOutput.count {
                             let newPart = String(fullText.dropFirst(lastOutput.count))
-                            tokenCallback(newPart, false)
+                            tokenCallback(newPart, false, 0, 0, 0, 0)
                         }
                         lastOutput = fullText
+                        genCount = tokens.count
 
                         for stop in stopStrings {
                             if fullText.contains(stop) {
@@ -184,15 +192,17 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                         return tokens.count >= maxTokens ? .stop : .more
                     }
                     if memExceeded { throw MLXContextBudgetExceeded() }
-                    return info
+                    // Realne prędkości faz z MLX: promptTokensPerSecond = prefill,
+                    // tokensPerSecond = decode. Dużo dokładniejsze niż wall-clock.
+                    return (promptCount, genCount, info.promptTokensPerSecond, info.tokensPerSecond)
                 }
 
-                tokenCallback("", true)
+                tokenCallback("", true, counts.0, counts.1, counts.2, counts.3)
                 resultCode = 0
                 print("[MLXBridge] Generowanie zakonczone (kod \(resultCode))")
             } catch {
                 print("[MLXBridge] Blad generowania: \(error)")
-                tokenCallback("", true)
+                tokenCallback("", true, 0, 0, 0, 0)
                 // Przekroczony kontekst albo blad alokacji pod twardym budzetem
                 // -> raportuj jako brak pamieci; inne bledy jako generyczne.
                 if error is MLXContextBudgetExceeded || budgetBytes > 0 {
@@ -269,7 +279,7 @@ public func MLXBridge_generate(
     topP: Float,
     maxContextTokens: Int32,
     memoryBudgetMB: Int32,
-    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UnsafeMutableRawPointer?) -> Void)?,
+    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UInt32, UInt32, Float, Float, UnsafeMutableRawPointer?) -> Void)?,
     callbackContext: UnsafeMutableRawPointer?,
     context: UnsafeMutableRawPointer?
 ) -> Int32 {
@@ -286,9 +296,9 @@ public func MLXBridge_generate(
         topP: topP,
         maxContextTokens: Int(maxContextTokens),
         memoryBudgetMB: Int(memoryBudgetMB)
-    ) { text, isFinal in
+    ) { text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps in
         text.withCString { cstr in
-            tokenCb(cstr, isFinal, callbackContext)
+            tokenCb(cstr, isFinal, UInt32(promptTokens), UInt32(completionTokens), Float(prefillTps), Float(decodeTps), callbackContext)
         }
     }
 }

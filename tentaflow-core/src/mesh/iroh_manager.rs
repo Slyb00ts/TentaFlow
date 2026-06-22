@@ -202,7 +202,9 @@ pub enum IrohMeshEvent {
     },
     TrustedKeysSyncReceived {
         node_id: String,
-        keys: Vec<(String, String)>,
+        /// (node_id, public_key_hex, origin_approved_at). `approved_at` keeps the
+        /// trust-expiry TTL anchored to the origin's first pairing across mirroring.
+        keys: Vec<(String, String, String)>,
     },
     /// F1b P3.B — peer pushed its HMAC issuer keys (pickup_token, frame_url,
     /// recording_url). Payload carries raw 32-byte secrets + optional
@@ -2727,7 +2729,7 @@ impl IrohMeshManagerRef {
                         keys: p
                             .keys
                             .into_iter()
-                            .map(|e| (e.node_id, e.public_key_hex))
+                            .map(|e| (e.node_id, e.public_key_hex, e.approved_at))
                             .collect(),
                     },
                     Err(e) => {

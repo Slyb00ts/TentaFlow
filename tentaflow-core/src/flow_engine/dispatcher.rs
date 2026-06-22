@@ -897,6 +897,7 @@ fn wrap_blocking_as_stream(
     use futures::stream::StreamExt;
     let payload_for_stream = outcome.final_envelope.payload.clone();
     let usage = outcome.usage.clone();
+    let perf = outcome.perf;
     let finish = outcome.finish_reason.clone();
     let err = outcome.error.clone();
     let stream = futures::stream::once(async move {
@@ -931,6 +932,7 @@ fn wrap_blocking_as_stream(
                     reasoning_delta: None,
                     tool_calls: Vec::new(),
                     usage: Some(usage),
+                    perf,
                     finish_reason: Some(finish),
                     error: err,
                 }))
@@ -1117,6 +1119,7 @@ mod tests {
                 completion_tokens: 7,
                 total_tokens: 12,
             },
+            perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 42,
             error: None,
@@ -1149,6 +1152,7 @@ mod tests {
             final_envelope: env,
             trace: Vec::new(),
             usage: TokenUsage::default(),
+            perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 0,
             error: None,
@@ -1198,6 +1202,7 @@ mod tests {
             final_envelope: env,
             trace: Vec::new(),
             usage: TokenUsage::default(),
+            perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 0,
             error: None,

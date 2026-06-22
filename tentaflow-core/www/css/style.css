@@ -3046,6 +3046,13 @@ input, textarea, select {
 .msg-row.user .bubble-meta { justify-content: flex-end; }
 .bubble-meta .who { font-weight: 600; color: var(--text-2); }
 
+.bubble-perf {
+  font-size: 10px;
+  color: var(--text-3);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.2px;
+}
+
 .bubble {
   padding: 12px 16px;
   border-radius: 14px;

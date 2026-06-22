@@ -206,6 +206,7 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             },
+            perf: None,
             finish_reason: finish,
             total_latency_ms: 42,
             error: None,

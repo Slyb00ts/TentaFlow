@@ -411,6 +411,7 @@ impl MeshSecurity {
             remote_public_key_hex,
             hostname,
             approved_by,
+            None,
         )?;
 
         self.trusted_keys.insert(remote_node_id.to_string(), vk);
@@ -566,22 +567,29 @@ impl MeshSecurity {
     // Trusted keys management (w tym synchronizacja po pairingu)
     // =========================================================================
 
-    /// Wszystkie zaufane nody jako pary (node_id, public_key_hex).
-    pub fn get_all_trusted_keys(&self) -> Vec<(String, String)> {
+    /// Wszystkie zaufane nody jako trojki (node_id, public_key_hex, approved_at).
+    /// `approved_at` is carried so trust mirroring can propagate the ORIGIN's approval
+    /// time, keeping the trust-expiry TTL anchored to the first real pairing.
+    pub fn get_all_trusted_keys(&self) -> Vec<(String, String, String)> {
         let trusted = db::repository::list_trusted_nodes(&self.db).unwrap_or_default();
         trusted
             .iter()
-            .map(|n| (n.node_id.clone(), n.public_key.clone()))
+            .map(|n| (n.node_id.clone(), n.public_key.clone(), n.approved_at.clone()))
             .collect()
     }
 
     /// Dodaje klucz zaufanego noda otrzymany od innego noda (propagacja
     /// trusted_keys po pairingu).
+    ///
+    /// `origin_approved_at` is the mirrored origin's `approved_at`; it becomes the
+    /// trust-expiry TTL anchor instead of "now", so a mirror re-add cannot resurrect a
+    /// long-dead identity with a fresh clock. Empty/None falls back to "now" (legacy peer).
     pub fn add_trusted_key(
         &self,
         node_id: &str,
         public_key_hex: &str,
         hostname: &str,
+        origin_approved_at: Option<&str>,
     ) -> Result<()> {
         if public_key_hex == self.public_key_hex() {
             return Ok(());
@@ -601,7 +609,14 @@ impl MeshSecurity {
 
         let vk = Self::parse_verifying_key(public_key_hex)?;
 
-        db::repository::add_trusted_node(&self.db, node_id, public_key_hex, hostname, "mesh-sync")?;
+        db::repository::add_trusted_node(
+            &self.db,
+            node_id,
+            public_key_hex,
+            hostname,
+            "mesh-sync",
+            origin_approved_at,
+        )?;
 
         self.trusted_keys.insert(node_id.to_string(), vk);
         self.rebuild_trusted_snapshot();
@@ -695,7 +710,7 @@ mod tests {
         let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         sec_b
-            .add_trusted_key("node-a", &sec_a.public_key_hex(), "host-a")
+            .add_trusted_key("node-a", &sec_a.public_key_hex(), "host-a", None)
             .unwrap();
 
         let data = b"Wiadomosc do podpisania";

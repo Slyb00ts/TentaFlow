@@ -2416,6 +2416,79 @@ export const encode = {
     );
   },
 
+  /** MessageBody::TokenUsageBody(UsageSummaryRequest) — agregat zuzycia tokenow. */
+  tokenUsageSummaryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenUsageSummaryRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+      String(payload.groupBy ?? payload.group_by ?? 'user'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(ListQuotasRequest) — lista limitow org. */
+  tokenListQuotasRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenListQuotasRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(UpsertQuotaRequest) — utworz/aktualizuj limit. */
+  tokenUpsertQuotaRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const quota = payload.quota ?? payload;
+    const body = _wasm.encodeTokenUpsertQuotaRequest(
+      quota.id ?? null,
+      String(quota.scopeType ?? quota.scope_type ?? ''),
+      quota.subjectId ?? quota.subject_id ?? null,
+      quota.modelId ?? quota.model_id ?? null,
+      String(quota.period ?? 'daily'),
+      BigInt(quota.maxTotalTokens ?? quota.max_total_tokens ?? 0),
+      Boolean(quota.isActive ?? quota.is_active ?? true),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(DeleteQuotaRequest) — usun limit po id. */
+  tokenDeleteQuotaRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenDeleteQuotaRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(CoordinatorStatusRequest) — status koordynatora. */
+  tokenCoordinatorStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenCoordinatorStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();

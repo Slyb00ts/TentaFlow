@@ -87,7 +87,11 @@ impl LlmDispatcherImpl {
         api_req: &ChatCompletionRequest,
     ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
         let db = self.db.as_ref()?;
-        let gateway = AiGateway::new(db.clone(), self.node_id.clone());
+        let gateway = AiGateway::new(
+            db.clone(),
+            self.node_id.clone(),
+            crate::compliance::ai_gateway::token_quota_enabled(),
+        );
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
@@ -564,7 +568,18 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
         text_delta,
         reasoning_delta,
         tool_calls,
-        usage: None,
+        // Przewlekamy realne liczniki z finalnego chunku silnika do flow-engine
+        // (executor agreguje to do FlowExecutionOutcome.usage → bump tokenów).
+        usage: chunk.usage.map(|u| TokenUsage {
+            prompt_tokens: u.prompt_tokens as u64,
+            completion_tokens: u.completion_tokens as u64,
+            total_tokens: u.total_tokens as u64,
+        }),
+        perf: chunk.perf.map(|p| crate::flow_engine::envelope::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
         finish_reason,
         error: None,
     }
@@ -845,6 +860,7 @@ mod tests {
             speaker_id: None,
             speaker_name: None,
             usage: None,
+            perf: None,
         };
         let mapped = chat_chunk_to_llm_chunk(chunk);
         assert_eq!(mapped.tool_calls.len(), 2);

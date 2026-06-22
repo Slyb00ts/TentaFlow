@@ -46,6 +46,11 @@ impl Router {
         // aktywuje się gdy admin nie skonfigurował user-defined flow.
         // Direct executor.execute_stt fallback wycięty w 3d-0b-final.
         if let Some(ref dispatcher) = self.flow_dispatcher {
+            // Czas trwania audio liczymy z naglowka WAV ZANIM `file` zostanie
+            // skonsumowany przez envelope; response duration ma pierwszenstwo.
+            let header_audio_ms = wav_duration_ms(&request.file);
+            let user_id = user.as_ref().map(|u| u.user_id.clone());
+            let model = request.model.clone();
             match crate::services::runtime::executor::stt_request_to_initial_envelope(
                 &request,
                 user.clone(),
@@ -69,6 +74,12 @@ impl Router {
                                         source: None,
                                     }
                                 })?;
+                            self.bump_audio_usage_best_effort(
+                                &model,
+                                user_id.as_deref(),
+                                &response,
+                                header_audio_ms,
+                            );
                             return Ok(crate::routing::RouteResult {
                                 response,
                                 metadata: crate::routing::RouteMetadata {
@@ -661,6 +672,50 @@ impl Router {
         }
     }
 
+    /// Best-effort doliczenie przetworzonego audio (ms) do dziennego licznika
+    /// tego wezla. Zrodlo czasu: `response.duration` (sekundy) ma pierwszenstwo,
+    /// dalej koniec ostatniego segmentu, na koncu naglowek WAV requestu. Blad
+    /// metryki nigdy nie psuje odpowiedzi.
+    fn bump_audio_usage_best_effort(
+        &self,
+        model: &str,
+        user_id: Option<&str>,
+        response: &TranscriptionResponse,
+        header_audio_ms: i64,
+    ) {
+        let Some(ref db) = self.db else {
+            return;
+        };
+        let audio_ms = response
+            .duration
+            .filter(|d| *d > 0.0)
+            .map(|d| (f64::from(d) * 1000.0).round() as i64)
+            .or_else(|| {
+                response.segments.as_ref().and_then(|segs| {
+                    segs.iter()
+                        .map(|s| s.end)
+                        .fold(None, |acc: Option<f32>, e| {
+                            Some(acc.map_or(e, |m| m.max(e)))
+                        })
+                        .filter(|d| *d > 0.0)
+                        .map(|d| (f64::from(d) * 1000.0).round() as i64)
+                })
+            })
+            .unwrap_or(header_audio_ms);
+        if audio_ms <= 0 {
+            return;
+        }
+        let node_id = self.local_node_id();
+        let org_id = crate::db::repository::primary_org_for_user(db, user_id);
+        let usage_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let user_id = user_id.unwrap_or(crate::db::repository::TOKEN_USAGE_SYSTEM_USER);
+        if let Err(err) = crate::db::repository::bump_audio_usage(
+            db, &node_id, &org_id, user_id, model, &usage_day, audio_ms,
+        ) {
+            tracing::warn!(error = %err, "zliczenie zuzycia STT nieudane");
+        }
+    }
+
     /// Routuje operacje speaker do QUIC STT service.
     ///
     /// Speaker operations (enrollment, identification, etc.) sa obslugiwane przez
@@ -841,4 +896,44 @@ impl Router {
             }
         }
     }
+}
+
+/// Szacuje dlugosc audio (ms) z naglowka WAV/RIFF: znajduje `fmt ` (byte_rate)
+/// i `data` (rozmiar) i liczy `data_size / byte_rate`. O(1), bez dekodowania.
+/// Zwraca 0 gdy bufor nie jest poprawnym PCM WAV (np. mp3/ogg) — wtedy licznik
+/// zda sie na `duration` z odpowiedzi STT.
+fn wav_duration_ms(bytes: &[u8]) -> i64 {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return 0;
+    }
+    let mut byte_rate: u32 = 0;
+    let mut data_size: u32 = 0;
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let chunk_id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body = pos + 8;
+        if chunk_id == b"fmt " && body + 16 <= bytes.len() {
+            byte_rate = u32::from_le_bytes([
+                bytes[body + 8],
+                bytes[body + 9],
+                bytes[body + 10],
+                bytes[body + 11],
+            ]);
+        } else if chunk_id == b"data" {
+            data_size = chunk_size as u32;
+            break;
+        }
+        // Chunki sa wyrownywane do parzystej liczby bajtow.
+        pos = body + chunk_size + (chunk_size & 1);
+    }
+    if byte_rate == 0 {
+        return 0;
+    }
+    (i64::from(data_size) * 1000) / i64::from(byte_rate)
 }

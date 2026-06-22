@@ -31,5 +31,6 @@ pub mod relay_health;
 pub mod robot_control;
 pub mod robot_dispatch;
 pub mod security;
+pub mod token_coordinator;
 pub mod ufp2;
 pub mod vector_transport;

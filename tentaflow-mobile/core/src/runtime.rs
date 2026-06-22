@@ -306,6 +306,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             node_id: node_id.clone(),
             role: "mobile".to_string(),
             mesh_config: config.mesh.as_ref().unwrap().clone(),
+            token_metrics: config.token_metrics.clone(),
         };
 
         match tokio::time::timeout(
