@@ -5552,7 +5552,8 @@ pub fn reseed_core_state_from_current_rows(
             K::TokenUsageDaily => {
                 let mut stmt = tx.prepare(
                     "SELECT id, node_id, org_id, user_id, model_id, usage_day, \
-                            prompt_tokens, completion_tokens, total_tokens, request_count \
+                            prompt_tokens, completion_tokens, total_tokens, request_count, \
+                            audio_ms, images, embedding_tokens \
                      FROM token_usage_daily",
                 )?;
                 let rows = stmt
@@ -5568,6 +5569,9 @@ pub fn reseed_core_state_from_current_rows(
                             r.get::<_, i64>(7)?,
                             r.get::<_, i64>(8)?,
                             r.get::<_, i64>(9)?,
+                            r.get::<_, i64>(10)?,
+                            r.get::<_, i64>(11)?,
+                            r.get::<_, i64>(12)?,
                         ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5582,6 +5586,9 @@ pub fn reseed_core_state_from_current_rows(
                     completion_tokens,
                     total_tokens,
                     request_count,
+                    audio_ms,
+                    images,
+                    embedding_tokens,
                 ) in rows
                 {
                     record_core_capture_for_org_tx(
@@ -5600,6 +5607,9 @@ pub fn reseed_core_state_from_current_rows(
                             completion_tokens,
                             total_tokens,
                             request_count,
+                            audio_ms,
+                            images,
+                            embedding_tokens,
                         ),
                         None,
                     )?;
@@ -8710,6 +8720,9 @@ pub fn token_usage_changed_fields(
     completion_tokens: i64,
     total_tokens: i64,
     request_count: i64,
+    audio_ms: i64,
+    images: i64,
+    embedding_tokens: i64,
 ) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
     use crate::sync::ledger::FieldValue;
     let mut fields = BTreeMap::new();
@@ -8725,6 +8738,12 @@ pub fn token_usage_changed_fields(
     );
     fields.insert("total_tokens".to_string(), FieldValue::I64(total_tokens));
     fields.insert("request_count".to_string(), FieldValue::I64(request_count));
+    fields.insert("audio_ms".to_string(), FieldValue::I64(audio_ms));
+    fields.insert("images".to_string(), FieldValue::I64(images));
+    fields.insert(
+        "embedding_tokens".to_string(),
+        FieldValue::I64(embedding_tokens),
+    );
     fields
 }
 
@@ -8769,6 +8788,138 @@ pub fn bump_token_usage(
     Ok(())
 }
 
+/// Podstawowa organizacja uzytkownika dla licznikow zuzycia (najstarsze
+/// czlonkostwo). Brak czlonkostwa lub brak user_id → `DEFAULT_ORG_ID`. Best-effort:
+/// blad DB tez degraduje do org domyslnej (metryki nie moga psuc requestu).
+pub fn primary_org_for_user(pool: &DbPool, user_id: Option<&str>) -> String {
+    let default = crate::services::org::DEFAULT_ORG_ID.to_string();
+    let Some(user_id) = user_id else {
+        return default;
+    };
+    let Ok(conn) = acquire(pool) else {
+        return default;
+    };
+    conn.query_row(
+        "SELECT org_id FROM org_memberships WHERE user_id = ?1 \
+         ORDER BY granted_at ASC, org_id ASC LIMIT 1",
+        rusqlite::params![user_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(default)
+}
+
+/// Lokalny UPSERT zuzycia embeddingow. Tokeny embeddingow trzymamy w osobnym
+/// liczniku (`embedding_tokens`) i NIE wliczamy ich do `prompt_tokens` ani
+/// `total_tokens` — to inna modalnosc niz chat LLM. Sciezka goraca, BEZ capture.
+pub fn bump_embedding_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    embedding_tokens: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, 0, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            embedding_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Lokalny UPSERT zuzycia STT — kumuluje milisekundy przetworzonego audio.
+/// Sciezka goraca, BEZ capture (flusher emituje capture batchem).
+pub fn bump_audio_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    audio_ms: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, ?7, 0, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            audio_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Lokalny UPSERT zuzycia generacji obrazow — kumuluje liczbe wygenerowanych
+/// obrazow. Sciezka goraca, BEZ capture (flusher emituje capture batchem).
+pub fn bump_image_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    images: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, ?7, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         images = images + excluded.images, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            images,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Emituje capture dla WLASNYCH licznikow tego noda zmienionych po
 /// `since_watermark`. Filtr `node_id = self` jest kluczowy: repliki licznikow z
 /// innych nodow (otrzymane przez sync) maja node-lokalny `updated_at` ustawiony
@@ -8792,11 +8943,15 @@ pub fn flush_token_usage_captures(
         i64,
         i64,
         i64,
+        i64,
+        i64,
+        i64,
         String,
     )> = {
         let mut stmt = conn.prepare_cached(
             "SELECT id, node_id, org_id, user_id, model_id, usage_day, \
-             prompt_tokens, completion_tokens, total_tokens, request_count, updated_at \
+             prompt_tokens, completion_tokens, total_tokens, request_count, \
+             audio_ms, images, embedding_tokens, updated_at \
              FROM token_usage_daily WHERE node_id = ?2 AND updated_at > ?1 ORDER BY updated_at",
         )?;
         let collected = stmt
@@ -8813,6 +8968,9 @@ pub fn flush_token_usage_captures(
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8836,6 +8994,9 @@ pub fn flush_token_usage_captures(
         completion_tokens,
         total_tokens,
         request_count,
+        audio_ms,
+        images,
+        embedding_tokens,
         updated_at,
     ) in &rows
     {
@@ -8855,6 +9016,9 @@ pub fn flush_token_usage_captures(
                 *completion_tokens,
                 *total_tokens,
                 *request_count,
+                *audio_ms,
+                *images,
+                *embedding_tokens,
             ),
             None,
         )?;
