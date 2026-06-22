@@ -180,6 +180,11 @@ pub struct StreamToken {
     /// (token_usage_daily) jest i64 i nigdy nie przenosi sumy tym kanałem.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Przepustowość faz raportowana przez silnik na tokenie finalnym: prefill
+    /// (tokeny promptu / czas prefillu) i dekodowanie (tokeny generacji / czas
+    /// generacji). 0.0 = silnik nie podał pomiaru (konsument wraca do wall-clock).
+    pub prefill_tps: f32,
+    pub completion_tps: f32,
 }
 
 /// Parametry embeddingów

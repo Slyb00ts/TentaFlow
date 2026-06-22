@@ -97,10 +97,11 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         topP: Float,
         maxContextTokens: Int,
         memoryBudgetMB: Int,
-        // (text, isFinal, promptTokens, completionTokens). Liczniki sa niezerowe
-        // tylko na finalnym wywolaniu (isFinal=true) — Rust uzywa ich do
-        // dokladnego zliczania tokenow per-wiadomosc.
-        tokenCallback: @escaping (String, Bool, Int, Int) -> Void
+        // (text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps).
+        // Liczniki i prędkości faz są niezerowe tylko na finalnym wywołaniu
+        // (isFinal=true). prefillTps/decodeTps pochodzą z realnych pomiarów MLX
+        // (GenerateCompletionInfo), nie z wall-clock TTFT.
+        tokenCallback: @escaping (String, Bool, Int, Int, Double, Double) -> Void
     ) -> Int32 {
         guard let container = modelContainer else {
             print("[MLXBridge] Brak zaladowanego modelu")
@@ -157,7 +158,7 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                     // Licznik wygenerowanych tokenow (perform-scope, jak lastOutput)
                     // — mutowany w @Sendable token-closure, zwracany na koncu.
                     var genCount = 0
-                    let _ = try MLXLMCommon.generate(
+                    let info = try MLXLMCommon.generate(
                         input: input,
                         parameters: parameters,
                         context: context
@@ -174,7 +175,7 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                         let fullText = context.tokenizer.decode(tokenIds: tokens)
                         if fullText.count > lastOutput.count {
                             let newPart = String(fullText.dropFirst(lastOutput.count))
-                            tokenCallback(newPart, false, 0, 0)
+                            tokenCallback(newPart, false, 0, 0, 0, 0)
                         }
                         lastOutput = fullText
                         genCount = tokens.count
@@ -191,15 +192,17 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                         return tokens.count >= maxTokens ? .stop : .more
                     }
                     if memExceeded { throw MLXContextBudgetExceeded() }
-                    return (promptCount, genCount)
+                    // Realne prędkości faz z MLX: promptTokensPerSecond = prefill,
+                    // tokensPerSecond = decode. Dużo dokładniejsze niż wall-clock.
+                    return (promptCount, genCount, info.promptTokensPerSecond, info.tokensPerSecond)
                 }
 
-                tokenCallback("", true, counts.0, counts.1)
+                tokenCallback("", true, counts.0, counts.1, counts.2, counts.3)
                 resultCode = 0
                 print("[MLXBridge] Generowanie zakonczone (kod \(resultCode))")
             } catch {
                 print("[MLXBridge] Blad generowania: \(error)")
-                tokenCallback("", true, 0, 0)
+                tokenCallback("", true, 0, 0, 0, 0)
                 // Przekroczony kontekst albo blad alokacji pod twardym budzetem
                 // -> raportuj jako brak pamieci; inne bledy jako generyczne.
                 if error is MLXContextBudgetExceeded || budgetBytes > 0 {
@@ -276,7 +279,7 @@ public func MLXBridge_generate(
     topP: Float,
     maxContextTokens: Int32,
     memoryBudgetMB: Int32,
-    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UInt32, UInt32, UnsafeMutableRawPointer?) -> Void)?,
+    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UInt32, UInt32, Float, Float, UnsafeMutableRawPointer?) -> Void)?,
     callbackContext: UnsafeMutableRawPointer?,
     context: UnsafeMutableRawPointer?
 ) -> Int32 {
@@ -293,9 +296,9 @@ public func MLXBridge_generate(
         topP: topP,
         maxContextTokens: Int(maxContextTokens),
         memoryBudgetMB: Int(memoryBudgetMB)
-    ) { text, isFinal, promptTokens, completionTokens in
+    ) { text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps in
         text.withCString { cstr in
-            tokenCb(cstr, isFinal, UInt32(promptTokens), UInt32(completionTokens), callbackContext)
+            tokenCb(cstr, isFinal, UInt32(promptTokens), UInt32(completionTokens), Float(prefillTps), Float(decodeTps), callbackContext)
         }
     }
 }
