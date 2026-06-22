@@ -1,8 +1,10 @@
 // =============================================================================
 // File: lib.rs — browser WebGPU/WebGL voxel / occupancy-grid SLAM viewer
 // Live 3D view of a robot's LiDAR cloud (~30-47k points/frame) drawn as instanced
-// voxel cubes with a height-based elevation colormap (Z-up), on top of a wireframe
-// ground grid, with a small robot marker at the cloud center and mouse orbit/zoom.
+// voxel cubes (Z-up) colored by horizontal radial distance from the robot (magenta
+// near -> green at the edges), each cube outlined with a dark Minecraft-style edge,
+// on top of a wireframe ground grid, with a small robot marker at the cloud center,
+// faint LiDAR rays and mouse orbit/zoom.
 // =============================================================================
 
 use std::cell::RefCell;
@@ -24,8 +26,8 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-// Initial height range in meters until the first cloud sets an adaptive range
-// from its actual Z extent.
+// Initial radial range in meters until the first cloud sets an adaptive range
+// from its actual horizontal extent.
 const HEATMAP_RANGE_METERS: f32 = 8.0;
 
 // Sparse LiDAR reads as isolated points at the 0.05 m resolution; rendering the
@@ -80,7 +82,8 @@ struct SolidVertex {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
-    // Reference corner the height colormap is measured from + inverse range.
+    // Cloud horizontal center the radial colormap is measured from (X-Y used;
+    // Z is ignored so the floor reads as one radial field) + inverse range.
     heatmap_origin: [f32; 3],
     inv_heatmap_range: f32,
     // Rendered cube edge length in meters (voxel pitch * fill factor).
@@ -139,22 +142,27 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
+    // Cube-local position in [-0.5, 0.5]; the fragment uses it to draw a dark
+    // edge outline on every voxel without extra geometry.
+    @location(1) local_pos: vec3<f32>,
 };
 
-// Compact HSV->RGB (h,s,v in [0,1]). Used for an elevation colormap so the floor
-// and obstacles read like a height field, the way occupancy-grid viewers show it.
+// Compact HSV->RGB (h,s,v in [0,1]). Used for the radial-distance colormap so
+// the cloud reads as a rainbow field centered on the robot.
 fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     let k = vec3<f32>(5.0, 3.0, 1.0) / 6.0;
     let p = abs(fract(vec3<f32>(h) + k) * 6.0 - 3.0);
     return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
 }
 
-// Elevation colormap: low (floor) = warm orange/red, rising through yellow/green/
-// cyan to high (tall obstacles) = blue/violet. t is normalized height [0,1].
-fn heightcolor(t: f32) -> vec3<f32> {
+// Radial-distance colormap: close to the robot = magenta/pink, sweeping through
+// red, orange, yellow to green at the far edges. t is normalized horizontal
+// distance from the cloud center [0,1]. Hue starts at ~magenta (0.85) and sweeps
+// forward, wrapping past red/orange (~0.0-0.1) to green (~0.33).
+fn radialcolor(t: f32) -> vec3<f32> {
     let c = clamp(t, 0.0, 1.0);
-    let h = 0.08 + c * 0.62; // ~orange at the floor -> ~blue/violet at the top
-    return hsv2rgb(h, 0.92, 1.0);
+    let h = fract(0.85 + c * 0.48);
+    return hsv2rgb(h, 0.95, 1.0);
 }
 
 @vertex
@@ -163,16 +171,29 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = in.translation + in.position * u.voxel_size;
     out.clip_position = u.view_proj * vec4<f32>(world, 1.0);
 
-    // Color by HEIGHT (Z): heatmap_origin.z carries the floor (min Z) and
-    // inv_heatmap_range = 1 / height-extent.
-    let t = (in.translation.z - u.heatmap_origin.z) * u.inv_heatmap_range;
-    out.color = heightcolor(t);
+    // Color by HORIZONTAL RADIAL DISTANCE from the cloud center (X-Y only, Z
+    // ignored). heatmap_origin carries the cloud center; inv_heatmap_range =
+    // 1 / max horizontal radius so green reaches the outer edge.
+    let dxy = in.translation.xy - u.heatmap_origin.xy;
+    let t = length(dxy) * u.inv_heatmap_range;
+    out.color = radialcolor(t);
+    out.local_pos = in.position;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+    // Dark edge outline (Minecraft-style block borders). A cube edge is where the
+    // two largest of |x|,|y|,|z| are both near the 0.5 face. Sort the three
+    // absolute components and test the second-largest against the edge band.
+    let a = abs(in.local_pos);
+    let m0 = max(a.x, max(a.y, a.z));   // largest (always ~0.5 on a face)
+    let m2 = min(a.x, min(a.y, a.z));   // smallest
+    let mid = (a.x + a.y + a.z) - m0 - m2; // middle component
+    // Edge band: within ~7% of the cube half-extent on the second axis too.
+    let edge = step(0.5 - 0.035, mid);
+    let shade = mix(1.0, 0.35, edge);
+    return vec4<f32>(in.color * shade, 1.0);
 }
 "#;
 
@@ -336,10 +357,11 @@ const ROBOT_NOSE_LEN: f32 = 0.12;
 const ROBOT_COLOR: [f32; 3] = [0.92, 0.94, 0.97];
 const ROBOT_NOSE_COLOR: [f32; 3] = [1.0, 0.85, 0.45];
 
-// Render every Nth point as a faint ray; keeps the ray draw cheap (~500-750 lines
-// for a 30-47k cloud) and the view readable.
-const RAY_STRIDE: usize = 64;
-const RAY_COLOR: [f32; 3] = [0.45, 0.10, 0.10];
+// Render every Nth point as a faint ray; a large stride keeps the rays sparse so
+// they read as a few faint beams under the robot rather than a dense fan.
+const RAY_STRIDE: usize = 128;
+// Near-black/dark gray so the rays stay subtle, like the reference.
+const RAY_COLOR: [f32; 3] = [0.10, 0.10, 0.10];
 
 impl State {
     fn write_uniforms(&self) {
@@ -1121,11 +1143,22 @@ impl VoxelView {
         if min.is_finite() && max.is_finite() {
             let center = (min + max) * 0.5;
             let extent = (max - min).length().max(0.5);
-            // Elevation colormap: floor (min Z) = warm, top = cool. heatmap_origin
-            // carries the floor height in .z; the range is the height extent so the
-            // full palette spans floor..tallest obstacle.
-            st.heatmap_origin = Vec3::new(0.0, 0.0, min.z);
-            st.heatmap_range = (max.z - min.z).max(0.3);
+            // Radial-distance colormap: color is keyed to the horizontal distance
+            // from the cloud center. heatmap_origin carries the full center, but
+            // the shader measures distance in X-Y only (Z ignored), so the floor
+            // reads as one radial field. The range is the cloud's max horizontal
+            // radius so green reaches the outer edge.
+            st.heatmap_origin = center;
+            let mut max_radius = 0.0f32;
+            for i in 0..n {
+                let dx = points[i * 3] - center.x;
+                let dy = points[i * 3 + 1] - center.y;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r > max_radius {
+                    max_radius = r;
+                }
+            }
+            st.heatmap_range = max_radius.max(0.3);
 
             // Ground grid follows the floor footprint (rebuilt only on material
             // change). Robot marker sits at the horizontal center on the floor.
