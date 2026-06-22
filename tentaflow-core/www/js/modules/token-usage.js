@@ -220,6 +220,9 @@ function renderUsagePanel() {
         <tf-column key="prompt" label="${escapeAttr(T('col_prompt'))}" renderer="num" sortable></tf-column>
         <tf-column key="completion" label="${escapeAttr(T('col_completion'))}" renderer="num" sortable></tf-column>
         <tf-column key="total" label="${escapeAttr(T('col_total'))}" renderer="num" sortable></tf-column>
+        <tf-column key="audioSec" label="${escapeAttr(T('col_audio_sec'))}" renderer="num" sortable></tf-column>
+        <tf-column key="images" label="${escapeAttr(T('col_images'))}" renderer="num" sortable></tf-column>
+        <tf-column key="embeddings" label="${escapeAttr(T('col_embeddings'))}" renderer="num" sortable></tf-column>
         <tf-column key="requests" label="${escapeAttr(T('col_requests'))}" renderer="num" sortable></tf-column>
       </tf-table>
     </section>
@@ -280,13 +283,20 @@ async function loadUsage() {
 function renderUsageTable() {
   const table = byId('tu-usage-table');
   if (!table) return;
-  table.rows = usageRows.map((r) => ({
-    key: r.key,
-    prompt: Number(r.prompt_tokens ?? r.promptTokens ?? 0),
-    completion: Number(r.completion_tokens ?? r.completionTokens ?? 0),
-    total: Number(r.total_tokens ?? r.totalTokens ?? 0),
-    requests: Number(r.request_count ?? r.requestCount ?? 0),
-  }));
+  table.rows = usageRows.map((r) => {
+    // audio_ms → sekundy, zaokrąglone do 1 miejsca po przecinku
+    const audioMs = Number(r.audioMs ?? r.audio_ms ?? 0);
+    return {
+      key: r.key,
+      prompt: Number(r.prompt_tokens ?? r.promptTokens ?? 0),
+      completion: Number(r.completion_tokens ?? r.completionTokens ?? 0),
+      total: Number(r.total_tokens ?? r.totalTokens ?? 0),
+      audioSec: Math.round((audioMs / 1000) * 10) / 10,
+      images: Number(r.images ?? r.images ?? 0),
+      embeddings: Number(r.embeddingTokens ?? r.embedding_tokens ?? 0),
+      requests: Number(r.request_count ?? r.requestCount ?? 0),
+    };
+  });
 }
 
 function renderUsageChart() {
