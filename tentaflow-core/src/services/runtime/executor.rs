@@ -398,11 +398,17 @@ impl ModelRuntimeExecutor {
                     Ok(Box::pin(stream))
                 }
                 BackendHandle::Http(client) => {
+                    // Wymuszamy `include_usage` upstream — bez niego vLLM/sglang
+                    // nie emituje finalnego chunku z usage, więc nie znalibyśmy
+                    // prompt/completion tokenów do wall-clockowego perf.
+                    request.stream_options = Some(crate::api::openai::types::StreamOptions {
+                        include_usage: true,
+                    });
                     let stream = client
                         .chat_completion_stream(request)
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-                    Ok(stream)
+                    Ok(Box::pin(ExternalPerfStream::new(stream)))
                 }
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
@@ -584,7 +590,7 @@ impl ModelRuntimeExecutor {
                             }
                         }
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(ExternalPerfStream::new(Box::pin(stream))))
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -2330,6 +2336,116 @@ pub(crate) fn flow_outcome_to_stt_response(
 /// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
 /// klient z `include_usage=true` widzi brak (warn'em wpisany w
 /// `apply_include_usage_split`).
+/// Wall-clockowy pomiar perf dla strumieni z ZEWNĘTRZNYCH serwisów (Docker
+/// vLLM/sglang, natywny python-bundle przez HTTP, QUIC sidecar). Silniki
+/// embedded raportują perf zmierzony wewnątrz silnika; serwis zewnętrzny nie
+/// ujawnia swojego wewnętrznego czasu prefill, więc jedynym uczciwym sygnałem
+/// jest zegar ścienny w naszym proxy: czas od dispatchu, moment pierwszego
+/// chunku z treścią i liczba tokenów z finalnego usage. Perf doklejany jest do
+/// FINALNEGO chunku (tego, który niesie usage), żeby przeszedł istniejącą
+/// ścieżką (LlmStreamChunk.perf → FlowExecutionOutcome.perf → ChatStreamEnd).
+struct ExternalPerfStream {
+    inner: ExecutorChunkStream,
+    start: std::time::Instant,
+    first_token_at: Option<std::time::Instant>,
+    content_chunks: u32,
+}
+
+impl ExternalPerfStream {
+    fn new(inner: ExecutorChunkStream) -> Self {
+        Self {
+            inner,
+            start: std::time::Instant::now(),
+            first_token_at: None,
+            content_chunks: 0,
+        }
+    }
+
+    /// Buduje GenPerf z zegara ściennego. `prefill_tps` to ESTYMATA: nie znamy
+    /// wewnętrznego czasu prefill serwisu zewnętrznego, więc od TTFT odejmujemy
+    /// jeden krok dekodowania (`1/decode_tps`) jako przybliżenie czasu samego
+    /// prefill. Gdy się nie da — coarse fallback `prompt_tokens / ttft_secs`.
+    fn build_perf(
+        &self,
+        end: std::time::Instant,
+        usage: Option<&crate::api::openai::types::Usage>,
+    ) -> crate::api::openai::types::GenPerf {
+        let first_token_at = self.first_token_at.unwrap_or(end);
+        let ttft_secs = first_token_at.duration_since(self.start).as_secs_f32();
+        let ttft_ms = (ttft_secs * 1000.0).round() as u32;
+
+        let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+        let completion_tokens = usage
+            .map(|u| u.completion_tokens)
+            .filter(|&c| c > 0)
+            .unwrap_or(self.content_chunks);
+
+        let decode_secs = end.duration_since(first_token_at).as_secs_f32();
+        let decode_tps = if completion_tokens > 1 && decode_secs > 0.0 {
+            (completion_tokens - 1) as f32 / decode_secs
+        } else {
+            0.0
+        };
+
+        let prefill_tps = if prompt_tokens == 0 {
+            0.0
+        } else if decode_tps > 0.0 {
+            let one_decode_step = 1.0 / decode_tps;
+            let prefill_secs = ttft_secs - one_decode_step;
+            if prefill_secs > 0.0 {
+                prompt_tokens as f32 / prefill_secs
+            } else if ttft_secs > 0.0 {
+                prompt_tokens as f32 / ttft_secs
+            } else {
+                0.0
+            }
+        } else if ttft_secs > 0.0 {
+            prompt_tokens as f32 / ttft_secs
+        } else {
+            0.0
+        };
+
+        crate::api::openai::types::GenPerf {
+            ttft_ms,
+            prefill_tps,
+            decode_tps,
+        }
+    }
+}
+
+impl Stream for ExternalPerfStream {
+    type Item = CoreResult<ChatCompletionChunk>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(mut chunk))) => {
+                let has_content = chunk
+                    .choices
+                    .iter()
+                    .any(|c| c.delta.content.as_deref().is_some_and(|s| !s.is_empty()));
+                if has_content {
+                    if self.first_token_at.is_none() {
+                        self.first_token_at = Some(std::time::Instant::now());
+                    }
+                    self.content_chunks = self.content_chunks.saturating_add(1);
+                }
+                // Finalny chunk to ten, który niesie usage (vLLM/sglang usage-tail
+                // albo QUIC Done z final_metrics) — wtedy doklejamy perf.
+                if chunk.usage.is_some() && chunk.perf.is_none() {
+                    let perf = self.build_perf(std::time::Instant::now(), chunk.usage.as_ref());
+                    chunk.perf = Some(perf);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+}
+
 fn extract_completion_usage(
     metrics: Option<&tentaflow_protocol::ModelMetrics>,
 ) -> Option<crate::api::openai::types::Usage> {
