@@ -59,6 +59,18 @@ const EXTRACT_BUFFER_SIZE: usize = 65_536;
 /// Domyslna pewnosc faktu, gdy LLM jej nie poda (ekstrakcja z tekstu, nie pewnik).
 const DEFAULT_CONFIDENCE: f32 = 0.6;
 
+/// Domyslny prog tau Thematic Denoising (D2): schemat (head_type, relation,
+/// tail_type) staje sie 'stable' dopiero gdy freq >= tau. Dopoki jest 'candidate',
+/// jego krawedzie NIE trafiaja do 'kg_active' (sa zapisane w SQLite z active=0), wiec
+/// schematy szumowe (pojedyncze wystapienia) nie zatruwaja retrievalu. tau=1 = denoising
+/// wylaczony (wszystko od razu stable — sensowne dla telefonu/malego korpusu).
+const DEFAULT_DENOISING_THRESHOLD: u64 = 2;
+
+/// Klucz instancyjnego KV, pod ktorym admin moze nadpisac prog tau per-instancja.
+/// To JEDYNY punkt wpiecia configu progu (state.read) — gdy brak wpisu, uzywamy
+/// DEFAULT_DENOISING_THRESHOLD. Nie budujemy tu osobnego systemu configu.
+const DENOISING_THRESHOLD_STATE_KEY: &str = "denoising_threshold";
+
 // Capy anti-DoS — LLM moze halucynowac dlugie listy. Nadmiar przycinamy/odrzucamy.
 /// Max encji wziętych z jednego chunku.
 const MAX_ENTITIES_PER_CHUNK: usize = 30;
@@ -536,13 +548,14 @@ fn run_ingest_pipeline(
     let mut doc_triples = 0usize;
     let mut graph_partial = false;
 
-    // Re-drain zaleglosci outboxu sprzed ewentualnego crashu poprzedniego ingestu
-    // (R3): TRWALE intencje applied=0 musza domknac sie zanim dolozymy nowe. Best-effort
-    // — nieudany re-drain nie wywala ingestu wektorowego, tylko znaczy graf jako czesciowy.
-    if let Err(e) = drain_graph_outbox() {
+    // Reconcile na starcie ingestu (samonaprawa po crashu): domyka zalegle promocje/
+    // aktywacje i re-drain outboxu (applied=0) sprzed ewentualnego crashu poprzedniego
+    // ingestu (R3), zanim dolozymy nowe fakty. Best-effort — nieudany reconcile nie wywala
+    // ingestu wektorowego, tylko znaczy graf jako czesciowy.
+    if let Err(e) = reconcile_schemas() {
         graph_partial = true;
         log::warn(&format!(
-            "rag: re-drain outboxu na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
+            "rag: reconcile na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
         ));
     }
 
@@ -582,6 +595,18 @@ fn run_ingest_pipeline(
         // Postep 30..95% rozlozony na chunki.
         let progress = 30 + ((index + 1) * 65 / total) as i64;
         update_progress(job_id, progress.min(95));
+    }
+
+    // Reconcile PO petli chunkow (zamiast dawnego per-chunk drainu): promocja schematow
+    // ktore osiagnely prog tau w tym ingescie + aktywacja partiami WSZYSTKICH zalegych
+    // krawedzi stabilnych schematow + materializacja do grafu. Idempotentny i globalny —
+    // sprzata tez zaleglosci rownoleglych ingestow. Best-effort (graf < wektory): blad
+    // znaczy graf jako czesciowy, nie wywala ingestu.
+    if let Err(e) = reconcile_schemas() {
+        graph_partial = true;
+        log::warn(&format!(
+            "rag: reconcile po ingescie dok {document_id} nieudany (graf czesciowy): {e}"
+        ));
     }
 
     // Zapisz liczniki ekstrakcji + flage czesciowosci na dokumencie (best-effort
@@ -725,7 +750,7 @@ fn should_delete_from_graph(remaining_refs: i64) -> bool {
 /// referowany" (nie kasujemy z grafu), zeby nie usunac wspoldzielonego wezla.
 fn count_other_node_refs(node_id: &str, exclude_document_id: &str) -> i64 {
     sql_query_one(
-        "SELECT COUNT(*) FROM graph_artifacts \
+        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts \
          WHERE kind = 'node' AND n_id = ? AND document_id != ?",
         &[
             SqlValue::String(node_id.to_string()),
@@ -738,10 +763,13 @@ fn count_other_node_refs(node_id: &str, exclude_document_id: &str) -> i64 {
     .unwrap_or(1)
 }
 
-/// Jak `count_other_node_refs`, ale dla krawedzi po kluczu (src, rel, dst).
+/// Jak `count_other_node_refs`, ale dla krawedzi po kluczu (src, rel, dst). Refcount =
+/// COUNT(DISTINCT document_id) (a NIE COUNT(*)): po INSERT OR IGNORE rejestr krawedzi jest
+/// unikalny per (document_id, src, rel, dst), wiec liczymy DOKUMENTY trzymajace krawedz, a
+/// nie wiersze — krawedz ginie z grafu dopiero gdy ZADEN inny dokument jej nie wnosi.
 fn count_other_edge_refs(src: &str, rel: &str, dst: &str, exclude_document_id: &str) -> i64 {
     sql_query_one(
-        "SELECT COUNT(*) FROM graph_artifacts \
+        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts \
          WHERE kind = 'edge' AND src = ? AND rel = ? AND dst = ? AND document_id != ?",
         &[
             SqlValue::String(src.to_string()),
@@ -1133,6 +1161,179 @@ fn build_provenance(document_id: &str, chunk_index: usize) -> Provenance {
     }
 }
 
+/// Parsuje wartosc progu tau z surowego stanu KV (bajty zapisane przez admina jako
+/// tekst). Pusta/nieparsowalna/zerowa wartosc -> DEFAULT_DENOISING_THRESHOLD (nigdy 0,
+/// bo tau=0 promowalby kazdy schemat przy pierwszym wystapieniu, czyli tau=1 — a
+/// zarazem dzielenie semantyki "off" miedzy 0 i 1 byloby mylace). Czysta funkcja:
+/// testowalna bez hosta.
+fn parse_denoising_threshold(raw: Option<&[u8]>) -> u64 {
+    raw.and_then(|b| std::str::from_utf8(b).ok())
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_DENOISING_THRESHOLD)
+}
+
+/// Czyta prog tau Thematic Denoising z instancyjnego KV (state.read). Brak wpisu lub
+/// blad odczytu -> DEFAULT_DENOISING_THRESHOLD. To JEDYNY punkt wpiecia configu progu.
+fn denoising_threshold() -> u64 {
+    let raw = state_get(DENOISING_THRESHOLD_STATE_KEY).ok().flatten();
+    parse_denoising_threshold(raw.as_deref())
+}
+
+/// Czysta regula promocji reconcile: schemat osiaga prog gdy freq >= tau. W produkcji ten
+/// predykat zyje WPROST w SQL reconcile_schemas (`COUNT(*) >= tau` wewnatrz UPDATE), wiec
+/// tu jest wylacznie referencyjna, testowalna bez hosta forma tej samej reguly. tau>=1
+/// (parse_denoising_threshold to gwarantuje), wiec tau=1 => promocja od pierwszego
+/// wystapienia (denoising off).
+#[cfg(test)]
+fn schema_reaches_threshold(freq: u64, tau: u64) -> bool {
+    freq >= tau
+}
+
+/// RECONCILE (sedno D2) — idempotentny, samonaprawialny krok PO commicie ledgera, ktory
+/// (A) promuje schematy candidate->stable na podstawie AUTORYTATYWNEGO COUNT (nie predykcji)
+/// i (B) aktywuje partiami WSZYSTKIE zalegle (active=0) krawedzie stabilnych schematow,
+/// enqueue'ujac ich materializacje do grafu. Na koncu woła drain_graph_outbox.
+///
+/// DLACZEGO oddzielnie od ingestu: ingest-tx liczyl promocje z predykcji freq_after sprzed
+/// commitu (stale-read) — przy rownoleglym ingescie dwa zapisy mogly NIE zauwazyc, ze
+/// laczny COUNT przekroczyl prog (zgubiony prog, blokery wyscigu). Reconcile podejmuje
+/// decyzje z COUNT WEWNATRZ UPDATE/SELECT na juz zacommitowanym ledgerze, wiec widzi pelny
+/// stan. Globalny zasieg (wszystkie schematy, nie tylko z tego ingestu) sprzata tez
+/// zaleglosci innych rownoleglych ingestow -> samonaprawa.
+///
+/// CONCURRENCY (exactly-once aktywacji): dwa rownolegle reconcile NIE moga podwojnie
+/// zmaterializowac tej samej krawedzi. Aktywacja kazdego faktu to w jednej tx (BEGIN
+/// IMMEDIATE — write-lock od startu, wiec rownolegle tx serializuja sie OD POCZATKU):
+///   1. enqueue WARUNKOWANY `INSERT ... SELECT ... WHERE EXISTS(active=0)` (zero op gdy juz aktywny),
+///   2. flip WARUNKOWY `UPDATE ... WHERE active=0` (zero wierszy gdy juz aktywny).
+/// Pierwszy reconcile flipuje active=0->1; drugi, po serializacji, widzi active=1, wiec jego
+/// enqueue wstawia 0 op i flip zmienia 0 wierszy. Crash-safe: enqueue i flip sa w jednej tx
+/// (atomowo), brak okna "active=1 bez outboxu". Partial-unique outbox (WHERE applied=0) +
+/// INSERT OR IGNORE artefaktow to druga warstwa dedupu. Promocja przez UPDATE status='stable'
+/// (WHERE candidate) jest jednokrotna; zaden prog sie nie gubi (decyzja z COUNT, nie z predykcji).
+///
+/// INWARIANT (testowany w SchemaModel): po DOMKNIETYM reconcile NIE istnieje fact_state.active=0
+/// dla schematu 'stable'. Inwariant jest EVENTUALLY-CONSISTENT, nie per-jedno-wywolanie: petla
+/// aktywacji ma cap RECONCILE_MAX_ITERS (anty-DoS, #5); po jego trafieniu reszta zaleglosci
+/// zostaje na active=0 (logowane warn z liczba pozostalych) i domyka ja nastepny reconcile/ingest.
+fn reconcile_schemas() -> Result<(), String> {
+    let tau = denoising_threshold() as i64;
+
+    // (A) Promocja: jeden atomowy UPDATE. status='stable' dla kazdego schematu candidate,
+    // ktorego realny COUNT par (fact_key, document_id) osiagnal prog. Decyzja jest w SQL
+    // (COUNT wewnatrz WHERE), wiec nie zalezy od predykcji ani od licznika schema_registry.freq.
+    let now = now_unix();
+    sql_exec(
+        "UPDATE schema_registry SET status = 'stable', promoted_at = ? \
+         WHERE status = 'candidate' \
+           AND (SELECT COUNT(*) FROM fact_schema fs WHERE fs.schema_id = schema_registry.schema_id) >= ?",
+        &[SqlValue::I64(now), SqlValue::I64(tau)],
+    )
+    .map_err(|e| format!("promocja schematow: {e}"))?;
+
+    // (B) Aktywacja partii: petla batchowa po zaleglych krawedziach stabilnych schematow.
+    // ORDER BY fact_seq -> deterministyczna kolejnosc; LIMIT ACTIVATION_BATCH -> ograniczona
+    // transakcja na batch; cap RECONCILE_MAX_ITERS -> anty-DoS. Powtarzamy az brak active=0
+    // dla stable (inwariant), wiec aktywujemy tez fakty, ktore stana sie aktywne "w tej samej
+    // rundzie" (kolejne batche widza zaktualizowany stan).
+    let mut cap_hit = true;
+    for _ in 0..RECONCILE_MAX_ITERS {
+        let rows = sql_query(
+            "SELECT fact_key, head_id, rel, tail_id FROM fact_state \
+             WHERE active = 0 \
+               AND schema_id IN (SELECT schema_id FROM schema_registry WHERE status = 'stable') \
+             ORDER BY fact_seq LIMIT ?",
+            &[SqlValue::I64(ACTIVATION_BATCH as i64)],
+        )
+        .map_err(|e| format!("odczyt zalegych faktow do aktywacji: {e}"))?;
+
+        if rows.is_empty() {
+            cap_hit = false;
+            break;
+        }
+
+        let batch_now = now_unix();
+        let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
+        for row in &rows {
+            let fact_key = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+            let head_id = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            let rel = row.get(2).and_then(|v| v.as_str()).unwrap_or_default();
+            let tail_id = row.get(3).and_then(|v| v.as_str()).unwrap_or_default();
+            if fact_key.is_empty() || head_id.is_empty() || rel.is_empty() || tail_id.is_empty() {
+                continue;
+            }
+
+            // Edge-artifact per dokument-evidence (refcount): krawedz candidate mogla byc
+            // widziana w wielu dokumentach przed promocja. INSERT OR IGNORE (bug #4) +
+            // refcount COUNT(DISTINCT document_id) czynia to idempotentnym — moze zostac
+            // bezwarunkowe.
+            let ev_docs = fact_evidence_documents(fact_key);
+            for ev_doc in &ev_docs {
+                push_edge_artifact(&mut tx, ev_doc, head_id, rel, tail_id, batch_now);
+            }
+
+            // EXACTLY-ONCE (blocker 1): enqueue WARUNKOWANY na active=0 MUSI byc przed
+            // flipem active=1, w tej samej tx (BEGIN IMMEDIATE serializuje rownolegle
+            // reconcile). Outbox upsert_edge: rekonstrukcja krawedzi z fact_state +
+            // DETERMINISTYCZNA, reprezentatywna provenance z fact_evidence (#6 ORDER BY).
+            let prov = representative_provenance(fact_key);
+            let op = outbox_upsert_edge(head_id, rel, tail_id, &prov);
+            push_outbox_if_inactive(&mut tx, &op, fact_key, batch_now);
+
+            // Flip WARUNKOWY active=0 -> 1 + updated_at bump (kursor A_det/D3: nowo-aktywny
+            // fakt musi byc widoczny ponad kursorem przyszlego skanu konfliktow). WHERE
+            // active=0 sprawia, ze drugi rownolegly reconcile (widzacy juz active=1) zmienia
+            // 0 wierszy — symetrycznie do zerowego enqueue powyzej.
+            tx.push((
+                "UPDATE fact_state SET active = 1, updated_at = ? WHERE fact_key = ? AND active = 0"
+                    .to_string(),
+                vec![
+                    SqlValue::I64(batch_now),
+                    SqlValue::String(fact_key.to_string()),
+                ],
+            ));
+        }
+
+        let stmts: Vec<(&str, &[SqlValue])> =
+            tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+        sql_transaction(&stmts).map_err(|e| format!("aktywacja batcha faktow: {e}"))?;
+
+        // Mniej niz pelny batch => brak dalszej zaleglosci; nie ma sensu pytac ponownie.
+        if rows.len() < ACTIVATION_BATCH {
+            cap_hit = false;
+            break;
+        }
+    }
+
+    // Cichy cap zabroniony (CLAUDE.md "no silent caps"): jesli petla wyczerpala
+    // RECONCILE_MAX_ITERS z wciaz pelnymi batchami, czesc zaleglych faktow zostala
+    // nieaktywowana. To jest ponawialne (inwariant "brak active=0 przy stable" jest
+    // EVENTUALLY-CONSISTENT — domknie go nastepny reconcile/ingest, nie to wywolanie),
+    // ale ucięcie musi byc widoczne w logu wraz z liczba pozostalych faktow.
+    if cap_hit {
+        let remaining = sql_query_one(
+            "SELECT COUNT(*) FROM fact_state \
+             WHERE active = 0 \
+               AND schema_id IN (SELECT schema_id FROM schema_registry WHERE status = 'stable')",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(-1);
+        log::warn(&format!(
+            "rag: reconcile osiagnal cap RECONCILE_MAX_ITERS={RECONCILE_MAX_ITERS} \
+             (batch={ACTIVATION_BATCH}); zaleglych active=0 dla stable: {remaining} \
+             — domknie nastepny reconcile (eventually-consistent)"
+        ));
+    }
+
+    // (3) Materializacja krawedzi (i ewentualnych zaleglych wezlow) z trwalej kolejki.
+    drain_graph_outbox()
+}
+
 /// Czy wynik ekstrakcji chunku ma oznaczyc graf jako czesciowy. KAZDY blad
 /// (LLM, parsowanie, upsert grafu, a takze blad REJESTRU graph_artifacts z bug 4)
 /// wraca tu jako Err i podnosi graph_partial — rozjazd "w grafie ale nie w
@@ -1276,14 +1477,27 @@ fn outbox_delete_edge(src: &str, rel: &str, dst: &str) -> OutboxOp {
 
 /// Ekstrakcja grafu dla jednego chunku: wola rag-llm, parsuje i — zamiast pisac WPROST
 /// do grafu — zapisuje stan do SQLite-ledgera (R1: schema_registry/fact_schema/
-/// fact_evidence/fact_state) ORAZ TRWALA INTENCJE materializacji do graph_outbox (R3),
-/// wszystko w JEDNEJ transakcji SQLite (sql_transaction). Dopiero osobny, idempotentny
-/// drain_graph_outbox aplikuje intencje do 'kg_active' host-fnami. graph_artifacts
-/// zostaje (refcount cleanup nadal kluczowany do kg_active). Zwraca `(encje, relacje)`.
-/// BEST-EFFORT: kazdy blad (LLM/parsowanie/zapis SQL/drain) -> Err -> graph_partial.
+/// fact_evidence/fact_state) ORAZ TRWALA INTENCJE materializacji WEZLOW do graph_outbox
+/// (R3), wszystko w JEDNEJ transakcji SQLite (sql_transaction). Zwraca `(encje, relacje)`.
+/// BEST-EFFORT: kazdy blad (LLM/parsowanie/zapis SQL) -> Err -> graph_partial.
 ///
-/// W D1 KAZDY fakt jest aktywny (fact_state.active=1) i materializowany od razu —
-/// gate progu tau (Candidate->Stable) wchodzi dopiero w D2; tu budujemy fundament.
+/// PODZIAL D2 (NAPRAWA wyscigu promocji): ta funkcja TYLKO ZAPISUJE ledger — NIE
+/// przewiduje freq_after, NIE promuje schematow, NIE aktywuje krawedzi i NIE enqueue'uje
+/// krawedzi. Cala promocja/aktywacja (Candidate->Stable + materializacja krawedzi) dzieje
+/// sie w osobnym, idempotentnym kroku `reconcile_schemas` PO commicie ledgera, na
+/// podstawie autorytatywnego COUNT — dzieki czemu nie ma stale-read (predykcja freq sprzed
+/// commitu) ani niewidocznosci faktow z tej samej tx. To eliminuje oba blokery wyscigu i
+/// jest samonaprawialne przy rownoleglym ingescie (reconcile globalny domyka zaleglosci).
+///
+/// Zapis JEDNOLITY dla KAZDEGO faktu (bez galezi stable/candidate):
+///  - schema_registry: wiersz candidate jesli nie istnieje; freq liczony AUTORYTATYWNIE
+///    jako COUNT(*) FROM fact_schema (po wstawieniu fact_schema w tej samej tx).
+///  - fact_schema (Phi), fact_evidence (Psi): INSERT OR IGNORE / upsert idempotentny.
+///  - fact_state: upsert z active=0 dla NOWYCH faktow; active istniejacych nie cofamy
+///    (MAX(active, 0) = bez zmian — reconcile/promocja juz mogla je aktywowac).
+///  - wezly head/tail: graph_artifacts (node) + outbox upsert_node ZAWSZE (jak D1) —
+///    izolowany wezel jest nieszkodliwy dla PPR/neighbors, a materializacja wezlow nie
+///    zalezy od stabilnosci schematu.
 ///
 /// `doc_triples_so_far` to licznik triple'ow juz zapisanych dla calego dokumentu
 /// (cap MAX_TRIPLES_PER_DOC) — aktualizowany o realnie wstawione krawedzie.
@@ -1321,16 +1535,15 @@ fn extract_chunk_graph(
             .unwrap_or_else(|| FALLBACK_ENTITY_TYPE.to_string())
     };
 
-    // Statementy ledgera+outboxu zbierane do JEDNEJ transakcji SQLite. Atomowosc:
-    // wybralismy sql_transaction (prawdziwy BEGIN/COMMIT po stronie hosta) zamiast
-    // outbox-first ordering, bo SDK go udostepnia — caly stan faktu (ledger + intencja
-    // grafu) jest commitowany lub rollbackowany razem. Materializacja do grafu jest
-    // poza ta transakcja (osobny silnik, R3) i odtwarzalna z TRWALEJ kolejki (drain
-    // czyta applied=0 z SQLite), wiec crash po commicie a przed drainem domyka re-drain.
+    // Statementy ledgera+outboxu (tylko wezly) zbierane do JEDNEJ transakcji SQLite.
+    // Materializacja KRAWEDZI jest poza ta transakcja: zrobi ja reconcile_schemas po
+    // commicie (autorytatywny COUNT, zero predykcji). Atomowosc tu obejmuje caly ledger
+    // faktu + intencje wezlow grafu.
     let mut tx: Vec<(String, Vec<SqlValue>)> = Vec::new();
 
     // Wezly encji. INWARIANT (bug 4): graph_artifacts MUSI byc nadzbiorem grafu, wiec
-    // rejestr i intencja outboxu sa w tej samej transakcji co reszta ledgera.
+    // rejestr i intencja outboxu sa w tej samej transakcji co reszta ledgera. INSERT OR
+    // IGNORE (bug 4 idempotencja): ux_graph_artifacts_node dedupuje per (dokument, n_id).
     let mut known: Vec<String> = Vec::with_capacity(extraction.entities.len());
     let mut entity_count = 0usize;
     for entity in &extraction.entities {
@@ -1346,7 +1559,9 @@ fn extract_chunk_graph(
 
     // Krawedzie relacji. head/tail musza byc znanymi encjami tego chunku; gdy brakuje
     // wezla konca, materializujemy go (label fallback "Entity"). Respektujemy cap
-    // triple'ow na dokument.
+    // triple'ow na dokument. KRAWEDZI tu NIE enqueue'ujemy i NIE aktywujemy — to robi
+    // reconcile po commicie. Zapisujemy WYLACZNIE ledger (schema_registry/fact_schema/
+    // fact_evidence/fact_state) jednolicie dla kazdego faktu.
     let mut relation_count = 0usize;
     for rel in &extraction.relations {
         if *doc_triples_so_far >= MAX_TRIPLES_PER_DOC {
@@ -1368,36 +1583,43 @@ fn extract_chunk_graph(
         let tail_type = type_of(&rel.tail_id, &entity_types);
         let schema_id = derive_schema_id(&head_type, &rel.relation, &tail_type);
 
-        push_schema_registry(&mut tx, &schema_id, &head_type, &rel.relation, &tail_type, now);
+        // Phi/Psi zapisujemy PRZED schema_registry, bo freq w schema_registry liczymy
+        // AUTORYTATYWNIE jako COUNT(*) FROM fact_schema (sql_transaction stosuje statementy
+        // sekwencyjnie w jednej transakcji, wiec INSERT fact_schema jest widoczny dla
+        // kolejnego SELECT COUNT w tej samej tx — to naprawia bug #3 double-count przy
+        // rownoleglym re-ingescie: freq nie zalezy od freq+1, tylko od realnej liczby par).
         push_fact_schema(&mut tx, &fact_key, &schema_id, document_id);
         push_fact_evidence(&mut tx, &fact_key, document_id, &chunk_id, &provenance);
-        push_fact_state(&mut tx, &fact_key, &schema_id, &rel.head_id, &rel.relation, &rel.tail_id, now);
-        push_edge_artifact(&mut tx, document_id, &rel.head_id, &rel.relation, &rel.tail_id, now);
-        let op = outbox_upsert_edge(&rel.head_id, &rel.relation, &rel.tail_id, &provenance);
-        push_outbox(&mut tx, &op, now);
+        push_schema_registry(&mut tx, &schema_id, &head_type, &rel.relation, &tail_type, now);
+
+        // fact_state: NOWE fakty z active=0. Istniejacych NIE cofamy (MAX(active,0)):
+        // reconcile mogl je juz aktywowac, a re-ingest nie moze zabrac stabilnej krawedzi.
+        push_fact_state(
+            &mut tx,
+            &fact_key,
+            &schema_id,
+            (&rel.head_id, &rel.relation, &rel.tail_id),
+            now,
+        );
 
         relation_count += 1;
         *doc_triples_so_far += 1;
     }
 
-    // Jedna atomowa transakcja: ledger + outbox + graph_artifacts. Borrow statementow
-    // jako &str tuz przed wywolaniem (sql_transaction bierze &[(&str, &[SqlValue])]).
+    // Jedna atomowa transakcja: ledger + intencje wezlow + graph_artifacts(node).
     let stmts: Vec<(&str, &[SqlValue])> =
         tx.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
     sql_transaction(&stmts).map_err(|e| format!("zapis ledgera grafu: {e}"))?;
 
-    // Materializacja PO commicie SQLite: drain czyta TRWALA kolejke (applied=0), nie
-    // pamiec biezacego wywolania, wiec crash miedzy commitem a drainem jest odtwarzalny
-    // (re-drain domyka zaleglosc). Idempotentny: applied=1 chroni przed powtorka.
-    drain_graph_outbox()?;
-
     Ok((entity_count, relation_count))
 }
 
-/// Dokleja INSERT wezla do graph_artifacts (refcount cleanupu) do transakcji.
+/// Dokleja INSERT wezla do graph_artifacts (refcount cleanupu) do transakcji. INSERT OR
+/// IGNORE (bug #4 idempotencja): ux_graph_artifacts_node dedupuje per (document_id, n_id),
+/// wiec ponowny ingest/aktywacja nie mnozy wierszy rejestru.
 fn push_node_artifact(tx: &mut Vec<(String, Vec<SqlValue>)>, document_id: &str, node_id: &str, now: i64) {
     tx.push((
-        "INSERT INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)"
+        "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, n_id, created_at) VALUES (?, 'node', ?, ?)"
             .to_string(),
         vec![
             SqlValue::String(document_id.to_string()),
@@ -1407,7 +1629,10 @@ fn push_node_artifact(tx: &mut Vec<(String, Vec<SqlValue>)>, document_id: &str, 
     ));
 }
 
-/// Dokleja INSERT krawedzi do graph_artifacts (refcount cleanupu) do transakcji.
+/// Dokleja INSERT krawedzi do graph_artifacts (refcount cleanupu) do transakcji. INSERT OR
+/// IGNORE (bug #4 idempotencja): ux_graph_artifacts_edge dedupuje per (document_id, src,
+/// rel, dst). Reconcile aktywuje krawedz raz, ale evidence moze byc z wielu chunkow tego
+/// dokumentu — bez OR IGNORE rejestr puchnalby duplikatami i psul refcount.
 fn push_edge_artifact(
     tx: &mut Vec<(String, Vec<SqlValue>)>,
     document_id: &str,
@@ -1417,7 +1642,7 @@ fn push_edge_artifact(
     now: i64,
 ) {
     tx.push((
-        "INSERT INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
+        "INSERT OR IGNORE INTO graph_artifacts (document_id, kind, src, rel, dst, created_at) \
          VALUES (?, 'edge', ?, ?, ?, ?)"
             .to_string(),
         vec![
@@ -1430,8 +1655,13 @@ fn push_edge_artifact(
     ));
 }
 
-/// UPSERT schematu: pierwsze wystapienie ustawia first_seen, kolejne tylko freq+1.
-/// status pozostaje 'candidate' (promocja do 'stable' to D2).
+/// UPSERT schematu: pierwsze wystapienie ustawia first_seen, kolejne aktualizuja freq.
+/// freq liczony AUTORYTATYWNIE jako `COUNT(*) FROM fact_schema WHERE schema_id=?` (a NIE
+/// `freq+1`) — to naprawia bug #3 double-count przy rownoleglym re-ingescie: licznik nie
+/// dryfuje, bo zawsze odzwierciedla realna liczbe dystynktnych par (fact_key, document_id)
+/// (PK fact_schema). MUSI byc wywolane PO push_fact_schema w tej samej transakcji, by
+/// COUNT widzial wlasnie wstawiony wiersz Phi. status pozostaje 'candidate' — promocja do
+/// 'stable' to osobny krok reconcile_schemas (po commicie, na podstawie COUNT>=tau).
 fn push_schema_registry(
     tx: &mut Vec<(String, Vec<SqlValue>)>,
     schema_id: &str,
@@ -1440,19 +1670,99 @@ fn push_schema_registry(
     tail_type: &str,
     now: i64,
 ) {
+    // Subselect liczy freq z fact_schema w TEJ SAMEJ transakcji (po wstawieniu Phi).
+    // Pierwsze wstawienie wiersza schematu ustawia freq od razu na realny COUNT; przy
+    // ON CONFLICT nadpisujemy freq tym samym COUNT. Zero zaleznosci od poprzedniej wartosci.
     tx.push((
         "INSERT INTO schema_registry (schema_id, head_type, relation, tail_type, freq, first_seen) \
-         VALUES (?, ?, ?, ?, 1, ?) \
-         ON CONFLICT(schema_id) DO UPDATE SET freq = freq + 1"
+         VALUES (?, ?, ?, ?, (SELECT COUNT(*) FROM fact_schema WHERE schema_id = ?), ?) \
+         ON CONFLICT(schema_id) DO UPDATE SET \
+           freq = (SELECT COUNT(*) FROM fact_schema WHERE schema_id = schema_registry.schema_id)"
             .to_string(),
         vec![
             SqlValue::String(schema_id.to_string()),
             SqlValue::String(head_type.to_string()),
             SqlValue::String(relation.to_string()),
             SqlValue::String(tail_type.to_string()),
+            SqlValue::String(schema_id.to_string()),
             SqlValue::I64(now),
         ],
     ));
+}
+
+/// Lista DYSTYNKTNYCH dokumentow majacych evidence danego faktu — pod refcount
+/// edge-artifactow przy hurtowej aktywacji (krawedz wniesiona przez kilka dokumentow).
+fn fact_evidence_documents(fact_key: &str) -> Vec<String> {
+    sql_query(
+        "SELECT DISTINCT document_id FROM fact_evidence WHERE fact_key = ?",
+        &[SqlValue::String(fact_key.to_string())],
+    )
+    .ok()
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+            .filter(|d| !d.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Odczyt wartosci REAL z SqlValue jako f32. SQLite moze zwrocic confidence jako F64
+/// (REAL) albo I64 (gdy zapisana wartosc byla calkowita) — pokrywamy oba.
+fn sql_value_to_f32(v: &SqlValue) -> Option<f32> {
+    match v {
+        SqlValue::F64(f) => Some(*f as f32),
+        SqlValue::I64(i) => Some(*i as f32),
+        _ => None,
+    }
+}
+
+/// Buduje reprezentatywna Provenance krawedzi z JEDNEGO wiersza fact_evidence danego
+/// faktu (LIMIT 1). Sluzy do rekonstrukcji payloadu outboxu przy hurtowej aktywacji —
+/// fakt zostal wyekstrahowany wczesniej, wiec jego dowod (doc/chunk/confidence) zyje w
+/// fact_evidence. Brak evidence (teoretycznie niemozliwy, bo fact_evidence pisane razem z
+/// fact_state) -> provenance z biezacym extractor_version i domyslna pewnoscia.
+fn representative_provenance(fact_key: &str) -> Provenance {
+    // span pomijamy: D1/D2 nie zapisuja offsetow do fact_evidence (ekstrakcja LLM ich
+    // nie zwraca), wiec Provenance.span pozostaje None — spojnie z build_provenance.
+    // DETERMINIZM (#6): bez ORDER BY LIMIT 1 zwracalby dowolny wiersz (zaleznie od planu
+    // SQLite) — przy rownoleglej aktywacji rozne reconcile moglyby wziac rozne provenance.
+    // Sortujemy po (confidence DESC, document_id, chunk_id): najpewniejszy dowod, a remis
+    // rozstrzyga stabilnie po kluczach. Provenance jest tylko reprezentatywna dla grafu.
+    let row = sql_query_one(
+        "SELECT document_id, chunk_id, confidence FROM fact_evidence \
+         WHERE fact_key = ? ORDER BY confidence DESC, document_id, chunk_id LIMIT 1",
+        &[SqlValue::String(fact_key.to_string())],
+    )
+    .ok()
+    .flatten();
+
+    match row {
+        Some(r) => {
+            let doc_id = r.first().and_then(|v| v.as_str()).map(str::to_string);
+            let chunk_id = r.get(1).and_then(|v| v.as_str()).map(str::to_string);
+            let confidence = r
+                .get(2)
+                .and_then(sql_value_to_f32)
+                .or(Some(DEFAULT_CONFIDENCE));
+            Provenance {
+                chunk_id,
+                doc_id,
+                page: None,
+                span: None,
+                confidence,
+                extractor_version: Some(EXTRACTOR_VERSION.to_string()),
+            }
+        }
+        None => Provenance {
+            chunk_id: None,
+            doc_id: None,
+            page: None,
+            span: None,
+            confidence: Some(DEFAULT_CONFIDENCE),
+            extractor_version: Some(EXTRACTOR_VERSION.to_string()),
+        },
+    }
 }
 
 /// Phi (fakt->schemat) per dokument. Idempotentne po (fact_key, document_id).
@@ -1502,22 +1812,29 @@ fn push_fact_evidence(
     ));
 }
 
-/// Stan faktu (zrodlo prawdy o krawedzi). active=1 w D1; ponowny ingest aktualizuje
-/// schema_id/updated_at, ale NIE rusza fact_seq (kursor A_det) ani created_at.
+/// Stan faktu (zrodlo prawdy o krawedzi). Ingest ZAWSZE wstawia NOWY fakt z active=0 —
+/// aktywacja (active=1) jest WYLACZNIE domena reconcile_schemas (po promocji schematu).
+/// Ponowny ingest aktualizuje schema_id/updated_at, ale NIE rusza fact_seq (kursor A_det),
+/// created_at ani active. updated_at bump zawsze (kursor A_det/D3 widzi aktualizacje).
+///
+/// UWAGA: active jest MONOTONICZNE w gore w obrebie faktu — re-ingest wstawia active=0,
+/// ale `active = MAX(active, 0)` zachowuje istniejaca jedynke. Inaczej re-ingest mogl by
+/// zabrac z grafu juz zmaterializowana, stabilna krawedz (zaktywowana wczesniej w reconcile).
 fn push_fact_state(
     tx: &mut Vec<(String, Vec<SqlValue>)>,
     fact_key: &str,
     schema_id: &str,
-    head_id: &str,
-    rel: &str,
-    tail_id: &str,
+    triple: (&str, &str, &str),
     now: i64,
 ) {
+    let (head_id, rel, tail_id) = triple;
     tx.push((
         "INSERT INTO fact_state (fact_key, schema_id, head_id, rel, tail_id, active, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
          ON CONFLICT(fact_key) DO UPDATE SET \
-           schema_id = excluded.schema_id, active = 1, updated_at = excluded.updated_at"
+           schema_id = excluded.schema_id, \
+           active = MAX(active, excluded.active), \
+           updated_at = excluded.updated_at"
             .to_string(),
         vec![
             SqlValue::String(fact_key.to_string()),
@@ -1552,6 +1869,36 @@ fn push_outbox(tx: &mut Vec<(String, Vec<SqlValue>)>, op: &OutboxOp, now: i64) {
     ));
 }
 
+/// Warunkowy enqueue uzywany WYLACZNIE przy aktywacji faktu w reconcile: wstawia op do
+/// outboxu TYLKO gdy fakt jest jeszcze nieaktywny (`fact_state.active=0`). To rdzen
+/// exactly-once przy rownoleglym reconcile — INSERT ... SELECT ... WHERE EXISTS(active=0)
+/// jest w TEJ SAMEJ tx co warunkowy flip active=0->1, a tx leci jako BEGIN IMMEDIATE, wiec
+/// drugi reconcile (po serializacji) widzi juz active=1: jego SELECT nie produkuje wiersza,
+/// INSERT wstawia 0 op -> brak podwojnej materializacji. INSERT OR IGNORE po partial-unique
+/// (applied=0) zostaje jako druga warstwa dedupu w obrebie jednego okna pending.
+fn push_outbox_if_inactive(
+    tx: &mut Vec<(String, Vec<SqlValue>)>,
+    op: &OutboxOp,
+    fact_key: &str,
+    now: i64,
+) {
+    let payload = serde_json::to_string(&op.payload).unwrap_or_else(|_| "{}".to_string());
+    tx.push((
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         SELECT ?, ?, ?, ?, 0, ? \
+         WHERE EXISTS (SELECT 1 FROM fact_state WHERE fact_key = ? AND active = 0)"
+            .to_string(),
+        vec![
+            SqlValue::String(op.dedup_key.clone()),
+            SqlValue::String(op.op.to_string()),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload),
+            SqlValue::I64(now),
+            SqlValue::String(fact_key.to_string()),
+        ],
+    ));
+}
+
 /// Maks. liczba wierszy outboxu przetwarzanych w jednej iteracji drainu — chroni przed
 /// DoS/OOM przy duzej zaleglosci (np. wiele nieprzetworzonych dokumentow po crashu).
 const OUTBOX_DRAIN_BATCH: usize = 256;
@@ -1559,6 +1906,16 @@ const OUTBOX_DRAIN_BATCH: usize = 256;
 /// Twardy limit iteracji petli drainu (BATCH * ITER = gorne ograniczenie pracy na
 /// jedno wywolanie). Reszta zaleglosci domknie sie przy nastepnym drainie.
 const OUTBOX_DRAIN_MAX_ITERS: usize = 4096;
+
+/// Rozmiar partii aktywacji faktow w reconcile: jedna transakcja na batch faktow
+/// przechodzacych z active=0 do active=1 (krawedzie stabilnych schematow). Chroni
+/// przed gigantyczna pojedyncza transakcja przy duzej zaleglosci.
+const ACTIVATION_BATCH: usize = 256;
+
+/// Twardy limit iteracji petli aktywacji w reconcile (anty-DoS, jak przy drainie):
+/// BATCH * ITER = gorne ograniczenie pracy na jedno wywolanie reconcile. Reszta
+/// domknie sie przy nastepnym reconcile (samonaprawa).
+const RECONCILE_MAX_ITERS: usize = 4096;
 
 /// Materializuje TRWALE intencje outboxu (graph_outbox WHERE applied=0) do grafu
 /// 'kg_active' i po sukcesie znacza je applied=1. Zrodlem jest SQLite (R3), NIE pamiec
@@ -2623,5 +2980,299 @@ mod tests {
         let a = outbox_upsert_edge("x", "rel", "y", &p1);
         let b = outbox_upsert_edge("x", "rel", "y", &p2);
         assert_eq!(a.dedup_key, b.dedup_key, "ten sam fakt -> ten sam dedup_key niezaleznie od dokumentu");
+    }
+
+    // --- MemGraphRAG D2: Thematic Denoising (prog tau, gate krawedzi, promocja) ---
+
+    #[test]
+    fn parse_threshold_defaults_and_overrides() {
+        // Brak wpisu / pusty / smieci -> domyslny prog.
+        assert_eq!(parse_denoising_threshold(None), DEFAULT_DENOISING_THRESHOLD);
+        assert_eq!(parse_denoising_threshold(Some(b"")), DEFAULT_DENOISING_THRESHOLD);
+        assert_eq!(parse_denoising_threshold(Some(b"abc")), DEFAULT_DENOISING_THRESHOLD);
+        // 0 jest niedozwolone (promowaloby wszystko od razu, mylne z tau=1) -> domyslny.
+        assert_eq!(parse_denoising_threshold(Some(b"0")), DEFAULT_DENOISING_THRESHOLD);
+        // Realne nadpisanie: tau=1 (off), tau=3 (serwer), z otaczajacymi spacjami.
+        assert_eq!(parse_denoising_threshold(Some(b"1")), 1);
+        assert_eq!(parse_denoising_threshold(Some(b"3")), 3);
+        assert_eq!(parse_denoising_threshold(Some(b"  5  ")), 5);
+    }
+
+    #[test]
+    fn threshold_rule_below_at_and_off() {
+        // Czysta regula promocji reconcile: freq<tau -> nie; freq>=tau -> tak; tau=1 (off)
+        // -> juz pierwsze wystapienie promuje.
+        assert!(!schema_reaches_threshold(1, 2), "freq<tau nie promuje");
+        assert!(schema_reaches_threshold(2, 2), "freq==tau promuje");
+        assert!(schema_reaches_threshold(7, 2), "freq>tau promuje");
+        assert!(schema_reaches_threshold(1, 1), "tau=1: denoising off, promocja od razu");
+    }
+
+    // Model RECONCILE bez hosta SQL. Odwzorowuje DOKLADNIE nowy podzial:
+    //  (A) ingest TYLKO zapisuje ledger: fact_schema (zrodlo freq = liczba dystynktnych
+    //      (fact_key, document_id)) + fact_state z active=0 (active nigdy nie cofniete).
+    //  (B) reconcile: promuje schematy z freq>=tau na 'stable' (idempotentnie) i aktywuje
+    //      WSZYSTKIE zalegle (active=0) fakty stabilnych schematow (active=0 -> 1, jednokrotnie).
+    // freq liczony jako COUNT dystynktnych par (push_schema_registry: freq=COUNT(*), bug #3).
+    #[derive(Default)]
+    struct SchemaModel {
+        // (fact_key, document_id) widziane w fact_schema — zrodlo freq (dystynktne pary).
+        pairs: Vec<(String, String)>,
+        // fact_key -> active. Stan faktu (active=1 oznacza krawedz w kg_active). NIGDY nie
+        // cofamy na false (monotonicznosc active, MAX(active,0) przy re-ingescie).
+        facts: std::collections::BTreeMap<String, bool>,
+        status: String,
+        // Ile razy schemat zostal promowany (musi byc dokladnie raz: WHERE status='candidate').
+        promotions: u32,
+        // fact_key -> ile razy enqueue'owano upsert_edge tego faktu. EXACTLY-ONCE: aktywacja
+        // (active 0->1) MUSI enqueue'owac op dokladnie raz nawet przy wielu/rownoleglych
+        // reconcile. Lustro warunkowanego push_outbox_if_inactive (INSERT...WHERE EXISTS active=0).
+        enqueues: std::collections::BTreeMap<String, u32>,
+    }
+
+    impl SchemaModel {
+        fn new() -> Self {
+            SchemaModel { status: "candidate".to_string(), ..Default::default() }
+        }
+        fn freq(&self) -> u64 {
+            self.pairs.len() as u64
+        }
+        /// (A) Ingest jednego faktu: zapisuje pare (freq=COUNT, bez double-count) i wstawia
+        /// fakt z active=0 (re-ingest NIE cofa istniejacego active). NIE promuje, NIE aktywuje
+        /// (to robi reconcile). Lustro extract_chunk_graph + push_fact_state.
+        fn ingest_fact(&mut self, fact_key: &str, document_id: &str) {
+            let pair = (fact_key.to_string(), document_id.to_string());
+            if !self.pairs.contains(&pair) {
+                self.pairs.push(pair);
+            }
+            // INSERT ... active=0 ON CONFLICT MAX(active, 0): nowy -> false, istniejacy bez zmian.
+            self.facts.entry(fact_key.to_string()).or_insert(false);
+        }
+        /// (B) Reconcile: promocja po COUNT>=tau (idempotentna) + aktywacja WSZYSTKICH
+        /// zalegych faktow stabilnego schematu. Lustro reconcile_schemas.
+        fn reconcile(&mut self, tau: u64) {
+            if self.status == "candidate" && schema_reaches_threshold(self.freq(), tau) {
+                self.status = "stable".to_string();
+                self.promotions += 1;
+            }
+            if self.status == "stable" {
+                // Aktywacja partii: per fakt warunkowy enqueue PRZED warunkowym flipem, oba na
+                // active=0 (lustro reconcile_schemas). enqueue tylko gdy active jeszcze false
+                // (INSERT...WHERE EXISTS active=0); flip tylko gdy active false (UPDATE WHERE
+                // active=0). Ten porzadek czyni aktywacje exactly-once: w jednym przebiegu fakt
+                // dostaje DOKLADNIE jeden enqueue, a powtorny reconcile (active juz true) zero.
+                for (k, v) in self.facts.iter_mut() {
+                    if !*v {
+                        *self.enqueues.entry(k.clone()).or_insert(0) += 1;
+                        *v = true;
+                    }
+                }
+            }
+        }
+        fn active_count(&self) -> usize {
+            self.facts.values().filter(|v| **v).count()
+        }
+        /// Laczna liczba enqueue'ow upsert_edge po wszystkich faktach (materializacje grafu).
+        fn total_enqueues(&self) -> u32 {
+            self.enqueues.values().sum()
+        }
+        /// Inwariant reconcile: NIE istnieje active=0 gdy schemat 'stable'.
+        fn invariant_no_inactive_when_stable(&self) -> bool {
+            self.status != "stable" || self.facts.values().all(|v| *v)
+        }
+    }
+
+    #[test]
+    fn freq_no_double_count_on_same_document_reingest() {
+        // Ten sam fakt z tego samego dokumentu ingestowany dwukrotnie -> freq=1 (PK
+        // (fact_key, document_id) blokuje double-count; freq=COUNT(*) nie freq+1, bug #3).
+        // Z tau=2 reconcile NIE promuje (freq<tau) — fakt zostaje nieaktywny.
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f1", "docA");
+        m.reconcile(2);
+        assert_eq!(m.freq(), 1, "re-ingest tego samego (fact,doc) nie zawyza freq");
+        assert_eq!(m.status, "candidate", "freq<tau -> schemat pozostaje candidate");
+        assert_eq!(m.active_count(), 0, "candidate ponizej progu -> krawedz nieaktywna");
+    }
+
+    #[test]
+    fn reconcile_promotes_at_threshold_and_activates_all_pending() {
+        // Dwa ROZNE fakty schematu z dwoch dokumentow. Ingest oba (active=0). Reconcile po
+        // 1. fakcie: freq=1<tau=2 -> bez promocji. Reconcile po 2.: freq=2>=tau -> promocja
+        // + aktywacja OBU (tez zalegly f1 z poprzedniej rundy).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.reconcile(2);
+        assert_eq!(m.status, "candidate");
+        assert_eq!(m.active_count(), 0, "ponizej progu -> nic nie aktywne");
+
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2);
+        assert_eq!(m.status, "stable", "freq>=tau -> promocja");
+        assert_eq!(m.promotions, 1, "promocja dokladnie raz");
+        assert_eq!(m.active_count(), 2, "reconcile aktywuje WSZYSTKIE zalegle (tez f1 z poprzedniej rundy)");
+        assert!(m.invariant_no_inactive_when_stable(), "inwariant: brak active=0 przy stable");
+    }
+
+    #[test]
+    fn reconcile_activates_facts_added_in_same_round() {
+        // Fakty dodane "w tej samej rundzie" co przekroczenie progu MUSZA sie aktywowac w
+        // tym samym reconcile (petla batchowa aktywuje wszystko az do braku active=0).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.ingest_fact("f3", "docC");
+        m.reconcile(2); // freq=3>=2 -> promocja + aktywacja calej trojki naraz
+        assert_eq!(m.active_count(), 3, "wszystkie fakty z tej rundy aktywne");
+        assert!(m.invariant_no_inactive_when_stable());
+    }
+
+    #[test]
+    fn tau_one_activates_every_fact_after_reconcile() {
+        // tau=1 (denoising off): kazdy fakt aktywny po reconcile, schemat promowany od razu.
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.reconcile(1);
+        assert_eq!(m.status, "stable");
+        assert_eq!(m.promotions, 1);
+        assert_eq!(m.active_count(), 1, "tau=1: pierwszy fakt aktywny po reconcile");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(1);
+        assert_eq!(m.active_count(), 2, "kolejne fakty stabilnego schematu aktywne");
+        assert_eq!(m.promotions, 1, "stabilny schemat nie jest promowany ponownie");
+    }
+
+    #[test]
+    fn already_stable_schema_activates_new_facts_on_next_reconcile() {
+        // Po promocji nowy fakt schematu jest aktywny przy nastepnym reconcile, bez ponownej
+        // promocji (WHERE status='candidate' czyni promocje jednokrotna).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2); // promocja
+        assert_eq!(m.status, "stable");
+        m.ingest_fact("f3", "docC");
+        m.reconcile(2);
+        assert_eq!(m.active_count(), 3, "nowy fakt stabilnego schematu aktywny po reconcile");
+        assert_eq!(m.promotions, 1, "brak ponownej promocji");
+        assert!(m.invariant_no_inactive_when_stable());
+    }
+
+    #[test]
+    fn reconcile_is_idempotent() {
+        // Wielokrotny reconcile (lustro dwoch rownoleglych reconcile) jest idempotentny:
+        // promocja raz, aktywacja niezmienna, inwariant utrzymany.
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2);
+        m.reconcile(2);
+        m.reconcile(2);
+        assert_eq!(m.promotions, 1, "promocja dokladnie raz mimo wielu reconcile");
+        assert_eq!(m.active_count(), 2);
+        assert!(m.invariant_no_inactive_when_stable());
+    }
+
+    #[test]
+    fn reingest_does_not_deactivate_active_fact() {
+        // Monotonicznosc active: gdy fakt jest juz aktywny (po reconcile), ponowny ingest
+        // tego samego faktu wstawia active=0, ale MAX(active,0) zachowuje 1.
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2); // f1, f2 aktywne
+        assert_eq!(m.active_count(), 2);
+        m.ingest_fact("f1", "docA"); // re-ingest: active=0 ON CONFLICT MAX -> bez zmian
+        assert_eq!(m.active_count(), 2, "re-ingest nie deaktywuje juz aktywnego faktu");
+    }
+
+    #[test]
+    fn activation_enqueues_each_edge_exactly_once() {
+        // Aktywacja faktu enqueue'uje upsert_edge DOKLADNIE raz (warunkowany na active=0).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2);
+        assert_eq!(m.active_count(), 2);
+        assert_eq!(m.total_enqueues(), 2, "kazdy aktywowany fakt enqueue'uje sie raz");
+    }
+
+    #[test]
+    fn second_reconcile_does_not_reenqueue_active_fact() {
+        // Drugi (rownolegly/powtorny) reconcile widzi active=1 -> warunkowany enqueue wstawia
+        // 0 op i warunkowany flip zmienia 0 wierszy. Zero podwojnej materializacji (blocker 1).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2);
+        let after_first = m.total_enqueues();
+        m.reconcile(2); // drugi przebieg: nic juz nieaktywne
+        m.reconcile(2); // i trzeci dla pewnosci
+        assert_eq!(
+            m.total_enqueues(),
+            after_first,
+            "po aktywacji kolejne reconcile NIE enqueue'uja ponownie (exactly-once)"
+        );
+        assert_eq!(m.total_enqueues(), 2, "lacznie dokladnie po jednym op na fakt");
+    }
+
+    #[test]
+    fn conditional_enqueue_skips_already_active_fact() {
+        // Bezposredni test warunku: gdy fakt JUZ active=1, druga proba aktywacji nie enqueue'uje
+        // (lustro INSERT...SELECT...WHERE EXISTS(active=0), ktory wstawia 0 wierszy).
+        let mut m = SchemaModel::new();
+        m.ingest_fact("f1", "docA");
+        m.ingest_fact("f2", "docB");
+        m.reconcile(2); // f1, f2 -> active, po 1 enqueue
+        m.ingest_fact("f3", "docC"); // nowy nieaktywny fakt stabilnego schematu
+        m.reconcile(2);
+        assert_eq!(m.total_enqueues(), 3, "tylko nowy f3 enqueue'uje sie przy drugim reconcile");
+        assert_eq!(*m.enqueues.get("f1").unwrap(), 1, "f1 enqueue'owany dokladnie raz");
+        assert_eq!(*m.enqueues.get("f3").unwrap(), 1, "f3 enqueue'owany dokladnie raz");
+    }
+
+    /// Lustro dedupe z migracji 004: zostaw MIN(id) per klucz naturalny. Wejscie: lista
+    /// (id, kind, klucz). Wynik: zachowane id (po jednym na klucz, najmniejsze).
+    fn dedupe_keep_min_id(rows: &[(i64, &str, &str)]) -> Vec<i64> {
+        use std::collections::BTreeMap;
+        let mut min_per_key: BTreeMap<(&str, &str), i64> = BTreeMap::new();
+        for (id, kind, key) in rows {
+            let e = min_per_key.entry((*kind, *key)).or_insert(*id);
+            if *id < *e {
+                *e = *id;
+            }
+        }
+        let mut kept: Vec<i64> = min_per_key.into_values().collect();
+        kept.sort_unstable();
+        kept
+    }
+
+    #[test]
+    fn migration004_dedupe_keeps_min_id_per_natural_key() {
+        // Duplikaty (document_id,n_id) dla node i (document_id,src,rel,dst) dla edge musza
+        // zostac zredukowane do MIN(id) PRZED unique indeksem (inaczej CREATE UNIQUE INDEX pada).
+        let rows = [
+            (10, "node", "docA|n1"),
+            (12, "node", "docA|n1"), // duplikat -> usun (zostaje 10)
+            (15, "node", "docA|n2"),
+            (20, "edge", "docA|a|rel|b"),
+            (5, "edge", "docA|a|rel|b"), // duplikat z mniejszym id -> zostaje 5
+            (30, "edge", "docB|a|rel|b"),
+        ];
+        let kept = dedupe_keep_min_id(&rows);
+        assert_eq!(kept, vec![5, 10, 15, 30], "zostaje MIN(id) per (kind, klucz naturalny)");
+    }
+
+    #[test]
+    fn migration004_dedupe_noop_when_no_duplicates() {
+        // Brak duplikatow -> dedupe nic nie usuwa (CREATE UNIQUE INDEX przejdzie).
+        let rows = [
+            (1, "node", "docA|n1"),
+            (2, "node", "docA|n2"),
+            (3, "edge", "docA|a|rel|b"),
+        ];
+        let kept = dedupe_keep_min_id(&rows);
+        assert_eq!(kept, vec![1, 2, 3], "bez duplikatow nic nie znika");
     }
 }
