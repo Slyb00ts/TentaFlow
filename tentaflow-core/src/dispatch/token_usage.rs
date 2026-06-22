@@ -59,6 +59,9 @@ fn summary_to_wire(row: UsageSummaryRow) -> TokenUsageSummaryWire {
         completion_tokens: row.completion_tokens,
         total_tokens: row.total_tokens,
         request_count: row.request_count,
+        audio_ms: row.audio_ms,
+        images: row.images,
+        embedding_tokens: row.embedding_tokens,
     }
 }
 

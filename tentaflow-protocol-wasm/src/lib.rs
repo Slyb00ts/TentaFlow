@@ -5209,6 +5209,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "total_tokens", (r.total_tokens as f64).into());
                     set(&item, "requestCount", (r.request_count as f64).into());
                     set(&item, "request_count", (r.request_count as f64).into());
+                    set(&item, "audioMs", (r.audio_ms as f64).into());
+                    set(&item, "audio_ms", (r.audio_ms as f64).into());
+                    set(&item, "images", (r.images as f64).into());
+                    set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
+                    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
                     arr.push(&item);
                 }
                 set(&obj, "rows", arr.into());

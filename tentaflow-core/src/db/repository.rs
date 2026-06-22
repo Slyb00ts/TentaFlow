@@ -9487,7 +9487,10 @@ pub fn usage_summary(
                 COALESCE(SUM(prompt_tokens), 0), \
                 COALESCE(SUM(completion_tokens), 0), \
                 COALESCE(SUM(total_tokens), 0), \
-                COALESCE(SUM(request_count), 0) \
+                COALESCE(SUM(request_count), 0), \
+                COALESCE(SUM(audio_ms), 0), \
+                COALESCE(SUM(images), 0), \
+                COALESCE(SUM(embedding_tokens), 0) \
          FROM token_usage_daily \
          WHERE org_id = ?1 AND {period_clause} \
          GROUP BY {group_col} ORDER BY 4 DESC"
@@ -9501,6 +9504,9 @@ pub fn usage_summary(
                 completion_tokens: row.get(2)?,
                 total_tokens: row.get(3)?,
                 request_count: row.get(4)?,
+                audio_ms: row.get(5)?,
+                images: row.get(6)?,
+                embedding_tokens: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

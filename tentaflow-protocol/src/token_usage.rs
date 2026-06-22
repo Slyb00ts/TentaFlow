@@ -14,6 +14,9 @@ pub struct TokenUsageSummaryWire {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub request_count: i64,
+    pub audio_ms: i64,
+    pub images: i64,
+    pub embedding_tokens: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
