@@ -73,6 +73,24 @@ impl Csr {
         self.neighbor_weights(u).iter().sum()
     }
 
+    /// Pełny stopień (out + in) każdego węzła, indeksowany jak `ids`. Używany do
+    /// kary log-degree przy P_init (MemGraphRAG §6.2): węzeł-hub (wysoka łączność)
+    /// jest słabszą kotwicą personalizacji PPR, bo prawie wszystko jest z nim
+    /// powiązane (mała selektywność). Liczymy nieważony stopień strukturalny:
+    /// out = długość przedziału CSR, in = liczba krawędzi celujących w węzeł
+    /// (pojedynczy przebieg po `targets`). Zwraca wektor długości `node_count`.
+    pub fn total_degrees(&self) -> Vec<usize> {
+        let n = self.node_count();
+        let mut deg = vec![0usize; n];
+        for u in 0..n {
+            deg[u] += self.out_degree(u);
+        }
+        for &t in &self.targets {
+            deg[t] += 1;
+        }
+        deg
+    }
+
     /// Buduje CSR z listy id węzłów i ważonych krawędzi `(src_id, dst_id, weight)`.
     /// Krawędzie wskazujące na nieznane id (spoza `ids`) są pomijane — eksport z
     /// Cozo nie powinien ich produkować, ale to chroni przed niespójnym

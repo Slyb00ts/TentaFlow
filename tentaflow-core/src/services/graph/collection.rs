@@ -732,20 +732,89 @@ impl GraphManager {
         org_id: &str,
         addon_id: &str,
         collection: &str,
-        seeds: &[String],
+        seeds: &[(String, f64)],
         top_n: u32,
         damping: f64,
         iterations: u32,
     ) -> Result<Vec<(String, f64)>> {
         let csr = self.export_csr(org_id, addon_id, collection)?;
         let index = csr.id_index();
-        let seed_indices: Vec<usize> =
-            seeds.iter().filter_map(|s| index.get(s.as_str()).copied()).collect();
+        // Mapujemy `(id, waga)` -> `(idx, waga)`; nieznane id są pomijane. Wagi
+        // niesie wektor personalizacji `personalized_pagerank` (P_init, R6).
+        let seed_indices: Vec<(usize, f64)> = seeds
+            .iter()
+            .filter_map(|(id, w)| index.get(id.as_str()).map(|&idx| (idx, *w)))
+            .collect();
         // Jawne seedy podane, ale żaden nie trafił w graf → brak ważnych kotwic.
         // Zwracamy pusto zamiast degenerować do globalnego PageRanku.
         if !seeds.is_empty() && seed_indices.is_empty() {
             return Ok(Vec::new());
         }
+        let mut scored =
+            super::ppr::personalized_pagerank(&csr, &seed_indices, damping, iterations as usize);
+        scored.truncate(top_n as usize);
+        Ok(scored)
+    }
+
+    /// PPR z pełnym sygnałem P_init structure-aware (MemGraphRAG §6.2) liczonym
+    /// nad JEDNYM snapshotem CSR. To ścieżka GraphRAG retrievalu: kara log-degree,
+    /// cap liczby kotwic i sam PPR MUSZĄ widzieć ten sam graf, więc eksportujemy
+    /// CSR dokładnie raz (inaczej stopnie i ranking byłyby z różnych snapshotów,
+    /// a kotwica capnięta przed przeważeniem nigdy nie zostałaby rozważona).
+    ///
+    /// `seeds` to wagi BAZOWE (`base × relevance`, jeszcze NIE capnięte) — caller
+    /// (adapter RAG) dorzuca boost relevance, bo zależy on od pasaży wektorowych.
+    /// Tutaj domykamy P_init dwoma krokami nad tym samym CSR:
+    ///   1. FILTR ZNANYCH: mapujemy kandydatów na indeksy CSR i ODRZUCAMY nieznane
+    ///      ZANIM cokolwiek capniemy. Wysokowagowy seed spoza grafu nie może wyprzeć
+    ///      znanej kotwicy z cap-u — inaczej PPR dostałby pusty/zubożony wektor mimo
+    ///      obecnych znanych kotwic.
+    ///   2. KARA LOG-DEGREE: `w /= 1 + ln(1 + degree)` na ZNANYCH kotwicach z tego
+    ///      CSR (węzeł-hub jest słabą, mało selektywną kotwicą).
+    ///   3. CAP PO PRZEWAŻENIU: sortujemy ZNANE kotwice po wadze FINALNEJ (malejąco)
+    ///      i ucinamy do `max_seeds`. Kotwica z wysoką wagą po log-degree/relevance,
+    ///      ale leksykalnie poza pierwszymi `max_seeds`, dzięki temu JEST rozważona.
+    ///
+    /// Semantyka pustych/nieznanych kotwic jak w [`Self::ppr`]: jawne, ale w całości
+    /// nieznane seedy → pusty wynik (nie degenerujemy do globalnego PageRanku).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ppr_with_p_init(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        seeds: &[(String, f64)],
+        max_seeds: usize,
+        top_n: u32,
+        damping: f64,
+        iterations: u32,
+    ) -> Result<Vec<(String, f64)>> {
+        let csr = self.export_csr(org_id, addon_id, collection)?;
+        let index = csr.id_index();
+        let degrees = csr.total_degrees();
+
+        // Krok 1: mapuj na indeksy TEGO CSR i ODFILTRUJ nieznane PRZED capem —
+        // nieznana, wysokowagowa kotwica nie może wyprzeć znanej z max_seeds.
+        let mut weighted: Vec<(usize, f64)> = seeds
+            .iter()
+            .filter_map(|(id, w)| index.get(id.as_str()).map(|&idx| (idx, *w)))
+            .collect();
+        // Jawne kotwice podane, ale żadna nie trafiła w graf → pusto (degradacja).
+        if !seeds.is_empty() && weighted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Krok 2: kara log-degree na ZNANYCH kotwicach z tego snapshotu.
+        for (idx, w) in &mut weighted {
+            *w /= 1.0 + (1.0 + degrees[*idx] as f64).ln();
+        }
+
+        // Krok 3: cap PO przeważeniu — sort po wadze finalnej, utnij do max_seeds.
+        // Cap dotyczy WYŁĄCZNIE znanych kotwic, więc nieznane nie zajmują slotów.
+        weighted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        weighted.truncate(max_seeds);
+
+        let seed_indices = weighted;
         let mut scored =
             super::ppr::personalized_pagerank(&csr, &seed_indices, damping, iterations as usize);
         scored.truncate(top_n as usize);

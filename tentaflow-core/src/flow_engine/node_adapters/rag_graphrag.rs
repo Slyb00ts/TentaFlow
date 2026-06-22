@@ -59,6 +59,13 @@ pub const MAX_ACCUMULATED_FACTS: usize = 40;
 /// z `graph_search`, ale nizszy: zapytanie uzytkownika to garstka encji.
 pub const MAX_GRAPH_SEEDS: usize = 16;
 
+/// Pula KANDYDATOW na seedy zbierana z `meta.graph_seeds` PRZED P_init. Wieksza
+/// niz `MAX_GRAPH_SEEDS`: cap do `MAX_GRAPH_SEEDS` zapada dopiero PO przewazeniu
+/// (log-degree + relevance) w `ppr_with_p_init`, wiec kandydat poza pierwszymi 16
+/// leksykalnie — ale z wysoka waga finalna — musi miec szanse trafic do PPR. Mimo
+/// to ograniczamy pule (anti-DoS), zeby koszt przewazenia/sortu nie rosl bez granic.
+pub const MAX_GRAPH_SEED_CANDIDATES: usize = 64;
+
 /// Minimalna dlugosc tokenu encji (w znakach). Krotsze tokeny (spojniki, „a",
 /// „w") sa szumem — nie seeduja grafu.
 const MIN_TOKEN_CHARS: usize = 3;
@@ -77,6 +84,12 @@ pub const MAX_GRAPH_FACTS: usize = 30;
 
 /// Liczba sasiadow pobieranych per encja (przed globalnym capem faktow).
 const NEIGHBORS_PER_ENTITY: u32 = 12;
+
+/// Mnoznik wagi seeda potwierdzonego w top-pasazach wektorowych (P_init relevance,
+/// MemGraphRAG §6.2). > 1, ale umiarkowany: pasaz to silny sygnal, lecz nie ma
+/// zdominowac kary log-degree ani struktury grafu. Encja zarazem rzadka (niski
+/// stopien) i obecna w pasazach wektorowych jest najsilniejsza kotwica.
+const RELEVANCE_BOOST: f64 = 2.0;
 
 /// Stopwordy PL/EN — nie seeduja grafu (czyste szumowe tokeny). Lista celowo
 /// krotka: tylko najczestsze spojniki/przyimki/zaimki pytajne, ktore nigdy nie
@@ -133,7 +146,12 @@ fn tokenize(query: &str) -> Vec<String> {
 /// Nieznane seedy sa NIESZKODLIWE: backend PPR pomija id spoza grafu
 /// (`GraphManager::ppr` filtruje przez `id_index`), wiec generujemy kandydatow
 /// hojnie, a graf sam zostawia tylko realne encje. Wynik jest zdeduplikowany
-/// (po id, wyzsza waga wygrywa) i capniety do `MAX_GRAPH_SEEDS`.
+/// (po id, wyzsza waga wygrywa). Producent NIE capuje do `MAX_GRAPH_SEEDS` (16),
+/// tylko do `MAX_GRAPH_SEED_CANDIDATES` (64) — meta niesie pelna pule kandydatow,
+/// a finalny cap do `MAX_GRAPH_SEEDS` zapada DOPIERO w `ppr_with_p_init` PO pelnym
+/// P_init (relevance + log-degree). Capowanie tutaj do 16 zabilo by pule: kandydat
+/// poza pierwszymi 16 leksykalnie nigdy nie dostalby przewazenia. Cap do 64 to
+/// granica anti-DoS na rozmiar payloadu meta (bounded).
 pub fn identify_query_entities(query: &str) -> Vec<(String, f64)> {
     use std::collections::HashMap;
 
@@ -185,9 +203,10 @@ pub fn identify_query_entities(query: &str) -> Vec<(String, f64)> {
             (id, w)
         })
         .collect();
-    // Najmocniejsze (najdluzsze frazy) najpierw, potem cap.
+    // Najmocniejsze (najdluzsze frazy) najpierw; cap tylko do puli kandydatow
+    // (anti-DoS). Finalny cap do MAX_GRAPH_SEEDS zapada PO przewazeniu w PPR.
     seeds.sort_by(|a, b| b.1.total_cmp(&a.1));
-    seeds.truncate(MAX_GRAPH_SEEDS);
+    seeds.truncate(MAX_GRAPH_SEED_CANDIDATES);
     seeds
 }
 
@@ -358,16 +377,18 @@ pub fn fuse_context(vector_context: &str, graph_facts_text: &str) -> String {
     s
 }
 
-/// Wyciaga seedy `[(id, weight)]` z `meta.graph_seeds`. Brak / zly ksztalt =>
-/// pusta lista (degradacja). Wagi nie sa dzis przekazywane do backendu PPR
-/// (`GraphManager::ppr` bierze rownowazone id), ale czytamy je dla zgodnosci
-/// wejscia z `GraphSeed`.
+/// Wyciaga KANDYDATOW na seedy `[(id, weight)]` z `meta.graph_seeds`. Brak / zly
+/// ksztalt => pusta lista (degradacja). Wagi to BAZA P_init (`base × relevance`
+/// dolozy `collect_facts`), ktora plynie do `ppr_with_p_init` jako wektor
+/// personalizacji.
 ///
-/// Cap `MAX_GRAPH_SEEDS` egzekwowany TUTAJ, a nie tylko w `rag_graph_seed`:
-/// `meta.graph_seeds` mogla zostac zapisana w innym flow albo zmutowana po
-/// seedowaniu, a to wlasnie ta funkcja karmi kosztowny PPR. Cap musi byc tam,
-/// gdzie odpala PPR — inaczej wektor personalizacji moze rosnac bez ograniczen.
-fn seeds_from_meta(envelope: &FlowEnvelope) -> Vec<String> {
+/// Tu NIE capujemy do `MAX_GRAPH_SEEDS` — cap zapada PO przewazeniu w
+/// `ppr_with_p_init`, inaczej kotwica poza pierwszymi 16 leksykalnie (ale z
+/// wysoka waga finalna) nigdy nie trafilaby do PPR. Ograniczamy jedynie pule do
+/// `MAX_GRAPH_SEED_CANDIDATES` (anti-DoS): `meta.graph_seeds` mogla zostac
+/// zapisana w innym flow albo zmutowana po seedowaniu, wiec rozmiar musi byc
+/// zwiazany tam, gdzie odpala kosztowny PPR.
+fn seeds_from_meta(envelope: &FlowEnvelope) -> Vec<(String, f64)> {
     envelope
         .meta
         .get(META_GRAPH_SEEDS)
@@ -375,15 +396,47 @@ fn seeds_from_meta(envelope: &FlowEnvelope) -> Vec<String> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|s| {
-                    s.get("id")
+                    let id = s
+                        .get("id")
                         .and_then(|v| v.as_str())
-                        .filter(|x| !x.is_empty())
-                        .map(str::to_string)
+                        .filter(|x| !x.is_empty())?;
+                    // Brak wagi => 1.0 (neutralna kotwica) — zgodnie z `GraphSeed`.
+                    let w = s.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    Some((id.to_string(), w))
                 })
-                .take(MAX_GRAPH_SEEDS)
+                .take(MAX_GRAPH_SEED_CANDIDATES)
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Dokleja sygnal P_init RELEVANCE (MemGraphRAG §6.2) do wag kandydatow PRZED
+/// PPR. To jedyny sygnal P_init liczony adapter-side, bo zalezy od pasazy
+/// wektorowych (`passage_text`, juz w payloadzie po `rag_accumulate`) — kary
+/// log-degree i cap robi `ppr_with_p_init` nad tym samym CSR co PPR.
+///
+/// Encja, ktorej znormalizowana nazwa WSPOLWYSTEPUJE w tekscie top-pasazy
+/// wektorowych, dostaje mnoznik `RELEVANCE_BOOST` — kotwica potwierdzona przez
+/// retrieval wektorowy jest mocniejsza (fuzja warstw M_pas i M_fac). `id` jest
+/// juz znormalizowany (lowercase, collapse) jak ingest, wiec szukamy go wprost w
+/// zlowercase'owanym tekscie. Pusty tekst => brak boostu (degradacja).
+///
+/// Wagi <= 0 nie powstaja (mnoznik dodatni). Kolejnosc i liczba kandydatow bez
+/// zmian — to tylko PRZEWAZENIE istniejacych kotwic.
+fn apply_relevance_boost(seeds: Vec<(String, f64)>, passage_text: &str) -> Vec<(String, f64)> {
+    let haystack = passage_text.to_lowercase();
+    if haystack.is_empty() {
+        return seeds;
+    }
+    seeds
+        .into_iter()
+        .map(|(id, mut w)| {
+            if id.len() >= MIN_TOKEN_CHARS && haystack.contains(&id) {
+                w *= RELEVANCE_BOOST;
+            }
+            (id, w)
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -494,12 +547,22 @@ impl RagGraphFactsNodeAdapter {
             Err(_) => return Vec::new(),
         };
 
-        // Krok 1: PPR personalizowany na seedach -> top encje powiazane w grafie.
-        let ranked = match ctx.graph.ppr(
+        // P_init structure-aware (MemGraphRAG §6.2): boost relevance liczymy tu
+        // (zalezy od pasazy wektorowych w payloadzie), a kare log-degree, cap
+        // liczby kotwic i PPR robi `ppr_with_p_init` nad JEDNYM snapshotem CSR —
+        // inaczej stopnie i ranking mogłyby byc z roznych snapshotow, a kandydat
+        // capniety przed przewazeniem nigdy nie zostalby rozwazony.
+        let passage_text = envelope.payload.as_text().unwrap_or_default();
+        let seeds = apply_relevance_boost(seeds, passage_text);
+
+        // Krok 1: PPR z P_init na seedach -> top encje powiazane w grafie. Cap do
+        // MAX_GRAPH_SEEDS zapada wewnatrz, PO przewazeniu base × relevance × log-degree.
+        let ranked = match ctx.graph.ppr_with_p_init(
             &org,
             addon,
             KG_COLLECTION,
             &seeds,
+            MAX_GRAPH_SEEDS,
             MAX_GRAPH_ENTITIES,
             0.85,
             20,
@@ -687,13 +750,21 @@ mod tests {
     }
 
     #[test]
-    fn identify_caps_seed_count() {
-        // Dlugie zapytanie z wieloma unikalnymi tokenami -> liczba seedow capnieta.
-        let words: Vec<String> = (0..50).map(|i| format!("token{i:03}")).collect();
+    fn identify_caps_seed_count_to_candidate_pool() {
+        // Producent NIE capuje do MAX_GRAPH_SEEDS (16) — niesie pelna pule do
+        // MAX_GRAPH_SEED_CANDIDATES (64), zeby finalny cap zapadl PO przewazeniu
+        // w PPR. Dlugie zapytanie z wieloma unikalnymi tokenami: liczba kandydatow
+        // capnieta do puli (anti-DoS), ale MOZE przekroczyc 16.
+        let words: Vec<String> = (0..120).map(|i| format!("token{i:03}")).collect();
         let seeds = identify_query_entities(&words.join(" "));
         assert!(
-            seeds.len() <= MAX_GRAPH_SEEDS,
-            "liczba seedow capnieta do {MAX_GRAPH_SEEDS}, bylo {}",
+            seeds.len() <= MAX_GRAPH_SEED_CANDIDATES,
+            "liczba kandydatow capnieta do {MAX_GRAPH_SEED_CANDIDATES}, bylo {}",
+            seeds.len()
+        );
+        assert!(
+            seeds.len() > MAX_GRAPH_SEEDS,
+            "pula kandydatow przekracza MAX_GRAPH_SEEDS (16) — pula NIE jest martwa, bylo {}",
             seeds.len()
         );
     }
@@ -997,13 +1068,15 @@ mod tests {
         assert!(!ctx_text.contains("tesla"), "globalna encja nie wyciekla: {ctx_text}");
     }
 
-    // --- seeds_from_meta cap (bug 2) ---------------------------------------
+    // --- seeds_from_meta pula kandydatow (bug 2) ---------------------------
 
     #[test]
-    fn seeds_from_meta_caps_seed_count() {
-        // meta.graph_seeds z wieksza liczba seedow niz MAX_GRAPH_SEEDS (np. po
-        // mutacji w innym flow) musi byc przyciete PRZED PPR.
-        let seeds_json: Vec<Value> = (0..(MAX_GRAPH_SEEDS + 10))
+    fn seeds_from_meta_caps_candidate_pool() {
+        // meta.graph_seeds z wieksza liczba seedow niz MAX_GRAPH_SEED_CANDIDATES
+        // (np. po mutacji w innym flow) musi byc przyciete do puli kandydatow.
+        // NIE do MAX_GRAPH_SEEDS — finalny cap zapada PO przewazeniu w
+        // `ppr_with_p_init`, zeby kandydat poza pierwszymi 16 mial szanse.
+        let seeds_json: Vec<Value> = (0..(MAX_GRAPH_SEED_CANDIDATES + 10))
             .map(|i| json!({"id": format!("e{i}"), "weight": 1.0}))
             .collect();
         let mut env = FlowEnvelope::empty();
@@ -1011,13 +1084,48 @@ mod tests {
         let seeds = seeds_from_meta(&env);
         assert_eq!(
             seeds.len(),
-            MAX_GRAPH_SEEDS,
-            "liczba seedow przycieta do {MAX_GRAPH_SEEDS}, bylo {}",
+            MAX_GRAPH_SEED_CANDIDATES,
+            "pula kandydatow przycieta do {MAX_GRAPH_SEED_CANDIDATES}, bylo {}",
             seeds.len()
         );
-        // Zachowana kolejnosc wejscia (pierwsze MAX_GRAPH_SEEDS).
-        assert_eq!(seeds[0], "e0");
-        assert_eq!(seeds[MAX_GRAPH_SEEDS - 1], format!("e{}", MAX_GRAPH_SEEDS - 1));
+        // Wieksza niz finalny cap — P_init dostaje pelna pule do przewazenia.
+        assert!(seeds.len() > MAX_GRAPH_SEEDS);
+        assert_eq!(seeds[0].0, "e0");
+    }
+
+    #[test]
+    fn seeds_from_meta_carries_weight() {
+        // Waga z meta MUSI przeplynac (R6) — nie jest gubiona. Brak wagi => 1.0.
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert(
+            META_GRAPH_SEEDS.into(),
+            json!([{"id": "a", "weight": 3.5}, {"id": "b"}]),
+        );
+        let seeds = seeds_from_meta(&env);
+        assert_eq!(seeds[0], ("a".to_string(), 3.5));
+        assert_eq!(seeds[1], ("b".to_string(), 1.0), "brak wagi => 1.0");
+    }
+
+    // --- P_init relevance (boost adapter-side) -----------------------------
+    // Kara log-degree i cap-po-przewazeniu testowane sa w `services::graph`
+    // (`ppr_with_p_init`), bo licza sie nad CSR. Tu tylko boost relevance.
+
+    #[test]
+    fn p_init_relevance_boosts_entities_in_passages() {
+        // Encja obecna w top-pasazach wektorowych dostaje boost relevance.
+        let passages = "Albert Einstein opracowal teorie wzglednosci.";
+        let out = apply_relevance_boost(
+            vec![("albert einstein".into(), 1.0), ("isaac newton".into(), 1.0)],
+            passages,
+        );
+        let w = |id: &str| out.iter().find(|(x, _)| x == id).map(|(_, w)| *w).unwrap();
+        assert!(
+            w("albert einstein") > w("isaac newton"),
+            "encja w pasazach mocniejsza: {} vs {}",
+            w("albert einstein"),
+            w("isaac newton")
+        );
+        assert_eq!(w("albert einstein"), RELEVANCE_BOOST);
     }
 
     // --- merge_accumulated_facts (bug 3: dedup + cap przez hopy) -----------

@@ -17,11 +17,13 @@ use tempfile::TempDir;
 use super::backend::{CozoBackend, GraphBackend};
 use super::collection::GraphManager;
 use super::error::GraphError;
-use super::ppr::personalized_pagerank;
+use super::ppr::{personalized_pagerank, PprScores};
 use crate::db::DbPool;
 
 const ORG_A: &str = "org-a";
 const ORG_B: &str = "org-b";
+/// Cap kotwic uzywany w testach `ppr_with_p_init` (lustro `MAX_GRAPH_SEEDS`).
+const MAX_SEEDS: usize = 16;
 
 fn in_memory_db() -> DbPool {
     let conn = Connection::open_in_memory().unwrap();
@@ -160,7 +162,7 @@ fn test_ppr_over_exported_csr() {
 
     // Seed na 'rag' (węzeł centralny tematu) — PPR powinien dać mu wysoki wynik.
     let seed_idx = csr.index_of("rag").expect("seed node present");
-    let scores = personalized_pagerank(&csr, &[seed_idx], 0.85, 50);
+    let scores = personalized_pagerank(&csr, &[(seed_idx, 1.0)], 0.85, 50);
     assert_eq!(scores.len(), csr.node_count());
     // Suma wyników ~ 1 (rozkład prawdopodobieństwa).
     let sum: f64 = scores.iter().map(|(_, s)| s).sum();
@@ -202,7 +204,7 @@ fn test_ppr_empty_seeds_given_is_global_pagerank() {
     mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "b", "to", "c", 1.0, "{}", "null")
         .unwrap();
 
-    let no_seeds: Vec<String> = Vec::new();
+    let no_seeds: Vec<(String, f64)> = Vec::new();
     let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &no_seeds, 10, 0.85, 30).unwrap();
     assert!(!ranked.is_empty(), "pusta lista seedow -> globalny PageRank (niepusty)");
 }
@@ -220,12 +222,12 @@ fn test_ppr_all_unknown_seeds_returns_empty() {
     mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "a", "to", "c", 1.0, "{}", "null")
         .unwrap();
 
-    let unknown: Vec<String> = vec!["x".into(), "y".into()];
+    let unknown: Vec<(String, f64)> = vec![("x".into(), 1.0), ("y".into(), 1.0)];
     let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &unknown, 10, 0.85, 30).unwrap();
     assert!(ranked.is_empty(), "same nieznane seedy -> pusty wynik, bylo: {ranked:?}");
 
     // Kontrola: jeden ZNANY seed wsrod nieznanych -> niepusty wynik (PPR dziala).
-    let mixed: Vec<String> = vec!["x".into(), "a".into()];
+    let mixed: Vec<(String, f64)> = vec![("x".into(), 1.0), ("a".into(), 1.0)];
     let ranked2 = mgr.ppr(ORG_A, "addon_a", "kg", &mixed, 10, 0.85, 30).unwrap();
     assert!(!ranked2.is_empty(), "jeden znany seed -> niepusty wynik");
 }
@@ -704,7 +706,7 @@ fn test_ppr_weighted_differs_from_unweighted() {
 
     let csr = be.export_edges().unwrap();
     let seed = csr.index_of("seed").unwrap();
-    let scores = personalized_pagerank(&csr, &[seed], 0.85, 100);
+    let scores = personalized_pagerank(&csr, &[(seed, 1.0)], 0.85, 100);
     let score = |id: &str| scores.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
     // Ciężka krawędź => `heavy` zbiera istotnie więcej masy niż `light`.
     assert!(
@@ -716,18 +718,176 @@ fn test_ppr_weighted_differs_from_unweighted() {
 }
 
 #[test]
+fn test_ppr_weighted_seeds_shift_ranking() {
+    // Dwie symetryczne kotwice (`a`, `b`) z izolowanymi „satelitami" (`a` -> `as`,
+    // `b` -> `bs`). Gdy seed `a` ma ciezsza wage personalizacji, satelita `as`
+    // dostaje wiecej masy niz `bs` — waga seeda STERUJE rankingiem (R6).
+    let be = CozoBackend::open_in_memory().unwrap();
+    for id in ["a", "b", "as", "bs"] {
+        be.upsert_node(id, "", "{}", "null").unwrap();
+    }
+    be.upsert_edge("a", "to", "as", 1.0, "{}", "null").unwrap();
+    be.upsert_edge("b", "to", "bs", 1.0, "{}", "null").unwrap();
+    let csr = be.export_edges().unwrap();
+    let ia = csr.index_of("a").unwrap();
+    let ib = csr.index_of("b").unwrap();
+    let score = |scores: &PprScores, id: &str| {
+        scores.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap()
+    };
+
+    // Rowne wagi => symetria: `as` i `bs` dostaja tyle samo.
+    let even = personalized_pagerank(&csr, &[(ia, 1.0), (ib, 1.0)], 0.85, 100);
+    assert!((score(&even, "as") - score(&even, "bs")).abs() < 1e-9);
+
+    // Ciezszy seed `a` => `as` bije `bs` i sam `a` bije `b`.
+    let skew = personalized_pagerank(&csr, &[(ia, 3.0), (ib, 1.0)], 0.85, 100);
+    assert!(score(&skew, "a") > score(&skew, "b"), "ciezszy seed -> wyzszy wynik");
+    assert!(score(&skew, "as") > score(&skew, "bs"), "waga seeda steruje rankingiem");
+
+    // Suma masy zachowana (normalizacja wag do 1).
+    let sum: f64 = skew.iter().map(|(_, s)| s).sum();
+    assert!((sum - 1.0).abs() < 1e-6, "PPR mass not conserved: {sum}");
+}
+
+#[test]
+fn test_ppr_non_positive_weights_filtered() {
+    // Wagi <= 0 sa odfiltrowane: seed z waga 0 nie personalizuje, a gdy WSZYSTKIE
+    // wagi sa niedodatnie -> degeneracja do uniform (jak pusty zbior seedow).
+    let (_dir, be) = build_sample_graph();
+    let csr = be.export_edges().unwrap();
+    let rag = csr.index_of("rag").unwrap();
+
+    // Same niedodatnie wagi => uniform (suma 1, niepusty, jak pusty zbior).
+    let zeroed = personalized_pagerank(&csr, &[(rag, 0.0)], 0.85, 50);
+    let uniform = personalized_pagerank(&csr, &[], 0.85, 50);
+    for ((_, sa), (_, sb)) in zeroed.iter().zip(uniform.iter()) {
+        assert!((sa - sb).abs() < 1e-12, "niedodatnie wagi != uniform");
+    }
+}
+
+#[test]
 fn test_ppr_dedups_seeds() {
     // Powtórzony seed nie zawyża jego masy. Wynik z [s, s, s] musi być
     // identyczny jak z [s].
     let (_dir, be) = build_sample_graph();
     let csr = be.export_edges().unwrap();
     let s = csr.index_of("rag").unwrap();
-    let once = personalized_pagerank(&csr, &[s], 0.85, 50);
-    let thrice = personalized_pagerank(&csr, &[s, s, s], 0.85, 50);
+    let once = personalized_pagerank(&csr, &[(s, 1.0)], 0.85, 50);
+    // Dedup SUMUJE wagi tego samego indeksu, ale po normalizacji do sumy 1 wektor
+    // teleportu jest IDENTYCZNY jak dla pojedynczego seeda — wynik bez zmian.
+    let thrice = personalized_pagerank(&csr, &[(s, 1.0), (s, 1.0), (s, 1.0)], 0.85, 50);
     for ((id_a, sa), (id_b, sb)) in once.iter().zip(thrice.iter()) {
         assert_eq!(id_a, id_b);
         assert!((sa - sb).abs() < 1e-12, "dedup changed score for {id_a}");
     }
+}
+
+#[test]
+fn test_ppr_with_p_init_log_degree_down_weights_hub() {
+    // Dwie kotwice o RoWNEJ wadze bazowej: `rare` (stopien 1) i `hub` (stopien
+    // wysoki, polaczony z wieloma satelitami). Kara log-degree liczona z TEGO
+    // CSR sprawia, ze `rare` wnosi wiecej masy personalizacji niz `hub` — wiec
+    // satelita `rare` (`rs`) bije izolowanego satelite huba (`hs`).
+    let (_dir, mgr) = mgr();
+    let nodes = ["rare", "rs", "hub", "hs", "h1", "h2", "h3", "h4", "h5"];
+    for id in nodes {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    // rare: stopien 1 (-> rs). hub: stopien wysoki (-> hs + 5 hubow).
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "rare", "to", "rs", 1.0, "{}", "null")
+        .unwrap();
+    for t in ["hs", "h1", "h2", "h3", "h4", "h5"] {
+        mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "hub", "to", t, 1.0, "{}", "null")
+            .unwrap();
+    }
+    let seeds = [("rare".to_string(), 1.0), ("hub".to_string(), 1.0)];
+    let ranked = mgr
+        .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, MAX_SEEDS, 20, 0.85, 50)
+        .unwrap();
+    let score = |id: &str| ranked.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
+    assert!(
+        score("rs") > score("hs"),
+        "hub down-weighted przez log-degree: rs={} hs={}",
+        score("rs"),
+        score("hs")
+    );
+}
+
+#[test]
+fn test_ppr_with_p_init_caps_after_reweighting() {
+    // Kandydat z WYSOKA waga finalna, ale leksykalnie OSTATNI, musi przejsc cap.
+    // `max_seeds=1`: bez cap-po-przewazeniu wygralby pierwszy leksykalnie (`aaa`),
+    // ale `zzz` ma 10x wieksza wage bazowa, wiec to ON ma byc jedyna kotwica.
+    let (_dir, mgr) = mgr();
+    for id in ["aaa", "as", "zzz", "zs"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "aaa", "to", "as", 1.0, "{}", "null")
+        .unwrap();
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "zzz", "to", "zs", 1.0, "{}", "null")
+        .unwrap();
+    // Kolejnosc wejscia leksykalna (aaa przed zzz), ale zzz ma 10x wage.
+    let seeds = [("aaa".to_string(), 1.0), ("zzz".to_string(), 10.0)];
+    let ranked = mgr
+        .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, 1, 20, 0.85, 50)
+        .unwrap();
+    let score = |id: &str| ranked.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
+    // Tylko `zzz` zostal kotwica => `zs` dostaje mase, `as` praktycznie zero.
+    assert!(
+        score("zs") > score("as"),
+        "kandydat poza pierwszymi max_seeds, ale z wysoka waga, JEST rozwazony: zs={} as={}",
+        score("zs"),
+        score("as")
+    );
+}
+
+#[test]
+fn test_ppr_with_p_init_unknown_does_not_evict_known_under_cap() {
+    // Regresja: nieznany seed o WYSOKIEJ wadze nie moze wyprzec znanej kotwicy z
+    // cap-u. `max_seeds=1`, wejscie: nieznana `ghost` (waga 99) + znana `anchor`
+    // (waga 1). Gdyby cap zapadal PRZED filtrem znanych, `ghost` zajalby slot i
+    // PPR dostalby pusty wektor. Po poprawce filtr known idzie PRZED capem, wiec
+    // `anchor` zostaje jedyna kotwica i `sat` dostaje mase personalizacji.
+    let (_dir, mgr) = mgr();
+    for id in ["anchor", "sat"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "anchor", "to", "sat", 1.0, "{}", "null")
+        .unwrap();
+    let seeds = [("ghost".to_string(), 99.0), ("anchor".to_string(), 1.0)];
+    let ranked = mgr
+        .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, 1, 20, 0.85, 50)
+        .unwrap();
+    assert!(
+        !ranked.is_empty(),
+        "znana kotwica nie zostala wyparta przez nieznany seed => PPR niepusty"
+    );
+    let sat = ranked.iter().find(|(x, _)| x == "sat").map(|(_, s)| *s);
+    assert!(
+        sat.is_some_and(|s| s > 0.0),
+        "satelita znanej kotwicy dostaje mase personalizacji: {ranked:?}"
+    );
+}
+
+#[test]
+fn test_ppr_with_p_init_all_unknown_returns_empty() {
+    // Jawne kotwice, ale zadna nie istnieje w grafie => pusto (degradacja, jak
+    // `ppr`): nie degenerujemy do globalnego PageRanku.
+    let (_dir, mgr) = mgr();
+    for id in ["a", "b"] {
+        mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
+            .unwrap();
+    }
+    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "a", "to", "b", 1.0, "{}", "null")
+        .unwrap();
+    let seeds = [("nieznana".to_string(), 1.0)];
+    let ranked = mgr
+        .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, MAX_SEEDS, 10, 0.85, 50)
+        .unwrap();
+    assert!(ranked.is_empty(), "wszystkie kotwice nieznane => pusto");
 }
 
 #[test]
