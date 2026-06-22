@@ -207,14 +207,20 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     seed::seed_defaults(&conn)?;
 
     // Pula odczytu — osobne połączenia do tego samego pliku. WAL pozwala im czytać
-    // równolegle z pisarzem. Rozmiar skalowany do liczby rdzeni (min 4), żeby równoległe
-    // żądania nie ustawiały się w kolejce po jedno połączenie odczytu.
-    let read_size = (num_cpus::get() as u32 * 2).max(4);
+    // równolegle z pisarzem. Rozmiar skalowany do liczby rdzeni, ale TWARDO ograniczony:
+    // na maszynach o dużej liczbie rdzeni (np. DGX, setki rdzeni) niesprowadzony rozmiar
+    // tworzyłby setki połączeń, a `build()` z domyślnym `min_idle == max_size` otwierałby
+    // je WSZYSTKIE od razu (każde z 256MB mmap), przekraczając `connection_timeout` →
+    // "timed out waiting for connection" już przy starcie. 16 połączeń odczytu w zupełności
+    // wystarcza na równoległość; `min_idle(1)` sprawia, że start otwiera tylko jedno, a
+    // reszta powstaje leniwie na żądanie.
+    let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
     let manager = SqliteConnectionManager::file(db_path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_init(init_read_connection);
     let read_pool = r2d2::Pool::builder()
         .max_size(read_size)
+        .min_idle(Some(1))
         .connection_timeout(std::time::Duration::from_secs(5))
         .build(manager)?;
 
