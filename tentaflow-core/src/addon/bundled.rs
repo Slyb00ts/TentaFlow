@@ -180,6 +180,7 @@ fn write_bundled_addon_files(addon_dir: &std::path::Path, addon: &BundledAddon) 
         std::fs::write(addon_dir.join("blocks.json"), addon.blocks_json).ok();
     }
     write_bundled_migrations(addon_dir, addon)?;
+    write_bundled_flows(addon_dir, addon)?;
     Ok(())
 }
 
@@ -242,6 +243,9 @@ fn compute_bundle_hash(addon: &BundledAddon) -> String {
     for (name, sql) in addon.migrations {
         hash_chunk(&mut hasher, name.as_bytes(), sql.as_bytes());
     }
+    for (name, content) in addon.flows {
+        hash_chunk(&mut hasher, name.as_bytes(), content.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -255,6 +259,20 @@ fn write_bundled_migrations(addon_dir: &std::path::Path, addon: &BundledAddon) -
     for (name, sql) in addon.migrations {
         std::fs::write(migrations_dir.join(name), sql)
             .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac migracji addonu '{name}': {e}"))?;
+    }
+    Ok(())
+}
+
+fn write_bundled_flows(addon_dir: &std::path::Path, addon: &BundledAddon) -> Result<()> {
+    if addon.flows.is_empty() {
+        return Ok(());
+    }
+    let flows_dir = addon_dir.join("flows");
+    std::fs::create_dir_all(&flows_dir)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu flows addonu: {e}"))?;
+    for (name, content) in addon.flows {
+        std::fs::write(flows_dir.join(name), content)
+            .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac flow addonu '{name}': {e}"))?;
     }
     Ok(())
 }
@@ -371,6 +389,7 @@ display_name = "Old Addon"
             description_md: "",
             blocks_json: "",
             migrations: &[],
+            flows: &[],
         };
         let addon_b = BundledAddon {
             name: "outlook",
@@ -380,6 +399,7 @@ display_name = "Old Addon"
             description_md: "",
             blocks_json: "",
             migrations: &[],
+            flows: &[],
         };
 
         assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));
@@ -395,6 +415,7 @@ display_name = "Old Addon"
             description_md: "",
             blocks_json: "",
             migrations: &[],
+            flows: &[],
         };
         let addon_b = BundledAddon {
             name: "outlook",
@@ -404,6 +425,7 @@ display_name = "Old Addon"
             description_md: "",
             blocks_json: "",
             migrations: &[],
+            flows: &[],
         };
 
         assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));
@@ -419,6 +441,7 @@ display_name = "Old Addon"
             description_md: "",
             blocks_json: "",
             migrations: &[("001_init.sql", "CREATE TABLE eureka_entries (id INTEGER);")],
+            flows: &[],
         };
         let addon_b = BundledAddon {
             name: "eureka",
@@ -431,6 +454,7 @@ display_name = "Old Addon"
                 "001_init.sql",
                 "CREATE TABLE eureka_entries (id INTEGER PRIMARY KEY);",
             )],
+            flows: &[],
         };
 
         assert_ne!(compute_bundle_hash(&addon_a), compute_bundle_hash(&addon_b));

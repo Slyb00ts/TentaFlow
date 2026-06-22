@@ -96,6 +96,12 @@ fn main() {
                     addon_dir.join("migrations").display()
                 );
             }
+            if addon_dir.join("flows").exists() {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    addon_dir.join("flows").display()
+                );
+            }
 
             println!(
                 "cargo:warning=Addon '{}' — rozpoczynam budowanie WASM",
@@ -229,6 +235,18 @@ fn main() {
                 if let Ok(entries) = std::fs::read_dir(&migrations_dir) {
                     for m in entries.flatten() {
                         std::fs::copy(m.path(), dest_migrations.join(m.file_name())).ok();
+                    }
+                }
+            }
+
+            // Kopiuj flows jesli sa
+            let flows_dir = addon_dir.join("flows");
+            if flows_dir.exists() {
+                let dest_flows = bundle_addon_dir.join("flows");
+                std::fs::create_dir_all(&dest_flows).unwrap();
+                if let Ok(entries) = std::fs::read_dir(&flows_dir) {
+                    for f in entries.flatten() {
+                        std::fs::copy(f.path(), dest_flows.join(f.file_name())).ok();
                     }
                 }
             }
@@ -420,6 +438,8 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
     code.push_str("    pub blocks_json: &'static str,\n");
     code.push_str("    /// Pliki migracji SQL addona\n");
     code.push_str("    pub migrations: &'static [(&'static str, &'static str)],\n");
+    code.push_str("    /// Pliki flow JSON addona\n");
+    code.push_str("    pub flows: &'static [(&'static str, &'static str)],\n");
     code.push_str("}\n\n");
 
     code.push_str("/// Lista wszystkich wbudowanych addonow\n");
@@ -432,6 +452,7 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
         let desc_path = addon.bundle_path.join("DESCRIPTION.md");
         let blocks_path = addon.bundle_path.join("blocks.json");
         let migrations_path = addon.bundle_path.join("migrations");
+        let flows_path = addon.bundle_path.join("flows");
 
         // Plik WASM i manifest musza istniec
         if !wasm_path.exists() || !manifest_path.exists() {
@@ -490,6 +511,29 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
             for migration in migrations {
                 let path = migration.path();
                 let name = migration.file_name().to_string_lossy().to_string();
+                code.push_str(&format!(
+                    "            (\"{}\", include_str!(\"{}\")),\n",
+                    name,
+                    escape_path(&path)
+                ));
+            }
+        }
+        code.push_str("        ],\n");
+
+        code.push_str("        flows: &[\n");
+        if flows_path.exists() {
+            let mut flows = std::fs::read_dir(&flows_path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            flows.sort_by_key(|entry| entry.file_name());
+            for flow in flows {
+                let path = flow.path();
+                let name = flow.file_name().to_string_lossy().to_string();
                 code.push_str(&format!(
                     "            (\"{}\", include_str!(\"{}\")),\n",
                     name,
