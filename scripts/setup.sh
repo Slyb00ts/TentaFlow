@@ -1369,13 +1369,35 @@ install_vulkan() {
         debian)
             # Core, required for the Vulkan llama.cpp backend: loader+headers,
             # shader compiler, SPIR-V tools.
+            #
+            # NVIDIA driver/Vulkan PPAs ship a newer libvulkan1 (e.g. 1.4.328)
+            # than Ubuntu base. The base libvulkan-dev pins libvulkan1 to the
+            # exact distro version, so a plain `apt-get install libvulkan-dev`
+            # breaks with "Depends: libvulkan1 (= 1.3.x) but 1.4.x is installed".
+            # Pin the dev package to whatever loader is already installed.
+            local vk_ver
+            vk_ver="$(dpkg-query -W -f='${Version}' libvulkan1 2>/dev/null || true)"
+            local vulkan_dev_pkg="libvulkan-dev"
+            if [[ -n "$vk_ver" ]] && apt-cache show "libvulkan-dev=$vk_ver" >/dev/null 2>&1; then
+                vulkan_dev_pkg="libvulkan-dev=$vk_ver"
+            fi
             local pkgs=(
-                libvulkan-dev
+                "$vulkan_dev_pkg"
                 glslang-dev
                 spirv-tools
             )
             log_info "Instalacja: ${pkgs[*]}"
-            run_privileged apt-get install -y "${pkgs[@]}"
+            if ! run_privileged apt-get install -y "${pkgs[@]}"; then
+                # The llama.cpp 'multi' variant links Vulkan unconditionally, so
+                # a loader/dev skew here surfaces as a cryptic `-lvulkan` link
+                # error much later. Fail loud with the remediation instead.
+                log_error "Nie udalo sie zainstalowac libvulkan-dev pasujacego do libvulkan1 ($vk_ver)."
+                log_error "  Zwykle wystarczy odswiezyc listy pakietow z repo NVIDIA Vulkan i powtorzyc:"
+                log_error "      sudo apt-get update && ./scripts/setup.sh"
+                log_error "  Jesli repo NVIDIA nie dostarcza pasujacego -dev, doinstaluj LunarG Vulkan SDK"
+                log_error "  albo zbuduj llama.cpp bez Vulkan: LLAMA_CPP_BACKENDS=cuda (lub --no-vulkan)."
+                exit 1
+            fi
             # Validation layers are debug-only and the package name churns across
             # Ubuntu releases — 24.04 dropped `vulkan-validationlayers-dev` in
             # favour of `vulkan-validationlayers` + `vulkan-utility-libraries-dev`.
