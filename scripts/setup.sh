@@ -1255,6 +1255,23 @@ cuda_new_enough() {
 install_cuda() {
     log_section "NVIDIA CUDA toolkit"
 
+    # CUDA instalujemy DOMYSLNIE (INSTALL_CUDA=true) na wszystkich maszynach z
+    # GPU NVIDIA — tak, by wszedzie byc CUDA wspierajaca Blackwell (B300 sm_103,
+    # DGX Spark/GB10, B200 sm_100) bez recznych krokow. Na maszynie bez GPU
+    # NVIDIA pomijamy, by nie ciagnac ~3 GB toolkitu bez powodu (wykrycie przez
+    # lspci/nvidia-smi; gdy nie da sie sprawdzic — kontynuujemy).
+    local has_nv_gpu=""
+    if command -v lspci &>/dev/null && lspci 2>/dev/null | grep -qiE 'nvidia'; then
+        has_nv_gpu=1
+    fi
+    if command -v nvidia-smi &>/dev/null && nvidia-smi -L 2>/dev/null | grep -qiE 'gpu'; then
+        has_nv_gpu=1
+    fi
+    if [[ -z "$has_nv_gpu" ]] && command -v lspci &>/dev/null; then
+        log_info "Nie wykryto GPU NVIDIA — pomijam instalacje CUDA."
+        return
+    fi
+
     # /usr/local/cuda/bin (instalacja z repo NVIDIA) ma pierwszenstwo nad starym
     # /usr/bin/nvcc z dystrybucyjnego pakietu.
     [[ -x /usr/local/cuda/bin/nvcc ]] && export PATH="/usr/local/cuda/bin:$PATH"
