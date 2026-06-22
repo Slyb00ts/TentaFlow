@@ -73,6 +73,11 @@ const SPORT_STAND_DOWN: u32 = 1005;
 const SPORT_RECOVERY_STAND: u32 = 1006;
 const SPORT_EULER: u32 = 1007;
 const SPORT_MOVE: u32 = 1008;
+// On-board obstacle avoidance toggle. Distinct topic from sport; `false` lets the
+// operator drive/turn manually, `true` lets the robot autonomously avoid obstacles
+// (which can block manual turns). Mirrors go2_ros2_sdk set_obstacle_avoidance.
+const OBSTACLE_AVOID_TOPIC: &str = "rt/api/obstacles_avoid/request";
+const OBSTACLE_AVOID_API: u32 = 1004;
 const SPORT_SIT: u32 = 1009;
 const SPORT_BODY_HEIGHT: u32 = 1013;
 const SPORT_FOOT_RAISE_HEIGHT: u32 = 1014;
@@ -430,6 +435,22 @@ fn build_sport(api_id: u32, parameter: &str) -> String {
         "type": "req",
         "topic": "rt/api/sport/request",
         "data": { "header": { "identity": { "id": id, "api_id": api_id } }, "parameter": parameter },
+    })
+    .to_string()
+}
+
+// Build the obstacle-avoidance toggle request. Same envelope shape as `build_sport`
+// but on the dedicated obstacles_avoid topic; `parameter` is a JSON STRING (like the
+// sport parameter) carrying the enable flag.
+fn build_obstacle_avoid(enabled: bool) -> String {
+    let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    json!({
+        "type": "req",
+        "topic": OBSTACLE_AVOID_TOPIC,
+        "data": {
+            "header": { "identity": { "id": id, "api_id": OBSTACLE_AVOID_API } },
+            "parameter": json!({ "is_remote_commands_from_api": enabled }).to_string(),
+        },
     })
     .to_string()
 }
@@ -1471,6 +1492,24 @@ fn set_lidar(enabled: bool) -> JsonValue {
     json!({ "status": "sent", "enabled": enabled })
 }
 
+/// Toggle on-board obstacle avoidance. Unlike the LiDAR intent (persisted and
+/// re-applied by on_tick), this is a direct, stateless toggle: send it to the live
+/// robot now. Requires the robot to be locally online with an open channel; a
+/// remote-owned/offline robot returns an error rather than silently dropping it.
+fn set_obstacle_avoid(enabled: bool) -> JsonValue {
+    let robot = match db::get_robot() {
+        Ok(r) => r,
+        Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
+    };
+    if robot.status != "online" || robot.channel_id.is_empty() {
+        return json!({ "error": "robot not online" });
+    }
+    match wc_send_text(&robot.channel_id, &build_obstacle_avoid(enabled)) {
+        Ok(()) => json!({ "status": "sent", "obstacle_avoid": enabled }),
+        Err(e) => json!({ "error": alloc::format!("send: {e}") }),
+    }
+}
+
 /// LiDAR frame availability snapshot. The live point cloud no longer flows
 /// through this JSON tool: the service tick decodes each frame DIRECTLY into the
 /// canonical packed-f32 layout and publishes it to the host `LidarStreamHub`
@@ -2104,6 +2143,11 @@ fn tick() {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg(POSE_TOPIC));
+                                    // Start with obstacle avoidance OFF on every connect so the
+                                    // operator can drive/turn manually by default (active avoidance
+                                    // can block manual turns). Matches go2_ros2_sdk's manual-driving
+                                    // default; the UI toggle re-enables it on demand.
+                                    let _ = wc_send_text(&robot.channel_id, &build_obstacle_avoid(false));
                                     // Go2 only starts publishing the camera RTP after this
                                     // app-level command; the recvonly transceiver alone is silent.
                                     if !cam_id.is_empty() {
@@ -2413,6 +2457,8 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
         "go2.pose" => send_pose(params),
         "go2.lidar_on" => set_lidar(true),
         "go2.lidar_off" => set_lidar(false),
+        "go2.obstacle_avoid_on" => set_obstacle_avoid(true),
+        "go2.obstacle_avoid_off" => set_obstacle_avoid(false),
         // Combined toggle: `{enabled: bool}`; defaults to enabling when absent.
         "go2.lidar" => {
             let enabled = params
@@ -2479,6 +2525,7 @@ fn capability_kinds() -> Vec<&'static str> {
         "body_height", "foot_raise_height", "speed_level", "pose", "wiggle_hips",
         "heart", "dance1", "dance2", "scrape", "front_flip", "front_jump",
         "front_pounce", "status", "camera", "lidar_on", "lidar_off", "lidar_frame",
+        "obstacle_avoid_on", "obstacle_avoid_off",
     ]
 }
 
@@ -2527,6 +2574,8 @@ fn actions_meta() -> JsonValue {
         { "kind": "status", "label": "Status", "risk": "low", "read_only": true, "params": [] },
         { "kind": "lidar_on", "label": "LiDAR włącz", "risk": "low", "params": [] },
         { "kind": "lidar_off", "label": "LiDAR wyłącz", "risk": "low", "params": [] },
+        { "kind": "obstacle_avoid_on", "label": "Omijanie przeszkód: wł", "risk": "low", "params": [] },
+        { "kind": "obstacle_avoid_off", "label": "Omijanie przeszkód: wył", "risk": "low", "params": [] },
         { "kind": "lidar_frame", "label": "LiDAR klatka", "risk": "low", "read_only": true, "params": [] },
     ])
 }
