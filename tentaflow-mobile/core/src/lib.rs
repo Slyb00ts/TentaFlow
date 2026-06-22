@@ -9,6 +9,7 @@ pub mod lifecycle;
 mod platform;
 mod runtime;
 pub mod ffi_discovery;
+pub mod ffi_sensors;
 mod diagnostics;
 
 use anyhow::Result;
@@ -224,6 +225,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
         },
         services_runtime: ServicesRuntimeConfig::default(),
         monitoring: MonitoringConfig::default(),
+        token_metrics: tentaflow_core::config::TokenMetricsConfig::default(),
         memory: None,
         security: None,
         node_role: NodeRole::Mobile,

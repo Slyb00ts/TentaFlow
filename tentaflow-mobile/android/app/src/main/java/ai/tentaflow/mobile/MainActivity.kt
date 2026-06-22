@@ -53,12 +53,34 @@ class MainActivity : AppCompatActivity() {
     private var attempts = 0
 
     private val cameraPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            // Depth (ARCore) needs the camera grant; if it lands after sensors started,
+            // start depth now instead of waiting for an app restart.
+            startDepthIfNeeded()
+        }
+
+    // Phone-as-sensor-robot: native capture → core fusion engine + shared map.
+    private var sensorBridge: SensorBridge? = null
+    private var depthCapture: DepthCapture? = null
+
+    private val sensorPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            startSensors()
+        }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestCameraPermission()
+        // Ask for location, then start sensor capture (IMU/baro need no runtime perm;
+        // GPS does; depth uses the camera grant). The CORE per-sensor permissions of
+        // the `phone` addon gate what actually reaches the fusion engine.
+        sensorPermissionLauncher.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            )
+        )
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -109,11 +131,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        depthCapture?.stop()
+        sensorBridge?.stop()
         if (::webView.isInitialized) {
             webView.destroy()
         }
         probeExecutor.shutdownNow()
         super.onDestroy()
+    }
+
+    /** Start native sensor capture (idempotent). GPS only if location was granted;
+     *  ARCore depth only on supported devices. Core gates each by addon permission. */
+    private fun startSensors() {
+        if (sensorBridge != null) return
+        val gnss = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val bridge = SensorBridge(applicationContext)
+        bridge.start(imu = true, baro = true, gnss = gnss)
+        sensorBridge = bridge
+        startDepthIfNeeded()
+    }
+
+    /** Start ARCore depth once the camera grant + an ARCore-capable device are present.
+     *  Idempotent; safe to call from both the sensor start and the camera-grant callback. */
+    private fun startDepthIfNeeded() {
+        val bridge = sensorBridge ?: return
+        if (depthCapture != null) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) return
+        depthCapture = DepthCapture(this, bridge).also {
+            if (!it.start()) depthCapture = null
+        }
     }
 
     private fun requestCameraPermission() {

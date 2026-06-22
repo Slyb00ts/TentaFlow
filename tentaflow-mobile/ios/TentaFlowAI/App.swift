@@ -40,6 +40,10 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     /// przy powrocie (applicationWillEnterForeground).
     private var lastBackgroundTime: Date?
 
+    /// Natywne przechwytywanie czujników (telefon jako robot-czujnik). Trzymane przy
+    /// życiu przez cały cykl aplikacji; rdzeń bramkuje czujniki uprawnieniami addonu.
+    private var sensorBridge: SensorBridge?
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         NSLog("[TentaFlow] didFinishLaunching — start")
 
@@ -87,6 +91,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             // Pusty string bezpieczny — nie wyklucza nic (i tak Rust odrzuci self).
             NSLog("[TentaFlow] NativeDiscovery.start() po opoznieniu 4s")
             NativeDiscovery.shared.start(nodeId: "", port: 8090)
+
+            // Czujniki pozycjonowania — start po starcie rdzenia (addon `phone` musi
+            // już działać, by opróżniać kolejkę). SensorBridge sam sprawdza dostępność
+            // i prosi o zgodę na lokalizację; rdzeń bramkuje per-czujnik uprawnieniami.
+            NSLog("[TentaFlow] Start SensorBridge (IMU/baro/GPS/depth)")
+            let bridge = SensorBridge()
+            bridge.start(imu: true, baro: true, gnss: true, depth: true)
+            self.sensorBridge = bridge
         }
 
         // Sprawdz port 8090 po kilku sekundach
