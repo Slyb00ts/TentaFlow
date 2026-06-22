@@ -1,7 +1,8 @@
 // =============================================================================
-// File: lib.rs — browser WebGPU/WebGL point-cloud (voxel) renderer
-// Live 3D view of a robot's LiDAR cloud (~47k points/frame @ ~7.5 fps) drawn as
-// instanced voxel cubes, depth-heatmap colored, with mouse orbit + zoom.
+// File: lib.rs — browser WebGPU/WebGL voxel / occupancy-grid SLAM viewer
+// Live 3D view of a robot's LiDAR cloud (~30-47k points/frame) drawn as instanced
+// voxel cubes with a height-based elevation colormap (Z-up), on top of a wireframe
+// ground grid, with a small robot marker at the cloud center and mouse orbit/zoom.
 // =============================================================================
 
 use std::cell::RefCell;
@@ -12,7 +13,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wgpu::util::DeviceExt;
 
-// Clear color tuned for a dark dashboard (~#0b0f17).
+// Clear color tuned for a dark dashboard (~#0b0f17), close to the reference
+// occupancy-grid viewer's dark gray backdrop.
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.043,
     g: 0.059,
@@ -22,10 +24,26 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-// Initial heatmap range in meters until the first cloud sets an adaptive range
-// from its actual radius. The palette maps depth (distance from the cloud center,
-// i.e. the robot) near = red → far = blue; points beyond clamp to the blue end.
+// Initial height range in meters until the first cloud sets an adaptive range
+// from its actual Z extent.
 const HEATMAP_RANGE_METERS: f32 = 8.0;
+
+// Sparse LiDAR reads as isolated points at the 0.05 m resolution; rendering the
+// cube slightly larger than the voxel pitch makes adjacent occupied cells visually
+// merge into solid blocks like the reference occupancy grid. The JS-passed
+// `voxelSize` keeps its meaning (the true cell pitch); this fill factor is applied
+// internally to the rendered cube edge only.
+const VOXEL_FILL_FACTOR: f32 = 1.3;
+
+// Ground grid: cell size and how far the grid is padded beyond the cloud's X-Y
+// extent, both in meters.
+const GRID_CELL_SIZE: f32 = 0.5;
+const GRID_PADDING: f32 = 1.0;
+// Subtle gray for the wireframe grid lines.
+const GRID_COLOR: [f32; 3] = [0.22, 0.22, 0.22];
+// Rebuild the grid only when the floor footprint changes by more than this many
+// meters on any edge, so we don't recreate the vertex buffer every frame.
+const GRID_REBUILD_EPSILON: f32 = 0.25;
 
 // -----------------------------------------------------------------------------
 // GPU data layout
@@ -46,14 +64,38 @@ struct Instance {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SolidVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
-    // Reference corner the heatmap distance is measured from + inverse range.
+    // Reference corner the height colormap is measured from + inverse range.
     heatmap_origin: [f32; 3],
     inv_heatmap_range: f32,
-    // Cube edge length in meters.
+    // Rendered cube edge length in meters (voxel pitch * fill factor).
     voxel_size: f32,
     _pad: [f32; 3],
+}
+
+// Uniform for the robot marker: a world-space model transform applied on top of
+// the shared view_proj. The grid and rays render in world space directly and
+// reuse only view_proj from the same buffer (model is identity for them).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ModelUniforms {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
 }
 
 // Unit cube centered at origin, edge length 1 (scaled by voxel_size in shader).
@@ -134,6 +176,41 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+// Shared shader for per-vertex-colored line and solid geometry (grid, rays, robot
+// marker). The robot draw applies a model matrix; grid/rays bind an identity model.
+const COLORED_SHADER_SRC: &str = r#"
+struct ModelUniforms {
+    view_proj: mat4x4<f32>,
+    model: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: ModelUniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    let world = u.model * vec4<f32>(in.position, 1.0);
+    out.clip_position = u.view_proj * world;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
+}
+"#;
+
 // -----------------------------------------------------------------------------
 // Orbit camera
 // -----------------------------------------------------------------------------
@@ -151,8 +228,10 @@ impl Camera {
         Self {
             target: Vec3::ZERO,
             distance: 10.0,
+            // Oblique 3/4 view: a slight azimuth and ~28° elevation looking down
+            // at the floor, matching the reference occupancy-grid screenshot.
             azimuth: 0.7,
-            elevation: 0.5,
+            elevation: 0.5, // ~28.6°
             aspect: 1.0,
         }
     }
@@ -186,6 +265,17 @@ impl Camera {
 // Renderer state
 // -----------------------------------------------------------------------------
 
+// Footprint of the ground grid in world space, cached to avoid rebuilding the
+// grid vertex buffer every frame.
+#[derive(Clone, Copy)]
+struct GridBounds {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    z: f32,
+}
+
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -202,6 +292,31 @@ struct State {
     instance_capacity: u32,
     instance_count: u32,
 
+    // Shared pipeline for colored line/solid geometry (grid, rays, robot).
+    colored_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+
+    // view_proj-only uniform (identity model) for world-space grid + rays.
+    world_uniform_buffer: wgpu::Buffer,
+    world_bind_group: wgpu::BindGroup,
+    // view_proj + robot model transform.
+    robot_uniform_buffer: wgpu::Buffer,
+    robot_bind_group: wgpu::BindGroup,
+
+    grid_buffer: wgpu::Buffer,
+    grid_vertex_count: u32,
+    grid_bounds: Option<GridBounds>,
+
+    robot_buffer: wgpu::Buffer,
+    robot_vertex_count: u32,
+    robot_model: Mat4,
+    robot_visible: bool,
+
+    // Faint LiDAR rays from the robot to a subset of points.
+    ray_buffer: wgpu::Buffer,
+    ray_capacity: u32,
+    ray_vertex_count: u32,
+
     depth_view: wgpu::TextureView,
 
     camera: Camera,
@@ -211,17 +326,49 @@ struct State {
     framed: bool,
 }
 
+// Geometry of the robot marker, in the marker's local frame (Z-up): a low box
+// body plus a triangular nose pointing +X to indicate heading.
+const ROBOT_BODY_X: f32 = 0.35;
+const ROBOT_BODY_Y: f32 = 0.20;
+const ROBOT_BODY_Z: f32 = 0.12;
+const ROBOT_NOSE_LEN: f32 = 0.12;
+// Near-white so the marker stands out from the height colormap.
+const ROBOT_COLOR: [f32; 3] = [0.92, 0.94, 0.97];
+const ROBOT_NOSE_COLOR: [f32; 3] = [1.0, 0.85, 0.45];
+
+// Render every Nth point as a faint ray; keeps the ray draw cheap (~500-750 lines
+// for a 30-47k cloud) and the view readable.
+const RAY_STRIDE: usize = 64;
+const RAY_COLOR: [f32; 3] = [0.45, 0.10, 0.10];
+
 impl State {
     fn write_uniforms(&self) {
+        let view_proj = self.camera.view_proj();
         let uniforms = Uniforms {
-            view_proj: self.camera.view_proj().to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
             heatmap_origin: self.heatmap_origin.to_array(),
             inv_heatmap_range: 1.0 / self.heatmap_range.max(0.5),
-            voxel_size: self.voxel_size,
+            voxel_size: self.voxel_size * VOXEL_FILL_FACTOR,
             _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        // World-space colored geometry (grid, rays): identity model.
+        let world = ModelUniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.world_uniform_buffer, 0, bytemuck::bytes_of(&world));
+
+        // Robot marker: view_proj + its world placement.
+        let robot = ModelUniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            model: self.robot_model.to_cols_array_2d(),
+        };
+        self.queue
+            .write_buffer(&self.robot_uniform_buffer, 0, bytemuck::bytes_of(&robot));
     }
 
     fn render(&self) {
@@ -263,6 +410,23 @@ impl State {
                 timestamp_writes: None,
             });
 
+            // Ground grid (wireframe) first so voxels and the robot draw over it.
+            if self.grid_vertex_count > 0 {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.world_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.grid_buffer.slice(..));
+                pass.draw(0..self.grid_vertex_count, 0..1);
+            }
+
+            // Faint LiDAR rays from the robot to a subset of points.
+            if self.ray_vertex_count > 0 {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.world_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.ray_buffer.slice(..));
+                pass.draw(0..self.ray_vertex_count, 0..1);
+            }
+
+            // Instanced voxel cubes.
             if self.instance_count > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -271,10 +435,183 @@ impl State {
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.instance_count);
             }
+
+            // Robot marker on top so it reads as the focal point.
+            if self.robot_visible && self.robot_vertex_count > 0 {
+                pass.set_pipeline(&self.colored_pipeline);
+                pass.set_bind_group(0, &self.robot_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.robot_buffer.slice(..));
+                pass.draw(0..self.robot_vertex_count, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+    }
+
+    // Rebuild the wireframe ground grid only when the floor footprint changed
+    // materially. Lines lie a hair below min Z to avoid z-fighting with floor
+    // voxels.
+    fn update_grid(&mut self, min: Vec3, max: Vec3) {
+        // Snap the padded footprint outward to whole grid cells.
+        let min_x = (min.x - GRID_PADDING) / GRID_CELL_SIZE;
+        let max_x = (max.x + GRID_PADDING) / GRID_CELL_SIZE;
+        let min_y = (min.y - GRID_PADDING) / GRID_CELL_SIZE;
+        let max_y = (max.y + GRID_PADDING) / GRID_CELL_SIZE;
+        let min_x = min_x.floor() * GRID_CELL_SIZE;
+        let max_x = max_x.ceil() * GRID_CELL_SIZE;
+        let min_y = min_y.floor() * GRID_CELL_SIZE;
+        let max_y = max_y.ceil() * GRID_CELL_SIZE;
+        // Drop the grid a small fraction of a cell below the floor.
+        let z = min.z - 0.01;
+
+        let new_bounds = GridBounds {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            z,
+        };
+
+        if let Some(prev) = self.grid_bounds {
+            let unchanged = (prev.min_x - min_x).abs() < GRID_REBUILD_EPSILON
+                && (prev.max_x - max_x).abs() < GRID_REBUILD_EPSILON
+                && (prev.min_y - min_y).abs() < GRID_REBUILD_EPSILON
+                && (prev.max_y - max_y).abs() < GRID_REBUILD_EPSILON
+                && (prev.z - z).abs() < GRID_REBUILD_EPSILON;
+            if unchanged {
+                return;
+            }
+        }
+
+        let mut verts: Vec<LineVertex> = Vec::new();
+        // Lines parallel to Y (varying X).
+        let mut x = min_x;
+        while x <= max_x + 1e-4 {
+            verts.push(LineVertex {
+                position: [x, min_y, z],
+                color: GRID_COLOR,
+            });
+            verts.push(LineVertex {
+                position: [x, max_y, z],
+                color: GRID_COLOR,
+            });
+            x += GRID_CELL_SIZE;
+        }
+        // Lines parallel to X (varying Y).
+        let mut y = min_y;
+        while y <= max_y + 1e-4 {
+            verts.push(LineVertex {
+                position: [min_x, y, z],
+                color: GRID_COLOR,
+            });
+            verts.push(LineVertex {
+                position: [max_x, y, z],
+                color: GRID_COLOR,
+            });
+            y += GRID_CELL_SIZE;
+        }
+
+        // The grid buffer is sized generously once at init; recreate it if a very
+        // large footprint ever exceeds the capacity.
+        let needed = (verts.len() * std::mem::size_of::<LineVertex>()) as u64;
+        if needed > self.grid_buffer.size() {
+            self.grid_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("grid-vertices"),
+                size: needed.next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.grid_buffer, 0, bytemuck::cast_slice(&verts));
+        self.grid_vertex_count = verts.len() as u32;
+        self.grid_bounds = Some(new_bounds);
+    }
+
+    // Build the robot marker geometry (triangle list) in its local frame and
+    // upload it. The marker is placed in world space via `robot_model`.
+    fn build_robot_geometry() -> Vec<SolidVertex> {
+        let hx = ROBOT_BODY_X * 0.5;
+        let hy = ROBOT_BODY_Y * 0.5;
+        let hz = ROBOT_BODY_Z * 0.5;
+
+        // Box corners (local frame, sitting on z = 0 .. ROBOT_BODY_Z).
+        let p = |x: f32, y: f32, z: f32| [x, y, z];
+        let c = ROBOT_COLOR;
+        let corners = [
+            p(-hx, -hy, 0.0),
+            p(hx, -hy, 0.0),
+            p(hx, hy, 0.0),
+            p(-hx, hy, 0.0),
+            p(-hx, -hy, ROBOT_BODY_Z),
+            p(hx, -hy, ROBOT_BODY_Z),
+            p(hx, hy, ROBOT_BODY_Z),
+            p(-hx, hy, ROBOT_BODY_Z),
+        ];
+        // CCW faces (matches the cube pipeline's Ccw + back-cull).
+        let faces: [[usize; 6]; 6] = [
+            [0, 2, 1, 0, 3, 2], // bottom (-Z) — wound so the outward normal is -Z
+            [4, 5, 6, 4, 6, 7], // top (+Z)
+            [0, 1, 5, 0, 5, 4], // -Y
+            [3, 7, 6, 3, 6, 2], // +Y
+            [0, 4, 7, 0, 7, 3], // -X
+            [1, 2, 6, 1, 6, 5], // +X
+        ];
+        let mut verts = Vec::new();
+        for f in faces {
+            for idx in f {
+                verts.push(SolidVertex {
+                    position: corners[idx],
+                    color: c,
+                });
+            }
+        }
+
+        // Triangular nose pointing +X (heading indicator). We have no robot yaw
+        // here, so the nose always points +X; once yaw is available, fold it into
+        // `robot_model`.
+        let tip = [hx + ROBOT_NOSE_LEN, 0.0, hz];
+        let left = [hx, -hy, hz];
+        let right = [hx, hy, hz];
+        let nc = ROBOT_NOSE_COLOR;
+        // Two-sided so the nose is visible regardless of cull winding.
+        for tri in [[tip, left, right], [tip, right, left]] {
+            for v in tri {
+                verts.push(SolidVertex {
+                    position: v,
+                    color: nc,
+                });
+            }
+        }
+        verts
+    }
+
+    // Rebuild the faint ray buffer from the robot origin to every RAY_STRIDE-th
+    // point. Called from set_points where the cloud is already in scope.
+    fn update_rays(&mut self, points: &[f32], n: usize, origin: Vec3) {
+        let mut verts: Vec<LineVertex> = Vec::new();
+        let max_rays = (self.ray_capacity / 2) as usize;
+        let mut i = 0;
+        while i < n && verts.len() / 2 < max_rays {
+            let p = [points[i * 3], points[i * 3 + 1], points[i * 3 + 2]];
+            verts.push(LineVertex {
+                position: origin.to_array(),
+                color: RAY_COLOR,
+            });
+            verts.push(LineVertex {
+                position: p,
+                color: RAY_COLOR,
+            });
+            i += RAY_STRIDE;
+        }
+        if verts.is_empty() {
+            self.ray_vertex_count = 0;
+            return;
+        }
+        self.queue
+            .write_buffer(&self.ray_buffer, 0, bytemuck::cast_slice(&verts));
+        self.ray_vertex_count = verts.len() as u32;
     }
 
     fn make_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
@@ -315,9 +652,9 @@ pub struct VoxelView {
 }
 
 /// Initialize the voxel renderer on `canvas`. Requests a wgpu adapter/device,
-/// configures the surface, builds the instanced pipeline, installs orbit/zoom
-/// pointer handlers and starts the render loop. `voxelSize` is the cube edge
-/// length in meters (the LiDAR resolution, ~0.05).
+/// configures the surface, builds the instanced + grid + robot pipelines, installs
+/// orbit/zoom pointer handlers and starts the render loop. `voxelSize` is the cube
+/// edge length in meters (the LiDAR resolution, ~0.05).
 #[wasm_bindgen(js_name = initVoxelView)]
 pub async fn init_voxel_view(
     canvas: web_sys::HtmlCanvasElement,
@@ -388,6 +725,10 @@ pub async fn init_voxel_view(
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel-shader"),
         source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
+    });
+    let colored_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("colored-shader"),
+        source: wgpu::ShaderSource::Wgsl(COLORED_SHADER_SRC.into()),
     });
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -486,6 +827,171 @@ pub async fn init_voxel_view(
         multiview: None,
     });
 
+    // --- Colored line/solid pipelines (grid, rays, robot) ---
+    let model_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("model-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let model_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("model-pl"),
+        bind_group_layouts: &[&model_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let colored_vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<LineVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+    };
+
+    // Lines (grid + rays): no culling.
+    let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("line-pipeline"),
+        layout: Some(&model_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &colored_shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[colored_vertex_layout.clone()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &colored_shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            // Lines are overlays/underlays: depth-test so they hide behind solid
+            // obstacles, but do NOT write depth, so they never punch holes through
+            // voxels drawn later (floor voxels extend below the grid's z).
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Solid triangles (robot marker): no culling so the two-sided nose shows.
+    let colored_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("solid-pipeline"),
+        layout: Some(&model_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &colored_shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[colored_vertex_layout],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &colored_shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    let world_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("world-uniforms"),
+        size: std::mem::size_of::<ModelUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let world_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("world-bg"),
+        layout: &model_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: world_uniform_buffer.as_entire_binding(),
+        }],
+    });
+    let robot_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("robot-uniforms"),
+        size: std::mem::size_of::<ModelUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let robot_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("robot-bg"),
+        layout: &model_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: robot_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    // Robot geometry is static in its local frame; upload once.
+    let robot_geometry = State::build_robot_geometry();
+    let robot_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("robot-vertices"),
+        contents: bytemuck::cast_slice(&robot_geometry),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let robot_vertex_count = robot_geometry.len() as u32;
+
+    // Grid buffer: sized for a generous footprint; grows on demand in update_grid.
+    let grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grid-vertices"),
+        size: 64 * 1024,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    // Ray buffer: cap the number of rays so the line draw stays cheap.
+    let ray_capacity = 4096u32;
+    let ray_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ray-vertices"),
+        size: (ray_capacity as u64) * std::mem::size_of::<LineVertex>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let instance_capacity = 65_536u32;
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("voxel-instances"),
@@ -512,6 +1018,22 @@ pub async fn init_voxel_view(
         instance_buffer,
         instance_capacity,
         instance_count: 0,
+        colored_pipeline,
+        line_pipeline,
+        world_uniform_buffer,
+        world_bind_group,
+        robot_uniform_buffer,
+        robot_bind_group,
+        grid_buffer,
+        grid_vertex_count: 0,
+        grid_bounds: None,
+        robot_buffer,
+        robot_vertex_count,
+        robot_model: Mat4::IDENTITY,
+        robot_visible: false,
+        ray_buffer,
+        ray_capacity,
+        ray_vertex_count: 0,
         depth_view,
         camera,
         voxel_size,
@@ -561,7 +1083,8 @@ impl VoxelView {
     /// Upload a new point cloud. `points` is interleaved world-space XYZ
     /// (length = `count` * 3), exactly the `Float32Array` that the dashboard's
     /// `decodeLidarFrame(...).points` returns. On the first non-empty cloud the
-    /// camera auto-frames the cloud bounds.
+    /// camera auto-frames the cloud bounds; the ground grid, robot marker and
+    /// LiDAR rays follow the cloud bounds on every update.
     #[wasm_bindgen(js_name = setPoints)]
     pub fn set_points(&self, points: &[f32], count: u32) {
         let state = match self.state.as_ref() {
@@ -573,12 +1096,14 @@ impl VoxelView {
         let usable = (count as usize).min(points.len() / 3);
         if usable == 0 {
             st.instance_count = 0;
+            st.ray_vertex_count = 0;
+            st.robot_visible = false;
             return;
         }
 
         let n = usable.min(st.instance_capacity as usize);
 
-        // Compute bounds for auto-framing and the heatmap reference corner.
+        // Compute bounds for auto-framing, the height colormap and the grid.
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
         for i in 0..n {
@@ -601,6 +1126,24 @@ impl VoxelView {
             // full palette spans floor..tallest obstacle.
             st.heatmap_origin = Vec3::new(0.0, 0.0, min.z);
             st.heatmap_range = (max.z - min.z).max(0.3);
+
+            // Ground grid follows the floor footprint (rebuilt only on material
+            // change). Robot marker sits at the horizontal center on the floor.
+            st.update_grid(min, max);
+
+            // The robot sits at the horizontal center of the cloud near the floor
+            // (min Z). No yaw is available, so the marker's +X nose is a fixed
+            // heading; fold yaw into this transform once it is provided.
+            let robot_origin = Vec3::new(center.x, center.y, min.z);
+            st.robot_model = Mat4::from_translation(robot_origin);
+            st.robot_visible = true;
+
+            // Faint rays from the robot origin to a subset of points. The robot
+            // body is ~0.12 m tall; cast from mid-body so rays read as emitted by
+            // the marker rather than the floor.
+            let ray_origin = robot_origin + Vec3::new(0.0, 0.0, ROBOT_BODY_Z * 0.5);
+            st.update_rays(points, n, ray_origin);
+
             if !st.framed {
                 st.camera.target = center;
                 st.camera.distance = extent * 1.2;
@@ -657,8 +1200,9 @@ impl VoxelView {
         }
         // Drop our owning State handle. With the rAF closure and all pointer
         // closures already dropped above, this releases the last Rc strong
-        // reference, so the wgpu device/surface/buffers are freed now rather
-        // than at JS GC of the wrapper.
+        // reference, so the wgpu device/surface/buffers (including the grid, robot
+        // and ray pipelines/buffers) are freed now rather than at JS GC of the
+        // wrapper.
         self.state = None;
     }
 }
