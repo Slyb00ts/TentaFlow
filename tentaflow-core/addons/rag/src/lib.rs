@@ -142,6 +142,22 @@ pub extern "C" fn on_start() -> i32 {
         }),
     );
 
+    // A_res (MemGraphRAG D4): asynchroniczna adjudykacja konfliktow przez LLM. OSOBNY tool
+    // od conflict_scan (rozdzielenie: detekcja tania 0-LLM vs adjudykacja droga LLM —
+    // niezalezne harmonogramy i kontrola kosztu R8). Rejestrowany jak conflict_scan: tool
+    // wolalny przez Scheduler (interval) ORAZ recznie do testow/debugu.
+    register_tool(
+        "conflict_resolve",
+        "A_res (LLM): adjudykuje OTWARTE konflikty (z conflict_scan) evidence-driven przez rag-llm. Dla kazdego konfliktu zbiera pasaze zrodlowe, prosi LLM o decyzje (keep_winner/temporal_split/merge_entities/escalate) i stosuje ja ODWRACALNIE (tombstone przegranych przez outbox). Batch z twardym capem kosztu, cache po zbiorze faktow, claim exactly-once.",
+        json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "max_conflicts": {"type": "integer"}
+            }
+        }),
+    );
+
     // Minimalny panel — lista kolekcji renderowana z SQL. Pelne GUI to osobny slice.
     if let Err(e) = render_main_panel() {
         log::warn(&format!("rag: nie udalo sie wyrenderowac panelu: {e}"));
@@ -195,6 +211,7 @@ pub extern "C" fn on_request(
         "list_documents" => handle_list_documents(&params),
         "ingest_status" => handle_ingest_status(&params),
         "conflict_scan" => handle_conflict_scan(&params),
+        "conflict_resolve" => handle_conflict_resolve(&params),
         _ => json!({"ok": false, "error": format!("Nieznane narzedzie: {tool_name}")}),
     };
 
@@ -1254,11 +1271,18 @@ fn reconcile_schemas() -> Result<(), String> {
     // transakcja na batch; cap RECONCILE_MAX_ITERS -> anty-DoS. Powtarzamy az brak active=0
     // dla stable (inwariant), wiec aktywujemy tez fakty, ktore stana sie aktywne "w tej samej
     // rundzie" (kolejne batche widza zaktualizowany stan).
+    //
+    // Aktywujemy WYLACZNIE fakty oczekujace na aktywacje: conflict_state IS NULL (swiezo
+    // wstawiony przez D1) albo 'candidate' (kandydat konfliktu D3, jeszcze nie rozsadzony).
+    // Fakt z 'resolved_loser' jest CELOWO zdezaktywowany przez A_res (D4 keep_winner) i jego
+    // active=0 jest TERMINALNE — bez tego filtra kolejny reconcile re-aktywowalby go (active=0
+    // -> 1 + upsert_edge), cofajac rozwiazanie konfliktu i ozywiajac stombstone'owana krawedz.
     let mut cap_hit = true;
     for _ in 0..RECONCILE_MAX_ITERS {
         let rows = sql_query(
             "SELECT fact_key, head_id, rel, tail_id FROM fact_state \
              WHERE active = 0 \
+               AND (conflict_state IS NULL OR conflict_state = 'candidate') \
                AND schema_id IN (SELECT schema_id FROM schema_registry WHERE status = 'stable') \
              ORDER BY fact_seq LIMIT ?",
             &[SqlValue::I64(ACTIVATION_BATCH as i64)],
@@ -1312,7 +1336,8 @@ fn reconcile_schemas() -> Result<(), String> {
                  SET active = 1, \
                      activation_seq = (SELECT COALESCE(MAX(activation_seq), 0) + 1 FROM fact_state), \
                      updated_at = ? \
-                 WHERE fact_key = ? AND active = 0"
+                 WHERE fact_key = ? AND active = 0 \
+                   AND (conflict_state IS NULL OR conflict_state = 'candidate')"
                     .to_string(),
                 vec![
                     SqlValue::I64(batch_now),
@@ -1341,6 +1366,7 @@ fn reconcile_schemas() -> Result<(), String> {
         let remaining = sql_query_one(
             "SELECT COUNT(*) FROM fact_state \
              WHERE active = 0 \
+               AND (conflict_state IS NULL OR conflict_state = 'candidate') \
                AND schema_id IN (SELECT schema_id FROM schema_registry WHERE status = 'stable')",
             &[],
         )
@@ -1734,13 +1760,26 @@ fn write_scan_cursor(activation_seq: i64) -> Result<(), String> {
 ///  2. Dla kazdego faktu w konflikcie: INSERT OR IGNORE do conflict_members(dedup_key,fact_key).
 ///     ATOMOWE i IDEMPOTENTNE (PRIMARY KEY) — bez read-modify-write union, wiec znika wyscig,
 ///     w ktorym dwa rownolegle skany nadpisywaly sobie wiekszy zbior (blocker 2).
-///  3. Cap czlonkow: przed dopisaniem sprawdzamy COUNT(*) grupy; po MAX_CONFLICT_MEMBERS NIE
+///  3. members_rev = COUNT(*) czlonkow grupy (AUTORYTATYWNA liczba, nie inkrement) ustawiany
+///     PODZAPYTANIEM w tej SAMEJ transakcji co inserty czlonkow — patrz nizej (TOCTOU).
+///  4. Cap czlonkow: przed dopisaniem sprawdzamy COUNT(*) grupy; po MAX_CONFLICT_MEMBERS NIE
 ///     dodajemy nowych + log::warn (deterministycznie, bez O(n) blow-up). A_res adjudykuje
 ///     grupe head+rel na reprezentatywnej probie — nie potrzebuje wszystkich faktow.
 ///
+/// ATOMOWOSC vs A_res (TOCTOU): inserty conflict_members ORAZ
+/// `UPDATE members_rev=(SELECT COUNT(*) ...)` ida w JEDNEJ sql_transaction (jeden commit).
+/// Dzieki temu zachodzi inwariant: "czlonek widoczny dla A_res ⟺ members_rev odzwierciedla
+/// jego obecnosc". members_rev to AUTORYTATYWNY COUNT (wzor z D2 freq=COUNT(fact_schema)), a
+/// NIE inkrement: eliminuje wyscig dwoch rownoleglych inkrementow i czyni licznik funkcja
+/// stanu (idempotentny re-run daje ten sam COUNT). A_res czyta rev0 PRZED snapshotem czlonkow;
+/// jesli zbior urosnie po jego rev0, members_rev>rev0 i KAZDY write apply/finalize (warunkowany
+/// na members_rev=:rev0) staje sie no-op => decyzja na niepelnym zbiorze odrzucona, konflikt
+/// wraca do 'open' do re-adjudykacji swiezego pelnego zbioru. Stale-close jest NIEMOZLIWY: nie
+/// istnieje przeplot, w ktorym A_res widzi nowego czlonka, a members_rev wciaz == rev0.
+///
 /// Idempotencja: ponowny skan tej samej grupy z tymi samymi faktami => INSERT OR IGNORE bez
-/// zmian (zero nowych wierszy). Spojne z oczekiwaniem A_res (D4): jeden open per grupa,
-/// czlonkowie odczytywani po dedup_key.
+/// zmian (zero nowych wierszy), a COUNT(*) zwraca te sama liczbe => members_rev bez zmian.
+/// Spojne z oczekiwaniem A_res (D4): jeden open per grupa, czlonkowie odczytywani po dedup_key.
 fn upsert_group_conflict(
     conflict_type: &str,
     schema_id: &str,
@@ -1750,24 +1789,25 @@ fn upsert_group_conflict(
     fact_keys: &[String],
 ) -> Result<bool, String> {
     let now = now_unix();
-    // (1) Tozsamosc grupy. INSERT OR IGNORE + partial-unique => max 1 open per dedup_key.
-    let ins = sql_exec(
-        "INSERT OR IGNORE INTO conflicts \
-           (conflict_type, schema_id, head_id, rel, dedup_key, status, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'open', ?)",
-        &[
-            SqlValue::String(conflict_type.to_string()),
-            SqlValue::String(schema_id.to_string()),
-            SqlValue::String(head_id.to_string()),
-            SqlValue::String(rel.to_string()),
-            SqlValue::String(dedup_key.to_string()),
-            SqlValue::I64(now),
-        ],
-    )
-    .map_err(|e| format!("zapis konfliktu grupy: {e}"))?;
-    let is_new = ins.rows_affected == 1;
 
-    // (3) Cap czlonkow grupy: jednorazowy COUNT przed dopisywaniem. Powyzej capu nie dodajemy.
+    // (0) Metryka `detected`/is_new: pre-check istnienia AKTYWNEGO konfliktu PRZED transakcja.
+    // To WYLACZNIE licznik (ile NOWYCH grup wykrylismy w tym skanie) — nie wplywa na poprawnosc
+    // zadnej sciezki (apply/finalize warunkowane sa members_rev+ownership, nie tym flagiem).
+    // Dlatego drobna nieprecyzja przy wyscigu metryki (dwa rownolegle skany tego samego nowego
+    // konfliktu) jest nieszkodliwa. NIE rozbijamy transakcji upsertu dla samego licznika:
+    // INSERT OR IGNORE konfliktu MUSI byc w jednej tx z insertami czlonkow i members_rev=COUNT.
+    let already_active = sql_query_one(
+        "SELECT 1 FROM conflicts WHERE dedup_key = ? AND status IN ('open', 'resolving')",
+        &[SqlValue::String(dedup_key.to_string())],
+    )
+    .map_err(|e| format!("pre-check istnienia konfliktu: {e}"))?
+    .is_some();
+    let is_new = !already_active;
+
+    // (4) Cap czlonkow grupy: jednorazowy COUNT przed budowaniem transakcji. To filtr WEJSCIA
+    // (ile faktow w ogole probowac dopisac) — soft-limit, nie musi byc atomowy z insertami:
+    // narastajacy `room` chroni przed przekroczeniem, a ewentualny rownolegly insert i tak
+    // wpadnie do COUNT(*) ustawiajacego members_rev (autorytatywnego), wiec rev nie sklamie.
     let member_count = sql_query_one(
         "SELECT COUNT(*) FROM conflict_members WHERE conflict_dedup_key = ?",
         &[SqlValue::String(dedup_key.to_string())],
@@ -1776,44 +1816,91 @@ fn upsert_group_conflict(
     .and_then(|r| r.first().and_then(|v| v.as_i64()))
     .unwrap_or(0);
 
+    // Tozsamosc grupy + inserty czlonkow + members_rev=COUNT skladamy w JEDNA sql_transaction
+    // (jeden commit), zeby ZADEN konflikt nie byl widoczny dla A_res bez kompletu czlonkow i bez
+    // members_rev=COUNT. Gdyby INSERT OR IGNORE konfliktu byl osobnym sql_exec przed tx czlonkow,
+    // istnialoby waskie okno: swiezo utworzony open ma members_rev=0 i ZERO czlonkow, a wspolbiezny
+    // A_res (osobny lock) moglby go claimnac, collect_conflict_facts zwrocilby 0 aktywnych faktow
+    // (<2) i A_res blednie zamknalby konflikt; pozniejszy UPDATE ... WHERE status IN('open',
+    // 'resolving') juz by go nie znalazl -> osierocony konflikt z czlonkami, ale resolved. Jedna
+    // tx eliminuje to okno: po commicie open ZAWSZE ma komplet czlonkow i spojny members_rev.
+    // owned: bufory String, refs: pozyczone slice'y do sql_transaction (q, params).
+    // INSERT OR IGNORE + partial-unique ux_conflicts_active => max 1 open per dedup_key.
+    let mut owned: Vec<(String, Vec<SqlValue>)> = Vec::with_capacity(fact_keys.len() + 2);
+    owned.push((
+        "INSERT OR IGNORE INTO conflicts \
+           (conflict_type, schema_id, head_id, rel, dedup_key, status, created_at) \
+         VALUES (?, ?, ?, ?, ?, 'open', ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(conflict_type.to_string()),
+            SqlValue::String(schema_id.to_string()),
+            SqlValue::String(head_id.to_string()),
+            SqlValue::String(rel.to_string()),
+            SqlValue::String(dedup_key.to_string()),
+            SqlValue::I64(now),
+        ],
+    ));
+
     if member_count >= MAX_CONFLICT_MEMBERS {
         log::warn(&format!(
             "rag: conflict_members cap MAX_CONFLICT_MEMBERS={MAX_CONFLICT_MEMBERS} \
              osiagniety dla dedup_key={dedup_key} (head_id={head_id} rel={rel}); \
              nie dodaje nowych czlonkow (A_res zdecyduje na probie)"
         ));
-        return Ok(is_new);
-    }
-
-    // (2) Czlonkostwo: atomowy, idempotentny INSERT OR IGNORE per fakt. Cap egzekwowany
-    // narastajaco (member_count + dotychczas dopisani w tym wywolaniu) — nie przekraczamy
-    // MAX_CONFLICT_MEMBERS nawet gdy biezacy zbior faktow jest wiekszy niz wolne miejsce.
-    let mut room = MAX_CONFLICT_MEMBERS - member_count;
-    for fk in fact_keys {
-        if room <= 0 {
-            log::warn(&format!(
-                "rag: conflict_members cap MAX_CONFLICT_MEMBERS={MAX_CONFLICT_MEMBERS} \
-                 wyczerpany w trakcie dopisywania dla dedup_key={dedup_key}; \
-                 pomijam pozostale fakty biezacego zbioru"
+    } else {
+        // (2) Czlonkostwo: idempotentny INSERT OR IGNORE per fakt. Cap egzekwowany narastajaco:
+        // room maleje za KAZDY zaplanowany insert (konserwatywnie, nawet jesli IGNORE pochlonie
+        // duplikat) — gwarantuje, ze nie przekroczymy MAX_CONFLICT_MEMBERS nawet gdy biezacy
+        // zbior faktow jest wiekszy niz wolne miejsce. members_rev i tak bedzie autorytatywnym
+        // COUNT(*) po commicie, wiec ewentualne niedopelnienie nie psuje licznika dla A_res.
+        let mut room = MAX_CONFLICT_MEMBERS - member_count;
+        for fk in fact_keys {
+            if room <= 0 {
+                log::warn(&format!(
+                    "rag: conflict_members cap MAX_CONFLICT_MEMBERS={MAX_CONFLICT_MEMBERS} \
+                     wyczerpany w trakcie dopisywania dla dedup_key={dedup_key}; \
+                     pomijam pozostale fakty biezacego zbioru"
+                ));
+                break;
+            }
+            owned.push((
+                "INSERT OR IGNORE INTO conflict_members (conflict_dedup_key, fact_key, added_at) \
+                 VALUES (?, ?, ?)"
+                    .to_string(),
+                vec![
+                    SqlValue::String(dedup_key.to_string()),
+                    SqlValue::String(fk.to_string()),
+                    SqlValue::I64(now),
+                ],
             ));
-            break;
-        }
-        let res = sql_exec(
-            "INSERT OR IGNORE INTO conflict_members (conflict_dedup_key, fact_key, added_at) \
-             VALUES (?, ?, ?)",
-            &[
-                SqlValue::String(dedup_key.to_string()),
-                SqlValue::String(fk.to_string()),
-                SqlValue::I64(now),
-            ],
-        )
-        .map_err(|e| format!("dopisanie czlonka konfliktu: {e}"))?;
-        // Tylko realnie wstawiony wiersz (rows_affected==1) zmniejsza wolne miejsce —
-        // ponowny czlonek (IGNORE) nie liczy sie do capu (idempotencja).
-        if res.rows_affected == 1 {
             room -= 1;
         }
     }
+
+    // (3) members_rev = AUTORYTATYWNY COUNT(*) czlonkow grupy, w tej samej transakcji co inserty.
+    // To twardy straznik TOCTOU dla A_res: po commicie members_rev ZAWSZE odpowiada realnemu
+    // zbiorowi czlonkow widocznemu dla A_res. Inkrement bylby podatny na wyscig (dwa rownolegle
+    // +1 moga sie zgubic) i nie bylby funkcja stanu; COUNT(*) jest idempotentny i autorytatywny
+    // (wzor z D2 freq=COUNT(fact_schema)). WHERE status IN(open,resolving): domkniety konflikt
+    // (resolved/escalated) nie jest juz czytany przez A_res, a nowy fakt i tak otworzy nowy open
+    // w (1) przy nastepnym skanie. updated_at odswiezamy razem (recovery A_res po 'resolving').
+    owned.push((
+        "UPDATE conflicts SET \
+           members_rev = (SELECT COUNT(*) FROM conflict_members WHERE conflict_dedup_key = ?), \
+           updated_at = ? \
+         WHERE dedup_key = ? AND status IN ('open', 'resolving')"
+            .to_string(),
+        vec![
+            SqlValue::String(dedup_key.to_string()),
+            SqlValue::I64(now),
+            SqlValue::String(dedup_key.to_string()),
+        ],
+    ));
+
+    let refs: Vec<(&str, &[SqlValue])> =
+        owned.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    sql_transaction(&refs).map_err(|e| format!("zapis grupy konfliktu (atomowy): {e}"))?;
 
     Ok(is_new)
 }
@@ -1827,6 +1914,1001 @@ fn relation_kind(rel: &str) -> Result<Option<String>, String> {
     )
     .map_err(|e| format!("odczyt kardynalnosci relacji: {e}"))?;
     Ok(row.and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string)))
+}
+
+// =============================================================================
+// A_res — asynchroniczna adjudykacja konfliktow przez LLM (MemGraphRAG D4)
+// =============================================================================
+//
+// A_res jest OSOBNY od A_det (conflict_scan): detekcja jest tania (0 LLM) i moze biec
+// czesto, adjudykacja jest droga (LLM) i musi miec twarde limity kosztu (R8). Rozdzielenie
+// pozwala na niezalezne harmonogramy. A_res czyta i decyduje WYLACZNIE z SQLite (R1); graf
+// jest tylko KARMIONY tombstone'ami przez graph_outbox (R3), nigdy pytany o stan.
+
+/// Twardy cap liczby konfliktow adjudykowanych w JEDNYM przebiegu conflict_resolve (R8).
+/// Kazdy konflikt to potencjalnie jedno wywolanie LLM — to gorne ograniczenie kosztu na
+/// uruchomienie. Reszta open konfliktow domknie sie przy nastepnym przebiegu (kandydaci sa
+/// brani deterministycznie ORDER BY id, a przejete zmieniaja status, wiec kursor nie jest
+/// potrzebny — kolejny przebieg nie zobaczy juz rozwiazanych).
+const MAX_CONFLICTS_PER_RUN: usize = 20;
+
+/// Twardy cap LACZNEJ dlugosci tekstu pasazy (evidence) wlozonej do promptu LLM (R8: token
+/// cap, ~znaki). Po przekroczeniu przestajemy dokladac pasaze (deterministycznie, ORDER BY
+/// confidence DESC — najmocniejsze evidence jako pierwsze) i logujemy obciecie (zakaz cichego
+/// capu). LLM dostaje reprezentatywna, najmocniejsza probe — wystarczy do decyzji.
+const MAX_EVIDENCE_CHARS: usize = 12_000;
+
+/// Twardy cap liczby pasazy (wierszy evidence) na CALY konflikt — druga warstwa obok
+/// MAX_EVIDENCE_CHARS. Chroni przed konfliktem z setkami krotkich pasazy (kazdy ponizej
+/// progu znakow, ale lacznie ogromna liczba), ktory rozdmuchalby prompt liczba pozycji.
+const MAX_EVIDENCE_PASSAGES: usize = 24;
+
+/// Maks. dlugosc pojedynczego pasazu wstrzyknietego do promptu (znaki). Jeden bardzo dlugi
+/// chunk nie moze sam wyczerpac calego budzetu znakow — przycinamy go, by zmiescic evidence
+/// z OBU stron konfliktu (inaczej LLM widzialby tylko jedna strone => stronnicza decyzja).
+const MAX_EVIDENCE_PASSAGE_CHARS: usize = 2_000;
+
+/// Twardy cap kandydatow evidence pobieranych z DB PER CZLONEK konfliktu (przed balansem).
+/// Round-robin selekcja i tak ograniczy wynik globalnymi capami; ten limit chroni samo
+/// zapytanie przed sciagnieciem ogromu wierszy gdy jeden fakt ma setki pasazy.
+const MAX_EVIDENCE_PER_MEMBER_FETCH: usize = 32;
+
+/// TTL (sekundy) dla konfliktu zaklinowanego w 'resolving' (crash A_res w trakcie adjudykacji
+/// przed zapisem decyzji). Po tym czasie kolejny przebieg traktuje go jak open (re-claim).
+/// Dluzszy niz realistyczny czas jednej adjudykacji LLM (latencja modelu), by NIE re-claimowac
+/// konfliktu, ktory jest wlasnie adjudykowany przez wspolbiezny, zywy przebieg.
+const CONFLICT_RESOLVE_RESOLVING_TTL_SECS: i64 = 900;
+
+/// Bufor na odpowiedz adjudykacji LLM (decyzja JSON — kilkaset bajtow wystarcza, ale dajemy
+/// zapas na dluzsze 'reason').
+const RESOLVE_BUFFER_SIZE: usize = 16_384;
+
+/// Decyzja adjudykacji sparsowana z odpowiedzi LLM (po odpornym parsowaniu). action steruje
+/// zastosowaniem; winner_fact_key jest wymagany tylko dla keep_winner; reason jest audytowy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolveDecision {
+    action: ResolveAction,
+    winner_fact_key: Option<String>,
+    reason: String,
+}
+
+/// Akcja decyzji A_res (zamkniety enum zamiast luznego String — silne typowanie, brak
+/// nieznanych galezi w stosowaniu decyzji). Nieznana/niesparsowalna akcja LLM => Escalate
+/// (bezpieczny default: oddaj czlowiekowi, nie zgaduj).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveAction {
+    KeepWinner,
+    TemporalSplit,
+    MergeEntities,
+    Escalate,
+}
+
+impl ResolveAction {
+    /// Mapuje surowy string akcji z LLM na enum. Nieznana wartosc -> None (caller eskaluje).
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "keep_winner" => Some(Self::KeepWinner),
+            "temporal_split" => Some(Self::TemporalSplit),
+            "merge_entities" => Some(Self::MergeEntities),
+            "escalate" => Some(Self::Escalate),
+            _ => None,
+        }
+    }
+
+    /// Etykieta do JSON-a decyzji / audytu (stabilna, niezalezna od Debug).
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::KeepWinner => "keep_winner",
+            Self::TemporalSplit => "temporal_split",
+            Self::MergeEntities => "merge_entities",
+            Self::Escalate => "escalate",
+        }
+    }
+}
+
+/// Jeden fakt nalezacy do grupy konfliktowej, z rozwinietymi danymi do promptu/decyzji.
+#[derive(Debug, Clone)]
+struct ConflictFact {
+    fact_key: String,
+    head_id: String,
+    rel: String,
+    tail_id: String,
+}
+
+/// Pasaz zrodlowy (evidence) jednego faktu — tekst chunku + pewnosc. confidence steruje
+/// kolejnoscia wkladania do promptu (ORDER BY confidence DESC: najmocniejsze najpierw).
+#[derive(Debug, Clone)]
+struct EvidencePassage {
+    fact_key: String,
+    text: String,
+    confidence: f64,
+}
+
+/// Wynik jednego przebiegu A_res (do raportu tool/dashboardu i testow).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConflictResolveStats {
+    /// Ile konfliktow faktycznie przejeto (claim) i przetworzono w tym przebiegu.
+    processed: u64,
+    /// Ile rozwiazano automatycznie (keep_winner/temporal_split -> resolved_auto).
+    resolved_auto: u64,
+    /// Ile oznaczono do merge (resolved_merge_pending -> D5).
+    merge_pending: u64,
+    /// Ile eskalowano do czlowieka (escalated).
+    escalated: u64,
+    /// Ile obsluzono z cache (zbior czlonkow bez zmian -> bez wywolania LLM).
+    cache_hits: u64,
+    /// Czy trafiono cap MAX_CONFLICTS_PER_RUN (sa jeszcze open do domkniecia).
+    cap_hit: bool,
+}
+
+/// Handler tool conflict_resolve (A_res). Patrz run_conflict_resolve.
+fn handle_conflict_resolve(params: &Value) -> Value {
+    let max_conflicts = params
+        .get("max_conflicts")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, MAX_CONFLICTS_PER_RUN))
+        .unwrap_or(MAX_CONFLICTS_PER_RUN);
+
+    match run_conflict_resolve(max_conflicts) {
+        Ok(stats) => json!({
+            "ok": true,
+            "processed": stats.processed,
+            "resolved_auto": stats.resolved_auto,
+            "merge_pending": stats.merge_pending,
+            "escalated": stats.escalated,
+            "cache_hits": stats.cache_hits,
+            "cap_hit": stats.cap_hit,
+        }),
+        Err(e) => err(&format!("conflict_resolve: {e}")),
+    }
+}
+
+/// Rdzen A_res. Bierze do MAX_CONFLICTS_PER_RUN konfliktow OPEN (lub 'resolving' po TTL =
+/// recovery), claimuje kazdy exactly-once (open->resolving), zbiera evidence z capem, decyduje
+/// (cache lub LLM) i stosuje decyzje ODWRACALNIE. Wszystkie odczyty/decyzje WYLACZNIE z SQLite
+/// (R1) — graf karmiony tombstone'ami przez outbox (R3).
+fn run_conflict_resolve(max_conflicts: usize) -> Result<ConflictResolveStats, String> {
+    let mut stats = ConflictResolveStats::default();
+    let now = now_unix();
+    let resolving_deadline = now - CONFLICT_RESOLVE_RESOLVING_TTL_SECS;
+
+    // Kandydaci: realne open ORAZ 'resolving' starsze niz TTL (recovery po crashu — punkt 8).
+    // ORDER BY id => deterministyczna kolejnosc; LIMIT = twardy cap kosztu LLM na przebieg (R8).
+    // Bierzemy max_conflicts+1, by wykryc (i zalogowac) ze cap przycial liste (zakaz cichego capu).
+    let candidates = sql_query(
+        "SELECT id, conflict_type, schema_id, head_id, rel, dedup_key, decision, resolved_members_hash, members_rev \
+         FROM conflicts \
+         WHERE status = 'open' OR (status = 'resolving' AND COALESCE(updated_at, 0) < ?) \
+         ORDER BY id LIMIT ?",
+        &[
+            SqlValue::I64(resolving_deadline),
+            SqlValue::I64(max_conflicts as i64 + 1),
+        ],
+    )
+    .map_err(|e| format!("odczyt otwartych konfliktow: {e}"))?;
+
+    if candidates.len() > max_conflicts {
+        stats.cap_hit = true;
+        log::warn(&format!(
+            "rag: conflict_resolve cap MAX_CONFLICTS_PER_RUN={max_conflicts} trafiony \
+             (jest wiecej otwartych konfliktow); reszte domknie nastepny przebieg"
+        ));
+    }
+
+    for row in candidates.iter().take(max_conflicts) {
+        let id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        let conflict_type = row.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let schema_id = row.get(2).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let head_id = row.get(3).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let rel = row.get(4).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let dedup_key = row.get(5).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let prior_decision = row.get(6).and_then(|v| v.as_str()).map(str::to_string);
+        let prior_hash = row.get(7).and_then(|v| v.as_str()).map(str::to_string);
+
+        // (1) Claim exactly-once: warunkowy UPDATE open/resolving-po-TTL -> resolving + stempel
+        // resolve_owner=token. Tylko rows_affected==1 oznacza, ze TEN przebieg przejal konflikt;
+        // wspolbiezny przebieg (lub szybszy claim) dostaje 0 i pomija. Stempel updated_at=now
+        // resetuje TTL recovery. Token (unikalny new_id) identyfikuje wlasciciela: apply+finalize
+        // warunkuje KAZDY write na tym tokenie, wiec gdy drugi przebieg przejmie konflikt po TTL
+        // (LLM pierwszego trwa >TTL), spozniony apply pierwszego jest no-op (brak podwojnego apply).
+        let owner = new_id("res");
+        // rev0: members_rev odczytany ATOMOWO z udanym claimem (po przejsciu na 'resolving').
+        // Od tego momentu kazdy bump przez D3 (nowy czlonek) jest TOCTOU, ktory chcemy wykryc.
+        let rev0 = match claim_conflict(id, &owner, now, resolving_deadline)? {
+            Some(rev0) => rev0,
+            None => continue,
+        };
+        stats.processed += 1;
+
+        match resolve_one_conflict(
+            id,
+            &owner,
+            rev0,
+            &conflict_type,
+            &schema_id,
+            &head_id,
+            &rel,
+            &dedup_key,
+            prior_decision.as_deref(),
+            prior_hash.as_deref(),
+        ) {
+            Ok(outcome) => match outcome {
+                ResolveOutcome::ResolvedAuto { cache_hit } => {
+                    stats.resolved_auto += 1;
+                    if cache_hit {
+                        stats.cache_hits += 1;
+                    }
+                }
+                ResolveOutcome::MergePending => stats.merge_pending += 1,
+                ResolveOutcome::Escalated => stats.escalated += 1,
+            },
+            Err(e) => {
+                // Blad adjudykacji JEDNEGO konfliktu nie przerywa calego przebiegu — konflikt
+                // zostaje w 'resolving' i wroci przez recovery po TTL (punkt 8). Reszta open
+                // jest dalej przetwarzana (best-effort, jak drain/scan).
+                log::warn(&format!(
+                    "rag: conflict_resolve nie zaadjudykowal konfliktu id={id} \
+                     (zostaje 'resolving', wroci po TTL): {e}"
+                ));
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Wynik adjudykacji jednego konfliktu (do agregacji statystyk przebiegu).
+enum ResolveOutcome {
+    ResolvedAuto { cache_hit: bool },
+    MergePending,
+    Escalated,
+}
+
+/// (1) Atomowy claim konfliktu: open (lub resolving po TTL) -> resolving, stempel updated_at
+/// i resolve_owner=token. rows_affected==1 => ten przebieg przejal. Warunek lustruje selekcje
+/// kandydatow, wiec dwa
+/// przebiegi widzace tego samego kandydata serializuja sie na UPDATE (drugi widzi status juz
+/// 'resolving' ze swiezym updated_at => 0 wierszy => pomija). Bez read-after-update (jak
+/// acquire_scan_lock).
+fn claim_conflict(
+    id: i64,
+    owner: &str,
+    now: i64,
+    resolving_deadline: i64,
+) -> Result<Option<i64>, String> {
+    // Stempel resolve_owner=token wraz z przejeciem: caly pozniejszy apply+finalize jest
+    // warunkowany na (status='resolving' AND resolve_owner=token). Re-claim po TTL (recovery)
+    // NADPISUJE owner nowym tokenem, wiec stary przebieg ktory wroci z LLM po przejeciu przez
+    // drugiego ma juz nieaktualny owner => jego writy to no-op (brak podwojnego apply).
+    let res = sql_exec(
+        "UPDATE conflicts SET status = 'resolving', resolve_owner = ?, updated_at = ? \
+         WHERE id = ? AND (status = 'open' OR (status = 'resolving' AND COALESCE(updated_at, 0) < ?))",
+        &[
+            SqlValue::String(owner.to_string()),
+            SqlValue::I64(now),
+            SqlValue::I64(id),
+            SqlValue::I64(resolving_deadline),
+        ],
+    )
+    .map_err(|e| format!("claim konfliktu id={id}: {e}"))?;
+    if res.rows_affected != 1 {
+        return Ok(None);
+    }
+    // rev0: members_rev po udanym claimie. Czytamy GO TU (a nie z pre-claim SELECT), bo to
+    // jest punkt odniesienia TOCTOU — od chwili przejscia na 'resolving' z naszym ownerem kazdy
+    // bump (D3 doklejajacy nowego czlonka konfliktowi 'resolving') zmieni members_rev != rev0,
+    // co uniewazni apply/finalize tego przebiegu (decyzja na nieaktualnym zbiorze odrzucona).
+    let rev0 = sql_query_one(
+        "SELECT members_rev FROM conflicts WHERE id = ?",
+        &[SqlValue::I64(id)],
+    )
+    .map_err(|e| format!("odczyt members_rev po claim id={id}: {e}"))?
+    .and_then(|r| r.first().and_then(|v| v.as_i64()))
+    .unwrap_or(0);
+    Ok(Some(rev0))
+}
+
+/// Adjudykuje JEDEN przejety (status='resolving') konflikt: zbiera czlonkow+evidence z capem,
+/// liczy member_set_hash, sprawdza cache (R8), w razie potrzeby woła LLM i stosuje decyzje
+/// ODWRACALNIE. Zwraca ResolveOutcome do statystyk.
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_conflict(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    conflict_type: &str,
+    schema_id: &str,
+    head_id: &str,
+    rel: &str,
+    dedup_key: &str,
+    prior_decision: Option<&str>,
+    prior_hash: Option<&str>,
+) -> Result<ResolveOutcome, String> {
+    // (2) Czlonkowie grupy -> fakty (fact_state). Tylko AKTYWNE fakty wchodza do adjudykacji:
+    // przegrany z poprzedniej rundy (active=0) nie wraca jako kandydat. Brak >=2 aktywnych
+    // faktow => konflikt sam sie rozwiazal (np. przegrany juz stombstone'owany / dokument
+    // usuniety) => zamykamy jako resolved_auto bez LLM.
+    let facts = collect_conflict_facts(dedup_key)?;
+    let member_set_hash = member_set_hash(&facts);
+
+    if facts.len() < 2 {
+        log::info(&format!(
+            "rag: conflict_resolve konflikt id={id} ma <2 aktywne fakty — \
+             rozwiazal sie sam, zamykam (resolved_auto, bez LLM)"
+        ));
+        let decision = json!({
+            "action": "keep_winner",
+            "reason": "konflikt rozwiazal sie sam (mniej niz 2 aktywne fakty)",
+            "members": facts.iter().map(|f| f.fact_key.clone()).collect::<Vec<_>>(),
+            "auto": true,
+        });
+        finalize_conflict(id, owner, rev0, "resolved_auto", &decision, &member_set_hash)?;
+        return Ok(ResolveOutcome::ResolvedAuto { cache_hit: false });
+    }
+
+    // (3) Cache R8: identyczny zbior czlonkow (member_set_hash) + istniejaca decyzja => NIE
+    // wolaj LLM. Zbior sie nie zmienil, wiec poprzednia decyzja nadal obowiazuje. Reaplikujemy
+    // ja (idempotentnie: tombstone'y delete_edge sa idempotentne) i utrzymujemy status.
+    if let (Some(prev_hash), Some(prev_decision_raw)) = (prior_hash, prior_decision) {
+        if prev_hash == member_set_hash {
+            if let Ok(prev_decision) = serde_json::from_str::<Value>(prev_decision_raw) {
+                let action = prev_decision
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .and_then(ResolveAction::from_str)
+                    .unwrap_or(ResolveAction::Escalate);
+                log::info(&format!(
+                    "rag: conflict_resolve cache HIT konflikt id={id} (zbior czlonkow bez zmian) \
+                     — reaplikuje decyzje '{}', bez wywolania LLM",
+                    action.as_label()
+                ));
+                let winner = prev_decision
+                    .get("winner_fact_key")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let decision = ResolveDecision {
+                    action,
+                    winner_fact_key: winner,
+                    reason: prev_decision
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                };
+                let outcome =
+                    apply_decision(id, owner, rev0, &facts, &member_set_hash, &decision, head_id, rel, true)?;
+                return Ok(outcome);
+            }
+        }
+    }
+
+    // (2) Evidence z capem (R8): pasaze zrodlowe czlonkow, ORDER BY confidence DESC, do
+    // MAX_EVIDENCE_CHARS / MAX_EVIDENCE_PASSAGES. Schemat z ontologii jako kontekst typow.
+    let evidence = collect_evidence(&facts)?;
+    let schema = load_schema(schema_id)?;
+
+    // (4) LLM: evidence-driven prompt -> odporne parsowanie decyzji.
+    let raw = call_resolution_llm(conflict_type, head_id, rel, &schema, &facts, &evidence)?;
+    let decision = parse_resolution_response(&raw, &facts);
+
+    // (5) Zastosuj decyzje ODWRACALNIE.
+    apply_decision(id, owner, rev0, &facts, &member_set_hash, &decision, head_id, rel, false)
+}
+
+/// (2) Zbiera AKTYWNE fakty grupy konfliktowej: conflict_members(dedup_key) JOIN fact_state.
+/// Tylko active=1 (przegrani z poprzednich rund nie wracaja). ORDER BY fact_key =
+/// deterministyczna kolejnosc (stabilny member_set_hash, powtarzalny prompt). Cap liczby
+/// czlonkow juz egzekwowany przy detekcji (MAX_CONFLICT_MEMBERS), ale stosujemy go ponownie
+/// jako twarda granice (defensywnie).
+fn collect_conflict_facts(dedup_key: &str) -> Result<Vec<ConflictFact>, String> {
+    let rows = sql_query(
+        "SELECT fs.fact_key, fs.head_id, fs.rel, fs.tail_id \
+         FROM conflict_members cm \
+         JOIN fact_state fs ON fs.fact_key = cm.fact_key \
+         WHERE cm.conflict_dedup_key = ? AND fs.active = 1 \
+         ORDER BY fs.fact_key LIMIT ?",
+        &[
+            SqlValue::String(dedup_key.to_string()),
+            SqlValue::I64(MAX_CONFLICT_MEMBERS),
+        ],
+    )
+    .map_err(|e| format!("odczyt czlonkow konfliktu: {e}"))?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let fact_key = r.first().and_then(|v| v.as_str())?.to_string();
+            let head_id = r.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let rel = r.get(2).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let tail_id = r.get(3).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            Some(ConflictFact { fact_key, head_id, rel, tail_id })
+        })
+        .collect())
+}
+
+/// (3) member_set_hash: kanoniczny, length-prefixed klucz POSORTOWANYCH fact_keys czlonkow.
+/// Sortowanie czyni hash niezaleznym od kolejnosci zwrocenia wierszy (stabilny), a
+/// length-prefix (canonical_key) bezkolizyjnym (granice kluczy jednoznaczne). To podpis ZBIORU
+/// czlonkow: identyczny zbior => identyczny hash => cache HIT (R8, brak re-adjudykacji LLM).
+fn member_set_hash(facts: &[ConflictFact]) -> String {
+    let mut keys: Vec<&str> = facts.iter().map(|f| f.fact_key.as_str()).collect();
+    keys.sort_unstable();
+    canonical_key(&keys)
+}
+
+/// Schemat ontologii (head_type, relation, tail_type) jako kontekst typow dla promptu A_res.
+/// Brak wiersza (schema_id nieznany) -> None (prompt poradzi sobie bez kontekstu typow).
+struct SchemaContext {
+    head_type: String,
+    relation: String,
+    tail_type: String,
+}
+
+fn load_schema(schema_id: &str) -> Result<Option<SchemaContext>, String> {
+    let row = sql_query_one(
+        "SELECT head_type, relation, tail_type FROM schema_registry WHERE schema_id = ?",
+        &[SqlValue::String(schema_id.to_string())],
+    )
+    .map_err(|e| format!("odczyt schematu konfliktu: {e}"))?;
+    Ok(row.map(|r| SchemaContext {
+        head_type: r.first().and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        relation: r.get(1).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        tail_type: r.get(2).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+    }))
+}
+
+/// (2) Zbiera pasaze zrodlowe (evidence) faktow grupy z TWARDYM capem (R8) i BALANSEM
+/// per-czlonek (wazne 5). Dla kazdego faktu: fact_evidence -> chunks.text, ORDER BY confidence
+/// DESC. Globalne ORDER BY confidence DESC moglo wziac evidence TYLKO jednego (najmocniejszego)
+/// faktu i zaglodzic drugą strone konfliktu — LLM widzialby jedna strone => stronnicza decyzja.
+/// Tu selekcja jest ROUND-ROBIN: w kolejnych pasach bierzemy po jednym najmocniejszym pasazu z
+/// KAZDEGO czlonka, dopoki nie wyczerpiemy globalnego capu (MAX_EVIDENCE_PASSAGES /
+/// MAX_EVIDENCE_CHARS). Dzieki temu kazdy fakt grupy dostaje reprezentacje ZANIM ktorykolwiek
+/// dostanie drugi pasaz. Pojedynczy pasaz przyciety do MAX_EVIDENCE_PASSAGE_CHARS. Obciecie
+/// logowane (zakaz cichego capu).
+fn collect_evidence(facts: &[ConflictFact]) -> Result<Vec<EvidencePassage>, String> {
+    if facts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Pasaze kandydaci PER CZLONEK, kazdy ORDER BY confidence DESC (najmocniejsze pierwsze),
+    // z twardym limitem fetchu na czlonka. Kolejnosc czlonkow = kolejnosc `facts`
+    // (deterministyczna: collect_conflict_facts sortuje), wiec round-robin jest powtarzalny.
+    let mut per_member: Vec<Vec<EvidencePassage>> = Vec::with_capacity(facts.len());
+    for f in facts {
+        let rows = sql_query(
+            "SELECT fe.fact_key, c.text, fe.confidence \
+             FROM fact_evidence fe \
+             JOIN chunks c ON c.document_id = fe.document_id \
+                           AND c.chunk_index = CAST(fe.chunk_id AS INTEGER) \
+             WHERE fe.fact_key = ? \
+             ORDER BY fe.confidence DESC, fe.chunk_id \
+             LIMIT ?",
+            &[
+                SqlValue::String(f.fact_key.clone()),
+                SqlValue::I64(MAX_EVIDENCE_PER_MEMBER_FETCH as i64),
+            ],
+        )
+        .map_err(|e| format!("odczyt evidence: {e}"))?;
+
+        let mut passages = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let fact_key = r.first().and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let raw_text = r.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            // confidence to REAL (SqlValue::F64) — sql_query mapuje liczby na I64 gdy calkowite,
+            // wiec probujemy oba (jak gdzie indziej w addonie evidence ma ulamkowa pewnosc).
+            let confidence = match r.get(2) {
+                Some(SqlValue::F64(c)) => *c,
+                Some(SqlValue::I64(i)) => *i as f64,
+                _ => DEFAULT_CONFIDENCE as f64,
+            };
+            // Przytnij pojedynczy pasaz (znaki, nie bajty — granica UTF-8).
+            let text: String = raw_text.chars().take(MAX_EVIDENCE_PASSAGE_CHARS).collect();
+            passages.push(EvidencePassage { fact_key, text, confidence });
+        }
+        per_member.push(passages);
+    }
+
+    let (out, passages_capped, chars_capped) = balance_evidence(per_member);
+
+    if passages_capped || chars_capped {
+        log::warn(&format!(
+            "rag: conflict_resolve cap evidence trafiony \
+             (pasaze>{MAX_EVIDENCE_PASSAGES}={passages_capped}, znaki>{MAX_EVIDENCE_CHARS}={chars_capped}); \
+             selekcja round-robin per-czlonek — LLM widzi OBIE strony konfliktu"
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Round-robin balans pasazy per czlonek konfliktu (wazne 5). `per_member[i]` to pasaze
+/// i-tego czlonka, kazdy juz ORDER BY confidence DESC. W kolejnych pasach bierzemy po jednym
+/// pasazu z KAZDEGO czlonka (najmocniejszy najpierw), dopoki nie wyczerpiemy globalnych capow
+/// MAX_EVIDENCE_PASSAGES / MAX_EVIDENCE_CHARS. Gwarantuje, ze kazdy fakt grupy dostaje
+/// reprezentacje zanim ktorykolwiek dostanie drugi pasaz — LLM widzi OBIE strony konfliktu.
+/// Zwraca (wybrane_pasaze, passages_capped, chars_capped). Czysta funkcja (testowalna bez SQL).
+fn balance_evidence(per_member: Vec<Vec<EvidencePassage>>) -> (Vec<EvidencePassage>, bool, bool) {
+    let total_available: usize = per_member.iter().map(|p| p.len()).sum();
+    let max_depth = per_member.iter().map(|p| p.len()).max().unwrap_or(0);
+
+    let mut out: Vec<EvidencePassage> = Vec::new();
+    let mut total_chars = 0usize;
+    let mut chars_capped = false;
+    let mut passages_capped = false;
+
+    'outer: for depth in 0..max_depth {
+        for member in &per_member {
+            let Some(p) = member.get(depth) else { continue };
+            if out.len() >= MAX_EVIDENCE_PASSAGES {
+                passages_capped = true;
+                break 'outer;
+            }
+            let len = p.text.chars().count();
+            if total_chars + len > MAX_EVIDENCE_CHARS {
+                chars_capped = true;
+                break 'outer;
+            }
+            total_chars += len;
+            out.push(p.clone());
+        }
+    }
+
+    // Cap trafiony rowniez gdy bylo wiecej dostepnych pasazy niz weszlo do wyniku (np. fetch
+    // per-czlonek przyciety LIMIT-em) — nie chowamy tego cicho.
+    if out.len() < total_available && !chars_capped {
+        passages_capped = true;
+    }
+
+    (out, passages_capped, chars_capped)
+}
+
+/// (4) Buduje evidence-driven prompt i woła rag-llm. Prompt niesie: schemat (kontekst typow),
+/// konfliktowe fakty (head rel tail) + ich pasaze zrodlowe, kryteria akcji. Prosi o WYLACZNIE
+/// JSON decyzji. Blad host-fn / pusta odpowiedz -> Err (caller: konflikt zostaje 'resolving',
+/// wroci po TTL).
+fn call_resolution_llm(
+    conflict_type: &str,
+    head_id: &str,
+    rel: &str,
+    schema: &Option<SchemaContext>,
+    facts: &[ConflictFact],
+    evidence: &[EvidencePassage],
+) -> Result<String, String> {
+    let schema_line = match schema {
+        Some(s) => format!(
+            "Schemat ontologii: ({}) -[{}]-> ({}).",
+            s.head_type, s.relation, s.tail_type
+        ),
+        None => "Schemat ontologii: nieznany.".to_string(),
+    };
+
+    let mut facts_block = String::new();
+    for f in facts {
+        facts_block.push_str(&format!(
+            "- fact_key={} | {} -[{}]-> {}\n",
+            f.fact_key, f.head_id, f.rel, f.tail_id
+        ));
+    }
+
+    let mut evidence_block = String::new();
+    for e in evidence {
+        evidence_block.push_str(&format!(
+            "- [fact_key={} conf={:.2}] {}\n",
+            e.fact_key, e.confidence, e.text
+        ));
+    }
+    if evidence_block.is_empty() {
+        evidence_block.push_str("(brak pasazy zrodlowych)\n");
+    }
+
+    let prompt = format!(
+        "Jestes arbitrem konfliktow w grafie wiedzy. Encja '{head_id}' ma wiele sprzecznych \
+         wartosci relacji '{rel}' (typ konfliktu: {conflict_type}). {schema_line}\n\n\
+         KONFLIKTOWE FAKTY:\n{facts_block}\n\
+         PASAZE ZRODLOWE (evidence):\n{evidence_block}\n\
+         Na podstawie WYLACZNIE evidence wybierz akcje:\n\
+         - keep_winner: jeden fakt jest poprawny, reszta to bledy/przestarzale (podaj winner_fact_key).\n\
+         - temporal_split: fakty sa poprawne w roznych okresach (relacja zmienna w czasie).\n\
+         - merge_entities: rozne tail to ta sama encja w roznej granularnosci/nazwie.\n\
+         - escalate: silne, sprzeczne evidence po obu stronach LUB brak podstaw do decyzji.\n\n\
+         Zwroc WYLACZNIE JSON: \
+         {{\"action\":\"keep_winner|temporal_split|merge_entities|escalate\",\
+         \"winner_fact_key\":\"...\",\"reason\":\"...\"}}. \
+         winner_fact_key TYLKO dla keep_winner i MUSI byc jednym z fact_key powyzej. \
+         Bez komentarza, bez markdown."
+    );
+
+    let model = "rag-llm";
+    let options = json!({ "task": "chat", "temperature": 0.0 });
+    let options_str =
+        serde_json::to_string(&options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
+
+    let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.as_bytes();
+    let options_bytes = options_str.as_bytes();
+    let mut buffer = vec![0u8; RESOLVE_BUFFER_SIZE];
+    let mut out_len: i32 = 0;
+
+    let rc = unsafe {
+        llm_generate(
+            prompt_bytes.as_ptr() as i32, prompt_bytes.len() as i32,
+            model_bytes.as_ptr() as i32, model_bytes.len() as i32,
+            options_bytes.as_ptr() as i32, options_bytes.len() as i32,
+            buffer.as_mut_ptr() as i32, RESOLVE_BUFFER_SIZE as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+    if rc < 0 {
+        return Err(format!("rag-llm (adjudykacja) zwrocil blad: {rc}"));
+    }
+    if out_len <= 0 {
+        return Err("rag-llm (adjudykacja) zwrocil pusta odpowiedz".to_string());
+    }
+    Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
+}
+
+/// (4) ODPORNE parsowanie decyzji LLM (wzor parse_extraction_response): rozpakuj
+/// chat-completion content, wytnij pierwszy zbalansowany obiekt JSON, sparsuj. KAZDY brak
+/// (niesparsowalny JSON, nieznana akcja, brak winner dla keep_winner, winner spoza grupy) ->
+/// bezpieczny default Escalate (oddaj czlowiekowi, nie zgaduj — korektnosc > automatyzacja).
+fn parse_resolution_response(raw: &str, facts: &[ConflictFact]) -> ResolveDecision {
+    let escalate = |reason: &str| ResolveDecision {
+        action: ResolveAction::Escalate,
+        winner_fact_key: None,
+        reason: reason.to_string(),
+    };
+
+    let inner = chat_completion_content(raw).unwrap_or_else(|| raw.to_string());
+    let Some(json_slice) = extract_json_object(&inner) else {
+        return escalate("LLM nie zwrocil parsowalnego JSON-a decyzji");
+    };
+    let Ok(value) = serde_json::from_str::<Value>(json_slice) else {
+        return escalate("LLM zwrocil niepoprawny JSON decyzji");
+    };
+
+    let action = value
+        .get("action")
+        .and_then(|v| v.as_str())
+        .and_then(ResolveAction::from_str);
+    let Some(action) = action else {
+        return escalate("LLM zwrocil nieznana lub brakujaca akcje");
+    };
+
+    let reason = value
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(MAX_ENTITY_NAME_CHARS * 4)
+        .collect::<String>();
+
+    match action {
+        ResolveAction::KeepWinner => {
+            // winner_fact_key OBOWIAZKOWY i MUSI nalezec do grupy (anty-halucynacja: LLM nie
+            // moze wskazac faktu spoza konfliktu). Brak/spoza grupy => eskalacja, nie zgadywanie.
+            let winner = value.get("winner_fact_key").and_then(|v| v.as_str()).unwrap_or("");
+            if winner.is_empty() || !facts.iter().any(|f| f.fact_key == winner) {
+                return escalate("keep_winner bez prawidlowego winner_fact_key z grupy konfliktu");
+            }
+            ResolveDecision {
+                action: ResolveAction::KeepWinner,
+                winner_fact_key: Some(winner.to_string()),
+                reason,
+            }
+        }
+        other => ResolveDecision { action: other, winner_fact_key: None, reason },
+    }
+}
+
+/// (5) Stosuje decyzje A_res ODWRACALNIE i ATOMOWO. `from_cache` rozroznia, czy decyzja
+/// pochodzi z cache (reaplikacja) czy ze swiezego LLM. Wszystkie akcje zapisuja KOMPLETNY
+/// decision JSON (czlonkowie + akcja + reason) => provenance i odwracalnosc.
+///
+/// OWNERSHIP exactly-once (blocker 3+4): caly apply (deaktywacja przegranych + enqueue
+/// tombstone) ORAZ finalize ida w JEDNEJ transakcji SQLite, a KAZDY write jest warunkowany na
+/// (status='resolving' AND resolve_owner=owner). Gdy ten przebieg STRACIL ownership (drugi
+/// resolver przejal konflikt po TTL, bo LLM tego przebiegu trwal >TTL), wszystkie warunki sa
+/// falszywe => transakcja nic nie zmienia (no-op): brak podwojnego apply i brak rozjazdu
+/// "loser active=0 bez tombstone'a". drain_graph_outbox idzie PO commicie (idempotentny;
+/// blad drainu nie cofa decyzji — domknie go nastepny drain).
+#[allow(clippy::too_many_arguments)]
+fn apply_decision(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    facts: &[ConflictFact],
+    member_set_hash: &str,
+    decision: &ResolveDecision,
+    head_id: &str,
+    rel: &str,
+    from_cache: bool,
+) -> Result<ResolveOutcome, String> {
+    let members: Vec<String> = facts.iter().map(|f| f.fact_key.clone()).collect();
+
+    match decision.action {
+        ResolveAction::KeepWinner => {
+            let winner = decision
+                .winner_fact_key
+                .as_deref()
+                .ok_or_else(|| "keep_winner bez winner_fact_key".to_string())?;
+
+            // Przegrani = czlonkowie != winner. Dla kazdego w TEJ SAMEJ transakcji:
+            // fact_state.active=0 + conflict_state='resolved_loser' (warunkowane na ownerze)
+            // ORAZ enqueue delete_edge (tombstone, tez warunkowany na ownerze). Atomowosc
+            // gwarantuje INWARIANT: loser active=0 <=> tombstone enqueued (nigdy rozjazd).
+            let losers: Vec<&ConflictFact> =
+                facts.iter().filter(|f| f.fact_key != winner).collect();
+
+            let decision_json = json!({
+                "action": "keep_winner",
+                "winner_fact_key": winner,
+                "losers": losers.iter().map(|f| f.fact_key.clone()).collect::<Vec<_>>(),
+                "members": members,
+                "reason": decision.reason,
+            });
+
+            let mut stmts: Vec<(String, Vec<SqlValue>)> = Vec::new();
+            for loser in &losers {
+                stmts.push(deactivate_loser_stmt(id, owner, rev0, &loser.fact_key));
+                stmts.push(enqueue_loser_tombstone_stmt(
+                    id, owner, rev0, &loser.head_id, &loser.rel, &loser.tail_id,
+                ));
+            }
+            stmts.push(finalize_conflict_stmt(id, owner, rev0, "resolved_auto", &decision_json, member_set_hash));
+            run_owned_apply(id, owner, rev0, &stmts)?;
+
+            // Drain materializuje tombstone'y do kg_active (idempotentnie) PO commicie. Blad
+            // drainu nie cofa decyzji w SQLite (zrodlo prawdy) — kolejny drain/przebieg ja domknie.
+            if let Err(e) = drain_graph_outbox() {
+                log::warn(&format!(
+                    "rag: conflict_resolve drain tombstone'ow konfliktu id={id} nie powiodl sie \
+                     (domknie nastepny drain): {e}"
+                ));
+            }
+
+            audit_decision(id, "keep_winner", head_id, rel, from_cache, &members);
+            Ok(ResolveOutcome::ResolvedAuto { cache_hit: from_cache })
+        }
+        ResolveAction::TemporalSplit => {
+            // Oba/wszystkie fakty ZOSTAJA aktywne (relacja zmienna w czasie). Nie tombstone'ujemy
+            // — tylko zapisujemy adnotacje czasowa w decision JSON. Pelna adnotacja w props
+            // krawedzi to pozniejszy refinement; tu minimalnie (nie komplikujemy).
+            let decision_json = json!({
+                "action": "temporal_split",
+                "members": members,
+                "reason": decision.reason,
+                "note": "fakty zachowane jako poprawne w roznych okresach (temporal)",
+            });
+            let stmts = vec![finalize_conflict_stmt(id, owner, rev0, "resolved_auto", &decision_json, member_set_hash)];
+            run_owned_apply(id, owner, rev0, &stmts)?;
+            audit_decision(id, "temporal_split", head_id, rel, from_cache, &members);
+            Ok(ResolveOutcome::ResolvedAuto { cache_hit: from_cache })
+        }
+        ResolveAction::MergeEntities => {
+            // Granularnosc/aliasy encji -> entity merge (D5). TU tylko oznaczamy; merge robi D5.
+            let decision_json = json!({
+                "action": "merge_entities",
+                "members": members,
+                "reason": decision.reason,
+            });
+            let stmts = vec![finalize_conflict_stmt(id, owner, rev0, "resolved_merge_pending", &decision_json, member_set_hash)];
+            run_owned_apply(id, owner, rev0, &stmts)?;
+            audit_decision(id, "merge_entities", head_id, rel, from_cache, &members);
+            Ok(ResolveOutcome::MergePending)
+        }
+        ResolveAction::Escalate => {
+            // Silne evidence po obu stronach / brak podstaw -> czlowiek (panel = D7). Fakty
+            // ZOSTAJA aktywne (nic nie tombstone'ujemy): eskalacja nie zmienia grafu.
+            let decision_json = json!({
+                "action": "escalate",
+                "members": members,
+                "reason": decision.reason,
+            });
+            let stmts = vec![finalize_conflict_stmt(id, owner, rev0, "escalated", &decision_json, member_set_hash)];
+            run_owned_apply(id, owner, rev0, &stmts)?;
+            audit_decision(id, "escalate", head_id, rel, from_cache, &members);
+            Ok(ResolveOutcome::Escalated)
+        }
+    }
+}
+
+/// Wykonuje warunkowany na ownerze ORAZ na members_rev=rev0 apply jako JEDNA transakcja SQLite.
+/// Brak zmienionych wierszy ma DWIE rozne przyczyny, ktore trzeba rozroznic PO commicie:
+///  (a) UTRATA OWNERSHIP — drugi resolver przejal konflikt po TTL (resolve_owner != owner).
+///      Wtedy NIC nie robimy: nowy owner sam zaadjudykuje (no-op, brak podwojnego apply).
+///  (b) ZMIANA members_rev — zbior czlonkow urosl podczas LLM (D3 doklejil nowego czlonka do
+///      'resolving'); my wciaz jestesmy ownerem, ale members_rev != rev0. Decyzja zapadla na
+///      NIEAKTUALNYM (niepelnym) zbiorze => REVERT statusu do 'open' (resolve_owner=NULL), zeby
+///      nastepny conflict_resolve re-claimnal i re-adjudykowal SWIEZY pelny zbior z conflict_members.
+///      To NIE polega na kursorze conflict_scan — re-read czlonkow przy re-claim pokrywa nowy fakt.
+/// Rozroznienie: po affected==0 czytamy aktualny (resolve_owner, members_rev) konfliktu.
+fn run_owned_apply(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    stmts: &[(String, Vec<SqlValue>)],
+) -> Result<(), String> {
+    let refs: Vec<(&str, &[SqlValue])> =
+        stmts.iter().map(|(q, p)| (q.as_str(), p.as_slice())).collect();
+    let affected = sql_transaction(&refs)
+        .map_err(|e| format!("atomowy apply decyzji konfliktu id={id}: {e}"))?;
+    if affected != 0 {
+        return Ok(());
+    }
+
+    // affected==0: rozroznij utrate ownershipu od zmiany zbioru czlonkow (TOCTOU).
+    let row = sql_query_one(
+        "SELECT resolve_owner, members_rev, status FROM conflicts WHERE id = ?",
+        &[SqlValue::I64(id)],
+    )
+    .map_err(|e| format!("odczyt stanu konfliktu po nieudanym apply id={id}: {e}"))?;
+    let cur_owner = row
+        .as_ref()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let cur_rev = row
+        .as_ref()
+        .and_then(|r| r.get(1))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(rev0);
+    let cur_status = row
+        .as_ref()
+        .and_then(|r| r.get(2))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let still_owner = cur_owner.as_deref() == Some(owner) && cur_status == "resolving";
+    if still_owner && cur_rev != rev0 {
+        // (b) Zbior urosl podczas LLM — decyzja odrzucona, oddajemy konflikt do re-adjudykacji.
+        let reverted = sql_exec(
+            "UPDATE conflicts SET status = 'open', resolve_owner = NULL, updated_at = ? \
+             WHERE id = ? AND status = 'resolving' AND resolve_owner = ?",
+            &[
+                SqlValue::I64(now_unix()),
+                SqlValue::I64(id),
+                SqlValue::String(owner.to_string()),
+            ],
+        )
+        .map_err(|e| format!("revert konfliktu id={id} do open po zmianie members_rev: {e}"))?;
+        if reverted.rows_affected == 1 {
+            log::info(&format!(
+                "rag: conflict_resolve apply konfliktu id={id} ODRZUCONY — zbior czlonkow urosl \
+                 podczas adjudykacji (members_rev {rev0} -> {cur_rev}); revert do 'open', \
+                 nastepny przebieg re-adjudykuje swiezy zbior"
+            ));
+        }
+    } else {
+        // (a) Utrata ownershipu (lub konflikt juz domkniety przez kogos) — no-op.
+        log::info(&format!(
+            "rag: conflict_resolve apply konfliktu id={id} pominiety — utracony ownership \
+             (drugi resolver przejal po TTL); brak podwojnego apply"
+        ));
+    }
+    Ok(())
+}
+
+/// (5) Statement deaktywacji przegranego, WARUNKOWANY na ownerze: active=0 +
+/// conflict_state='resolved_loser' + updated_at, ale TYLKO gdy ten przebieg wciaz wlada
+/// konfliktem (EXISTS na conflicts.status='resolving' AND resolve_owner=owner). ODWRACALNE:
+/// re-aktywacja (active=1) odtworzylaby krawedz; conflict_state='resolved_loser' jest jednak
+/// TERMINALNE dla reconcile (nie re-aktywuje takiego faktu — blocker 1).
+fn deactivate_loser_stmt(id: i64, owner: &str, rev0: i64, fact_key: &str) -> (String, Vec<SqlValue>) {
+    (
+        "UPDATE fact_state SET active = 0, conflict_state = 'resolved_loser', updated_at = ? \
+         WHERE fact_key = ? \
+           AND EXISTS (SELECT 1 FROM conflicts WHERE id = ? AND status = 'resolving' AND resolve_owner = ? AND members_rev = ?)"
+            .to_string(),
+        vec![
+            SqlValue::I64(now_unix()),
+            SqlValue::String(fact_key.to_string()),
+            SqlValue::I64(id),
+            SqlValue::String(owner.to_string()),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// (5) Statement enqueue tombstone (delete_edge) przegranego, WARUNKOWANY na ownerze. Tombstone
+/// w kg_active jest ODWRACALNY (D1: ponowny upsert_edge ozywia krawedz). INSERT OR IGNORE ...
+/// SELECT ... WHERE EXISTS(owner): wstawia wiersz pending TYLKO gdy ten przebieg wlada
+/// konfliktem (mirror deaktywacji), zachowujac inwariant loser-active=0 <=> tombstone enqueued.
+fn enqueue_loser_tombstone_stmt(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    src: &str,
+    rel: &str,
+    dst: &str,
+) -> (String, Vec<SqlValue>) {
+    let op = outbox_delete_edge(src, rel, dst);
+    let payload = serde_json::to_string(&op.payload).unwrap_or_else(|_| "{}".to_string());
+    (
+        "INSERT OR IGNORE INTO graph_outbox (dedup_key, op, collection, payload, applied, created_at) \
+         SELECT ?, ?, ?, ?, 0, ? \
+         WHERE EXISTS (SELECT 1 FROM conflicts WHERE id = ? AND status = 'resolving' AND resolve_owner = ? AND members_rev = ?)"
+            .to_string(),
+        vec![
+            SqlValue::String(op.dedup_key),
+            SqlValue::String(op.op.to_string()),
+            SqlValue::String(KG_COLLECTION.to_string()),
+            SqlValue::String(payload),
+            SqlValue::I64(now_unix()),
+            SqlValue::I64(id),
+            SqlValue::String(owner.to_string()),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// (5) Statement domkniecia konfliktu, WARUNKOWANY na ownerze: status, KOMPLETNY decision JSON
+/// (provenance/odwracalnosc; w tym surowy reason z LLM — DB, nie log), resolved_members_hash
+/// (cache R8), resolved_at, updated_at — ale TYLKO gdy ten przebieg wciaz wlada konfliktem
+/// (status='resolving' AND resolve_owner=owner). Utrata ownershipu => 0 zmian (no-op).
+fn finalize_conflict_stmt(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    status: &str,
+    decision: &Value,
+    member_set_hash: &str,
+) -> (String, Vec<SqlValue>) {
+    let decision_str = serde_json::to_string(decision).unwrap_or_else(|_| "{}".to_string());
+    let now = now_unix();
+    (
+        "UPDATE conflicts \
+         SET status = ?, decision = ?, resolver = 'A_res', \
+             resolved_members_hash = ?, resolved_at = ?, updated_at = ? \
+         WHERE id = ? AND status = 'resolving' AND resolve_owner = ? AND members_rev = ?"
+            .to_string(),
+        vec![
+            SqlValue::String(status.to_string()),
+            SqlValue::String(decision_str),
+            SqlValue::String(member_set_hash.to_string()),
+            SqlValue::I64(now),
+            SqlValue::I64(now),
+            SqlValue::I64(id),
+            SqlValue::String(owner.to_string()),
+            SqlValue::I64(rev0),
+        ],
+    )
+}
+
+/// Domkniecie konfliktu poza apply_decision (sciezka <2 aktywne fakty), WARUNKOWANE na ownerze.
+/// Jeden statement w jednej transakcji (spojnosc z apply_decision: utrata ownershipu => no-op).
+fn finalize_conflict(
+    id: i64,
+    owner: &str,
+    rev0: i64,
+    status: &str,
+    decision: &Value,
+    member_set_hash: &str,
+) -> Result<(), String> {
+    let stmt = finalize_conflict_stmt(id, owner, rev0, status, decision, member_set_hash);
+    run_owned_apply(id, owner, rev0, std::slice::from_ref(&stmt))
+}
+
+/// (6) Audyt decyzji A_res (R8): log strukturalny per outcome — id konfliktu, akcja, encja,
+/// relacja, resolver, model, zrodlo (cache/LLM), czlonkowie. NIE loguje surowego `reason` z
+/// LLM: tekst uzasadnienia moze zawierac fragmenty dokumentow uzytkownika (dane wrazliwe),
+/// wiec zostaje WYLACZNIE w conflicts.decision (DB), nigdy w strumieniu logu. Pelna provenance
+/// (w tym reason) jest w decision JSON (finalize_conflict); log daje slad bez tresci zrodlowej.
+fn audit_decision(
+    id: i64,
+    action: &str,
+    head_id: &str,
+    rel: &str,
+    from_cache: bool,
+    members: &[String],
+) {
+    let source = if from_cache { "cache" } else { "llm" };
+    log::info(&format!(
+        "rag: A_res decyzja id={id} action={action} head={head_id} rel={rel} \
+         resolver=A_res model=rag-llm zrodlo={source} czlonkowie={}",
+        members.join(",")
+    ));
 }
 
 /// Czy wynik ekstrakcji chunku ma oznaczyc graf jako czesciowy. KAZDY blad
@@ -3972,21 +5054,30 @@ mod tests {
     // conflicts: jeden open per dedup_key (BTreeSet open). conflict_members: BTreeSet wierszy
     // (dedup_key, fact_key) — INSERT OR IGNORE = wstaw do zbioru (idempotentne, atomowe,
     // bez read-modify-write union). Cap czlonkow per grupa egzekwowany jak w kodzie.
+    // members_rev = AUTORYTATYWNY COUNT(*) czlonkow grupy ustawiany ATOMOWO z insertami w jednej
+    // tx (lustro `UPDATE members_rev=(SELECT COUNT(*) ...)`), wylacznie dla open|resolving.
     #[derive(Default)]
     struct ConflictGroupModel {
         // dedup_key -> {fact_key}. Tylko jeden 'open' per dedup_key (partial-unique).
         members: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
         open_keys: std::collections::BTreeSet<String>,
+        // dedup_key -> status ('open'|'resolving'|'resolved'). Domyslnie brak = nieistniejacy.
+        status: std::collections::BTreeMap<String, String>,
+        // dedup_key -> members_rev (COUNT czlonkow z chwili ostatniej tx upsert, gdy open|resolving).
+        members_rev: std::collections::BTreeMap<String, i64>,
         inserts: u32,
         capped: u32,
     }
     impl ConflictGroupModel {
         // Lustro upsert_group_conflict: zwraca true gdy NOWY open (detected++).
-        // Czlonkowie dopisywani INSERT OR IGNORE z capem MAX_CONFLICT_MEMBERS.
+        // Czlonkowie dopisywani INSERT OR IGNORE z capem MAX_CONFLICT_MEMBERS, a members_rev
+        // ustawiany na COUNT(*) ATOMOWO (jeden krok modelu = jeden commit tx).
         fn upsert(&mut self, dedup_key: &str, fact_keys: &[String]) -> bool {
+            // INSERT OR IGNORE conflicts(...open...): tworzy open tylko gdy grupy jeszcze nie ma.
             let is_new = self.open_keys.insert(dedup_key.to_string());
             if is_new {
                 self.inserts += 1;
+                self.status.insert(dedup_key.to_string(), "open".into());
             }
             let set = self.members.entry(dedup_key.to_string()).or_default();
             let mut room = MAX_CONFLICT_MEMBERS - set.len() as i64;
@@ -4000,10 +5091,50 @@ mod tests {
                     room -= 1;
                 }
             }
+            // members_rev = COUNT(*) — TYLKO dla open|resolving (lustro WHERE status IN(...)).
+            // Atomowe z insertami: w modelu to ten sam krok, wiec "czlonek widoczny ⟺ rev to
+            // odzwierciedla". To rdzen ochrony TOCTOU A_res (stale-close niemozliwy).
+            let count = set.len() as i64;
+            let st = self.status.get(dedup_key).map(String::as_str).unwrap_or("");
+            if st == "open" || st == "resolving" {
+                self.members_rev.insert(dedup_key.to_string(), count);
+            }
             is_new
         }
         fn member_count(&self, dedup_key: &str) -> usize {
             self.members.get(dedup_key).map(|s| s.len()).unwrap_or(0)
+        }
+        fn rev(&self, dedup_key: &str) -> i64 {
+            self.members_rev.get(dedup_key).copied().unwrap_or(0)
+        }
+        // Lustro claim_conflict: open->resolving, zwraca rev0 = members_rev w chwili claimu
+        // (czytany PO przejsciu na resolving, czyli PRZED snapshotem czlonkow przez A_res).
+        fn claim(&mut self, dedup_key: &str) -> i64 {
+            self.status.insert(dedup_key.to_string(), "resolving".into());
+            self.rev(dedup_key)
+        }
+        // Lustro snapshotu A_res: collect_conflict_facts czyta czlonkow PO odczycie rev0.
+        fn snapshot(&self, dedup_key: &str) -> std::collections::BTreeSet<String> {
+            self.members.get(dedup_key).cloned().unwrap_or_default()
+        }
+        // Lustro finalize/apply warunkowanego na members_rev=:rev0 (i statusie resolving).
+        // Zwraca true gdy write PRZESZEDL (rev pasuje) => konflikt domkniety; false = no-op
+        // (rev urosl podczas adjudykacji => stale-set => revert do open). To dowodzi, ze
+        // finalize na NIEAKTUALNYM zbiorze jest odrzucany (stale-close niemozliwy).
+        fn finalize(&mut self, dedup_key: &str, rev0: i64) -> bool {
+            let st = self.status.get(dedup_key).map(String::as_str).unwrap_or("");
+            if st == "resolving" && self.rev(dedup_key) == rev0 {
+                self.status.insert(dedup_key.to_string(), "resolved".into());
+                self.open_keys.remove(dedup_key);
+                true
+            } else {
+                false
+            }
+        }
+        // Lustro run_owned_apply rozroznienia: gdy finalize=no-op a rev urosl, revert do open.
+        fn revert_to_open(&mut self, dedup_key: &str) {
+            self.status.insert(dedup_key.to_string(), "open".into());
+            self.open_keys.insert(dedup_key.to_string());
         }
     }
 
@@ -4053,5 +5184,729 @@ mod tests {
             "liczba czlonkow ograniczona twardym capem"
         );
         assert!(m.capped > 0, "cap zostal trafiony i odnotowany (log::warn w kodzie)");
+    }
+
+    #[test]
+    fn members_rev_equals_count_after_inserts() {
+        // members_rev to AUTORYTATYWNY COUNT(*) czlonkow (nie inkrement). Po atomowym insert+rev
+        // members_rev == liczba ROZNYCH czlonkow grupy. Wzor z D2 freq=COUNT(fact_schema).
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        m.upsert(&dk, &["fA".into(), "fB".into()]);
+        assert_eq!(m.rev(&dk), 2, "members_rev = COUNT po dwoch czlonkach");
+        m.upsert(&dk, &["fC".into()]);
+        assert_eq!(m.rev(&dk), 3, "doszedl trzeci czlonek -> rev=3");
+        assert_eq!(m.rev(&dk) as usize, m.member_count(&dk), "members_rev == COUNT(*) zawsze");
+    }
+
+    #[test]
+    fn open_conflict_never_visible_without_its_members() {
+        // D4 mikro-poprawka: CALY upsert (INSERT OR IGNORE conflicts + inserty czlonkow +
+        // members_rev=COUNT) jest w JEDNEJ tx, wiec nie istnieje obserwowalny stan
+        // "open + 0 czlonkow". Gdyby INSERT konfliktu byl osobny przed tx czlonkow, A_res
+        // moglby claimnac memberless open (rev=0, 0 faktow), zobaczyc <2 aktywne fakty i go
+        // blednie zamknac. Model: w chwili gdy konflikt jest open, ZAWSZE ma >=1 czlonka, a
+        // members_rev == COUNT czlonkow. Sprawdzamy ten inwariant po upsercie.
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        assert!(m.upsert(&dk, &["fA".into(), "fB".into()]), "pierwszy upsert -> NOWY open");
+        // Inwariant po commicie: open => komplet czlonkow + members_rev spojny z COUNT.
+        assert!(m.open_keys.contains(&dk), "konflikt jest open");
+        assert!(m.member_count(&dk) >= 1, "open NIGDY nie jest widoczny bez czlonkow");
+        assert_eq!(
+            m.rev(&dk) as usize,
+            m.member_count(&dk),
+            "members_rev == COUNT czlonkow (atomowo, brak okna memberless)"
+        );
+        // A_res na tak utworzonym konflikcie widzi PELNY zbior (>=2 -> realny konflikt).
+        assert_eq!(m.snapshot(&dk).len(), 2, "A_res widzi komplet czlonkow, nie pusty zbior");
+    }
+
+    #[test]
+    fn members_rev_unchanged_by_duplicate_insert() {
+        // Idempotencja: ponowny INSERT OR IGNORE istniejacego czlonka NIE zmienia COUNT(*),
+        // wiec members_rev sie nie rusza => brak falszywego odrzucenia A_res przy re-ingescie.
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("temporal", "Acme", "ceo_of");
+        m.upsert(&dk, &["f1".into(), "f2".into()]);
+        let rev_before = m.rev(&dk);
+        m.upsert(&dk, &["f2".into(), "f1".into()]); // te same fakty, inna kolejnosc
+        assert_eq!(m.rev(&dk), rev_before, "duplikat nie zmienia COUNT => members_rev staly");
+        assert_eq!(m.rev(&dk), 2);
+    }
+
+    #[test]
+    fn stale_close_is_impossible_with_count_rev() {
+        // SEDNO blockera TOCTOU (D4 round 2): A_res claimuje konflikt (open->resolving), czyta
+        // rev0 PRZED snapshotem czlonkow, decyduje DLUGO (LLM). W tym czasie D3 dopisuje NOWEGO
+        // czlonka do 'resolving'. Przy members_rev=COUNT atomowym z insertem: finalize warunkowany
+        // na members_rev=:rev0 musi byc NO-OP (rev urosl) => revert do open => re-adjudykacja
+        // PELNEGO zbioru. Stale-close (zamkniecie na niepelnym zbiorze) jest NIEMOZLIWY.
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+
+        // D3: otwiera konflikt na [fA, fB].
+        m.upsert(&dk, &["fA".into(), "fB".into()]);
+        assert_eq!(m.rev(&dk), 2);
+
+        // A_res: claim (open->resolving) i odczyt rev0 (PRZED snapshotem czlonkow).
+        let rev0 = m.claim(&dk);
+        assert_eq!(rev0, 2, "rev0 czytany po claimie, przed snapshotem");
+        let snapshot = m.snapshot(&dk);
+        assert_eq!(snapshot.len(), 2, "A_res widzi [fA, fB] w chwili decyzji");
+
+        // D3 (przeplot): dopisuje fC do konfliktu 'resolving' — atomowy insert+rev=COUNT.
+        m.upsert(&dk, &["fC".into()]);
+        assert_eq!(m.rev(&dk), 3, "nowy czlonek -> members_rev=COUNT=3 != rev0");
+
+        // A_res finalize warunkowany na members_rev=:rev0 — MUSI byc no-op (rev urosl).
+        assert!(!m.finalize(&dk, rev0), "finalize na nieaktualnym zbiorze ODRZUCONY (stale-close niemozliwy)");
+        assert_ne!(m.status[&dk], "resolved", "konflikt NIE zostal domkniety na niepelnym zbiorze");
+
+        // run_owned_apply: revert do open => nastepny przebieg re-claimnie PELNY zbior.
+        m.revert_to_open(&dk);
+        let rev1 = m.claim(&dk);
+        let snapshot2 = m.snapshot(&dk);
+        assert_eq!(snapshot2.len(), 3, "re-adjudykacja widzi PELNY zbior [fA, fB, fC]");
+        // Tym razem zbior stabilny (zaden D3 w trakcie) => finalize przechodzi.
+        assert!(m.finalize(&dk, rev1), "finalize na pelnym, stabilnym zbiorze przechodzi");
+        assert_eq!(m.status[&dk], "resolved");
+    }
+
+    #[test]
+    fn finalize_succeeds_when_set_stable_during_resolving() {
+        // Pozytyw: gdy zbior NIE zmienia sie podczas adjudykacji (members_rev == rev0),
+        // finalize przechodzi za pierwszym razem (brak zbednego revertu). To dowodzi, ze
+        // straznik TOCTOU nie generuje falszywych odrzucen na stabilnym zbiorze.
+        let mut m = ConflictGroupModel::default();
+        let dk = conflict_dedup_key("temporal", "Acme", "ceo_of");
+        m.upsert(&dk, &["f1".into(), "f2".into()]);
+        let rev0 = m.claim(&dk);
+        let _ = m.snapshot(&dk);
+        // Zaden D3 nie dopisuje czlonka -> members_rev == rev0.
+        assert!(m.finalize(&dk, rev0), "stabilny zbior => finalize przechodzi od razu");
+        assert_eq!(m.status[&dk], "resolved");
+    }
+
+    // --- MemGraphRAG D4: A_res — adjudykacja konfliktow przez LLM (parsowanie, cache, akcje) ---
+
+    /// Helper: grupa konfliktowa z N faktow o roznym tail (head+rel staly). fact_key kanoniczny.
+    fn conflict_facts(head: &str, rel: &str, tails: &[&str]) -> Vec<ConflictFact> {
+        tails
+            .iter()
+            .map(|t| ConflictFact {
+                fact_key: fact_key_for(head, rel, t),
+                head_id: head.to_string(),
+                rel: rel.to_string(),
+                tail_id: t.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_decision_keep_winner_valid() {
+        // Odporne parsowanie: czysty JSON keep_winner z winner_fact_key z grupy => KeepWinner.
+        let facts = conflict_facts("Alice", "born_in", &["Paris", "London"]);
+        let win = facts[0].fact_key.clone();
+        let raw = format!(
+            "{{\"action\":\"keep_winner\",\"winner_fact_key\":\"{win}\",\"reason\":\"zrodlo A\"}}"
+        );
+        let d = parse_resolution_response(&raw, &facts);
+        assert_eq!(d.action, ResolveAction::KeepWinner);
+        assert_eq!(d.winner_fact_key.as_deref(), Some(win.as_str()));
+        assert_eq!(d.reason, "zrodlo A");
+    }
+
+    #[test]
+    fn parse_decision_tolerates_fence_and_prose() {
+        // LLM owija JSON w ```json i prozę — extract_json_object wycina obiekt (wzor ekstrakcji).
+        let facts = conflict_facts("Acme", "ceo_of", &["X", "Y"]);
+        let raw = "Oto decyzja:\n```json\n{\"action\":\"temporal_split\",\"reason\":\"rozne lata\"}\n```";
+        let d = parse_resolution_response(raw, &facts);
+        assert_eq!(d.action, ResolveAction::TemporalSplit);
+        assert_eq!(d.reason, "rozne lata");
+    }
+
+    #[test]
+    fn parse_decision_unwraps_chat_completion() {
+        // Odpowiedz w ksztalcie chat-completion (choices[].message.content) jest rozpakowywana.
+        let facts = conflict_facts("Bob", "member_of", &["A", "B"]);
+        let raw = "{\"choices\":[{\"message\":{\"content\":\"{\\\"action\\\":\\\"merge_entities\\\",\\\"reason\\\":\\\"alias\\\"}\"}}]}";
+        let d = parse_resolution_response(raw, &facts);
+        assert_eq!(d.action, ResolveAction::MergeEntities);
+    }
+
+    #[test]
+    fn parse_decision_garbage_escalates() {
+        // Niesparsowalny / pusty / bez akcji => bezpieczny default Escalate (nie zgadujemy).
+        let facts = conflict_facts("Eve", "born_in", &["P", "Q"]);
+        assert_eq!(parse_resolution_response("totalny smieci", &facts).action, ResolveAction::Escalate);
+        assert_eq!(parse_resolution_response("{\"foo\":1}", &facts).action, ResolveAction::Escalate);
+        assert_eq!(
+            parse_resolution_response("{\"action\":\"wymyslona\"}", &facts).action,
+            ResolveAction::Escalate
+        );
+    }
+
+    #[test]
+    fn parse_decision_keep_winner_hallucinated_loser_escalates() {
+        // Anty-halucynacja: keep_winner z winner_fact_key SPOZA grupy => eskalacja, nie zgadywanie.
+        let facts = conflict_facts("Alice", "born_in", &["Paris", "London"]);
+        let raw = "{\"action\":\"keep_winner\",\"winner_fact_key\":\"3:fXX\",\"reason\":\"r\"}";
+        let d = parse_resolution_response(raw, &facts);
+        assert_eq!(d.action, ResolveAction::Escalate, "winner spoza grupy -> eskalacja");
+        assert!(d.winner_fact_key.is_none());
+    }
+
+    #[test]
+    fn parse_decision_keep_winner_missing_winner_escalates() {
+        // keep_winner BEZ winner_fact_key jest nieuzyteczny => eskalacja.
+        let facts = conflict_facts("Alice", "born_in", &["Paris", "London"]);
+        let d = parse_resolution_response("{\"action\":\"keep_winner\",\"reason\":\"r\"}", &facts);
+        assert_eq!(d.action, ResolveAction::Escalate);
+    }
+
+    #[test]
+    fn action_roundtrip_labels() {
+        // from_str <-> as_label spojne; nieznane -> None.
+        for a in [
+            ResolveAction::KeepWinner,
+            ResolveAction::TemporalSplit,
+            ResolveAction::MergeEntities,
+            ResolveAction::Escalate,
+        ] {
+            assert_eq!(ResolveAction::from_str(a.as_label()), Some(a));
+        }
+        assert_eq!(ResolveAction::from_str("nope"), None);
+        assert_eq!(ResolveAction::from_str(" keep_winner "), Some(ResolveAction::KeepWinner));
+    }
+
+    #[test]
+    fn member_set_hash_is_order_independent_and_collision_free() {
+        // Cache R8: hash zalezy od ZBIORU fact_keys, nie kolejnosci (stabilny przy re-skanie).
+        let a = conflict_facts("H", "r", &["t1", "t2", "t3"]);
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(member_set_hash(&a), member_set_hash(&b), "kolejnosc bez wplywu na hash");
+        // Inny zbior czlonkow -> inny hash (dojscie nowego faktu uniewaznia cache => re-LLM).
+        let c = conflict_facts("H", "r", &["t1", "t2"]);
+        assert_ne!(member_set_hash(&a), member_set_hash(&c), "zmiana zbioru -> inny hash");
+    }
+
+    // Model CLAIM exactly-once: lustro claim_conflict (warunkowy UPDATE open/resolving-po-TTL
+    // -> resolving, rows_affected==1). Dwa wspolbiezne przebiegi widzace ten sam open: dokladnie
+    // jeden przejmuje. Recovery: 'resolving' starszy niz TTL jest re-claimowalny.
+    #[derive(Clone)]
+    struct ConflictRow {
+        status: String,
+        updated_at: i64,
+    }
+    impl ConflictRow {
+        fn open() -> Self {
+            ConflictRow { status: "open".into(), updated_at: 0 }
+        }
+        // Lustro claim_conflict: zwraca rows_affected (1=przejal, 0=zajete/poza-warunkiem).
+        fn claim(&mut self, now: i64, resolving_deadline: i64) -> u64 {
+            let claimable = self.status == "open"
+                || (self.status == "resolving" && self.updated_at < resolving_deadline);
+            if claimable {
+                self.status = "resolving".into();
+                self.updated_at = now;
+                1
+            } else {
+                0
+            }
+        }
+    }
+
+    #[test]
+    fn claim_grants_exactly_one() {
+        // Dwa przebiegi widza ten sam open -> tylko pierwszy claim==1, drugi 0 (pomija).
+        let mut c = ConflictRow::open();
+        let now = 10_000;
+        let deadline = now - CONFLICT_RESOLVE_RESOLVING_TTL_SECS;
+        assert_eq!(c.claim(now, deadline), 1, "pierwszy przejmuje open");
+        assert_eq!(c.status, "resolving");
+        assert_eq!(c.claim(now, deadline), 0, "drugi widzi resolving (swiezy) -> 0");
+    }
+
+    #[test]
+    fn claim_recovers_stale_resolving_after_ttl() {
+        // Punkt 8: crash zostawil 'resolving'; po TTL kolejny przebieg re-claimuje (jak open).
+        let mut c = ConflictRow { status: "resolving".into(), updated_at: 1_000 };
+        // now tuz po wstawieniu: NIE re-claim (resolving swiezy, moze byc adjudykowany teraz).
+        let now_fresh = 1_000 + CONFLICT_RESOLVE_RESOLVING_TTL_SECS - 1;
+        assert_eq!(
+            c.claim(now_fresh, now_fresh - CONFLICT_RESOLVE_RESOLVING_TTL_SECS),
+            0,
+            "swiezy resolving nie jest re-claimowany"
+        );
+        // now po TTL: re-claim (crash uznany, konflikt wraca do adjudykacji).
+        let now_late = 1_000 + CONFLICT_RESOLVE_RESOLVING_TTL_SECS + 1;
+        assert_eq!(
+            c.claim(now_late, now_late - CONFLICT_RESOLVE_RESOLVING_TTL_SECS),
+            1,
+            "resolving po TTL jest re-claimowany (recovery)"
+        );
+    }
+
+    // Model ZASTOSOWANIA decyzji bez hosta SQL: odwzorowuje apply_decision na poziomie efektow:
+    // keep_winner -> przegrani active=0 + tombstone (delete_edge) per przegrany; status
+    // resolved_auto. temporal -> oba active, resolved_auto. merge -> resolved_merge_pending.
+    // escalate -> wszyscy active, status escalated. decision JSON zawsze kompletny (odwracalnosc).
+    #[derive(Default)]
+    struct ApplyModel {
+        active: std::collections::BTreeMap<String, bool>,
+        tombstones: Vec<String>, // fact_key krawedzi enqueue'owanych do delete_edge
+        status: String,
+        decision_members: Vec<String>,
+        resolved_hash: Option<String>,
+    }
+    impl ApplyModel {
+        fn new(facts: &[ConflictFact]) -> Self {
+            let mut active = std::collections::BTreeMap::new();
+            for f in facts {
+                active.insert(f.fact_key.clone(), true);
+            }
+            ApplyModel { active, ..Default::default() }
+        }
+        // Lustro apply_decision (efekty na ledger+outbox). Zwraca etykiete outcome.
+        fn apply(&mut self, facts: &[ConflictFact], d: &ResolveDecision, hash: &str) -> &'static str {
+            self.decision_members = facts.iter().map(|f| f.fact_key.clone()).collect();
+            self.resolved_hash = Some(hash.to_string());
+            match d.action {
+                ResolveAction::KeepWinner => {
+                    let winner = d.winner_fact_key.clone().unwrap();
+                    for f in facts {
+                        if f.fact_key != winner {
+                            self.active.insert(f.fact_key.clone(), false);
+                            self.tombstones.push(f.fact_key.clone());
+                        }
+                    }
+                    self.status = "resolved_auto".into();
+                    "resolved_auto"
+                }
+                ResolveAction::TemporalSplit => {
+                    self.status = "resolved_auto".into();
+                    "resolved_auto"
+                }
+                ResolveAction::MergeEntities => {
+                    self.status = "resolved_merge_pending".into();
+                    "resolved_merge_pending"
+                }
+                ResolveAction::Escalate => {
+                    self.status = "escalated".into();
+                    "escalated"
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_keep_winner_tombstones_losers_only() {
+        // keep_winner: TYLKO przegrani -> active=0 + tombstone; winner zostaje aktywny.
+        let facts = conflict_facts("Alice", "born_in", &["Paris", "London", "Berlin"]);
+        let winner = facts[0].fact_key.clone();
+        let hash = member_set_hash(&facts);
+        let d = ResolveDecision {
+            action: ResolveAction::KeepWinner,
+            winner_fact_key: Some(winner.clone()),
+            reason: "r".into(),
+        };
+        let mut m = ApplyModel::new(&facts);
+        assert_eq!(m.apply(&facts, &d, &hash), "resolved_auto");
+        assert!(m.active[&winner], "winner pozostaje aktywny");
+        assert_eq!(m.active.values().filter(|v| !**v).count(), 2, "dwaj przegrani deaktywowani");
+        assert_eq!(m.tombstones.len(), 2, "tombstone (delete_edge) per przegrany");
+        assert!(!m.tombstones.contains(&winner), "winner NIE tombstone'owany");
+        // Odwracalnosc: decision niesie wszystkich czlonkow + hash zapisany (cache + undo).
+        assert_eq!(m.decision_members.len(), 3, "decision JSON kompletny (wszyscy czlonkowie)");
+        assert_eq!(m.resolved_hash.as_deref(), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn apply_temporal_keeps_all_active() {
+        // temporal_split: WSZYSTKIE fakty zostaja aktywne (zero tombstone'ow), status auto.
+        let facts = conflict_facts("Acme", "ceo_of", &["X", "Y"]);
+        let d = ResolveDecision { action: ResolveAction::TemporalSplit, winner_fact_key: None, reason: "lata".into() };
+        let mut m = ApplyModel::new(&facts);
+        assert_eq!(m.apply(&facts, &d, "h"), "resolved_auto");
+        assert!(m.active.values().all(|v| *v), "oba fakty aktywne");
+        assert!(m.tombstones.is_empty(), "temporal nie tombstone'uje");
+    }
+
+    #[test]
+    fn apply_merge_marks_pending_no_tombstone() {
+        // merge_entities: status resolved_merge_pending (D5), bez deaktywacji/tombstone tutaj.
+        let facts = conflict_facts("Shanghai", "located_in", &["China", "Asia"]);
+        let d = ResolveDecision { action: ResolveAction::MergeEntities, winner_fact_key: None, reason: "granular".into() };
+        let mut m = ApplyModel::new(&facts);
+        assert_eq!(m.apply(&facts, &d, "h"), "resolved_merge_pending");
+        assert!(m.active.values().all(|v| *v));
+        assert!(m.tombstones.is_empty());
+    }
+
+    #[test]
+    fn apply_escalate_keeps_all_active() {
+        // escalate: czlowiek (D7), graf nietkniety (wszyscy aktywni), status escalated.
+        let facts = conflict_facts("Eve", "born_in", &["P", "Q"]);
+        let d = ResolveDecision { action: ResolveAction::Escalate, winner_fact_key: None, reason: "sprzeczne".into() };
+        let mut m = ApplyModel::new(&facts);
+        assert_eq!(m.apply(&facts, &d, "h"), "escalated");
+        assert!(m.active.values().all(|v| *v));
+        assert!(m.tombstones.is_empty());
+    }
+
+    // Model CACHE R8: identyczny member_set_hash + istniejaca decyzja => brak ponownego LLM.
+    // Lustro galezi cache w resolve_one_conflict (prior_hash == member_set_hash).
+    fn cache_should_skip_llm(prior_hash: Option<&str>, current_hash: &str, has_decision: bool) -> bool {
+        matches!(prior_hash, Some(h) if h == current_hash) && has_decision
+    }
+
+    #[test]
+    fn cache_skips_llm_when_member_set_unchanged() {
+        let facts = conflict_facts("Alice", "born_in", &["Paris", "London"]);
+        let hash = member_set_hash(&facts);
+        // Ten sam zbior + zapisana decyzja => cache HIT (bez LLM).
+        assert!(cache_should_skip_llm(Some(&hash), &hash, true), "zbior bez zmian -> cache HIT");
+        // Brak zapisanej decyzji => musi wolac LLM (pierwsza adjudykacja).
+        assert!(!cache_should_skip_llm(Some(&hash), &hash, false), "brak decyzji -> LLM");
+        // Zmieniony zbior (dojscie nowego faktu) => inny hash => LLM.
+        let grown = conflict_facts("Alice", "born_in", &["Paris", "London", "Berlin"]);
+        let grown_hash = member_set_hash(&grown);
+        assert!(!cache_should_skip_llm(Some(&hash), &grown_hash, true), "zmiana zbioru -> LLM");
+        // Pierwszy raz (brak prior_hash) => LLM.
+        assert!(!cache_should_skip_llm(None, &hash, true), "brak prior_hash -> LLM");
+    }
+
+    #[test]
+    fn run_caps_conflicts_per_run() {
+        // R8: liczba kandydatow brana per przebieg jest ograniczona MAX_CONFLICTS_PER_RUN.
+        // Czysta asercja na stalej + clamp w handlerze (handle_conflict_resolve).
+        assert!(MAX_CONFLICTS_PER_RUN >= 1);
+        let clamp = |n: u64| (n as usize).clamp(1, MAX_CONFLICTS_PER_RUN);
+        assert_eq!(clamp(0), 1, "0 -> co najmniej 1");
+        assert_eq!(clamp(1000), MAX_CONFLICTS_PER_RUN, "powyzej capu -> cap");
+        assert_eq!(clamp(5).min(MAX_CONFLICTS_PER_RUN), 5.min(MAX_CONFLICTS_PER_RUN));
+    }
+
+    // --- Blocker 1: reconcile NIE re-aktywuje przegranych konfliktu (resolved_loser) ---
+
+    /// Lustro predykatu aktywacji reconcile_schemas: aktywujemy fakt active=0 stabilnego
+    /// schematu TYLKO gdy conflict_state oczekuje na aktywacje (NULL lub 'candidate').
+    /// 'resolved_loser' jest TERMINALNY — celowa deaktywacja przez A_res nie wraca.
+    fn reconcile_activates(active: i64, conflict_state: Option<&str>) -> bool {
+        active == 0 && matches!(conflict_state, None | Some("candidate"))
+    }
+
+    #[test]
+    fn reconcile_does_not_reactivate_resolved_loser() {
+        // Blocker 1: przegrany konfliktu (active=0, conflict_state='resolved_loser') NIE jest
+        // re-aktywowany przez kolejny reconcile — inaczej cofalibysmy rozwiazanie konfliktu.
+        assert!(!reconcile_activates(0, Some("resolved_loser")), "loser NIE re-aktywowany");
+        // Swiezy fakt (NULL) i kandydat konfliktu ('candidate') SA aktywowane (pending).
+        assert!(reconcile_activates(0, None), "swiezy fakt aktywowany");
+        assert!(reconcile_activates(0, Some("candidate")), "kandydat aktywowany");
+        // Juz aktywny fakt nie wchodzi (predykat active=0).
+        assert!(!reconcile_activates(1, None), "aktywny pominiety");
+    }
+
+    // --- Blocker 2: JEDEN aktywny konflikt per grupa w CALYM cyklu (open LUB resolving) ---
+
+    /// Lustro partial-unique ux_conflicts_active (008) + D3 upsert_group_conflict: D3 dokleja
+    /// czlonkow do istniejacego konfliktu grupy w stanie open LUB resolving, NIE tworzy drugiego.
+    #[derive(Default)]
+    struct LifecycleGroupModel {
+        // dedup_key -> (status, {fact_key}). Najwyzej jeden aktywny (open|resolving) per grupa.
+        groups: std::collections::BTreeMap<String, (String, std::collections::BTreeSet<String>)>,
+        inserts: u32,
+    }
+    impl LifecycleGroupModel {
+        fn is_active(status: &str) -> bool {
+            status == "open" || status == "resolving"
+        }
+        // Lustro upsert_group_conflict pod indeksem open|resolving: wstaw nowy open TYLKO gdy
+        // brak aktywnego (open|resolving) dla dedup_key; inaczej dolacz czlonkow do istniejacego.
+        fn upsert(&mut self, dedup_key: &str, fact_keys: &[String]) -> bool {
+            let entry = self.groups.entry(dedup_key.to_string());
+            let is_new = match &entry {
+                std::collections::btree_map::Entry::Occupied(o) => !Self::is_active(&o.get().0),
+                std::collections::btree_map::Entry::Vacant(_) => true,
+            };
+            let slot = entry.or_insert_with(|| ("open".into(), Default::default()));
+            if is_new {
+                slot.0 = "open".into();
+                self.inserts += 1;
+            }
+            for fk in fact_keys {
+                slot.1.insert(fk.clone());
+            }
+            is_new
+        }
+        // Lustro claim A_res: open -> resolving (grupa pozostaje aktywna, klucz wciaz zajety).
+        fn claim(&mut self, dedup_key: &str) {
+            if let Some(g) = self.groups.get_mut(dedup_key) {
+                if g.0 == "open" {
+                    g.0 = "resolving".into();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_active_conflict_across_open_and_resolving() {
+        // Blocker 2: gdy A_res przestawi open->resolving, D3 NIE tworzy drugiego open dla tej
+        // samej grupy — dokleja czlonka do istniejacego resolving (jeden aktywny lifecycle).
+        let mut m = LifecycleGroupModel::default();
+        let dk = conflict_dedup_key("mutual_exclusive", "Alice", "born_in");
+        assert!(m.upsert(&dk, &["fA".into(), "fB".into()]), "pierwszy -> NOWY open");
+        m.claim(&dk); // A_res przejmuje: open -> resolving
+        assert!(
+            !m.upsert(&dk, &["fC".into()]),
+            "podczas resolving NOWY open NIE powstaje (dolaczamy czlonka)"
+        );
+        assert_eq!(m.inserts, 1, "DOKLADNIE jeden aktywny konflikt per grupa w calym cyklu");
+        assert_eq!(
+            m.groups[&dk].1,
+            ["fA", "fB", "fC"].iter().map(|s| s.to_string()).collect(),
+            "czlonek dolaczony do istniejacego resolving (re-adjudykacja przez zmiane hash)"
+        );
+    }
+
+    #[test]
+    fn closed_conflict_frees_key_for_new_open() {
+        // Po zamknieciu (resolved_*) klucz sie zwalnia: ponowny konflikt grupy otwiera NOWY.
+        let mut m = LifecycleGroupModel::default();
+        let dk = conflict_dedup_key("temporal", "Acme", "ceo_of");
+        assert!(m.upsert(&dk, &["f1".into()]));
+        m.groups.get_mut(&dk).unwrap().0 = "resolved_auto".into(); // domkniety
+        assert!(m.upsert(&dk, &["f2".into()]), "zamkniety -> klucz wolny -> NOWY open");
+        assert_eq!(m.inserts, 2);
+    }
+
+    // --- Blocker 3+4: atomowy apply (loser active=0 <=> tombstone) + ownership exactly-once ---
+
+    /// Lustro apply_decision keep_winner jako JEDNA atomowa transakcja warunkowana na ownerze.
+    /// Albo wszystkie writy ownera przechodza (apply), albo zaden (utracony ownership -> no-op).
+    /// Inwariant: liczba deaktywowanych przegranych == liczba enqueue'owanych tombstone'ow.
+    struct OwnedApplyModel {
+        // Aktualny wlasciciel konfliktu w DB (resolving + resolve_owner). None => nie resolving.
+        db_owner: Option<String>,
+    }
+    impl OwnedApplyModel {
+        // Lustro run_owned_apply: writy przechodza TYLKO gdy owner pasuje do db_owner.
+        // Zwraca (deaktywowani, enqueued_tombstones, finalized).
+        fn apply_keep_winner(
+            &self,
+            owner: &str,
+            losers: usize,
+        ) -> (usize, usize, bool) {
+            let owns = self.db_owner.as_deref() == Some(owner);
+            if owns {
+                // Atomowo: kazdy loser dostaje deaktywacje I tombstone (te same warunki ownera).
+                (losers, losers, true)
+            } else {
+                // Utracony ownership: cala transakcja to no-op (warunki EXISTS falszywe).
+                (0, 0, false)
+            }
+        }
+    }
+
+    #[test]
+    fn apply_atomic_loser_deactivation_implies_tombstone() {
+        // Blocker 3: nigdy "loser active=0 bez tombstone'a" — oba writy sa w jednej tx pod tym
+        // samym warunkiem ownera, wiec liczby zawsze rowne (crash nie rozjedzie stanu).
+        let m = OwnedApplyModel { db_owner: Some("res_1".into()) };
+        let (deact, tombs, fin) = m.apply_keep_winner("res_1", 2);
+        assert_eq!(deact, tombs, "deaktywacja przegranego <=> enqueue tombstone (inwariant)");
+        assert_eq!(deact, 2);
+        assert!(fin, "finalize w tej samej tx");
+    }
+
+    #[test]
+    fn apply_noop_when_ownership_lost() {
+        // Blocker 4: drugi resolver przejal konflikt po TTL (db_owner=res_2); spozniony apply
+        // pierwszego (owner=res_1) jest NO-OP: zero deaktywacji, zero tombstone'ow, brak
+        // finalize -> brak podwojnego apply i brak rozjazdu (split) stanu.
+        let m = OwnedApplyModel { db_owner: Some("res_2".into()) };
+        let (deact, tombs, fin) = m.apply_keep_winner("res_1", 2);
+        assert_eq!((deact, tombs), (0, 0), "utracony owner -> zero zmian");
+        assert!(!fin, "utracony owner -> brak finalize (no-op)");
+    }
+
+    // --- Blocker TOCTOU (runda 2): members_rev strazy zbioru czlonkow podczas adjudykacji ---
+
+    /// Lustro D3 upsert_group_conflict (bump members_rev) + A_res claim (rev0) + run_owned_apply
+    /// (warunek members_rev=rev0 i rozroznienie revert-do-open vs no-op). members_rev rosnie
+    /// TYLKO przy realnie nowym czlonku; idempotentny re-insert tego samego NIE bumpuje.
+    struct ToctouModel {
+        status: String,
+        owner: Option<String>,
+        members_rev: i64,
+        members: std::collections::BTreeSet<String>,
+    }
+    impl ToctouModel {
+        fn open(members: &[&str]) -> Self {
+            Self {
+                status: "open".into(),
+                owner: None,
+                members_rev: 0,
+                members: members.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+        // Lustro upsert_group_conflict: dopisanie czlonka bumpuje members_rev TYLKO gdy nowy
+        // i tylko dla open|resolving. Re-insert istniejacego = idempotentny, brak bumpu.
+        fn add_member(&mut self, fk: &str) {
+            let newly = self.members.insert(fk.to_string());
+            if newly && (self.status == "open" || self.status == "resolving") {
+                self.members_rev += 1;
+            }
+        }
+        // Lustro claim_conflict: open -> resolving, stempel ownera, zwrot rev0 po claimie.
+        fn claim(&mut self, owner: &str) -> i64 {
+            self.status = "resolving".into();
+            self.owner = Some(owner.to_string());
+            self.members_rev
+        }
+        // Lustro run_owned_apply: writy/finalize przechodza tylko gdy owner+members_rev=rev0.
+        // Zwraca (applied, reverted_to_open). Po affected==0 rozroznia rev-change od utraty ownera.
+        fn apply(&mut self, owner: &str, rev0: i64) -> (bool, bool) {
+            let owns = self.owner.as_deref() == Some(owner) && self.status == "resolving";
+            if owns && self.members_rev == rev0 {
+                self.status = "resolved_auto".into();
+                return (true, false);
+            }
+            // affected==0: rozroznienie.
+            if owns && self.members_rev != rev0 {
+                // Zbior urosl -> revert do open (re-claim re-czyta swiezy zbior).
+                self.status = "open".into();
+                self.owner = None;
+                (false, true)
+            } else {
+                // Utrata ownershipu -> no-op.
+                (false, false)
+            }
+        }
+    }
+
+    #[test]
+    fn members_rev_bumps_only_on_new_member() {
+        let mut m = ToctouModel::open(&["fA", "fB"]);
+        assert_eq!(m.members_rev, 0);
+        m.add_member("fB"); // duplikat -> brak bumpu (idempotencja)
+        assert_eq!(m.members_rev, 0, "re-insert istniejacego NIE bumpuje");
+        m.add_member("fC"); // nowy -> bump
+        assert_eq!(m.members_rev, 1, "nowy czlonek bumpuje members_rev");
+    }
+
+    #[test]
+    fn apply_noop_and_revert_when_member_set_grew_during_llm() {
+        // TOCTOU: claim na rev0, podczas LLM D3 dokleja nowego czlonka (bump), apply musi byc
+        // no-op (decyzja na nieaktualnym zbiorze odrzucona) i konflikt wraca do 'open'.
+        let mut m = ToctouModel::open(&["fA", "fB"]);
+        let rev0 = m.claim("res_1");
+        m.add_member("fC"); // D3 podczas dlugiego LLM -> members_rev != rev0
+        let (applied, reverted) = m.apply("res_1", rev0);
+        assert!(!applied, "decyzja na starym zbiorze odrzucona (no-op)");
+        assert!(reverted, "rev-change + wciaz owner -> revert do 'open'");
+        assert_eq!(m.status, "open");
+        assert_eq!(m.owner, None, "owner wyczyszczony przy revert");
+    }
+
+    #[test]
+    fn revert_enables_readjudication_of_fresh_set() {
+        // Po revert do 'open' nastepny przebieg re-claimuje i adjudykuje SWIEZY (pelny) zbior —
+        // nowy fakt zlapany przez re-read conflict_members, NIE przez kursor conflict_scan.
+        let mut m = ToctouModel::open(&["fA", "fB"]);
+        let rev0 = m.claim("res_1");
+        m.add_member("fC");
+        m.apply("res_1", rev0); // revert do open
+        // Re-claim: rev1 odzwierciedla pelny zbior {fA,fB,fC}.
+        let rev1 = m.claim("res_2");
+        assert_eq!(rev1, 1, "re-claim widzi zaktualizowany members_rev");
+        let (applied, reverted) = m.apply("res_2", rev1);
+        assert!(applied, "swiezy zbior zaadjudykowany");
+        assert!(!reverted);
+        assert_eq!(
+            m.members,
+            ["fA", "fB", "fC"].iter().map(|s| s.to_string()).collect(),
+            "decyzja objela nowy fakt fC"
+        );
+    }
+
+    #[test]
+    fn lost_ownership_does_not_revert() {
+        // Gdy inny resolver przejal konflikt (recovery po TTL), nasz spozniony apply jest NO-OP
+        // i NIE robi revertu (to nie nasz konflikt) — odrozniamy od rev-change.
+        let mut m = ToctouModel::open(&["fA", "fB"]);
+        let rev0 = m.claim("res_1");
+        let _ = m.claim("res_2"); // drugi resolver przejal (owner=res_2)
+        let (applied, reverted) = m.apply("res_1", rev0);
+        assert!(!applied, "spozniony apply pierwszego -> no-op");
+        assert!(!reverted, "utrata ownershipu -> NIE revert (inny resolver dziala)");
+        assert_eq!(m.owner.as_deref(), Some("res_2"), "owner drugiego nietkniety");
+        assert_eq!(m.status, "resolving");
+    }
+
+    #[test]
+    fn apply_succeeds_when_members_rev_unchanged() {
+        // Brak TOCTOU: zbior bez zmian podczas LLM -> apply przechodzi, finalize OK.
+        let mut m = ToctouModel::open(&["fA", "fB"]);
+        let rev0 = m.claim("res_1");
+        let (applied, reverted) = m.apply("res_1", rev0);
+        assert!(applied && !reverted);
+        assert_eq!(m.status, "resolved_auto");
+    }
+
+    // --- Wazne 5: evidence balance per-czlonek (LLM widzi OBIE strony konfliktu) ---
+
+    fn ev(fact_key: &str, conf: f64, text: &str) -> EvidencePassage {
+        EvidencePassage { fact_key: fact_key.into(), text: text.into(), confidence: conf }
+    }
+
+    #[test]
+    fn evidence_balance_gives_each_member_representation() {
+        // Wazne 5: czlonek A ma duzo mocnego evidence, czlonek B malo i slabsze. Globalne
+        // ORDER BY confidence zabralo by same pasaze A; round-robin gwarantuje, ze B tez wchodzi
+        // ZANIM A dostanie drugi pasaz — LLM nie jest zaglodzony jedna strona.
+        let member_a: Vec<EvidencePassage> =
+            (0..10).map(|i| ev("fA", 0.99, &format!("a{i}"))).collect();
+        let member_b = vec![ev("fB", 0.30, "b0")];
+        let (out, _pc, _cc) = balance_evidence(vec![member_a, member_b]);
+        // Pierwsze dwa pasaze to po jednym z A i B (round-robin pas 0), MIMO ze B ma nizsza conf.
+        assert_eq!(out[0].fact_key, "fA");
+        assert_eq!(out[1].fact_key, "fB", "B wchodzi w pierwszym pasie, nie zaglodzony");
+        assert!(out.iter().any(|p| p.fact_key == "fB"), "obie strony obecne");
+    }
+
+    #[test]
+    fn evidence_balance_respects_global_passage_cap() {
+        // Globalny cap MAX_EVIDENCE_PASSAGES nadal obowiazuje mimo balansu per-czlonek.
+        let members: Vec<Vec<EvidencePassage>> = (0..8)
+            .map(|m| (0..8).map(|i| ev(&format!("f{m}"), 0.5, &format!("t{m}_{i}"))).collect())
+            .collect();
+        let (out, passages_capped, _cc) = balance_evidence(members);
+        assert!(out.len() <= MAX_EVIDENCE_PASSAGES, "globalny cap pasazy respektowany");
+        assert!(passages_capped, "obciecie zgloszone (zakaz cichego capu)");
+    }
+
+    // --- Wazne 6: audit log NIE zawiera surowego reason z LLM ---
+
+    /// Lustro audit_decision: buduje linie logu BEZ pola reason (reason zostaje w DB.decision).
+    fn audit_line(id: i64, action: &str, head: &str, rel: &str, from_cache: bool, members: &[&str]) -> String {
+        let source = if from_cache { "cache" } else { "llm" };
+        format!(
+            "rag: A_res decyzja id={id} action={action} head={head} rel={rel} \
+             resolver=A_res model=rag-llm zrodlo={source} czlonkowie={}",
+            members.join(",")
+        )
+    }
+
+    #[test]
+    fn audit_log_omits_raw_llm_reason() {
+        // Wazne 6: reason z LLM (moze niesc fragmenty dokumentow usera) NIE trafia do logu.
+        let line = audit_line(7, "keep_winner", "Alice", "born_in", false, &["fA", "fB"]);
+        assert!(!line.contains("reason"), "linia audytu NIE zawiera reason");
+        assert!(line.contains("action=keep_winner") && line.contains("czlonkowie=fA,fB"));
     }
 }
