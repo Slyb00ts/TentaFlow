@@ -62,9 +62,9 @@ pub use protocol::{
     },
     robot::{RobotActionWire, RobotControlResponseWire, RobotDispatchInput},
     sensors::{
-        BaroSample, GnssFix, ImuSample, MagSample, BARO_SAMPLE_LEN, BARO_SAMPLE_VERSION,
-        GNSS_FIX_LEN, GNSS_FIX_VERSION, GNSS_FLAG_HAS_VELOCITY, IMU_SAMPLE_LEN, IMU_SAMPLE_VERSION,
-        MAG_SAMPLE_LEN, MAG_SAMPLE_VERSION,
+        BaroSample, GnssFix, ImuSample, MagSample, PoseSample, BARO_SAMPLE_LEN,
+        BARO_SAMPLE_VERSION, GNSS_FIX_LEN, GNSS_FIX_VERSION, GNSS_FLAG_HAS_VELOCITY, IMU_SAMPLE_LEN,
+        IMU_SAMPLE_VERSION, MAG_SAMPLE_LEN, MAG_SAMPLE_VERSION, POSE_SAMPLE_LEN, POSE_SAMPLE_VERSION,
     },
     robot_joints::{
         RobotJointsFrame, ROBOT_JOINTS_HEADER_LEN, ROBOT_JOINTS_MAX, ROBOT_JOINTS_VERSION,

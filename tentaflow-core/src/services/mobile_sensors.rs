@@ -24,6 +24,9 @@ pub const SENSOR_KIND_GNSS: u8 = 2;
 pub const SENSOR_KIND_BARO: u8 = 3;
 /// A canonical `LidarFrame` (depth/LiDAR) → shared map.
 pub const SENSOR_KIND_DEPTH: u8 = 4;
+/// A device-local 6DoF pose (`PoseSample`, e.g. ARKit/ARCore) → marker + map frame +
+/// AR↔ENU georeference alignment.
+pub const SENSOR_KIND_POSE: u8 = 5;
 
 /// Max buffered samples before the oldest is dropped. At 100 Hz IMU + a 100 ms drain
 /// tick that is ~10 entries/tick; 4096 covers long tick stalls with vast headroom.

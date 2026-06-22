@@ -28,7 +28,8 @@ pub use graph::{
 pub use eskf::{EskfConfig, EskfEngine};
 pub use frame::{decode_lidar_frame, DecodedLidar};
 pub use geo::{
-    ecef_to_geodetic, enu_to_geodetic, geodetic_to_ecef, geodetic_to_enu, GeoAnchor,
+    align_yaw_translation, ecef_to_geodetic, enu_to_geodetic, geodetic_to_ecef, geodetic_to_enu,
+    GeoAnchor,
 };
 pub use loop_closure::{verify_loop_closure, LoopGate, LoopVerification};
 pub use mapping::{MapStep, MappingFrontend, SealPolicy};

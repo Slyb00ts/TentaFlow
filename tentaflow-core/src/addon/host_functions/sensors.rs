@@ -13,7 +13,8 @@
 
 use bytes::Bytes;
 use tentaflow_sdk_spec::{
-    BaroSample, GnssFix, ImuSample, LidarFrameHeader, BARO_SAMPLE_LEN, GNSS_FIX_LEN, IMU_SAMPLE_LEN,
+    BaroSample, GnssFix, ImuSample, LidarFrameHeader, PoseSample, BARO_SAMPLE_LEN, GNSS_FIX_LEN,
+    IMU_SAMPLE_LEN,
 };
 
 use super::{
@@ -25,6 +26,7 @@ use crate::services::lidar_hub::LidarStreamHub;
 use crate::services::localization::LocalizationEngine;
 use crate::services::mobile_sensors::{
     MobileSensorQueue, SENSOR_KIND_BARO, SENSOR_KIND_DEPTH, SENSOR_KIND_GNSS, SENSOR_KIND_IMU,
+    SENSOR_KIND_POSE,
 };
 use crate::services::slam_scene::SlamSceneManager;
 
@@ -35,6 +37,8 @@ const PERM_SENSOR_GPS: &str = "sensor.gps";
 const PERM_SENSOR_BARO: &str = "sensor.baro";
 /// Depth/LiDAR frames reuse the same grant as a robot's point-cloud publish.
 const PERM_LIDAR_PUBLISH: &str = "lidar.publish";
+/// The device's AR pose is a camera-derived (visual-inertial) product → camera grant.
+const PERM_SENSOR_CAMERA: &str = "sensor.camera";
 
 // ----- Shared feed helpers (used by both the direct publish ABIs and the drain) -----
 // Each decodes one canonical message and routes it to the right engine, keyed by the
@@ -64,6 +68,16 @@ fn feed_baro(device_id: &str, bytes: &[u8]) -> bool {
     match BaroSample::decode(bytes) {
         Some(s) => {
             LocalizationEngine::global().ingest_baro(device_id, &s);
+            true
+        }
+        None => false,
+    }
+}
+
+fn feed_pose(device_id: &str, bytes: &[u8]) -> bool {
+    match PoseSample::decode(bytes) {
+        Some(p) => {
+            LocalizationEngine::global().ingest_pose(device_id, &p);
             true
         }
         None => false,
@@ -205,6 +219,10 @@ pub fn mobile_sensor_drain_v1(caller: WasmCaller<'_, AddonState>) -> i32 {
             SENSOR_KIND_DEPTH => {
                 check_permission(caller.data(), PERM_LIDAR_PUBLISH, None)
                     && feed_depth(&device_id, &bytes)
+            }
+            SENSOR_KIND_POSE => {
+                check_permission(caller.data(), PERM_SENSOR_CAMERA, None)
+                    && feed_pose(&device_id, &bytes)
             }
             _ => false,
         };

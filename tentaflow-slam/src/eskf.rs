@@ -136,6 +136,13 @@ impl EskfEngine {
         self.origin.is_some()
     }
 
+    /// The ENU nav-frame origin's geodetic position `(lat°, lon°, alt m)`, set on the
+    /// first GNSS fix. `None` until georeferenced. Used to convert an ENU-aligned
+    /// device-local map into WGS84 (see `GeoAnchor::from_alignment`).
+    pub fn origin(&self) -> Option<(f64, f64, f64)> {
+        self.origin
+    }
+
     /// IMU predict step. `dt` is derived from consecutive sample timestamps; the first
     /// sample only seeds the clock (no integration). Non-finite samples are dropped.
     /// Returns `true` iff the state was actually advanced (a prediction ran) — callers
