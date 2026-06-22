@@ -1792,6 +1792,31 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::RerankBody(Request). Natywny rerank (Tier 1) — odpowiednik
+   * REST /v1/rerank. `topN` opcjonalne (pomiń = wszystkie dokumenty).
+   *
+   * @param {string} correlationId
+   * @param {{ model: string, query: string, documents: string[], topN?: number, returnDocuments?: boolean }} args
+   * @param {number} sequence
+   */
+  rerankRequest(correlationId, { model, query, documents, topN, returnDocuments }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRerankRequest(
+      model,
+      query,
+      documents,
+      typeof topN === 'number' ? topN : undefined,
+      returnDocuments === true,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Fast-path patterns
   // -------------------------------------------------------------------------

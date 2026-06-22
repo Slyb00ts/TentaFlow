@@ -6488,6 +6488,12 @@ pub enum MessageBody {
     // PiiRuleBody. Patrz ProfilingBody jako wzor inner-enum pack.
     VisionBody(crate::vision::VisionInferPayload),
 
+    // ---- Rerank inference (single-slot, req+res w inner enum) ----
+    // Natywny odpowiednik REST `/v1/rerank` / `/v1/ranking` dla Tier 1
+    // (dashboard / addony przez protokol binarny). Request i response dziela
+    // jeden slot — patrz VisionBody jako wzor inner-enum pack.
+    RerankBody(crate::types::RerankExchange),
+
     // ---- Camera admin RPCs (F2 P7.a) ----
     // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
     // analogicznie do ProfilingBody / VisionBody. Powod: CBOR 0.8 256-variant
