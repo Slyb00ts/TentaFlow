@@ -665,6 +665,8 @@ fn run_ingest_pipeline(
             (parsed.markdown, parsed.page_count.max(1))
         }
         SourceKind::Text => (String::from_utf8_lossy(&bytes).to_string(), 1),
+        SourceKind::Xlsx => (xlsx_to_markdown(&bytes)?, 1),
+        SourceKind::Docx => (docx_to_markdown(&bytes)?, 1),
     };
     let _ = sql_exec(
         "UPDATE documents SET page_count = ? WHERE id = ?",
@@ -6878,6 +6880,10 @@ enum SourceKind {
     Text,
     /// Obraz/PDF -> doc_parse (alias rag-parse renderuje strony na markdown).
     Parse,
+    /// Arkusz XLSX -> calamine -> tabele markdown (liczby przez parser, nie OCR).
+    Xlsx,
+    /// Dokument DOCX -> unzip word/document.xml -> markdown (akapity + tabele).
+    Docx,
 }
 
 /// Klasyfikuje MIME wg allowlisty. Zwraca `None` dla nieobslugiwanych typow
@@ -6892,7 +6898,370 @@ fn classify_mime(mime: &str) -> Option<SourceKind> {
     if base.starts_with("text/") || base == "application/json" {
         return Some(SourceKind::Text);
     }
+    // Office: rozpoznajemy oba warianty MIME (OOXML i starszy ms-*). Niektorzy
+    // klienci wysylaja generyczne typy, wiec tolerujemy tez fallback po MIME ms-*.
+    if base == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        || base == "application/vnd.ms-excel"
+    {
+        return Some(SourceKind::Xlsx);
+    }
+    if base == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        || base == "application/msword"
+    {
+        return Some(SourceKind::Docx);
+    }
     None
+}
+
+/// Escapuje tresc komorki tabeli markdown: `|` rozwala kolumny, znaki nowej linii
+/// rozwalaja wiersz — oba zamieniamy na bezpieczne odpowiedniki.
+fn md_table_cell_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\r', " ")
+        .replace('\n', "<br>")
+        .trim()
+        .to_string()
+}
+
+/// Formatuje liczbe z calamine bez notacji naukowej tam, gdzie to rozsadne.
+/// Calowite -> bez kropki; ulamki -> domyslny `{}` f64 (Rust nie uzywa `e` dla
+/// typowych zakresow danych emisyjnych).
+fn xlsx_format_float(f: f64) -> String {
+    if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e15 {
+        format!("{}", f as i64)
+    } else {
+        let s = format!("{f}");
+        s
+    }
+}
+
+/// Zamienia pojedyncza komorke calamine na tekst (liczby przez parser, nie OCR).
+fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
+    use calamine::Data;
+    match cell {
+        Data::Empty => String::new(),
+        Data::String(s) => s.clone(),
+        Data::Float(f) => xlsx_format_float(*f),
+        Data::Int(i) => i.to_string(),
+        Data::Bool(b) => b.to_string(),
+        Data::DateTime(d) => xlsx_format_float(d.as_f64()),
+        Data::DateTimeIso(s) => s.clone(),
+        Data::DurationIso(s) => s.clone(),
+        Data::Error(e) => format!("#ERR({e:?})"),
+    }
+}
+
+/// XLSX -> markdown: kazdy arkusz jako `## <nazwa>` + tabela GFM. Pierwszy wiersz
+/// arkusza traktujemy jako naglowek. Puste arkusze pomijamy. To kluczowa sciezka
+/// dla danych emisyjnych — liczby maja przejsc dokladnie jako komorki tabeli.
+fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, String> {
+    use calamine::{Reader, Xlsx};
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(bytes.to_vec());
+    let mut workbook: Xlsx<_> =
+        Xlsx::new(cursor).map_err(|e| format!("Blad odczytu xlsx: {e}"))?;
+
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut out = String::new();
+
+    for name in sheet_names {
+        let range = match workbook.worksheet_range(&name) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!("Blad odczytu arkusza '{name}': {e}"));
+            }
+        };
+        if range.is_empty() {
+            continue;
+        }
+
+        // Zbierz wiersze, pomijajac calkowicie puste; liczba kolumn = najszerszy wiersz.
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut max_cols = 0usize;
+        for row in range.rows() {
+            let cells: Vec<String> = row.iter().map(xlsx_cell_to_string).collect();
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            max_cols = max_cols.max(cells.len());
+            rows.push(cells);
+        }
+        if rows.is_empty() || max_cols == 0 {
+            continue;
+        }
+
+        out.push_str("## ");
+        out.push_str(&name);
+        out.push_str("\n\n");
+
+        // Naglowek = pierwszy niepusty wiersz; reszta jako wiersze danych.
+        let header = &rows[0];
+        let mut header_cells: Vec<String> = (0..max_cols)
+            .map(|i| {
+                let c = header.get(i).map(|s| s.as_str()).unwrap_or("");
+                let esc = md_table_cell_escape(c);
+                if esc.is_empty() {
+                    format!("col{}", i + 1)
+                } else {
+                    esc
+                }
+            })
+            .collect();
+        // Zapewnij niepuste id kolumn (gdy caly naglowek byl pusty, juz wypelnione wyzej).
+        for cell in &mut header_cells {
+            if cell.is_empty() {
+                *cell = "col".to_string();
+            }
+        }
+
+        out.push('|');
+        for h in &header_cells {
+            out.push(' ');
+            out.push_str(h);
+            out.push_str(" |");
+        }
+        out.push('\n');
+        out.push('|');
+        for _ in 0..max_cols {
+            out.push_str(" --- |");
+        }
+        out.push('\n');
+
+        for row in &rows[1..] {
+            out.push('|');
+            for i in 0..max_cols {
+                let c = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                out.push(' ');
+                out.push_str(&md_table_cell_escape(c));
+                out.push_str(" |");
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    if out.trim().is_empty() {
+        return Err("Plik xlsx nie zawiera danych".to_string());
+    }
+    Ok(out)
+}
+
+/// DOCX -> markdown: rozpakuj `word/document.xml` i przejdz po `w:p`/`w:tbl`.
+/// Akapity (z mapowaniem styli Heading na `#`/`##`) i tabele (pierwszy wiersz jako
+/// naglowek) — zachowuje tabele z dokumentow Wykaz/Prompty.
+fn docx_to_markdown(bytes: &[u8]) -> Result<String, String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader as XmlReader;
+    use std::io::{Cursor, Read};
+
+    let cursor = Cursor::new(bytes.to_vec());
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| format!("Blad odczytu docx (zip): {e}"))?;
+    let mut xml = String::new();
+    {
+        let mut file = archive
+            .by_name("word/document.xml")
+            .map_err(|e| format!("Brak word/document.xml w docx: {e}"))?;
+        file.read_to_string(&mut xml)
+            .map_err(|e| format!("Blad odczytu document.xml: {e}"))?;
+    }
+
+    let mut reader = XmlReader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+
+    let mut out = String::new();
+
+    // Stan biezacego akapitu.
+    let mut para_text = String::new();
+    let mut para_heading: u8 = 0; // 0 = brak, 1..=6 poziom naglowka
+    let mut in_text = false;
+
+    // Stan tabeli.
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut cur_row: Vec<String> = Vec::new();
+    let mut cur_cell = String::new();
+    let mut in_cell = false;
+
+    // Tagi porownujemy po local-name (ignorujemy prefiks `w:`), bo namespace bywa rozny.
+    fn local_name(name: &[u8]) -> &[u8] {
+        match name.iter().rposition(|&b| b == b':') {
+            Some(p) => &name[p + 1..],
+            None => name,
+        }
+    }
+
+    // Domyka akapit do markdown (z naglowkiem lub jako zwykly tekst).
+    fn flush_para(out: &mut String, para_text: &mut String, para_heading: &mut u8) {
+        let t = para_text.trim();
+        if !t.is_empty() {
+            if *para_heading >= 1 {
+                let hashes = "#".repeat((*para_heading).min(6) as usize);
+                out.push_str(&hashes);
+                out.push(' ');
+            }
+            out.push_str(t);
+            out.push_str("\n\n");
+        }
+        para_text.clear();
+        *para_heading = 0;
+    }
+
+    // Renderuje zebrana tabele jako markdown GFM (pierwszy wiersz = naglowek).
+    fn flush_table(out: &mut String, rows: &mut Vec<Vec<String>>) {
+        if !rows.is_empty() {
+            let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+            if cols > 0 {
+                let header = &rows[0];
+                out.push('|');
+                for i in 0..cols {
+                    let c = header.get(i).map(|s| s.as_str()).unwrap_or("");
+                    out.push(' ');
+                    out.push_str(&md_table_cell_escape(c));
+                    out.push_str(" |");
+                }
+                out.push('\n');
+                out.push('|');
+                for _ in 0..cols {
+                    out.push_str(" --- |");
+                }
+                out.push('\n');
+                for row in &rows[1..] {
+                    out.push('|');
+                    for i in 0..cols {
+                        let c = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                        out.push(' ');
+                        out.push_str(&md_table_cell_escape(c));
+                        out.push_str(" |");
+                    }
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+        }
+        rows.clear();
+    }
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Err(e) => return Err(format!("Blad parsowania document.xml: {e}")),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let ln = local_name(e.name().as_ref()).to_vec();
+                match ln.as_slice() {
+                    b"tbl" => {
+                        flush_para(&mut out, &mut para_text, &mut para_heading);
+                        in_table = true;
+                        table_rows.clear();
+                    }
+                    b"tr" if in_table => {
+                        cur_row.clear();
+                    }
+                    b"tc" if in_table => {
+                        in_cell = true;
+                        cur_cell.clear();
+                    }
+                    b"t" => in_text = true,
+                    b"pStyle" => {
+                        // <w:pStyle w:val="Heading1"> -> poziom naglowka.
+                        for attr in e.attributes().flatten() {
+                            if local_name(attr.key.as_ref()) == b"val" {
+                                if let Ok(val) = attr.unescape_value() {
+                                    if let Some(rest) = val
+                                        .strip_prefix("Heading")
+                                        .or_else(|| val.strip_prefix("heading"))
+                                    {
+                                        if let Ok(n) = rest.trim().parse::<u8>() {
+                                            para_heading = n.clamp(1, 6);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let ln = local_name(e.name().as_ref()).to_vec();
+                match ln.as_slice() {
+                    // Self-closing pStyle (czeste): <w:pStyle w:val="..."/>.
+                    b"pStyle" => {
+                        for attr in e.attributes().flatten() {
+                            if local_name(attr.key.as_ref()) == b"val" {
+                                if let Ok(val) = attr.unescape_value() {
+                                    if let Some(rest) = val
+                                        .strip_prefix("Heading")
+                                        .or_else(|| val.strip_prefix("heading"))
+                                    {
+                                        if let Ok(n) = rest.trim().parse::<u8>() {
+                                            para_heading = n.clamp(1, 6);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // <w:br/> wewnatrz runu -> spacja (nie lamiemy akapitu).
+                    b"br" | b"tab" => {
+                        if in_cell {
+                            cur_cell.push(' ');
+                        } else {
+                            para_text.push(' ');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) if in_text => {
+                let s = t
+                    .unescape()
+                    .map(|c| c.into_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
+                if in_cell {
+                    cur_cell.push_str(&s);
+                } else {
+                    para_text.push_str(&s);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let ln = local_name(e.name().as_ref()).to_vec();
+                match ln.as_slice() {
+                    b"t" => in_text = false,
+                    b"tc" if in_table => {
+                        in_cell = false;
+                        cur_row.push(cur_cell.trim().to_string());
+                        cur_cell.clear();
+                    }
+                    b"tr" if in_table => {
+                        if !cur_row.is_empty() {
+                            table_rows.push(std::mem::take(&mut cur_row));
+                        }
+                    }
+                    b"tbl" => {
+                        in_table = false;
+                        flush_table(&mut out, &mut table_rows);
+                    }
+                    b"p" if !in_table => {
+                        flush_para(&mut out, &mut para_text, &mut para_heading);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    // Domknij ewentualny ostatni akapit poza tabela.
+    flush_para(&mut out, &mut para_text, &mut para_heading);
+
+    if out.trim().is_empty() {
+        return Err("Dokument docx nie zawiera tekstu".to_string());
+    }
+    Ok(out)
 }
 
 /// Generuje unikalny id z prefiksem (czas + licznik monotoniczny).
@@ -7154,14 +7523,25 @@ mod tests {
 
     #[test]
     fn classify_mime_rejects_unsupported() {
-        for m in [
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/octet-stream",
-            "application/zip",
-            "",
-        ] {
+        for m in ["application/octet-stream", "application/zip", ""] {
             assert_eq!(classify_mime(m), None, "{m} powinien byc nieobslugiwany");
         }
+    }
+
+    #[test]
+    fn classify_mime_office_paths() {
+        assert_eq!(
+            classify_mime("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            Some(SourceKind::Xlsx)
+        );
+        assert_eq!(classify_mime("application/vnd.ms-excel"), Some(SourceKind::Xlsx));
+        assert_eq!(
+            classify_mime(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            Some(SourceKind::Docx)
+        );
+        assert_eq!(classify_mime("application/msword"), Some(SourceKind::Docx));
     }
 
     #[test]
