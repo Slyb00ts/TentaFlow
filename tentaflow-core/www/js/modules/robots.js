@@ -1550,7 +1550,8 @@ async function ensureVoxel(container) {
     const live = lidarLive.get(selectedRobotId);
     if (live && voxelView) {
       if (live.lastScenePoints && voxelView.setMapPoints) {
-        renderSceneUnion(selectedRobotId, live);
+        renderMap(selectedRobotId, live);
+        renderOverlay(selectedRobotId, live);
       } else if (live.lastPoints) {
         try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
       }
@@ -2237,12 +2238,12 @@ function onSceneChunk(id, live, body) {
   // init is async, and the server skips re-sending an unchanged map) can replay it.
   live.lastScenePoints = f.points ?? null;
   live.lastSceneCount = Number(f.pointCount ?? f.point_count ?? 0);
-  renderSceneUnion(id, live);
+  renderMap(id, live);
 }
 
 // A camera depth-map snapshot (`scene:<id>-depth`): same canonical frame as the
-// LiDAR scene, but the cloud reconstructed from the camera. Stashed separately so
-// the calibration overlay can union it with the LiDAR cloud (see renderSceneUnion).
+// LiDAR scene, but the cloud reconstructed from the camera. Stashed separately and
+// rendered as a distinct-colour overlay (renderOverlay → setOverlayPoints).
 function onDepthSceneChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
   if (body.variant !== 'StreamFrame') return;
@@ -2259,44 +2260,34 @@ function onDepthSceneChunk(id, live, body) {
   if (!f || !(f.hasFrame ?? f.has_frame)) return;
   live.lastDepthPoints = f.points ?? null;
   live.lastDepthCount = Number(f.pointCount ?? f.point_count ?? 0);
-  renderSceneUnion(id, live);
+  renderOverlay(id, live);
 }
 
-// Render the shared map for `id`: the LiDAR scene cloud, optionally unioned with the
-// camera depth cloud when the calibration overlay is on. One authoritative
-// setMapPoints call (the renderer replaces; both clouds share the same colormap —
-// a distinct-colour overlay is a renderer follow-up). Used to eyeball whether the
-// camera cloud sits on the LiDAR surface (calibrated) or floats off it.
-function renderSceneUnion(id, live) {
+// Render the LiDAR shared map (authoritative replace, radial colormap).
+function renderMap(id, live) {
   if (!voxelView || id !== selectedRobotId || !voxelView.setMapPoints) return;
-  const a = live.lastScenePoints;
-  const an = live.lastSceneCount | 0;
-  const b = (live.depthOn && live.lastDepthPoints) ? live.lastDepthPoints : null;
-  const bn = b ? (live.lastDepthCount | 0) : 0;
-  let pts;
-  let cnt;
-  if (a && b) {
-    pts = new Float32Array(a.length + b.length);
-    pts.set(a, 0);
-    pts.set(b, a.length);
-    cnt = an + bn;
-  } else if (a) {
-    pts = a;
-    cnt = an;
-  } else if (b) {
-    pts = b;
-    cnt = bn;
-  } else {
-    // Neither cloud present (e.g. depth overlay turned off before any LiDAR
-    // snapshot) — clear the renderer so stale geometry never lingers.
-    pts = new Float32Array(0);
-    cnt = 0;
-  }
+  if (!live.lastScenePoints) return;
   try {
-    voxelView.setMapPoints(pts, cnt);
+    voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount | 0);
     applyRobotPose(id);
   } catch (e) {
     console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
+  }
+}
+
+// Render the camera-depth overlay as a SECOND cloud in a distinct colour (the
+// renderer's setOverlayPoints), or clear it when the overlay is off. Kept separate
+// from the LiDAR map so the two can be compared/calibrated against each other.
+function renderOverlay(id, live) {
+  if (!voxelView || id !== selectedRobotId || !voxelView.setOverlayPoints) return;
+  try {
+    if (live.depthOn && live.lastDepthPoints) {
+      voxelView.setOverlayPoints(live.lastDepthPoints, live.lastDepthCount | 0);
+    } else {
+      voxelView.setOverlayPoints(new Float32Array(0), 0);
+    }
+  } catch (e) {
+    console.warn('[robots] voxel setOverlayPoints threw:', e?.message ?? e);
   }
 }
 
@@ -2322,7 +2313,7 @@ function handleDepthToggle(id, on) {
     live.lastDepthPoints = null;
     live.lastDepthCount = 0;
   }
-  renderSceneUnion(id, live);
+  renderOverlay(id, live);
 }
 
 // Reset the depth overlay to OFF after a subscribe error / terminal end so the
@@ -2334,7 +2325,7 @@ function resetDepthOverlay(id, live) {
   live.depthSceneUnsub = null;
   live.lastDepthPoints = null;
   live.lastDepthCount = 0;
-  renderSceneUnion(id, live);
+  renderOverlay(id, live);
   refreshLidarUi(id);
 }
 

@@ -112,6 +112,10 @@ struct Uniforms {
     // Rendered cube edge length in meters (voxel pitch * fill factor).
     voxel_size: f32,
     _pad: [f32; 3],
+    // Overlay mode + fixed color: `[mode, r, g, b]`. mode>0.5 makes the vertex
+    // shader use the fixed RGB instead of the radial colormap, so a second cloud
+    // (camera depth) renders in one distinct colour over the lidar map.
+    overlay: [f32; 4],
 }
 
 // Uniform for the robot marker: a world-space model transform applied on top of
@@ -161,12 +165,18 @@ const CUBE_INDICES: [u16; 36] = [
     1, 5, 6, 6, 2, 1, // +X
 ];
 
+// Fixed colour for the overlay (camera-depth) cloud — bright magenta, which the
+// lidar map's red→blue radial colormap never reaches, so the two layers never
+// blend into the same hue.
+const OVERLAY_COLOR: [f32; 3] = [1.0, 0.0, 1.0];
+
 const SHADER_SRC: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
     heatmap_origin: vec3<f32>,
     inv_heatmap_range: f32,
     voxel_size: f32,
+    overlay: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -211,12 +221,18 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = in.translation + in.position * u.voxel_size;
     out.clip_position = u.view_proj * vec4<f32>(world, 1.0);
 
-    // Color by HORIZONTAL RADIAL DISTANCE from the cloud center (X-Y only, Z
-    // ignored). heatmap_origin carries the cloud center; inv_heatmap_range =
-    // 1 / max horizontal radius so green reaches the outer edge.
-    let dxy = in.translation.xy - u.heatmap_origin.xy;
-    let t = length(dxy) * u.inv_heatmap_range;
-    out.color = radialcolor(t);
+    // Overlay cloud (camera depth) renders in one fixed colour so it reads as a
+    // distinct layer over the lidar map; the lidar map keeps the radial colormap.
+    if (u.overlay.x > 0.5) {
+        out.color = u.overlay.yzw;
+    } else {
+        // Color by HORIZONTAL RADIAL DISTANCE from the cloud center (X-Y only, Z
+        // ignored). heatmap_origin carries the cloud center; inv_heatmap_range =
+        // 1 / max horizontal radius so green reaches the outer edge.
+        let dxy = in.translation.xy - u.heatmap_origin.xy;
+        let t = length(dxy) * u.inv_heatmap_range;
+        out.color = radialcolor(t);
+    }
     out.local_pos = in.position;
     out.world_pos = world;
     return out;
@@ -448,6 +464,18 @@ struct State {
     instance_capacity: u32,
     instance_count: u32,
 
+    // Overlay (camera-depth) cloud: its own uniform (fixed-colour mode) + instance
+    // buffer + cell set, drawn with the SAME pipeline as the map after it. Kept fully
+    // separate from `cells` so it never affects framing, the grid, or the colormap.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_uniform_buffer: wgpu::Buffer,
+    overlay_bind_group: wgpu::BindGroup,
+    overlay_instance_buffer: wgpu::Buffer,
+    overlay_instance_capacity: u32,
+    overlay_instance_count: u32,
+    overlay_cells: HashMap<(i32, i32, i32), Vec3>,
+    overlay_cell_order: VecDeque<(i32, i32, i32)>,
+
     // Pipeline for colored solid geometry on ModelUniforms (box-marker fallback).
     colored_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -578,9 +606,22 @@ impl State {
             inv_heatmap_range: 1.0 / self.heatmap_range.max(0.5),
             voxel_size: self.voxel_size * VOXEL_FILL_FACTOR,
             _pad: [0.0; 3],
+            overlay: [0.0; 4], // map cloud: radial colormap (mode off)
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        // Overlay cloud (camera depth): same view, fixed magenta so it stands out
+        // against the lidar map's rainbow colormap.
+        let overlay_uniforms = Uniforms {
+            overlay: [1.0, OVERLAY_COLOR[0], OVERLAY_COLOR[1], OVERLAY_COLOR[2]],
+            ..uniforms
+        };
+        self.queue.write_buffer(
+            &self.overlay_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&overlay_uniforms),
+        );
 
         // World-space colored geometry (grid): identity model.
         let world = ModelUniforms {
@@ -695,7 +736,7 @@ impl State {
                 pass.draw(0..self.grid_vertex_count, 0..1);
             }
 
-            // Instanced voxel cubes.
+            // Instanced voxel cubes (the lidar/shared map, radial colormap).
             if self.instance_count > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -703,6 +744,17 @@ impl State {
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.instance_count);
+            }
+
+            // Overlay cloud (camera depth) on top, same pipeline + fixed-colour bind
+            // group, so it overlays the map in a single distinct hue for comparison.
+            if self.overlay_instance_count > 0 {
+                pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.overlay_instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.overlay_instance_count);
             }
 
             // Robot on top so it reads as the focal point. Primary path: the
@@ -1158,6 +1210,38 @@ impl State {
         self.instance_count = count as u32;
     }
 
+    // Re-upload the overlay (camera-depth) instance buffer from its cell set. Mirrors
+    // `rebuild_instance_buffer` but on the overlay buffers; called on each replace.
+    fn rebuild_overlay_buffer(&mut self) {
+        let count = self.overlay_cells.len();
+        if count == 0 {
+            self.overlay_instance_count = 0;
+            return;
+        }
+        let mut instances: Vec<Instance> = Vec::with_capacity(count);
+        for center in self.overlay_cells.values() {
+            instances.push(Instance {
+                translation: center.to_array(),
+            });
+        }
+        if count as u32 > self.overlay_instance_capacity {
+            let new_cap = (count as u32).next_power_of_two();
+            self.overlay_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("voxel-overlay-instances"),
+                size: (new_cap as u64) * std::mem::size_of::<Instance>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.overlay_instance_capacity = new_cap;
+        }
+        self.queue.write_buffer(
+            &self.overlay_instance_buffer,
+            0,
+            bytemuck::cast_slice(&instances),
+        );
+        self.overlay_instance_count = count as u32;
+    }
+
     // Recompute the radial colormap origin + adaptive range from the current robot
     // pose (or the accumulated-cloud center when no pose is set yet) and over the
     // accumulated cells. Called both when a new frame arrives and when the pose
@@ -1342,6 +1426,23 @@ pub async fn init_voxel_view(
         }],
     });
 
+    // Overlay uniform + bind group: same layout, separate buffer so the overlay
+    // (camera-depth) draw can use fixed-colour mode while the map draw stays radial.
+    let overlay_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("voxel-overlay-uniforms"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("voxel-overlay-bg"),
+        layout: &bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: overlay_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel-pl"),
         bind_group_layouts: &[&bind_group_layout],
@@ -1394,6 +1495,62 @@ pub async fn init_voxel_view(
             format: DEPTH_FORMAT,
             depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    // Overlay (camera-depth) pipeline: identical to the map pipeline but with a
+    // LESS_EQUAL depth test. The overlay draws AFTER the map; when the camera cloud
+    // is correctly calibrated it quantizes to the SAME voxel centers (equal depth),
+    // and a strict `Less` test would reject it — hiding the magenta exactly where
+    // alignment is good. `LessEqual` lets the overlay win at equal depth so it stays
+    // visible on top.
+    let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("voxel-overlay-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CubeVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Instance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![1 => Float32x3],
+                },
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -1647,6 +1804,14 @@ pub async fn init_voxel_view(
         mapped_at_creation: false,
     });
 
+    let overlay_instance_capacity = 65_536u32;
+    let overlay_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("voxel-overlay-instances"),
+        size: (overlay_instance_capacity as u64) * std::mem::size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let depth_view = State::make_depth_view(&device, config.width, config.height);
 
     let mut camera = Camera::new();
@@ -1665,6 +1830,14 @@ pub async fn init_voxel_view(
         instance_buffer,
         instance_capacity,
         instance_count: 0,
+        overlay_pipeline,
+        overlay_uniform_buffer,
+        overlay_bind_group,
+        overlay_instance_buffer,
+        overlay_instance_capacity,
+        overlay_instance_count: 0,
+        overlay_cells: HashMap::new(),
+        overlay_cell_order: VecDeque::new(),
         colored_pipeline,
         line_pipeline,
         robot_pipeline,
@@ -1949,6 +2122,49 @@ impl VoxelView {
             st.camera.distance = extent * 1.2;
             st.framed = true;
         }
+    }
+
+    /// Replace the OVERLAY cloud (camera-depth `scene-depth:<id>` snapshot) — a
+    /// second cloud rendered in one fixed colour over the lidar map for side-by-side
+    /// calibration. Like `setMapPoints` it is authoritative-replace, but it never
+    /// touches the camera framing, grid, or colormap (those stay driven by the map).
+    /// An empty frame clears the overlay.
+    #[wasm_bindgen(js_name = setOverlayPoints)]
+    pub fn set_overlay_points(&self, points: &[f32], count: u32) {
+        let state = match self.state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut st = state.borrow_mut();
+        st.overlay_cells.clear();
+        st.overlay_cell_order.clear();
+
+        let usable = (count as usize).min(points.len() / 3);
+        if usable == 0 {
+            st.overlay_instance_count = 0;
+            return;
+        }
+        for i in 0..usable {
+            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+            if !p.is_finite() {
+                continue;
+            }
+            let key = st.cell_key(p);
+            let center = st.cell_center(key);
+            if st.overlay_cells.insert(key, center).is_none() {
+                st.overlay_cell_order.push_back(key);
+            }
+        }
+        // FIFO cap, same bound as the map set.
+        while st.overlay_cells.len() > MAX_ACCUMULATED_CELLS {
+            match st.overlay_cell_order.pop_front() {
+                Some(old) => {
+                    st.overlay_cells.remove(&old);
+                }
+                None => break,
+            }
+        }
+        st.rebuild_overlay_buffer();
     }
 
     /// Reconfigure the surface and depth buffer for a new backing size in
