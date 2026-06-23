@@ -2210,8 +2210,12 @@ fn spawn_quic_event_handler(
                                 count = payload.services.len(),
                                 "MeshServicesGetResponse: replace_node"
                             );
-                            mesh_services_registry
-                                .replace_node(payload.from_node_id, payload.services);
+                            let services =
+                                crate::services::mesh_registry::normalize_advertised_service_node_id(
+                                    payload.services,
+                                    &from_node_id,
+                                );
+                            mesh_services_registry.replace_node(from_node_id, services);
                         }
                         Err(e) => {
                             warn!(peer = %from_node_id, "MeshServicesGetResponse decode error: {}", e);
@@ -2237,8 +2241,12 @@ fn spawn_quic_event_handler(
                                 count = payload.services.len(),
                                 "MeshServicesAnnounce: replace_node"
                             );
-                            mesh_services_registry
-                                .replace_node(payload.from_node_id, payload.services);
+                            let services =
+                                crate::services::mesh_registry::normalize_advertised_service_node_id(
+                                    payload.services,
+                                    &from_node_id,
+                                );
+                            mesh_services_registry.replace_node(from_node_id, services);
                         }
                         Err(e) => {
                             warn!(peer = %from_node_id, "MeshServicesAnnounce decode error: {}", e);
@@ -2260,8 +2268,12 @@ fn spawn_quic_event_handler(
                     {
                         Ok(payload) => {
                             debug!(peer = %from_node_id, "MeshServicesUpdate: apply_change");
-                            mesh_services_registry
-                                .apply_change(payload.from_node_id, payload.change);
+                            let change =
+                                crate::services::mesh_registry::normalize_advertised_service_change(
+                                    payload.change,
+                                    &from_node_id,
+                                );
+                            mesh_services_registry.apply_change(from_node_id, change);
                         }
                         Err(e) => {
                             warn!(peer = %from_node_id, "MeshServicesUpdate decode error: {}", e);
