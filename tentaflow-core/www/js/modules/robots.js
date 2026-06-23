@@ -149,6 +149,14 @@ let cardEls = new Map();
 // back button clears it.
 let selectedRobotId = null;
 
+// Shared-map ("Mapa scen") view state. When true the screen shows the combined
+// real-world map of ALL robots (each robot's accumulated scene + camera-depth +
+// live lidar), not the list/detail. Mutually exclusive with `selectedRobotId`.
+let mapOpen = false;
+// In shared-map mode the render fans every robot's clouds into ONE voxel view
+// (union), instead of the single-robot detail render.
+let sharedMapMode = false;
+
 // Per-detail live LiDAR state. At most ONE entry exists — for the open detail's
 // robot, ONLY while LiDAR is enabled AND the robot is online. Adding/removing it
 // owns the single subscription lifecycle: every start has a matching close, so no
@@ -304,6 +312,8 @@ const RobotsScreen = {
     inFlightRefresh = false;
     cardEls = new Map();
     selectedRobotId = null;
+    mapOpen = false;
+    sharedMapMode = false;
     detailLog = [];
   },
 };
@@ -457,7 +467,9 @@ function activeViewHost() {
 // selected AND still present, otherwise LIST. A selected robot that disappears
 // from the mesh falls back to the list (its subscriptions are torn down).
 function renderActiveView() {
-  if (selectedRobotId && findRobot(selectedRobotId)) {
+  if (mapOpen) {
+    renderSharedMap();
+  } else if (selectedRobotId && findRobot(selectedRobotId)) {
     renderDetail();
   } else {
     if (selectedRobotId) closeDetail();
@@ -520,6 +532,175 @@ function closeDetail() {
 }
 
 // =============================================================================
+// SHARED MAP view ("Mapa scen") — the combined real-world map of ALL robots.
+// Each robot's accumulated scene map + camera-depth cloud (and live lidar as a
+// fallback when its scene is still empty) are fanned into ONE wgpu voxel view.
+// =============================================================================
+
+function openSharedMap() {
+  closeDetail();
+  selectedRobotId = null;
+  mapOpen = true;
+  renderActiveView();
+}
+
+// Leave the map: tear down every per-robot subscription + the voxel view.
+function backFromMap() {
+  sharedMapMode = false;
+  stopLidarLoop();
+  disposeVoxel();
+  mapOpen = false;
+  renderActiveView();
+}
+
+function renderSharedMap() {
+  const root = activeViewHost();
+  if (!root) return;
+  if (!byId('robots-map')) {
+    cardEls = new Map();
+    root.innerHTML = `
+      <div class="robots-map" id="robots-map">
+        <div class="robots-map-toolbar">
+          <tf-button variant="ghost" icon="arrow-left" id="robots-map-back">Roboty</tf-button>
+          <h1>${sprite('globe-grid')} Wspólna mapa scen</h1>
+          <tf-badge tone="success" value="na żywo"></tf-badge>
+          <span class="robots-map-spacer"></span>
+        </div>
+        <div class="robots-map-grid">
+          <div class="robots-map-side" data-field="map-side"></div>
+          <div class="robots-tile robots-tile-lidar robots-map-scene" data-field="map-scene">
+            <div class="robots-voxel" data-field="voxel">
+              <div class="robots-voxel-ph" data-voxel-ph>renderer się uruchamia…</div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    byId('robots-map-back')?.addEventListener('click', () => backFromMap());
+    sharedMapMode = true;
+    if (lidarTimer == null) {
+      lidarTimer = window.setInterval(sweepLidarStaleness, LIDAR_STALE_SWEEP_MS);
+    }
+    ensureVoxel(byId('robots-map').querySelector('[data-field="voxel"]'));
+  }
+
+  // Each poll: subscribe EVERY robot's clouds (scene + camera-depth + live lidar)
+  // into the shared view — idempotent, so robots that appear later are picked up.
+  // sharedMapMode makes the chunk handlers union across all robots.
+  if (sharedMapMode) {
+    const present = new Set();
+    for (const r of robots) {
+      const id = robotId(r);
+      if (!id) continue;
+      present.add(id);
+      if (!lidarLive.has(id)) startRobotLidar(id);
+      const live = lidarLive.get(id);
+      // Attempt the camera-depth stream ONCE per robot per map session. The backend
+      // rejects `scene-depth:` for non-local robots; without this guard the failure
+      // (which clears depthSceneUnsub) would re-fire a failing subscribe every poll.
+      if (live && !live.depthSceneUnsub && !live.depthTried) {
+        live.depthOn = true;
+        live.depthTried = true;
+        openDepthSceneSubscription(id, live);
+      }
+    }
+    // Drop subscriptions for robots that vanished from the mesh, so their stale
+    // clouds stop contributing to the union + side-panel stats.
+    let pruned = false;
+    for (const id of [...lidarLive.keys()]) {
+      if (!present.has(id)) {
+        const live = lidarLive.get(id);
+        if (live) closeLidarSubscription(id, live);
+        lidarLive.delete(id);
+        pruned = true;
+      }
+    }
+    // A vanished robot leaves no future chunk to redraw, so re-union now (this also
+    // clears both buffers when the last source is gone).
+    if (pruned) renderSharedClouds();
+  }
+  renderMapSidePanel();
+}
+
+// Left info panel: robots list (status pills) + scene stats + layer legend.
+function renderMapSidePanel() {
+  const side = byId('robots-map')?.querySelector('[data-field="map-side"]');
+  if (!side) return;
+  const rows = robots
+    .map((r) => {
+      const id = robotId(r);
+      const name = robotKind(r) || id;
+      return `<tf-badge tone="${statusTone(r.status || '')}" value="${escapeAttr(name)}"></tf-badge>`;
+    })
+    .join('');
+  // Aggregate occupied-cell counts across robots as a coarse "coverage" proxy.
+  let cells = 0;
+  for (const live of lidarLive.values()) {
+    cells += (live.lastSceneCount | 0) + (live.lastDepthCount | 0);
+  }
+  side.innerHTML = `
+    <div class="robots-map-card">
+      <h3>Sceny i roboty</h3>
+      <div class="robots-map-tree">${rows || '<span class="robots-map-muted">Brak robotów</span>'}</div>
+    </div>
+    <div class="robots-map-card">
+      <h3>Scena</h3>
+      <dl class="robots-map-kv">
+        <dt>Roboty</dt><dd>${robots.length}</dd>
+        <dt>Punkty (lidar+kamera)</dt><dd>${cells.toLocaleString('pl-PL')}</dd>
+        <dt>Georef</dt><dd>lokalna (brak GPS)</dd>
+        <dt>Aktualizacja</dt><dd>na żywo</dd>
+      </dl>
+    </div>
+    <div class="robots-map-card">
+      <h3>Warstwy</h3>
+      <div class="robots-map-legend">
+        <span class="robots-map-leg"><i class="dot lidar"></i>LiDAR (głębia)</span>
+        <span class="robots-map-leg"><i class="dot depth"></i>Kamera (depth)</span>
+      </div>
+    </div>`;
+}
+
+// Union every robot's clouds into the single voxel view. LiDAR layer prefers the
+// accumulated scene, falling back to the live frame for robots whose scene is
+// still empty; the camera-depth layer is the magenta overlay.
+function renderSharedClouds() {
+  if (!voxelView || !voxelView.setMapPoints) return;
+  const lidarParts = [];
+  const depthParts = [];
+  for (const live of lidarLive.values()) {
+    if (live.lastScenePoints && live.lastSceneCount) {
+      lidarParts.push([live.lastScenePoints, live.lastSceneCount | 0]);
+    } else if (live.lastPoints && live.lastPointCount) {
+      lidarParts.push([live.lastPoints, live.lastPointCount | 0]);
+    }
+    if (live.lastDepthPoints && live.lastDepthCount) {
+      depthParts.push([live.lastDepthPoints, live.lastDepthCount | 0]);
+    }
+  }
+  unionInto(voxelView.setMapPoints.bind(voxelView), lidarParts);
+  if (voxelView.setOverlayPoints) {
+    unionInto(voxelView.setOverlayPoints.bind(voxelView), depthParts);
+  }
+}
+
+// Concatenate `[points, count]` parts into one packed buffer and hand it to `fn`.
+function unionInto(fn, parts) {
+  let total = 0;
+  for (const [, n] of parts) total += n;
+  if (total === 0) {
+    try { fn(new Float32Array(0), 0); } catch { /* ignore */ }
+    return;
+  }
+  const buf = new Float32Array(total * 3);
+  let off = 0;
+  for (const [pts, n] of parts) {
+    buf.set(pts.subarray(0, n * 3), off);
+    off += n * 3;
+  }
+  try { fn(buf, total); } catch (e) { console.warn('[robots] shared map union render threw:', e?.message ?? e); }
+}
+
+// =============================================================================
 // LIST view
 // =============================================================================
 
@@ -540,11 +721,13 @@ function renderList() {
           <div class="sub" id="robots-sub">Roboty wykryte w sieci mesh — status, podgląd i sterowanie</div>
         </div>
         <div class="actions">
+          <tf-button variant="secondary" icon="globe-grid" id="robots-open-map">Wspólna mapa</tf-button>
           <tf-button variant="ghost" icon="refresh" id="robots-refresh">Odśwież</tf-button>
         </div>
       </div>
       <div id="robots-list" class="robots-grid"></div>`;
     byId('robots-refresh')?.addEventListener('click', () => loadRobots({ showSpinner: true }));
+    byId('robots-open-map')?.addEventListener('click', () => openSharedMap());
     host = byId('robots-list');
   }
 
@@ -1545,18 +1728,23 @@ async function ensureVoxel(container) {
     voxelResizeObs = new ResizeObserver(() => resizeVoxel());
     voxelResizeObs.observe(container);
     resizeVoxel();
-    // Seed immediately so the view isn't blank until the next push. Prefer the
-    // authoritative server map (full replace); fall back to the last live frame.
-    const live = lidarLive.get(selectedRobotId);
-    if (live && voxelView) {
-      if (live.lastScenePoints && voxelView.setMapPoints) {
-        renderMap(selectedRobotId, live);
-        renderOverlay(selectedRobotId, live);
-      } else if (live.lastPoints) {
-        try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
+    // Seed immediately so the view isn't blank until the next push. In shared-map
+    // mode replay EVERY robot's cached clouds (frames may have arrived before this
+    // async init finished); in the detail prefer the authoritative server map.
+    if (sharedMapMode) {
+      renderSharedClouds();
+    } else {
+      const live = lidarLive.get(selectedRobotId);
+      if (live && voxelView) {
+        if (live.lastScenePoints && voxelView.setMapPoints) {
+          renderMap(selectedRobotId, live);
+          renderOverlay(selectedRobotId, live);
+        } else if (live.lastPoints) {
+          try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
+        }
       }
+      applyRobotPose(selectedRobotId);
     }
-    applyRobotPose(selectedRobotId);
   } catch (err) {
     if (token !== voxelInitToken) { canvas.remove(); return; }
     canvas.remove();
@@ -2265,6 +2453,7 @@ function onDepthSceneChunk(id, live, body) {
 
 // Render the LiDAR shared map (authoritative replace, radial colormap).
 function renderMap(id, live) {
+  if (sharedMapMode) { renderSharedClouds(); return; }
   if (!voxelView || id !== selectedRobotId || !voxelView.setMapPoints) return;
   if (!live.lastScenePoints) return;
   try {
@@ -2279,6 +2468,7 @@ function renderMap(id, live) {
 // renderer's setOverlayPoints), or clear it when the overlay is off. Kept separate
 // from the LiDAR map so the two can be compared/calibrated against each other.
 function renderOverlay(id, live) {
+  if (sharedMapMode) { renderSharedClouds(); return; }
   if (!voxelView || id !== selectedRobotId || !voxelView.setOverlayPoints) return;
   try {
     if (live.depthOn && live.lastDepthPoints) {
@@ -2421,9 +2611,12 @@ function onLidarChunk(id, live, body) {
   live.lastRaw = f.raw ?? null;
   live.lastPoints = f.points ?? null;
 
-  // Feed the wgpu voxel renderer (open LiDAR surface only). The renderer owns
-  // color/orbit; we only push the interleaved world-XYZ Float32Array + count.
-  if (voxelView && id === selectedRobotId && live.lastPoints) {
+  // Feed the wgpu voxel renderer. In shared-map mode union every robot's live
+  // lidar (fallback when its accumulated scene is still empty); in the detail push
+  // only the selected robot's live frame.
+  if (sharedMapMode) {
+    renderSharedClouds();
+  } else if (voxelView && id === selectedRobotId && live.lastPoints) {
     try {
       voxelView.setPoints(live.lastPoints, live.lastPointCount);
       applyRobotPose(id);
