@@ -918,14 +918,22 @@ impl ModelRuntimeExecutor {
                 ..
             } => {
                 use tentaflow_protocol::*;
-                let protocol_messages =
-                    crate::routing::openai_messages_to_protocol(&request.messages);
-                let model_request = ModelRequest {
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    payload: ModelPayload::Completion(CompletionPayload {
+                // Vision-chat (np. nemotron-parse): CompletionPayload niesie tylko
+                // tekst, więc obraz zgubiłby się na hopie mesh. Gdy request niesie
+                // obraz, forwardujemy jako ModelPayload::Vision (peer ma ramię
+                // Vision -> route_vision_via_protocol). Inaczej zwykły Completion.
+                let payload = if crate::routing::messages_have_image(&request.messages) {
+                    ModelPayload::Vision(VisionPayload {
+                        model: model_name.clone(),
+                        messages: crate::routing::openai_messages_to_vision(&request.messages),
+                        max_tokens: request.max_tokens,
+                        temperature: request.temperature,
+                    })
+                } else {
+                    ModelPayload::Completion(CompletionPayload {
                         model: model_name.clone(),
                         prompt: None,
-                        messages: protocol_messages,
+                        messages: crate::routing::openai_messages_to_protocol(&request.messages),
                         temperature: request.temperature,
                         max_tokens: request.max_tokens,
                         top_p: request.top_p,
@@ -937,7 +945,11 @@ impl ModelRuntimeExecutor {
                         audio_input: None,
                         prefix_cache_id: None,
                         prefix_text: None,
-                    }),
+                    })
+                };
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload,
                     stream: false,
                     metadata: None,
                     session_id: None,
@@ -1738,68 +1750,66 @@ impl ModelRuntimeExecutor {
         if crate::services::document::is_pdf_mime(&request.mime) {
             return self.execute_documents_pdf(request, ctx).await;
         }
-        let outcome = {
-            let snapshot = self.catalog.snapshot();
-            let req = ResolveRequest {
-                requested_model: &request.model,
-                required_surface: ServiceSurface::Documents,
-                required_input_modalities: &[InputModality::Image],
-                required_output_modalities: &[OutputModality::Text],
-            };
-            self.resolver.resolve(&req, &snapshot, ctx)?
+        // Vision-parse to model CHAT (VLM przez /v1/chat/completions, np.
+        // nemotron-parse — zgodnie z NVIDIA nv-ingest, które serwuje
+        // nemoretriever-parse jako VLM na /v1/chat/completions z obrazem). Budujemy
+        // vision-chat request (obraz strony jako image_url base64 + instrukcja) i
+        // idziemy przez `execute_chat`: resolve Chat-surface, Local→HTTP
+        // /v1/chat/completions, MeshForward→ModelPayload::Vision (obraz ZACHOWANY
+        // przez mesh — binarnie). Markdown = tekst odpowiedzi. Detektory
+        // YOLOX/table/OCR (`/v1/infer`) to osobna typed ścieżka Documents —
+        // patrz docs/RAG_INGEST_FLOW_PLAN.md.
+        use crate::api::openai::types::{
+            ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent,
+        };
+        use base64::Engine as _;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&request.image_bytes);
+        let data_uri = format!("data:{};base64,{}", request.mime, b64);
+        let instruction = "Wyodrębnij całą treść tej strony dokumentu jako czysty Markdown. \
+             Zachowaj strukturę tabel (GFM), nagłówki, listy i kolejność czytania. \
+             Zwróć WYŁĄCZNIE treść dokumentu, bez komentarza.";
+
+        let chat_request = ChatCompletionRequest {
+            model: request.model.clone(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: instruction.to_string(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: data_uri,
+                            detail: None,
+                        },
+                    },
+                ])),
+                ..Default::default()
+            }],
+            temperature: Some(0.0),
+            max_tokens: Some(8192),
+            top_p: None,
+            n: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            memory_options: None,
+            audio_input: None,
         };
 
-        let state = self.strategy_state_for(&request.model);
-        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
-
-        let mut last_err: Option<String> = None;
-        let mut attempts = 0usize;
-        let mut last_kind: &'static str = "unknown";
-        let mut deferred_cutover: Option<&'static str> = None;
-
-        for target in ranked {
-            attempts += 1;
-            last_kind = target.telemetry_tag();
-            match self
-                .dispatch_documents_blocking(&target, request.clone(), ctx)
-                .await
-            {
-                Ok(response) => {
-                    ctx.route_metadata.served_by_node = served_by(&target);
-                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
-                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
-                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
-                    note_fallback(
-                        &request.model,
-                        outcome.requested_is_alias,
-                        attempts,
-                        target.telemetry_tag(),
-                    );
-                    return Ok(response);
-                }
-                Err(e) if e.aborts_fallback_chain() => return Err(e),
-                Err(ExecutorError::TransportPendingCutover(kind)) => {
-                    deferred_cutover.get_or_insert(kind);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target_kind = target.telemetry_tag(),
-                        error = %e,
-                        "document parse dispatch failed; trying next candidate"
-                    );
-                    last_err = Some(e.to_string());
-                }
-            }
-        }
-
-        if let Some(kind) = deferred_cutover {
-            return Err(ExecutorError::TransportPendingCutover(kind));
-        }
-
-        Err(ExecutorError::AllCandidatesFailed {
-            target_kind: last_kind,
-            attempts,
-            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        let response = self.execute_chat(chat_request, ctx).await?;
+        let markdown = crate::routing::extract_response_text(&response);
+        Ok(DocumentParseResponse {
+            markdown,
+            blocks: Vec::new(),
+            usage: response.usage,
         })
     }
 
