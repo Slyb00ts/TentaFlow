@@ -16,6 +16,7 @@ import base64
 import io
 import os
 import re
+import sys
 import threading
 
 import numpy as np
@@ -79,8 +80,11 @@ def _start_background_load() -> None:
 def _safe_load() -> None:
     try:
         _ensure_pipe()
-    except Exception:  # noqa: BLE001 — błąd już zapisany w _state["error"]
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Hard-fail the process so the deploy probe (which waits on process exit,
+        # max_wait=None) rolls back, instead of a permanent 503 hang on /health.
+        print(f"FATAL: depth model load failed: {exc}", file=sys.stderr, flush=True)
+        os._exit(1)
 
 
 def _decode_image(url: str) -> Image.Image:
@@ -95,7 +99,13 @@ def _decode_image(url: str) -> Image.Image:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "model": MODEL, "ready": _state["pipe"] is not None}
+    # READINESS, not liveness: TentaFlow's deploy probe treats any 2xx as "ready",
+    # so we must return non-2xx until the pipeline is actually loaded (otherwise the
+    # service is marked Running while /v1/depth still 503s) — or on a load failure.
+    if _state["pipe"] is None:
+        detail = _state["error"] or "loading"
+        raise HTTPException(status_code=503, detail=f"not ready: {detail}")
+    return {"status": "ok", "model": MODEL, "ready": True}
 
 
 @app.post("/v1/depth")
