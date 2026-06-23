@@ -1803,12 +1803,11 @@ impl ModelRuntimeExecutor {
         })
     }
 
-    /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium za
-    /// feature `pdf`), parsuje każdą stronę przez `execute_documents` (ten sam
+    /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
+    /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
     /// (`merge_page_responses`). Cap stron egzekwowany na poziomie rasteryzera
-    /// ([`MAX_PDF_PAGES`]). Bez feature `pdf` zwraca czytelny błąd zamiast crashu.
-    #[cfg(feature = "pdf")]
+    /// ([`MAX_PDF_PAGES`]).
     async fn execute_documents_pdf(
         &self,
         request: DocumentParseRequest,
@@ -1881,20 +1880,6 @@ impl ModelRuntimeExecutor {
         }
 
         Ok(document::merge_page_responses(page_responses))
-    }
-
-    /// Bez feature `pdf` PDF nie jest wspierany — zwracamy czytelny błąd
-    /// (deploy bez pdfium/mobile nie crashuje, tylko odrzuca PDF z jasną
-    /// informacją że trzeba zbudować z `--features pdf`).
-    #[cfg(not(feature = "pdf"))]
-    async fn execute_documents_pdf(
-        &self,
-        _request: DocumentParseRequest,
-        _ctx: &mut ExecutionContext,
-    ) -> Result<DocumentParseResponse, ExecutorError> {
-        Err(ExecutorError::Internal(
-            "PDF parsing requires 'pdf' feature".into(),
-        ))
     }
 
     /// Per-target document-parse dispatch. Serwer obsługuje parsowanie przez
@@ -3750,7 +3735,6 @@ mod tests {
 
     /// RAG E1.4 — buduje `DocumentParseRequest` z realnym, minimalnym PDF
     /// (jedna strona A4) i mime `application/pdf`.
-    #[cfg(feature = "pdf")]
     fn make_pdf_request(model: &str) -> DocumentParseRequest {
         let pdf = crate::services::document::rasterize::minimal_pdf(1);
         DocumentParseRequest {
@@ -3766,7 +3750,6 @@ mod tests {
     /// a parse per-strona idzie przez resolver. Na pustym katalogu pierwsza
     /// strona surface'uje `Resolve` (brak serwisu documents) — to dowód, że
     /// rasteryzacja się powiodła (gdyby pdfium padł, dostalibyśmy `Internal`).
-    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn execute_documents_pdf_rasterizes_then_resolves_per_page() {
         let exec = dummy_executor();
@@ -3779,31 +3762,6 @@ mod tests {
             matches!(err, ExecutorError::Resolve(_)),
             "po udanej rasteryzacji per-strona idzie przez resolver: {err:?}"
         );
-    }
-
-    /// RAG E1.4 — bez feature `pdf` mime PDF zwraca czytelny `Internal`
-    /// ("PDF parsing requires 'pdf' feature"), NIE crash i NIE resolve.
-    #[cfg(not(feature = "pdf"))]
-    #[tokio::test]
-    async fn execute_documents_pdf_without_feature_returns_readable_error() {
-        let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
-        let req = DocumentParseRequest {
-            model: "rag-parse".into(),
-            image_bytes: vec![0x25, 0x50, 0x44, 0x46], // "%PDF"
-            mime: crate::services::document::PDF_MIME.to_string(),
-            flow_depth: 0,
-        };
-        let err = exec
-            .execute_documents(req, &mut ctx)
-            .await
-            .expect_err("PDF bez feature musi być błędem");
-        match err {
-            ExecutorError::Internal(msg) => {
-                assert!(msg.contains("'pdf' feature"), "czytelny komunikat: {msg}");
-            }
-            other => panic!("oczekiwano Internal, dostano {other:?}"),
-        }
     }
 
     /// `execute_documents` dla aliasu `rag-parse` na pustym katalogu surface'uje

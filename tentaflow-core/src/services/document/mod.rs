@@ -2,11 +2,9 @@
 // Plik: services/document/mod.rs
 // Opis: Warstwa dokumentów dla doc_parse (RAG E1.4) — rasteryzacja PDF → obrazy
 //       stron + scalanie wyników parse per-strona. Rasteryzer (pdfium) jest
-//       za feature `pdf`; typy/capy/merge są zawsze dostępne, żeby executor
-//       potrafił rozpoznać PDF i zwrócić czytelny błąd bez feature `pdf`.
+//       BEZWARUNKOWY — PDF musi działać na każdym urządzeniu.
 // =============================================================================
 
-#[cfg(feature = "pdf")]
 pub mod rasterize;
 
 use crate::services::runtime::executor::{DocBlock, DocumentParseResponse};
@@ -133,7 +131,6 @@ mod tests {
     /// realny 2-stronicowy PDF (pdfium), symuluje odpowiedź vision per-strona
     /// (markdown + 1 blok), scala i sprawdza numery stron + złączony markdown.
     /// NIE uruchamia realnego vision service — dispatch zastąpiony mockiem.
-    #[cfg(feature = "pdf")]
     #[test]
     fn pdf_to_pages_to_merge_assigns_page_numbers() {
         let pdf = super::rasterize::minimal_pdf(2);
