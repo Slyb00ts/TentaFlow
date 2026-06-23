@@ -714,3 +714,79 @@
   background: var(--tf-surface-2, rgba(255, 255, 255, 0.04));
   border-radius: 8px;
 }
+
+/* =============================================================================
+   Shared map view ("Mapa scen") — combined real-world map of all robots.
+   ========================================================================== */
+.robots-map {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 120px);
+  min-height: 520px;
+}
+.robots-map-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.robots-map-toolbar h1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 20px;
+  color: var(--text, #e6e9f0);
+}
+.robots-map-toolbar h1 .icon { width: 20px; height: 20px; }
+.robots-map-spacer { flex: 1; }
+.robots-map-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+.robots-map-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+}
+.robots-map-card {
+  background: var(--bg-card, rgba(255,255,255,0.03));
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: var(--radius, 12px);
+  padding: 14px;
+}
+.robots-map-card h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2, #b6bccb);
+}
+.robots-map-tree { display: flex; flex-direction: column; gap: 8px; }
+.robots-map-muted { color: var(--text-3, #8a93a6); font-size: 13px; }
+.robots-map-tree tf-badge { cursor: default; }
+.robots-map-kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+.robots-map-kv dt { color: var(--text-3, #8a93a6); }
+.robots-map-kv dd { margin: 0; text-align: right; color: var(--text, #e6e9f0); font-variant-numeric: tabular-nums; }
+.robots-map-legend { display: flex; flex-direction: column; gap: 8px; }
+.robots-map-leg { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2, #b6bccb); }
+.robots-map-leg .dot { width: 12px; height: 12px; border-radius: 3px; }
+.robots-map-leg .dot.lidar { background: linear-gradient(90deg, #ff3b3b, #3ddc84, #2f6bff); }
+.robots-map-leg .dot.depth { background: #ff00ff; }
+.robots-map-scene {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+.robots-map-scene .robots-voxel { position: absolute; inset: 0; height: 100%; }
