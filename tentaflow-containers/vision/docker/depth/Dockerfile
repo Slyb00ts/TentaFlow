@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
       "transformers>=4.45" accelerate "pillow>=12" numpy \
       fastapi==0.115.6 uvicorn==0.34.0 python-multipart==0.0.20 \
-      "huggingface_hub[hf_transfer]"
+      huggingface_hub hf_transfer
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 COPY tentaflow-containers/vision/python/depth/server.py /app/server.py

@@ -25,11 +25,15 @@ disk_gb = 20
 platforms = ["linux-x86_64"]
 
 # Tylko CUDA. Domyślne wheel'e torch na Linux/Windows zawierają CUDA, więc bez
-# osobnego extra_index. Sam pakiet DA3 instalujemy w extras_no_build_isolation,
-# żeby jego build widział zainstalowany torch (zgodnie z README: pip install -e .).
+# osobnego extra_index. DA3 to pakiet hatchling (czysto-pythonowy, NIE buduje
+# rozszerzeń CUDA i NIE importuje torch przy buildzie), więc instalujemy go z
+# NORMALNĄ izolacją builda — pip sam dociąga hatchling/hatch-vcs do środowiska
+# builda (z `--no-build-isolation` venv nie miał hatchling → build padał z exit 1).
+# `numpy<2` bo DA3 tego wymaga; `hf_transfer` jako osobny pakiet (nowy
+# huggingface_hub nie ma extra `[hf_transfer]`, a env HF_HUB_ENABLE_HF_TRANSFER=1
+# bez niego wysypuje pobieranie modelu).
 [[install_variants]]
 backend = "cuda"
-extras = ["torch>=2", "torchvision", "xformers", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "huggingface_hub[hf_transfer]"]
-extras_no_build_isolation = ["depth-anything-3 @ git+https://github.com/ByteDance-Seed/depth-anything-3@41736238f5bced4debf3f2a12375d2466874866d"]
+extras = ["torch>=2", "torchvision", "xformers", "pillow>=12", "numpy<2", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "huggingface_hub", "hf_transfer", "depth-anything-3 @ git+https://github.com/ByteDance-Seed/depth-anything-3@41736238f5bced4debf3f2a12375d2466874866d"]
 env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }
-install_hint = "CUDA_VISIBLE_DEVICES=0; DA3 wymaga GPU + nvcc do builda pakietu"
+install_hint = "CUDA_VISIBLE_DEVICES=0; DA3 ciągnie ciężkie zależności (open3d, pycolmap, opencv); wymaga GPU"

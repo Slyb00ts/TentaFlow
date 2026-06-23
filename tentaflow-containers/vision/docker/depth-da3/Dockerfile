@@ -20,15 +20,19 @@ RUN pip install --no-cache-dir --upgrade pip wheel setuptools
 # Trio wg README DA3 (domyślne wheel'e torch na Linux zawierają CUDA).
 RUN pip install --no-cache-dir xformers "torch>=2" torchvision
 
-# Pakiet DA3 z repo (editable wg README), z widocznym już torchem. Pinowany
-# commit — bez tego każdy build brałby aktualny HEAD upstreamu (niedeterministyczne).
+# Pakiet DA3 z repo (editable wg README), pinowany commit. NORMALNA izolacja builda
+# (DA3 to pakiet hatchling — pip sam dociąga hatchling/hatch-vcs; `--no-build-isolation`
+# wysypywał build bo venv nie miał hatchling). To ciągnie ciężkie deps DA3
+# (open3d, pycolmap, opencv, e3nn...).
 RUN git clone https://github.com/ByteDance-Seed/depth-anything-3 /opt/depth-anything-3 \
     && git -C /opt/depth-anything-3 checkout 41736238f5bced4debf3f2a12375d2466874866d \
-    && pip install --no-cache-dir --no-build-isolation -e /opt/depth-anything-3
+    && pip install --no-cache-dir -e /opt/depth-anything-3
 
+# hf_transfer jako osobny pakiet (nowy huggingface_hub nie ma extra [hf_transfer],
+# a env HF_HUB_ENABLE_HF_TRANSFER=1 bez niego wysypuje pobieranie modelu).
 RUN pip install --no-cache-dir \
       fastapi==0.115.6 uvicorn==0.34.0 python-multipart==0.0.20 \
-      numpy "pillow>=12" "huggingface_hub[hf_transfer]"
+      "numpy<2" "pillow>=12" huggingface_hub hf_transfer
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 COPY tentaflow-containers/vision/python/depth-da3/server.py /app/server.py
