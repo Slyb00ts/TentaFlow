@@ -56,6 +56,44 @@ pub extern "C" fn tentaflow_mobile_clear_sensors() {
     MobileSensorQueue::global().clear();
 }
 
+/// iOS / C ABI — wpycha jedną jednostkę dostępu H.264 (Annex-B) z natywnego enkodera
+/// telefonu do zarejestrowanej kamery push (ten sam potok co każda kamera: kafelek
+/// MSE + skrzynka klatek dla TentaVision/AI-głębi). Kamerę rejestruje addon `phone`
+/// przez `camera_register_pushed_v1`; tu tylko pompujemy bajty.
+///
+/// # Safety
+/// `ptr` musi wskazywać na `len` ważnych bajtów.
+#[no_mangle]
+pub unsafe extern "C" fn tentaflow_mobile_push_camera_h264(ptr: *const u8, len: i32) -> bool {
+    if ptr.is_null() || len <= 0 {
+        return false;
+    }
+    let au = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+    tentaflow_core::services::mobile_camera::MobileCameraIngest::global().push_any(au.into()) > 0
+}
+
+/// Android / JNI — Kotlin `NativeLib.pushCameraH264(ByteArray)`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_ai_tentaflow_mobile_NativeLib_pushCameraH264(
+    mut env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+) -> jboolean {
+    match env.convert_byte_array(&data) {
+        Ok(b) if !b.is_empty() => {
+            let n = tentaflow_core::services::mobile_camera::MobileCameraIngest::global()
+                .push_any(b.into());
+            if n > 0 {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        }
+        _ => JNI_FALSE,
+    }
+}
+
 /// Android / JNI — Kotlin `NativeLib.pushSensor(kind, ByteArray)`.
 #[cfg(target_os = "android")]
 #[no_mangle]
