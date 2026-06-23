@@ -360,6 +360,9 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "camera_add_v1", camera::camera_add_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_add_v1: {e}"))?;
         linker
+            .func_wrap("tentaflow", "camera_register_pushed_v1", camera::camera_register_pushed_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_register_pushed_v1: {e}"))?;
+        linker
             .func_wrap("tentaflow", "camera_list_v1", camera::camera_list_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_list_v1: {e}"))?;
         linker

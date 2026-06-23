@@ -876,7 +876,6 @@ mod include_usage_tests {
 
     fn chunk_with_usage(text: &str, finish: bool, usage: Option<Usage>) -> ChatCompletionChunk {
         ChatCompletionChunk {
-            perf: None,
             id: "id1".into(),
             object: "chat.completion.chunk".into(),
             created: 0,
@@ -994,7 +993,6 @@ mod compliance_stream_tests {
 
     fn chunk(text: &str, usage: Option<Usage>) -> ChatCompletionChunk {
         ChatCompletionChunk {
-            perf: None,
             id: "stream-1".to_string(),
             object: "chat.completion.chunk".to_string(),
             created: 1,

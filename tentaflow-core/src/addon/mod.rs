@@ -1254,6 +1254,7 @@ impl AddonManager {
         crate::services::lidar_hub::LidarStreamHub::global().remove(addon_id);
         crate::services::slam_scene::SlamSceneManager::global().remove(addon_id);
         crate::services::localization::LocalizationEngine::global().remove(addon_id);
+        crate::services::mobile_camera::MobileCameraIngest::global().remove(addon_id);
         if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
             warn!(
                 "addon state: purge on uninstall failed for '{}': {}",
@@ -2379,6 +2380,7 @@ impl AddonManager {
             crate::services::lidar_hub::LidarStreamHub::global().remove(&addon_id);
             crate::services::slam_scene::SlamSceneManager::global().remove(&addon_id);
             crate::services::localization::LocalizationEngine::global().remove(&addon_id);
+            crate::services::mobile_camera::MobileCameraIngest::global().remove(&addon_id);
 
             // A2: the addon is fully stopped — flush any durable writes that
             // have not yet hit the periodic flush so a stop+exit before the next
