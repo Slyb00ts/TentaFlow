@@ -61,6 +61,24 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
         .unwrap()
 }
 
+/// Tworzy response z dowolnym typem zawartosci (publiczne assety: HTML, JS).
+fn asset_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> Response<OpenAIBody> {
+    let stream = futures::stream::once(async move { Ok(Frame::data(Bytes::from(body))) });
+    let boxed_stream: Pin<
+        Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>,
+    > = Box::pin(stream);
+    Response::builder()
+        .status(status)
+        .header("Content-Type", content_type)
+        .body(StreamBody::new(boxed_stream))
+        .unwrap()
+}
+
+/// Tworzy HTML response (publiczna strona /docs).
+fn html_response(status: StatusCode, body: Vec<u8>) -> Response<OpenAIBody> {
+    asset_response(status, "text/html; charset=utf-8", body)
+}
+
 /// Mapuje dowolny anyhow::Error (potencjalnie CoreError) na error response z odpowiednim HTTP status.
 fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
     let core_error = e.downcast_ref::<CoreError>();
@@ -380,6 +398,26 @@ pub async fn handle_request(
             let principal = req.extensions().get::<Principal>().cloned();
             handle_models_list(router, principal.as_ref()).await
         }
+
+        // Publiczna dokumentacja REST API — spec OpenAPI 3.1 (bez auth).
+        ("GET", "/openapi.json") => {
+            let spec = crate::api::openai::openapi::build_spec();
+            let body = serde_json::to_vec(&spec).unwrap_or_default();
+            Ok(json_response(StatusCode::OK, body))
+        }
+
+        // Publiczna strona Scalar API reference (bez auth).
+        ("GET", "/docs") | ("GET", "/docs/") => Ok(html_response(
+            StatusCode::OK,
+            crate::api::openai::openapi::docs_html().into_bytes(),
+        )),
+
+        // Zbundlowany Scalar JS — samowystarczalne /docs (offline, bez CDN).
+        ("GET", "/docs/scalar.js") => Ok(asset_response(
+            StatusCode::OK,
+            "application/javascript; charset=utf-8",
+            crate::api::openai::openapi::scalar_js().as_bytes().to_vec(),
+        )),
 
         // 404 Not Found
         _ => {

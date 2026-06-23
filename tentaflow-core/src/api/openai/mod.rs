@@ -9,6 +9,8 @@ pub mod types;
 
 pub mod comfyui;
 
+pub mod openapi;
+
 pub mod server;
 
 pub use types::*;
