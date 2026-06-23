@@ -2085,12 +2085,22 @@ fn extract_json_object(text: &str) -> Option<&str> {
 /// chunku i zwraca surowa odpowiedz. Blad host-fn / pusta odpowiedz -> Err (caller
 /// traktuje to best-effort: loguje i kontynuuje ingest wektorowy).
 fn call_extraction_llm(chunk_text: &str) -> Result<String, String> {
+    // Bez placeholderow "..." — slabe modele kwantyzowane (np. deepseek-q2) kopiuja
+    // doslownie kazda wartosc-wzorzec zamiast ja wypelnic. Zamiast tego konkretny
+    // jednostrzalowy przyklad z domeny + jawny zakaz kopiowania wartosci przykladu.
     let prompt = format!(
-        "Wyciagnij encje i relacje z ponizszego tekstu. Zwroc WYLACZNIE JSON o ksztalcie \
-         {{\"entities\":[{{\"name\":\"...\",\"type\":\"...\"}}],\
-         \"relations\":[{{\"head\":\"...\",\"relation\":\"...\",\"tail\":\"...\"}}]}}. \
-         Uzywaj TYLKO faktow obecnych w tekscie, nie halucynuj. head i tail relacji musza \
-         odpowiadac nazwom encji. Bez komentarza, bez markdown.\n\nTEKST:\n{chunk_text}"
+        "Twoje zadanie: wyodrebnij RZECZYWISTE encje i relacje z podanego tekstu i zwroc \
+         WYLACZNIE JSON. Bez komentarza, bez markdown, bez tekstu poza JSON. Uzywaj TYLKO \
+         faktow obecnych w tekscie, nie halucynuj. Pole head i tail kazdej relacji musi \
+         doslownie odpowiadac jakiejs nazwie encji (name).\n\n\
+         Przyklad formatu (NIE kopiuj wartosci):\n\
+         {{\"entities\":[{{\"name\":\"Dyrektywa 2018/2001\",\"type\":\"akt prawny\"}},\
+         {{\"name\":\"biometan\",\"type\":\"substancja\"}}],\
+         \"relations\":[{{\"head\":\"Dyrektywa 2018/2001\",\"relation\":\"reguluje\",\
+         \"tail\":\"biometan\"}}]}}\n\n\
+         Powyzej to TYLKO przyklad formatu — NIE kopiuj jego wartosci. Wypelnij \
+         RZECZYWISTYMI encjami i relacjami wystepujacymi w ponizszym tekscie.\n\n\
+         TEKST DO ANALIZY:\n{chunk_text}"
     );
     let model = "rag-llm";
     let options = json!({ "task": "chat", "temperature": 0.0 });
