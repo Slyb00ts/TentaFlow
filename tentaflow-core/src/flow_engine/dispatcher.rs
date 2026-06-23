@@ -56,7 +56,11 @@ use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
 use crate::flow_engine::synthetic;
 use crate::services::runtime::quic_handle::ServiceManager;
 
-const FLOW_TIMEOUT_SECS: u64 = 120;
+/// Globalny cap na CAŁY flow to już TYLKO backstop anty-zawieszeniowy (nie
+/// limit „budżetu czasu"): per-node 600 s + `max_iterations` ograniczają normalne
+/// multi-hop/extraction flow, więc 1 h nigdy nie ucina poprawnego wykonania, a
+/// jedynie łapie faktycznie zawieszony / nieskończony flow.
+const FLOW_BACKSTOP_SECS: u64 = 3600;
 
 /// Stage 3d-0b-final: typed dispatch error żeby routing layer mógł
 /// mapować na precyzyjne HTTP status codes:
@@ -576,7 +580,7 @@ impl FlowDispatcher {
 
     /// Background-run variant (Harness §3.6/§3.7): runs the agent harness flow
     /// for an `AgentRunManager` task. Unlike `dispatch_by_flow_id` it does NOT
-    /// impose the 120 s `FLOW_TIMEOUT_SECS` cap — a long agent run is governed
+    /// impose the `FLOW_BACKSTOP_SECS` cap — a long agent run is governed
     /// solely by `meta.deadline` (the agent's own budget) and `meta.cancel_token`,
     /// both already enforced between nodes by the executor. ACL is skipped: the
     /// manager already verified the spawning principal and the harness flows are
@@ -765,8 +769,13 @@ impl FlowDispatcher {
     ) -> Result<FlowExecutionOutcome> {
         let ctx = self.ctx_factory.make_context(&meta);
         let flow_id = compiled.flow_id.clone();
+        // Per-node 600 s (w executorze) + `max_iterations` w pętlach domykają
+        // czas wykonania. Ten globalny `timeout` to wyłącznie backstop na
+        // faktycznie zawieszony flow — celowo hojny (1 h), żeby nie ucinał
+        // normalnego multi-hop RAG ani per-chunk extraction. `cancel_token`
+        // (klient disconnect) działa niezależnie, między nodami w executorze.
         match timeout(
-            Duration::from_secs(FLOW_TIMEOUT_SECS),
+            Duration::from_secs(FLOW_BACKSTOP_SECS),
             execute_blocking(
                 self.db.clone(),
                 compiled,
@@ -783,9 +792,9 @@ impl FlowDispatcher {
                 Err(e)
             }
             Err(_) => {
-                warn!(flow_id, "Timeout flow po {FLOW_TIMEOUT_SECS}s");
+                warn!(flow_id, "Backstop flow po {FLOW_BACKSTOP_SECS}s (zawieszony flow)");
                 Err(anyhow::anyhow!(
-                    "flow {flow_id} timeout after {FLOW_TIMEOUT_SECS}s"
+                    "flow {flow_id} backstop timeout after {FLOW_BACKSTOP_SECS}s"
                 ))
             }
         }
