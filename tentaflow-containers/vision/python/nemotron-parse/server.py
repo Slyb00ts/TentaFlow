@@ -64,6 +64,17 @@ def _require_cuda() -> None:
 _LOAD_LOCK = threading.Lock()
 
 
+def _pick_attn_impl() -> str:
+    """flash_attention_2 gdy pakiet dostepny (najszybsza atencja), inaczej `sdpa`
+    (natywne PyTorch scaled-dot-product, zawsze obecne, szybsze od `eager`)."""
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except Exception:  # noqa: BLE001
+        return "sdpa"
+
+
 def _ensure_model() -> None:
     if _state["model"] is not None:
         return
@@ -71,13 +82,41 @@ def _ensure_model() -> None:
         if _state["model"] is not None:
             return
         _require_cuda()
-        model = AutoModel.from_pretrained(
-            MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
-        ).to("cuda").eval()
+        attn_impl = _pick_attn_impl()
+        try:
+            model = AutoModel.from_pretrained(
+                MODEL_ID,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+            )
+        except Exception as exc:  # noqa: BLE001 — model bez wsparcia attn_impl
+            print(f"attn_implementation={attn_impl} odrzucone ({exc}); fallback default", flush=True)
+            model = AutoModel.from_pretrained(
+                MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+        model = model.to("cuda").eval()
+        # torch.compile (reduce-overhead = CUDA graphs) eliminuje narzut Pythona
+        # per-token: model 885M NIE wysyca GPU (util ~25% bez compile), bo pętla
+        # generate odpala mikro-kernele i wraca do Pythona. CUDA graphs łączą je
+        # w jeden replay. Bez TensorRT. fullgraph=False — custom VLM/generate ma
+        # graph-breaki (logits processory w Pythonie), kompilujemy co się da.
+        try:
+            compiled = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+            _state["model"] = compiled
+        except Exception as exc:  # noqa: BLE001 — compile nieobowiazkowy
+            print(f"torch.compile pominiety ({exc}); model nieskompilowany", flush=True)
+            _state["model"] = model
         _state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_ID)
         _state["processor"] = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        _state["gen"] = GenerationConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-        _state["model"] = model
+        gen = GenerationConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+        # Static KV-cache — warunek wstepny CUDA graphs w generate (bez tego cache
+        # realokuje sie co krok i graf nie moze byc przechwycony).
+        try:
+            gen.cache_implementation = "static"
+        except Exception:  # noqa: BLE001
+            pass
+        _state["gen"] = gen
 
 
 # Model ladowany w WATKU TLA przy starcie — synchroniczne ladowanie w handlerze
