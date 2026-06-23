@@ -202,10 +202,9 @@ pub extern "C" fn on_start() -> i32 {
     // SQL, capy, paginacja, izolacja per-instancja.
     register_read_side_tools();
 
-    // Pelny panel GUI (NavTabs: kolekcje, dokumenty, czat, graf, konflikty) przez
-    // binarny protokol CBOR (sdk-runtime). Zastepuje dawny minimalny panel JSON.
+    // Pelny panel GUI (Split: sidebar baz wiedzy | workspace czat-first) przez binarny
+    // protokol CBOR (sdk-runtime). send_panel_shell sam wypycha oba sloty.
     ui::send_panel_shell();
-    ui::send_tab_content(ui::DEFAULT_TAB);
 
     log::info("rag: uruchomiony");
     0
@@ -223,7 +222,6 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
     }
     ui::reset_for_open(epoch as u64);
     ui::send_panel_shell();
-    ui::send_tab_content(ui::DEFAULT_TAB);
     0
 }
 

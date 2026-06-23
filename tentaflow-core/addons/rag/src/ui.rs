@@ -1,14 +1,16 @@
 // =============================================================================
 // Plik: addons/rag/src/ui.rs
 // Opis: Pelne GUI addona RAG (MemGraphRAG) przez binarny protokol CBOR (sdk-runtime).
-//       Panel `main` z NavTabs (5 zakladek): Kolekcje, Dokumenty, Czat, Graf,
-//       Konflikty. Komponenty emitowane DEKLARATYWNIE typami SDK
+//       Panel `main` jako Split (sidebar baz wiedzy | workspace czat-first). Sidebar
+//       to klikalne karty kolekcji; workspace to naglowek bazy + NavTabs (Czat,
+//       Dokumenty, Graf, Konflikty). Komponenty emitowane DEKLARATYWNIE typami SDK
 //       (tentaflow_sdk_spec::protocol::ui::*); zero HTML/JS. Akcje UI (Handler ->
 //       action_id) wracaja do hosta jako tool "ui.main.<action>", a host wola
 //       crate::ui::handle_ui_action, ktory uderza w read/write tooly z lib.rs i
-//       odswieza panel przez SlotContent / StatePatch. Stan panelu (wybrana
-//       kolekcja, wiersze tabel, wyniki) trzymany w stanie panelu pod sciezkami
-//       StatePath; tabele czytaja wiersze z tych sciezek (rows_path).
+//       odswieza panel przez SlotContent / StatePatch. Sidebar i workspace to dwa
+//       osobne sloty (Split renderuje puste data-slot-id, tresc kazdego idzie
+//       osobnym SlotContent). Historia czatu zyje w KV (`chat_log:{collection_id}`),
+//       bo addon nie czyta stanu panelu hosta — dymki buduje z KV przy renderze.
 // =============================================================================
 
 use serde_json::{json, Value as JsonValue};
@@ -18,14 +20,18 @@ use tentaflow_sdk_spec::protocol::ui::a11y::EventKind;
 use tentaflow_sdk_spec::protocol::ui::actions::Button;
 use tentaflow_sdk_spec::protocol::ui::bind::{BindRef, PathSegment, StatePath};
 use tentaflow_sdk_spec::protocol::ui::component::{Component, HandlerMap};
-use tentaflow_sdk_spec::protocol::ui::data::{Heading, Markdown, Table, Text};
+use tentaflow_sdk_spec::protocol::ui::data::{Avatar, Badge, Heading, Markdown, Table, Tag, Text};
 use tentaflow_sdk_spec::protocol::ui::form::{FileInput, Input, Select, Textarea};
 use tentaflow_sdk_spec::protocol::ui::handler::{FailurePolicy, Handler};
+use tentaflow_sdk_spec::protocol::ui::icon_name::IconName;
 use tentaflow_sdk_spec::protocol::ui::inline::{
-    NavTab, SelectOption, SelectValue, TableColumn, TableColumnWidth,
+    AvatarRef, BorderToken, DimensionToken, IconRef, NavTab, SelectOption, SelectValue, SplitSize,
+    TableColumn, TableColumnWidth,
 };
-use tentaflow_sdk_spec::protocol::ui::layout::{NavTabs, Stack};
-use tentaflow_sdk_spec::protocol::ui::molecules::Inspector;
+use tentaflow_sdk_spec::protocol::ui::layout::{
+    Card, Cluster, Divider, NavTabs, ScrollContainer, Split, Stack,
+};
+use tentaflow_sdk_spec::protocol::ui::molecules::EmptyState;
 use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
 use tentaflow_sdk_spec::protocol::ui::patch::{PatchOp, PatchOpKind};
 use tentaflow_sdk_spec::protocol::ui::slot::{
@@ -34,9 +40,11 @@ use tentaflow_sdk_spec::protocol::ui::slot::{
 use tentaflow_sdk_spec::protocol::ui::slot_msg::SlotContent;
 use tentaflow_sdk_spec::protocol::ui::state::StatePatch;
 use tentaflow_sdk_spec::protocol::ui::tokens::{
-    ButtonSize, ButtonVariant, ColumnRender, Density, FlexAlign, InputSize, InputType, LinkTarget,
-    MarkdownFeature, NavTabsVariant, Spacing, TableSelectMode, TableVariant, TextAlign, TextStyle,
-    Tone,
+    AvatarShape, AvatarSize, BackgroundToken, BadgeVariant, ButtonSize, ButtonVariant, CardVariant,
+    ColumnRender, Density, DividerOrientation, DividerVariant, EmptyStateVariant, FlexAlign,
+    FlexJustify, InputSize, InputType, LinkTarget, MarkdownFeature, NavTabsVariant, RadiusToken,
+    ScrollOrientation, ShadowToken, Spacing, TableSelectMode, TableVariant, TagSize, TextAlign,
+    TextStyle, Tone,
 };
 use tentaflow_sdk_spec::protocol::ui::ui_payload::UiPayload;
 use tentaflow_sdk_spec::protocol::value::Value as CborValue;
@@ -52,30 +60,31 @@ extern "C" {
 
 pub const ADDON_ID: &str = "rag";
 pub const PANEL_ID: &str = "main";
-const SLOT_ID: &str = "content";
-pub const DEFAULT_TAB: &str = "collections";
+/// Slot sidebara (lista baz wiedzy) Splitu shellu.
+const SLOT_SIDEBAR: &str = "sidebar";
+/// Slot workspace (naglowek bazy + zakladki) Splitu shellu.
+const SLOT_WORKSPACE: &str = "workspace";
+pub const DEFAULT_TAB: &str = "chat";
 
-// Zakladki NavTabs.
-const TAB_COLLECTIONS: &str = "collections";
+// Zakladki workspace (NavTabs). Kolekcje nie ma juz zakladki — ich role pelni sidebar.
 const TAB_DOCUMENTS: &str = "documents";
 const TAB_CHAT: &str = "chat";
 const TAB_GRAPH: &str = "graph";
 const TAB_CONFLICTS: &str = "conflicts";
 
 // Sciezki stanu panelu (StatePath::Key). Tabele czytaja wiersze z *_rows; pola
-// formularzy bind-uja sie do *_input; wybrana kolekcja steruje zakladkami
-// Dokumenty/Czat.
+// formularzy bind-uja sie do *_input; wybrana kolekcja steruje workspace.
 const SP_ACTIVE_TAB: &str = "active_tab";
-const SP_COLLECTION_ROWS: &str = "collection_rows";
 const SP_NEW_COLLECTION: &str = "new_collection_name";
+const SP_SIDEBAR_SEARCH: &str = "sidebar_search";
+const SP_CREATE_OPEN: &str = "create_open";
 const SP_SELECTED_COLLECTION: &str = "selected_collection";
 const SP_SELECTED_COLLECTION_NAME: &str = "selected_collection_name";
+const SP_WS_DOCCOUNT: &str = "ws_doc_count";
 const SP_DOCUMENT_ROWS: &str = "document_rows";
 const SP_INGEST_SUMMARY: &str = "ingest_summary";
-const SP_CHAT_QUESTION: &str = "chat_question";
-const SP_CHAT_COLLECTION: &str = "chat_collection";
-const SP_CHAT_ANSWER: &str = "chat_answer";
-const SP_CITATION_ROWS: &str = "citation_rows";
+const SP_CHAT_INPUT: &str = "chat_input";
+const SP_CHAT_MESSAGES: &str = "chat_messages";
 const SP_GRAPH_QUERY: &str = "graph_query";
 const SP_GRAPH_CENTER: &str = "graph_center";
 const SP_NEIGHBOR_ROWS: &str = "neighbor_rows";
@@ -188,10 +197,10 @@ fn gc_session_fields() {
 /// allowlisty `set-field` i hydratacji renderu).
 const KNOWN_FIELDS: &[&str] = &[
     SP_NEW_COLLECTION,
+    SP_SIDEBAR_SEARCH,
     SP_SELECTED_COLLECTION,
     SP_SELECTED_COLLECTION_NAME,
-    SP_CHAT_QUESTION,
-    SP_CHAT_COLLECTION,
+    SP_CHAT_INPUT,
     SP_GRAPH_QUERY,
     SP_CONFLICT_STATUS,
 ];
@@ -274,65 +283,52 @@ fn set_field_handler(event: EventKind, field_key: &str) -> (EventKind, Handler) 
 }
 
 pub fn send_panel_shell() {
-    // Zakladki grafowe sa zamknięte, dopoki graf jest wylaczony — czysty RAG wektorowy
-    // nie buduje grafu wiedzy ani nie wykrywa konfliktow.
-    let graph_on = ui_graph_enabled();
-    let mut nav = NavTabs {
-        items: vec![
-            nav_tab(TAB_COLLECTIONS, "Kolekcje"),
-            nav_tab(TAB_DOCUMENTS, "Dokumenty"),
-            nav_tab(TAB_CHAT, "Czat"),
-            nav_tab_locked(TAB_GRAPH, "Graf", !graph_on),
-            nav_tab_locked(TAB_CONFLICTS, "Konflikty", !graph_on),
-        ],
-        active_id: bound(SP_ACTIVE_TAB),
-        variant: NavTabsVariant::Underlined,
-        scroll_overflow: true,
-    }
-    .into_component("nav-tabs")
-    .expect("kodowanie NavTabs");
-    nav.handlers = Some(HandlerMap(vec![backend_handler(
-        EventKind::Select,
-        "panel-navigate",
-    )]));
-
-    let body = Inspector {
-        title: lit("RAG"),
-        content_slot: SLOT_ID.into(),
-        actions: vec![],
-        tabs: None,
-        collapsible: false,
-    }
-    .into_component("content-host")
-    .expect("kodowanie Inspector");
-
-    let layout = Stack {
-        gap: Spacing::Md,
-        align: FlexAlign::Stretch,
-        children: vec![nav, body],
-        padding: None,
+    // Split: 22% sidebar (baz wiedzy) | 78% workspace (czat-first). Renderer zostawia
+    // dwa puste data-slot-id; tresc kazdego panelu idzie osobnym SlotContent ponizej.
+    let layout = Split {
+        orientation: tentaflow_sdk_spec::protocol::ui::tokens::SplitOrientation::Horizontal,
+        primary_size: SplitSize::Percent { value: 22.0 },
+        min_primary: 220,
+        max_primary: 420,
+        resizable: true,
+        primary_slot: SLOT_SIDEBAR.into(),
+        secondary_slot: SLOT_WORKSPACE.into(),
     }
     .into_component("root")
-    .expect("kodowanie Stack root");
+    .expect("kodowanie Split root");
 
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
         panel_epoch: panel_epoch(),
         layout,
-        slots: vec![SlotDecl {
-            id: SLOT_ID.into(),
-            semantics: SlotSemantics::MainContent,
-            default_state: SlotDefault::Loading,
-            cache_policy: CachePolicy::None,
-            visibility: SlotVisibility::Always,
-            max_payload_bytes: None,
-        }],
+        slots: vec![
+            SlotDecl {
+                id: SLOT_SIDEBAR.into(),
+                semantics: SlotSemantics::SidePanel,
+                default_state: SlotDefault::Loading,
+                cache_policy: CachePolicy::None,
+                visibility: SlotVisibility::Always,
+                max_payload_bytes: None,
+            },
+            SlotDecl {
+                id: SLOT_WORKSPACE.into(),
+                semantics: SlotSemantics::MainContent,
+                default_state: SlotDefault::Loading,
+                cache_policy: CachePolicy::None,
+                visibility: SlotVisibility::Always,
+                max_payload_bytes: None,
+            },
+        ],
         initial_state: initial_state_entries(),
         initial_commands: vec![],
     };
 
     send_ui(&UiPayload::PanelShell(shell));
+
+    // Split renderuje puste sloty — wypchnij tresc obu osobnym SlotContent.
+    send_sidebar();
+    send_workspace(&active_tab());
 }
 
 /// Stan poczatkowy panelu — wszystkie sciezki, ktorych dotykaja bind-y/tabele,
@@ -342,16 +338,16 @@ fn initial_state_entries() -> Vec<StateEntry> {
     let empty_str = || CborValue::Text("".into());
     vec![
         StateEntry { path: state_path(SP_ACTIVE_TAB), value: CborValue::Text(DEFAULT_TAB.into()) },
-        StateEntry { path: state_path(SP_COLLECTION_ROWS), value: empty_arr() },
         StateEntry { path: state_path(SP_NEW_COLLECTION), value: empty_str() },
+        StateEntry { path: state_path(SP_SIDEBAR_SEARCH), value: empty_str() },
+        StateEntry { path: state_path(SP_CREATE_OPEN), value: CborValue::Text("0".into()) },
         StateEntry { path: state_path(SP_SELECTED_COLLECTION), value: empty_str() },
         StateEntry { path: state_path(SP_SELECTED_COLLECTION_NAME), value: empty_str() },
+        StateEntry { path: state_path(SP_WS_DOCCOUNT), value: empty_str() },
         StateEntry { path: state_path(SP_DOCUMENT_ROWS), value: empty_arr() },
         StateEntry { path: state_path(SP_INGEST_SUMMARY), value: empty_str() },
-        StateEntry { path: state_path(SP_CHAT_QUESTION), value: empty_str() },
-        StateEntry { path: state_path(SP_CHAT_COLLECTION), value: empty_str() },
-        StateEntry { path: state_path(SP_CHAT_ANSWER), value: empty_str() },
-        StateEntry { path: state_path(SP_CITATION_ROWS), value: empty_arr() },
+        StateEntry { path: state_path(SP_CHAT_INPUT), value: empty_str() },
+        StateEntry { path: state_path(SP_CHAT_MESSAGES), value: empty_arr() },
         StateEntry { path: state_path(SP_GRAPH_QUERY), value: empty_str() },
         StateEntry { path: state_path(SP_GRAPH_CENTER), value: empty_str() },
         StateEntry { path: state_path(SP_NEIGHBOR_ROWS), value: empty_arr() },
@@ -367,109 +363,634 @@ fn initial_state_entries() -> Vec<StateEntry> {
     ]
 }
 
+/// Aktualna zakladka workspace z KV sesji (domyslnie czat). Sterowanie nawigacja
+/// trzymamy w polu sesyjnym, by re-push workspace po akcjach trafial w wlasciwy widok.
+fn active_tab() -> String {
+    field_value(SP_ACTIVE_TAB).unwrap_or_else(|| DEFAULT_TAB.to_string())
+}
+
 // =============================================================================
-// SlotContent — fragment zakladki + overlay danych (wiersze tabel)
+// SlotContent — sidebar + workspace (dwa osobne sloty Splitu)
 // =============================================================================
 
-pub fn send_tab_content(tab: &str) {
-    let fragment = build_tab(tab);
+/// Wypycha tresc sidebara (lista baz wiedzy). Overlay niesie pola sterowane bindami
+/// (search + flaga inline-create), zeby input zachowal wartosc po re-renderze.
+pub fn send_sidebar() {
+    let overlay = vec![
+        StateEntry {
+            path: state_path(SP_SIDEBAR_SEARCH),
+            value: CborValue::Text(field_value(SP_SIDEBAR_SEARCH).unwrap_or_default()),
+        },
+        StateEntry {
+            path: state_path(SP_CREATE_OPEN),
+            value: CborValue::Text(if create_open() { "1" } else { "0" }.into()),
+        },
+        StateEntry {
+            path: state_path(SP_NEW_COLLECTION),
+            value: CborValue::Text(field_value(SP_NEW_COLLECTION).unwrap_or_default()),
+        },
+    ];
+    send_ui(&UiPayload::SlotContent(SlotContent {
+        addon_id: ADDON_ID.into(),
+        panel_id: PANEL_ID.into(),
+        panel_epoch: panel_epoch(),
+        slot_id: SLOT_SIDEBAR.into(),
+        fragment: sidebar_view(),
+        state_overlay: Some(overlay),
+    }));
+}
+
+/// Wypycha tresc workspace dla zadanej zakladki. Utrwala aktywna zakladke w KV sesji
+/// (zrodlo prawdy dla re-pushy) i dolacza overlay danych/pol tej zakladki.
+pub fn send_workspace(tab: &str) {
+    set_kv(SP_ACTIVE_TAB, tab);
     let mut overlay = vec![StateEntry {
         path: state_path(SP_ACTIVE_TAB),
         value: CborValue::Text(tab.into()),
     }];
-    overlay.extend(tab_data_overlay(tab));
-    overlay.extend(tab_field_overlay(tab));
+    overlay.extend(workspace_data_overlay(tab));
+    overlay.extend(workspace_field_overlay(tab));
 
-    let slot_content = SlotContent {
+    send_ui(&UiPayload::SlotContent(SlotContent {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
         panel_epoch: panel_epoch(),
-        slot_id: SLOT_ID.into(),
-        fragment,
+        slot_id: SLOT_WORKSPACE.into(),
+        fragment: workspace_view(tab),
         state_overlay: Some(overlay),
-    };
-    send_ui(&UiPayload::SlotContent(slot_content));
+    }));
 }
 
-/// Dane (wiersze tabel) ladowane razem z fragmentem zakladki — tabele czytaja je
+/// Dane (wiersze tabel) ladowane razem z fragmentem workspace — tabele czytaja je
 /// ze sciezek stanu (rows_path), wiec overlay musi je dostarczyc przy renderze.
-fn tab_data_overlay(tab: &str) -> Vec<StateEntry> {
+fn workspace_data_overlay(tab: &str) -> Vec<StateEntry> {
+    let collection = selected_collection();
+    if collection.is_empty() {
+        return vec![];
+    }
     match tab {
-        TAB_COLLECTIONS => vec![StateEntry {
-            path: state_path(SP_COLLECTION_ROWS),
-            value: load_collection_rows(),
-        }],
-        TAB_DOCUMENTS => {
-            let collection = selected_collection();
-            let (rows, summary) = if collection.is_empty() {
-                (CborValue::Array(vec![]), CborValue::Text("Wybierz kolekcje w zakladce Kolekcje.".into()))
-            } else {
-                (load_document_rows(&collection), CborValue::Text(load_ingest_summary(&collection)))
-            };
-            vec![
-                StateEntry { path: state_path(SP_DOCUMENT_ROWS), value: rows },
-                StateEntry { path: state_path(SP_INGEST_SUMMARY), value: summary },
-            ]
-        }
+        TAB_DOCUMENTS => vec![
+            StateEntry { path: state_path(SP_DOCUMENT_ROWS), value: load_document_rows(&collection) },
+            StateEntry {
+                path: state_path(SP_INGEST_SUMMARY),
+                value: CborValue::Text(load_ingest_summary(&collection)),
+            },
+        ],
         TAB_CONFLICTS => vec![StateEntry {
             path: state_path(SP_CONFLICT_ROWS),
             value: load_conflict_rows(&conflict_status_filter()),
         }],
-        // Czat i Graf startuja puste — wypelnia je akcja uzytkownika.
         _ => vec![],
     }
 }
 
-/// HYDRATACJA pol formularza: wstawia AKTUALNA per-sesyjna wartosc pola (z KV
-/// `f:{user}:{epoch}:{field}`) do renderowanej sciezki stanu, zeby UI pokazywal to
-/// samo co backend. Bez tego po nawigacji input bylby pusty (stan panelu hosta nie
-/// zna wartosci zebranej w innej zakladce), a submit czytalby z KV — UI≠backend.
-/// Hydratujemy TYLKO pola wprowadzane przez usera w danej zakladce; selecty z
-/// wartosciami sterowanymi (kolekcja/status) tez, bo ich biezacy wybor zyje w KV.
-fn tab_field_overlay(tab: &str) -> Vec<StateEntry> {
+/// HYDRATACJA pol formularza workspace: wstawia aktualna per-sesyjna wartosc pola (z
+/// KV) do renderowanej sciezki stanu, zeby UI pokazywal to samo co backend. Naglowek
+/// workspace (nazwa bazy + licznik dokumentow + przelacznik grafu) tez jest sterowany.
+fn workspace_field_overlay(tab: &str) -> Vec<StateEntry> {
     let hydrate = |field: &str, default: &str| StateEntry {
         path: state_path(field),
         value: CborValue::Text(field_value(field).unwrap_or_else(|| default.to_string())),
     };
+    let mut entries = vec![
+        hydrate(SP_SELECTED_COLLECTION_NAME, ""),
+        StateEntry {
+            path: state_path(SP_WS_DOCCOUNT),
+            value: CborValue::Text(field_value(SP_WS_DOCCOUNT).unwrap_or_default()),
+        },
+        StateEntry {
+            path: state_path(SP_GRAPH_ENABLED),
+            value: CborValue::Text(if ui_graph_enabled() { "1" } else { "0" }.into()),
+        },
+    ];
     match tab {
-        TAB_COLLECTIONS => vec![
-            hydrate(SP_NEW_COLLECTION, ""),
-            // Przelacznik grafu czytamy z configu instancji (Durable), NIE z pola
-            // sesyjnego — to ustawienie instancji wspolne dla wszystkich userow panelu.
-            StateEntry {
-                path: state_path(SP_GRAPH_ENABLED),
-                value: CborValue::Text(if ui_graph_enabled() { "1" } else { "0" }.into()),
-            },
-        ],
-        TAB_DOCUMENTS => {
-            // Nazwa wybranej kolekcji (display) jest per-sesja — zhydratuj etykiete
-            // w tym samym formacie co `action_open_collection` ("Kolekcja: {name}").
-            let label = field_value(SP_SELECTED_COLLECTION_NAME)
-                .map(|name| format!("Kolekcja: {name}"))
-                .unwrap_or_default();
-            vec![StateEntry {
-                path: state_path(SP_SELECTED_COLLECTION_NAME),
-                value: CborValue::Text(label),
-            }]
+        TAB_CHAT => entries.push(hydrate(SP_CHAT_INPUT, "")),
+        TAB_GRAPH => entries.push(hydrate(SP_GRAPH_QUERY, "")),
+        TAB_CONFLICTS => entries.push(hydrate(SP_CONFLICT_STATUS, "open")),
+        _ => {}
+    }
+    entries
+}
+
+// =============================================================================
+// Sidebar — lista baz wiedzy (klikalne karty)
+// =============================================================================
+
+/// Czy panel inline-create kolekcji jest otwarty (KV sesji "1"/"0").
+fn create_open() -> bool {
+    field_value(SP_CREATE_OPEN).map(|v| v == "1").unwrap_or(false)
+}
+
+/// Filtr listy baz w sidebarze (substring, lowercase). Pusty => brak filtra.
+fn sidebar_filter() -> String {
+    field_value(SP_SIDEBAR_SEARCH).unwrap_or_default().to_lowercase()
+}
+
+/// Widok sidebara: naglowek + przycisk "Nowa", wyszukiwarka, lista kart kolekcji.
+/// Karty buduje JAWNIE (Sidebar.items sa plaskie — nie obsluguja bogatych itemow).
+fn sidebar_view() -> Component {
+    let title = heading("sb-title", "Bazy wiedzy");
+    let mut new_btn = Button {
+        variant: ButtonVariant::Ghost,
+        tone: Tone::Primary,
+        label: lit("Nowa"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Compact,
+    }
+    .into_component("sb-new")
+    .expect("kodowanie Button new");
+    new_btn.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Click,
+        "start-create-collection",
+    )]));
+    let header = cluster_between("sb-header", vec![title, new_btn]);
+
+    let mut search = Input {
+        r#type: InputType::Text,
+        bind_path: state_path(SP_SIDEBAR_SEARCH),
+        placeholder: Some(lit("Szukaj bazy…")),
+        label: None,
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: Some(128),
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }
+    .into_component("sb-search")
+    .expect("kodowanie Input search");
+    search.handlers = Some(HandlerMap(vec![
+        set_field_handler(EventKind::Change, SP_SIDEBAR_SEARCH),
+        backend_handler(EventKind::Change, "filter-collections"),
+    ]));
+
+    let collections = list_collections_data();
+    let filter = sidebar_filter();
+    let selected = selected_collection();
+    let graph_on = ui_graph_enabled();
+    let cards: Vec<Component> = collections
+        .iter()
+        .filter(|c| {
+            filter.is_empty()
+                || c.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&filter)
+        })
+        .enumerate()
+        .map(|(i, c)| collection_card(i, c, &selected, graph_on))
+        .collect();
+
+    let list: Component = if cards.is_empty() {
+        empty_state(
+            "sb-empty",
+            IconName::Database,
+            "Brak baz wiedzy",
+            Some("Utworz pierwsza baze przyciskiem „Nowa”."),
+            EmptyStateVariant::Compact,
+            None,
+        )
+    } else {
+        ScrollContainer {
+            orientation: ScrollOrientation::Vertical,
+            height: DimensionToken::Full,
+            max_height: None,
+            children: cards,
+            sticky_header_slot: None,
+            virtualize: false,
         }
-        TAB_CHAT => vec![
-            hydrate(SP_CHAT_QUESTION, ""),
-            hydrate(SP_CHAT_COLLECTION, ""),
+        .into_component("sb-scroll")
+        .expect("kodowanie ScrollContainer sidebar")
+    };
+
+    let mut children = vec![header, search, list];
+    if create_open() {
+        children.push(sidebar_create_card());
+    }
+    stack("tab-sidebar", children)
+}
+
+/// Pojedyncza klikalna karta kolekcji w sidebarze: nazwa + licznik dokumentow +
+/// Badge statusu grafu. Aktywna karta (id == wybrana kolekcja) dostaje akcent.
+fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) -> Component {
+    let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+    let docs = c.get("document_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    let active = !id.is_empty() && id == selected;
+
+    let info = Stack {
+        gap: Spacing::Xs,
+        align: FlexAlign::Start,
+        children: vec![
+            body_text(&format!("cc-name-{index}"), lit(name)),
+            muted_caption(&format!("cc-docs-{index}"), lit(&format!("{docs} dok"))),
         ],
-        TAB_GRAPH => vec![hydrate(SP_GRAPH_QUERY, "")],
-        TAB_CONFLICTS => vec![hydrate(SP_CONFLICT_STATUS, "open")],
-        _ => vec![],
+        padding: None,
+    }
+    .into_component(format!("cc-info-{index}"))
+    .expect("kodowanie Stack card info");
+
+    let badge = Badge {
+        variant: BadgeVariant::Dot,
+        tone: if graph_on { Tone::Success } else { Tone::Neutral },
+        label: lit(if graph_on { "graf" } else { "wektor" }),
+        icon: None,
+        count: None,
+        max: 0,
+        pulse: false,
+    }
+    .into_component(format!("cc-badge-{index}"))
+    .expect("kodowanie Badge card");
+
+    let row = cluster_between(&format!("cc-row-{index}"), vec![info, badge]);
+
+    let (variant, accent) = if active {
+        (CardVariant::Filled, Some(Tone::Primary))
+    } else {
+        (CardVariant::Ghost, None)
+    };
+    let mut card = Card {
+        variant,
+        padding: Spacing::Sm,
+        gap: Spacing::Xs,
+        radius: RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: if active { BorderToken::Accent { tone: Tone::Primary } } else { BorderToken::Hairline },
+        background: BackgroundToken::None,
+        accent,
+        children: vec![row],
+        interactive: true,
+        clickable: true,
+    }
+    .into_component(format!("cc-{index}"))
+    .expect("kodowanie Card kolekcji");
+    card.handlers = Some(HandlerMap(vec![(
+        EventKind::Click,
+        Handler::Backend {
+            action_id: "open-collection".into(),
+            params: CborMap(vec![("id".into(), CborValue::Text(id.into()))]),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    card
+}
+
+/// Inline-karta tworzenia kolekcji na dole sidebara (gdy SP_CREATE_OPEN == "1").
+fn sidebar_create_card() -> Component {
+    let name = text_input("sb-new-name", SP_NEW_COLLECTION, "", "Nazwa nowej bazy");
+    let create = action_button(
+        "sb-create-ok",
+        "Utworz",
+        "create-collection",
+        ButtonVariant::Primary,
+        Tone::Primary,
+    );
+    let cancel = action_button(
+        "sb-create-cancel",
+        "Anuluj",
+        "cancel-create-collection",
+        ButtonVariant::Ghost,
+        Tone::Neutral,
+    );
+    let actions = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![create, cancel],
+    }
+    .into_component("sb-create-actions")
+    .expect("kodowanie Cluster create");
+
+    Card {
+        variant: CardVariant::Outlined,
+        padding: Spacing::Sm,
+        gap: Spacing::Sm,
+        radius: RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Thin,
+        background: BackgroundToken::Subtle,
+        accent: None,
+        children: vec![name, actions],
+        interactive: false,
+        clickable: false,
+    }
+    .into_component("sb-create")
+    .expect("kodowanie Card create")
+}
+
+// =============================================================================
+// Workspace — naglowek bazy + NavTabs + widok aktywnej zakladki
+// =============================================================================
+
+/// Widok workspace. Bez wybranej bazy => EmptyState zachecajacy do wyboru/utworzenia.
+/// Z baza => naglowek (nazwa + licznik + przelacznik grafu + usun) + NavTabs + tresc.
+fn workspace_view(tab: &str) -> Component {
+    if selected_collection().is_empty() {
+        let new_btn = action_button(
+            "ws-empty-new",
+            "Nowa baza wiedzy",
+            "start-create-collection",
+            ButtonVariant::Primary,
+            Tone::Primary,
+        );
+        return empty_state(
+            "ws-empty",
+            IconName::Database,
+            "Wybierz baze wiedzy",
+            Some("Wybierz baze z listy po lewej albo utworz nowa, aby zaczac rozmowe."),
+            EmptyStateVariant::Illustrated,
+            Some(new_btn),
+        );
+    }
+
+    let header = workspace_header();
+    let divider = Divider {
+        orientation: DividerOrientation::Horizontal,
+        variant: DividerVariant::Subtle,
+        spacing: Spacing::Sm,
+        label: None,
+    }
+    .into_component("ws-divider")
+    .expect("kodowanie Divider");
+    let nav = workspace_nav(tab);
+    let content = match tab {
+        TAB_DOCUMENTS => documents_tab(),
+        TAB_GRAPH => graph_tab(),
+        TAB_CONFLICTS => conflicts_tab(),
+        _ => chat_view(),
+    };
+
+    stack("tab-workspace", vec![header, divider, nav, content])
+}
+
+/// Naglowek workspace: nazwa bazy + Tag z liczba dokumentow + Select grafu + Usun.
+fn workspace_header() -> Component {
+    // Heading bind do nazwy wybranej bazy (czysta nazwa, bez prefiksu "Kolekcja:").
+    let name = bound_heading("ws-name", SP_SELECTED_COLLECTION_NAME);
+
+    let doc_tag = Tag {
+        tone: Tone::Info,
+        label: bound(SP_WS_DOCCOUNT),
+        size: TagSize::Sm,
+    }
+    .into_component("ws-doctag")
+    .expect("kodowanie Tag doccount");
+
+    let mut graph_toggle = Select {
+        bind_path: state_path(SP_GRAPH_ENABLED),
+        options: graph_enabled_options(),
+        placeholder: None,
+        label: None,
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Sm,
+        groups: None,
+    }
+    .into_component("ws-graph-toggle")
+    .expect("kodowanie Select graph");
+    graph_toggle.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Change,
+        "set-graph-enabled",
+    )]));
+
+    let delete = action_button(
+        "ws-delete",
+        "Usun baze",
+        "delete-collection",
+        ButtonVariant::Ghost,
+        Tone::Critical,
+    );
+
+    let left = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![name, doc_tag],
+    }
+    .into_component("ws-header-left")
+    .expect("kodowanie Cluster header left");
+    let right = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::End,
+        children: vec![graph_toggle, delete],
+    }
+    .into_component("ws-header-right")
+    .expect("kodowanie Cluster header right");
+
+    cluster_between("ws-header", vec![left, right])
+}
+
+/// NavTabs workspace. Graf/Konflikty sa locked, gdy warstwa grafu jest wylaczona.
+fn workspace_nav(_tab: &str) -> Component {
+    let graph_on = ui_graph_enabled();
+    let mut nav = NavTabs {
+        items: vec![
+            nav_tab(TAB_CHAT, "Czat"),
+            nav_tab(TAB_DOCUMENTS, "Dokumenty"),
+            nav_tab_locked(TAB_GRAPH, "Graf", !graph_on),
+            nav_tab_locked(TAB_CONFLICTS, "Konflikty", !graph_on),
+        ],
+        active_id: bound(SP_ACTIVE_TAB),
+        variant: NavTabsVariant::Underlined,
+        scroll_overflow: true,
+    }
+    .into_component("ws-nav")
+    .expect("kodowanie NavTabs workspace");
+    nav.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Select,
+        "panel-navigate",
+    )]));
+    nav
+}
+
+// =============================================================================
+// Czat — dymki z historii (KV) + pasek wejscia
+// =============================================================================
+
+/// Widok czatu: przewijalna lista dymkow z historii KV + pinowany pasek wejscia.
+fn chat_view() -> Component {
+    let collection = selected_collection();
+    let log = load_chat_log(&collection);
+
+    let bubbles: Vec<Component> = log
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if role.is_empty() {
+                return None;
+            }
+            Some(message_bubble(i, role, content))
+        })
+        .collect();
+
+    let scroll: Component = if bubbles.is_empty() {
+        empty_state(
+            "chat-empty",
+            IconName::Chat,
+            "Zadaj pierwsze pytanie",
+            Some("Np. „Podsumuj kluczowe wnioski z dokumentow w tej bazie.”"),
+            EmptyStateVariant::Default,
+            None,
+        )
+    } else {
+        ScrollContainer {
+            orientation: ScrollOrientation::Vertical,
+            height: DimensionToken::Full,
+            max_height: None,
+            children: bubbles,
+            sticky_header_slot: None,
+            virtualize: false,
+        }
+        .into_component("chat-scroll")
+        .expect("kodowanie ScrollContainer chat")
+    };
+
+    let mut input = Textarea {
+        bind_path: state_path(SP_CHAT_INPUT),
+        placeholder: Some(lit("Zadaj pytanie…")),
+        label: None,
+        hint: None,
+        validators: vec![],
+        max_length: Some(4096),
+        min_length: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+        rows: 2,
+        autoresize: true,
+        max_rows: Some(8),
+        monospace: false,
+    }
+    .into_component("chat-input")
+    .expect("kodowanie Textarea chat");
+    input.handlers = Some(HandlerMap(vec![
+        set_field_handler(EventKind::Change, SP_CHAT_INPUT),
+        set_field_handler(EventKind::Submit, SP_CHAT_INPUT),
+    ]));
+
+    let send = action_button(
+        "chat-send",
+        "Wyslij",
+        "ask-question",
+        ButtonVariant::Primary,
+        Tone::Primary,
+    );
+    let input_bar = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::End,
+        justify: FlexJustify::Start,
+        children: vec![input, send],
+    }
+    .into_component("chat-input-bar")
+    .expect("kodowanie Cluster input bar");
+
+    stack("tab-chat", vec![scroll, input_bar])
+}
+
+/// Dymek wiadomosci. user => karta wyrownana do prawej z akcentem; assistant =>
+/// avatar + karta z Markdownem wyrownana do lewej.
+fn message_bubble(index: usize, role: &str, content: &str) -> Component {
+    if role == "user" {
+        let card = Card {
+            variant: CardVariant::Filled,
+            padding: Spacing::Sm,
+            gap: Spacing::Xs,
+            radius: RadiusToken::Lg,
+            shadow: ShadowToken::None,
+            border: BorderToken::None,
+            background: BackgroundToken::Accent,
+            accent: Some(Tone::Primary),
+            children: vec![body_text(&format!("msg-u-{index}"), lit(content))],
+            interactive: false,
+            clickable: false,
+        }
+        .into_component(format!("msg-card-{index}"))
+        .expect("kodowanie Card user");
+        Cluster {
+            gap: Spacing::Sm,
+            align: FlexAlign::Start,
+            justify: FlexJustify::End,
+            children: vec![card],
+        }
+        .into_component(format!("msg-{index}"))
+        .expect("kodowanie Cluster user bubble")
+    } else {
+        let avatar = Avatar {
+            source: AvatarRef::Initials { initials: "AI".into() },
+            size: AvatarSize::Sm,
+            shape: AvatarShape::Circle,
+            status: None,
+            tone: Some(Tone::Primary),
+        }
+        .into_component(format!("msg-av-{index}"))
+        .expect("kodowanie Avatar");
+        let card = Card {
+            variant: CardVariant::Filled,
+            padding: Spacing::Sm,
+            gap: Spacing::Xs,
+            radius: RadiusToken::Lg,
+            shadow: ShadowToken::None,
+            border: BorderToken::None,
+            background: BackgroundToken::Subtle,
+            accent: None,
+            children: vec![chat_markdown(&format!("msg-md-{index}"), content)],
+            interactive: false,
+            clickable: false,
+        }
+        .into_component(format!("msg-card-{index}"))
+        .expect("kodowanie Card assistant");
+        Cluster {
+            gap: Spacing::Sm,
+            align: FlexAlign::Start,
+            justify: FlexJustify::Start,
+            children: vec![avatar, card],
+        }
+        .into_component(format!("msg-{index}"))
+        .expect("kodowanie Cluster assistant bubble")
     }
 }
 
-fn build_tab(tab: &str) -> Component {
-    match tab {
-        TAB_DOCUMENTS => documents_tab(),
-        TAB_CHAT => chat_tab(),
-        TAB_GRAPH => graph_tab(),
-        TAB_CONFLICTS => conflicts_tab(),
-        _ => collections_tab(),
+/// Markdown odpowiedzi asystenta (literal — tresc juz wbudowana w dymek z KV).
+fn chat_markdown(id: &str, content: &str) -> Component {
+    Markdown {
+        content: lit(content),
+        allowed_features: vec![
+            MarkdownFeature::Heading,
+            MarkdownFeature::List,
+            MarkdownFeature::CodeBlock,
+            MarkdownFeature::CodeInline,
+            MarkdownFeature::Blockquote,
+            MarkdownFeature::Emphasis,
+            MarkdownFeature::Strong,
+            MarkdownFeature::Link,
+        ],
+        max_height_px: None,
+        link_target: LinkTarget::BlankViaCommand,
     }
+    .into_component(id)
+    .expect("kodowanie Markdown chat")
 }
 
 // =============================================================================
@@ -485,6 +1006,51 @@ fn heading(id: &str, content: &str) -> Component {
     }
     .into_component(id)
     .expect("kodowanie Heading")
+}
+
+/// Naglowek z trescia bind-owana do sciezki stanu (nazwa wybranej bazy).
+fn bound_heading(id: &str, key: &str) -> Component {
+    Heading {
+        content: bound(key),
+        level: 3,
+        tone: None,
+        align: None,
+    }
+    .into_component(id)
+    .expect("kodowanie Heading bound")
+}
+
+/// Cluster z trescia rozsunieta na krawedzie (space-between) — naglowki sidebara/workspace.
+fn cluster_between(id: &str, children: Vec<Component>) -> Component {
+    Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::SpaceBetween,
+        children,
+    }
+    .into_component(id)
+    .expect("kodowanie Cluster between")
+}
+
+/// EmptyState z opcjonalnym przyciskiem akcji glownej. Ikona nazwana (sprite SDK).
+fn empty_state(
+    id: &str,
+    icon: IconName,
+    heading_text: &str,
+    message: Option<&str>,
+    variant: EmptyStateVariant,
+    primary: Option<Component>,
+) -> Component {
+    EmptyState {
+        icon: IconRef::Named { name: icon, size: None, tone: None },
+        heading: lit(heading_text),
+        message: message.map(lit),
+        primary_action: primary,
+        secondary_action: None,
+        variant,
+    }
+    .into_component(id)
+    .expect("kodowanie EmptyState")
 }
 
 fn body_text(id: &str, content: BindRef) -> Component {
@@ -649,90 +1215,7 @@ fn row_action(id: &str, label: &str, action_id: &str, tone: Tone) -> Component {
 }
 
 // =============================================================================
-// Zakladka 1 — Kolekcje
-// =============================================================================
-
-fn collections_tab() -> Component {
-    let new_name = text_input("col-new-name", SP_NEW_COLLECTION, "Nowa kolekcja", "Nazwa kolekcji");
-    let create = action_button(
-        "col-create",
-        "Utworz kolekcje",
-        "create-collection",
-        ButtonVariant::Primary,
-        Tone::Neutral,
-    );
-    let refresh = action_button("col-refresh", "Odswiez", "refresh-collections", ButtonVariant::Secondary, Tone::Neutral);
-
-    // Przelacznik warstwy grafu (MemGraphRAG) per-instancja. Select on/off (renderer
-    // SDK), wartosc bind-owana do SP_GRAPH_ENABLED i hydratowana ze stanu instancji.
-    // Zmiana -> action `set-graph-enabled`, ktora utrwala config i przerenderowuje shell
-    // (zakladki Graf/Konflikty pojawiaja sie / znikaja).
-    let graph_on = ui_graph_enabled();
-    let mut graph_toggle = Select {
-        bind_path: state_path(SP_GRAPH_ENABLED),
-        options: graph_enabled_options(),
-        placeholder: None,
-        label: Some(lit("Baza grafowa (MemGraphRAG)")),
-        searchable: false,
-        clearable: false,
-        virtualize: false,
-        disabled: None,
-        size: InputSize::Md,
-        groups: None,
-    }
-    .into_component("col-graph-toggle")
-    .expect("kodowanie Select graph");
-    graph_toggle.handlers = Some(HandlerMap(vec![backend_handler(
-        EventKind::Change,
-        "set-graph-enabled",
-    )]));
-
-    // Opis DLACZEGO graf jest opcjonalny + status ON/OFF + ostrzezenie o braku
-    // wstecznej ekstrakcji (graf buduje sie przy NOWYCH ingestach / po re-ingescie).
-    let graph_status = if graph_on { "WLACZONA" } else { "WYLACZONA" };
-    let graph_help = muted_caption(
-        "col-graph-help",
-        lit(&format!(
-            "Status: {graph_status}. Wlaczona warstwa grafu (MemGraphRAG) ekstrahuje encje i \
-             relacje z dokumentow (przez LLM) i daje lepsze odpowiedzi wielohopowe, ale spowalnia \
-             ingest. Wylaczona = czysty RAG wektorowy (szybszy ingest, retrieval po podobienstwie). \
-             Uwaga: wlaczenie grafu NIE ekstrahuje wstecznie juz zaingestowanych dokumentow — graf \
-             zbuduje sie przy nowych ingestach lub po ponownym wgraniu dokumentu.",
-        )),
-    );
-
-    let tbl = table(
-        "col-table",
-        SP_COLLECTION_ROWS,
-        "id",
-        vec![
-            col("c-name", "Nazwa", "name", TableColumnWidth::Fr { value: 3 }),
-            col("c-docs", "Dokumenty", "document_count", TableColumnWidth::Fr { value: 1 }),
-            col("c-created", "Utworzono", "created", TableColumnWidth::Fr { value: 2 }),
-        ],
-        vec![
-            row_action("col-open", "Otworz", "open-collection", Tone::Primary),
-            row_action("col-delete", "Usun", "delete-collection", Tone::Critical),
-        ],
-    );
-
-    stack(
-        "tab-collections",
-        vec![
-            heading("col-heading", "Kolekcje"),
-            muted_caption("col-status", bound(SP_STATUS_MESSAGE)),
-            new_name,
-            create,
-            refresh,
-            graph_toggle,
-            graph_help,
-            tbl,
-        ],
-    )
-}
-
-// =============================================================================
-// Zakladka 2 — Dokumenty + status ingestu
+// Zakladka — Dokumenty + status ingestu
 // =============================================================================
 
 fn documents_tab() -> Component {
@@ -806,105 +1289,7 @@ fn documents_tab() -> Component {
 }
 
 // =============================================================================
-// Zakladka 3 — Czat + cytaty
-// =============================================================================
-
-fn chat_tab() -> Component {
-    let mut collection_select = Select {
-        bind_path: state_path(SP_CHAT_COLLECTION),
-        options: collection_select_options(),
-        placeholder: Some(lit("Wybierz kolekcje")),
-        label: Some(lit("Kolekcja")),
-        searchable: true,
-        clearable: false,
-        virtualize: false,
-        disabled: None,
-        size: InputSize::Md,
-        groups: None,
-    }
-    .into_component("chat-collection")
-    .expect("kodowanie Select");
-    collection_select.handlers = Some(HandlerMap(vec![set_field_handler(
-        EventKind::Change,
-        SP_CHAT_COLLECTION,
-    )]));
-
-    let mut question = Textarea {
-        bind_path: state_path(SP_CHAT_QUESTION),
-        placeholder: Some(lit("Zadaj pytanie do kolekcji...")),
-        label: Some(lit("Pytanie")),
-        hint: None,
-        validators: vec![],
-        max_length: Some(4096),
-        min_length: None,
-        disabled: None,
-        readonly: None,
-        error: None,
-        size: InputSize::Md,
-        rows: 3,
-        autoresize: true,
-        max_rows: Some(8),
-        monospace: false,
-    }
-    .into_component("chat-question")
-    .expect("kodowanie Textarea");
-    question.handlers = Some(HandlerMap(vec![set_field_handler(
-        EventKind::Change,
-        SP_CHAT_QUESTION,
-    )]));
-
-    let ask = action_button("chat-ask", "Zapytaj", "ask-question", ButtonVariant::Primary, Tone::Neutral);
-
-    // Odpowiedz jako Markdown (LLM zwraca tekst/markdown).
-    let answer = Markdown {
-        content: bound(SP_CHAT_ANSWER),
-        allowed_features: vec![
-            MarkdownFeature::Heading,
-            MarkdownFeature::List,
-            MarkdownFeature::CodeBlock,
-            MarkdownFeature::CodeInline,
-            MarkdownFeature::Blockquote,
-            MarkdownFeature::Emphasis,
-            MarkdownFeature::Strong,
-            MarkdownFeature::Link,
-        ],
-        max_height_px: None,
-        link_target: LinkTarget::BlankViaCommand,
-    }
-    .into_component("chat-answer")
-    .expect("kodowanie Markdown");
-
-    let citations = table(
-        "chat-citations",
-        SP_CITATION_ROWS,
-        "key",
-        vec![
-            col("ci-doc", "Dokument", "doc_id", TableColumnWidth::Fr { value: 2 }),
-            col("ci-chunk", "Chunk", "chunk_index", TableColumnWidth::Fr { value: 1 }),
-            col("ci-score", "Wynik", "score", TableColumnWidth::Fr { value: 1 }),
-            col("ci-text", "Pasaz", "text", TableColumnWidth::Fr { value: 5 }),
-        ],
-        vec![],
-    );
-
-    stack(
-        "tab-chat",
-        vec![
-            heading("chat-heading", "Czat"),
-            muted_caption("chat-status", bound(SP_STATUS_MESSAGE)),
-            collection_select,
-            question,
-            ask,
-            heading("chat-answer-heading", "Odpowiedz"),
-            answer,
-            heading("chat-cit-heading", "Cytaty"),
-            citations,
-        ],
-    )
-}
-
-// =============================================================================
-// Zakladka 4 — Graf (explorer)
+// Zakladka — Graf (explorer)
 // =============================================================================
 
 fn graph_tab() -> Component {
@@ -1096,26 +1481,60 @@ fn rows_to_cbor(rows: Vec<JsonValue>) -> CborValue {
     CborValue::Array(rows.iter().map(cbor_from_json).collect())
 }
 
-fn load_collection_rows() -> CborValue {
+/// Surowa lista kolekcji (id, name, document_count, created_at) z read-toola.
+/// Sidebar buduje z niej jawne karty (filtr + akcent aktywnej).
+fn list_collections_data() -> Vec<JsonValue> {
     let res = crate::handle_list_collections();
-    let cols = res
-        .get("data")
+    res.get("data")
         .and_then(|d| d.get("collections"))
         .and_then(|c| c.as_array())
         .cloned()
-        .unwrap_or_default();
-    let rows: Vec<JsonValue> = cols
+        .unwrap_or_default()
+}
+
+/// Liczba dokumentow w kolekcji (z read-toola) jako tekst do Tag-a w naglowku workspace.
+fn collection_doc_count(id: &str) -> i64 {
+    list_collections_data()
         .iter()
-        .map(|c| {
-            json!({
-                "id": c.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "name": c.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-                "document_count": c.get("document_count").and_then(|v| v.as_i64()).unwrap_or(0),
-                "created": fmt_ts(c.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0)),
-            })
-        })
-        .collect();
-    rows_to_cbor(rows)
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(id))
+        .and_then(|c| c.get("document_count").and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+// =============================================================================
+// Historia czatu w KV (`chat_log:{collection_id}`) — addon nie czyta stanu panelu,
+// wiec dymki buduje z KV. Wartosc to JSON array {id, role, content}.
+// =============================================================================
+
+/// Klucz KV historii czatu danej bazy (per-sesja, jak pozostale pola panelu).
+fn chat_log_key(collection_id: &str) -> String {
+    session_key(&format!("chat_log:{collection_id}"))
+}
+
+/// Wczytuje historie czatu bazy z KV (pusta gdy brak/niepoprawny JSON).
+fn load_chat_log(collection_id: &str) -> Vec<JsonValue> {
+    if collection_id.is_empty() {
+        return vec![];
+    }
+    crate::state_get(&chat_log_key(collection_id))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<Vec<JsonValue>>(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Dopisuje wiadomosc {role, content} do historii czatu bazy w KV (Ephemeral).
+fn append_chat_message(collection_id: &str, role: &str, content: &str) {
+    let mut log = load_chat_log(collection_id);
+    let id = log.len();
+    log.push(json!({ "id": id, "role": role, "content": content }));
+    if let Ok(bytes) = serde_json::to_vec(&log) {
+        let _ = crate::state_set(
+            &chat_log_key(collection_id),
+            &bytes,
+            crate::StateTier::Ephemeral,
+        );
+    }
 }
 
 fn load_document_rows(collection_id: &str) -> CborValue {
@@ -1196,31 +1615,6 @@ fn load_conflict_rows(status: &str) -> CborValue {
     rows_to_cbor(rows)
 }
 
-/// Opcje Select kolekcji (czat) — z handle_list_collections.
-fn collection_select_options() -> Vec<SelectOption> {
-    let res = crate::handle_list_collections();
-    res.get("data")
-        .and_then(|d| d.get("collections"))
-        .and_then(|c| c.as_array())
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| {
-                    let id = c.get("id").and_then(|v| v.as_str())?;
-                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-                    Some(SelectOption {
-                        value: SelectValue::Text(id.to_string()),
-                        label: lit(name),
-                        icon: None,
-                        disabled: false,
-                        group_id: None,
-                        description: None,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn conflict_status_options() -> Vec<SelectOption> {
     let opt = |value: &str, label: &str| SelectOption {
         value: SelectValue::Text(value.to_string()),
@@ -1257,35 +1651,6 @@ fn graph_enabled_options() -> Vec<SelectOption> {
     ]
 }
 
-/// Skrocony format znacznika czasu (sekundy uniksowe -> ISO-podobny tekst). Bez
-/// zewnetrznych crateow daty — w GUI wystarczy sekundowy epoch jako liczba dni/godzin.
-fn fmt_ts(unix: i64) -> String {
-    if unix <= 0 {
-        return "-".to_string();
-    }
-    // Prosty rozklad na YYYY-MM-DD HH:MM (UTC) bez crate'ow — wystarczajacy do listy.
-    let days = unix / 86_400;
-    let secs_of_day = unix % 86_400;
-    let (h, m) = (secs_of_day / 3600, (secs_of_day % 3600) / 60);
-    // Liczymy date od 1970-01-01 (algorytm cywilny, proleptyczny gregorianski).
-    let (y, mo, d) = civil_from_days(days);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
-}
-
-/// Konwersja liczby dni od epoki na (rok, miesiac, dzien) — algorytm Howarda Hinnanta.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
 // =============================================================================
 // Akcje UI — host wola "ui.main.<action>" -> tu -> read/write tool -> StatePatch
 // =============================================================================
@@ -1302,11 +1667,24 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
                 .and_then(|v| v.as_str())
                 .unwrap_or(DEFAULT_TAB)
                 .to_string();
-            send_tab_content(&tab);
+            send_workspace(&tab);
             json!({"ok": true, "tab": tab})
         }
-        "refresh-collections" => {
-            send_tab_content(TAB_COLLECTIONS);
+        "start-create-collection" => {
+            set_kv(SP_CREATE_OPEN, "1");
+            send_sidebar();
+            json!({"ok": true})
+        }
+        "cancel-create-collection" => {
+            set_kv(SP_CREATE_OPEN, "0");
+            set_kv(SP_NEW_COLLECTION, "");
+            send_sidebar();
+            json!({"ok": true})
+        }
+        "filter-collections" => {
+            // Wartosc wyszukiwarki zostala juz zapisana do KV przez `set-field`;
+            // filtr tylko przerenderowuje sidebar wg aktualnego SP_SIDEBAR_SEARCH.
+            send_sidebar();
             json!({"ok": true})
         }
         "set-graph-enabled" => action_set_graph_enabled(params),
@@ -1314,7 +1692,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "delete-collection" => action_delete_collection(params),
         "open-collection" => action_open_collection(params),
         "refresh-documents" => {
-            send_tab_content(TAB_DOCUMENTS);
+            send_workspace(TAB_DOCUMENTS);
             json!({"ok": true})
         }
         "delete-document" => action_delete_document(params),
@@ -1324,7 +1702,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "filter-conflicts" => {
             // Wartosc selecta zostala juz zapisana do KV przez `set-field` (on-change);
             // filtr tylko przerenderowuje zakladke wg aktualnego SP_CONFLICT_STATUS.
-            send_tab_content(TAB_CONFLICTS);
+            send_workspace(TAB_CONFLICTS);
             json!({"ok": true})
         }
         "conflict-detail" => action_conflict_detail(params),
@@ -1352,10 +1730,10 @@ fn action_set_graph_enabled(params: &JsonValue) -> JsonValue {
     ) {
         return json!({"ok": false, "error": format!("Zapis ustawienia grafu nieudany: {e:?}")});
     }
-    // Re-render shell: zakladki grafowe zmieniaja stan locked; po nim re-render zakladki
-    // Kolekcje, by przelacznik i opis statusu pokazaly nowa wartosc.
-    send_panel_shell();
-    send_tab_content(TAB_COLLECTIONS);
+    // Re-render: sidebar (Badge grafu na kartach) + workspace (NavTabs Graf/Konflikty
+    // zmieniaja stan locked, przelacznik pokazuje nowa wartosc) na aktualnej zakladce.
+    send_sidebar();
+    send_workspace(&active_tab());
     json!({"ok": true, "graph_enabled": on})
 }
 
@@ -1408,8 +1786,8 @@ fn is_known_field(field: &str) -> bool {
     matches!(
         field,
         SP_NEW_COLLECTION
-            | SP_CHAT_QUESTION
-            | SP_CHAT_COLLECTION
+            | SP_SIDEBAR_SEARCH
+            | SP_CHAT_INPUT
             | SP_GRAPH_QUERY
             | SP_CONFLICT_STATUS
     )
@@ -1445,7 +1823,7 @@ fn parse_upload_detail(params: &JsonValue) -> Result<(String, String, String), S
 fn action_ingest_uploaded(params: &JsonValue) -> JsonValue {
     let collection = selected_collection();
     if collection.is_empty() {
-        patch_status("Najpierw otworz kolekcje (zakladka Kolekcje -> Otworz).");
+        patch_status("Najpierw wybierz baze wiedzy w panelu po lewej.");
         return json!({"ok": false, "error": "brak wybranej kolekcji"});
     }
     let (doc_ref, mime, filename) = match parse_upload_detail(params) {
@@ -1470,11 +1848,12 @@ fn action_ingest_uploaded(params: &JsonValue) -> JsonValue {
             .and_then(|c| c.as_i64())
             .unwrap_or(0);
         patch_status(&format!("Zingestowano '{filename}' ({chunks} chunkow)."));
-        send_tab_content(TAB_DOCUMENTS);
+        refresh_ws_doc_count(&collection);
+        send_workspace(TAB_DOCUMENTS);
     } else {
         patch_status(&format!("Ingest '{filename}': {}", error_text(&res)));
         // Odswiez liste (dokument moze byc w stanie failed z artefaktami statusu).
-        send_tab_content(TAB_DOCUMENTS);
+        send_workspace(TAB_DOCUMENTS);
     }
     res
 }
@@ -1491,26 +1870,42 @@ fn action_create_collection(_params: &JsonValue) -> JsonValue {
     };
     let res = crate::handle_create_collection(&json!({ "name": name }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        patch_status(&format!("Utworzono kolekcje '{name}'."));
-        // Wyczysc pole nazwy w KV i w widoku po udanym utworzeniu.
+        patch_status(&format!("Utworzono baze '{name}'."));
+        // Zamknij inline-create i wyczysc pole nazwy; nowa kolekcja staje sie aktywna,
+        // wiec ustaw wybor i otworz workspace na czacie.
         set_kv(SP_NEW_COLLECTION, "");
-        patch_set(SP_NEW_COLLECTION, CborValue::Text("".into()));
-        send_tab_content(TAB_COLLECTIONS);
+        set_kv(SP_CREATE_OPEN, "0");
+        if let Some(id) = res
+            .get("data")
+            .and_then(|d| d.get("collection_id"))
+            .and_then(|v| v.as_str())
+        {
+            select_collection(id, &name);
+        }
+        send_sidebar();
+        send_workspace(TAB_CHAT);
     } else {
         patch_status(&error_text(&res));
+        send_sidebar();
     }
     res
 }
 
-fn action_delete_collection(params: &JsonValue) -> JsonValue {
-    let id = match row_key(params, "id") {
-        Some(id) => id,
-        None => return json!({"ok": false, "error": "brak collection_id"}),
-    };
+fn action_delete_collection(_params: &JsonValue) -> JsonValue {
+    // Usuwamy AKTUALNIE wybrana baze (przycisk w naglowku workspace), nie wiersz tabeli.
+    let id = selected_collection();
+    if id.is_empty() {
+        return json!({"ok": false, "error": "brak wybranej kolekcji"});
+    }
     let res = crate::handle_delete_collection(&json!({ "collection_id": id }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        patch_status("Usunieto kolekcje.");
-        send_tab_content(TAB_COLLECTIONS);
+        patch_status("Usunieto baze wiedzy.");
+        // Wyczysc wybor — workspace wroci do EmptyState.
+        set_kv(SP_SELECTED_COLLECTION, "");
+        set_kv(SP_SELECTED_COLLECTION_NAME, "");
+        set_kv(SP_WS_DOCCOUNT, "");
+        send_sidebar();
+        send_workspace(TAB_CHAT);
     } else {
         patch_status(&error_text(&res));
     }
@@ -1522,14 +1917,25 @@ fn action_open_collection(params: &JsonValue) -> JsonValue {
         Some(id) => id,
         None => return json!({"ok": false, "error": "brak collection_id"}),
     };
-    // Nazwa kolekcji do podgladu w naglowku zakladki Dokumenty.
     let name = collection_name(&id).unwrap_or_else(|| id.clone());
-    set_kv(SP_SELECTED_COLLECTION, &id);
-    set_kv(SP_SELECTED_COLLECTION_NAME, &name);
-    patch_set(SP_SELECTED_COLLECTION, CborValue::Text(id.clone()));
-    patch_set(SP_SELECTED_COLLECTION_NAME, CborValue::Text(format!("Kolekcja: {name}")));
-    send_tab_content(TAB_DOCUMENTS);
+    select_collection(&id, &name);
+    // Re-push sidebar (akcent aktywnej karty) + workspace na czacie (domyslna zakladka).
+    send_sidebar();
+    send_workspace(TAB_CHAT);
     json!({"ok": true, "collection_id": id})
+}
+
+/// Ustawia wybrana baze w KV sesji: id, czysta nazwa i licznik dokumentow do naglowka.
+fn select_collection(id: &str, name: &str) {
+    set_kv(SP_SELECTED_COLLECTION, id);
+    set_kv(SP_SELECTED_COLLECTION_NAME, name);
+    refresh_ws_doc_count(id);
+}
+
+/// Odswieza licznik dokumentow wybranej bazy (Tag w naglowku workspace).
+fn refresh_ws_doc_count(id: &str) {
+    let count = collection_doc_count(id);
+    set_kv(SP_WS_DOCCOUNT, &format!("{count} dok"));
 }
 
 fn action_delete_document(params: &JsonValue) -> JsonValue {
@@ -1540,7 +1946,8 @@ fn action_delete_document(params: &JsonValue) -> JsonValue {
     let res = crate::handle_delete_document(&json!({ "document_id": id }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         patch_status("Usunieto dokument.");
-        send_tab_content(TAB_DOCUMENTS);
+        refresh_ws_doc_count(&selected_collection());
+        send_workspace(TAB_DOCUMENTS);
     } else {
         patch_status(&error_text(&res));
     }
@@ -1548,61 +1955,40 @@ fn action_delete_document(params: &JsonValue) -> JsonValue {
 }
 
 fn action_ask(_params: &JsonValue) -> JsonValue {
-    // Pytanie i kolekcja czytane z KV (zapisane przez `set-field` on-change).
-    let question = match field_value(SP_CHAT_QUESTION) {
+    // Pytanie z KV (zapisane przez `set-field`); kolekcja z aktualnego wyboru sidebara.
+    let question = match field_value(SP_CHAT_INPUT) {
         Some(q) => q,
         None => {
             patch_status("Wpisz pytanie.");
             return json!({"ok": false, "error": "brak pytania"});
         }
     };
-    let collection = field_value(SP_CHAT_COLLECTION).or_else(|| {
-        let s = selected_collection();
-        if s.is_empty() { None } else { Some(s) }
-    });
-    let collection = match collection {
-        Some(c) => c,
-        None => {
-            patch_status("Wybierz kolekcje do pytania.");
-            return json!({"ok": false, "error": "brak kolekcji"});
-        }
-    };
+    let collection = selected_collection();
+    if collection.is_empty() {
+        patch_status("Wybierz baze wiedzy do pytania.");
+        return json!({"ok": false, "error": "brak kolekcji"});
+    }
+
+    // Dopisz pytanie usera do historii i wyczysc pole wejscia (UI + KV).
+    append_chat_message(&collection, "user", &question);
+    set_kv(SP_CHAT_INPUT, "");
 
     patch_status("Pytanie w toku...");
     let res = crate::handle_ask(&json!({ "collection_id": collection, "question": question }));
-    if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        patch_status(&error_text(&res));
-        patch_set(SP_CHAT_ANSWER, CborValue::Text("".into()));
-        patch_set(SP_CITATION_ROWS, CborValue::Array(vec![]));
-        return res;
-    }
-    let answer = res
-        .get("data")
-        .and_then(|d| d.get("answer"))
-        .and_then(|a| a.as_str())
-        .unwrap_or("");
-    let citations = res
-        .get("data")
-        .and_then(|d| d.get("citations"))
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let rows: Vec<JsonValue> = citations
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            json!({
-                "key": format!("cit-{i}"),
-                "doc_id": c.get("doc_id").and_then(|v| v.as_str()).unwrap_or(""),
-                "chunk_index": c.get("chunk_index").and_then(|v| v.as_i64()).unwrap_or(0),
-                "score": fmt_score(c.get("score")),
-                "text": truncate_chars(c.get("text").and_then(|v| v.as_str()).unwrap_or(""), 300),
-            })
-        })
-        .collect();
-    patch_set(SP_CHAT_ANSWER, CborValue::Text(answer.to_string()));
-    patch_set(SP_CITATION_ROWS, rows_to_cbor(rows));
-    patch_status(&format!("Gotowe — {} cytatow.", citations.len()));
+    let answer = if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        res.get("data")
+            .and_then(|d| d.get("answer"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        // Blad zapisujemy jako dymek asystenta, zeby kontekst rozmowy byl spojny.
+        format!("Blad: {}", error_text(&res))
+    };
+    append_chat_message(&collection, "assistant", &answer);
+    patch_status("Gotowe.");
+    // Przebuduj workspace na czacie — dymki czyta z KV historii.
+    send_workspace(TAB_CHAT);
     res
 }
 
@@ -1724,7 +2110,7 @@ fn action_approve_escalated(params: &JsonValue) -> JsonValue {
     }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         patch_status("Konflikt rozstrzygniety (keep_winner).");
-        send_tab_content(TAB_CONFLICTS);
+        send_workspace(TAB_CONFLICTS);
     } else {
         patch_status(&error_text(&res));
     }
@@ -1740,7 +2126,7 @@ fn action_run_agent(_params: &JsonValue, tool: &str, label: &str) -> JsonValue {
     };
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         patch_status(&format!("{label}: wykonano."));
-        send_tab_content(TAB_CONFLICTS);
+        send_workspace(TAB_CONFLICTS);
     } else {
         patch_status(&format!("{label}: {}", error_text(&res)));
     }
@@ -1870,23 +2256,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn civil_from_days_matches_known_dates() {
-        // 1970-01-01 = dzien 0.
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2000-03-01 = dzien 11017 (po przestepnym lutym 2000).
-        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
-    }
-
-    #[test]
-    fn fmt_ts_formats_epoch_and_handles_zero() {
-        assert_eq!(fmt_ts(0), "-");
-        assert_eq!(fmt_ts(-5), "-");
-        // 1700000000 = 2023-11-14 22:13 UTC.
-        let s = fmt_ts(1_700_000_000);
-        assert!(s.starts_with("2023-11-14"), "got: {s}");
-    }
-
-    #[test]
     fn fmt_score_rounds_and_handles_missing() {
         assert_eq!(fmt_score(Some(&json!(0.123456))), "0.123");
         assert_eq!(fmt_score(Some(&json!(1))), "1.000");
@@ -1908,17 +2277,17 @@ mod tests {
         // Allowlista pol formularza zapisywanych przez `set-field`.
         for f in [
             SP_NEW_COLLECTION,
-            SP_CHAT_QUESTION,
-            SP_CHAT_COLLECTION,
+            SP_SIDEBAR_SEARCH,
+            SP_CHAT_INPUT,
             SP_GRAPH_QUERY,
             SP_CONFLICT_STATUS,
         ] {
             assert!(is_known_field(f), "pole {f} powinno byc dozwolone");
         }
-        // Klucze stanu NIE bedace polami formularza (np. wybrana kolekcja, wiersze) sa
+        // Klucze stanu NIE bedace polami formularza (np. wybrana kolekcja, doc-count) sa
         // odrzucane — set-field nie moze pisac dowolnego klucza KV.
         assert!(!is_known_field(SP_SELECTED_COLLECTION));
-        assert!(!is_known_field(SP_COLLECTION_ROWS));
+        assert!(!is_known_field(SP_WS_DOCCOUNT));
         assert!(!is_known_field("dowolny_inny_klucz"));
     }
 
@@ -2021,7 +2390,7 @@ mod tests {
         set_panel_epoch(7);
         assert_eq!(session_key(SP_NEW_COLLECTION), "f:user-A:7:new_collection_name");
         assert_ne!(
-            session_key(SP_CHAT_QUESTION),
+            session_key(SP_CHAT_INPUT),
             session_key(SP_GRAPH_QUERY),
             "rozne pola tej samej sesji musza miec rozne klucze"
         );
@@ -2091,8 +2460,8 @@ mod tests {
         }
         for f in [
             SP_NEW_COLLECTION,
-            SP_CHAT_QUESTION,
-            SP_CHAT_COLLECTION,
+            SP_SIDEBAR_SEARCH,
+            SP_CHAT_INPUT,
             SP_GRAPH_QUERY,
             SP_CONFLICT_STATUS,
         ] {
