@@ -482,6 +482,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "token_metrics_modalities",
             MigrationStep::Sql(TOKEN_METRICS_MODALITIES),
         ),
+        (
+            89,
+            "cameras_depth_mapping_columns",
+            MigrationStep::Rust(cameras_add_depth_mapping_columns),
+        ),
     ]
 }
 
@@ -748,6 +753,33 @@ CREATE INDEX IF NOT EXISTS idx_camera_grants_camera ON camera_grants(camera_id);
 fn cameras_add_analysis_flow_id_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "analysis_flow_id")? {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN analysis_flow_id TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Adds the depth-mapping columns to `cameras`. When `depth_mapping_enabled`,
+/// the always-on depth loop pulls RGB frames, runs a metric depth model, and
+/// back-projects to a world point cloud fed into the shared SLAM map under
+/// `depth_robot_id`. `depth_camera_fov_deg` is the horizontal field of view used
+/// to derive pinhole intrinsics (no per-camera calibration table yet);
+/// `depth_fps` paces the loop (depth inference is far heavier than detection).
+/// Idempotent — each column guarded by a probe.
+fn cameras_add_depth_mapping_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_mapping_enabled")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_mapping_enabled INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !column_exists(conn, "cameras", "depth_robot_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_robot_id TEXT NULL;")?;
+    }
+    if !column_exists(conn, "cameras", "depth_camera_fov_deg")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_camera_fov_deg REAL NOT NULL DEFAULT 60.0;",
+        )?;
+    }
+    if !column_exists(conn, "cameras", "depth_fps")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_fps INTEGER NOT NULL DEFAULT 2;")?;
     }
     Ok(())
 }

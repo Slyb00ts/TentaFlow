@@ -248,6 +248,21 @@ impl SlamSceneManager {
         slam.latest_global
     }
 
+    /// The robot's latest pose in the SCENE frame (metric, never WGS84) — the frame
+    /// the voxel map and `on_lidar_frame` points live in. Unlike [`Self::latest_pose`]
+    /// (which reports WGS84 once geo-anchored), this is always scene-local, so the
+    /// depth consumer can transform camera points into the map frame regardless of
+    /// anchoring. `None` until a real pose has been adopted.
+    pub fn latest_scene_pose(&self, robot_id: &str) -> Option<Pose> {
+        let entry = self.robots.get(robot_id)?;
+        let slam = entry.lock();
+        if slam.has_pose {
+            Some(slam.last_pose)
+        } else {
+            None
+        }
+    }
+
     /// Number of occupied cells currently retained for a robot (0 if unknown).
     pub fn cell_count(&self, robot_id: &str) -> usize {
         self.robots

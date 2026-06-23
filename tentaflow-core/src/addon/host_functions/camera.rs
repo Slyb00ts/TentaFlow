@@ -252,6 +252,8 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
                 // analysis must run even when nobody is watching. Idempotent.
                 #[cfg(feature = "inference-vision-gpu")]
                 crate::services::camera_ingest::vision_analysis::ensure_analysis(&row.camera_id);
+                // Depth → shared SLAM map (no-op unless the camera has mapping enabled).
+                crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&row.camera_id);
             }
             Err(e) => warn!(
                 "camera_ingest: failed to hydrate camera_id={} vendor={}: {}",
@@ -270,6 +272,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
 pub async fn shutdown_camera_supervisor_global() {
     #[cfg(feature = "inference-vision-gpu")]
     crate::services::camera_ingest::vision_analysis::drain();
+    crate::services::camera_ingest::depth_mapping::drain();
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
     }
@@ -280,6 +283,7 @@ pub async fn shutdown_camera_supervisor_global() {
 /// leak. Best-effort: the supervisor removal is spawned (non-blocking) and the
 /// row is hard-deleted (ephemeral camera, no audit retention).
 pub fn remove_backed_camera(owner_addon_id: &str, camera_id: &str) {
+    crate::services::camera_ingest::depth_mapping::stop_depth_mapping(camera_id);
     if let (Some(sup), Ok(handle)) = (SUPERVISOR.get(), tokio::runtime::Handle::try_current()) {
         let sup = sup.clone();
         let cid = camera_id.to_string();
@@ -509,6 +513,19 @@ pub fn camera_register_pushed_v1(
             return AbiError::Operation.as_i32();
         }
     }
+    // A phone that pushes its camera IS a robot (addon_id == robot_id): bind the
+    // stream to the shared SLAM map so its frames become a metric point cloud.
+    // Idempotent and non-fatal — the camera is already live if this fails.
+    let depth_patch = CameraPatch {
+        depth_mapping_enabled: Some(true),
+        depth_robot_id: Some(Some(addon_id.clone())),
+        ..Default::default()
+    };
+    if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
+        warn!("camera.register_pushed depth-mapping enable failed (non-fatal): {e}");
+    } else {
+        crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&camera_id);
+    }
     audit(caller.data(), "camera.register_pushed", Some(&camera_id), RiskClass::A, "ok", None);
     write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, camera_id.as_bytes())
 }
@@ -516,9 +533,9 @@ pub fn camera_register_pushed_v1(
 /// Latest decoded RGB24 frame for a camera, taken from the running session's
 /// frame mailbox via the process-wide supervisor. `None` when the supervisor
 /// is not initialized, the camera is not registered, or no frame has landed
-/// yet. Used by the always-on vision analysis loop to pull frames without
-/// reaching into session internals.
-#[cfg(feature = "inference-vision-gpu")]
+/// yet. Used by the always-on vision analysis loop and the depth-mapping loop to
+/// pull frames without reaching into session internals.
+#[cfg(feature = "camera")]
 pub async fn latest_frame_global(camera_id: &str) -> Option<(std::sync::Arc<[u8]>, u32, u32)> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
@@ -2516,6 +2533,10 @@ pub fn camera_update_v1(
         retention_class: input.retention_class.clone(),
         profile: input.profile.clone(),
         analysis_flow_id,
+        depth_mapping_enabled: None,
+        depth_robot_id: None,
+        depth_camera_fov_deg: None,
+        depth_fps: None,
     };
 
     if update_camera(
@@ -2756,6 +2777,9 @@ pub fn camera_remove_v1(
             warn!("camera.remove supervisor.remove_camera (post-soft-delete): {e}");
         }
     }
+    // Stop the depth-mapping loop (no-op if the camera had none) so a removed
+    // camera leaves no ticking background task / stale registry entry.
+    crate::services::camera_ingest::depth_mapping::stop_depth_mapping(&input.camera_id);
 
     audit(
         caller.data(),

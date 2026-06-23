@@ -19894,6 +19894,12 @@ pub struct CameraPatch {
     /// Per-camera analysis Flow id. Tri-state: `None` = untouched,
     /// `Some(None)` = clear (NULL), `Some(Some(id))` = assign.
     pub analysis_flow_id: Option<Option<String>>,
+    pub depth_mapping_enabled: Option<bool>,
+    /// Robot the depth point cloud is attributed to. Tri-state like
+    /// `analysis_flow_id`: `Some(None)` clears the binding (disables mapping).
+    pub depth_robot_id: Option<Option<String>>,
+    pub depth_camera_fov_deg: Option<f64>,
+    pub depth_fps: Option<i64>,
 }
 
 #[cfg(feature = "camera")]
@@ -20518,6 +20524,79 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Per-camera depth-mapping configuration. When `enabled`, the depth loop feeds
+/// a world point cloud (reconstructed from a metric depth model) into the shared
+/// SLAM map under `robot_id`. `fov_deg` is the horizontal field of view used to
+/// derive pinhole intrinsics; `fps` paces the (heavy) depth inference.
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct DepthMappingConfig {
+    pub camera_id: String,
+    pub robot_id: String,
+    pub fov_deg: f32,
+    pub fps: u32,
+}
+
+/// Reads the depth-mapping config for one camera, or `None` when mapping is off,
+/// the row is missing, or no `depth_robot_id` is set (a robot binding is
+/// mandatory — the cloud is keyed by robot). `fov_deg` clamps to a sane optics
+/// range; `fps` clamps to `1..=10` (depth inference is far heavier than RF-DETR).
+#[cfg(feature = "camera")]
+pub fn camera_depth_mapping_config(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<DepthMappingConfig>> {
+    let conn = acquire(pool)?;
+    let row: Option<(i64, Option<String>, f64, i64)> = conn
+        .query_row(
+            "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps \
+             FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((enabled, robot_id, fov, fps)) = row else {
+        return Ok(None);
+    };
+    if enabled == 0 {
+        return Ok(None);
+    }
+    let robot_id = robot_id.filter(|s| !s.is_empty());
+    let Some(robot_id) = robot_id else {
+        return Ok(None);
+    };
+    Ok(Some(DepthMappingConfig {
+        camera_id: camera_id.to_string(),
+        robot_id,
+        fov_deg: (fov as f32).clamp(20.0, 150.0),
+        fps: (fps.clamp(1, 10)) as u32,
+    }))
+}
+
+/// Lists every camera with depth mapping currently enabled (and a robot bound).
+/// The always-on depth loop calls this to discover which cameras to drive.
+#[cfg(feature = "camera")]
+pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfig>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps \
+         FROM cameras \
+         WHERE depth_mapping_enabled = 1 AND depth_robot_id IS NOT NULL \
+           AND depth_robot_id <> '' AND removed_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DepthMappingConfig {
+                camera_id: r.get::<_, String>(0)?,
+                robot_id: r.get::<_, String>(1)?,
+                fov_deg: (r.get::<_, f64>(2)? as f32).clamp(20.0, 150.0),
+                fps: (r.get::<_, i64>(3)?.clamp(1, 10)) as u32,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Per-camera analysis Flow id (the cold path runs it on a detection event).
 /// `None` (NULL or empty) = no flow assigned → default hardcoded enrichment.
 pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
@@ -20600,6 +20679,23 @@ pub fn update_camera(
         // Tri-state: `Some(None)` clears (binds NULL), `Some(Some(id))` assigns.
         sets.push("analysis_flow_id = ?");
         params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.depth_mapping_enabled {
+        sets.push("depth_mapping_enabled = ?");
+        params.push(Box::new(v as i64));
+    }
+    if let Some(v) = patch.depth_robot_id.as_ref() {
+        // Tri-state like analysis_flow_id: `Some(None)` clears the binding.
+        sets.push("depth_robot_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.depth_camera_fov_deg {
+        sets.push("depth_camera_fov_deg = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.depth_fps {
+        sets.push("depth_fps = ?");
+        params.push(Box::new(v));
     }
     sets.push("updated_at = ?");
     params.push(Box::new(now));
