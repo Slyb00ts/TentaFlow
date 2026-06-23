@@ -159,7 +159,7 @@ reason = "Parsowanie obrazow stron PDF/skanow na markdown (ingest image/PDF go w
 
 [[vector_namespace]]
 name = "passages"
-dimensions = 1024
+dimensions = 2048
 distance = "cosine"
 data_class = "C"
 
@@ -200,7 +200,7 @@ indexed = false
 # re-embedding tej samej encji nadpisywal jej wektor, nie duplikowal).
 [[vector_namespace]]
 name = "entities"
-dimensions = 1024
+dimensions = 2048
 distance = "cosine"
 data_class = "C"
 
