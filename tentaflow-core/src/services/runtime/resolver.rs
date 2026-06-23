@@ -329,7 +329,16 @@ impl AliasResolver {
     ) {
         let local_id = (self.local_node_id)();
         for inst in instances {
-            if inst.node_id == local_id {
+            // Local-vs-remote routing turns on identity equality. An empty
+            // `local_id` (mesh registry not yet populated) or an empty
+            // instance `node_id` (peer announced before its identity loaded)
+            // must NEVER collapse to a Local match — `"" == ""` would route a
+            // remote-owned model to a local supervisor port (127.0.0.1:5000)
+            // that means nothing to us. Fail safe to MeshForward instead.
+            let is_local = !local_id.is_empty()
+                && !inst.node_id.is_empty()
+                && inst.node_id == local_id;
+            if is_local {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
                     if surface == ServiceSurface::Rerank
                         && matches!(handle, crate::services::handles_cache::BackendHandle::Embedded { .. })

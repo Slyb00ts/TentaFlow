@@ -21,6 +21,47 @@ use tentaflow_protocol::{ServiceChange, ServiceInfo};
 /// pipeline'u.
 pub type RegistryChangeCallback = Arc<dyn Fn() + Send + Sync>;
 
+/// Force every advertised service's `node_id` to the transport-authenticated
+/// sender. A node only legitimately advertises its OWN services, so the
+/// per-service `node_id` is never trusted from the wire: a peer that stamped
+/// its snapshot before its identity loaded (empty `node_id`) or embedded a
+/// foreign id would otherwise have the resolver mistake a remote-owned model
+/// for a local one and dispatch chat to a local supervisor port that means
+/// nothing to us. Normalizing at the receive site guarantees the catalog can
+/// never hold a service whose `node_id` differs from the peer that announced
+/// it. Mirrors `snapshot_builder::project_service_row`, which stamps
+/// `node_id = local_node_id` for locally owned rows, and the robot dispatch
+/// `normalize_advertised_node_id`. PURE.
+pub fn normalize_advertised_service_node_id(
+    mut services: Vec<ServiceInfo>,
+    sender_node_id: &str,
+) -> Vec<ServiceInfo> {
+    for svc in &mut services {
+        svc.node_id = sender_node_id.to_string();
+    }
+    services
+}
+
+/// Re-own a single incremental change's `ServiceInfo` to the authenticated
+/// sender, mirroring `normalize_advertised_service_node_id`. `Removed` carries
+/// no `node_id`, so it passes through unchanged.
+pub fn normalize_advertised_service_change(
+    change: ServiceChange,
+    sender_node_id: &str,
+) -> ServiceChange {
+    match change {
+        ServiceChange::Added(mut svc) => {
+            svc.node_id = sender_node_id.to_string();
+            ServiceChange::Added(svc)
+        }
+        ServiceChange::Updated(mut svc) => {
+            svc.node_id = sender_node_id.to_string();
+            ServiceChange::Updated(svc)
+        }
+        ServiceChange::Removed { service_id } => ServiceChange::Removed { service_id },
+    }
+}
+
 /// Snapshot kept per remote node: the last full vector of `ServiceInfo`
 /// received and the wallclock instant we received it. `last_seen_at` is used
 /// only for diagnostics — eviction is driven by explicit `remove_node` calls
