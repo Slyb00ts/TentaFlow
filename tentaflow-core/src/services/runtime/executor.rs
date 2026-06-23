@@ -1850,8 +1850,16 @@ impl ModelRuntimeExecutor {
         // parse-flow nie zalał backendu i żeby `flow_depth` był deterministyczny.
         // Numery stron narastają z `page.index` (0..N), merge je przepisuje.
         let mut page_responses: Vec<DocumentParseResponse> = Vec::new();
-        let mut parse_err: Option<ExecutorError> = None;
+        let mut failed_pages = 0usize;
+        let mut last_page_err: Option<ExecutorError> = None;
+        // Każda strona to NIEZALEŻNY dispatch (jeden mesh-hop my→serwis parse),
+        // nie ogniwo jednego łańcucha re-forward. Współdzielony mutowalny `ctx`
+        // kumulowałby `hop_count` (enter_hop inkrementuje trwale) → po
+        // MAX_HOP_COUNT stron mesh-forward byłby odrzucony ("hop limit reached").
+        // Resetujemy hop do wartości bazowej PRZED każdą stroną.
+        let base_hop = ctx.hop_count;
         while let Some(page) = rx.recv().await {
+            ctx.hop_count = base_hop;
             let page_request = DocumentParseRequest {
                 model: request.model.clone(),
                 image_bytes: page.png,
@@ -1864,8 +1872,18 @@ impl ModelRuntimeExecutor {
             match Box::pin(self.execute_documents(page_request, ctx)).await {
                 Ok(resp) => page_responses.push(resp),
                 Err(e) => {
-                    parse_err = Some(e);
-                    break;
+                    // Tolerancja per-strona: pojedyncza felerna strona (np. bug
+                    // postprocessingu modelu parse na konkretnym layoutcie, albo
+                    // chwilowy błąd backendu) NIE może ubić całego wielostronicowego
+                    // dokumentu. Logujemy i kontynuujemy; dokument fail-uje TYLKO
+                    // gdy ŻADNA strona się nie sparsowała (sprawdzenie niżej).
+                    failed_pages += 1;
+                    tracing::warn!(
+                        error = %e,
+                        failed_pages,
+                        "document parse: strona nie sparsowana, pomijam (tolerancja per-strona)"
+                    );
+                    last_page_err = Some(e);
                 }
             }
         }
@@ -1877,16 +1895,25 @@ impl ModelRuntimeExecutor {
             .await
             .map_err(|e| ExecutorError::Internal(format!("rasterize join: {e}")))?;
 
-        // Najpierw raportuj błąd parse strony (failover wewnątrz już wyczerpany),
-        // potem ewentualny błąd rasteryzacji (np. EmptyDocument, PDF uszkodzony).
-        if let Some(e) = parse_err {
-            return Err(e);
-        }
         let page_count =
             rasterize_result.map_err(|e| ExecutorError::Internal(format!("PDF rasterize: {e}")))?;
 
-        if page_count == 0 || page_responses.is_empty() {
+        // Dokument fail-uje TYLKO gdy żadna strona się nie sparsowała. Gdy choć
+        // jedna przeszła, scalamy co mamy — felerne strony zostały pominięte
+        // (raportujemy ile), zamiast tracić cały dokument przez jedną stronę.
+        if page_responses.is_empty() {
+            if let Some(e) = last_page_err {
+                return Err(e);
+            }
             return Err(ExecutorError::Internal("PDF has no renderable pages".into()));
+        }
+        if failed_pages > 0 {
+            tracing::warn!(
+                failed_pages,
+                ok_pages = page_responses.len(),
+                page_count,
+                "document parse: dokument ukończony z pominiętymi stronami"
+            );
         }
 
         Ok(document::merge_page_responses(page_responses))
