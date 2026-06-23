@@ -26,6 +26,8 @@ pub mod webrtc_source;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod vision_analysis;
 
+pub mod depth_mapping;
+
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};
 pub use error::{CameraIngestError, Result};

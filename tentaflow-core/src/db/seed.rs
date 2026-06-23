@@ -216,10 +216,16 @@ fn seed_pii_rules(conn: &Connection) -> Result<()> {
     ];
 
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO pii_rules (name, category, pattern, replacement, priority, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO pii_rules (id, org_id, name, category, pattern, replacement, priority, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (name, category, pattern, replacement, priority, description) in rules {
+        // Deterministic id (category is unique among the defaults) so every node
+        // seeds the SAME id per default rule. Random per-node UUIDs would collide
+        // under UNIQUE(org_id, name) and block cross-node sync of an edited rule;
+        // a stable id keeps the synced default idempotent (LWW by same id).
         let affected = stmt.execute(rusqlite::params![
+            format!("pii-default-{category}"),
+            crate::services::org::DEFAULT_ORG_ID,
             name,
             category,
             pattern,

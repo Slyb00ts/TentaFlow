@@ -1,0 +1,102 @@
+# =============================================================================
+# Addon: phone (mobile device as a sensor-robot)
+# Installing this addon on a TentaFlow MOBILE node turns the phone/tablet into a
+# robot that contributes to SLAM mapping + positioning: its native sensors (camera,
+# depth/LiDAR, IMU, GPS, barometer) are captured by the native layer, buffered into
+# Core's MobileSensorQueue, and DRAINED here each tick into the fusion engine
+# (ESKF → GlobalPose) and the shared scene map. Per-sensor permissions gate each
+# stream — grant LiDAR but not the camera, or camera+IMU but not GPS, etc.; an
+# ungranted sensor is simply never fed (graceful degradation).
+# The [robot] block makes it appear + map like any robot. See
+# docs/UNIVERSAL_POSITIONING_PLAN.md.
+# =============================================================================
+[addon]
+id = "phone"
+name = "Telefon (urządzenie mobilne)"
+version = "0.0.1"
+description = "Zamienia urządzenie mobilne w robota-czujnik: kamera, głębia/LiDAR, IMU, GPS, barometr → fuzja pozycji (ESKF) i wspólna mapa. Uprawnienia per-czujnik."
+category = "robotics"
+keywords = ["robot", "phone", "mobile", "slam", "positioning", "sensors"]
+author = "TentaFlow"
+
+# Auto-started service: a slow tick drains the native sensor queue into the fusion
+# engine. The native capture runs at sensor rate; the tick batches whatever arrived.
+[service]
+auto_start = true
+tick_interval_ms = 100
+tick_fuel_budget = 50000000
+
+# ── Universal robot capability descriptor ────────────────────────────────────
+# A phone is a sensor/mapping robot: it has no remotely-commanded locomotion, but it
+# provides telemetry, a depth/point-cloud map and (optionally) a camera feed.
+[robot]
+controls_robot = true
+kind = "phone"
+vendor = "generic"
+model = "mobile"
+display_name = "Telefon"
+icon = "robot"
+transports = ["native"]
+
+[robot.capabilities]
+locomotion = false
+poses = false
+actions = []
+estop = false
+telemetry = ["pose", "imu", "gnss"]
+camera = true
+lidar = true
+audio = false
+
+# ── Per-sensor permissions (the "lidar yes, camera no" model) ────────────────
+[[permission]]
+id = "sensor.imu"
+display_name = "Akcelerometr i żyroskop (IMU)"
+description = "Odczyt IMU urządzenia (przyspieszenie + prędkość kątowa) jako szkielet ruchu dla fuzji pozycji."
+risk = "low"
+
+[[permission]]
+id = "sensor.gps"
+display_name = "GPS / GNSS"
+description = "Odczyt globalnej pozycji urządzenia (lat/lon/alt) — kotwiczy mapę w rzeczywistym świecie (WGS84)."
+risk = "medium"
+
+[[permission]]
+id = "sensor.baro"
+display_name = "Barometr"
+description = "Odczyt ciśnienia/wysokości względnej — ogranicza dryf pionowy między poprawkami GNSS."
+risk = "low"
+
+[[permission]]
+id = "sensor.camera"
+display_name = "Kamera"
+description = "Strumień obrazu z kamery urządzenia (podgląd; w przyszłości lokalizacja wizualna)."
+risk = "medium"
+
+[[permission]]
+id = "lidar.publish"
+display_name = "Publikacja chmury punktów (głębia/LiDAR)"
+description = "Publikacja kanonicznej ramki chmury punktów z głębi/LiDAR-a urządzenia do wspólnej mapy."
+risk = "low"
+
+[[permission]]
+id = "state.read"
+display_name = "Odczyt stanu współdzielonego"
+description = "Odczyt live statusu urządzenia (które czujniki aktywne)."
+risk = "low"
+
+[[permission]]
+id = "state.write"
+display_name = "Zapis stanu współdzielonego"
+description = "Zapis live statusu urządzenia (aktywne czujniki, online)."
+risk = "low"
+
+[[permission]]
+id = "events"
+display_name = "Zdarzenia"
+description = "Publikacja zdarzeń urządzenia (online/offline)."
+risk = "low"
+
+[visibility]
+admin_only = false
+show_in_catalog = true

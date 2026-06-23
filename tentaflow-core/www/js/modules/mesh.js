@@ -686,7 +686,9 @@ function buildGauges(node) {
     if (vramTotal > 0) {
       const pct = Math.round((vramUsed / vramTotal) * 100);
       const names = gpus.map(x => x.name).filter(Boolean);
-      const sub = gpus.length === 1 ? (names[0] || '') : `${gpus.length}× GPU`;
+      const gpuLabel = gpus.length === 1 ? (names[0] || '') : `${gpus.length}× GPU`;
+      // Pokazuj used / total (na unified memory total = RAM), jak przy RAM; nazwa GPU jako sufiks.
+      const sub = `${formatMb(vramUsed)} / ${formatMb(vramTotal)}${gpuLabel ? ' · ' + gpuLabel : ''}`;
       g.push(renderRing('VRAM', formatMb(vramUsed), '', sub, pct));
     } else {
       g.push(renderRing('VRAM', '—', '', I18n.t('mesh.no_gpu'), null));

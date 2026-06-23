@@ -825,6 +825,7 @@ async fn donor_rejects_untrusted_peer() {
         node_id: joiner_node_id.clone(),
         proposed_donor: String::new(),
         epoch_seen: 0,
+        sender_op_count: 0,
     };
     write_frame(&mut joiner_stream, &elect, "elect")
         .await

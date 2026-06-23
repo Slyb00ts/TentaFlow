@@ -87,7 +87,11 @@ impl LlmDispatcherImpl {
         api_req: &ChatCompletionRequest,
     ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
         let db = self.db.as_ref()?;
-        let gateway = AiGateway::new(db.clone(), self.node_id.clone());
+        let gateway = AiGateway::new(
+            db.clone(),
+            self.node_id.clone(),
+            crate::compliance::ai_gateway::token_quota_enabled(),
+        );
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
@@ -269,6 +273,12 @@ impl LlmDispatcher for LlmDispatcherImpl {
         let cancel = req.cancel_token.clone();
         let deadline = req.deadline;
         let api_req = build_chat_request(&req, true, self.blobs.as_ref()).await?;
+        // Per-call audit event with the RESOLVED model (api_req.model from the
+        // node's config) — the streaming twin of the blocking `execute` path.
+        // Without it the only token bump came from the session-level chat event,
+        // whose model is empty for flow chats → usage mis-attributed to "".
+        // AuditFinishStream finishes it with the streamed usage (incl reasoning).
+        let audit_event = self.start_audit_event(&req, &api_req);
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let mut rctx = RuntimeContext::new(user);
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
@@ -292,7 +302,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             Err(e) => Err(anyhow!("LlmDispatcher stream chunk: {e}")),
         });
         let bounded = StreamBoundary::new(Box::pin(mapped), deadline, cancel_for_stream);
-        Ok(Box::pin(bounded))
+        Ok(Box::pin(AuditFinishStream::new(Box::pin(bounded), audit_event)))
     }
 }
 
@@ -373,6 +383,96 @@ where
                 Poll::Ready(None)
             }
             other => other,
+        }
+    }
+}
+
+/// Wraps the bounded LLM stream to finish the per-call AiGateway audit event
+/// once the stream settles, accumulating the assistant text and the real token
+/// usage (the usage-tail carries reasoning tokens too). This is what bumps
+/// `token_usage_daily` under the node's RESOLVED model for streaming flow chats
+/// — the streaming twin of the blocking `execute` path. Mirrors
+/// `ComplianceAuditStream` but for the flow engine's `LlmStreamChunk` shape.
+struct AuditFinishStream<S> {
+    inner: Pin<Box<S>>,
+    event: Option<crate::compliance::ai_gateway::AiEventHandle>,
+    text: String,
+    usage: Option<TokenUsage>,
+    finished: bool,
+}
+
+impl<S> AuditFinishStream<S> {
+    fn new(
+        inner: Pin<Box<S>>,
+        event: Option<crate::compliance::ai_gateway::AiEventHandle>,
+    ) -> Self {
+        Self {
+            inner,
+            event,
+            text: String::new(),
+            usage: None,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, error: Option<&str>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let Some(event) = self.event.take() else {
+            return;
+        };
+        if let Some(msg) = error {
+            let _ = event.finish_failed(msg);
+            return;
+        }
+        let usage = self.usage.map(|u| crate::api::openai::types::Usage {
+            prompt_tokens: u.prompt_tokens as u32,
+            completion_tokens: u.completion_tokens as u32,
+            total_tokens: u.total_tokens as u32,
+        });
+        // tool_calls stay empty here: per-call tool execution is audited
+        // separately; this finish exists for response text + token accounting.
+        if let Err(e) = event.finish_stream_success(&self.text, usage.as_ref(), &[]) {
+            tracing::warn!("gateway-aware LLM stream audit finish failed: {e}");
+        }
+    }
+}
+
+impl<S> futures::Stream for AuditFinishStream<S>
+where
+    S: futures::Stream<Item = Result<LlmStreamChunk>> + Send,
+{
+    type Item = Result<LlmStreamChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.text.push_str(&chunk.text_delta);
+                if let Some(u) = chunk.usage {
+                    self.usage = Some(u);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                let msg = e.to_string();
+                self.finish(Some(&msg));
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.finish(None);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for AuditFinishStream<S> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(Some("stream dropped before completion"));
         }
     }
 }
@@ -565,7 +665,18 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
         text_delta,
         reasoning_delta,
         tool_calls,
-        usage: None,
+        // Przewlekamy realne liczniki z finalnego chunku silnika do flow-engine
+        // (executor agreguje to do FlowExecutionOutcome.usage → bump tokenów).
+        usage: chunk.usage.map(|u| TokenUsage {
+            prompt_tokens: u.prompt_tokens as u64,
+            completion_tokens: u.completion_tokens as u64,
+            total_tokens: u.total_tokens as u64,
+        }),
+        perf: chunk.perf.map(|p| crate::flow_engine::envelope::GenPerf {
+            ttft_ms: p.ttft_ms,
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
         finish_reason,
         error: None,
     }
@@ -846,6 +957,7 @@ mod tests {
             speaker_id: None,
             speaker_name: None,
             usage: None,
+            perf: None,
         };
         let mapped = chat_chunk_to_llm_chunk(chunk);
         assert_eq!(mapped.tool_calls.len(), 2);

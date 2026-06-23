@@ -20,7 +20,7 @@ use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
 use crate::flow_engine::envelope::{
     ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue,
-    NodeInput, TokenUsage, TraceStatus, TraceStep,
+    GenPerf, NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::io_mapping;
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter};
@@ -289,6 +289,7 @@ pub async fn execute_blocking(
         final_envelope,
         trace,
         usage: aggregate_usage,
+        perf: None,
         finish_reason,
         total_latency_ms,
         error: error.clone(),
@@ -746,6 +747,7 @@ async fn run_loop_region_streaming(
     seed: FlowEnvelope,
     outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
     last_usage: &mut Option<TokenUsage>,
+    last_perf: &mut Option<GenPerf>,
     last_finish: &mut Option<FinishReason>,
 ) -> Result<FlowEnvelope> {
     let mut current = seed;
@@ -778,7 +780,7 @@ async fn run_loop_region_streaming(
             },
         );
         current =
-            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage)
+            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage, last_perf)
                 .await?;
         iterations += 1;
         ctx.progress.emit(
@@ -811,7 +813,7 @@ async fn run_loop_region_streaming(
             },
         );
         current =
-            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage)
+            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage, last_perf)
                 .await?;
         iterations += 1;
         current.meta.remove("loop_final_pass");
@@ -868,6 +870,7 @@ async fn execute_subdag_streaming(
     seed: FlowEnvelope,
     outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
     last_usage: &mut Option<TokenUsage>,
+    last_perf: &mut Option<GenPerf>,
 ) -> Result<FlowEnvelope> {
     let member_set: HashSet<usize> = region.member_pos.iter().copied().collect();
     let mut member_out: HashMap<usize, Arc<FlowEnvelope>> = HashMap::new();
@@ -909,7 +912,7 @@ async fn execute_subdag_streaming(
         // never overlays a stream producer (R7), so the streamed member takes the
         // raw-config produce_stream path while the rest keep the io-mapping seam.
         let result = if adapters.is_stream_producer(&node.node_type) {
-            stream_llm_member(adapters, node, &inputs, ctx, outbound, last_usage).await?
+            stream_llm_member(adapters, node, &inputs, ctx, outbound, last_usage, last_perf).await?
         } else {
             let inbound: &FlowEnvelope =
                 io_mapping_inbound(&inputs).unwrap_or_else(|| seed_arc.as_ref());
@@ -941,6 +944,7 @@ async fn stream_llm_member(
     ctx: &Arc<ExecutionContext>,
     outbound: &mpsc::Sender<Result<EnvelopeDelta>>,
     last_usage: &mut Option<TokenUsage>,
+    last_perf: &mut Option<GenPerf>,
 ) -> Result<FlowEnvelope> {
     let producer = adapters.stream_producer(&node.node_type).ok_or_else(|| {
         anyhow!(
@@ -981,6 +985,9 @@ async fn stream_llm_member(
             *last_usage = Some(*u);
             ctx.usage_sink.record(&node.id, *u);
         }
+        if let Some(p) = chunk.perf {
+            *last_perf = Some(p);
+        }
         if let Some(fr) = chunk.finish_reason {
             finish_reason = Some(fr);
         }
@@ -995,6 +1002,7 @@ async fn stream_llm_member(
                 reasoning_delta: chunk.reasoning_delta,
                 tool_calls: Vec::new(),
                 usage: None,
+                perf: None,
                 finish_reason: None,
                 error: None,
             });
@@ -1616,6 +1624,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
 
     let producer_attempt = Instant::now();
     let mut last_usage: Option<TokenUsage> = None;
+    let mut last_perf: Option<GenPerf> = None;
     let mut last_finish: Option<FinishReason> = None;
 
     let region_result = run_loop_region_streaming(
@@ -1626,6 +1635,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         seed,
         &outbound_tx,
         &mut last_usage,
+        &mut last_perf,
         &mut last_finish,
     )
     .await;
@@ -1676,6 +1686,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                 final_envelope: (*ctx.initial_envelope).clone(),
                 trace,
                 usage: TokenUsage::default(),
+                perf: last_perf,
                 finish_reason: finish,
                 total_latency_ms: started.elapsed().as_millis() as i64,
                 error: Some(msg),
@@ -1784,6 +1795,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         reasoning_delta: None,
         tool_calls: Vec::new(),
         usage: Some(usage),
+        perf: last_perf,
         finish_reason: Some(finish_reason),
         error: post_error.clone(),
     });
@@ -1796,6 +1808,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         final_envelope: (*final_arc).clone(),
         trace,
         usage: aggregate_usage,
+        perf: last_perf,
         finish_reason,
         total_latency_ms: started.elapsed().as_millis() as i64,
         error: post_error,
@@ -1832,6 +1845,7 @@ async fn finalize_streaming_flow(
     let mut reasoning_buf = String::new();
     let mut last_finish: Option<FinishReason> = None;
     let mut last_usage: Option<TokenUsage> = None;
+    let mut last_perf: Option<GenPerf> = None;
     // Stage 3d Krok 2c-2: audio path agregator. Audio chunki z chain
     // (np. tts_stream_bridge) — outcome.payload to Empty (klient
     // skonsumował bytes przez SSE), ale finish_reason agregowany
@@ -1860,6 +1874,9 @@ async fn finalize_streaming_flow(
                     }
                     if let Some(u) = c.usage.as_ref() {
                         last_usage = Some(*u);
+                    }
+                    if let Some(p) = c.perf {
+                        last_perf = Some(p);
                     }
                     tokio::select! {
                         biased;
@@ -1993,6 +2010,7 @@ async fn finalize_streaming_flow(
         final_envelope,
         trace: inputs.trace,
         usage: aggregate_usage,
+        perf: last_perf,
         finish_reason,
         total_latency_ms,
         error: error.clone().or(if cancelled {

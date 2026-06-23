@@ -265,3 +265,200 @@ async fn terminal_source_fails_subscribe_cleanly() {
 
     hub.unregister_factory(id);
 }
+
+/// A `dynamic_init()==true` source must serve each subscriber a FRESH init,
+/// while a default (`false`) source reuses the value cached at creation. This
+/// proves the late-joiner fix for latest-wins self-describing streams (LiDAR):
+/// the first subscriber caches one init, the current init then changes, and a
+/// SECOND subscriber receives the NEW init — not the stale cached one. The
+/// control source with default `dynamic_init` keeps the cache-once behavior so
+/// camera fMP4 is unaffected.
+#[tokio::test]
+async fn dynamic_init_serves_fresh_init_to_late_joiner() {
+    use std::sync::Mutex;
+
+    struct MutableInitSource {
+        id: String,
+        mime: String,
+        tx: broadcast::Sender<Bytes>,
+        current_init: Arc<Mutex<Option<Bytes>>>,
+        dynamic: bool,
+    }
+    #[async_trait::async_trait]
+    impl BinaryStreamSource for MutableInitSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn mime_type(&self) -> &str {
+            &self.mime
+        }
+        async fn init_segment(&self) -> Option<Bytes> {
+            self.current_init.lock().unwrap().clone()
+        }
+        fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+            Some(self.tx.clone())
+        }
+        fn dynamic_init(&self) -> bool {
+            self.dynamic
+        }
+    }
+
+    let hub = hub();
+
+    // Dynamic-init source: starts with NO init (cache-once would cache None).
+    let dyn_init = Arc::new(Mutex::new(None::<Bytes>));
+    let dyn_init_factory = Arc::clone(&dyn_init);
+    let dyn_id = "lidar:dynamic-init-test";
+    hub.register_factory(
+        dyn_id.to_string(),
+        Box::new(move || {
+            let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+            Ok(Arc::new(MutableInitSource {
+                id: "lidar:dynamic-init-test".to_string(),
+                mime: "application/octet-stream".to_string(),
+                tx,
+                current_init: Arc::clone(&dyn_init_factory),
+                dynamic: true,
+            }) as Arc<dyn BinaryStreamSource>)
+        }),
+    )
+    .unwrap();
+
+    // First subscriber: init is None (no frame yet), source now cached.
+    let h1 = hub.subscribe(dyn_id).await.unwrap();
+    assert!(h1.init_segment.is_none(), "first joiner sees no frame yet");
+
+    // The current frame changes (a publish), but publishing then PAUSES.
+    *dyn_init.lock().unwrap() = Some(Bytes::from_static(b"FRAME1"));
+
+    // Late joiner: must get the CURRENT frame via a fresh init, not the stale
+    // cached None — proving dynamic_init re-fetches per subscriber.
+    let h2 = hub.subscribe(dyn_id).await.unwrap();
+    assert_eq!(
+        h2.init_segment.as_deref(),
+        Some(&b"FRAME1"[..]),
+        "late joiner on a dynamic-init source gets the current frame"
+    );
+
+    drop(h1);
+    drop(h2);
+    hub.unregister_factory(dyn_id);
+
+    // Control: a default (cache-once) source ignores later init changes.
+    let static_init = Arc::new(Mutex::new(Some(Bytes::from_static(b"CACHED"))));
+    let static_init_factory = Arc::clone(&static_init);
+    let static_id = "camera:cache-once-test";
+    hub.register_factory(
+        static_id.to_string(),
+        Box::new(move || {
+            let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+            Ok(Arc::new(MutableInitSource {
+                id: "camera:cache-once-test".to_string(),
+                mime: "video/mp4".to_string(),
+                tx,
+                current_init: Arc::clone(&static_init_factory),
+                dynamic: false,
+            }) as Arc<dyn BinaryStreamSource>)
+        }),
+    )
+    .unwrap();
+
+    let c1 = hub.subscribe(static_id).await.unwrap();
+    assert_eq!(c1.init_segment.as_deref(), Some(&b"CACHED"[..]));
+    // Even if the underlying init changes, a cache-once source serves the value
+    // captured at creation (camera fMP4 ftyp+moov never changes).
+    *static_init.lock().unwrap() = Some(Bytes::from_static(b"CHANGED"));
+    let c2 = hub.subscribe(static_id).await.unwrap();
+    assert_eq!(
+        c2.init_segment.as_deref(),
+        Some(&b"CACHED"[..]),
+        "cache-once source reuses the cached init (camera unaffected)"
+    );
+
+    drop(c1);
+    drop(c2);
+    hub.unregister_factory(static_id);
+}
+
+/// RAII-covers-await invariant for the fast (already-active) path: on a
+/// `dynamic_init()==true` source the subscriber counter is incremented BEFORE
+/// the per-subscriber `init_segment().await`, and the `SubscriberToken` is
+/// constructed in the same step (before the await). If the subscribe future is
+/// dropped mid-await (client disconnect / caller timeout), the token's Drop
+/// still runs and returns the counter to 0 — no leaked refcount keeping the
+/// source alive forever. The first call (creation init) is fast so the source
+/// becomes active; every later per-subscriber fetch is slow, suspending the
+/// future exactly inside the increment→await window.
+#[tokio::test]
+async fn dropped_subscribe_during_slow_dynamic_init_leaves_no_leak() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    struct SlowInitSource {
+        id: String,
+        mime: String,
+        tx: broadcast::Sender<Bytes>,
+        creation_done: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl BinaryStreamSource for SlowInitSource {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn mime_type(&self) -> &str {
+            &self.mime
+        }
+        async fn init_segment(&self) -> Option<Bytes> {
+            // First call = creation init: return immediately so the source goes
+            // active. Every subsequent per-subscriber fetch is slow so the test
+            // can drop the future while suspended inside the await window.
+            if self.creation_done.swap(true, Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            Some(Bytes::from_static(b"INIT"))
+        }
+        fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
+            Some(self.tx.clone())
+        }
+        fn dynamic_init(&self) -> bool {
+            true
+        }
+    }
+
+    let hub = hub();
+    let id = "lidar:slow-dynamic-init-cancel-test";
+    hub.register_factory(
+        id.to_string(),
+        Box::new(move || {
+            let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+            Ok(Arc::new(SlowInitSource {
+                id: "lidar:slow-dynamic-init-cancel-test".to_string(),
+                mime: "application/octet-stream".to_string(),
+                tx,
+                creation_done: AtomicBool::new(false),
+            }) as Arc<dyn BinaryStreamSource>)
+        }),
+    )
+    .unwrap();
+
+    // Prime: creation init is fast, so this completes and the source is active.
+    let primer = hub.subscribe(id).await.unwrap();
+    assert!(hub.is_active(id));
+    assert_eq!(hub.subscriber_count(id), 1);
+
+    // Second subscribe takes the fast active path: it does fetch_add (count→2),
+    // builds the token, then suspends in the slow per-subscriber init. The
+    // timeout drops that future mid-await; the token's Drop must decrement back.
+    let timed = tokio::time::timeout(Duration::from_millis(50), hub.subscribe(id)).await;
+    assert!(timed.is_err(), "slow dynamic init must not finish in time");
+    assert_eq!(
+        hub.subscriber_count(id),
+        1,
+        "cancelled subscribe mid-init must not leak a refcount"
+    );
+
+    drop(primer);
+    assert_eq!(hub.subscriber_count(id), 0);
+    assert!(!hub.is_active(id), "source freed once all handles drop");
+    hub.unregister_factory(id);
+}

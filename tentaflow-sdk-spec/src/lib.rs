@@ -49,6 +49,11 @@ pub use protocol::{
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
+    global_pose::{
+        GlobalPoseFrame, GLOBAL_POSE_LEN, GLOBAL_POSE_VERSION, POSE_SRC_GNSS, POSE_SRC_IMU,
+        POSE_SRC_LIDAR, POSE_SRC_MAP, POSE_SRC_ODOM, POSE_SRC_VISION, POSE_SRC_WIFI,
+        POSE_STATE_GLOBAL, POSE_STATE_LOST, POSE_STATE_SCENE_LOCAL,
+    },
     // NOTE: graph's `GraphNode` is intentionally NOT re-exported here — it would
     // collide with `ui::inline::GraphNode`. Reach it via `protocol::graph::GraphNode`.
     graph::{
@@ -59,12 +64,25 @@ pub use protocol::{
         GraphUpsertNodeInput, GraphUpsertNodeOutput, Provenance,
     },
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    lidar::{
+        LidarFrameHeader, LIDAR_FLAGS_KNOWN, LIDAR_FLAGS_OFFSET, LIDAR_FLAG_LZ4_BODY,
+        LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET, LIDAR_LAYOUT_XYZ,
+        LIDAR_LAYOUT_XYZ_I16_PLANAR, LIDAR_LAYOUT_XYZI,
+    },
     recording::{
         FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,
         RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput,
         SaveRecordingOut, StatsOut, StatsPerCamera, StatsTotals, UrlOut,
     },
     robot::{RobotActionWire, RobotControlResponseWire, RobotDispatchInput},
+    sensors::{
+        BaroSample, GnssFix, ImuSample, MagSample, PoseSample, BARO_SAMPLE_LEN,
+        BARO_SAMPLE_VERSION, GNSS_FIX_LEN, GNSS_FIX_VERSION, GNSS_FLAG_HAS_VELOCITY, IMU_SAMPLE_LEN,
+        IMU_SAMPLE_VERSION, MAG_SAMPLE_LEN, MAG_SAMPLE_VERSION, POSE_SAMPLE_LEN, POSE_SAMPLE_VERSION,
+    },
+    robot_joints::{
+        RobotJointsFrame, ROBOT_JOINTS_HEADER_LEN, ROBOT_JOINTS_MAX, ROBOT_JOINTS_VERSION,
+    },
     services::{
         GpuOut, NodeResourcesInput, NodeResourcesOut, ServiceInfoOut, ServiceListInput,
         ServiceListOutput,

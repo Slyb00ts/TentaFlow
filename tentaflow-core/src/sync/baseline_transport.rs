@@ -42,7 +42,8 @@ use crate::db::DbPool;
 use crate::mesh::security::MeshSecurity;
 use crate::sync::core_baseline::{
     begin_adopt_atomic, build_baseline_header, capture_baseline_snapshot, chunk_snapshot,
-    decide_roles, deserialize_snapshot, import_baseline, load_adopt_state, local_role,
+    decide_roles, decide_roles_by_content, deserialize_snapshot, import_baseline, load_adopt_state,
+    local_role,
     reassemble_chunks, serialize_snapshot, store_adopt_state, validate_ack_agreement,
     BaselineAdoptState, BaselineImportReport, BaselinePhase, BaselineRole, BeginOutcome,
     BASELINE_MAX_TOTAL_BYTES,
@@ -148,6 +149,12 @@ pub async fn run_joiner_session<S: FrameStream>(
         node_id: local_node_id.to_string(),
         proposed_donor: donor.clone(),
         epoch_seen,
+        // Advertise our content so the donor can settle the role data-aware: if we
+        // (the dialer) actually hold MORE content than the peer we proposed as
+        // donor, the donor refuses and our pull fails — the peer adopts from us
+        // instead. This is what stops an empty node from donating over a populated
+        // peer when both sides dial after auto-pairing.
+        sender_op_count: crate::sync::runtime::local_op_count() as u64,
     };
     write_frame(stream, &elect, "elect").await?;
 
@@ -299,10 +306,21 @@ pub async fn run_donor_session<S: FrameStream>(
         ));
     }
 
-    // Deterministyczna elekcja MUSI dac ten sam wynik co u joinera. Potwierdzamy,
-    // ze to MY jestesmy dawca; inaczej odmawiamy (joiner liczy elekcje tak samo,
-    // wiec niezgodnosc to bug albo manipulacja).
-    let (donor, joiner) = decide_roles(local_node_id, remote_node_id, elect_donor(&elect));
+    // Content-aware role decision. The node that HOLDS MORE content is the donor;
+    // ties break on the lower node_id. We compare our own ledger op count against
+    // the count the requester advertised in `BaselineElect`, so the empty node
+    // adopts from the data-holder, never the reverse. If this makes the REQUESTER
+    // the rightful donor (it holds more), we refuse: the requester's own
+    // reciprocal pull (where it is the donor) is the one that must serve. Both
+    // sides feed the identical two `(node_id, op_count)` pairs into the pure
+    // decision, so they agree on a single donor without extra negotiation.
+    let local_op_count = crate::sync::runtime::local_op_count() as u64;
+    let (donor, joiner) = decide_roles_by_content(
+        local_node_id,
+        local_op_count,
+        remote_node_id,
+        elect.sender_op_count,
+    );
     if donor != local_node_id {
         let nack = BaselineAck {
             accepted: false,
@@ -313,7 +331,11 @@ pub async fn run_donor_session<S: FrameStream>(
         let _ = write_frame(stream, &nack, "ack").await;
         return Err(transport_err(
             "elect",
-            format!("election does not make local node the donor (donor={donor})"),
+            format!(
+                "content election makes peer the donor (donor={donor}, local_ops={local_op_count}, \
+                 peer_ops={}); refusing to donate",
+                elect.sender_op_count
+            ),
         ));
     }
     if local_role(local_node_id, &donor) != BaselineRole::Donor {
@@ -394,16 +416,6 @@ pub async fn run_donor_session<S: FrameStream>(
         "baseline transport: donor session completed"
     );
     Ok(())
-}
-
-/// Propozycja dawcy z `BaselineElect` przekazywana do `decide_roles`. Pusta
-/// propozycja (joiner nie wskazal jawnie) -> `None` (elekcja po node_id).
-fn elect_donor(elect: &BaselineElect) -> Option<&str> {
-    if elect.proposed_donor.is_empty() {
-        None
-    } else {
-        Some(elect.proposed_donor.as_str())
-    }
 }
 
 // =============================================================================

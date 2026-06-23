@@ -84,6 +84,17 @@ static ENGINES: &[EngineDefinition] = &[
         engine_type: "llm",
     },
     EngineDefinition {
+        id: "ds4",
+        name: "DeepSeek V4 (ds4)",
+        description: "antirez/ds4 — DeepSeek V4 Flash/Pro dedicated C engine (Metal/CUDA/ROCm), MoE SSD streaming, MTP speculative decoding",
+        supported_platforms: &[Platform::Linux, Platform::MacOS],
+        model_format: "gguf",
+        hf_filter_tags: &["deepseek", "gguf"],
+        default_port: 8000,
+        shared_model_formats: &["gguf"],
+        engine_type: "llm",
+    },
+    EngineDefinition {
         id: "mlx",
         name: "MLX",
         description: "Apple MLX framework for Apple Silicon inference",
@@ -183,6 +194,11 @@ pub fn deploy_mode_for(engine_id: &str, platform: &Platform) -> DeployMode {
         ("vllm", Platform::Linux) => DeployMode::Docker,
         ("ollama", Platform::Linux) => DeployMode::Docker,
         ("llamacpp", Platform::Linux) => DeployMode::Docker,
+        // ds4 ships a Docker image on Linux (CUDA) and a native binary build on
+        // macOS (Metal). Both deploy methods are also offered via the manifest
+        // deploy sections; this is just the GUI's default hint per platform.
+        ("ds4", Platform::Linux) => DeployMode::Docker,
+        ("ds4", Platform::MacOS) => DeployMode::Native,
         ("tensorrt-llm", Platform::Linux) => DeployMode::Docker,
         ("whisper", _) => DeployMode::Native,
         ("faster-whisper", _) => DeployMode::Docker,

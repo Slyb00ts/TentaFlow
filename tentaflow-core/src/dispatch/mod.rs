@@ -47,6 +47,7 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;
 
@@ -730,6 +731,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::RobotsPayload::ControlResponse(_) => "RobotControlResponse",
             tentaflow_protocol::RobotsPayload::CameraShareRequest(_) => "RobotCameraShareRequest",
             tentaflow_protocol::RobotsPayload::CameraShareResponse(_) => "RobotCameraShareResponse",
+            tentaflow_protocol::RobotsPayload::GeoAnchorSetRequest(_) => "RobotGeoAnchorSetRequest",
+            tentaflow_protocol::RobotsPayload::GeoAnchorGetRequest(_) => "RobotGeoAnchorGetRequest",
+            tentaflow_protocol::RobotsPayload::GeoAnchorResponse(_) => "RobotGeoAnchorResponse",
         },
         MessageBody::SkillsBody(p) => match p {
             tentaflow_protocol::SkillsPayload::ListRequest(_) => "SkillsListRequest",
@@ -1001,6 +1005,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::VisionBody(p) => match p {
             tentaflow_protocol::VisionInferPayload::InferRequest(_) => "VisionInferRequest",
             tentaflow_protocol::VisionInferPayload::InferResponse(_) => "VisionInferResponse",
+        },
+        MessageBody::RerankBody(p) => match p {
+            tentaflow_protocol::RerankExchange::Request(_) => "RerankRequest",
+            tentaflow_protocol::RerankExchange::Response(_) => "RerankResponse",
         },
         MessageBody::FastPathListRequest => "FastPathListRequest",
         MessageBody::FastPathListResponse { .. } => "FastPathListResponse",
@@ -1318,6 +1326,36 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ApiKeyScopeClearRequest { .. } => "ApiKeyScopeClearRequest",
         MessageBody::ApiKeyRotateRequest { .. } => "ApiKeyRotateRequest",
         MessageBody::ApiKeyRotateResponse { .. } => "ApiKeyRotateResponse",
+        MessageBody::TokenUsageBody(p) => match p {
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest { .. } => {
+                "TokenUsageSummaryRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryResponse { .. } => {
+                "TokenUsageSummaryResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasRequest => "TokenListQuotasRequest",
+            tentaflow_protocol::TokenUsagePayload::ListQuotasResponse { .. } => {
+                "TokenListQuotasResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest { .. } => {
+                "TokenUpsertQuotaRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaResponse { .. } => {
+                "TokenUpsertQuotaResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { .. } => {
+                "TokenDeleteQuotaRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaResponse => {
+                "TokenDeleteQuotaResponse"
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest => {
+                "TokenCoordinatorStatusRequest"
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse { .. } => {
+                "TokenCoordinatorStatusResponse"
+            }
+        },
     }
 }
 

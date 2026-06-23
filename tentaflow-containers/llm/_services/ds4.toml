@@ -1,0 +1,183 @@
+# Manifest serwisu ds4 (antirez/ds4) — dedykowany silnik DeepSeek V4 Flash/Pro
+# w czystym C. NIE jest to wariant llama.cpp: własny graf inferencji, MoE SSD
+# streaming routowanych ekspertów i MTP speculative decoding. Backendy: Metal
+# (macOS), CUDA (Linux — DGX Spark/GB10 oraz generic/Blackwell), ROCm (Strix
+# Halo gfx1151). Single-node; tryb distributed (coordinator/worker, layer split)
+# uruchamiamy przez cluster osobno i dojdzie w kolejnej iteracji.
+#
+# Wdrożenie jako ZEWNĘTRZNY proces (nie embedded): Docker na Linux/CUDA oraz
+# native binary (runtime="binary") na macOS/Linux/Strix Halo — TentaFlow buduje
+# i spawnuje `ds4-server`, mówi do niego po HTTP (OpenAI-compatible). Kwantyzacja
+# w ds4 jest wypalona w pliku GGUF, więc "kwantyzacja" = wybór presetu modelu.
+
+[engine]
+id = "ds4"
+category = "llm"
+name = "DeepSeek V4 (ds4)"
+description_pl = "Dedykowany silnik DeepSeek V4 Flash/Pro (antirez/ds4). Metal/CUDA/ROCm, streaming ekspertów MoE z SSD, MTP speculative decoding."
+description_en = "Dedicated DeepSeek V4 Flash/Pro engine (antirez/ds4). Metal/CUDA/ROCm, MoE expert SSD streaming, MTP speculative decoding."
+homepage = "https://github.com/antirez/ds4"
+license = "BSD-2-Clause"
+icon = "deepseek"
+default_port = 8000
+api = "openai-compatible"
+version = "main"
+
+[deploy.docker]
+context_path = "llm/docker/ds4"
+platforms = ["linux"]
+transport = "direct-http"
+gpus = "all"
+
+# Pinowany commit ds4 + domyślny target make. Dla Blackwell/B300 nadpisz
+# DS4_MAKE_TARGET="cuda" + DS4_CUDA_ARCH="sm_100" (lub właściwy sm_), dla DGX
+# Spark/GB10 użyj obrazu native (cuda-spark). Generic build celuje w lokalną
+# architekturę karty obecnej przy budowie obrazu.
+[deploy.docker.default_build_args]
+CUDA_IMAGE = "nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
+DS4_REF = "main"
+DS4_MAKE_TARGET = "cuda-generic"
+DS4_CUDA_ARCH = ""
+
+# Native binary: build ze źródeł przez llm/native/ds4/server (build-on-first-run),
+# spawn ds4-server na przydzielonym porcie. macOS = Metal, Linux = CUDA
+# (cuda-spark/cuda-generic auto), Strix Halo = ROCm. Backend wybiera DS4_BACKEND
+# albo autodetekcja w skrypcie.
+[deploy.native]
+platforms = ["linux", "macos"]
+runtime = "binary"
+binary_path = "llm/native/ds4"
+
+# ---------------------------------------------------------------------------
+# Parametry kreatora → env (Docker entrypoint i native server mapują je na
+# flagi ds4-server). Bindingi dla obu celów wdrożenia: docker + native_binary.
+# ---------------------------------------------------------------------------
+
+[[parameter]]
+key = "backend"
+label_pl = "Backend obliczeniowy"
+label_en = "Compute backend"
+kind = "enum"
+options = ["auto", "metal", "cuda", "rocm", "cpu"]
+default = "auto"
+bindings = [
+  { when = "docker", type = "env", name = "DS4_BACKEND" },
+  { when = "native_binary", type = "env", name = "DS4_BACKEND" }
+]
+
+[[parameter]]
+key = "ctx"
+label_pl = "Kontekst (tokeny)"
+label_en = "Context tokens"
+kind = "int"
+default = 100000
+range = { min = 2048.0, max = 1048576.0, step = 1024.0 }
+bindings = [
+  { when = "docker", type = "env", name = "DS4_CTX" },
+  { when = "native_binary", type = "env", name = "DS4_CTX" }
+]
+
+[[parameter]]
+key = "ssd_streaming"
+label_pl = "Streaming ekspertów z SSD"
+label_en = "SSD expert streaming"
+kind = "enum"
+options = ["auto", "on", "off"]
+default = "auto"
+bindings = [
+  { when = "docker", type = "env", name = "DS4_SSD_STREAMING" },
+  { when = "native_binary", type = "env", name = "DS4_SSD_STREAMING" }
+]
+
+[[parameter]]
+key = "ssd_cache_experts"
+label_pl = "Cache ekspertów (liczba lub GiB, np. 32 albo 24GiB)"
+label_en = "Expert cache (count or GiB, e.g. 32 or 24GiB)"
+kind = "string"
+default = "auto"
+bindings = [
+  { when = "docker", type = "env", name = "DS4_SSD_CACHE_EXPERTS" },
+  { when = "native_binary", type = "env", name = "DS4_SSD_CACHE_EXPERTS" }
+]
+
+[[parameter]]
+key = "mtp"
+label_pl = "MTP speculative decoding"
+label_en = "MTP speculative decoding"
+kind = "enum"
+options = ["off", "on"]
+default = "off"
+bindings = [
+  { when = "docker", type = "env", name = "DS4_MTP" },
+  { when = "native_binary", type = "env", name = "DS4_MTP" }
+]
+
+[[parameter]]
+key = "mtp_draft"
+label_pl = "MTP draft tokens"
+label_en = "MTP draft tokens"
+kind = "int"
+default = 2
+range = { min = 1.0, max = 8.0, step = 1.0 }
+bindings = [
+  { when = "docker", type = "env", name = "DS4_MTP_DRAFT" },
+  { when = "native_binary", type = "env", name = "DS4_MTP_DRAFT" }
+]
+
+[[parameter]]
+key = "power"
+label_pl = "Limit mocy / throttling (0 = bez limitu)"
+label_en = "Power throttle (0 = unlimited)"
+kind = "int"
+default = 0
+range = { min = 0.0, max = 100.0, step = 1.0 }
+bindings = [
+  { when = "docker", type = "env", name = "DS4_POWER" },
+  { when = "native_binary", type = "env", name = "DS4_POWER" }
+]
+
+[[parameter]]
+key = "threads"
+label_pl = "Wątki CPU (0 = auto)"
+label_en = "CPU threads (0 = auto)"
+kind = "int"
+default = 0
+range = { min = 0.0, max = 256.0, step = 1.0 }
+bindings = [
+  { when = "docker", type = "env", name = "DS4_THREADS" },
+  { when = "native_binary", type = "env", name = "DS4_THREADS" }
+]
+
+# ---------------------------------------------------------------------------
+# Presety modeli = gotowe "bloczki". `repo` niesie target download_model.sh
+# (download_model.sh zna konkretne pliki GGUF w repo antirez/deepseek-v4-gguf),
+# więc MODEL=<target> wystarcza skryptom build/entrypoint do pobrania wag.
+# `featured` = własny kafelek w katalogu (turnkey deploy DeepSeek V4 Flash/Pro).
+# ---------------------------------------------------------------------------
+
+[[model_preset]]
+id = "deepseek-v4-flash-q2"
+display_name = "DeepSeek V4 Flash — IQ2 (~81 GB, 96/128 GB RAM)"
+repo = "q2-imatrix"
+quantization = "IQ2_XXS"
+recommended = true
+featured = true
+
+[[model_preset]]
+id = "deepseek-v4-flash-q2q4"
+display_name = "DeepSeek V4 Flash — IQ2/Q4 mix (~98 GB, 128 GB)"
+repo = "q2-q4-imatrix"
+quantization = "IQ2_XXS+Q4_K"
+
+[[model_preset]]
+id = "deepseek-v4-flash-q4"
+display_name = "DeepSeek V4 Flash — Q4_K (~153 GB, 256 GB+ RAM)"
+repo = "q4-imatrix"
+quantization = "Q4_K"
+
+[[model_preset]]
+id = "deepseek-v4-pro-q2"
+display_name = "DeepSeek V4 Pro — IQ2 (~430 GB, 512 GB RAM)"
+repo = "pro-q2-imatrix"
+quantization = "IQ2_XXS"
+featured = true

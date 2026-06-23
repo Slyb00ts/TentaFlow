@@ -29,6 +29,8 @@ pub enum ServiceSurface {
     ImageGen,
     Documents,
     Agents,
+    /// Monocular depth estimation (Depth Anything / MiDaS) — image in, depth map out.
+    Depth,
 }
 
 impl ServiceSurface {
@@ -46,6 +48,7 @@ impl ServiceSurface {
             "image-gen" | "image_gen" => Some(Self::ImageGen),
             "documents" => Some(Self::Documents),
             "agents" => Some(Self::Agents),
+            "depth" => Some(Self::Depth),
             _ => None,
         }
     }
@@ -62,6 +65,7 @@ impl ServiceSurface {
             "image-gen" | "image_gen" => Some(Self::ImageGen),
             "documents" => Some(Self::Documents),
             "agents" => Some(Self::Agents),
+            "depth" => Some(Self::Depth),
             _ => None,
         }
     }
@@ -80,6 +84,7 @@ impl ServiceSurface {
             Self::ImageGen => "image_gen",
             Self::Documents => "documents",
             Self::Agents => "agents",
+            Self::Depth => "depth",
         }
     }
 
@@ -97,6 +102,7 @@ impl ServiceSurface {
             "image_gen" => Some(Self::ImageGen),
             "documents" => Some(Self::Documents),
             "agents" => Some(Self::Agents),
+            "depth" => Some(Self::Depth),
             _ => None,
         }
     }

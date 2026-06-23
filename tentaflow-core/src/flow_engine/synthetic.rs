@@ -36,6 +36,30 @@ pub fn synthetic_chat(model: &str) -> FlowDefinition {
     }
 }
 
+/// Synthetic vision flow: trigger → vision_llm(model) → pii_filter → output.
+/// Używany gdy request niesie obraz (modality="image") a admin nie skonfigurował
+/// dedykowanego flow. `vision_llm` konsumuje `FlowValue::Image` payload (trigger
+/// emituje go przez port `image`), dokleja prompt + obraz jako multimodal Parts
+/// i dispatchuje przez backend — bez tego image payload przeszedłby surowy do
+/// output i serializował się jako blob ref zamiast odpowiedzi modelu.
+pub fn synthetic_vision(model: &str) -> FlowDefinition {
+    FlowDefinition {
+        nodes: vec![
+            trigger_node(),
+            capability_node("vision_llm", "l1", model),
+            pii_filter_node(),
+            output_node(),
+        ],
+        edges: vec![
+            // Image payload: trigger.image → vision_llm.in (port `in` ma typ Image).
+            edge("t1", "l1", "image", "in"),
+            edge("l1", "p1", "full", "in"),
+            edge("p1", "o1", "full", "text"),
+        ],
+        variables: Vec::new(),
+    }
+}
+
 /// Synthetic chat-stream flow: trigger → llm(model) → pii_filter →
 /// output(stream). LLM emituje przez `stream` port, pii_filter (jako
 /// `StreamingNodeAdapter`) przepuszcza i wycina PII per zdanie, sink ma
@@ -176,6 +200,7 @@ mod tests {
     use crate::flow_engine::node_adapter::AdapterRegistry;
     use crate::flow_engine::node_adapters::{
         LlmNodeAdapter, OutputNodeAdapter, PiiFilterNodeAdapter, TriggerNodeAdapter,
+        VisionNodeAdapter,
     };
     use std::sync::Arc;
 
@@ -185,6 +210,7 @@ mod tests {
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register_streaming(Arc::new(PiiFilterNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
+        r.register(Arc::new(VisionNodeAdapter::new()));
         r
     }
 
@@ -193,6 +219,24 @@ mod tests {
         let def = synthetic_chat("qwen3.5-0.8b");
         let compiled = CompiledFlow::compile("0", def, &min_registry());
         assert!(compiled.is_ok(), "synthetic chat: {:?}", compiled.err());
+    }
+
+    #[test]
+    fn synthetic_vision_compiles_and_carries_model() {
+        let def = synthetic_vision("qwen3-vl");
+        let vision = def
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "vision_llm")
+            .expect("vision_llm node present");
+        assert_eq!(
+            vision.config.get("model").and_then(|v| v.as_str()),
+            Some("qwen3-vl")
+        );
+        // Trigger emituje obraz przez port `image`, nie `text`.
+        assert_eq!(def.edges[0].from_port, "image");
+        let compiled = CompiledFlow::compile("0", def, &min_registry());
+        assert!(compiled.is_ok(), "synthetic vision: {:?}", compiled.err());
     }
 
     #[test]

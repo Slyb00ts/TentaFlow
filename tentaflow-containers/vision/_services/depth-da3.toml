@@ -1,0 +1,57 @@
+# =============================================================================
+# Plik: depth-da3.toml
+# Opis: Manifest serwisu Depth Anything 3 (DA3) — OSOBNY serwis od `depth`, bo DA3
+#       NIE działa przez `transformers` `pipeline("depth-estimation")`: wymaga
+#       własnego pakietu `depth_anything_3` (z repo ByteDance-Seed) i API
+#       `DepthAnything3.from_pretrained(...).inference([path])`. Surface "depth":
+#       wejście obraz, wyjście mapa głębi (image), REST `POST /v1/depth`. Warianty:
+#       DA3-* dają głębię RELATYWNĄ (ewaluacja V3), DA3NESTED-* — METRYCZNĄ (metry).
+#       Serwis do oceny/porównań; mapowanie z kamery (depth_mapping) używa silnika
+#       `depth` (transformers), nie tego — engine_id celowo różny.
+# =============================================================================
+
+[engine]
+id = "depth-da3"
+category = "vision"
+name = "Depth Anything 3 (DA3)"
+description_pl = "Depth Anything 3 (ByteDance) — własny pakiet, nie transformers. DA3-* relatywne (ewaluacja V3), DA3NESTED-* metryczne. POST /v1/depth zwraca mapę głębi f32."
+description_en = "Depth Anything 3 (ByteDance) — custom package, not transformers. DA3-* relative (V3 eval), DA3NESTED-* metric. POST /v1/depth returns an f32 depth map."
+homepage = "https://github.com/ByteDance-Seed/depth-anything-3"
+license = "apache-2.0"
+icon = "vision"
+default_port = 8097
+api = "custom"
+version = "1.0.0"
+service_surfaces = ["depth"]
+input_modalities = ["image"]
+output_modalities = ["image"]
+
+# Native tylko Linux: DA3 buduje pakiet ze źródeł (--no-build-isolation, nvcc) +
+# xformers — runner natywny (sam venv) nie zapewnia toolchaina CUDA na Windows.
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "vision/python/depth-da3"
+
+[deploy.docker]
+context_path = "vision/docker/depth-da3"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+
+# DA3 RELATYWNE — to czego chcieliśmy do oceny V3 (głębia względna, nie metry).
+[[model_preset]]
+id = "da3-large"
+display_name = "DA3 Large (relatywny)"
+repo = "depth-anything/DA3-LARGE"
+recommended = true
+
+[[model_preset]]
+id = "da3-small"
+display_name = "DA3 Small (relatywny, szybki)"
+repo = "depth-anything/DA3-SMALL"
+
+# DA3 METRYCZNE — głębia już w METRACH (bez konwersji), opcja cięższa (giant).
+[[model_preset]]
+id = "da3-nested-giant-large"
+display_name = "DA3 Nested Giant+Large 1.1 (metryczny, ciężki)"
+repo = "depth-anything/DA3NESTED-GIANT-LARGE-1.1"

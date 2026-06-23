@@ -46,4 +46,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    // Positioning sensors: fused GPS + ARCore depth (phone as a sensor-robot).
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+    implementation("com.google.ar:core:1.45.0")
 }

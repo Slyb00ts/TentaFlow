@@ -21,18 +21,12 @@ use base64::Engine;
 use serde_json::{json, Value as JsonValue};
 
 use tentaflow_hardware::unitree::go2::protocol;
-use tentaflow_sdk_spec::protocol::control::CborMap;
-use tentaflow_sdk_spec::protocol::ui::{
-    actions::Button as ButtonComp,
-    bind::BindRef,
-    data::{Heading as HeadingComp, Text as TextComp},
-    inline::*,
-    layout::SectionCard,
-    tokens::*,
+use tentaflow_sdk_spec::{
+    LidarFrameHeader, LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_LAYOUT_XYZ_I16_PLANAR,
 };
 use tentaflow_sdk_spec::{
-    CameraGrantInput, CameraGrantOut, Component, FailurePolicy, Handler, HandlerMap, PanelShell,
-    RobotActionWire, RobotControlResponseWire, RobotDispatchInput, StateEntry, UiPayload, Value,
+    CameraGrantInput, CameraGrantOut,
+    RobotActionWire, RobotControlResponseWire, RobotDispatchInput,
     WebRtcCloseInput, WebRtcConnectInput, WebRtcConnectOutput, WebRtcDrainInput, WebRtcDrainOutput,
     WebRtcRegisterCameraInput, WebRtcRegisterCameraOutput, WebRtcSendInput, WebRtcSetAnswerInput,
     WebRtcStateInput, WebRtcStateOutput, WebRtcStatusOutput,
@@ -45,7 +39,6 @@ const VISION_ADDON_ID: &str = "tentavision";
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const ADDON_ID: &str = "go2";
-const PANEL_ID: &str = "overview";
 // The robot IP is provided per-install via the `ip` connection_param and read
 // from addon_config at runtime — there is intentionally NO hardcoded default.
 const IP_CONFIG_KEY: &str = "ip";
@@ -55,9 +48,11 @@ const BATTERY_ALERT_PCT: i64 = 20;
 // that stops advancing telemetry (persistent drain/state errors) is declared dead.
 const CONNECT_TIMEOUT_SECS: i64 = 20;
 const VALIDATION_TIMEOUT_SECS: i64 = 20;
+// Auto-connect backoff: when offline with connect-intent on, the tick retries a
+// connect at most this often (the tick runs every 100ms — don't hammer the robot).
+const RECONNECT_BACKOFF_SECS: i64 = 5;
 const ONLINE_STALE_SECS: i64 = 12;
 
-static PANEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
 
 // Sport command api_ids (Go2 normal mode). This addon drives the robot over the
@@ -78,6 +73,11 @@ const SPORT_STAND_DOWN: u32 = 1005;
 const SPORT_RECOVERY_STAND: u32 = 1006;
 const SPORT_EULER: u32 = 1007;
 const SPORT_MOVE: u32 = 1008;
+// On-board obstacle avoidance toggle. Distinct topic from sport; `false` lets the
+// operator drive/turn manually, `true` lets the robot autonomously avoid obstacles
+// (which can block manual turns). Mirrors go2_ros2_sdk set_obstacle_avoidance.
+const OBSTACLE_AVOID_TOPIC: &str = "rt/api/obstacles_avoid/request";
+const OBSTACLE_AVOID_API: u32 = 1004;
 const SPORT_SIT: u32 = 1009;
 const SPORT_BODY_HEIGHT: u32 = 1013;
 const SPORT_FOOT_RAISE_HEIGHT: u32 = 1014;
@@ -108,7 +108,6 @@ const FOOT_RAISE_MAX: f64 = 0.10;
 
 #[link(wasm_import_module = "tentaflow")]
 extern "C" {
-    fn ui_render_cbor(cbor_ptr: i32, cbor_len: i32) -> i32;
     fn event_publish(et_ptr: i32, et_len: i32, p_ptr: i32, p_len: i32) -> i32;
     fn log_info(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_warn(msg_ptr: i32, msg_len: i32) -> i32;
@@ -123,6 +122,17 @@ extern "C" {
     fn camera_grant_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn robot_dispatch_v1(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn config_get_v1(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn lidar_publish_v1(in_ptr: i32, in_len: i32) -> i32;
+}
+
+/// Publish ONE canonical LiDAR frame (packed f32, sdk-spec layout) to the host
+/// LidarStreamHub. A single byte buffer, single host copy; non-fatal on
+/// failure (the next frame retries). Logs a warning on a real ABI error.
+fn publish_lidar_frame(frame: &[u8]) {
+    let ret = unsafe { lidar_publish_v1(frame.as_ptr() as i32, frame.len() as i32) };
+    if ret != 0 {
+        log::warn(&alloc::format!("go2 lidar: publish abi error {ret}"));
+    }
 }
 
 /// Reads an install-time connection param from `addon_config` (scoped to this
@@ -199,6 +209,45 @@ mod log {
     }
     pub fn warn(m: &str) {
         unsafe { log_warn(m.as_ptr() as i32, m.len() as i32); }
+    }
+    /// Error-level host log. The host exposes only info/warn import symbols, so
+    /// error routes through `log_warn` with an explicit `ERROR` prefix — there is
+    /// no separate error import to add. Used by the panic hook to make a future
+    /// trap loud and unmistakable.
+    pub fn error(m: &str) {
+        let line = alloc::format!("ERROR {m}");
+        unsafe { log_warn(line.as_ptr() as i32, line.len() as i32); }
+    }
+}
+
+/// Sub-millisecond clocks for pipeline timing. The addon targets `wasm32-wasip1`
+/// and both the wasmtime (desktop) and wasmi (mobile) hosts back WASI
+/// `clock_time_get` for clock_id 0 (realtime) and 1 (monotonic), so `std::time`
+/// works here with real precision — no extra host-fn is needed just to measure.
+/// `wall_micros` stamps the canonical frame header so the browser can compute a
+/// true end-to-end latency; `mono_micros` measures stage durations (immune to
+/// wall-clock steps).
+mod clock {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    /// Wall-clock microseconds since the Unix epoch. Used to stamp the canonical
+    /// frame header (`timestamp_us`) so the browser, on the same machine for the
+    /// local case, can subtract its own wall clock for an end-to-end delta.
+    pub fn wall_micros() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Monotonic microseconds from a process-static reference Instant. Only valid
+    /// for measuring intervals/durations within this process (never compared
+    /// across machines), so it never goes backwards under NTP adjustments.
+    pub fn mono_micros() -> i64 {
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = EPOCH.get_or_init(Instant::now);
+        epoch.elapsed().as_micros() as i64
     }
 }
 
@@ -386,6 +435,22 @@ fn build_sport(api_id: u32, parameter: &str) -> String {
         "type": "req",
         "topic": "rt/api/sport/request",
         "data": { "header": { "identity": { "id": id, "api_id": api_id } }, "parameter": parameter },
+    })
+    .to_string()
+}
+
+// Build the obstacle-avoidance toggle request. Same envelope shape as `build_sport`
+// but on the dedicated obstacles_avoid topic; `parameter` is a JSON STRING (like the
+// sport parameter) carrying the enable flag.
+fn build_obstacle_avoid(enabled: bool) -> String {
+    let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    json!({
+        "type": "req",
+        "topic": OBSTACLE_AVOID_TOPIC,
+        "data": {
+            "header": { "identity": { "id": id, "api_id": OBSTACLE_AVOID_API } },
+            "parameter": json!({ "is_remote_commands_from_api": enabled }).to_string(),
+        },
     })
     .to_string()
 }
@@ -717,6 +782,14 @@ struct Telemetry {
     imu_yaw: Option<f64>,
     imu_quaternion: Vec<f64>,
     imu_temperature: Option<f64>,
+    // Leg joint angles (radians) from lowstate `motor_state[i].q`, Go2 order:
+    // 0-2 FR, 3-5 FL, 6-8 RR, 9-11 RL. Drives the dashboard robot animation (R2).
+    joints: Vec<f64>,
+    // World pose from `rt/utlidar/robot_pose` (lidar odometry frame): position
+    // [x,y,z] meters and orientation quaternion [x,y,z,w]. Drives robot placement
+    // + map accumulation in the 3D viewer.
+    pose_position: Vec<f64>,
+    pose_orientation: Vec<f64>,
     bat_soc: Option<f64>,
     bat_voltage: Option<f64>,
     bat_current: Option<f64>,
@@ -733,6 +806,10 @@ std::thread_local! {
 
 const LIDAR_TOPIC: &str = "rt/utlidar/voxel_map_compressed";
 const LIDAR_SWITCH_TOPIC: &str = "rt/utlidar/switch";
+// Lidar-derived robot odometry pose (position + orientation quaternion). Unlike
+// `rt/sportmodestate` (not published over WebRTC on this firmware), go2_ros2_sdk
+// sources its /odom from this topic, so it should carry world pose on the Air too.
+const POSE_TOPIC: &str = "rt/utlidar/robot_pose";
 // Upstream decoder buffers the decompressed occupancy grid at exactly 80_000 bytes
 // (go2_webrtc_connect `decompressBuffer`). The grid addresses z*0x800 + y*0x10 +
 // x_byte: z-stride 0x800 (2048), y-stride 0x10 (16), 16 x-bytes => 128 x-voxels.
@@ -753,6 +830,15 @@ const LIDAR_MAX_POINTS: usize = 300_000;
 // the card without writing on every decoded voxel frame; availability/enabled
 // transitions bypass this and persist immediately.
 const LIDAR_STATUS_REFRESH_SECS: i64 = 1;
+// Rate-limit for the per-frame pipeline timing log line. At a typical ~5 Hz voxel
+// stream this emits roughly one concise timing line every ~2 s, enough to watch
+// live without flooding the log on the hot drain path.
+const LIDAR_TIMING_LOG_EVERY: u64 = 10;
+// Rate-limit for the per-frame decode-sizing diagnostic line. The FIRST voxel
+// frame of a session always logs (counter starts at 0), then one line every
+// LIDAR_DIAG_LOG_EVERY frames so the 5Hz stream is not flooded while still
+// surfacing src_size / decompressed length / point_count on real data.
+const LIDAR_DIAG_LOG_EVERY: u64 = 25;
 
 /// Latest decoded LiDAR frame plus the on/off intent. Only the MOST RECENT frame
 /// is kept (the voxel map is a stream); a new frame overwrites the prior one so
@@ -781,15 +867,10 @@ struct LidarState {
     // Cheap occupied-voxel count of the latest frame (popcount over the bitfield).
     // The on_tick path NEVER materializes the full point cloud — it only counts set
     // bits — so a dense frame cannot blow the per-tick fuel budget and wedge the
-    // connection. The full Vec<[f32;3]> is built only on demand in lidar_frame from
-    // the retained compressed raw frame below.
+    // connection. The canonical packed-f32 cloud is decoded directly on the tick
+    // (decode_voxel_to_canonical) and published to the host LidarStreamHub; this
+    // addon never retains the full Vec<[f32;3]> or the raw frame.
     point_count: usize,
-    // Latest raw (LZ4-compressed) voxel payload + its origin/resolution, kept so the
-    // full point cloud can be decoded ON DEMAND (off the tick path) in lidar_frame.
-    // Compressed (≤ ~80KB), so retaining one frame stays bounded. The framing header
-    // is stripped: this is the bytes passed directly to lz4 decompress.
-    latest_raw: Vec<u8>,
-    latest_src_size: usize,
     // Monotonic counter of frames decoded this session (UI freshness indicator).
     frame_seq: u64,
     // Wall-clock seconds of the last decoded frame.
@@ -797,10 +878,100 @@ struct LidarState {
     // Size of the last compressed payload received (bytes), for diagnostics even
     // when a frame failed to decode.
     last_payload_bytes: usize,
+    // --- Pipeline timing (always-on, rate-limited in logs) ---
+    // Monotonic µs of the previous voxel-frame arrival, to derive the WebRTC
+    // inter-arrival interval (and thus the robot's effective send Hz). Zero until
+    // the first frame establishes a baseline (no interval logged for frame #1).
+    last_voxel_arrival_us: i64,
+    // Counter of ingested voxel frames, used to rate-limit the timing log line so
+    // a multi-Hz stream emits roughly one timing line per LIDAR_TIMING_LOG_EVERY
+    // frames instead of one per frame.
+    timing_log_counter: u64,
+    // Counter of voxel frames seen by the diagnostic line (decode sizing inputs).
+    // First frame always logs; thereafter rate-limited by LIDAR_DIAG_LOG_EVERY so
+    // we can confirm src_size / decompressed length / point_count on real data
+    // without flooding the 5Hz stream.
+    diag_log_counter: u64,
 }
 
 std::thread_local! {
     static LIDAR: core::cell::RefCell<LidarState> = core::cell::RefCell::new(LidarState::default());
+    // One-shot guard so parse_voxel_frame logs the matched JSON framing offset and
+    // declared src_size EXACTLY ONCE per worker, confirming the (2,0) auto-detect
+    // picked the correct boundary on real firmware without flooding the stream.
+    static VOXEL_FRAMING_LOGGED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    // Throttle counter for the robot_pose probe log.
+    static POSE_LOG: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    // DIAGNOSTIC (R2 / 0e-live probe): distinct WebRTC topics seen this session +
+    // one-shot lowstate-shape dump. Tells us what data is actually available over
+    // WebRTC (joints? position?) so we know whether option-B pose is possible here.
+    static DIAG: core::cell::RefCell<DiagState> =
+        core::cell::RefCell::new(DiagState { topics: alloc::vec::Vec::new(), lowstate_dumped: false });
+}
+
+#[derive(Default)]
+struct DiagState {
+    topics: alloc::vec::Vec<alloc::string::String>,
+    lowstate_dumped: bool,
+}
+
+/// Log each DISTINCT inbound topic exactly once (cap 64) — enumerates what the
+/// robot actually publishes over WebRTC.
+fn diag_note_topic(raw: &[u8]) {
+    let needle = b"\"topic\":\"";
+    let Some(pos) = find_sub(raw, needle, 0) else { return };
+    let start = pos + needle.len();
+    let rest = &raw[start..];
+    let Some(end) = rest.iter().position(|&b| b == b'"') else { return };
+    let Ok(topic) = core::str::from_utf8(&rest[..end]) else { return };
+    DIAG.with(|c| {
+        let mut d = c.borrow_mut();
+        if d.topics.iter().any(|t| t == topic) || d.topics.len() >= 64 {
+            return;
+        }
+        d.topics.push(alloc::string::String::from(topic));
+        log::info(&alloc::format!("go2 DIAG topic seen: {topic}"));
+    });
+}
+
+/// One-shot dump of the lowstate payload shape: which `data` keys exist, the joint
+/// `motor_state[].q` values (R2), and whether any position-like field is present
+/// (0e-live source check). Runs on the first lowstate frame only.
+fn diag_lowstate_dump(data: &JsonValue) {
+    let first = DIAG.with(|c| {
+        let mut d = c.borrow_mut();
+        if d.lowstate_dumped {
+            return false;
+        }
+        d.lowstate_dumped = true;
+        true
+    });
+    if !first {
+        return;
+    }
+    if let Some(obj) = data.as_object() {
+        let keys: alloc::vec::Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        log::info(&alloc::format!("go2 DIAG lowstate data keys: {keys:?}"));
+    }
+    match data.get("motor_state").and_then(JsonValue::as_array) {
+        Some(ms) => {
+            let qs: alloc::vec::Vec<f64> = ms
+                .iter()
+                .take(12)
+                .filter_map(|m| m.get("q").and_then(JsonValue::as_f64))
+                .collect();
+            log::info(&alloc::format!(
+                "go2 DIAG joints: motor_state count={} q[0..12]={qs:?}",
+                ms.len()
+            ));
+        }
+        None => log::info("go2 DIAG joints: NO motor_state in lowstate"),
+    }
+    for k in ["position", "pose", "p", "xyz", "foot_position", "trunk_pose"] {
+        if data.get(k).is_some() {
+            log::info(&alloc::format!("go2 DIAG lowstate HAS position-like field '{k}'"));
+        }
+    }
 }
 
 /// Reset all per-session LiDAR runtime state. Called on disconnect/offline so a
@@ -817,6 +988,9 @@ fn lidar_reset_session() {
     });
     let _ = state::delete(state::KEY_TELEMETRY);
     let _ = state::delete(state::KEY_LIDAR_STATUS);
+    // Reset the diagnostic probe so a reconnect re-enumerates topics + re-dumps the
+    // lowstate shape (it is meant to report what THIS session sees).
+    DIAG.with(|cell| *cell.borrow_mut() = DiagState::default());
 }
 
 /// Mirror the connection-status fields the advertise path (and a future host-side
@@ -885,51 +1059,118 @@ fn lidar_status_json() -> JsonValue {
     })
 }
 
-/// Decode the Go2 voxel-map occupancy bitfield into voxel-center points (meters).
-/// Mirrors the upstream `go2_webrtc_connect` NATIVE decoder exactly:
-///   - the decompressed buffer is a 3D occupancy grid addressed as
-///     `index = z*0x800 + y*0x10 + x_byte`; each byte packs 8 voxels along x
-///     (`x = x_byte*8 + bit`, MSB-first).
-///   - a point is emitted for every set bit, at `[x,y,z]*resolution + origin`.
-/// The grid dimensions (0x800 z-stride, 0x10 y-stride, 16 bytes => 128 x-voxels)
-/// are the upstream constants. Returns the points or `None` if the count would
-/// exceed `LIDAR_MAX_POINTS` (logged by the caller — never a partial set).
-fn voxel_bits_to_points(buf: &[u8], origin: [f64; 3], resolution: f32) -> Option<Vec<[f32; 3]>> {
-    let res = resolution as f64;
-    let mut out: Vec<[f32; 3]> = Vec::new();
-    for (i, &byte) in buf.iter().enumerate() {
+/// Cheap occupied-voxel count: popcount over the decompressed occupancy bitfield.
+/// O(bitfield bytes) and allocates nothing. Used both to size the canonical frame
+/// buffer exactly and as the availability/diagnostic point count, so the per-tick
+/// cost stays bounded even for a dense grid (the failure mode that wedged the
+/// connection when the cloud was materialized as a Vec).
+fn count_voxel_points(buf: &[u8]) -> usize {
+    buf.iter().map(|b| b.count_ones() as usize).sum()
+}
+
+/// Decode the Go2 voxel-map occupancy bitfield DIRECTLY into a canonical,
+/// vendor-agnostic `LidarFrame` (packed f32, sdk-spec layout) — the format Core
+/// and the renderer consume identically for every robot. This is the path used
+/// on the service tick instead of building a `Vec<[f32;3]>` + JSON.
+///
+/// INVARIANT (the whole point of L1): zero JSON; the output `Vec<u8>` is
+/// PREALLOCATED to exactly `LIDAR_HEADER_LEN + point_count*3*2` from the exact
+/// popcount, so it never grows during the bit-scan, and the whole frame is one
+/// buffer for a single WASM->host copy in `publish_lidar_frame`.
+///
+/// Returns `None` if the occupied count exceeds `LIDAR_MAX_POINTS` (caller logs
+/// + drops the frame — never a partial cloud, which would misplace points).
+fn decode_voxel_to_canonical(
+    decompressed: &[u8],
+    resolution: f32,
+    origin: [f32; 3],
+    frame_seq: u32,
+    ts_us: i64,
+) -> Option<Vec<u8>> {
+    let point_count = count_voxel_points(decompressed);
+    if point_count > LIDAR_MAX_POINTS {
+        return None;
+    }
+    let header = LidarFrameHeader {
+        version: LIDAR_FRAME_VERSION,
+        // Packed-i16 grid indices: half the wire bytes of f32 XYZ and lossless for
+        // a voxel map (every point already lands on `origin + index * resolution`).
+        // The browser reconstructs world meters from these indices + the header's
+        // resolution/origin, so those two fields are now load-bearing, not just
+        // informational. Emitting indices is also cheaper per point than the f32
+        // multiply-add, easing the service-tick fuel budget.
+        layout: LIDAR_LAYOUT_XYZ_I16_PLANAR,
+        // Addon emits an uncompressed body; the host pump applies LZ4 + the flag
+        // on the way out, so the metered service tick never pays compression fuel.
+        flags: 0,
+        point_count: point_count as u32,
+        frame_seq,
+        timestamp_us: ts_us,
+        // The addon does not know when the host will broadcast this frame; the
+        // host pump stamps `host_send_us` in place just before the WS send.
+        host_send_us: 0,
+        resolution,
+        origin,
+    };
+    // Exact preallocation with checked arithmetic so a pathological count can
+    // never overflow usize and panic the allocation size. point_count is already
+    // capped at LIDAR_MAX_POINTS above, so the checked path always succeeds here;
+    // the saturating fallback is a defensive belt-and-braces (still a finite,
+    // bounded reserve — never a panic). The body is `point_count * 3 * 2` bytes
+    // (3 i16 grid indices per point, XYZ_I16 layout).
+    let body_cap = point_count
+        .checked_mul(3)
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(LIDAR_HEADER_LEN))
+        .unwrap_or(LIDAR_HEADER_LEN);
+    // Fallible reserve instead of with_capacity: under panic = abort an oversized
+    // or garbage allocation request would call handle_alloc_error and KILL the
+    // process (no panic to catch). try_reserve_exact returns Err on failure so we
+    // drop the frame (caller logs) instead of aborting the connection. We size the
+    // exact buffer then `resize` (within the reserved capacity, so no reallocation
+    // / abort) because PLANAR emission writes to three disjoint regions by index,
+    // not sequentially.
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(body_cap).is_err() {
+        return None;
+    }
+    out.resize(body_cap, 0);
+    out[..LIDAR_HEADER_LEN].copy_from_slice(&header.encode_header());
+    // Emit raw grid INDICES as i16 in PLANAR order: all ix, then all iy, then all
+    // iz. Each plane is a long low-entropy run (iy/iz barely change along a scan
+    // row), so the host's LZ4 pass compresses it far better than interleaved. The
+    // browser reconstructs `idx * resolution + origin`; no per-point float math
+    // here, which also trims the service-tick fuel.
+    let n = point_count;
+    let ix_base = LIDAR_HEADER_LEN;
+    let iy_base = LIDAR_HEADER_LEN + n * 2;
+    let iz_base = LIDAR_HEADER_LEN + n * 4;
+    let mut p = 0usize;
+    for (i, &byte) in decompressed.iter().enumerate() {
         if byte == 0 {
             continue;
         }
-        let z = (i / 0x800) as f64;
+        let z = (i / 0x800) as i16;
         let n_slice = i % 0x800;
-        let y = (n_slice / 0x10) as f64;
-        let x_base = ((n_slice % 0x10) * 8) as f64;
-        // MSB-first bit order (matches numpy `unpackbits`).
-        for bit in 0..8u32 {
-            if byte & (0x80 >> bit) != 0 {
-                if out.len() >= LIDAR_MAX_POINTS {
-                    return None;
-                }
-                let x = x_base + bit as f64;
-                out.push([
-                    (x * res + origin[0]) as f32,
-                    (y * res + origin[1]) as f32,
-                    (z * res + origin[2]) as f32,
-                ]);
-            }
+        let y = (n_slice / 0x10) as i16;
+        let x_base = ((n_slice % 0x10) * 8) as i16;
+        // y/z are constant for this byte; only x varies per set bit.
+        let yi = y.to_le_bytes();
+        let zi = z.to_le_bytes();
+        // Bit-scan: only set bits do work. The Go2 grid is MSB-first along x
+        // (bit 0 == 0x80), so reverse the trailing-zero index to recover x.
+        let mut bits = byte;
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            bits &= bits - 1;
+            let xi = (x_base + (7 - b) as i16).to_le_bytes();
+            out[ix_base + p * 2..ix_base + p * 2 + 2].copy_from_slice(&xi);
+            out[iy_base + p * 2..iy_base + p * 2 + 2].copy_from_slice(&yi);
+            out[iz_base + p * 2..iz_base + p * 2 + 2].copy_from_slice(&zi);
+            p += 1;
         }
     }
     Some(out)
-}
-
-/// Cheap occupied-voxel count: popcount over the decompressed occupancy bitfield.
-/// This is the ONLY voxel work done on the service tick — it is O(bitfield bytes)
-/// and allocates nothing, so a dense frame can never exceed the per-tick fuel
-/// budget (the failure mode that wedged the connection). The full point cloud is
-/// built only on demand in `lidar_frame`, never here.
-fn count_voxel_points(buf: &[u8]) -> usize {
-    buf.iter().map(|b| b.count_ones() as usize).sum()
 }
 
 /// Read a 3-element `[x,y,z]` numeric origin from the lidar frame JSON `data`.
@@ -937,74 +1178,120 @@ fn count_voxel_points(buf: &[u8]) -> usize {
 /// place points against a fabricated origin).
 fn parse_origin3(v: Option<&JsonValue>) -> Option<[f64; 3]> {
     let arr = v.and_then(JsonValue::as_array)?;
-    if arr.len() < 3 {
-        return None;
-    }
-    Some([arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?])
+    // get(..) instead of indexing: a JSON origin array shorter than 3 returns
+    // None rather than panicking (panic = abort would drop the link).
+    Some([
+        arr.get(0)?.as_f64()?,
+        arr.get(1)?.as_f64()?,
+        arr.get(2)?.as_f64()?,
+    ])
 }
 
 /// Parse the two binary data-channel framings the Go2 uses for an inbound voxel
-/// map (matches upstream `deal_array_buffer`):
-///   - LiDAR framing: leading `<HH>` == (2,0); then at +4 a `<I>` json length,
-///     JSON at [8..8+len], compressed bytes after.
-///   - normal framing: `<H>` json length at 0, JSON at [4..4+len], compressed
-///     bytes after.
+/// map (upstream `deal_array_buffer`):
+///   - LiDAR framing: leading `<HH>` == (2,0); then a `<I>` (u32 LE) JSON length;
+///     the `len`-byte JSON object follows, then the LZ4-compressed bitfield. The
+///     JSON starts either immediately after the length (raw[8]) or after a 4-byte
+///     pad (raw[12]) depending on firmware. We AUTO-DETECT by trying both and
+///     keeping the one that parses as the voxel topic — the JSON is exactly `len`
+///     bytes, so each candidate boundary is unambiguous to validate, and the
+///     compressed tail follows it. This avoids a fragile hard-coded offset (an
+///     off-by-4 there silently yields zero points / a broken decode).
+///   - normal framing: `<H>` JSON length at 0, JSON at [4..4+len], compressed after.
 /// Returns `(data_json, compressed_bytes)` where `data_json` is the inner `data`
 /// object carrying `{resolution, origin, src_size}`. `None` if the frame is too
-/// short, the JSON is invalid, or the topic is not the voxel map.
+/// short, the JSON is invalid, or the topic is not the voxel map. Every read is
+/// bounds-checked via `get(..)`: a short/truncated/oddly-framed real frame can
+/// NEVER panic the decode path (panic = abort would drop the whole connection).
 fn parse_voxel_frame(raw: &[u8]) -> Option<(JsonValue, &[u8])> {
-    if raw.len() < 4 {
-        return None;
-    }
-    let h1 = u16::from_le_bytes([raw[0], raw[1]]);
-    let h2 = u16::from_le_bytes([raw[2], raw[3]]);
-    let (json_bytes, compressed): (&[u8], &[u8]) = if h1 == 2 && h2 == 0 {
-        // LiDAR framing: skip the 4-byte (2,0) header, then a u32 length at +0.
-        let body = &raw[4..];
-        if body.len() < 8 {
-            return None;
+    let header = raw.get(0..4)?;
+    let h1 = u16::from_le_bytes([header[0], header[1]]);
+    let h2 = u16::from_le_bytes([header[2], header[3]]);
+    if h1 == 2 && h2 == 0 {
+        // LiDAR framing: u32 JSON length right after the (2,0) header.
+        let len_bytes = raw.get(4..8)?;
+        let len =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        // The JSON object is exactly `len` bytes; firmware places it at raw[8] or
+        // raw[12]. Try both and accept the one that parses to the voxel topic.
+        for json_start in [8usize, 12usize] {
+            let Some(json_end) = json_start.checked_add(len) else {
+                continue;
+            };
+            let Some(json) = raw.get(json_start..json_end) else {
+                continue;
+            };
+            let Ok(env) = serde_json::from_slice::<JsonValue>(json) else {
+                continue;
+            };
+            if env.get("topic").and_then(JsonValue::as_str) != Some(LIDAR_TOPIC) {
+                continue;
+            }
+            let compressed = raw.get(json_end..)?;
+            let data = env.get("data")?.clone();
+            // One-shot: confirm WHICH json_start matched and the declared src_size on
+            // real firmware. An off-by-4 in this auto-detect silently yields a broken
+            // decode, so logging the empirically-chosen boundary once pins it down.
+            VOXEL_FRAMING_LOGGED.with(|logged| {
+                if !logged.get() {
+                    logged.set(true);
+                    let src_size = data.get("src_size").and_then(JsonValue::as_u64);
+                    log::info(&alloc::format!(
+                        "go2 lidar framing: json_start={} declared_len={} src_size={:?}",
+                        json_start,
+                        len,
+                        src_size,
+                    ));
+                }
+            });
+            return Some((data, compressed));
         }
-        let len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-        let json_end = 8usize.checked_add(len)?;
-        if body.len() < json_end {
-            return None;
-        }
-        (&body[8..json_end], &body[json_end..])
+        None
     } else {
-        // Normal framing: u16 length at 0, JSON at [4..4+len].
-        let len = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+        // Normal framing: u16 JSON length at 0, JSON at [4..4+len].
+        let len = u16::from_le_bytes([header[0], header[1]]) as usize;
         let json_end = 4usize.checked_add(len)?;
-        if raw.len() < json_end {
+        let json = raw.get(4..json_end)?;
+        let envelope: JsonValue = serde_json::from_slice(json).ok()?;
+        // EXACT match: only the voxel-map topic decodes into the voxel frame.
+        if envelope.get("topic").and_then(JsonValue::as_str) != Some(LIDAR_TOPIC) {
             return None;
         }
-        (&raw[4..json_end], &raw[json_end..])
-    };
-    let envelope: JsonValue = serde_json::from_slice(json_bytes).ok()?;
-    let topic = envelope.get("topic").and_then(JsonValue::as_str).unwrap_or("");
-    // EXACT match: only the voxel-map topic decodes into the voxel frame. An
-    // unrelated utlidar binary message must never enter the LZ4 decode path.
-    if topic != LIDAR_TOPIC {
-        return None;
+        let compressed = raw.get(json_end..)?;
+        let data = envelope.get("data")?.clone();
+        Some((data, compressed))
     }
-    let data = envelope.get("data")?.clone();
-    Some((data, compressed))
 }
 
 /// Ingest one inbound binary voxel-map frame: parse the framing, LZ4-decompress to
-/// `src_size`, COUNT occupied voxels (cheap popcount — no point Vec), and overwrite
-/// the latest-frame slot (bounded memory: only the newest frame's metadata + its
-/// compressed raw payload are kept). Tolerant: a malformed or oversized frame
-/// updates the diagnostic byte size + logs, but leaves the prior decoded frame
-/// untouched and `available` unchanged rather than fabricating data.
+/// `src_size`, COUNT occupied voxels (cheap popcount), bump the latest-frame
+/// metadata, then decode the bitfield DIRECTLY into the canonical packed-f32 layout
+/// and publish it to the host `LidarStreamHub`. No raw payload is retained: only the
+/// newest frame's small metadata (count/resolution/origin/seq/ts) stays in WASM
+/// state; the cloud lives in the host hub (latest-wins). Tolerant: a malformed or
+/// oversized frame updates the diagnostic byte size + logs, but leaves the prior
+/// metadata untouched and `available` unchanged rather than fabricating data.
 ///
-/// INVARIANT: lidar processing on the service tick is O(bitfield) and cannot exceed
-/// the fuel budget; the full point cloud is built only on-demand in `lidar_frame`.
+/// INVARIANT: the per-tick cost is O(bitfield) — popcount + a single bit-scan into
+/// one preallocated buffer — so a dense frame cannot exceed the fuel budget.
 fn ingest_voxel_map(raw: &[u8]) {
     let Some((data, compressed)) = parse_voxel_frame(raw) else {
         return;
     };
-    LIDAR.with(|cell| {
-        cell.borrow_mut().last_payload_bytes = compressed.len();
+    // Stage 1: WebRTC voxel-frame cadence. Snapshot the arrival instant and the
+    // delta from the previous voxel frame (0 for the very first one). Monotonic,
+    // so an NTP step can't produce a bogus negative interval.
+    let arrival_us = clock::mono_micros();
+    let webrtc_interval_us = LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        l.last_payload_bytes = compressed.len();
+        let delta = if l.last_voxel_arrival_us > 0 {
+            arrival_us - l.last_voxel_arrival_us
+        } else {
+            0
+        };
+        l.last_voxel_arrival_us = arrival_us;
+        delta
     });
     let resolution = data.get("resolution").and_then(JsonValue::as_f64);
     let origin = parse_origin3(data.get("origin"));
@@ -1033,6 +1320,10 @@ fn ingest_voxel_map(raw: &[u8]) {
         log::warn("go2 lidar: src_size out of bounds — frame skipped");
         return;
     }
+    // Stage 2: addon decode duration starts here (LZ4-decompress + the bit-scan
+    // canonical decode below). Monotonic so it measures pure CPU work, immune to
+    // any wall-clock adjustment mid-frame.
+    let decode_start_us = clock::mono_micros();
     let mut decompressed = vec![0u8; src_size];
     let n = match lz4_flex::block::decompress_into(compressed, &mut decompressed) {
         Ok(n) => n,
@@ -1048,20 +1339,44 @@ fn ingest_voxel_map(raw: &[u8]) {
         log::warn("go2 lidar: decompressed length != src_size — frame skipped");
         return;
     }
+    // Clamp the valid-byte length to the buffer even though `n == src_size ==
+    // decompressed.len()` here: a bogus `n` from the decompressor can NEVER
+    // produce an out-of-bounds slice (panic = abort would drop the link).
+    let n = n.min(decompressed.len());
+    let grid = match decompressed.get(..n) {
+        Some(g) => g,
+        None => return,
+    };
     let resolution_f32 = resolution as f32;
-    // Cheap popcount over the bitfield — the tick NEVER materializes the cloud.
-    let point_count = count_voxel_points(&decompressed[..n]);
+    // Cheap popcount first so the canonical buffer below can be exact-preallocated.
+    let point_count = count_voxel_points(grid);
+    // Rate-limited decode-sizing diagnostic: surfaces the exact inputs that drive
+    // the canonical buffer allocation. A garbage-huge point_count here (vs the real
+    // Go2 ~30k-42k) means the framing/decompress is wrong (bad src_size or a
+    // misaligned compressed tail), which is the root cause of the allocation abort.
+    let should_diag = LIDAR.with(|cell| {
+        let mut l = cell.borrow_mut();
+        let first = l.diag_log_counter == 0;
+        let due = l.diag_log_counter % LIDAR_DIAG_LOG_EVERY == 0;
+        l.diag_log_counter = l.diag_log_counter.wrapping_add(1);
+        first || due
+    });
+    if should_diag {
+        log::info(&alloc::format!(
+            "go2 lidar diag: src_size={} decompressed_n={} compressed_len={} point_count={} resolution={}",
+            src_size,
+            n,
+            compressed.len(),
+            point_count,
+            resolution,
+        ));
+    }
     let now = db::now_secs();
-    let should_persist = LIDAR.with(|cell| {
+    let (should_persist, frame_seq, enabled) = LIDAR.with(|cell| {
         let mut l = cell.borrow_mut();
         l.resolution = Some(resolution_f32);
         l.origin = Some(origin);
         l.point_count = point_count;
-        // Retain the compressed raw frame so lidar_frame can decode the full cloud
-        // on demand (off the tick path). Compressed payload stays small (≤ grid).
-        l.latest_raw.clear();
-        l.latest_raw.extend_from_slice(compressed);
-        l.latest_src_size = src_size;
         l.frame_seq = l.frame_seq.saturating_add(1);
         l.last_update_ts = now;
         // Throttle the shared-DB status write the same way telemetry is throttled:
@@ -1072,14 +1387,66 @@ fn ingest_voxel_map(raw: &[u8]) {
         let state = (l.enabled, l.frame_seq > 0 && l.point_count > 0);
         let transitioned = state != l.status_persist_state;
         let due = now - l.status_persist_ts >= LIDAR_STATUS_REFRESH_SECS;
-        if transitioned || due {
+        let should = if transitioned || due {
             l.status_persist_state = state;
             l.status_persist_ts = now;
             true
         } else {
             false
-        }
+        };
+        (should, l.frame_seq, l.enabled)
     });
+    // Decode the bitfield DIRECTLY into the canonical packed-f32 frame and publish
+    // it to the host (one preallocated buffer, one WASM->host copy, zero JSON) so
+    // the L2 stream hub / renderer get vendor-agnostic points. Only when LiDAR is
+    // enabled and the grid actually has occupied voxels. A frame above
+    // LIDAR_MAX_POINTS is dropped + logged.
+    //
+    // The header `timestamp_us` is the REAL wall-clock microsecond of decode time
+    // (WASI realtime clock), not the old second-granularity `now*1e6` — the
+    // browser subtracts its own wall clock from this to get end-to-end latency, so
+    // sub-millisecond precision is required (1 s granularity would make every
+    // latency look like 0–1000 ms of pure rounding noise).
+    let mut decode_us: i64 = 0;
+    let mut publish_us: i64 = 0;
+    let mut published_bytes: usize = 0;
+    if enabled && point_count > 0 {
+        match decode_voxel_to_canonical(
+            grid,
+            resolution_f32,
+            [origin[0] as f32, origin[1] as f32, origin[2] as f32],
+            frame_seq as u32,
+            clock::wall_micros(),
+        ) {
+            Some(frame) => {
+                // Stage 2 end: decode duration covers LZ4 + canonical bit-scan.
+                decode_us = clock::mono_micros() - decode_start_us;
+                published_bytes = frame.len();
+                // Stage 3: publish duration — the WASM->host copy into the hub.
+                let publish_start_us = clock::mono_micros();
+                publish_lidar_frame(&frame);
+                publish_us = clock::mono_micros() - publish_start_us;
+            }
+            None => log::warn("go2 lidar: frame exceeds LIDAR_MAX_POINTS — not published"),
+        }
+        // Rate-limited timing line: one concise summary per LIDAR_TIMING_LOG_EVERY
+        // frames so a multi-Hz stream doesn't flood the log. Covers stages 1–3.
+        let should_log = LIDAR.with(|cell| {
+            let mut l = cell.borrow_mut();
+            l.timing_log_counter = l.timing_log_counter.wrapping_add(1);
+            l.timing_log_counter % LIDAR_TIMING_LOG_EVERY == 0
+        });
+        if should_log && decode_us > 0 {
+            log::info(&alloc::format!(
+                "lidar timing: webrtc_interval={}ms decode={}us publish={}us points={} bytes={}",
+                webrtc_interval_us / 1000,
+                decode_us,
+                publish_us,
+                point_count,
+                published_bytes,
+            ));
+        }
+    }
     // Persist the SMALL status (metadata only) so any worker's go2.status /
     // lidar_frame sees the latest availability. The full point cloud stays in the
     // service instance's memory (never persisted — see lidar_frame).
@@ -1125,66 +1492,36 @@ fn set_lidar(enabled: bool) -> JsonValue {
     json!({ "status": "sent", "enabled": enabled })
 }
 
-/// On-demand fetch of the latest LiDAR frame for a future 3D renderer.
-///
-/// The full point cloud is built ONLY here (on demand), NEVER on the service tick —
-/// the tick only counts occupied voxels (see `ingest_voxel_map`). When this tool
-/// runs ON the service instance (the one draining + decoding the voxel stream) the
-/// retained latest compressed frame is LZ4-decompressed and decoded into points via
-/// `voxel_bits_to_points`, capped by `LIDAR_MAX_POINTS`.
-///
-/// After the DB+instance concurrency overhaul this tool can also run on a pooled
-/// worker that does NOT share the service instance's memory. In that case there is
-/// no retained raw frame here, so we are HONEST about it: return the DB-persisted
-/// availability metadata plus an explicit `frame_pending_renderer:true` flag rather
-/// than fabricating points or persisting the huge cloud to SQLite. The 3D renderer
-/// is deferred anyway; when it lands, the points will be streamed via a dedicated
-/// seam (e.g. a service host-fn / mesh frame channel) on the service instance.
-fn lidar_frame() -> JsonValue {
-    // Same-instance fast path: decode the retained latest compressed frame on demand.
-    let decoded = LIDAR.with(|cell| {
-        let l = cell.borrow();
-        if l.latest_raw.is_empty() || l.latest_src_size == 0 {
-            return None;
-        }
-        let (resolution, origin) = match (l.resolution, l.origin) {
-            (Some(r), Some(o)) => (r, o),
-            _ => return None,
-        };
-        let mut decompressed = alloc::vec![0u8; l.latest_src_size];
-        let n = match lz4_flex::block::decompress_into(&l.latest_raw, &mut decompressed) {
-            Ok(n) if n == l.latest_src_size => n,
-            _ => return None,
-        };
-        let points = voxel_bits_to_points(&decompressed[..n], origin, resolution)?;
-        Some((points, resolution, origin, l.frame_seq, l.last_update_ts))
-    });
-    if let Some((points, resolution, origin, frame_seq, ts)) = decoded {
-        let pts: Vec<JsonValue> = points
-            .iter()
-            .map(|p| json!([p[0], p[1], p[2]]))
-            .collect();
-        return json!({
-            "enabled": true,
-            "available": true,
-            "point_count": points.len(),
-            "resolution": resolution,
-            "origin": [origin[0], origin[1], origin[2]],
-            "frame_seq": frame_seq,
-            "last_update_ts": ts,
-            "points": pts,
-        });
-    }
-    // Cross-worker path: no retained raw frame in this process. A REAL read error
-    // must NOT be papered over as an empty/"disabled" frame — surface it so the
-    // renderer can distinguish "no data yet" from "read failed".
-    let status = match lidar_status_from_store() {
-        Ok(s) => s,
-        Err(e) => return json!({ "error": alloc::format!("lidar status read: {e}") }),
+/// Toggle on-board obstacle avoidance. Unlike the LiDAR intent (persisted and
+/// re-applied by on_tick), this is a direct, stateless toggle: send it to the live
+/// robot now. Requires the robot to be locally online with an open channel; a
+/// remote-owned/offline robot returns an error rather than silently dropping it.
+fn set_obstacle_avoid(enabled: bool) -> JsonValue {
+    let robot = match db::get_robot() {
+        Ok(r) => r,
+        Err(e) => return json!({ "error": alloc::format!("db: {e}") }),
     };
-    let mut obj = status.as_object().cloned().unwrap_or_default();
-    obj.insert("frame_pending_renderer".into(), json!(true));
-    JsonValue::Object(obj)
+    if robot.status != "online" || robot.channel_id.is_empty() {
+        return json!({ "error": "robot not online" });
+    }
+    match wc_send_text(&robot.channel_id, &build_obstacle_avoid(enabled)) {
+        Ok(()) => json!({ "status": "sent", "obstacle_avoid": enabled }),
+        Err(e) => json!({ "error": alloc::format!("send: {e}") }),
+    }
+}
+
+/// LiDAR frame availability snapshot. The live point cloud no longer flows
+/// through this JSON tool: the service tick decodes each frame DIRECTLY into the
+/// canonical packed-f32 layout and publishes it to the host `LidarStreamHub`
+/// (`publish_lidar_frame`), which the renderer pulls as binary L1 bytes. This
+/// tool stays as the mesh-action seam (`RobotAction::LidarFrame`) and returns the
+/// small availability metadata (enabled/available/point_count/frame_seq), never
+/// the cloud. A REAL store read error is surfaced, not papered over as "disabled".
+fn lidar_frame() -> JsonValue {
+    match lidar_status_from_store() {
+        Ok(s) => s,
+        Err(e) => json!({ "error": alloc::format!("lidar status read: {e}") }),
+    }
 }
 
 /// Read the persistent LiDAR enable INTENT from the shared store. Propagates a
@@ -1217,6 +1554,48 @@ fn json_f64_array(v: Option<&JsonValue>) -> Vec<f64> {
         }
     }
     out
+}
+
+/// Probe handler for `rt/utlidar/robot_pose`: parse the world pose
+/// (`data.pose.position` {x,y,z} + `data.pose.orientation` {x,y,z,w}) and log it
+/// throttled. Confirms whether the Go2 Air actually streams pose over WebRTC
+/// (go2_ros2_sdk sources /odom from this topic) and whether it tracks motion,
+/// before wiring odometry + map accumulation.
+fn ingest_robot_pose(raw: &[u8]) {
+    let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else {
+        return;
+    };
+    let data = v.get("data").unwrap_or(&v);
+    let pose = data.get("pose").unwrap_or(data);
+    let getf = |o: Option<&JsonValue>, k: &str| {
+        o.and_then(|m| m.get(k)).and_then(JsonValue::as_f64)
+    };
+    let pos = pose.get("position");
+    let ori = pose.get("orientation");
+    let (px, py, pz) = (getf(pos, "x"), getf(pos, "y"), getf(pos, "z"));
+    if px.is_none() && py.is_none() && pz.is_none() {
+        return;
+    }
+    let (ox, oy, oz, ow) = (getf(ori, "x"), getf(ori, "y"), getf(ori, "z"), getf(ori, "w"));
+    if let (Some(x), Some(y), Some(z)) = (px, py, pz) {
+        TELEMETRY.with(|cell| {
+            let mut t = cell.borrow_mut();
+            t.pose_position = alloc::vec![x, y, z];
+            if let (Some(a), Some(b), Some(c), Some(d)) = (ox, oy, oz, ow) {
+                t.pose_orientation = alloc::vec![a, b, c, d];
+            }
+        });
+    }
+    POSE_LOG.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        // ~1 in 25 frames keeps the log readable while still showing motion.
+        if n % 25 == 1 {
+            log::info(&alloc::format!(
+                "go2 DIAG robot_pose: pos=({px:?},{py:?},{pz:?}) quat=({ox:?},{oy:?},{oz:?},{ow:?})"
+            ));
+        }
+    });
 }
 
 /// Parse a `rt/sportmodestate` message body into the latest-telemetry snapshot,
@@ -1290,6 +1669,7 @@ fn ingest_sportmodestate(raw: &[u8]) {
 fn ingest_lowstate_battery(raw: &[u8]) {
     let Ok(v) = serde_json::from_slice::<JsonValue>(raw) else { return; };
     let data = v.get("data").unwrap_or(&v);
+    diag_lowstate_dump(data);
     let bms = data.get("bms_state").or_else(|| data.get("bms"));
     TELEMETRY.with(|cell| {
         let mut t = cell.borrow_mut();
@@ -1314,7 +1694,11 @@ fn ingest_lowstate_battery(raw: &[u8]) {
             .or_else(|| bms.and_then(|b| b.get("current")))
             .and_then(JsonValue::as_f64)
         {
-            t.bat_current = Some(curr);
+            // The Go2 BMS reports pack current in milliamps on this firmware (e.g.
+            // -1588 = -1.588 A), while `power_a` (when present) is already amps. A
+            // robot's real draw is well under ~50 A, so normalize an implausibly
+            // large magnitude from mA to A.
+            t.bat_current = Some(if curr.abs() > 100.0 { curr / 1000.0 } else { curr });
         }
         if let Some(temp) = bms
             .and_then(|b| b.get("temperature"))
@@ -1340,6 +1724,19 @@ fn ingest_lowstate_battery(raw: &[u8]) {
             }
             if let Some(temp) = imu.get("temperature").and_then(JsonValue::as_f64) {
                 t.imu_temperature = Some(temp);
+            }
+        }
+        // Leg joint angles for the dashboard robot animation (R2). The first 12 of
+        // `motor_state` are FR/FL/RR/RL × hip/thigh/calf; later entries (jaw etc.)
+        // are ignored. Only stored when all 12 are present (never a partial pose).
+        if let Some(ms) = data.get("motor_state").and_then(JsonValue::as_array) {
+            let q: Vec<f64> = ms
+                .iter()
+                .take(12)
+                .filter_map(|m| m.get("q").and_then(JsonValue::as_f64))
+                .collect();
+            if q.len() == 12 {
+                t.joints = q;
             }
         }
     });
@@ -1384,6 +1781,17 @@ fn telemetry_json() -> JsonValue {
         }
         if !t.foot_force.is_empty() {
             obj.insert("foot_force".into(), json!(t.foot_force));
+        }
+        // 12 leg joint angles (rad) for the dashboard robot animation (R2).
+        if !t.joints.is_empty() {
+            obj.insert("joints".into(), json!(t.joints));
+        }
+        // World pose (odom frame) for robot placement + map accumulation in the viewer.
+        if !t.pose_position.is_empty() {
+            obj.insert("pose_position".into(), json!(t.pose_position));
+        }
+        if !t.pose_orientation.is_empty() {
+            obj.insert("pose_orientation".into(), json!(t.pose_orientation));
         }
 
         let mut imu = serde_json::Map::new();
@@ -1473,6 +1881,9 @@ fn lidar_status_from_store() -> Result<JsonValue, AbiError> {
 
 fn do_connect() -> JsonValue {
     log::info("go2: do_connect entered");
+    // Explicit connect = operator wants the link up: persist the intent so the tick
+    // auto-reconnects if it later drops.
+    let _ = state::set_durable(state::KEY_CONNECT_INTENT, alloc::vec![1u8]);
     let robot = db::get_robot().unwrap_or_default();
     // The configured IP (install-time `ip` connection_param) is the single source
     // of truth. No default — an unconfigured instance refuses to connect.
@@ -1514,6 +1925,7 @@ fn do_connect() -> JsonValue {
         keepalive_text: Some(protocol::HEARTBEAT_TEXT.into()),
         keepalive_interval_ms: 1000,
         keepalive_marker: Some(protocol::HEARTBEAT_MARKER.into()),
+        peer_ipv4: Some(ip.clone()),
     };
     let out: WebRtcConnectOutput = match call_cbor_in_out(&connect_in, webrtc_connect_v1) {
         Ok(o) => o,
@@ -1587,6 +1999,9 @@ fn do_connect() -> JsonValue {
 }
 
 fn do_disconnect() -> JsonValue {
+    // Explicit disconnect = stay down: clear the intent so the tick does NOT
+    // auto-reconnect until the operator connects again.
+    let _ = state::set_durable(state::KEY_CONNECT_INTENT, alloc::vec![0u8]);
     if let Ok(robot) = db::get_robot() {
         if !robot.channel_id.is_empty() {
             wc_close(&robot.channel_id);
@@ -1633,6 +2048,26 @@ fn do_reset_estop() -> JsonValue {
     let _ = db::set_estop(false);
     publish_event("go2.estop", json!({ "active": false }));
     json!({ "status": "estop_cleared" })
+}
+
+/// Operator connect intent (durable, DEFAULT-ON). A read error or absent key both
+/// yield `true` so a transient store hiccup never silently disables auto-connect.
+fn connect_intent() -> bool {
+    match state::get(state::KEY_CONNECT_INTENT) {
+        Ok(Some(v)) => v.first().map(|b| *b != 0).unwrap_or(true),
+        // Never set yet → default-on (auto-connect a fresh robot).
+        Ok(None) => true,
+        // Read hiccup → FAIL CLOSED: do NOT auto-connect this tick. If the operator
+        // had disconnected (intent=0), a transient error must not resurrect the link;
+        // a genuine auto-connect just retries next tick once the read succeeds.
+        Err(_) => false,
+    }
+}
+
+std::thread_local! {
+    // Wall-clock second of the last auto-connect attempt (backoff gate). Resets on
+    // restart, which is fine — a fresh process should attempt promptly.
+    static LAST_CONNECT_ATTEMPT: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
 }
 
 /// Tick: drive validation, then continuous telemetry.
@@ -1707,6 +2142,12 @@ fn tick() {
                                 Ok(true) => {
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/lf/lowstate"));
                                     let _ = wc_send_text(&robot.channel_id, &subscribe_msg("rt/sportmodestate"));
+                                    let _ = wc_send_text(&robot.channel_id, &subscribe_msg(POSE_TOPIC));
+                                    // Start with obstacle avoidance OFF on every connect so the
+                                    // operator can drive/turn manually by default (active avoidance
+                                    // can block manual turns). Matches go2_ros2_sdk's manual-driving
+                                    // default; the UI toggle re-enables it on demand.
+                                    let _ = wc_send_text(&robot.channel_id, &build_obstacle_avoid(false));
                                     // Go2 only starts publishing the camera RTP after this
                                     // app-level command; the recvonly transceiver alone is silent.
                                     if !cam_id.is_empty() {
@@ -1822,6 +2263,16 @@ fn tick() {
             }
             let mut battery = robot.battery_pct;
             let mut got_telemetry = false;
+            // The single latest binary (voxel) frame is copied OUT of the scratch
+            // here and ingested AFTER the DECODE_BUF borrow is released. This is the
+            // connection-saving invariant: ingest_voxel_map -> decode can abort the
+            // process on a garbage allocation (panic = abort, no unwinding); if that
+            // ran while DECODE_BUF was borrowed, the borrow guard would leak and
+            // EVERY later tick would abort at borrow_mut ("already borrowed"),
+            // stalling telemetry until the 12s watchdog tore down the link. By
+            // owning a small Vec copy we never hold the scratch across the fallible
+            // decode, so at worst one tick is lost and telemetry resumes next tick.
+            let mut voxel_payload: Option<Vec<u8>> = None;
             DECODE_BUF.with(|cell| {
                 let mut dec = cell.borrow_mut();
                 // Index of the LAST binary frame drained this tick. The voxel map is
@@ -1832,7 +2283,7 @@ fn tick() {
                     .messages
                     .iter()
                     .rposition(|m| !m.is_text);
-                for (idx, msg) in drained.messages.iter().enumerate() {
+                for msg in drained.messages.iter() {
                     let src = msg.data_b64.as_bytes();
                     // base64 decodes to at most 3/4 of the input length; size the
                     // scratch to the source length (an upper bound) so the slice
@@ -1850,11 +2301,14 @@ fn tick() {
                     // binary framing's JSON header by parse_voxel_frame. Only the
                     // latest binary frame is ingested; earlier ones are superseded.
                     if !msg.is_text {
-                        if Some(idx) == last_binary {
-                            ingest_voxel_map(raw);
-                        }
+                        // Defer the (single) voxel decode until AFTER the whole
+                        // drain has been scanned for telemetry below: the lidar
+                        // path must never run before the watchdog-feeding lowstate
+                        // is recorded, so a lidar issue cannot stall the link.
                         continue;
                     }
+                    // DIAGNOSTIC: enumerate every distinct inbound topic once.
+                    diag_note_topic(raw);
                     // Only lowstate carries battery; gate on the topic substring,
                     // then pull the integer soc with a zero-alloc byte scan. The
                     // richer battery detail (voltage/current/temp) is parsed into
@@ -1869,14 +2323,40 @@ fn tick() {
                         // High-rate motion/IMU stream: keep only the latest values
                         // in memory; never advertise at this raw rate.
                         ingest_sportmodestate(raw);
+                    } else if find_sub(raw, b"robot_pose", 0).is_some() {
+                        // Lidar-derived world pose (probe: confirm the Air streams it
+                        // and whether it tracks motion before wiring odometry/mapping).
+                        ingest_robot_pose(raw);
+                    }
+                }
+                // Telemetry watchdog FIRST: record real lowstate receipt before any
+                // lidar work this drain, so the link's liveness is updated regardless
+                // of a (possibly malformed) voxel frame in the same drain.
+                if got_telemetry {
+                    let _ = db::record_lowstate(battery);
+                }
+                // Decode the single latest binary frame from base64 into the scratch
+                // and COPY the bytes into an owned Vec. ingest is intentionally NOT
+                // called here: it runs after this closure ends (see voxel_payload).
+                if let Some(idx) = last_binary {
+                    if let Some(msg) = drained.messages.get(idx) {
+                        let src = msg.data_b64.as_bytes();
+                        if dec.len() < src.len() {
+                            dec.resize(src.len(), 0);
+                        }
+                        if let Ok(n) = B64.decode_slice(src, &mut dec[..]) {
+                            if let Some(raw) = dec.get(..n) {
+                                voxel_payload = Some(raw.to_vec());
+                            }
+                        }
                     }
                 }
             });
-            // Liveness: advance last_telemetry EVERY tick a lowstate actually
-            // arrived (not throttled), so the watchdog tracks real receipt
-            // regardless of which tick the throttled publish lands on.
-            if got_telemetry {
-                let _ = db::record_lowstate(battery);
+            // DECODE_BUF borrow is released. Ingest the latest voxel frame now: an
+            // allocation/decode abort here can no longer leak the scratch borrow and
+            // cascade into a permanent per-tick abort. Telemetry is already recorded.
+            if let Some(payload) = voxel_payload {
+                ingest_voxel_map(&payload);
             }
             // Throttle RTT poll + publish + telemetry DB persist to ~1s (every 5
             // ticks @200ms) so the high-rate stream never hammers SQLite. The
@@ -1925,151 +2405,19 @@ fn tick() {
                 }
             }
         }
-        _ => {}
-    }
-}
-
-// =============================================================================
-// UI
-// =============================================================================
-
-fn next_id() -> String {
-    static C: AtomicU64 = AtomicU64::new(0);
-    alloc::format!("c{}", C.fetch_add(1, Ordering::Relaxed))
-}
-
-fn lit(s: &str) -> BindRef {
-    BindRef::Literal(Value::Text(s.into()))
-}
-
-fn text(content: &str) -> Component {
-    TextComp {
-        content: lit(content),
-        style: TextStyle::Body,
-        tone: None,
-        align: None,
-        wrap: None,
-        max_lines: None,
-        format: None,
-    }
-    .into_component(next_id())
-    .expect("Text")
-}
-
-fn heading(level: u8, content: &str) -> Component {
-    HeadingComp { content: lit(content), level, tone: None, align: None }
-        .into_component(next_id())
-        .expect("Heading")
-}
-
-fn button(label: &str, action: &str, variant: &str) -> Component {
-    let v = match variant {
-        "primary" => ButtonVariant::Primary,
-        "danger" => ButtonVariant::Destructive,
-        _ => ButtonVariant::Secondary,
-    };
-    let mut c = ButtonComp {
-        variant: v,
-        tone: Tone::Neutral,
-        label: lit(label),
-        icon_leading: None,
-        icon_trailing: None,
-        size: ButtonSize::Md,
-        full_width: false,
-        disabled: None,
-        loading: None,
-        density: Density::Default,
-    }
-    .into_component(next_id())
-    .expect("Button");
-    c.handlers = Some(HandlerMap(vec![(
-        tentaflow_sdk_spec::EventKind::Click,
-        Handler::Backend {
-            action_id: action.into(),
-            params: CborMap::default(),
-            optimistic: None,
-            on_failure: FailurePolicy::Toast,
-        },
-    )]));
-    c
-}
-
-fn card(title: &str, children: Vec<Component>) -> Component {
-    SectionCard {
-        title: lit(title),
-        subtitle: None,
-        header_actions: vec![],
-        header_divider: false,
-        body: children,
-        footer: None,
-        padding: Spacing::Lg,
-        gap: Spacing::Md,
-        variant: CardVariant::Outlined,
-        radius: RadiusToken::Lg,
-        shadow: ShadowToken::Subtle,
-        border: BorderToken::Hairline,
-        background: BackgroundToken::None,
-        accent: None,
-    }
-    .into_component(next_id())
-    .expect("SectionCard")
-}
-
-fn render_panel() {
-    let robot = db::get_robot().unwrap_or_default();
-    let battery = if robot.battery_pct >= 0 {
-        alloc::format!("{}%", robot.battery_pct)
-    } else {
-        "—".into()
-    };
-    let rtt = if robot.rtt_ms >= 0 {
-        alloc::format!("{} ms", robot.rtt_ms)
-    } else {
-        "—".into()
-    };
-    // IP pochodzi WYLACZNIE z konfiguracji instalacji (connection-param). Brak
-    // fallbacku do starej kolumny robot.ip — niesakonfigurowana instancja pokazuje
-    // marker, zeby UI nie sugerowal polaczenia z nieaktualnym/legacy adresem.
-    let ip_display = config_get(IP_CONFIG_KEY).unwrap_or_else(|| "(brak konfiguracji)".to_string());
-    let status_line = alloc::format!("Status: {}  ·  IP: {}", robot.status, ip_display);
-    let estop_line = if robot.estop_active { "E-STOP AKTYWNY".into() } else { "e-stop: wyłączony".to_string() };
-
-    let layout = card(
-        "Unitree Go2",
-        vec![
-            heading(2, "Status"),
-            text(&status_line),
-            text(&alloc::format!("Bateria: {battery}   ·   Latency (RTT): {rtt}")),
-            text(&estop_line),
-            heading(3, "Połączenie"),
-            button("Połącz", "go2.connect", "primary"),
-            button("Rozłącz", "go2.disconnect", "secondary"),
-            heading(3, "Bezpieczeństwo"),
-            button("STOP (e-stop)", "go2.estop", "danger"),
-            button("Reset e-stop", "go2.reset_estop", "secondary"),
-            heading(3, "Sterowanie"),
-            button("RecoveryStand", "go2.action_recovery", "secondary"),
-            button("Hello", "go2.action_hello", "secondary"),
-            button("Sit", "go2.action_sit", "secondary"),
-            button("Naprzód", "go2.move_fwd", "secondary"),
-            button("W tył", "go2.move_back", "secondary"),
-            button("Lewo", "go2.move_left", "secondary"),
-            button("Prawo", "go2.move_right", "secondary"),
-        ],
-    );
-
-    let payload = UiPayload::PanelShell(PanelShell {
-        addon_id: ADDON_ID.into(),
-        panel_id: PANEL_ID.into(),
-        panel_epoch: PANEL_EPOCH.load(Ordering::Relaxed),
-        layout,
-        slots: Vec::<tentaflow_sdk_spec::SlotDecl>::new(),
-        initial_state: Vec::<StateEntry>::new(),
-        initial_commands: vec![],
-    });
-    let mut buf = Vec::with_capacity(4096);
-    if minicbor::encode(&payload, &mut buf).is_ok() {
-        unsafe { ui_render_cbor(buf.as_ptr() as i32, buf.len() as i32); }
+        // offline / error / unknown → AUTO-CONNECT. When the operator intent is
+        // "connected" (default), the tick re-establishes the link itself (with a
+        // backoff), so a robot comes online without any manual connect in any UI.
+        _ => {
+            if connect_intent() {
+                let now = db::now_secs();
+                let last = LAST_CONNECT_ATTEMPT.with(|c| c.get());
+                if last == 0 || now - last >= RECONNECT_BACKOFF_SECS {
+                    LAST_CONNECT_ATTEMPT.with(|c| c.set(now));
+                    let _ = do_connect();
+                }
+            }
+        }
     }
 }
 
@@ -2109,6 +2457,8 @@ fn handle(tool: &str, params: &JsonValue) -> JsonValue {
         "go2.pose" => send_pose(params),
         "go2.lidar_on" => set_lidar(true),
         "go2.lidar_off" => set_lidar(false),
+        "go2.obstacle_avoid_on" => set_obstacle_avoid(true),
+        "go2.obstacle_avoid_off" => set_obstacle_avoid(false),
         // Combined toggle: `{enabled: bool}`; defaults to enabling when absent.
         "go2.lidar" => {
             let enabled = params
@@ -2175,6 +2525,7 @@ fn capability_kinds() -> Vec<&'static str> {
         "body_height", "foot_raise_height", "speed_level", "pose", "wiggle_hips",
         "heart", "dance1", "dance2", "scrape", "front_flip", "front_jump",
         "front_pounce", "status", "camera", "lidar_on", "lidar_off", "lidar_frame",
+        "obstacle_avoid_on", "obstacle_avoid_off",
     ]
 }
 
@@ -2223,6 +2574,8 @@ fn actions_meta() -> JsonValue {
         { "kind": "status", "label": "Status", "risk": "low", "read_only": true, "params": [] },
         { "kind": "lidar_on", "label": "LiDAR włącz", "risk": "low", "params": [] },
         { "kind": "lidar_off", "label": "LiDAR wyłącz", "risk": "low", "params": [] },
+        { "kind": "obstacle_avoid_on", "label": "Omijanie przeszkód: wł", "risk": "low", "params": [] },
+        { "kind": "obstacle_avoid_off", "label": "Omijanie przeszkód: wył", "risk": "low", "params": [] },
         { "kind": "lidar_frame", "label": "LiDAR klatka", "risk": "low", "read_only": true, "params": [] },
     ])
 }
@@ -2348,9 +2701,54 @@ pub extern "C" fn on_install() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
+    install_panic_hook();
     ensure_robot_from_config();
     bridge_legacy_lidar_intent();
+    seed_lidar_disabled_on_fresh_session();
     0
+}
+
+/// Install a panic hook that logs the panic LOCATION (file:line:col) and message
+/// through the host log fn BEFORE the process aborts. The addon is built with
+/// `panic = abort` on wasm32-wasip1 (so `catch_unwind` is impossible), but the
+/// hook still runs before the abort, and the panic location string survives
+/// `strip = true`. This is the primary diagnostic for the steady-state tick trap:
+/// a future panic prints e.g.
+///   `go2 PANIC at src/lib.rs:1234:5: index out of bounds: len 80000 but index 80001`
+/// Idempotent across re-starts (set_hook simply replaces the prior hook).
+fn install_panic_hook() {
+    std::panic::set_hook(std::boxed::Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| alloc::format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        log::error(&alloc::format!("go2 PANIC at {location}: {message}"));
+    }));
+}
+
+/// Default the persistent LiDAR enable INTENT to OFF at the start of a FRESH
+/// session so a reconnect comes up with telemetry + camera only (no voxel
+/// stream). The voxel decoder runs on arbitrary real sensor data; defaulting the
+/// stream off isolates the connect + telemetry path from the decoder on bring-up,
+/// and a known-bad decoder can never auto-stream on reconnect — the operator must
+/// explicitly re-enable LiDAR via the GUI toggle after telemetry is confirmed.
+///
+/// This writes the durable intent UNCONDITIONALLY to OFF on every start. It runs
+/// AFTER `bridge_legacy_lidar_intent` (the one-time legacy upgrade) deliberately:
+/// a clean bring-up must win over a possibly-ON persisted/legacy value. To
+/// re-enable, toggle from the GUI (writes the durable intent back to ON), which
+/// then survives reconnects until the next process start. Reversible: removing
+/// this call restores "intent persists across starts".
+fn seed_lidar_disabled_on_fresh_session() {
+    if let Err(e) = state::set_durable(state::KEY_LIDAR_ENABLED, alloc::vec![0u8]) {
+        log::warn(&alloc::format!("go2: lidar default-off seed failed: {e}"));
+    }
 }
 
 /// One-time, idempotent upgrade bridge for the LiDAR enable INTENT. The intent
@@ -2404,9 +2802,7 @@ pub extern "C" fn on_event(_ptr: i32, _len: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn on_panel_open(_id_ptr: i32, _id_len: i32, epoch: i64) -> i32 {
-    PANEL_EPOCH.store(epoch.max(1) as u64, Ordering::Relaxed);
-    render_panel();
+pub extern "C" fn on_panel_open(_id_ptr: i32, _id_len: i32, _epoch: i64) -> i32 {
     0
 }
 
@@ -2445,8 +2841,6 @@ mod host_stubs {
     #[no_mangle]
     extern "C" fn event_publish(_a: i32, _b: i32, _c: i32, _d: i32) -> i32 { 0 }
     #[no_mangle]
-    extern "C" fn ui_render_cbor(_p: i32, _l: i32) -> i32 { 0 }
-    #[no_mangle]
     extern "C" fn config_get_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 2 }
     #[no_mangle]
     extern "C" fn http_raw_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
@@ -2468,6 +2862,8 @@ mod host_stubs {
     extern "C" fn camera_grant_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
     #[no_mangle]
     extern "C" fn robot_dispatch_v1(_a: i32, _b: i32, _c: i32, _d: i32, _e: i32) -> i32 { 5 }
+    #[no_mangle]
+    extern "C" fn lidar_publish_v1(_a: i32, _b: i32) -> i32 { 0 }
     // Native tests can't round-trip the host SQL ABI: it passes pointers as i32,
     // which truncates 64-bit stack addresses → SIGSEGV. Under `#[cfg(test)]` the
     // `db` module routes SQL to its own in-memory `robot_live` store instead, so
@@ -2509,76 +2905,114 @@ mod tests {
     }
 
     #[test]
-    fn voxel_decode_single_voxel_matches_reference() {
-        let _clock_guard = CLOCK_LOCK.lock().unwrap();
-        db::set_now_secs(1_700_000_000);
-        // One occupied voxel at grid index z=1, y=1, x_byte=0, MSB bit 0 (=> x=0).
-        // index = z*0x800 + y*0x10 + x_byte = 0x800 + 0x10 + 0 = 0x810.
-        // Byte value 0x80 sets the MSB => bit 0 => x = x_byte*8 + 0 = 0.
-        let idx = 0x800 + 0x10;
-        let mut grid = vec![0u8; idx + 1];
-        grid[idx] = 0x80;
-        let resolution = 0.05;
-        let origin = [1.0, 2.0, 3.0];
-        let frame = build_normal_frame(&grid, resolution, origin);
+    fn decode_voxel_to_canonical_round_trips_points() {
+        // A synthetic grid with K known set bits must decode to a canonical buffer
+        // that (a) parses back to exactly K points, (b) is preallocated EXACTLY
+        // (no spare capacity), and (c) places points at the upstream MSB-first
+        // coords (`index = z*0x800 + y*0x10 + x_byte`, `x = x_byte*8 + bit`).
+        let resolution = 0.05f32;
+        let origin = [1.0f32, -2.0, 0.5];
+        // byte 0 = 0x81 (bits for x=0 and x=7), byte at y-stride 0x10 = 0x01 (x=7,y=1).
+        let mut grid = vec![0u8; 0x20];
+        grid[0] = 0x81; // x=0 and x=7 at y=0,z=0
+        grid[0x10] = 0x01; // x=7 at y=1,z=0
+        let k = count_voxel_points(&grid);
+        assert_eq!(k, 3);
 
-        ingest_voxel_map(&frame);
+        let frame = decode_voxel_to_canonical(&grid, resolution, origin, 5, 1_234_000_000)
+            .expect("under cap");
+        // Preallocation is EXACT: no growth during the bit-scan. Body is 6 B/point
+        // (3 i16 grid indices) under the XYZ_I16 layout.
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + k * 3 * 2);
+        assert_eq!(frame.capacity(), LIDAR_HEADER_LEN + k * 3 * 2);
 
-        // Tick path: only the cheap count is materialized — no point Vec.
-        LIDAR.with(|cell| {
-            let l = cell.borrow();
-            assert_eq!(l.point_count, 1, "exactly one occupied voxel counted");
-            assert_eq!(l.frame_seq, 1);
-            assert_eq!(l.resolution, Some(resolution as f32));
-        });
-        // On-demand path: lidar_frame decodes the retained raw frame into points.
-        let frame_json = lidar_frame();
-        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
-        assert_eq!(pts.len(), 1, "exactly one occupied voxel decodes on demand");
-        let p = pts[0].as_array().expect("xyz");
-        // x = 0 -> 0*0.05 + 1.0 = 1.0; y = 1 -> 0.05 + 2.0; z = 1 -> 0.05 + 3.0.
-        assert!((p[0].as_f64().unwrap() - 1.0).abs() < 1e-5);
-        assert!((p[1].as_f64().unwrap() - 2.05).abs() < 1e-5);
-        assert!((p[2].as_f64().unwrap() - 3.05).abs() < 1e-5);
-        lidar_reset_session();
-        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let h = LidarFrameHeader::decode_header(&frame).expect("header");
+        assert_eq!(h.point_count as usize, k);
+        assert_eq!(h.frame_seq, 5);
+        assert_eq!(h.timestamp_us, 1_234_000_000);
+        // The addon never stamps the host send time; the host pump does.
+        assert_eq!(h.host_send_us, 0);
+        assert_eq!(h.resolution, resolution);
+        assert_eq!(h.origin, origin);
+
+        // Reconstruct points from the PLANAR i16 grid body (all ix, then all iy,
+        // then all iz; world = `idx * resolution + origin`, exactly what the browser
+        // decoder does) and compare to the upstream MSB-first decode as the oracle.
+        let body = &frame[LIDAR_HEADER_LEN..];
+        let ix_base = 0;
+        let iy_base = k * 2;
+        let iz_base = k * 4;
+        let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
+        let mut got: Vec<[f32; 3]> = Vec::new();
+        for p in 0..k {
+            got.push([
+                rd(ix_base + p * 2) * resolution + origin[0],
+                rd(iy_base + p * 2) * resolution + origin[1],
+                rd(iz_base + p * 2) * resolution + origin[2],
+            ]);
+        }
+        let res = resolution as f64;
+        let mut expected: Vec<[f32; 3]> = Vec::new();
+        for (idx, &byte) in grid.iter().enumerate() {
+            if byte == 0 {
+                continue;
+            }
+            let z = (idx / 0x800) as f64;
+            let n_slice = idx % 0x800;
+            let y = (n_slice / 0x10) as f64;
+            let x_base = ((n_slice % 0x10) * 8) as f64;
+            for bit in 0..8u32 {
+                if byte & (0x80 >> bit) != 0 {
+                    let x = x_base + bit as f64;
+                    expected.push([
+                        (x * res + origin[0] as f64) as f32,
+                        (y * res + origin[1] as f64) as f32,
+                        (z * res + origin[2] as f64) as f32,
+                    ]);
+                }
+            }
+        }
+        assert_eq!(got.len(), expected.len());
+        // Point ORDER within a byte differs (the canonical decoder bit-scans
+        // LSB-first for speed; the reference walks MSB-first), but the SET of
+        // points must be identical — compare order-insensitively.
+        let key = |p: &[f32; 3]| {
+            (
+                (p[0] * 1000.0).round() as i64,
+                (p[1] * 1000.0).round() as i64,
+                (p[2] * 1000.0).round() as i64,
+            )
+        };
+        let mut got_keys: Vec<_> = got.iter().map(key).collect();
+        let mut exp_keys: Vec<_> = expected.iter().map(key).collect();
+        got_keys.sort_unstable();
+        exp_keys.sort_unstable();
+        assert_eq!(got_keys, exp_keys);
     }
 
     #[test]
-    fn voxel_decode_bit_order_is_msb_first() {
-        // Byte 0x01 at index 0 sets only the LSB => MSB-first bit 7 => x = 7.
-        let mut grid = vec![0u8; 1];
-        grid[0] = 0x01;
-        let frame = build_normal_frame(&grid, 0.1, [0.0, 0.0, 0.0]);
-        ingest_voxel_map(&frame);
-        LIDAR.with(|cell| assert_eq!(cell.borrow().point_count, 1));
-        let frame_json = lidar_frame();
-        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
-        assert_eq!(pts.len(), 1);
-        let p = pts[0].as_array().unwrap();
-        // x = 7 -> 7 * 0.1 = 0.7; y = z = 0.
-        assert!((p[0].as_f64().unwrap() - 0.7).abs() < 1e-5);
-        assert!(p[1].as_f64().unwrap().abs() < 1e-5);
-        assert!(p[2].as_f64().unwrap().abs() < 1e-5);
-        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    fn decode_voxel_to_canonical_rejects_over_cap() {
+        // A grid whose popcount exceeds LIDAR_MAX_POINTS must return None (the
+        // caller drops + logs it) — never a partial cloud.
+        let bytes_needed = (LIDAR_MAX_POINTS / 8) + 16;
+        let grid = vec![0xFFu8; bytes_needed];
+        assert!(count_voxel_points(&grid) > LIDAR_MAX_POINTS);
+        assert!(decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0).is_none());
     }
 
     #[test]
-    fn voxel_decode_full_byte_yields_eight_points() {
-        // 0xFF at index 0 => all 8 x positions (0..7) at y=z=0.
-        let grid = vec![0xFFu8];
-        let frame = build_normal_frame(&grid, 1.0, [0.0, 0.0, 0.0]);
-        ingest_voxel_map(&frame);
-        LIDAR.with(|cell| assert_eq!(cell.borrow().point_count, 8));
-        let frame_json = lidar_frame();
-        let pts = frame_json.get("points").and_then(JsonValue::as_array).expect("points");
-        assert_eq!(pts.len(), 8);
-        let xs: Vec<i32> = pts
-            .iter()
-            .map(|p| p.as_array().unwrap()[0].as_f64().unwrap().round() as i32)
-            .collect();
-        assert_eq!(xs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    fn decode_voxel_to_canonical_large_count_uses_fallible_reserve() {
+        // A dense grid at (just under) the cap drives the largest allocation the
+        // decoder will ever attempt. try_reserve_exact must succeed and produce a
+        // full frame — proving the fallible-reserve path does not regress the happy
+        // case and never aborts on a legitimately large (but bounded) point count.
+        let bytes = (LIDAR_MAX_POINTS / 8) - 1;
+        let grid = vec![0xFFu8; bytes];
+        let count = count_voxel_points(&grid);
+        assert!(count <= LIDAR_MAX_POINTS);
+        let frame = decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0)
+            .expect("at-cap frame must decode, not abort");
+        assert_eq!(frame.len(), LIDAR_HEADER_LEN + count * 3 * 2);
     }
 
     #[test]
@@ -2607,9 +3041,6 @@ mod tests {
             let l = cell.borrow();
             assert_eq!(l.point_count, expected, "tick stores the cheap popcount");
             assert_eq!(l.point_count, 12);
-            // The retained raw frame is the compressed payload, not a decoded cloud.
-            assert!(!l.latest_raw.is_empty(), "raw kept for on-demand decode");
-            assert_eq!(l.latest_src_size, grid.len());
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
@@ -2630,6 +3061,140 @@ mod tests {
             let l = cell.borrow();
             assert_eq!(l.frame_seq, 1, "malformed frames do not bump frame_seq");
             assert_eq!(l.point_count, 1, "prior counted points retained");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    /// Build a "LiDAR-framing" voxel-map binary message: leading `<HH>` == (2,0),
+    /// then a `<u32 json_len>` at +4, the JSON envelope at [8..8+len], compressed
+    /// grid after. Mirrors the real Go2 LiDAR data-channel framing.
+    fn build_lidar_frame(grid: &[u8], resolution: f64, origin: [f64; 3]) -> Vec<u8> {
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": resolution, "origin": origin, "src_size": grid.len() },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(grid);
+        let mut out = Vec::new();
+        out.extend_from_slice(&2u16.to_le_bytes()); // raw[0..2] h1 == 2
+        out.extend_from_slice(&0u16.to_le_bytes()); // raw[2..4] h2 == 0
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes()); // raw[4..8] json len
+        out.extend_from_slice(json_bytes); // raw[8..8+len] JSON
+        out.extend_from_slice(&compressed);
+        out
+    }
+
+    #[test]
+    fn parse_voxel_frame_handles_truncated_and_short_inputs() {
+        // Every length that is too short to hold the framing header / declared JSON
+        // must return None, never panic. Covers empty, sub-4-byte, a LiDAR header
+        // with no json-length, and a header declaring more JSON than is present.
+        assert!(parse_voxel_frame(&[]).is_none());
+        assert!(parse_voxel_frame(&[0]).is_none());
+        assert!(parse_voxel_frame(&[2, 0, 0]).is_none());
+        assert!(parse_voxel_frame(&[2, 0, 0, 0]).is_none()); // (2,0) header, no u32 len
+        assert!(parse_voxel_frame(&[2, 0, 0, 0, 0xFF]).is_none()); // partial u32 len
+        // LiDAR framing whose declared json_len overruns the buffer.
+        let mut overrun = Vec::new();
+        overrun.extend_from_slice(&2u16.to_le_bytes());
+        overrun.extend_from_slice(&0u16.to_le_bytes());
+        overrun.extend_from_slice(&1000u32.to_le_bytes()); // claim 1000 JSON bytes
+        overrun.extend_from_slice(b"{}"); // but only 2 present
+        assert!(parse_voxel_frame(&overrun).is_none());
+        // Normal framing whose declared u16 len overruns the buffer.
+        let mut overrun2 = Vec::new();
+        overrun2.extend_from_slice(&500u16.to_le_bytes());
+        overrun2.extend_from_slice(&[0u8, 0u8]);
+        overrun2.extend_from_slice(b"{}");
+        assert!(parse_voxel_frame(&overrun2).is_none());
+    }
+
+    #[test]
+    fn parse_voxel_frame_accepts_real_lidar_framing() {
+        // The (2,0)+u32-len LiDAR framing must parse to the voxel data + compressed
+        // tail, proving the bounds-safe rewrite still matches the real wire format.
+        let grid = vec![0x81u8, 0x00];
+        let frame = build_lidar_frame(&grid, 0.05, [1.0, 2.0, 3.0]);
+        let (data, compressed) = parse_voxel_frame(&frame).expect("parses lidar framing");
+        assert_eq!(data.get("src_size").and_then(JsonValue::as_u64), Some(2));
+        assert_eq!(
+            compressed,
+            lz4_flex::block::compress(&grid).as_slice(),
+            "compressed tail recovered intact"
+        );
+    }
+
+    #[test]
+    fn parse_voxel_frame_autodetects_4byte_padded_framing() {
+        // Some firmware places a 4-byte pad between the u32 length and the JSON, so
+        // the JSON starts at raw[12] instead of raw[8]. parse_voxel_frame must
+        // auto-detect this variant and recover the same data + compressed tail.
+        let grid = vec![0x81u8, 0x00];
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": 0.05, "origin": [1.0, 2.0, 3.0], "src_size": grid.len() },
+        })
+        .to_string();
+        let json_bytes = json.as_bytes();
+        let compressed = lz4_flex::block::compress(&grid);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u16.to_le_bytes()); // raw[0..2] h1 == 2
+        frame.extend_from_slice(&0u16.to_le_bytes()); // raw[2..4] h2 == 0
+        frame.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes()); // raw[4..8] len
+        frame.extend_from_slice(&[0u8; 4]); // raw[8..12] 4-byte pad
+        frame.extend_from_slice(json_bytes); // raw[12..12+len] JSON
+        frame.extend_from_slice(&compressed);
+        let (data, tail) = parse_voxel_frame(&frame).expect("auto-detects padded framing");
+        assert_eq!(data.get("src_size").and_then(JsonValue::as_u64), Some(2));
+        assert_eq!(tail, compressed.as_slice(), "compressed tail recovered intact");
+    }
+
+    #[test]
+    fn ingest_oversized_src_size_does_not_panic_or_decode() {
+        // A frame whose JSON declares src_size beyond the grid bound must be skipped
+        // (no decode, no state change) and MUST NOT panic. Build a valid framing but
+        // override src_size to exceed LIDAR_GRID_BYTES.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0xFFu8, 0x0F];
+        let json = json!({
+            "type": "msg",
+            "topic": "rt/utlidar/voxel_map_compressed",
+            "data": { "resolution": 0.05, "origin": [0.0, 0.0, 0.0], "src_size": LIDAR_GRID_BYTES + 1 },
+        })
+        .to_string();
+        let compressed = lz4_flex::block::compress(&grid);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(json.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&[0u8, 0u8]);
+        frame.extend_from_slice(json.as_bytes());
+        frame.extend_from_slice(&compressed);
+        ingest_voxel_map(&frame); // must not panic
+        LIDAR.with(|cell| {
+            let l = cell.borrow();
+            assert_eq!(l.frame_seq, 0, "oversized src_size frame never decoded");
+        });
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+    }
+
+    #[test]
+    fn ingest_truncated_compressed_tail_does_not_panic() {
+        // A valid framing + topic but a corrupt/short LZ4 tail must be skipped
+        // (decompress fails or length mismatches) without panicking.
+        let _clock_guard = CLOCK_LOCK.lock().unwrap();
+        db::set_now_secs(1_700_000_000);
+        LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
+        let grid = vec![0xFFu8, 0x0F, 0x01, 0x80];
+        let mut frame = build_normal_frame(&grid, 0.05, [0.0, 0.0, 0.0]);
+        // Lop off the last few bytes of the compressed tail to corrupt it.
+        frame.truncate(frame.len().saturating_sub(2));
+        ingest_voxel_map(&frame); // must not panic
+        LIDAR.with(|cell| {
+            assert_eq!(cell.borrow().frame_seq, 0, "corrupt tail never decoded");
         });
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
     }
@@ -2998,16 +3563,16 @@ mod tests {
     }
 
     #[test]
-    fn lidar_frame_returns_metadata_with_pending_flag() {
+    fn lidar_frame_returns_status_snapshot_never_points() {
         state::test_reset();
-        // Empty thread_local => no retained raw frame in this worker => cross-worker
-        // pending path (no fabricated cloud).
         LIDAR.with(|cell| *cell.borrow_mut() = LidarState::default());
         set_lidar_intent(true);
+        // The live cloud flows through the binary host hub now; this tool returns
+        // only the small availability snapshot — never points, never a fabricated
+        // pending flag.
         let frame = lidar_frame();
-        // No full point cloud cross-worker — honest pending flag, never fabricated points.
-        assert_eq!(frame.get("frame_pending_renderer").and_then(JsonValue::as_bool), Some(true));
-        assert!(frame.get("points").is_none(), "full cloud is never persisted/returned");
+        assert!(frame.get("points").is_none(), "cloud is never returned by this tool");
+        assert!(frame.get("frame_pending_renderer").is_none(), "no pending flag — points moved off this path");
         assert_eq!(frame.get("enabled").and_then(JsonValue::as_bool), Some(true));
         state::test_reset();
     }
@@ -3026,7 +3591,6 @@ mod tests {
         state::test_fail_next_get();
         let frame = lidar_frame();
         assert!(frame.get("error").is_some(), "lidar_frame surfaces the read error");
-        assert!(frame.get("frame_pending_renderer").is_none(), "no fabricated frame on read error");
         // Recovery: the next read returns the intent-default object (enabled).
         let recovered = lidar_status_from_store().expect("read recovers");
         assert_eq!(recovered.get("enabled").and_then(JsonValue::as_bool), Some(true));
@@ -3156,11 +3720,10 @@ pub extern "C" fn on_request(
     let req: JsonValue = serde_json::from_str(&input).unwrap_or(JsonValue::Null);
     let raw_tool = req.get("tool").and_then(|t| t.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(JsonValue::Null);
-    // Panel button actions arrive from the dashboard as `ui.<panel_id>.<action_id>`
-    // (ui_channel: format!("ui.{panel}.{action}")). Strip the panel prefix so the
-    // declared action_ids (go2.connect, go2.estop, …) route to handle(). Flow
-    // blocks come via invoke_block as `block.go2.*` with no ui prefix.
-    let tool = raw_tool.strip_prefix("ui.overview.").unwrap_or(raw_tool);
+    // Control actions arrive as raw declared action_ids (go2.connect, go2.estop, …)
+    // from the core Roboty module via robot dispatch. Flow blocks come via
+    // invoke_block as `block.go2.*`.
+    let tool = raw_tool;
     let response = if let Some(block_type) = tool.strip_prefix("block.") {
         handle_block(block_type, &params)
     } else {

@@ -112,7 +112,7 @@ mod core_sync_repository_tests {
     }
 
     #[test]
-    fn update_flow_with_snapshot_records_only_flow_capture() {
+    fn update_flow_with_snapshot_records_flow_and_version_captures() {
         let db = setup_db();
         let _actor_id = create_actor(&db);
         let id =
@@ -134,8 +134,8 @@ mod core_sync_repository_tests {
                 |row| row.get(0),
             )
             .expect("flow capture count");
-        // flow_versions are local-only now, so the snapshot insert must NOT emit a
-        // core capture — only the two flow writes (insert + update) do.
+        // flow_versions now replicate, so the snapshot insert emits one Insert
+        // capture alongside the two flow writes (insert + update).
         let version_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
@@ -144,7 +144,6 @@ mod core_sync_repository_tests {
                 |row| row.get(0),
             )
             .expect("version capture count");
-        // The local snapshot row still exists for rollback.
         let local_version_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM flow_versions WHERE flow_id = ?1",
@@ -154,7 +153,7 @@ mod core_sync_repository_tests {
             .expect("local version rows");
 
         assert_eq!(flow_count, 2);
-        assert_eq!(version_count, 0);
+        assert_eq!(version_count, 1);
         assert_eq!(local_version_rows, 1);
     }
 
@@ -315,15 +314,16 @@ fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlow> {
 fn row_to_pii_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbPiiRule> {
     Ok(DbPiiRule {
         id: row.get(0)?,
-        name: row.get(1)?,
-        category: row.get(2)?,
-        pattern: row.get(3)?,
-        replacement: row.get(4)?,
-        is_active: row.get(5)?,
-        priority: row.get(6)?,
-        description: row.get(7)?,
-        test_examples: row.get(8)?,
-        created_at: row.get(9)?,
+        org_id: row.get(1)?,
+        name: row.get(2)?,
+        category: row.get(3)?,
+        pattern: row.get(4)?,
+        replacement: row.get(5)?,
+        is_active: row.get(6)?,
+        priority: row.get(7)?,
+        description: row.get(8)?,
+        test_examples: row.get(9)?,
+        created_at: row.get(10)?,
     })
 }
 
@@ -3855,6 +3855,35 @@ fn flow_changed_fields(
     fields
 }
 
+/// Replicated field set for a `flow_versions` snapshot row. `flow_json` and the
+/// version metadata travel; `created_at` is node-local. The id is the resource
+/// id, so it is not a field.
+fn flow_version_changed_fields(
+    flow_id: &str,
+    version_num: i64,
+    name: &str,
+    description: Option<&str>,
+    status: &str,
+    created_by: Option<&str>,
+    flow_json: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("flow_id".to_string(), field_string(flow_id));
+    fields.insert(
+        "version_num".to_string(),
+        crate::sync::ledger::FieldValue::I64(version_num),
+    );
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(description),
+    );
+    fields.insert("status".to_string(), field_string(status));
+    fields.insert("created_by".to_string(), field_optional_string(created_by));
+    fields.insert("flow_json".to_string(), field_string(flow_json));
+    fields
+}
+
 fn flow_binding_changed_fields(
     flow_id: &str,
     model_pattern: &str,
@@ -3867,6 +3896,422 @@ fn flow_binding_changed_fields(
         "priority".to_string(),
         crate::sync::ledger::FieldValue::I64(priority),
     );
+    fields
+}
+
+/// Replicated field set for a `compliance_data_categories` row. Runtime
+/// timestamps (created_at/updated_at) are node-local and excluded.
+#[allow(clippy::too_many_arguments)]
+fn compliance_data_category_fields(
+    org_id: &str,
+    slug: &str,
+    name_translations: &str,
+    description_translations: &str,
+    personal_data: bool,
+    sensitive_data: bool,
+    risk_class: &str,
+    source_scope: &str,
+    addon_id: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("slug".to_string(), field_string(slug));
+    fields.insert(
+        "name_translations".to_string(),
+        field_string(name_translations),
+    );
+    fields.insert(
+        "description_translations".to_string(),
+        field_string(description_translations),
+    );
+    fields.insert(
+        "personal_data".to_string(),
+        FieldValue::Bool(personal_data),
+    );
+    fields.insert(
+        "sensitive_data".to_string(),
+        FieldValue::Bool(sensitive_data),
+    );
+    fields.insert("risk_class".to_string(), field_string(risk_class));
+    fields.insert("source_scope".to_string(), field_string(source_scope));
+    fields.insert("addon_id".to_string(), field_optional_string(addon_id));
+    fields
+}
+
+/// Replicated field set for a `compliance_processing_activities` row.
+#[allow(clippy::too_many_arguments)]
+fn compliance_processing_activity_fields(
+    org_id: &str,
+    slug: &str,
+    name_translations: &str,
+    purpose_translations: &str,
+    controller_role: &str,
+    owner_user_id: Option<&str>,
+    system_scope: &str,
+    addon_id: Option<&str>,
+    status: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("slug".to_string(), field_string(slug));
+    fields.insert(
+        "name_translations".to_string(),
+        field_string(name_translations),
+    );
+    fields.insert(
+        "purpose_translations".to_string(),
+        field_string(purpose_translations),
+    );
+    fields.insert(
+        "controller_role".to_string(),
+        field_string(controller_role),
+    );
+    fields.insert(
+        "owner_user_id".to_string(),
+        field_optional_string(owner_user_id),
+    );
+    fields.insert("system_scope".to_string(), field_string(system_scope));
+    fields.insert("addon_id".to_string(), field_optional_string(addon_id));
+    fields.insert("status".to_string(), field_string(status));
+    fields
+}
+
+/// Replicated field set for a `compliance_legal_basis` row.
+fn compliance_legal_basis_fields(
+    org_id: &str,
+    activity_id: Option<&str>,
+    category_id: Option<&str>,
+    basis_kind: &str,
+    basis_reference: &str,
+    description_translations: &str,
+    is_active: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert(
+        "activity_id".to_string(),
+        field_optional_string(activity_id),
+    );
+    fields.insert(
+        "category_id".to_string(),
+        field_optional_string(category_id),
+    );
+    fields.insert("basis_kind".to_string(), field_string(basis_kind));
+    fields.insert(
+        "basis_reference".to_string(),
+        field_string(basis_reference),
+    );
+    fields.insert(
+        "description_translations".to_string(),
+        field_string(description_translations),
+    );
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+    fields
+}
+
+/// Replicated field set for a `compliance_retention_policies` row.
+#[allow(clippy::too_many_arguments)]
+fn compliance_retention_policy_fields(
+    org_id: &str,
+    slug: &str,
+    name_translations: &str,
+    scope_kind: &str,
+    category_id: Option<&str>,
+    retention_days: i64,
+    minimum_days: i64,
+    action_after_retention: &str,
+    is_default: bool,
+    is_active: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("slug".to_string(), field_string(slug));
+    fields.insert(
+        "name_translations".to_string(),
+        field_string(name_translations),
+    );
+    fields.insert("scope_kind".to_string(), field_string(scope_kind));
+    fields.insert(
+        "category_id".to_string(),
+        field_optional_string(category_id),
+    );
+    fields.insert(
+        "retention_days".to_string(),
+        FieldValue::I64(retention_days),
+    );
+    fields.insert("minimum_days".to_string(), FieldValue::I64(minimum_days));
+    fields.insert(
+        "action_after_retention".to_string(),
+        field_string(action_after_retention),
+    );
+    fields.insert("is_default".to_string(), FieldValue::Bool(is_default));
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+    fields
+}
+
+/// Emit one Insert capture per compliance config row of `org_id` from the given
+/// transaction. Called from `create_organization` right after
+/// `ensure_org_defaults` seeds the rows, so a freshly created org's compliance
+/// config reaches the outbox. The migration-backfill path for pre-existing orgs
+/// deliberately does NOT capture here: those seeded rows are deterministically
+/// identical on every node and are re-emitted by the baseline reset / reseed,
+/// not by per-row capture during a migration (no HLC clock during migration).
+pub(crate) fn capture_seeded_compliance_defaults(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+) -> Result<()> {
+    use crate::sync::core_registry::CoreSyncResourceKind as K;
+    use crate::sync::runtime::SqlWriteAction::Insert;
+
+    {
+        let mut stmt = tx.prepare(
+            "SELECT category_id, slug, name_translations, description_translations, \
+                    personal_data, sensitive_data, risk_class, source_scope, addon_id \
+             FROM compliance_data_categories WHERE org_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, bool>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, slug, name_tr, desc_tr, personal, sensitive, risk, scope, addon_id) in rows {
+            record_core_capture_for_org_tx(
+                tx,
+                K::ComplianceDataCategory,
+                org_id,
+                id,
+                Insert,
+                compliance_data_category_fields(
+                    org_id,
+                    &slug,
+                    &name_tr,
+                    &desc_tr,
+                    personal,
+                    sensitive,
+                    &risk,
+                    &scope,
+                    addon_id.as_deref(),
+                ),
+                None,
+            )?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT activity_id, slug, name_translations, purpose_translations, controller_role, \
+                    owner_user_id, system_scope, addon_id, status \
+             FROM compliance_processing_activities WHERE org_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, slug, name_tr, purpose_tr, role, owner, scope, addon_id, status) in rows {
+            record_core_capture_for_org_tx(
+                tx,
+                K::ComplianceProcessingActivity,
+                org_id,
+                id,
+                Insert,
+                compliance_processing_activity_fields(
+                    org_id,
+                    &slug,
+                    &name_tr,
+                    &purpose_tr,
+                    &role,
+                    owner.as_deref(),
+                    &scope,
+                    addon_id.as_deref(),
+                    &status,
+                ),
+                None,
+            )?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT legal_basis_id, activity_id, category_id, basis_kind, basis_reference, \
+                    description_translations, is_active \
+             FROM compliance_legal_basis WHERE org_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, activity_id, category_id, basis_kind, basis_reference, desc_tr, is_active) in rows
+        {
+            record_core_capture_for_org_tx(
+                tx,
+                K::ComplianceLegalBasis,
+                org_id,
+                id,
+                Insert,
+                compliance_legal_basis_fields(
+                    org_id,
+                    activity_id.as_deref(),
+                    category_id.as_deref(),
+                    &basis_kind,
+                    &basis_reference,
+                    &desc_tr,
+                    is_active,
+                ),
+                None,
+            )?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT retention_policy_id, slug, name_translations, scope_kind, category_id, \
+                    retention_days, minimum_days, action_after_retention, is_default, is_active \
+             FROM compliance_retention_policies WHERE org_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, bool>(8)?,
+                    r.get::<_, bool>(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (
+            id,
+            slug,
+            name_tr,
+            scope_kind,
+            category_id,
+            retention_days,
+            minimum_days,
+            action,
+            is_default,
+            is_active,
+        ) in rows
+        {
+            record_core_capture_for_org_tx(
+                tx,
+                K::ComplianceRetentionPolicy,
+                org_id,
+                id,
+                Insert,
+                compliance_retention_policy_fields(
+                    org_id,
+                    &slug,
+                    &name_tr,
+                    &scope_kind,
+                    category_id.as_deref(),
+                    retention_days,
+                    minimum_days,
+                    &action,
+                    is_default,
+                    is_active,
+                ),
+                None,
+            )?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT processor_id, name, role, country, transfer_mechanism, dpa_reference, is_active \
+             FROM compliance_processors WHERE org_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, name, role, country, transfer_mechanism, dpa_reference, is_active) in rows {
+            record_core_capture_for_org_tx(
+                tx,
+                K::ComplianceProcessor,
+                org_id,
+                id,
+                Insert,
+                compliance_processor_fields(
+                    org_id,
+                    &name,
+                    &role,
+                    &country,
+                    &transfer_mechanism,
+                    &dpa_reference,
+                    is_active,
+                ),
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Replicated field set for a `compliance_processors` row.
+fn compliance_processor_fields(
+    org_id: &str,
+    name: &str,
+    role: &str,
+    country: &str,
+    transfer_mechanism: &str,
+    dpa_reference: &str,
+    is_active: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("role".to_string(), field_string(role));
+    fields.insert("country".to_string(), field_string(country));
+    fields.insert(
+        "transfer_mechanism".to_string(),
+        field_string(transfer_mechanism),
+    );
+    fields.insert("dpa_reference".to_string(), field_string(dpa_reference));
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
     fields
 }
 
@@ -4759,6 +5204,548 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::FlowVersion => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, flow_id, version_num, name, description, status, created_by, flow_json \
+                     FROM flow_versions",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, String>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, flow_id, version_num, name, description, status, created_by, flow_json) in
+                    rows
+                {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        id,
+                        Insert,
+                        flow_version_changed_fields(
+                            &flow_id,
+                            version_num,
+                            &name,
+                            description.as_deref(),
+                            status.as_deref().unwrap_or("draft"),
+                            created_by.as_deref(),
+                            &flow_json,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::PiiRule => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, org_id, name, category, pattern, replacement, is_active, priority, \
+                            description, test_examples FROM pii_rules",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, bool>(6)?,
+                            r.get::<_, i64>(7)?,
+                            r.get::<_, Option<String>>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    org_id,
+                    name,
+                    category,
+                    pattern,
+                    replacement,
+                    is_active,
+                    priority,
+                    description,
+                    test_examples,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id,
+                        Insert,
+                        pii_rule_changed_fields(
+                            &org_id,
+                            &name,
+                            &category,
+                            &pattern,
+                            &replacement,
+                            is_active,
+                            priority,
+                            description.as_deref(),
+                            test_examples.as_deref(),
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ComplianceDataCategory => {
+                let mut stmt = tx.prepare(
+                    "SELECT category_id, org_id, slug, name_translations, description_translations, \
+                            personal_data, sensitive_data, risk_class, source_scope, addon_id \
+                     FROM compliance_data_categories",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, bool>(5)?,
+                            r.get::<_, bool>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, String>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    category_id,
+                    org_id,
+                    slug,
+                    name_tr,
+                    desc_tr,
+                    personal,
+                    sensitive,
+                    risk,
+                    scope,
+                    addon_id,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        category_id,
+                        Insert,
+                        compliance_data_category_fields(
+                            &org_id,
+                            &slug,
+                            &name_tr,
+                            &desc_tr,
+                            personal,
+                            sensitive,
+                            &risk,
+                            &scope,
+                            addon_id.as_deref(),
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ComplianceProcessingActivity => {
+                let mut stmt = tx.prepare(
+                    "SELECT activity_id, org_id, slug, name_translations, purpose_translations, \
+                            controller_role, owner_user_id, system_scope, addon_id, status \
+                     FROM compliance_processing_activities",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, Option<String>>(8)?,
+                            r.get::<_, String>(9)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    activity_id,
+                    org_id,
+                    slug,
+                    name_tr,
+                    purpose_tr,
+                    role,
+                    owner,
+                    scope,
+                    addon_id,
+                    status,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        activity_id,
+                        Insert,
+                        compliance_processing_activity_fields(
+                            &org_id,
+                            &slug,
+                            &name_tr,
+                            &purpose_tr,
+                            &role,
+                            owner.as_deref(),
+                            &scope,
+                            addon_id.as_deref(),
+                            &status,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ComplianceLegalBasis => {
+                let mut stmt = tx.prepare(
+                    "SELECT legal_basis_id, org_id, activity_id, category_id, basis_kind, \
+                            basis_reference, description_translations, is_active \
+                     FROM compliance_legal_basis",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, bool>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    legal_basis_id,
+                    org_id,
+                    activity_id,
+                    category_id,
+                    basis_kind,
+                    basis_reference,
+                    desc_tr,
+                    is_active,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        legal_basis_id,
+                        Insert,
+                        compliance_legal_basis_fields(
+                            &org_id,
+                            activity_id.as_deref(),
+                            category_id.as_deref(),
+                            &basis_kind,
+                            &basis_reference,
+                            &desc_tr,
+                            is_active,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ComplianceRetentionPolicy => {
+                let mut stmt = tx.prepare(
+                    "SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                            category_id, retention_days, minimum_days, action_after_retention, \
+                            is_default, is_active FROM compliance_retention_policies",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, i64>(7)?,
+                            r.get::<_, String>(8)?,
+                            r.get::<_, bool>(9)?,
+                            r.get::<_, bool>(10)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    retention_policy_id,
+                    org_id,
+                    slug,
+                    name_tr,
+                    scope_kind,
+                    category_id,
+                    retention_days,
+                    minimum_days,
+                    action,
+                    is_default,
+                    is_active,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        retention_policy_id,
+                        Insert,
+                        compliance_retention_policy_fields(
+                            &org_id,
+                            &slug,
+                            &name_tr,
+                            &scope_kind,
+                            category_id.as_deref(),
+                            retention_days,
+                            minimum_days,
+                            &action,
+                            is_default,
+                            is_active,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ComplianceProcessor => {
+                let mut stmt = tx.prepare(
+                    "SELECT processor_id, org_id, name, role, country, transfer_mechanism, \
+                            dpa_reference, is_active FROM compliance_processors",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, bool>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    processor_id,
+                    org_id,
+                    name,
+                    role,
+                    country,
+                    transfer_mechanism,
+                    dpa_reference,
+                    is_active,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        processor_id,
+                        Insert,
+                        compliance_processor_fields(
+                            &org_id,
+                            &name,
+                            &role,
+                            &country,
+                            &transfer_mechanism,
+                            &dpa_reference,
+                            is_active,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::TokenUsageDaily => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, node_id, org_id, user_id, model_id, usage_day, \
+                            prompt_tokens, completion_tokens, total_tokens, request_count, \
+                            audio_ms, images, embedding_tokens \
+                     FROM token_usage_daily",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, i64>(7)?,
+                            r.get::<_, i64>(8)?,
+                            r.get::<_, i64>(9)?,
+                            r.get::<_, i64>(10)?,
+                            r.get::<_, i64>(11)?,
+                            r.get::<_, i64>(12)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    node_id,
+                    org_id,
+                    user_id,
+                    model_id,
+                    usage_day,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    request_count,
+                    audio_ms,
+                    images,
+                    embedding_tokens,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id,
+                        Update,
+                        token_usage_changed_fields(
+                            &node_id,
+                            &org_id,
+                            &user_id,
+                            &model_id,
+                            &usage_day,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            request_count,
+                            audio_ms,
+                            images,
+                            embedding_tokens,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::TokenQuota => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, org_id, scope_type, subject_id, model_id, period, \
+                            max_total_tokens, is_active FROM token_quota",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, bool>(7)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    org_id,
+                    scope_type,
+                    subject_id,
+                    model_id,
+                    period,
+                    max_total_tokens,
+                    is_active,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id,
+                        Insert,
+                        token_quota_changed_fields(
+                            &org_id,
+                            &scope_type,
+                            subject_id.as_deref(),
+                            model_id.as_deref(),
+                            &period,
+                            max_total_tokens,
+                            is_active,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::TokenLease => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, org_id, quota_id, node_id, period_key, base_used, \
+                            granted_tokens, coordinator_node_id, expires_at FROM token_lease",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, String>(7)?,
+                            r.get::<_, String>(8)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    org_id,
+                    quota_id,
+                    node_id,
+                    period_key,
+                    base_used,
+                    granted_tokens,
+                    coordinator_node_id,
+                    expires_at,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id,
+                        Update,
+                        token_lease_changed_fields(
+                            &org_id,
+                            &quota_id,
+                            &node_id,
+                            &period_key,
+                            base_used,
+                            granted_tokens,
+                            &coordinator_node_id,
+                            &expires_at,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
@@ -5300,8 +6287,9 @@ pub fn update_flow_with_snapshot(
             |r| r.get(0),
         )?;
 
-        // flow_versions is a LOCAL-ONLY snapshot history (not core-synced), so it
-        // gets a local UUID and no capture row. It still uses UUID ids after v53.
+        // flow_versions replicates as an append-only core sync resource. The org
+        // is DEFAULT_ORG_ID at this write site, mirroring the sibling flow
+        // capture (flows here are default-org scoped).
         let version_id = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO flow_versions \
@@ -5318,15 +6306,55 @@ pub fn update_flow_with_snapshot(
                 created_by,
             ],
         )?;
-
-        // Prune — zostawiamy tylko FLOW_VERSIONS_KEEP najnowszych
-        tx.execute(
-            "DELETE FROM flow_versions WHERE flow_id = ?1 AND id NOT IN ( \
-               SELECT id FROM flow_versions WHERE flow_id = ?1 \
-               ORDER BY version_num DESC LIMIT ?2 \
-             )",
-            rusqlite::params![id, FLOW_VERSIONS_KEEP],
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowVersion,
+            version_id.clone(),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            flow_version_changed_fields(
+                id,
+                next_ver,
+                &old_name,
+                old_description.as_deref(),
+                old_status.as_deref().unwrap_or("draft"),
+                created_by,
+                &old_flow_json,
+            ),
+            None,
         )?;
+
+        // Prune — zostawiamy tylko FLOW_VERSIONS_KEEP najnowszych. Pruned rows are
+        // emitted as Delete captures so peers drop the same trimmed snapshots.
+        let pruned: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM flow_versions WHERE flow_id = ?1 AND id NOT IN ( \
+                   SELECT id FROM flow_versions WHERE flow_id = ?1 \
+                   ORDER BY version_num DESC LIMIT ?2 \
+                 )",
+            )?;
+            let collected = stmt
+                .query_map(rusqlite::params![id, FLOW_VERSIONS_KEEP], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            collected
+        };
+        for pruned_id in &pruned {
+            tx.execute(
+                "DELETE FROM flow_versions WHERE id = ?1",
+                rusqlite::params![pruned_id],
+            )?;
+            let mut fields = BTreeMap::new();
+            fields.insert("id".to_string(), field_string(pruned_id));
+            record_core_capture_tx(
+                &tx,
+                crate::sync::core_registry::CoreSyncResourceKind::FlowVersion,
+                pruned_id.clone(),
+                crate::sync::runtime::SqlWriteAction::Delete,
+                fields,
+                None,
+            )?;
+        }
     }
 
     // Wlasciwa aktualizacja z optimistic locking
@@ -7616,66 +8644,1048 @@ pub fn delete_flow_node_template(pool: &DbPool, id: i64) -> Result<()> {
 
 // --- PII Rules ---
 
-const PII_RULE_COLS: &str = "id, name, category, pattern, replacement, is_active, priority, description, test_examples, created_at";
+const PII_RULE_COLS: &str = "id, org_id, name, category, pattern, replacement, is_active, priority, description, test_examples, created_at";
 
-pub fn list_pii_rules(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPiiRule>> {
+/// Replicated field set for a `pii_rules` row. `org_id` travels so the
+/// materializer can satisfy the NOT NULL column; `created_at` is node-local and
+/// preserved on UPSERT.
+fn pii_rule_changed_fields(
+    org_id: &str,
+    name: &str,
+    category: &str,
+    pattern: &str,
+    replacement: &str,
+    is_active: bool,
+    priority: i64,
+    description: Option<&str>,
+    test_examples: Option<&str>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("category".to_string(), field_string(category));
+    fields.insert("pattern".to_string(), field_string(pattern));
+    fields.insert("replacement".to_string(), field_string(replacement));
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+    fields.insert("priority".to_string(), FieldValue::I64(priority));
+    fields.insert(
+        "description".to_string(),
+        field_optional_string(description),
+    );
+    fields.insert(
+        "test_examples".to_string(),
+        field_optional_string(test_examples),
+    );
+    fields
+}
+
+pub fn list_pii_rules(
+    pool: &DbPool,
+    org_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<DbPiiRule>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM pii_rules ORDER BY priority DESC LIMIT ?1 OFFSET ?2",
+        "SELECT {} FROM pii_rules WHERE org_id = ?1 ORDER BY priority DESC LIMIT ?2 OFFSET ?3",
         PII_RULE_COLS
     ))?;
     let rows = stmt
-        .query_map(rusqlite::params![limit, offset], row_to_pii_rule)?
+        .query_map(rusqlite::params![org_id, limit, offset], row_to_pii_rule)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-pub fn list_pii_rules_active(pool: &DbPool) -> Result<Vec<DbPiiRule>> {
+pub fn list_pii_rules_active(pool: &DbPool, org_id: &str) -> Result<Vec<DbPiiRule>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM pii_rules WHERE is_active = 1 ORDER BY priority DESC",
+        "SELECT {} FROM pii_rules WHERE org_id = ?1 AND is_active = 1 ORDER BY priority DESC",
         PII_RULE_COLS
     ))?;
     let rows = stmt
-        .query_map([], row_to_pii_rule)?
+        .query_map(rusqlite::params![org_id], row_to_pii_rule)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-pub fn get_pii_rule(pool: &DbPool, id: i64) -> Result<Option<DbPiiRule>> {
+pub fn get_pii_rule(pool: &DbPool, org_id: &str, id: &str) -> Result<Option<DbPiiRule>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM pii_rules WHERE id = ?1",
+        "SELECT {} FROM pii_rules WHERE org_id = ?1 AND id = ?2",
         PII_RULE_COLS
     ))?;
     let result = stmt
-        .query_row(rusqlite::params![id], row_to_pii_rule)
+        .query_row(rusqlite::params![org_id, id], row_to_pii_rule)
         .optional()?;
     Ok(result)
 }
 
-pub fn create_pii_rule(pool: &DbPool, params: &NewPiiRule<'_>) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO pii_rules (name, category, pattern, replacement, priority, description, test_examples) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![params.name, params.category, params.pattern, params.replacement, params.priority, params.description, params.test_examples],
+pub fn create_pii_rule(pool: &DbPool, params: &NewPiiRule<'_>) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO pii_rules (id, org_id, name, category, pattern, replacement, priority, description, test_examples) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![id, params.org_id, params.name, params.category, params.pattern, params.replacement, params.priority, params.description, params.test_examples],
     )?;
-    Ok(conn.last_insert_rowid())
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::PiiRule,
+        params.org_id,
+        id.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        pii_rule_changed_fields(
+            params.org_id,
+            params.name,
+            params.category,
+            params.pattern,
+            params.replacement,
+            true,
+            params.priority,
+            params.description,
+            params.test_examples,
+        ),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn update_pii_rule(pool: &DbPool, params: &UpdatePiiRule<'_>) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
+        "UPDATE pii_rules SET name = ?3, category = ?4, pattern = ?5, replacement = ?6, is_active = ?7, priority = ?8, description = ?9, test_examples = ?10 WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![params.id, params.org_id, params.name, params.category, params.pattern, params.replacement, params.is_active, params.priority, params.description, params.test_examples],
+    )?;
+    if rows_affected > 0 {
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::PiiRule,
+            params.org_id,
+            params.id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            pii_rule_changed_fields(
+                params.org_id,
+                params.name,
+                params.category,
+                params.pattern,
+                params.replacement,
+                params.is_active,
+                params.priority,
+                params.description,
+                params.test_examples,
+            ),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn delete_pii_rule(pool: &DbPool, org_id: &str, id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
+        "DELETE FROM pii_rules WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![id, org_id],
+    )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::PiiRule,
+            org_id,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+// --- Token Metrics (usage / quotas / leases) ---
+
+/// Sentinel uzytkownika gdy wywolanie nie ma UserContext (np. wewnetrzny flow).
+pub const TOKEN_USAGE_SYSTEM_USER: &str = "__system__";
+
+const TOKEN_QUOTA_COLS: &str =
+    "id, org_id, scope_type, subject_id, model_id, period, max_total_tokens, is_active, created_at";
+
+const TOKEN_LEASE_COLS: &str = "id, org_id, quota_id, node_id, period_key, base_used, granted_tokens, coordinator_node_id, expires_at, created_at";
+
+fn row_to_token_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenQuota> {
+    Ok(TokenQuota {
+        id: row.get(0)?,
+        org_id: row.get(1)?,
+        scope_type: row.get(2)?,
+        subject_id: row.get(3)?,
+        model_id: row.get(4)?,
+        period: row.get(5)?,
+        max_total_tokens: row.get(6)?,
+        is_active: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+    })
+}
+
+fn row_to_token_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenLease> {
+    Ok(TokenLease {
+        id: row.get(0)?,
+        org_id: row.get(1)?,
+        quota_id: row.get(2)?,
+        node_id: row.get(3)?,
+        period_key: row.get(4)?,
+        base_used: row.get(5)?,
+        granted_tokens: row.get(6)?,
+        coordinator_node_id: row.get(7)?,
+        expires_at: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+/// Deterministyczne id licznika zuzycia: ten sam klucz na kazdym wezle (klucz
+/// zawiera node_id, wiec sumowanie mesh-wide nie powoduje kolizji miedzy wezlami).
+fn token_usage_id(
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+) -> String {
+    format!("usage:{node_id}:{org_id}:{user_id}:{model_id}:{usage_day}")
+}
+
+/// Deterministyczne id limitu z krotki scope. Dzieki temu te same logicznie
+/// kwoty (np. dwie utworzone na tym samym/roznych wezlach) kolapsuja do jednego
+/// wiersza (lokalnie i cross-node przez LWW), zamiast duplikowac sie — SQLite
+/// `UNIQUE` traktuje NULL jako rozne, wiec sam constraint by ich nie zlapal.
+/// `*` to sentinel braku podmiotu/modelu (org-scope, brak ograniczenia modelu).
+fn token_quota_id(
+    org_id: &str,
+    scope_type: &str,
+    subject_id: Option<&str>,
+    model_id: Option<&str>,
+    period: &str,
+) -> String {
+    format!(
+        "quota:{org_id}:{scope_type}:{}:{}:{period}",
+        subject_id.unwrap_or("*"),
+        model_id.unwrap_or("*"),
+    )
+}
+
+/// Deterministyczne id dzierzawy (quota, wezel, okres).
+fn token_lease_id(quota_id: &str, node_id: &str, period_key: &str) -> String {
+    format!("lease:{quota_id}:{node_id}:{period_key}")
+}
+
+/// Replikowane pola wiersza `token_usage_daily` (wszystko poza node-lokalnym `updated_at`).
+#[allow(clippy::too_many_arguments)]
+pub fn token_usage_changed_fields(
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    request_count: i64,
+    audio_ms: i64,
+    images: i64,
+    embedding_tokens: i64,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
+    fields.insert("model_id".to_string(), field_string(model_id));
+    fields.insert("usage_day".to_string(), field_string(usage_day));
+    fields.insert("prompt_tokens".to_string(), FieldValue::I64(prompt_tokens));
+    fields.insert(
+        "completion_tokens".to_string(),
+        FieldValue::I64(completion_tokens),
+    );
+    fields.insert("total_tokens".to_string(), FieldValue::I64(total_tokens));
+    fields.insert("request_count".to_string(), FieldValue::I64(request_count));
+    fields.insert("audio_ms".to_string(), FieldValue::I64(audio_ms));
+    fields.insert("images".to_string(), FieldValue::I64(images));
+    fields.insert(
+        "embedding_tokens".to_string(),
+        FieldValue::I64(embedding_tokens),
+    );
+    fields
+}
+
+/// Lokalny UPSERT licznika zuzycia. Sciezka goraca — BEZ capture (flusher
+/// kolejno emituje capture batchem). Kazde wywolanie to jedno zliczone zadanie.
+pub fn bump_token_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+) -> Result<()> {
     let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    let total = prompt_tokens + completion_tokens;
     conn.execute(
-        "UPDATE pii_rules SET name = ?2, category = ?3, pattern = ?4, replacement = ?5, is_active = ?6, priority = ?7, description = ?8, test_examples = ?9 WHERE id = ?1",
-        rusqlite::params![params.id, params.name, params.category, params.pattern, params.replacement, params.is_active, params.priority, params.description, params.test_examples],
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
+         completion_tokens = completion_tokens + excluded.completion_tokens, \
+         total_tokens = total_tokens + excluded.total_tokens, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            prompt_tokens,
+            completion_tokens,
+            total,
+        ],
     )?;
     Ok(())
 }
 
-pub fn delete_pii_rule(pool: &DbPool, id: i64) -> Result<()> {
+/// Podstawowa organizacja uzytkownika dla licznikow zuzycia (najstarsze
+/// czlonkostwo). Brak czlonkostwa lub brak user_id → `DEFAULT_ORG_ID`. Best-effort:
+/// blad DB tez degraduje do org domyslnej (metryki nie moga psuc requestu).
+pub fn primary_org_for_user(pool: &DbPool, user_id: Option<&str>) -> String {
+    let default = crate::services::org::DEFAULT_ORG_ID.to_string();
+    let Some(user_id) = user_id else {
+        return default;
+    };
+    let Ok(conn) = acquire(pool) else {
+        return default;
+    };
+    conn.query_row(
+        "SELECT org_id FROM org_memberships WHERE user_id = ?1 \
+         ORDER BY granted_at ASC, org_id ASC LIMIT 1",
+        rusqlite::params![user_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(default)
+}
+
+/// Lokalny UPSERT zuzycia embeddingow. Tokeny embeddingow trzymamy w osobnym
+/// liczniku (`embedding_tokens`) i NIE wliczamy ich do `prompt_tokens` ani
+/// `total_tokens` — to inna modalnosc niz chat LLM. Sciezka goraca, BEZ capture.
+pub fn bump_embedding_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    embedding_tokens: i64,
+) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute("DELETE FROM pii_rules WHERE id = ?1", rusqlite::params![id])?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, 0, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            embedding_tokens,
+        ],
+    )?;
     Ok(())
+}
+
+/// Lokalny UPSERT zuzycia STT — kumuluje milisekundy przetworzonego audio.
+/// Sciezka goraca, BEZ capture (flusher emituje capture batchem).
+pub fn bump_audio_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    audio_ms: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, ?7, 0, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            audio_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Lokalny UPSERT zuzycia generacji obrazow — kumuluje liczbe wygenerowanych
+/// obrazow. Sciezka goraca, BEZ capture (flusher emituje capture batchem).
+pub fn bump_image_usage(
+    pool: &DbPool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage_day: &str,
+    images: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
+    conn.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, ?7, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         images = images + excluded.images, \
+         request_count = request_count + 1, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            usage_day,
+            images,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Emituje capture dla WLASNYCH licznikow tego noda zmienionych po
+/// `since_watermark`. Filtr `node_id = self` jest kluczowy: repliki licznikow z
+/// innych nodow (otrzymane przez sync) maja node-lokalny `updated_at` ustawiony
+/// przy materializacji, wiec bez tego filtra node re-publikowalby cudze wiersze.
+/// Wszystkie wiersze w jednej transakcji (jeden commit). Zwraca najwyzszy
+/// widziany `updated_at` (lub echo `since_watermark` gdy brak wierszy).
+pub fn flush_token_usage_captures(
+    pool: &DbPool,
+    self_node_id: &str,
+    since_watermark: &str,
+) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+    )> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, node_id, org_id, user_id, model_id, usage_day, \
+             prompt_tokens, completion_tokens, total_tokens, request_count, \
+             audio_ms, images, embedding_tokens, updated_at \
+             FROM token_usage_daily WHERE node_id = ?2 AND updated_at > ?1 ORDER BY updated_at",
+        )?;
+        let collected = stmt
+            .query_map(rusqlite::params![since_watermark, self_node_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        collected
+    };
+
+    if rows.is_empty() {
+        return Ok(since_watermark.to_string());
+    }
+
+    let mut max_watermark = since_watermark.to_string();
+    let tx = conn.transaction()?;
+    for (
+        id,
+        node_id,
+        org_id,
+        user_id,
+        model_id,
+        usage_day,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        request_count,
+        audio_ms,
+        images,
+        embedding_tokens,
+        updated_at,
+    ) in &rows
+    {
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::TokenUsageDaily,
+            org_id,
+            id.clone(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            token_usage_changed_fields(
+                node_id,
+                org_id,
+                user_id,
+                model_id,
+                usage_day,
+                *prompt_tokens,
+                *completion_tokens,
+                *total_tokens,
+                *request_count,
+                *audio_ms,
+                *images,
+                *embedding_tokens,
+            ),
+            None,
+        )?;
+        if updated_at > &max_watermark {
+            max_watermark = updated_at.clone();
+        }
+    }
+    tx.commit()?;
+    Ok(max_watermark)
+}
+
+/// Replikowane pola wiersza `token_quota` (wszystko poza node-lokalnym `created_at`).
+pub fn token_quota_changed_fields(
+    org_id: &str,
+    scope_type: &str,
+    subject_id: Option<&str>,
+    model_id: Option<&str>,
+    period: &str,
+    max_total_tokens: i64,
+    is_active: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("scope_type".to_string(), field_string(scope_type));
+    fields.insert("subject_id".to_string(), field_optional_string(subject_id));
+    fields.insert("model_id".to_string(), field_optional_string(model_id));
+    fields.insert("period".to_string(), field_string(period));
+    fields.insert(
+        "max_total_tokens".to_string(),
+        FieldValue::I64(max_total_tokens),
+    );
+    fields.insert("is_active".to_string(), FieldValue::Bool(is_active));
+    fields
+}
+
+pub fn create_token_quota(pool: &DbPool, params: &NewTokenQuota<'_>) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = token_quota_id(
+        params.org_id,
+        params.scope_type,
+        params.subject_id,
+        params.model_id,
+        params.period,
+    );
+    // Upsert po deterministycznym id: ponowne utworzenie tej samej kwoty
+    // aktualizuje limit/aktywność zamiast tworzyć duplikat.
+    tx.execute(
+        "INSERT INTO token_quota (id, org_id, scope_type, subject_id, model_id, period, max_total_tokens, is_active) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(id) DO UPDATE SET max_total_tokens = excluded.max_total_tokens, is_active = excluded.is_active",
+        rusqlite::params![
+            id,
+            params.org_id,
+            params.scope_type,
+            params.subject_id,
+            params.model_id,
+            params.period,
+            params.max_total_tokens,
+            params.is_active,
+        ],
+    )?;
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::TokenQuota,
+        params.org_id,
+        id.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        token_quota_changed_fields(
+            params.org_id,
+            params.scope_type,
+            params.subject_id,
+            params.model_id,
+            params.period,
+            params.max_total_tokens,
+            params.is_active,
+        ),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+pub fn update_token_quota(pool: &DbPool, params: &UpdateTokenQuota<'_>) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
+        "UPDATE token_quota SET scope_type = ?3, subject_id = ?4, model_id = ?5, period = ?6, max_total_tokens = ?7, is_active = ?8 \
+         WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![
+            params.id,
+            params.org_id,
+            params.scope_type,
+            params.subject_id,
+            params.model_id,
+            params.period,
+            params.max_total_tokens,
+            params.is_active,
+        ],
+    )?;
+    if rows_affected > 0 {
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::TokenQuota,
+            params.org_id,
+            params.id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            token_quota_changed_fields(
+                params.org_id,
+                params.scope_type,
+                params.subject_id,
+                params.model_id,
+                params.period,
+                params.max_total_tokens,
+                params.is_active,
+            ),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn delete_token_quota(pool: &DbPool, org_id: &str, id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let rows_affected = tx.execute(
+        "DELETE FROM token_quota WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![id, org_id],
+    )?;
+    if rows_affected > 0 {
+        let mut fields = BTreeMap::new();
+        fields.insert("id".to_string(), field_string(id));
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::TokenQuota,
+            org_id,
+            id.to_string(),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn list_token_quotas(pool: &DbPool, org_id: &str) -> Result<Vec<TokenQuota>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM token_quota WHERE org_id = ?1 ORDER BY created_at",
+        TOKEN_QUOTA_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], row_to_token_quota)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Wszystkie aktywne limity wszystkich organizacji — koordynator dzierzaw musi
+/// widziec limity miedzy organizacjami, zeby przydzielic pule tokenow per org.
+pub fn list_all_active_token_quotas(pool: &DbPool) -> Result<Vec<TokenQuota>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM token_quota WHERE is_active = 1 ORDER BY org_id, created_at",
+        TOKEN_QUOTA_COLS
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_token_quota)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Replikowane pola wiersza `token_lease` (wszystko poza node-lokalnym `created_at`).
+#[allow(clippy::too_many_arguments)]
+pub fn token_lease_changed_fields(
+    org_id: &str,
+    quota_id: &str,
+    node_id: &str,
+    period_key: &str,
+    base_used: i64,
+    granted_tokens: i64,
+    coordinator_node_id: &str,
+    expires_at: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("quota_id".to_string(), field_string(quota_id));
+    fields.insert("node_id".to_string(), field_string(node_id));
+    fields.insert("period_key".to_string(), field_string(period_key));
+    fields.insert("base_used".to_string(), FieldValue::I64(base_used));
+    fields.insert("granted_tokens".to_string(), FieldValue::I64(granted_tokens));
+    fields.insert(
+        "coordinator_node_id".to_string(),
+        field_string(coordinator_node_id),
+    );
+    fields.insert("expires_at".to_string(), field_string(expires_at));
+    fields
+}
+
+pub fn upsert_token_lease(pool: &DbPool, params: &TokenLeaseUpsert<'_>) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = token_lease_id(params.quota_id, params.node_id, params.period_key);
+    tx.execute(
+        "INSERT INTO token_lease \
+         (id, org_id, quota_id, node_id, period_key, base_used, granted_tokens, coordinator_node_id, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(id) DO UPDATE SET \
+         org_id = excluded.org_id, quota_id = excluded.quota_id, node_id = excluded.node_id, \
+         period_key = excluded.period_key, base_used = excluded.base_used, \
+         granted_tokens = excluded.granted_tokens, coordinator_node_id = excluded.coordinator_node_id, \
+         expires_at = excluded.expires_at",
+        rusqlite::params![
+            id,
+            params.org_id,
+            params.quota_id,
+            params.node_id,
+            params.period_key,
+            params.base_used,
+            params.granted_tokens,
+            params.coordinator_node_id,
+            params.expires_at,
+        ],
+    )?;
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::TokenLease,
+        params.org_id,
+        id.clone(),
+        crate::sync::runtime::SqlWriteAction::Update,
+        token_lease_changed_fields(
+            params.org_id,
+            params.quota_id,
+            params.node_id,
+            params.period_key,
+            params.base_used,
+            params.granted_tokens,
+            params.coordinator_node_id,
+            params.expires_at,
+        ),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_token_lease(
+    pool: &DbPool,
+    org_id: &str,
+    quota_id: &str,
+    node_id: &str,
+    period_key: &str,
+) -> Result<Option<TokenLease>> {
+    let conn = acquire(pool)?;
+    let id = token_lease_id(quota_id, node_id, period_key);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM token_lease WHERE id = ?1 AND org_id = ?2",
+        TOKEN_LEASE_COLS
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![id, org_id], row_to_token_lease)
+        .optional()?;
+    Ok(result)
+}
+
+pub fn list_token_leases(pool: &DbPool, org_id: &str) -> Result<Vec<TokenLease>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM token_lease WHERE org_id = ?1 ORDER BY created_at",
+        TOKEN_LEASE_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], row_to_token_lease)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Aktywne limity dotyczace tego wywolania (org / user / grupa uzytkownika /
+/// model), z opcjonalnym ograniczeniem na model_id limitu.
+pub fn applicable_token_quotas(
+    pool: &DbPool,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+) -> Result<Vec<TokenQuota>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM token_quota \
+         WHERE org_id = ?1 AND is_active = 1 \
+           AND ( scope_type = 'org' \
+              OR (scope_type = 'user' AND subject_id = ?2) \
+              OR (scope_type = 'group' AND subject_id IN \
+                  (SELECT group_id FROM group_members WHERE user_id = ?2)) \
+              OR (scope_type = 'model' AND subject_id = ?3) ) \
+           AND (model_id IS NULL OR model_id = ?3) \
+         ORDER BY created_at",
+        TOKEN_QUOTA_COLS
+    ))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![org_id, user_id, model_id],
+            row_to_token_quota,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Buduje fragment WHERE i parametry dopasowania okresu oraz podmiotu limitu dla
+/// agregacji `token_usage_daily`. `period`='daily' → dokladny `usage_day`,
+/// 'monthly' → prefiks "YYYY-MM". Zwraca (warunek_okresu, warunek_podmiotu,
+/// opcjonalny subject_id, opcjonalny model_id-limitu).
+fn quota_usage_period_clause(period: &str) -> &'static str {
+    if period == "monthly" {
+        "substr(usage_day, 1, 7) = ?2"
+    } else {
+        "usage_day = ?2"
+    }
+}
+
+/// Sumuje `total_tokens` na WSZYSTKICH wezlach pasujacych do podmiotu limitu w
+/// danym oknie okresu (z opcjonalnym ograniczeniem model_id limitu). Zwraca 0 dla NULL.
+pub fn global_usage_for_quota(
+    pool: &DbPool,
+    quota: &TokenQuota,
+    period_key: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let period_clause = quota_usage_period_clause(&quota.period);
+    let subject = quota.subject_id.as_deref().unwrap_or("");
+    let model = quota.model_id.as_deref().unwrap_or("");
+
+    let (subject_clause, bind_subject): (String, bool) = match quota.scope_type.as_str() {
+        "user" => ("AND user_id = ?3".to_string(), true),
+        "model" => ("AND model_id = ?3".to_string(), true),
+        "group" => (
+            "AND user_id IN (SELECT user_id FROM group_members WHERE group_id = ?3)".to_string(),
+            true,
+        ),
+        _ => (String::new(), false),
+    };
+
+    // Dla scope='model' subject_clause juz wiaze model_id (= subject_id), wiec
+    // dodatkowe ograniczenie model_id byloby sprzeczne (zawsze 0) — pomijamy je.
+    let has_model = quota.model_id.is_some() && quota.scope_type != "model";
+    let model_clause = if has_model {
+        if bind_subject {
+            "AND model_id = ?4"
+        } else {
+            "AND model_id = ?3"
+        }
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        "SELECT COALESCE(SUM(total_tokens), 0) FROM token_usage_daily \
+         WHERE org_id = ?1 AND {period_clause} {subject_clause} {model_clause}"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    let total: i64 = match (bind_subject, has_model) {
+        (true, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, subject, model],
+            |row| row.get(0),
+        )?,
+        (true, false) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, subject],
+            |row| row.get(0),
+        )?,
+        (false, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, model],
+            |row| row.get(0),
+        )?,
+        (false, false) => {
+            stmt.query_row(rusqlite::params![quota.org_id, period_key], |row| row.get(0))?
+        }
+    };
+    Ok(total)
+}
+
+/// Jak `global_usage_for_quota`, ale tylko wiersze tego wezla (`node_id`).
+pub fn node_usage_for_quota(
+    pool: &DbPool,
+    node_id: &str,
+    quota: &TokenQuota,
+    period_key: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let period_clause = quota_usage_period_clause(&quota.period);
+    let subject = quota.subject_id.as_deref().unwrap_or("");
+    let model = quota.model_id.as_deref().unwrap_or("");
+
+    let (subject_clause, bind_subject): (String, bool) = match quota.scope_type.as_str() {
+        "user" => ("AND user_id = ?4".to_string(), true),
+        "model" => ("AND model_id = ?4".to_string(), true),
+        "group" => (
+            "AND user_id IN (SELECT user_id FROM group_members WHERE group_id = ?4)".to_string(),
+            true,
+        ),
+        _ => (String::new(), false),
+    };
+
+    let has_model = quota.model_id.is_some() && quota.scope_type != "model";
+    let model_clause = if has_model {
+        if bind_subject {
+            "AND model_id = ?5"
+        } else {
+            "AND model_id = ?4"
+        }
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        "SELECT COALESCE(SUM(total_tokens), 0) FROM token_usage_daily \
+         WHERE org_id = ?1 AND node_id = ?3 AND {period_clause} {subject_clause} {model_clause}"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    let total: i64 = match (bind_subject, has_model) {
+        (true, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, node_id, subject, model],
+            |row| row.get(0),
+        )?,
+        (true, false) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, node_id, subject],
+            |row| row.get(0),
+        )?,
+        (false, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, node_id, model],
+            |row| row.get(0),
+        )?,
+        (false, false) => stmt.query_row(
+            rusqlite::params![quota.org_id, period_key, node_id],
+            |row| row.get(0),
+        )?,
+    };
+    Ok(total)
+}
+
+/// Zagregowane zuzycie do GUI, grupowane po user/model/day w oknie okresu.
+pub fn usage_summary(
+    pool: &DbPool,
+    org_id: &str,
+    period: &str,
+    period_key: &str,
+    group_by: &str,
+) -> Result<Vec<UsageSummaryRow>> {
+    let conn = acquire(pool)?;
+    let period_clause = if period == "monthly" {
+        "substr(usage_day, 1, 7) = ?2"
+    } else {
+        "usage_day = ?2"
+    };
+    // group="group" odlozone na pozniej — domyslnie grupujemy po uzytkowniku.
+    let group_col = match group_by {
+        "model" => "model_id",
+        "day" => "usage_day",
+        _ => "user_id",
+    };
+    let sql = format!(
+        "SELECT {group_col} AS key, \
+                COALESCE(SUM(prompt_tokens), 0), \
+                COALESCE(SUM(completion_tokens), 0), \
+                COALESCE(SUM(total_tokens), 0), \
+                COALESCE(SUM(request_count), 0), \
+                COALESCE(SUM(audio_ms), 0), \
+                COALESCE(SUM(images), 0), \
+                COALESCE(SUM(embedding_tokens), 0) \
+         FROM token_usage_daily \
+         WHERE org_id = ?1 AND {period_clause} \
+         GROUP BY {group_col} ORDER BY 4 DESC"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id, period_key], |row| {
+            Ok(UsageSummaryRow {
+                key: row.get(0)?,
+                prompt_tokens: row.get(1)?,
+                completion_tokens: row.get(2)?,
+                total_tokens: row.get(3)?,
+                request_count: row.get(4)?,
+                audio_ms: row.get(5)?,
+                images: row.get(6)?,
+                embedding_tokens: row.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 // --- Fast Path Patterns ---
@@ -9482,13 +11492,25 @@ pub fn add_trusted_node(
     public_key_hex: &str,
     hostname: &str,
     approved_by: &str,
+    approved_at: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
-        rusqlite::params![node_id, public_key_hex, hostname, approved_by],
-    )?;
+    // `approved_at` is the trust-expiry TTL anchor. A real local pairing passes `None`
+    // and we stamp `now`. A mirror re-add (TrustedKeysSync / first-contact propagation)
+    // passes the ORIGIN's `approved_at`, so a long-dead identity keeps its old timestamp
+    // and is pruned again next cycle instead of resurrecting with a fresh clock.
+    match approved_at.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(at) => conn.execute(
+            "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            rusqlite::params![node_id, public_key_hex, hostname, approved_by, at],
+        )?,
+        None => conn.execute(
+            "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), 1)",
+            rusqlite::params![node_id, public_key_hex, hostname, approved_by],
+        )?,
+    };
     drop(conn);
     ensure_default_core_sync_policies(pool)?;
     ensure_trusted_nodes_in_sync_identity(pool)?;
@@ -9534,6 +11556,40 @@ pub fn remove_trusted_node(pool: &DbPool, node_id: &str) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
         "DELETE FROM trusted_nodes WHERE node_id = ?1",
+        rusqlite::params![node_id],
+    )?;
+    Ok(())
+}
+
+/// Zwraca ostatni utrwalony czas udanego polaczenia (`peer_persisted.last_seen_ms`,
+/// epoka UNIX w ms) dla peera identyfikowanego heksowym node_id. `None` gdy node_id
+/// nie jest poprawnym 32-bajtowym kluczem albo nie ma jeszcze wiersza w `peer_persisted`
+/// (np. peer sparowany, ale nigdy nie polaczony). Uzywane przez prune wygaslego
+/// zaufania — to trwaly sygnal "ostatniego sukcesu", wiec przetrwa restart.
+pub fn get_peer_last_seen_ms(pool: &DbPool, node_id_hex: &str) -> Result<Option<i64>> {
+    let mut id_bytes = [0u8; 32];
+    if hex::decode_to_slice(node_id_hex, &mut id_bytes).is_err() {
+        return Ok(None);
+    }
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT last_seen_ms FROM peer_persisted WHERE node_id = ?1",
+            rusqlite::params![id_bytes.as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Usuwa wiersz tozsamosci sync dla noda, zdejmujac go z zbioru celow synchronizacji
+/// (`list_permission_filtered_sync_targets_*` filtruje po `trust_status='trusted'`).
+/// Wolane przy prune wygaslego zaufania, zeby martwa tozsamosc nie zostawala celem
+/// replikacji. Idempotentne — brak wiersza nie jest bledem.
+pub fn delete_sync_node(pool: &DbPool, node_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM sync_nodes WHERE node_id = ?1",
         rusqlite::params![node_id],
     )?;
     Ok(())
@@ -9613,6 +11669,26 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
                 OR sync_nodes.display_name = ''",
             rusqlite::params![node.node_id, node.public_key, display_name],
         )?;
+    }
+    // A newly-trusted node becomes a sync TARGET, but the donor's existing ops were
+    // minted before it existed, so the mint-time outbox fan-out never queued them
+    // to it and they sit until brand-new activity nudges the outbox. Bumping the
+    // permission epoch makes the periodic authority-side backfill
+    // (`backfill_outbox_for_permission_grants`) re-evaluate every op against the now-
+    // expanded target set and replay the full content backlog to the new node
+    // promptly — the same machinery that already backfills permission grants. Only
+    // bump when a row actually changed, so a steady-state restart is a no-op.
+    if changed > 0 {
+        let org_ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT org_id FROM organizations ORDER BY org_id ASC")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        };
+        for org_id in org_ids {
+            bump_sync_permission_epoch_with_conn(&conn, &org_id)?;
+        }
     }
     Ok(changed)
 }
@@ -17999,6 +20075,14 @@ pub struct CameraPatch {
     /// Per-camera analysis Flow id. Tri-state: `None` = untouched,
     /// `Some(None)` = clear (NULL), `Some(Some(id))` = assign.
     pub analysis_flow_id: Option<Option<String>>,
+    pub depth_mapping_enabled: Option<bool>,
+    /// Robot the depth point cloud is attributed to. Tri-state like
+    /// `analysis_flow_id`: `Some(None)` clears the binding (disables mapping).
+    pub depth_robot_id: Option<Option<String>>,
+    pub depth_camera_fov_deg: Option<f64>,
+    pub depth_fps: Option<i64>,
+    /// Pose source robot. Tri-state: `Some(None)` clears (merged: pose == store id).
+    pub depth_pose_robot_id: Option<Option<String>>,
 }
 
 #[cfg(feature = "camera")]
@@ -18623,6 +20707,94 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Per-camera depth-mapping configuration. When `enabled`, the depth loop feeds
+/// a world point cloud (reconstructed from a metric depth model) into the shared
+/// SLAM map under `robot_id`. `fov_deg` is the horizontal field of view used to
+/// derive pinhole intrinsics; `fps` paces the (heavy) depth inference.
+#[cfg(feature = "camera")]
+#[derive(Debug, Clone)]
+pub struct DepthMappingConfig {
+    pub camera_id: String,
+    /// Robot the depth cloud is STORED under (the scene map key).
+    pub robot_id: String,
+    /// Robot whose POSE places the cloud. Equals `robot_id` unless decoupled for
+    /// calibration (camera reuses another robot's pose, stores under its own id).
+    pub pose_robot_id: String,
+    pub fov_deg: f32,
+    pub fps: u32,
+}
+
+/// Reads the depth-mapping config for one camera, or `None` when mapping is off,
+/// the row is missing, or no `depth_robot_id` is set (a robot binding is
+/// mandatory — the cloud is keyed by robot). `fov_deg` clamps to a sane optics
+/// range; `fps` clamps to `1..=10` (depth inference is far heavier than RF-DETR).
+#[cfg(feature = "camera")]
+pub fn camera_depth_mapping_config(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<DepthMappingConfig>> {
+    let conn = acquire(pool)?;
+    let row: Option<(i64, Option<String>, f64, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps, \
+             depth_pose_robot_id \
+             FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((enabled, robot_id, fov, fps, pose_robot_id)) = row else {
+        return Ok(None);
+    };
+    if enabled == 0 {
+        return Ok(None);
+    }
+    let robot_id = robot_id.filter(|s| !s.is_empty());
+    let Some(robot_id) = robot_id else {
+        return Ok(None);
+    };
+    let pose_robot_id = pose_robot_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| robot_id.clone());
+    Ok(Some(DepthMappingConfig {
+        camera_id: camera_id.to_string(),
+        robot_id,
+        pose_robot_id,
+        fov_deg: (fov as f32).clamp(20.0, 150.0),
+        fps: (fps.clamp(1, 10)) as u32,
+    }))
+}
+
+/// Lists every camera with depth mapping currently enabled (and a robot bound).
+/// The always-on depth loop calls this to discover which cameras to drive.
+#[cfg(feature = "camera")]
+pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfig>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps, depth_pose_robot_id \
+         FROM cameras \
+         WHERE depth_mapping_enabled = 1 AND depth_robot_id IS NOT NULL \
+           AND depth_robot_id <> '' AND removed_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let robot_id = r.get::<_, String>(1)?;
+            let pose_robot_id = r
+                .get::<_, Option<String>>(4)?
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| robot_id.clone());
+            Ok(DepthMappingConfig {
+                camera_id: r.get::<_, String>(0)?,
+                robot_id,
+                pose_robot_id,
+                fov_deg: (r.get::<_, f64>(2)? as f32).clamp(20.0, 150.0),
+                fps: (r.get::<_, i64>(3)?.clamp(1, 10)) as u32,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Per-camera analysis Flow id (the cold path runs it on a detection event).
 /// `None` (NULL or empty) = no flow assigned → default hardcoded enrichment.
 pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
@@ -18704,6 +20876,27 @@ pub fn update_camera(
     if let Some(v) = patch.analysis_flow_id.as_ref() {
         // Tri-state: `Some(None)` clears (binds NULL), `Some(Some(id))` assigns.
         sets.push("analysis_flow_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.depth_mapping_enabled {
+        sets.push("depth_mapping_enabled = ?");
+        params.push(Box::new(v as i64));
+    }
+    if let Some(v) = patch.depth_robot_id.as_ref() {
+        // Tri-state like analysis_flow_id: `Some(None)` clears the binding.
+        sets.push("depth_robot_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.depth_camera_fov_deg {
+        sets.push("depth_camera_fov_deg = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.depth_fps {
+        sets.push("depth_fps = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.depth_pose_robot_id.as_ref() {
+        sets.push("depth_pose_robot_id = ?");
         params.push(Box::new(v.clone()));
     }
     sets.push("updated_at = ?");
@@ -20174,6 +22367,7 @@ mod chunk_c_visibility_consumer_tests {
             "pub-flow-target",
             "Flow Target",
             "test",
+            None,
         )
         .expect("trusted node");
 
@@ -21385,5 +23579,237 @@ mod engine_flow_binding_tests {
             get_flow_for_model(&db, "team-anything").unwrap().is_some(),
             "glob '*' nadal matchuje dowolny sufiks"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_metrics_tests {
+    use super::*;
+    use crate::db::models::{NewTokenQuota, TokenLeaseUpsert};
+    use crate::services::org::DEFAULT_ORG_ID;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    // Minimalny seed userow/grup do testow scope user/group.
+    fn seed_principals(pool: &DbPool) {
+        let conn = acquire(pool).unwrap();
+        for (id, name) in [("u1", "user-one"), ("u2", "user-two")] {
+            conn.execute(
+                "INSERT INTO user_accounts (id, username, password_hash) VALUES (?1, ?2, 'x')",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO user_groups (id, name) VALUES ('g1', 'group-one')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES ('g1', 'u1')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn quota(pool: &DbPool, scope: &str, subject: Option<&str>, model: Option<&str>) -> String {
+        create_token_quota(
+            pool,
+            &NewTokenQuota {
+                org_id: DEFAULT_ORG_ID,
+                scope_type: scope,
+                subject_id: subject,
+                model_id: model,
+                period: "daily",
+                max_total_tokens: 1000,
+                is_active: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn load_quota(pool: &DbPool, id: &str) -> crate::db::models::TokenQuota {
+        list_token_quotas(pool, DEFAULT_ORG_ID)
+            .unwrap()
+            .into_iter()
+            .find(|q| q.id == id)
+            .expect("quota present")
+    }
+
+    #[test]
+    fn bump_is_cumulative_and_per_node_keyed() {
+        let pool = fresh_db();
+        // Ten sam klucz (node,org,user,model,day) kumuluje; rozne nody = rozne wiersze.
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 5).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 20, 10).unwrap();
+        bump_token_usage(&pool, "B", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 50).unwrap();
+
+        let q = load_quota(&pool, &quota(&pool, "user", Some("u1"), None));
+        // global = A(45) + B(150) = 195; node A = 45.
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 195);
+        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 45);
+        assert_eq!(node_usage_for_quota(&pool, "B", &q, "2026-06-21").unwrap(), 150);
+    }
+
+    #[test]
+    fn scope_filters_sum_correctly() {
+        let pool = fresh_db();
+        seed_principals(&pool);
+        // u1 uzywa m1 i m2; u2 uzywa m1.
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m2", "2026-06-21", 30, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u2", "m1", "2026-06-21", 7, 0).unwrap();
+
+        let user_q = load_quota(&pool, &quota(&pool, "user", Some("u1"), None));
+        let group_q = load_quota(&pool, &quota(&pool, "group", Some("g1"), None));
+        let model_q = load_quota(&pool, &quota(&pool, "model", Some("m1"), None));
+        let org_q = load_quota(&pool, &quota(&pool, "org", None, None));
+
+        assert_eq!(global_usage_for_quota(&pool, &user_q, "2026-06-21").unwrap(), 130); // u1: m1+m2
+        assert_eq!(global_usage_for_quota(&pool, &group_q, "2026-06-21").unwrap(), 130); // g1 = {u1}
+        assert_eq!(global_usage_for_quota(&pool, &model_q, "2026-06-21").unwrap(), 107); // m1: u1+u2
+        assert_eq!(global_usage_for_quota(&pool, &org_q, "2026-06-21").unwrap(), 137); // wszystko
+    }
+
+    #[test]
+    fn model_scope_ignores_redundant_model_restriction() {
+        // CR-002: scope='model' z dodatkowym (sprzecznym) model_id nie moze dawac 0.
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 50, 0).unwrap();
+        let q = load_quota(&pool, &quota(&pool, "model", Some("m1"), Some("m2")));
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 50);
+        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 50);
+    }
+
+    #[test]
+    fn monthly_period_sums_across_days() {
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-20", 40, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 60, 0).unwrap();
+        let id = create_token_quota(
+            &pool,
+            &NewTokenQuota {
+                org_id: DEFAULT_ORG_ID,
+                scope_type: "user",
+                subject_id: Some("u1"),
+                model_id: None,
+                period: "monthly",
+                max_total_tokens: 1000,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        let q = load_quota(&pool, &id);
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06").unwrap(), 100);
+        // inny miesiac nie wlicza sie (enforcement podaje klucz pasujacy do okresu)
+        assert_eq!(global_usage_for_quota(&pool, &q, "2026-05").unwrap(), 0);
+    }
+
+    #[test]
+    fn applicable_quotas_match_by_scope() {
+        let pool = fresh_db();
+        seed_principals(&pool);
+        let uq = quota(&pool, "user", Some("u1"), None);
+        let gq = quota(&pool, "group", Some("g1"), None);
+        let oq = quota(&pool, "org", None, None);
+        let mq = quota(&pool, "model", Some("m1"), None);
+
+        let for_u1_m1 = applicable_token_quotas(&pool, DEFAULT_ORG_ID, "u1", "m1").unwrap();
+        let ids: Vec<&str> = for_u1_m1.iter().map(|q| q.id.as_str()).collect();
+        assert!(ids.contains(&uq.as_str()), "user quota applies");
+        assert!(ids.contains(&gq.as_str()), "group quota applies (u1 in g1)");
+        assert!(ids.contains(&oq.as_str()), "org quota always applies");
+        assert!(ids.contains(&mq.as_str()), "model quota applies for m1");
+
+        // u2 nie jest w g1; m2 nie pasuje do model quoty.
+        let for_u2_m2 = applicable_token_quotas(&pool, DEFAULT_ORG_ID, "u2", "m2").unwrap();
+        let ids2: Vec<&str> = for_u2_m2.iter().map(|q| q.id.as_str()).collect();
+        assert!(ids2.contains(&oq.as_str()));
+        assert!(!ids2.contains(&uq.as_str()));
+        assert!(!ids2.contains(&gq.as_str()));
+        assert!(!ids2.contains(&mq.as_str()));
+    }
+
+    #[test]
+    fn lease_roundtrips() {
+        let pool = fresh_db();
+        let qid = quota(&pool, "user", Some("u1"), None);
+        upsert_token_lease(
+            &pool,
+            &TokenLeaseUpsert {
+                org_id: DEFAULT_ORG_ID,
+                quota_id: &qid,
+                node_id: "A",
+                period_key: "2026-06-21",
+                base_used: 100,
+                granted_tokens: 500,
+                coordinator_node_id: "A",
+                expires_at: "2026-06-21T12:00:00Z",
+            },
+        )
+        .unwrap();
+        let lease = get_token_lease(&pool, DEFAULT_ORG_ID, &qid, "A", "2026-06-21")
+            .unwrap()
+            .expect("lease present");
+        assert_eq!(lease.base_used, 100);
+        assert_eq!(lease.granted_tokens, 500);
+        // Upsert nadpisuje, nie duplikuje.
+        upsert_token_lease(
+            &pool,
+            &TokenLeaseUpsert {
+                org_id: DEFAULT_ORG_ID,
+                quota_id: &qid,
+                node_id: "A",
+                period_key: "2026-06-21",
+                base_used: 100,
+                granted_tokens: 700,
+                coordinator_node_id: "A",
+                expires_at: "2026-06-21T12:05:00Z",
+            },
+        )
+        .unwrap();
+        assert_eq!(list_token_leases(&pool, DEFAULT_ORG_ID).unwrap().len(), 1);
+        assert_eq!(
+            get_token_lease(&pool, DEFAULT_ORG_ID, &qid, "A", "2026-06-21")
+                .unwrap()
+                .unwrap()
+                .granted_tokens,
+            700
+        );
+    }
+
+    #[test]
+    fn flusher_captures_only_own_node_rows() {
+        // Kluczowa poprawka: flusher publikuje wylacznie wiersze tego noda.
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 0).unwrap();
+        bump_token_usage(&pool, "B", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 0).unwrap();
+        // Nieznany node nie ma wlasnych wierszy → znacznik niezmieniony.
+        assert_eq!(
+            flush_token_usage_captures(&pool, "ZZZ", "").unwrap(),
+            "".to_string()
+        );
+        // Node A ma wiersze → znacznik przesuwa sie poza "".
+        assert_ne!(flush_token_usage_captures(&pool, "A", "").unwrap(), "");
+    }
+
+    #[test]
+    fn usage_summary_groups_by_dimension() {
+        let pool = fresh_db();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u2", "m1", "2026-06-21", 40, 0).unwrap();
+        bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m2", "2026-06-21", 10, 0).unwrap();
+
+        let by_user = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "user").unwrap();
+        let u1 = by_user.iter().find(|r| r.key == "u1").unwrap();
+        assert_eq!(u1.total_tokens, 110);
+        assert_eq!(u1.request_count, 2);
+
+        let by_model = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
+        let m1 = by_model.iter().find(|r| r.key == "m1").unwrap();
+        assert_eq!(m1.total_tokens, 140);
     }
 }

@@ -1218,33 +1218,131 @@ install_android_gradle_runner() {
 
 # --- CUDA ---
 
+# Minimalna wersja CUDA dla najnowszych architektur Blackwell sm_100/sm_103
+# (B200/B300/GB300). 12.9 wprowadza sm_103; celujemy w 13.x. Dystrybucyjny
+# `nvidia-cuda-toolkit` (Ubuntu pakietuje 12.0/11.x) NIE zna sm_103 i wywala
+# build llama.cpp na `Unsupported gpu architecture 'compute_103'`.
+CUDA_MIN_MAJOR=12
+CUDA_MIN_MINOR=9
+CUDA_TARGET_PKG="cuda-toolkit-13-0"
+
+# Wypisuje "MAJOR MINOR" zainstalowanego nvcc (PATH oraz /usr/local/cuda), nic gdy brak.
+detect_nvcc_version() {
+    local nvcc_bin=""
+    if command -v nvcc &>/dev/null; then
+        nvcc_bin="$(command -v nvcc)"
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+        nvcc_bin="/usr/local/cuda/bin/nvcc"
+    else
+        return 1
+    fi
+    local v
+    v=$("$nvcc_bin" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')
+    [[ -n "$v" ]] || return 1
+    echo "${v%%.*} ${v##*.}"
+}
+
+# Zwraca 0 gdy zainstalowany nvcc >= CUDA_MIN (czyli zna Blackwell sm_103).
+cuda_new_enough() {
+    local mm maj min
+    mm=$(detect_nvcc_version) || return 1
+    maj=${mm%% *}; min=${mm##* }
+    if (( maj > CUDA_MIN_MAJOR )); then return 0; fi
+    if (( maj == CUDA_MIN_MAJOR && min >= CUDA_MIN_MINOR )); then return 0; fi
+    return 1
+}
+
 install_cuda() {
     log_section "NVIDIA CUDA toolkit"
 
-    if command -v nvcc &>/dev/null; then
-        log_ok "CUDA juz zainstalowane: $(nvcc --version 2>/dev/null | tail -1)"
+    # CUDA instalujemy DOMYSLNIE (INSTALL_CUDA=true) na wszystkich maszynach z
+    # GPU NVIDIA — tak, by wszedzie byc CUDA wspierajaca Blackwell (B300 sm_103,
+    # DGX Spark/GB10, B200 sm_100) bez recznych krokow. Na maszynie bez GPU
+    # NVIDIA pomijamy, by nie ciagnac ~3 GB toolkitu bez powodu (wykrycie przez
+    # lspci/nvidia-smi; gdy nie da sie sprawdzic — kontynuujemy).
+    local has_nv_gpu=""
+    if command -v lspci &>/dev/null && lspci 2>/dev/null | grep -qiE 'nvidia'; then
+        has_nv_gpu=1
+    fi
+    if command -v nvidia-smi &>/dev/null && nvidia-smi -L 2>/dev/null | grep -qiE 'gpu'; then
+        has_nv_gpu=1
+    fi
+    if [[ -z "$has_nv_gpu" ]] && command -v lspci &>/dev/null; then
+        log_info "Nie wykryto GPU NVIDIA — pomijam instalacje CUDA."
         return
+    fi
+
+    # /usr/local/cuda/bin (instalacja z repo NVIDIA) ma pierwszenstwo nad starym
+    # /usr/bin/nvcc z dystrybucyjnego pakietu.
+    [[ -x /usr/local/cuda/bin/nvcc ]] && export PATH="/usr/local/cuda/bin:$PATH"
+
+    if cuda_new_enough; then
+        log_ok "CUDA wystarczajaca dla Blackwell: $(nvcc --version 2>/dev/null | grep release)"
+        return
+    fi
+
+    if local mm; mm=$(detect_nvcc_version); then
+        log_warn "Wykryto za stary CUDA toolkit (${mm// /.}) — nie zna sm_103 (B300). Aktualizuje do ${CUDA_TARGET_PKG}."
     fi
 
     case "$DISTRO" in
         arch)
+            # Arch (rolling) ma aktualny pakiet `cuda`.
             log_info "Instalacja pakietu cuda z pacman..."
             run_privileged pacman -S --needed --noconfirm cuda
             INSTALLED+=("cuda")
             ;;
         debian)
-            log_info "Instalacja nvidia-cuda-toolkit..."
-            run_privileged apt-get install -y nvidia-cuda-toolkit
-            INSTALLED+=("nvidia-cuda-toolkit")
+            # Dystrybucyjny nvidia-cuda-toolkit jest za stary na Blackwell —
+            # bierzemy toolkit z repo NVIDIA (network repo) w wersji 13.x.
+            if dpkg -l nvidia-cuda-toolkit 2>/dev/null | grep -q '^ii'; then
+                log_warn "Usuwam dystrybucyjny nvidia-cuda-toolkit (za stary, przyslania nowy nvcc w /usr/bin)"
+                run_privileged apt-get remove -y nvidia-cuda-toolkit || true
+            fi
+            local ubuntu_ver="${VERSION_ID//./}"   # 24.04 -> 2404
+            local cuda_arch
+            case "$(uname -m)" in
+                x86_64)        cuda_arch="x86_64" ;;
+                aarch64|arm64) cuda_arch="sbsa" ;;   # Grace/ARM server (GB200/GB300)
+                *)             cuda_arch="x86_64" ;;
+            esac
+            local repo_base="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${ubuntu_ver}/${cuda_arch}"
+            local keyring="/tmp/cuda-keyring_1.1-1_all.deb"
+            # curl jest potrzebny do pobrania keyringa — na czystej maszynie moze go brakowac.
+            if ! command -v curl &>/dev/null; then
+                run_privileged apt-get install -y curl ca-certificates
+            fi
+            log_info "Dodaje repo NVIDIA CUDA (ubuntu${ubuntu_ver}/${cuda_arch}) i instaluje ${CUDA_TARGET_PKG}..."
+            if curl -fsSL "${repo_base}/cuda-keyring_1.1-1_all.deb" -o "$keyring"; then
+                run_privileged dpkg -i "$keyring"
+                run_privileged apt-get update
+                # Najpierw celowana 13.0; jak brak dla tej wersji Ubuntu — najnowszy meta-pakiet.
+                if run_privileged apt-get install -y "${CUDA_TARGET_PKG}"; then
+                    INSTALLED+=("${CUDA_TARGET_PKG}")
+                elif run_privileged apt-get install -y cuda-toolkit; then
+                    INSTALLED+=("cuda-toolkit")
+                else
+                    log_warn "Nie udalo sie zainstalowac CUDA z repo NVIDIA. Zainstaluj recznie: https://developer.nvidia.com/cuda-downloads"
+                fi
+                export PATH="/usr/local/cuda/bin:$PATH"
+                # Trwały PATH dla przyszłych powłok — inaczej build nie znajdzie nvcc
+                # po usunięciu starego /usr/bin/nvcc (build-all.sh w nowej powłoce).
+                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                    echo 'export PATH=/usr/local/cuda/bin:$PATH' | run_privileged tee /etc/profile.d/zz-cuda.sh >/dev/null
+                    log_ok "CUDA w PATH: /etc/profile.d/zz-cuda.sh (nowe powloki). W BIEZACEJ sesji: export PATH=/usr/local/cuda/bin:\$PATH"
+                fi
+            else
+                log_warn "Nie pobrano cuda-keyring (ubuntu${ubuntu_ver}/${cuda_arch}). Sprawdz wersje Ubuntu/arch i zainstaluj CUDA 13 recznie: https://developer.nvidia.com/cuda-downloads"
+            fi
             ;;
         fedora)
-            log_warn "CUDA na Fedorze wymaga recznie dodanego repo NVIDIA."
-            log_warn "Instrukcja: https://developer.nvidia.com/cuda-downloads"
-            log_info "Probuje zainstalowac z istniejacych repo..."
+            log_warn "CUDA na Fedorze wymaga recznie dodanego repo NVIDIA (https://developer.nvidia.com/cuda-downloads)."
+            log_info "Probuje zainstalowac cuda-toolkit z istniejacych repo..."
             if run_privileged dnf install -y cuda-toolkit 2>/dev/null; then
                 INSTALLED+=("cuda-toolkit")
+                export PATH="/usr/local/cuda/bin:$PATH"
             else
-                log_warn "Nie udalo sie zainstalowac CUDA. Dodaj repo NVIDIA i uruchom ponownie."
+                log_warn "Nie udalo sie zainstalowac CUDA. Dodaj repo NVIDIA (>= 12.9 dla sm_103) i uruchom ponownie."
             fi
             ;;
     esac
@@ -1271,13 +1369,35 @@ install_vulkan() {
         debian)
             # Core, required for the Vulkan llama.cpp backend: loader+headers,
             # shader compiler, SPIR-V tools.
+            #
+            # NVIDIA driver/Vulkan PPAs ship a newer libvulkan1 (e.g. 1.4.328)
+            # than Ubuntu base. The base libvulkan-dev pins libvulkan1 to the
+            # exact distro version, so a plain `apt-get install libvulkan-dev`
+            # breaks with "Depends: libvulkan1 (= 1.3.x) but 1.4.x is installed".
+            # Pin the dev package to whatever loader is already installed.
+            local vk_ver
+            vk_ver="$(dpkg-query -W -f='${Version}' libvulkan1 2>/dev/null || true)"
+            local vulkan_dev_pkg="libvulkan-dev"
+            if [[ -n "$vk_ver" ]] && apt-cache show "libvulkan-dev=$vk_ver" >/dev/null 2>&1; then
+                vulkan_dev_pkg="libvulkan-dev=$vk_ver"
+            fi
             local pkgs=(
-                libvulkan-dev
+                "$vulkan_dev_pkg"
                 glslang-dev
                 spirv-tools
             )
             log_info "Instalacja: ${pkgs[*]}"
-            run_privileged apt-get install -y "${pkgs[@]}"
+            if ! run_privileged apt-get install -y "${pkgs[@]}"; then
+                # The llama.cpp 'multi' variant links Vulkan unconditionally, so
+                # a loader/dev skew here surfaces as a cryptic `-lvulkan` link
+                # error much later. Fail loud with the remediation instead.
+                log_error "Nie udalo sie zainstalowac libvulkan-dev pasujacego do libvulkan1 ($vk_ver)."
+                log_error "  Zwykle wystarczy odswiezyc listy pakietow z repo NVIDIA Vulkan i powtorzyc:"
+                log_error "      sudo apt-get update && ./scripts/setup.sh"
+                log_error "  Jesli repo NVIDIA nie dostarcza pasujacego -dev, doinstaluj LunarG Vulkan SDK"
+                log_error "  albo zbuduj llama.cpp bez Vulkan: LLAMA_CPP_BACKENDS=cuda (lub --no-vulkan)."
+                exit 1
+            fi
             # Validation layers are debug-only and the package name churns across
             # Ubuntu releases — 24.04 dropped `vulkan-validationlayers-dev` in
             # favour of `vulkan-validationlayers` + `vulkan-utility-libraries-dev`.

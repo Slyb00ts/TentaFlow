@@ -33,7 +33,9 @@ use super::{HandlerContext, SessionAuthKind};
 // =============================================================================
 
 fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
-    use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
+    use crate::api::openai::types::{
+        ChatCompletionRequest, Message, MessageContent, StreamOptions,
+    };
 
     let stream_req = match req {
         MessageBody::ChatStreamRequestBody(r) => r,
@@ -44,6 +46,9 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     text: None,
+                    ttft_ms: 0,
+                    prefill_tps: 0.0,
+                    decode_tps: 0.0,
                 })),
             );
             return;
@@ -85,7 +90,12 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             presence_penalty: None,
             stop: None,
             stream: true,
-            stream_options: None,
+            // Dashboard chce metryk per-message (TTFT, prefill/decode tok/s) i
+            // realnych liczb tokenow — wlaczamy usage-tail, ktory niesie usage
+            // i perf na finalnym chunku.
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             user: None,
             response_format: None,
             tools: None,
@@ -102,8 +112,17 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             Some(flow_id) => crate::routing::streaming::ChatFlowSelector::FlowId(flow_id),
             None => crate::routing::streaming::ChatFlowSelector::Synthetic,
         };
+        // Realny zalogowany użytkownik z sesji → atrybucja zużycia tokenów i kwot
+        // per-user (bez tego AiGateway zapisywałby zużycie na sentinel __system__).
+        let user = match &ctx.session {
+            SessionAuth::UserSession { user_id, role } => Some(crate::auth::acl::UserContext::new(
+                super::handlers::user_id_to_uuid(user_id),
+                role.clone().unwrap_or_else(|| "user".to_string()),
+            )),
+            _ => None,
+        };
         let route_result = match router
-            .route_chat_completion_stream(request, None, None, flow_selector)
+            .route_chat_completion_stream(request, user, None, flow_selector)
             .await
         {
             Ok(r) => r,
@@ -121,6 +140,9 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         text: None,
+                        ttft_ms: 0,
+                        prefill_tps: 0.0,
+                        decode_tps: 0.0,
                     })),
                 );
                 return;
@@ -129,6 +151,11 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         let mut stream = route_result.response;
         let mut completion_tokens: u32 = 0;
+        // Realne liczniki i metryki z finalnego chunku (usage-tail). Gdy backend
+        // ich nie zaraportuje, zostaja przy domyslnych zerach / liczeniu delt.
+        let mut prompt_tokens: u32 = 0;
+        let mut final_completion_tokens: Option<u32> = None;
+        let mut perf: Option<crate::api::openai::types::GenPerf> = None;
         // Suma wszystkich wyslanych delt — ChatStreamEnd.text pozwala
         // frontendowi odtworzyc odpowiedz gdy zlozone delty sa puste.
         let mut full_text = String::new();
@@ -153,6 +180,14 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     break;
                 }
             };
+            // Usage-tail (choices: [], usage+perf) — realne liczby z silnika.
+            if let Some(u) = chunk.usage.as_ref() {
+                prompt_tokens = u.prompt_tokens;
+                final_completion_tokens = Some(u.completion_tokens);
+            }
+            if let Some(p) = chunk.perf {
+                perf = Some(p);
+            }
             if let Some(choice) = chunk.choices.first() {
                 let reasoning = choice
                     .delta
@@ -215,16 +250,22 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             .await;
         }
 
+        let perf = perf.unwrap_or_default();
         let _ = push_end_async(
             &sub,
             Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
-                prompt_tokens: 0,
-                completion_tokens,
+                prompt_tokens,
+                // Realny licznik z usage-tail gdy backend go dostarczyl; w innym
+                // wypadku liczba wyslanych delt jako przyblizenie.
+                completion_tokens: final_completion_tokens.unwrap_or(completion_tokens),
                 text: if full_text.is_empty() {
                     None
                 } else {
                     Some(full_text)
                 },
+                ttft_ms: perf.ttft_ms,
+                prefill_tps: perf.prefill_tps,
+                decode_tps: perf.decode_tps,
             })),
         )
         .await;

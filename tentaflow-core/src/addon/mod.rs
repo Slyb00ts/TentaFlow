@@ -59,6 +59,14 @@ use permissions::PermissionChecker;
 /// 0.5–2 sek scisle limitu CPU per wywolanie — wciaz tanio dla DoS-guard.
 const DEFAULT_FUEL_LIMIT: u64 = 200_000_000;
 
+/// Domyslny budzet paliwa na pojedynczy service-tick (gdy manifest nie ustawia
+/// `tick_fuel_budget`). 50M — fuel to NIE jest glowny anti-hang (tym jest
+/// `tick_timeout_ms` przez epoch watchdog); fuel-out tylko przerywa biezacy tick
+/// i refueluje nastepny. Realna praca per-tick (np. dekodowanie ~32k punktow
+/// LiDAR, parsowanie, krypto) latwo przekracza dawne 5M i trapowala CICHO (bez
+/// panic-hooka). 50M to ~kilka ms — wciaz mocno ograniczone dla 200ms ticka.
+const DEFAULT_TICK_FUEL_BUDGET: u64 = 50_000_000;
+
 /// Domyslny limit pamieci WASM w bajtach (256 MB)
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -306,8 +314,12 @@ pub struct AddonServiceSection {
     /// instance daje wlasciwosc trzymania stanu miedzy eventami).
     #[serde(default)]
     pub tick_interval_ms: Option<u64>,
-    /// Budzet paliwa na pojedynczy tick. Default 5M instrukcji — wystarczy
-    /// na typowy poll/aggregation, blokuje runaway loop w guest.
+    /// Budzet paliwa na pojedynczy tick. `None` = `DEFAULT_TICK_FUEL_BUDGET`.
+    /// Fuel to NIE jest glowny anti-hang (tym jest `tick_timeout_ms` przez
+    /// epoch watchdog) — fuel-out tylko przerywa BIEZACY tick i refueluje
+    /// nastepny, wiec moze byc hojny. Domyslnie 50M, bo realna praca per-tick
+    /// (dekodowanie danych/parsowanie/krypto) latwo przekracza kilka M, a
+    /// fuel-out trapuje BEZ panic-hooka (cichy, mylacy crash).
     #[serde(default)]
     pub tick_fuel_budget: Option<u64>,
     /// Hard deadline na pojedynczy tick w ms. Watchdog thread po wygasnieciu
@@ -1189,6 +1201,17 @@ impl AddonManager {
     fn purge_addon_state(&self, addon_id: &str) {
         let store = state_store::AddonStateStore::global();
         store.drop_addon(addon_id);
+        // L1: the addon is being removed — drop its latest LiDAR frame slot too
+        // (keyed by addon_id == robot_id), matching the state shard's
+        // best-effort purge-on-uninstall lifecycle above. Like `drop_addon`, this
+        // is best-effort: on a force-uninstall while a service tick is still alive,
+        // a later `lidar_publish_v1` can transiently recreate the slot (the hub
+        // analog of the state store re-resolving a fresh, orphaned shard). It is
+        // bounded — at most one latest-wins frame (≤4 MiB) until the tick dies.
+        crate::services::lidar_hub::LidarStreamHub::global().remove(addon_id);
+        crate::services::slam_scene::SlamSceneManager::global().remove(addon_id);
+        crate::services::localization::LocalizationEngine::global().remove(addon_id);
+        crate::services::mobile_camera::MobileCameraIngest::global().remove(addon_id);
         if let Err(e) = state_flusher::purge_addon(&self.db, addon_id) {
             warn!(
                 "addon state: purge on uninstall failed for '{}': {}",
@@ -1762,7 +1785,7 @@ impl AddonManager {
                 if service.enabled {
                     if let Some(interval_ms) = service.tick_interval_ms {
                         if interval_ms > 0 {
-                            let fuel = service.tick_fuel_budget.unwrap_or(5_000_000);
+                            let fuel = service.tick_fuel_budget.unwrap_or(DEFAULT_TICK_FUEL_BUDGET);
                             let timeout_ms = service.tick_timeout_ms;
                             self.spawn_service_tick_loop(
                                 addon_id.to_string(),
@@ -2306,6 +2329,15 @@ impl AddonManager {
         // Deactivate aliases when the last instance of any addon is gone.
         if no_instances_left {
             self.deactivate_aliases_owned_by_addon(&addon_id);
+
+            // L2: the addon's LAST instance is gone — drop its latest LiDAR frame
+            // slot (keyed by addon_id == robot_id). Doing this here, not per-
+            // instance, is the correct granularity: a single pooled-worker stop
+            // must NOT wipe a slot the still-live service instance keeps feeding.
+            crate::services::lidar_hub::LidarStreamHub::global().remove(&addon_id);
+            crate::services::slam_scene::SlamSceneManager::global().remove(&addon_id);
+            crate::services::localization::LocalizationEngine::global().remove(&addon_id);
+            crate::services::mobile_camera::MobileCameraIngest::global().remove(&addon_id);
 
             // A2: the addon is fully stopped — flush any durable writes that
             // have not yet hit the periodic flush so a stop+exit before the next

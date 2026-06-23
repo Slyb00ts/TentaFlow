@@ -171,6 +171,11 @@ pub struct StreamToken {
     // na tokenie finalnym; 0 dla fragmentów. Pozwala konsumentowi (core generate)
     // raportować realne prompt_tokens zamiast twardego 0.
     pub prompt_tokens: u32,
+    // Przepustowość fazy prefill (tokeny promptu / czas prefillu) oraz fazy dekodowania
+    // (tokeny wygenerowane / czas generacji), mierzone w SILNIKU po realnych granicach
+    // faz slotu. Ustawiane wyłącznie na tokenie finalnym; 0.0 = brak pomiaru.
+    pub prefill_tps: f32,
+    pub completion_tps: f32,
 }
 
 // Strumień wyjściowy jednego requestu. Konsument odbiera tokeny w tempie własnym;
@@ -456,6 +461,12 @@ struct Slot {
     // stream_stall_timeout, slot jest siłą zwalniany — patrz CR-001 (anty-hang
     // „żywego ale niemego" konsumenta, który nigdy nie czyta i nie rozłącza się).
     last_progress: std::time::Instant,
+    // Granice czasowe faz slotu do pomiaru przepustowości. `prefill_start` ustawiany
+    // przy starcie requestu (start fazy prefill), `gen_start` przy przejściu
+    // Prefill→Generating (koniec prefillu = start dekodowania). Różnica = czas prefillu;
+    // od `gen_start` do finału = czas dekodowania.
+    prefill_start: std::time::Instant,
+    gen_start: Option<std::time::Instant>,
 }
 
 #[cfg(feature = "llama")]
@@ -486,6 +497,8 @@ impl Slot {
             drafted_this_turn: false,
             spec_impl_ready: false,
             last_progress: std::time::Instant::now(),
+            prefill_start: std::time::Instant::now(),
+            gen_start: None,
         }
     }
 
@@ -513,6 +526,8 @@ impl Slot {
         self.drafted_this_turn = false;
         self.spec_impl_ready = false;
         self.last_progress = std::time::Instant::now();
+        self.prefill_start = std::time::Instant::now();
+        self.gen_start = None;
     }
 }
 
@@ -1126,6 +1141,7 @@ fn scheduler_main(
                     continue;
                 }
                 slot.state = SlotState::Generating;
+                slot.gen_start = Some(std::time::Instant::now());
             }
 
             commit_generation(
@@ -1487,6 +1503,7 @@ fn start_job(
 
     slot.reset();
     slot.state = SlotState::Prefill;
+    slot.prefill_start = std::time::Instant::now();
     // Drafter ngram potrzebuje pełnego kontekstu sekwencji — seedujemy history
     // promptem. Po prefillu history = prompt, dalej rośnie o zaakceptowane tokeny
     // i pozostaje spójna z zawartością KV.
@@ -1514,6 +1531,8 @@ fn reject_job(
         finish_reason: Some(reason),
         generated_tokens: 0,
         prompt_tokens: 0,
+        prefill_tps: 0.0,
+        completion_tps: 0.0,
     });
     inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 }
@@ -1540,6 +1559,8 @@ fn emit_text_until(slot: &mut Slot, target: usize) {
                 finish_reason: None,
                 generated_tokens: 0,
                 prompt_tokens: 0,
+                prefill_tps: 0.0,
+                completion_tps: 0.0,
             },
         );
     }
@@ -1720,6 +1741,25 @@ fn finish_slot(
         return;
     }
     slot.finishing = Some(reason.clone());
+    // Przepustowość faz mierzona po realnych granicach slotu: prefill = od startu
+    // requestu do przejścia w Generating, dekodowanie = od tego przejścia do finału.
+    // Dekodowanie liczymy od (generated-1), bo pierwszy token powstaje jeszcze w
+    // ramach prefillu — inaczej zaniżalibyśmy tok/s o jeden forward pass.
+    let prefill_secs = slot
+        .gen_start
+        .map(|g| g.duration_since(slot.prefill_start).as_secs_f32())
+        .unwrap_or(0.0);
+    let decode_secs = slot.gen_start.map(|g| g.elapsed().as_secs_f32()).unwrap_or(0.0);
+    let prefill_tps = if prefill_secs > 0.0 {
+        slot.prompt.len() as f32 / prefill_secs
+    } else {
+        0.0
+    };
+    let completion_tps = if decode_secs > 0.0 && slot.generated > 1 {
+        (slot.generated - 1) as f32 / decode_secs
+    } else {
+        0.0
+    };
     slot.pending.push_back(StreamToken {
         text: String::new(),
         is_final: true,
@@ -1727,6 +1767,8 @@ fn finish_slot(
         generated_tokens: slot.generated,
         // Slot trzyma prompt aż do reset(), więc to realna liczba tokenów promptu.
         prompt_tokens: slot.prompt.len() as u32,
+        prefill_tps,
+        completion_tps,
     });
     flush_pending(slot, memory, inflight);
 }

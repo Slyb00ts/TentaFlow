@@ -663,7 +663,7 @@ pub struct ChatStreamChunk {
     pub delta: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ChatStreamEnd {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -672,6 +672,14 @@ pub struct ChatStreamEnd {
     /// `#[serde(default)]` zachowuje kompatybilnosc ze starszymi peerami.
     #[serde(default)]
     pub text: Option<String>,
+    /// Per-message metryki wydajnosci inferencji. `#[serde(default)]` zachowuje
+    /// kompatybilnosc ze starszymi peerami (0 gdy nieznane).
+    #[serde(default)]
+    pub ttft_ms: u32,
+    #[serde(default)]
+    pub prefill_tps: f32,
+    #[serde(default)]
+    pub decode_tps: f32,
 }
 
 // =============================================================================
@@ -2003,6 +2011,18 @@ pub struct RobotTelemetrySnapshot {
     pub imu: Option<RobotImuSnapshot>,
     #[serde(default)]
     pub battery: Option<RobotBatterySnapshot>,
+    /// Leg joint angles in radians, Go2 order FR/FL/RR/RL × hip/thigh/calf
+    /// (empty when absent). Drives the dashboard robot animation. APPENDED LAST for
+    /// wire back-compat (ciborium positional fields — new fields go at the end).
+    #[serde(default)]
+    pub joints: Vec<f64>,
+    /// World pose (odom frame) from lidar odometry: position [x,y,z] meters.
+    /// APPENDED for wire back-compat — keep new fields after this.
+    #[serde(default)]
+    pub pose_position: Vec<f64>,
+    /// World orientation quaternion [x,y,z,w] paired with `pose_position`.
+    #[serde(default)]
+    pub pose_orientation: Vec<f64>,
 }
 
 /// SMALL LiDAR availability snapshot — NEVER the point cloud (which would be far
@@ -2092,8 +2112,10 @@ pub struct RobotControlResponse {
     pub rejected: Option<String>,
     pub error: Option<String>,
     /// Optional JSON result payload for read-only actions that return data (e.g.
-    /// `lidar_frame` returns the decoded point set + metadata). Appended last for
-    /// CBOR back-compat: an older peer decodes it as `None`
+    /// `lidar_frame` returns small availability metadata — enabled/available/
+    /// point_count/frame_seq — never the cloud, which flows as binary L1 frames
+    /// through the host LidarStreamHub). Appended last for CBOR back-compat: an
+    /// older peer decodes it as `None`
     /// (`#[serde(default)]`, ciborium APPEND-AT-END rule). Action-class commands
     /// (move/pose/…) leave it `None`.
     #[serde(default)]
@@ -2116,6 +2138,42 @@ pub struct RobotCameraShareResponse {
     pub note: Option<String>,
 }
 
+/// Manual georeference for a robot's scene (the "set map origin" operation): pins the
+/// scene origin to a real-world WGS84 position + heading. `lat/lon/alt/heading` all
+/// `Some` = set; all `None` = clear the anchor. Heading is the compass bearing
+/// (degrees clockwise from true North) of the scene's +X axis.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorSetRequest {
+    pub robot_id: String,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub alt: Option<f64>,
+    pub heading: Option<f64>,
+}
+
+/// Read a robot's current geo anchor + live real-world position.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorGetRequest {
+    pub robot_id: String,
+}
+
+/// The robot's geo anchor + (when anchored and a pose is known) its current WGS84
+/// position. `anchored` is the applied-anchor flag; `*_deg`/`alt`/`heading` describe
+/// it; `pose_*` carry the live global position (None until the robot has a pose).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct RobotGeoAnchorResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub anchored: bool,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub alt: Option<f64>,
+    pub heading: Option<f64>,
+    pub pose_lat: Option<f64>,
+    pub pose_lon: Option<f64>,
+    pub pose_alt: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum RobotsPayload {
     ListRequest(RobotsListRequest),
@@ -2124,6 +2182,9 @@ pub enum RobotsPayload {
     ControlResponse(RobotControlResponse),
     CameraShareRequest(RobotCameraShareRequest),
     CameraShareResponse(RobotCameraShareResponse),
+    GeoAnchorSetRequest(RobotGeoAnchorSetRequest),
+    GeoAnchorGetRequest(RobotGeoAnchorGetRequest),
+    GeoAnchorResponse(RobotGeoAnchorResponse),
 }
 
 // ----- Skills registry (Harness plan §3.2) -----
@@ -6515,6 +6576,12 @@ pub enum MessageBody {
     // PiiRuleBody. Patrz ProfilingBody jako wzor inner-enum pack.
     VisionBody(crate::vision::VisionInferPayload),
 
+    // ---- Rerank inference (single-slot, req+res w inner enum) ----
+    // Natywny odpowiednik REST `/v1/rerank` / `/v1/ranking` dla Tier 1
+    // (dashboard / addony przez protokol binarny). Request i response dziela
+    // jeden slot — patrz VisionBody jako wzor inner-enum pack.
+    RerankBody(crate::types::RerankExchange),
+
     // ---- Camera admin RPCs (F2 P7.a) ----
     // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
     // analogicznie do ProfilingBody / VisionBody. Powod: CBOR 0.8 256-variant
@@ -6596,13 +6663,17 @@ pub enum MessageBody {
     // Appended AFTER the API-key variants so origin's variant indices stay
     // wire-stable across the fleet; RobotsBody takes the new highest index.
     RobotsBody(RobotsPayload),
+    // Token metrics admin: usage summary, quota CRUD, lease coordinator status.
+    // Appended at the END so existing variant indices stay wire-stable across
+    // the fleet (ciborium 0.8 encodes variants by index).
+    TokenUsageBody(crate::token_usage::TokenUsagePayload),
 
     // ----- Addon UI document upload (generic FileInput → addon document store) -----
     // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym):
-    // wstawienie w środku przesunęłoby indeksy ~200 kolejnych wariantów i zerwało
-    // zgodność wire ze starszymi peerami/zapisanymi ramkami. Najwyższy indeks =
-    // bezpieczny dopisek. JEDEN wariant na całą rodzinę (request+response w
-    // `AddonDocumentPayload`), bo `MessageBody` dobił do limitu 256 wariantów.
+    // wstawienie w środku przesunęłoby indeksy kolejnych wariantów i zerwało
+    // zgodność wire. Po TokenUsageBody (które ma już wdrożony indeks we flocie),
+    // więc nasz dopisek bierze NOWY najwyższy indeks i nie rusza istniejących.
+    // JEDEN wariant na całą rodzinę (request+response w `AddonDocumentPayload`).
     AddonDocumentBody(AddonDocumentPayload),
 }
 
@@ -6904,6 +6975,9 @@ mod tests {
             prompt_tokens: 12,
             completion_tokens: 34,
             text: Some("Hello".to_string()),
+            ttft_ms: 50,
+            prefill_tps: 120.0,
+            decode_tps: 45.5,
         });
         assert_eq!(round_trip(end.clone()), end);
     }
@@ -7806,6 +7880,7 @@ mod tests {
                 vyaw: Some(0.05),
                 position: vec![1.0, 2.0, 0.3],
                 foot_force: vec![120.0, 118.0, 121.0, 119.0],
+                joints: vec![0.1, -0.8, 1.4, -0.1, -0.8, 1.4, 0.1, -0.9, 1.4, -0.1, -0.9, 1.4],
                 imu: Some(RobotImuSnapshot {
                     roll: Some(0.01),
                     pitch: Some(-0.02),

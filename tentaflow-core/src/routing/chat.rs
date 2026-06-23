@@ -110,13 +110,22 @@ impl Router {
         };
 
         let compliance_event = if let Some(db) = self.db.as_ref() {
-            let gateway = AiGateway::new(db.clone(), self.local_node_id());
+            let gateway = AiGateway::new(
+                db.clone(),
+                self.local_node_id(),
+                crate::compliance::ai_gateway::token_quota_enabled(),
+            );
             Some(
                 gateway
                     .start_chat_event(&request, user.as_ref(), compliance_context.as_ref())
-                    .map_err(|e| CoreError::InternalError {
-                        message: "compliance AI audit start failed".to_string(),
-                        source: Some(e),
+                    // Zachowaj realny błąd domenowy (np. RateLimitExceeded z limitu
+                    // tokenów) — inaczej klient widzi mylące „błąd wewnętrzny".
+                    .map_err(|e| match e.downcast::<CoreError>() {
+                        Ok(core) => core,
+                        Err(e) => CoreError::InternalError {
+                            message: "compliance AI audit start failed".to_string(),
+                            source: Some(e),
+                        },
                     })?,
             )
         } else {

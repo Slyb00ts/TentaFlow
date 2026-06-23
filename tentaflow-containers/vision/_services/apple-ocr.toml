@@ -1,0 +1,45 @@
+# =============================================================================
+# Plik: apple-ocr.toml
+# Opis: Manifest serwisu Apple OCR — natywny `VNRecognizeTextRequest` (Vision
+#       framework) na macOS/iOS. Wbudowany engine (embedded), bez kontenera
+#       docker, bez bundla python i bez modelu na dysku — caly silnik jest w
+#       systemie operacyjnym. Zastepuje martwy paddle-ocr-mlx jako opcja OCR na
+#       macOS/iOS.
+#
+#       Implementacja:
+#         tentaflow-desktop/macos/swift/MLXBridge/Sources/MLXBridge/Vision/AppleOcrEngine.swift
+#         (Swift dylib `MLXAppleOCR_*`) + tentaflow-core/src/vision/apple_ocr.rs
+#         (Rust OcrRunner). Deploy rejestruje runner przez set_ocr_runner, wiec
+#         VisionDispatcher (flow `vision_ocr`) i camera-enrich uzywaja go
+#         in-process bez `inference-vision-gpu`.
+# =============================================================================
+
+[engine]
+id = "apple-ocr"
+category = "vision"
+resource_kind = "ai"
+name = "Apple OCR"
+description_pl = "Natywny OCR macOS/iOS przez Vision (VNRecognizeTextRequest). Rozpoznaje tekst (pl/en i ~kilkadziesiat jezykow) bez sieci i bez modelu na dysku."
+description_en = "Native macOS/iOS OCR via Vision (VNRecognizeTextRequest). Recognizes text (pl/en and dozens of languages) with no network and no on-disk model."
+homepage = "https://developer.apple.com/documentation/vision/vnrecognizetextrequest"
+license = "Proprietary (Apple system)"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "1.0.0"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+# Brak feature_flag — apple-ocr (VNRecognizeTextRequest) jest ZAWSZE
+# wkompilowany na macOS/iOS, gated tylko przez target_os, nie przez Cargo
+# feature. Vision dziala bez MLX i bez modelu na dysku.
+
+[[model_preset]]
+id = "apple-vision-ocr"
+display_name = "Apple Vision OCR (pl/en)"
+repo = "system"
+recommended = true

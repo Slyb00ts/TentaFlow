@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Robots — Mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>Robots</h1>
+  <p class="subtitle">Redesign aplikacji Robots — lista pokazuje tylko ogólne informacje, a wszystko (kamera, lidar, pełne sterowanie, telemetria) jest w widoku szczegółów. Mockupy v1.</p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3>Podział widoków</h3>
+        <p>Lista = RTT, bateria, online/offline, E-STOP/Start, ruch ogólny, Hello. Reszta po wejściu w robota: zakładki Kamera / LiDAR / Sterowanie / Informacje / Log.</p>
+      </div>
+      <div class="rule">
+        <h3>Addon bez UI</h3>
+        <p>Addon robota wystawia tylko dane i akcje przez protokół. Całe UI to core'owy moduł Robots. Połączenie <strong>automatyczne</strong> przez service-tick z backoffem (bez klikania w addonie).</p>
+      </div>
+      <div class="rule">
+        <h3>Stylistyka</h3>
+        <p>Komponenty <code>tf-*</code>, paleta TentaFlow (Manrope, dark indigo/violet). Nowe primitywy (np. d-pad, robot-card) trafią później do <code>tf-*</code> jako reużywalne.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-grid">
+    <a class="index-card" href="m01-list.html"><div class="id">R1</div><h3>Lista robotów</h3><p>Karty z ogólnym info: status, bateria, RTT + ogólne sterowanie (E-STOP, Start, Hello, d-pad). Wejście w szczegóły.</p></a>
+    <a class="index-card" href="m02-detail.html"><div class="id">R2</div><h3>Szczegóły robota</h3><p>Nagłówek + KPI + zakładki: Przegląd, Kamera (live), LiDAR 3D (głębia/heatmapa), pełne Sterowanie, Informacje, Log.</p></a>
+    <a class="index-card" href="m03-map.html"><div class="id">R3</div><h3>Mapa scen</h3><p>Roboty na mapie 3D budowanej w czasie rzeczywistym; każdy stoi w swojej zlokalizowanej pozycji. Warstwy: voxele / heatmapa / prymitywy.</p></a>
+  </div>
+</div>
+</body>
+</html>

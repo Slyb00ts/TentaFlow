@@ -206,6 +206,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
             node_id: node_id.clone(),
             role: "desktop".to_string(),
             mesh_config: config.mesh.as_ref().unwrap().clone(),
+            token_metrics: config.token_metrics.clone(),
         };
 
         match start_mesh_pipeline(
@@ -493,11 +494,13 @@ fn sync_all_to_state(
     }
 
     // PII Rules
-    if let Ok(rules) = db::repository::list_pii_rules(db, 0, 1000) {
+    if let Ok(rules) =
+        db::repository::list_pii_rules(db, tentaflow_core::services::org::DEFAULT_ORG_ID, 0, 1000)
+    {
         s.pii_rules = rules
             .iter()
             .map(|r| ui_state::PiiRule {
-                id: r.id,
+                id: r.id.clone(),
                 name: r.name.clone(),
                 category: r.category.clone(),
                 pattern: r.pattern.clone(),
@@ -900,6 +903,7 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
             db::repository::create_pii_rule(
                 db,
                 &NewPiiRule {
+                    org_id: tentaflow_core::services::org::DEFAULT_ORG_ID,
                     name,
                     category,
                     pattern,
@@ -922,7 +926,8 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
             db::repository::update_pii_rule(
                 db,
                 &UpdatePiiRule {
-                    id: *id,
+                    id,
+                    org_id: tentaflow_core::services::org::DEFAULT_ORG_ID,
                     name,
                     category,
                     pattern,
@@ -935,7 +940,7 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
             )?;
         }
         UiCommand::DeletePiiRule(id) => {
-            db::repository::delete_pii_rule(db, *id)?;
+            db::repository::delete_pii_rule(db, tentaflow_core::services::org::DEFAULT_ORG_ID, id)?;
         }
 
         // --- TTS Cleaning Rules ---

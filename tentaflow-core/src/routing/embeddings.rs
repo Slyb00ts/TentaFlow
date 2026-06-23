@@ -44,7 +44,47 @@ impl Router {
                 }
             }
         }
-        self.route_embeddings_inner(request, user).await
+        let model = request.model.clone();
+        let user_id = user.as_ref().map(|u| u.user_id.clone());
+        let result = self.route_embeddings_inner(request, user).await;
+        if let Ok(ref outcome) = result {
+            self.bump_embedding_usage_best_effort(
+                &model,
+                user_id.as_deref(),
+                outcome.response.usage.prompt_tokens,
+                outcome.response.usage.total_tokens,
+            );
+        }
+        result
+    }
+
+    /// Best-effort doliczenie tokenow embeddingow do dziennego licznika tego
+    /// wezla. Blad metryki nigdy nie psuje odpowiedzi. Liczymy `prompt_tokens`
+    /// (gdy 0 — fallback na `total_tokens`), bo embeddingi nie maja completion.
+    fn bump_embedding_usage_best_effort(
+        &self,
+        model: &str,
+        user_id: Option<&str>,
+        prompt_tokens: u32,
+        total_tokens: u32,
+    ) {
+        let Some(ref db) = self.db else {
+            return;
+        };
+        let tokens = i64::from(if prompt_tokens > 0 {
+            prompt_tokens
+        } else {
+            total_tokens
+        });
+        let node_id = self.local_node_id();
+        let org_id = crate::db::repository::primary_org_for_user(db, user_id);
+        let usage_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let user_id = user_id.unwrap_or(crate::db::repository::TOKEN_USAGE_SYSTEM_USER);
+        if let Err(err) = crate::db::repository::bump_embedding_usage(
+            db, &node_id, &org_id, user_id, model, &usage_day, tokens,
+        ) {
+            tracing::warn!(error = %err, "zliczenie zuzycia embeddingow nieudane");
+        }
     }
 
     /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.

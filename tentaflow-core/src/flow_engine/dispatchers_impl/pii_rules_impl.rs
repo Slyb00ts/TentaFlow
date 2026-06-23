@@ -25,8 +25,12 @@ impl PiiRulesStoreImpl {
 impl PiiRulesStore for PiiRulesStoreImpl {
     async fn active_rules(&self) -> Result<Vec<PiiRule>> {
         let db = self.db.clone();
-        let rows =
-            tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db)).await??;
+        // The PiiFilter node runs in default-org context (no per-request org in
+        // scope here), so it loads the default org's active rules.
+        let rows = tokio::task::spawn_blocking(move || {
+            repository::list_pii_rules_active(&db, crate::services::org::DEFAULT_ORG_ID)
+        })
+        .await??;
         Ok(rows
             .into_iter()
             .map(|r| PiiRule {

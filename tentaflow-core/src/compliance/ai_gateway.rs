@@ -21,6 +21,23 @@ use super::repository::{
     add_ai_payload, add_ai_tool_call, default_ai_legal_basis_id, finish_ai_event, start_ai_event,
 };
 
+/// Procesowy przelacznik egzekwowania limitow tokenow, ustawiany raz na
+/// starcie z `config.token_metrics.enabled`. Dzieki temu liczne miejsca
+/// tworzace `AiGateway` (routing, flow, agenci) nie musza przenosic calego
+/// NodeConfig — odczytuja flage jednym wywolaniem.
+static TOKEN_QUOTA_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Ustawia procesowy stan egzekwowania limitow tokenow (startup).
+pub fn set_token_quota_enabled(enabled: bool) {
+    TOKEN_QUOTA_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Czy egzekwowac limity tokenow i zliczac zuzycie (domyslnie true).
+pub fn token_quota_enabled() -> bool {
+    TOKEN_QUOTA_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AiGatewayContext {
     pub org_id: Option<String>,
@@ -54,6 +71,8 @@ pub struct AiGatewayContext {
 pub struct AiGateway {
     db: DbPool,
     node_id: String,
+    /// Czy egzekwowac limity tokenow i zliczac zuzycie (config.token_metrics.enabled).
+    quota_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +83,14 @@ pub struct AiEventHandle {
     /// value as the turn's correlation key so the flow's per-call events copy it
     /// (§3.4).
     request_id: String,
+    /// Tozsamosc wymagana do zliczania zuzycia tokenow na finiszu.
+    node_id: String,
+    org_id: String,
+    /// Sentinel `__system__` gdy brak UserContext.
+    user_id: String,
+    model_id: String,
+    /// Czy zliczac zuzycie tokenow przy finiszu (lustro AiGateway.quota_enabled).
+    quota_enabled: bool,
 }
 
 /// One EXECUTED tool call (HARNESS_PLAN §3.1) — the real outcome of running
@@ -88,10 +115,11 @@ pub struct ToolExecution<'a> {
 }
 
 impl AiGateway {
-    pub fn new(db: DbPool, node_id: impl Into<String>) -> Self {
+    pub fn new(db: DbPool, node_id: impl Into<String>, quota_enabled: bool) -> Self {
         Self {
             db,
             node_id: node_id.into(),
+            quota_enabled,
         }
     }
 
@@ -101,8 +129,21 @@ impl AiGateway {
         user: Option<&UserContext>,
         context: Option<&AiGatewayContext>,
     ) -> Result<AiEventHandle> {
+        // Tozsamosc wyliczamy poza write-lockiem: helper egzekwujacy limity oraz
+        // bump zuzycia wolaja repository fns biorace ten sam writer mutex (acquire),
+        // ktory nie jest reentrantny — trzymanie go tutaj zakleszczyloby proces.
+        let org_id = {
+            let conn = self.db.read().map_err(|_| anyhow!("blokada DB zatruta"))?;
+            resolve_org_id(&conn, user, context)?
+        };
+        let user_id_owned = user
+            .map(|u| u.user_id.to_string())
+            .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
+        let model_id_owned = request.model.clone();
+
+        self.enforce_token_quota(&org_id, &user_id_owned, &model_id_owned)?;
+
         let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
-        let org_id = resolve_org_id(&conn, user, context)?;
         let request_id = uuid::Uuid::new_v4().to_string();
         // A session/root event with no inbound correlation key anchors the turn:
         // it correlates to its own request_id, which routing then propagates so
@@ -145,7 +186,102 @@ impl AiGateway {
             db: self.db.clone(),
             event_id,
             request_id,
+            node_id: self.node_id.clone(),
+            org_id,
+            user_id: user_id_owned,
+            model_id: model_id_owned,
+            quota_enabled: self.quota_enabled,
         })
+    }
+
+    /// Egzekwuje aktywne limity tokenow przed startem wywolania. Fail-open na
+    /// bledach infrastruktury (DB) — tylko realne przekroczenie limitu blokuje
+    /// request. Wszystkie odczyty repozytorium biora wlasny krotki lock, wiec
+    /// helper NIE moze byc wolany z trzymanym write-lockiem.
+    fn enforce_token_quota(&self, org_id: &str, user_id: &str, model_id: &str) -> Result<()> {
+        if !self.quota_enabled {
+            return Ok(());
+        }
+        let quotas = match crate::db::repository::applicable_token_quotas(
+            &self.db, org_id, user_id, model_id,
+        ) {
+            Ok(quotas) => quotas,
+            Err(err) => {
+                tracing::warn!(error = %err, "odczyt limitow tokenow nieudany — przepuszczam request");
+                return Ok(());
+            }
+        };
+        if quotas.is_empty() {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now();
+        let day_key = now.format("%Y-%m-%d").to_string();
+        let month_key = now.format("%Y-%m").to_string();
+
+        for quota in &quotas {
+            let period_key = if quota.period == "monthly" {
+                &month_key
+            } else {
+                &day_key
+            };
+
+            // Swieza dzierzawa: limituj wzgledem przydzialu tego wezla; nieaktualna
+            // lub jej brak → spadamy na globalny licznik zuzycia.
+            let lease = match crate::db::repository::get_token_lease(
+                &self.db,
+                org_id,
+                &quota.id,
+                &self.node_id,
+                period_key,
+            ) {
+                Ok(lease) => lease,
+                Err(err) => {
+                    tracing::warn!(error = %err, "odczyt dzierzawy tokenow nieudany — przepuszczam request");
+                    return Ok(());
+                }
+            };
+
+            if let Some(lease) = lease {
+                let fresh = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+                    .map(|exp| exp.with_timezone(&chrono::Utc) > now)
+                    .unwrap_or(false);
+                if fresh {
+                    let used = match crate::db::repository::node_usage_for_quota(
+                        &self.db,
+                        &self.node_id,
+                        quota,
+                        period_key,
+                    ) {
+                        Ok(used) => used,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "odczyt zuzycia wezla nieudany — przepuszczam request");
+                            return Ok(());
+                        }
+                    };
+                    if used >= lease.base_used + lease.granted_tokens {
+                        return Err(quota_exceeded(quota));
+                    }
+                    continue;
+                }
+            }
+
+            let used = match crate::db::repository::global_usage_for_quota(
+                &self.db,
+                quota,
+                period_key,
+            ) {
+                Ok(used) => used,
+                Err(err) => {
+                    tracing::warn!(error = %err, "odczyt globalnego zuzycia nieudany — przepuszczam request");
+                    return Ok(());
+                }
+            };
+            if used >= quota.max_total_tokens {
+                return Err(quota_exceeded(quota));
+            }
+        }
+        Ok(())
     }
 
     /// Records one EXECUTED tool call against the latest `compliance_ai_events`
@@ -202,6 +338,38 @@ impl AiEventHandle {
         &self.request_id
     }
 
+    /// Dolicza zuzycie tokenow do dziennego licznika tego wezla. Brak usage =
+    /// nic do policzenia (pomijamy). Blad bumpu nigdy nie psuje odpowiedzi —
+    /// metryki sa best-effort.
+    fn bump_usage(&self, usage: Option<&Usage>) {
+        if !self.quota_enabled {
+            return;
+        }
+        let Some(usage) = usage else {
+            return;
+        };
+        // Empty model_id = a flow/session-level event with no resolved model
+        // (the dashboard chat selects a FLOW, not a model). Per-node LLM events
+        // inside the flow own attribution under the real model, so bumping here
+        // would both mis-attribute to "" AND double-count the node's tokens.
+        if self.model_id.trim().is_empty() {
+            return;
+        }
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        if let Err(err) = crate::db::repository::bump_token_usage(
+            &self.db,
+            &self.node_id,
+            &self.org_id,
+            &self.user_id,
+            &self.model_id,
+            &today,
+            i64::from(usage.prompt_tokens),
+            i64::from(usage.completion_tokens),
+        ) {
+            tracing::warn!(error = %err, "zliczenie zuzycia tokenow nieudane");
+        }
+    }
+
     /// Records the result of one executed tool call into
     /// `compliance_ai_tool_calls`. Called by the tool loop right after the
     /// tool returns — pairs the model-issued call id with the real status,
@@ -233,6 +401,9 @@ impl AiEventHandle {
     }
 
     pub fn finish_success(&self, response: &ChatCompletionResponse) -> Result<()> {
+        // Zliczanie tokenow poza write-lockiem: bump_token_usage bierze wlasny
+        // writer lock (acquire), nieaktualny tu trzymany guard zakleszczylby DB.
+        self.bump_usage(response.usage.as_ref());
         let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let response_text = chat_response_text(response);
         add_ai_payload(
@@ -296,6 +467,7 @@ impl AiEventHandle {
         usage: Option<&Usage>,
         tool_calls: &[ToolCall],
     ) -> Result<()> {
+        self.bump_usage(usage);
         let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         add_ai_payload(
             &conn,
@@ -334,6 +506,15 @@ impl AiEventHandle {
             None,
         )
     }
+}
+
+fn quota_exceeded(quota: &crate::db::models::TokenQuota) -> anyhow::Error {
+    anyhow!(crate::error::CoreError::RateLimitExceeded {
+        message: format!(
+            "token quota exceeded (scope={}, period={})",
+            quota.scope_type, quota.period
+        ),
+    })
 }
 
 fn resolve_org_id(
@@ -477,7 +658,7 @@ mod tests {
     #[test]
     fn ai_gateway_zapisuje_prompt_odpowiedz_i_audit() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {
@@ -565,7 +746,7 @@ mod tests {
     #[test]
     fn ai_gateway_zapisuje_odpowiedz_streamingowa() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {
@@ -631,7 +812,7 @@ mod tests {
     #[test]
     fn record_tool_execution_persists_real_results() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {
@@ -744,7 +925,7 @@ mod tests {
     #[test]
     fn record_run_tool_execution_attaches_to_latest_run_event() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {
@@ -834,7 +1015,7 @@ mod tests {
     #[test]
     fn session_and_per_call_events_share_correlation_id() {
         let db = db();
-        let gateway = AiGateway::new(db.clone(), "node-test");
+        let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
             model: "bielik".to_string(),
             messages: vec![Message {

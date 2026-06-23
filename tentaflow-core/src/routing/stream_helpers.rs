@@ -165,6 +165,7 @@ fn make_chunk(
         speaker_id: None,
         speaker_name: None,
         usage: None,
+        perf: None,
     }
 }
 

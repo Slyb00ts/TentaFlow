@@ -199,6 +199,28 @@ pub async fn push_chunk_async(sub: &Subscription, body: MessageBody) -> Result<(
         .map_err(|e| format!("receiver closed: {}", e))
 }
 
+/// Outcome of a non-blocking lossy chunk push, used by live latest-wins streams
+/// (LiDAR point clouds) that must never block on a slow consumer.
+pub enum LossyPush {
+    /// Queued for the writer.
+    Sent,
+    /// Writer channel was full — frame intentionally dropped (a newer one follows).
+    Dropped,
+    /// Receiver gone — caller must end its task.
+    Closed,
+}
+
+/// Non-blocking variant for live latest-wins streams. A full channel drops the
+/// frame (the next live frame supersedes it) instead of awaiting, so a slow
+/// consumer can never back up the queue and inflate end-to-end latency.
+pub fn push_chunk_lossy(sub: &Subscription, body: MessageBody) -> LossyPush {
+    match sub.tx.try_send(SubscriptionEvent::Chunk(body)) {
+        Ok(()) => LossyPush::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => LossyPush::Dropped,
+        Err(mpsc::error::TrySendError::Closed(_)) => LossyPush::Closed,
+    }
+}
+
 /// Wysyla koncowy frame. Po tym subscription powinno byc cancel'owane przez writer.
 pub fn push_end(sub: &Subscription, final_body: Option<MessageBody>) -> Result<(), String> {
     sub.tx

@@ -39,7 +39,10 @@ use tentaflow_sdk_spec::{
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
 use super::cbor_io::{decode_cbor_exact, read_input_cbor, write_cbor_capped};
-use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmCaller};
+use super::{
+    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, write_guest_output,
+    AddonState, WasmCaller,
+};
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
@@ -249,6 +252,8 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
                 // analysis must run even when nobody is watching. Idempotent.
                 #[cfg(feature = "inference-vision-gpu")]
                 crate::services::camera_ingest::vision_analysis::ensure_analysis(&row.camera_id);
+                // Depth → shared SLAM map (no-op unless the camera has mapping enabled).
+                crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&row.camera_id);
             }
             Err(e) => warn!(
                 "camera_ingest: failed to hydrate camera_id={} vendor={}: {}",
@@ -267,6 +272,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
 pub async fn shutdown_camera_supervisor_global() {
     #[cfg(feature = "inference-vision-gpu")]
     crate::services::camera_ingest::vision_analysis::drain();
+    crate::services::camera_ingest::depth_mapping::drain();
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
     }
@@ -277,6 +283,7 @@ pub async fn shutdown_camera_supervisor_global() {
 /// leak. Best-effort: the supervisor removal is spawned (non-blocking) and the
 /// row is hard-deleted (ephemeral camera, no audit retention).
 pub fn remove_backed_camera(owner_addon_id: &str, camera_id: &str) {
+    crate::services::camera_ingest::depth_mapping::stop_depth_mapping(camera_id);
     if let (Some(sup), Ok(handle)) = (SUPERVISOR.get(), tokio::runtime::Handle::try_current()) {
         let sup = sup.clone();
         let cid = camera_id.to_string();
@@ -405,6 +412,24 @@ pub fn camera_register_backed_v1(
         );
         return AbiError::Operation.as_i32();
     }
+    // A robot that backs its camera (e.g. Go2) gets depth → map, but kept SEPARATE
+    // from its LiDAR cloud for calibration: cloud stored under `<addon>-depth`,
+    // placed with the robot's own pose (`<addon>`), so the two clouds can be overlaid
+    // and the FOV / scale tuned against the LiDAR ground truth. FOV defaults to a
+    // wide-angle 120° guess (Go2 front lens) — calibrate live via `depth_camera_fov_deg`.
+    // Non-fatal + idempotent: the camera is already live if this fails.
+    let depth_patch = CameraPatch {
+        depth_mapping_enabled: Some(true),
+        depth_robot_id: Some(Some(format!("{addon_id}-depth"))),
+        depth_pose_robot_id: Some(Some(addon_id.clone())),
+        depth_camera_fov_deg: Some(120.0),
+        ..Default::default()
+    };
+    if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
+        warn!("camera.register_backed depth-mapping enable failed (non-fatal): {e}");
+    } else {
+        crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&camera_id);
+    }
     audit(
         caller.data(),
         "camera.register_backed",
@@ -425,12 +450,112 @@ pub fn camera_register_backed_v1(
     )
 }
 
+/// Register a PUSHED camera source (the phone's native encoder feeds H.264 over the
+/// mobile FFI, not a WebRTC peer). Creates the H.264 channel, registers it as a
+/// normal `webrtc`-vendor camera (so the GStreamer tee fans it out to the MSE tile +
+/// the decoded-frame mailbox that TentaVision + depth-AI read — one stream, three
+/// consumers), records the sender for the FFI push, and returns the new `camera_id`.
+///
+/// String ABI (the phone addon does string I/O): `display_name` UTF-8 in, `camera_id`
+/// UTF-8 out. Gated by `cameras.write`.
+pub fn camera_register_pushed_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    name_ptr: i32,
+    name_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(caller.data(), "camera.register_pushed", None, RiskClass::A, "denied", Some("missing_permission"));
+        return AbiError::Permission.as_i32();
+    }
+    let display_name = match read_guest_bytes(&memory, &caller, name_ptr, name_len) {
+        Some(b) => String::from_utf8_lossy(b).into_owned(),
+        None => return AbiError::Operation.as_i32(),
+    };
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+    let org_id_for_insert = caller.data().org_id.clone();
+
+    // Idempotent: reuse an existing pushed camera for this addon (re-attach a fresh
+    // channel) so a restart does NOT leak a new supervisor session + DB row each time.
+    let existing = list_cameras_for_addon(&db, &addon_id, org_id_for_insert.as_deref())
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.vendor == "webrtc" && r.url.starts_with("phone:"))
+                .map(|r| r.camera_id)
+        });
+    let camera_id = existing.clone().unwrap_or_else(|| format!("cam_{}", uuid::Uuid::new_v4()));
+
+    // The H.264 channel: native encoder → FFI → tx → appsrc. A few seconds of access
+    // units buffered; latest-wins drop under backpressure (live video).
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(120);
+    let cfg = CameraConfig {
+        camera_id: camera_id.clone(),
+        vendor: "webrtc".to_string(),
+        url: format!("phone:{addon_id}"), // marker only; source is the live rx
+        target_fps: 30,
+        resolution: None,
+        owner_addon_id: Some(addon_id.clone()),
+        credentials_encrypted: None,
+        decoder_override: None,
+    };
+    let sup = match run_async(get_or_init_supervisor()) {
+        Ok(s) => s,
+        Err(e) => return e.as_i32(),
+    };
+    // Reused id: drop any stale session for it before re-attaching the fresh channel.
+    if existing.is_some() {
+        let _ = run_async(sup.remove_camera(&camera_id));
+    }
+    if let Err(e) = run_async(sup.add_webrtc_camera(cfg, rx)) {
+        audit(caller.data(), "camera.register_pushed", Some(&camera_id), RiskClass::A, "error", Some(&format!("session_start_failed: {e}")));
+        return map_ingest_error(&e).as_i32();
+    }
+    crate::services::mobile_camera::MobileCameraIngest::global().set_sender(&addon_id, tx);
+    // Only insert a DB row for a NEW camera; a reused one already has its row.
+    if existing.is_none() {
+        if let Err(e) = insert_camera(
+            &db, &camera_id, &addon_id, &display_name, "webrtc", &format!("phone:{addon_id}"),
+            30, 5, None, None, "C", "default", None, None, None, org_id_for_insert.as_deref(),
+        ) {
+            warn!("camera.register_pushed insert_camera failed (compensating): {e}");
+            let _ = run_async(sup.remove_camera(&camera_id));
+            crate::services::mobile_camera::MobileCameraIngest::global().remove(&addon_id);
+            return AbiError::Operation.as_i32();
+        }
+    }
+    // A phone that pushes its camera IS a robot (addon_id == robot_id): bind the
+    // stream to the shared SLAM map so its frames become a metric point cloud.
+    // Idempotent and non-fatal — the camera is already live if this fails.
+    // Phone has no LiDAR to compare against → merged: pose source == store id
+    // (`depth_pose_robot_id` left default/NULL falls back to `depth_robot_id`).
+    let depth_patch = CameraPatch {
+        depth_mapping_enabled: Some(true),
+        depth_robot_id: Some(Some(addon_id.clone())),
+        ..Default::default()
+    };
+    if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
+        warn!("camera.register_pushed depth-mapping enable failed (non-fatal): {e}");
+    } else {
+        crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&camera_id);
+    }
+    audit(caller.data(), "camera.register_pushed", Some(&camera_id), RiskClass::A, "ok", None);
+    write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, camera_id.as_bytes())
+}
+
 /// Latest decoded RGB24 frame for a camera, taken from the running session's
 /// frame mailbox via the process-wide supervisor. `None` when the supervisor
 /// is not initialized, the camera is not registered, or no frame has landed
-/// yet. Used by the always-on vision analysis loop to pull frames without
-/// reaching into session internals.
-#[cfg(feature = "inference-vision-gpu")]
+/// yet. Used by the always-on vision analysis loop and the depth-mapping loop to
+/// pull frames without reaching into session internals.
+#[cfg(feature = "camera")]
 pub async fn latest_frame_global(camera_id: &str) -> Option<(std::sync::Arc<[u8]>, u32, u32)> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
@@ -2428,6 +2553,11 @@ pub fn camera_update_v1(
         retention_class: input.retention_class.clone(),
         profile: input.profile.clone(),
         analysis_flow_id,
+        depth_mapping_enabled: None,
+        depth_robot_id: None,
+        depth_camera_fov_deg: None,
+        depth_fps: None,
+        depth_pose_robot_id: None,
     };
 
     if update_camera(
@@ -2668,6 +2798,9 @@ pub fn camera_remove_v1(
             warn!("camera.remove supervisor.remove_camera (post-soft-delete): {e}");
         }
     }
+    // Stop the depth-mapping loop (no-op if the camera had none) so a removed
+    // camera leaves no ticking background task / stale registry entry.
+    crate::services::camera_ingest::depth_mapping::stop_depth_mapping(&input.camera_id);
 
     audit(
         caller.data(),

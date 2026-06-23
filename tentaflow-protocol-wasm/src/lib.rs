@@ -1589,6 +1589,73 @@ pub fn encode_scheduler_job_run_now_request(job_id: String) -> Result<Vec<u8>, J
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeTokenUsageSummaryRequest)]
+pub fn encode_token_usage_summary_request(
+    period: String,
+    period_key: String,
+    group_by: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest {
+            period,
+            period_key,
+            group_by,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenListQuotasRequest)]
+pub fn encode_token_list_quotas_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::ListQuotasRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenUpsertQuotaRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_token_upsert_quota_request(
+    id: Option<String>,
+    scope_type: String,
+    subject_id: Option<String>,
+    model_id: Option<String>,
+    period: String,
+    max_total_tokens: i64,
+    is_active: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest {
+            quota: tentaflow_protocol::TokenQuotaUpsertWire {
+                id,
+                scope_type,
+                subject_id,
+                model_id,
+                period,
+                max_total_tokens,
+                is_active,
+            },
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenDeleteQuotaRequest)]
+pub fn encode_token_delete_quota_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeTokenCoordinatorStatusRequest)]
+pub fn encode_token_coordinator_status_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TokenUsageBody(
+        tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
 pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -3243,6 +3310,29 @@ pub fn encode_vision_infer_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::RerankBody(Request) — encoder rerankingu (Tier 1). `topN`
+/// opcjonalne (None = wszystkie dokumenty).
+#[wasm_bindgen(js_name = encodeRerankRequest)]
+pub fn encode_rerank_request(
+    model: String,
+    query: String,
+    documents: Vec<String>,
+    top_n: Option<u32>,
+    return_documents: bool,
+) -> Result<Vec<u8>, JsError> {
+    let req = tentaflow_protocol::RerankRequest {
+        model,
+        query,
+        documents,
+        top_n,
+        return_documents,
+    };
+    encode_body_inner(&MessageBody::RerankBody(
+        tentaflow_protocol::RerankExchange::Request(req),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Fast-path ------------------------------------------------------------
 
 /// MessageBody::FastPathListRequest (unit).
@@ -4169,6 +4259,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 Some(t) => set(&obj, "text", t.into()),
                 None => set(&obj, "text", JsValue::NULL),
             }
+            // Metryki wydajnosci jako Number (f64) — patrz memory: u64.into()
+            // daloby BigInt i psulo arytmetyke w JS.
+            set(&obj, "ttftMs", (end.ttft_ms as f64).into());
+            set(&obj, "ttft_ms", (end.ttft_ms as f64).into());
+            set(&obj, "prefillTps", (end.prefill_tps as f64).into());
+            set(&obj, "prefill_tps", (end.prefill_tps as f64).into());
+            set(&obj, "decodeTps", (end.decode_tps as f64).into());
+            set(&obj, "decode_tps", (end.decode_tps as f64).into());
         }
         MessageBody::FlowInvokeRequestBody(_) => {
             // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.
@@ -5128,6 +5226,109 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "run_json", resp.run_json.into());
             }
         },
+        MessageBody::TokenUsageBody(payload) => match payload {
+            // Warianty request są obsługiwane tylko po stronie Core — dashboard
+            // ich nie dekoduje, więc mapujemy je na sam znacznik wariantu.
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryRequest { .. } => {
+                set(&obj, "variant", "TokenUsageSummaryRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasRequest => {
+                set(&obj, "variant", "TokenListQuotasRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaRequest { .. } => {
+                set(&obj, "variant", "TokenUpsertQuotaRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaRequest { .. } => {
+                set(&obj, "variant", "TokenDeleteQuotaRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusRequest => {
+                set(&obj, "variant", "TokenCoordinatorStatusRequest".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UsageSummaryResponse { rows } => {
+                set(&obj, "variant", "TokenUsageSummaryResponse".into());
+                let arr = js_sys::Array::new();
+                for r in rows {
+                    let item = js_sys::Object::new();
+                    set(&item, "key", r.key.into());
+                    // Liczniki tokenów jako JS Number (f64) — i64 trafiłby do JS
+                    // jako BigInt i psuł arytmetykę/wykresy w dashboardzie.
+                    set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+                    set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+                    set(&item, "completionTokens", (r.completion_tokens as f64).into());
+                    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                    set(&item, "totalTokens", (r.total_tokens as f64).into());
+                    set(&item, "total_tokens", (r.total_tokens as f64).into());
+                    set(&item, "requestCount", (r.request_count as f64).into());
+                    set(&item, "request_count", (r.request_count as f64).into());
+                    set(&item, "audioMs", (r.audio_ms as f64).into());
+                    set(&item, "audio_ms", (r.audio_ms as f64).into());
+                    set(&item, "images", (r.images as f64).into());
+                    set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
+                    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
+                    arr.push(&item);
+                }
+                set(&obj, "rows", arr.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::ListQuotasResponse { quotas } => {
+                set(&obj, "variant", "TokenListQuotasResponse".into());
+                let arr = js_sys::Array::new();
+                for q in quotas {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", q.id.into());
+                    set(&item, "orgId", q.org_id.clone().into());
+                    set(&item, "org_id", q.org_id.into());
+                    set(&item, "scopeType", q.scope_type.clone().into());
+                    set(&item, "scope_type", q.scope_type.into());
+                    set_optional_string(&item, "subjectId", q.subject_id.clone());
+                    set_optional_string(&item, "subject_id", q.subject_id);
+                    set_optional_string(&item, "modelId", q.model_id.clone());
+                    set_optional_string(&item, "model_id", q.model_id);
+                    set(&item, "period", q.period.into());
+                    set(&item, "maxTotalTokens", (q.max_total_tokens as f64).into());
+                    set(&item, "max_total_tokens", (q.max_total_tokens as f64).into());
+                    set(&item, "isActive", q.is_active.into());
+                    set(&item, "is_active", q.is_active.into());
+                    arr.push(&item);
+                }
+                set(&obj, "quotas", arr.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::UpsertQuotaResponse { id } => {
+                set(&obj, "variant", "TokenUpsertQuotaResponse".into());
+                set(&obj, "id", id.into());
+            }
+            tentaflow_protocol::TokenUsagePayload::DeleteQuotaResponse => {
+                set(&obj, "variant", "TokenDeleteQuotaResponse".into());
+            }
+            tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse {
+                coordinator_node_id,
+                leases,
+            } => {
+                set(&obj, "variant", "TokenCoordinatorStatusResponse".into());
+                set_optional_string(&obj, "coordinatorNodeId", coordinator_node_id.clone());
+                set_optional_string(&obj, "coordinator_node_id", coordinator_node_id);
+                let arr = js_sys::Array::new();
+                for l in leases {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", l.id.into());
+                    set(&item, "quotaId", l.quota_id.clone().into());
+                    set(&item, "quota_id", l.quota_id.into());
+                    set(&item, "nodeId", l.node_id.clone().into());
+                    set(&item, "node_id", l.node_id.into());
+                    set(&item, "periodKey", l.period_key.clone().into());
+                    set(&item, "period_key", l.period_key.into());
+                    set(&item, "baseUsed", (l.base_used as f64).into());
+                    set(&item, "base_used", (l.base_used as f64).into());
+                    set(&item, "grantedTokens", (l.granted_tokens as f64).into());
+                    set(&item, "granted_tokens", (l.granted_tokens as f64).into());
+                    set(&item, "coordinatorNodeId", l.coordinator_node_id.clone().into());
+                    set(&item, "coordinator_node_id", l.coordinator_node_id.into());
+                    set(&item, "expiresAt", l.expires_at.clone().into());
+                    set(&item, "expires_at", l.expires_at.into());
+                    arr.push(&item);
+                }
+                set(&obj, "leases", arr.into());
+            }
+        },
         MessageBody::SkillsBody(payload) => match payload {
             tentaflow_protocol::SkillsPayload::ListRequest(req) => {
                 set(&obj, "variant", "SkillsListRequest".into());
@@ -5916,6 +6117,26 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&obj, "poses", arr.into());
                     }
                 }
+            }
+        },
+        MessageBody::RerankBody(p) => match p {
+            tentaflow_protocol::RerankExchange::Request(_) => {
+                set(&obj, "variant", "RerankRequest".into());
+            }
+            tentaflow_protocol::RerankExchange::Response(r) => {
+                set(&obj, "variant", "RerankResponse".into());
+                set(&obj, "model", r.model.into());
+                let arr = js_sys::Array::new();
+                for item in r.results {
+                    let entry = js_sys::Object::new();
+                    set(&entry, "index", (item.index as u32).into());
+                    set(&entry, "relevanceScore", item.relevance_score.into());
+                    if let Some(doc) = item.document {
+                        set(&entry, "document", doc.into());
+                    }
+                    arr.push(&entry.into());
+                }
+                set(&obj, "results", arr.into());
             }
         },
         MessageBody::FastPathListRequest => {
@@ -7994,6 +8215,23 @@ fn robot_telemetry_to_js(t: &tentaflow_protocol::RobotTelemetrySnapshot) -> JsVa
     }
     set(&obj, "footForce", foot_force.clone().into());
     set(&obj, "foot_force", foot_force.into());
+    let joints = js_sys::Array::new();
+    for v in &t.joints {
+        joints.push(&JsValue::from(*v));
+    }
+    set(&obj, "joints", joints.into());
+    let pose_position = js_sys::Array::new();
+    for v in &t.pose_position {
+        pose_position.push(&JsValue::from(*v));
+    }
+    set(&obj, "posePosition", pose_position.clone().into());
+    set(&obj, "pose_position", pose_position.into());
+    let pose_orientation = js_sys::Array::new();
+    for v in &t.pose_orientation {
+        pose_orientation.push(&JsValue::from(*v));
+    }
+    set(&obj, "poseOrientation", pose_orientation.clone().into());
+    set(&obj, "pose_orientation", pose_orientation.into());
     match t.vx {
         Some(vx) => set(&obj, "vx", vx.into()),
         None => set(&obj, "vx", JsValue::NULL),
@@ -8157,7 +8395,172 @@ fn decode_robots_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Robo
                 None => set(obj, "note", JsValue::NULL),
             }
         }
+        P::GeoAnchorSetRequest(req) => {
+            set(obj, "variant", "RobotGeoAnchorSetRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+        }
+        P::GeoAnchorGetRequest(req) => {
+            set(obj, "variant", "RobotGeoAnchorGetRequest".into());
+            set(obj, "robotId", req.robot_id.clone().into());
+            set(obj, "robot_id", req.robot_id.into());
+        }
+        P::GeoAnchorResponse(resp) => {
+            set(obj, "variant", "RobotGeoAnchorResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            set(obj, "anchored", resp.anchored.into());
+            let num = |o: &js_sys::Object, k: &str, v: Option<f64>| match v {
+                Some(x) => set(o, k, x.into()),
+                None => set(o, k, JsValue::NULL),
+            };
+            num(obj, "lat", resp.lat);
+            num(obj, "lon", resp.lon);
+            num(obj, "alt", resp.alt);
+            num(obj, "heading", resp.heading);
+            num(obj, "poseLat", resp.pose_lat);
+            num(obj, "poseLon", resp.pose_lon);
+            num(obj, "poseAlt", resp.pose_alt);
+        }
     }
+}
+
+/// Project a RAW canonical LiDAR frame (36-byte LE header + packed f32 body — the
+/// bytes carried verbatim in a `StreamFrame.data` push) into the JS shape the
+/// dashboard LiDAR consumer (L3a freshness) and the wgpu renderer (L4) expect.
+/// The frame is parsed via the single source-of-truth header decoder
+/// (`tentaflow_sdk_spec::LidarFrameHeader::decode_header`) so the fixed header
+/// layout is never duplicated in JS. The returned object carries both the parsed
+/// scalar fields and the raw/typed-array bodies: L3a reads `frameSeq`/`pointCount`
+/// for freshness, L4 uploads `points` (world-space XYZ as a Float32Array, decoded
+/// from whichever body layout the header declares) / `raw` (the full frame) to the
+/// GPU. A malformed/short frame yields `{hasFrame: false}` rather than a fabricated
+/// partial cloud.
+fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
+    use tentaflow_sdk_spec::{LidarFrameHeader, LIDAR_HEADER_LEN};
+    let obj = js_sys::Object::new();
+    let Some(header) = LidarFrameHeader::decode_header(bytes) else {
+        set(&obj, "hasFrame", false.into());
+        return obj.into();
+    };
+    // A frame is only "present" if the FULL declared body is actually here. An
+    // unknown layout / overflowing `point_count` (`body_len() == None`) or a
+    // short read (buffer ends before the declared frame) is treated as NO frame
+    // rather than fabricating a clamped, mismatched cloud — `pointCount` must
+    // always equal `points.length / layout`. Attacker-controlled bytes can only
+    // reach the `{hasFrame:false}` path here; no `unwrap`/panic.
+    let Some(body_len) = header.body_len() else {
+        set(&obj, "hasFrame", false.into());
+        return obj.into();
+    };
+    // Cap the inflate target derived from the (untrusted) header. The LZ4 path
+    // allocates `body_len` zeroed bytes BEFORE validating the compressed input, so
+    // a hostile header (huge point_count, tiny body) could otherwise OOM the tab.
+    // 64 MiB covers any real frame (~0.5 MB) with vast headroom; larger = reject.
+    const LIDAR_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+    if body_len > LIDAR_MAX_BODY_BYTES {
+        set(&obj, "hasFrame", false.into());
+        return obj.into();
+    }
+    // Acquire the UNCOMPRESSED body: inflate the LZ4 block when flagged, else take
+    // the declared slice. Either way `body.len() == body_len` afterward; a corrupt
+    // block or short buffer yields `{hasFrame:false}` (never a partial cloud).
+    let inflated;
+    let body: &[u8] = if header.lz4_body() {
+        match lz4_flex::block::decompress(&bytes[LIDAR_HEADER_LEN..], body_len) {
+            Ok(d) if d.len() == body_len => {
+                inflated = d;
+                &inflated
+            }
+            _ => {
+                set(&obj, "hasFrame", false.into());
+                return obj.into();
+            }
+        }
+    } else {
+        let frame_end = LIDAR_HEADER_LEN + body_len;
+        if bytes.len() < frame_end {
+            set(&obj, "hasFrame", false.into());
+            return obj.into();
+        }
+        &bytes[LIDAR_HEADER_LEN..frame_end]
+    };
+    set(&obj, "hasFrame", true.into());
+    set(&obj, "frameSeq", header.frame_seq.into());
+    set(&obj, "frame_seq", header.frame_seq.into());
+    set(&obj, "pointCount", header.point_count.into());
+    set(&obj, "point_count", header.point_count.into());
+    set(&obj, "layout", header.layout.into());
+    set(&obj, "resolution", header.resolution.into());
+    let origin = js_sys::Array::new();
+    for v in &header.origin {
+        origin.push(&JsValue::from(*v as f64));
+    }
+    set(&obj, "origin", origin.into());
+    set(&obj, "timestampUs", (header.timestamp_us as f64).into());
+    set(&obj, "timestamp_us", (header.timestamp_us as f64).into());
+    set(&obj, "hostSendUs", (header.host_send_us as f64).into());
+    set(&obj, "host_send_us", (header.host_send_us as f64).into());
+    // Raw canonical frame = header + UNCOMPRESSED body. For an LZ4 frame this
+    // reconstructs the inflated canonical bytes so downstream (the L4 GPU upload)
+    // never sees the compressed wire form. The LZ4 flag is CLEARED in the rebuilt
+    // header so `raw` is a self-consistent uncompressed frame — re-decoding it must
+    // not try to inflate an already-inflated body.
+    let mut raw = Vec::with_capacity(LIDAR_HEADER_LEN + body.len());
+    raw.extend_from_slice(&bytes[..LIDAR_HEADER_LEN]);
+    raw.extend_from_slice(body);
+    raw[tentaflow_sdk_spec::LIDAR_FLAGS_OFFSET] &= !tentaflow_sdk_spec::LIDAR_FLAG_LZ4_BODY;
+    set(&obj, "raw", js_sys::Uint8Array::from(&raw[..]).into());
+    // World-space XYZ as a Float32Array (what the renderer uploads). We build a
+    // Rust `Vec<f32>` first and hand it over with a SINGLE bulk `Float32Array::from`
+    // copy — per-element `set_index` across the wasm/JS boundary was the dominant
+    // decode cost. For the packed-i16 grid layout we reconstruct world meters here
+    // (`idx * resolution + origin`); for the f32 layouts the body is copied as-is.
+    let floats: Vec<f32> = if header.layout == tentaflow_sdk_spec::LIDAR_LAYOUT_XYZ_I16_PLANAR {
+        // Planar i16 grid: all ix, then all iy, then all iz. Reconstruct world
+        // meters as `idx * resolution + origin` into interleaved XYZ for the GPU.
+        let n = header.point_count as usize;
+        let res = header.resolution;
+        let [ox, oy, oz] = header.origin;
+        let iy_base = n * 2;
+        let iz_base = n * 4;
+        let rd = |o: usize| i16::from_le_bytes([body[o], body[o + 1]]) as f32;
+        let mut v = Vec::with_capacity(n * 3);
+        for p in 0..n {
+            v.push(rd(p * 2) * res + ox);
+            v.push(rd(iy_base + p * 2) * res + oy);
+            v.push(rd(iz_base + p * 2) * res + oz);
+        }
+        v
+    } else {
+        // f32 layouts (XYZ / XYZI): body is already little-endian f32 scalars.
+        let count = body_len / 4;
+        let mut v = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * 4;
+            v.push(f32::from_le_bytes([
+                body[off],
+                body[off + 1],
+                body[off + 2],
+                body[off + 3],
+            ]));
+        }
+        v
+    };
+    set(&obj, "points", js_sys::Float32Array::from(&floats[..]).into());
+    obj.into()
+}
+
+/// Decode the RAW canonical LiDAR frame bytes pushed in a `StreamFrame.data`
+/// (L3a real-time PUSH stream `streamId = "lidar:<robot_id>"`) into the JS frame
+/// projection. Reuses the sdk-spec header layout via `lidar_frame_to_js`; a
+/// malformed/short frame returns `{hasFrame: false}` (no panic).
+#[wasm_bindgen(js_name = decodeLidarFrame)]
+pub fn decode_lidar_frame(bytes: &[u8]) -> JsValue {
+    lidar_frame_to_js(bytes)
 }
 
 fn ml_studio_summary_to_js(s: &tentaflow_protocol::MlStudioProjectSummary) -> js_sys::Object {
@@ -14101,3 +14504,32 @@ pub fn encode_robot_camera_share_request(
     )))
     .map_err(|e| JsError::new(&e))
 }
+
+/// MessageBody::RobotsBody(GeoAnchorSetRequest) — pin the robot's scene origin to a
+/// real-world lat/lon/alt + heading (all `Some` = set; all `None` = clear).
+#[wasm_bindgen(js_name = encodeRobotGeoAnchorSetRequest)]
+pub fn encode_robot_geo_anchor_set_request(
+    robot_id: String,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt: Option<f64>,
+    heading: Option<f64>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotGeoAnchorSetRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorSetRequest(
+        RobotGeoAnchorSetRequest { robot_id, lat, lon, alt, heading },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::RobotsBody(GeoAnchorGetRequest) — read a robot's geo anchor + live
+/// real-world position.
+#[wasm_bindgen(js_name = encodeRobotGeoAnchorGetRequest)]
+pub fn encode_robot_geo_anchor_get_request(robot_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{RobotGeoAnchorGetRequest, RobotsPayload};
+    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorGetRequest(
+        RobotGeoAnchorGetRequest { robot_id },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
