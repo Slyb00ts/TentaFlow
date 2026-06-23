@@ -13,8 +13,8 @@
 
 use bytes::Bytes;
 use tentaflow_sdk_spec::{
-    BaroSample, GnssFix, ImuSample, LidarFrameHeader, PoseSample, BARO_SAMPLE_LEN, GNSS_FIX_LEN,
-    IMU_SAMPLE_LEN,
+    BaroSample, GnssFix, ImuSample, LidarFrameHeader, MagSample, PoseSample, BARO_SAMPLE_LEN,
+    GNSS_FIX_LEN, IMU_SAMPLE_LEN,
 };
 
 use super::{
@@ -26,7 +26,7 @@ use crate::services::lidar_hub::LidarStreamHub;
 use crate::services::localization::LocalizationEngine;
 use crate::services::mobile_sensors::{
     MobileSensorQueue, SENSOR_KIND_BARO, SENSOR_KIND_DEPTH, SENSOR_KIND_GNSS, SENSOR_KIND_IMU,
-    SENSOR_KIND_POSE,
+    SENSOR_KIND_MAG, SENSOR_KIND_POSE,
 };
 use crate::services::slam_scene::SlamSceneManager;
 
@@ -68,6 +68,16 @@ fn feed_baro(device_id: &str, bytes: &[u8]) -> bool {
     match BaroSample::decode(bytes) {
         Some(s) => {
             LocalizationEngine::global().ingest_baro(device_id, &s);
+            true
+        }
+        None => false,
+    }
+}
+
+fn feed_mag(device_id: &str, bytes: &[u8]) -> bool {
+    match MagSample::decode(bytes) {
+        Some(m) => {
+            LocalizationEngine::global().ingest_mag(device_id, &m);
             true
         }
         None => false,
@@ -223,6 +233,10 @@ pub fn mobile_sensor_drain_v1(caller: WasmCaller<'_, AddonState>) -> i32 {
             SENSOR_KIND_POSE => {
                 check_permission(caller.data(), PERM_SENSOR_CAMERA, None)
                     && feed_pose(&device_id, &bytes)
+            }
+            // Magnetometer rides the IMU grant (an orientation/inertial aid).
+            SENSOR_KIND_MAG => {
+                check_permission(caller.data(), PERM_SENSOR_IMU, None) && feed_mag(&device_id, &bytes)
             }
             _ => false,
         };

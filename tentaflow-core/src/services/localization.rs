@@ -242,6 +242,15 @@ impl LocalizationEngine {
         }
     }
 
+    /// Feed a magnetometer sample (heading aid) into the ESKF. It only refines the
+    /// orientation estimate (used by the AR↔ENU alignment); it does not itself drive
+    /// the marker, so no pose push here.
+    pub fn ingest_mag(&self, device_id: &str, s: &tentaflow_sdk_spec::MagSample) {
+        if let Some(e) = self.devices.get(device_id) {
+            e.lock().engine.ingest_mag(s);
+        }
+    }
+
     /// True once the device's engine has a global (GNSS-anchored) frame.
     pub fn is_georeferenced(&self, device_id: &str) -> bool {
         self.devices
