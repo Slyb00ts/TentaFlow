@@ -132,9 +132,16 @@ pub fn llm_generate(
             }
         };
 
+        // Model engine-flow nalezacy do wolajacego addonu (np. "rag-...:query")
+        // jest jego wlasnym, opublikowanym flow zarejestrowanym w FlowDispatcher
+        // jako "<addon_id>:<flow_id>" — nie jest surowym nadpisaniem modelu, wiec
+        // nie wymaga permission "llm_model". Wewnetrzne node'y flow autoryzuja
+        // swoje aliasy osobno w kontekscie wykonania flow.
+        let owns_model = model.starts_with(&format!("{addon_id}:"));
+
         // Raw model override: gate on the per-model permission. Aliases skip
         // this — they passed the alias gate above.
-        if !is_alias && !check_permission(caller.data(), "llm_model", Some(model)) {
+        if !is_alias && !owns_model && !check_permission(caller.data(), "llm_model", Some(model)) {
             audit_log(
                 caller.data(),
                 "llm.generate",
