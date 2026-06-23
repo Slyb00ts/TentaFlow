@@ -409,7 +409,7 @@ function bindAliasRowActions(root) {
   root.querySelectorAll('[data-alias-edit]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      const id = parseInt(b.dataset.aliasEdit, 10);
+      const id = b.dataset.aliasEdit;
       const wasOpen = aliasEditingId === id;
       if (wasOpen) {
         aliasEditingId = null;
@@ -433,13 +433,13 @@ function bindAliasRowActions(root) {
   root.querySelectorAll('[data-alias-delete]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      deleteAlias(parseInt(b.dataset.aliasDelete, 10), b.dataset.aliasName);
+      deleteAlias(b.dataset.aliasDelete, b.dataset.aliasName);
     };
   });
   root.querySelectorAll('[data-alias-access]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      const id = parseInt(b.dataset.aliasAccess, 10);
+      const id = b.dataset.aliasAccess;
       const wasOpen = aliasAccessId === id;
       aliasAccessId = wasOpen ? null : id;
       patchAliasesTab();
@@ -455,7 +455,7 @@ function bindAliasRowActions(root) {
   });
   root.querySelectorAll('[data-alias-toggle]').forEach((tg) => {
     tg.addEventListener('change', async (e) => {
-      const id = parseInt(tg.dataset.aliasToggle, 10);
+      const id = tg.dataset.aliasToggle;
       const checked = !!e.detail?.checked;
       await updateAliasActive(id, checked);
     });
@@ -476,7 +476,7 @@ function bindAliasInlineEditEvents(root) {
   root.querySelectorAll('[data-alias-save]').forEach((b) => {
     b.onclick = async (e) => {
       e.stopPropagation();
-      const id = parseInt(b.dataset.aliasSave, 10);
+      const id = b.dataset.aliasSave;
       await saveAliasInline(id);
     };
   });
@@ -591,7 +591,7 @@ function attachFallbackDrag(listEl) {
 // is_active and alias name unchanged (toggle handles is_active, rename is not
 // part of the inline edit by design — rename forces a re-create flow).
 async function saveAliasInline(id) {
-  const alias = aliases.find((x) => x.id === id);
+  const alias = aliases.find((x) => String(x.id) === id);
   if (!alias || !aliasEditDraft || aliasEditDraft.id !== id) return;
   const errEl = document.querySelector(`[data-edit-error="${CSS.escape(String(id))}"]`);
   const target = aliasEditDraft.targetModel.trim();
@@ -623,7 +623,7 @@ async function saveAliasInline(id) {
 // Toggle handler — flips is_active via the same update RPC. Optimistic UI:
 // the toggle has already animated by the time we get here.
 async function updateAliasActive(id, checked) {
-  const alias = aliases.find((x) => x.id === id);
+  const alias = aliases.find((x) => String(x.id) === id);
   if (!alias) return;
   try {
     await ApiBinary.action('modelAliasUpdateRequest', {
@@ -1105,17 +1105,18 @@ function renderAliasRow(a) {
     !a.is_active ? 'inactive' : '',
     emptyTarget ? 'empty-target' : '',
   ].filter(Boolean).join(' ');
-  const isEditing = aliasEditingId === a.id;
+  const aliasId = String(a.id);
+  const isEditing = aliasEditingId === aliasId;
   const editPanel = isEditing ? renderAliasInlineEdit(a) : '';
-  const isAccess = aliasAccessId === a.id;
+  const isAccess = aliasAccessId === aliasId;
   // Access panel reflects the effective (optimistically-mirrored) visibility so
   // the collapsed-row chip and the expanded segmented stay in sync. When the
   // alias's real visibility is not loaded (the list endpoint omits it) this is
   // 'unknown' — rendered as a muted chip, never a false 'restricted'.
-  const effVis = Access.effectiveVisibility('alias', a.id, vis.value);
+  const effVis = Access.effectiveVisibility('alias', aliasId, vis.value);
   const accessPanel = isAccess
-    ? `<div class="svc-alias-access-wrap" data-access-wrap="alias-${escapeAttr(a.id)}">
-         ${Access.renderConsumerPanel('alias', a.id, a.alias, effVis)}
+    ? `<div class="svc-alias-access-wrap" data-access-wrap="alias-${escapeAttr(aliasId)}">
+         ${Access.renderConsumerPanel('alias', aliasId, a.alias, effVis)}
        </div>`
     : '';
 
@@ -1164,7 +1165,7 @@ function renderAliasRow(a) {
 // used to flag the edit panel as "unsaved" so D&D reorder, primary change or
 // fallback add/remove become visible to the user before they click Save.
 function isDraftDirty(a) {
-  if (!aliasEditDraft || aliasEditDraft.id !== a.id) return false;
+  if (!aliasEditDraft || aliasEditDraft.id !== String(a.id)) return false;
   const origTarget = a.target_model || '';
   const origStrategy = (a.strategy || 'first_available').toLowerCase();
   const origFbs = parseFallbackTargets(a.fallback_targets).values;
@@ -1181,10 +1182,10 @@ function isDraftDirty(a) {
 // state so unrelated row clicks do not clobber unsaved input. Drag handlers
 // bind in `bindAliasInlineEditEvents` (called from bindTabEvents).
 function renderAliasInlineEdit(a) {
-  if (!aliasEditDraft || aliasEditDraft.id !== a.id) {
+  if (!aliasEditDraft || aliasEditDraft.id !== String(a.id)) {
     const fbParse = parseFallbackTargets(a.fallback_targets);
     aliasEditDraft = {
-      id: a.id,
+      id: String(a.id),
       targetModel: a.target_model || '',
       strategy: (a.strategy || 'first_available').toLowerCase(),
       fallbacks: fbParse.values.slice(),
