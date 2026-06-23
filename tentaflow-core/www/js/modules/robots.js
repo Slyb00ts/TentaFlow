@@ -1346,6 +1346,8 @@ function mountLidarTile(host, r) {
       <tf-toggle data-lidar-toggle></tf-toggle>
       <span class="robots-lidar-label">Strumień 3D</span>
       <span class="robots-lidar-status" data-lidar-status>—</span>
+      <tf-toggle data-depth-toggle></tf-toggle>
+      <span class="robots-lidar-label">Kamera (depth)</span>
     </div>
     <div class="robots-lidar-diag" data-lidar-diag hidden></div>`;
 
@@ -1353,6 +1355,12 @@ function mountLidarTile(host, r) {
   toggle.addEventListener('change', (e) => {
     const on = e?.detail?.checked ?? e?.detail ?? toggle.checked ?? toggle.hasAttribute('checked');
     handleLidarToggle(id, !!on, toggle);
+  });
+
+  const depthToggle = host.querySelector('[data-depth-toggle]');
+  depthToggle.addEventListener('change', (e) => {
+    const on = e?.detail?.checked ?? e?.detail ?? depthToggle.checked ?? depthToggle.hasAttribute('checked');
+    handleDepthToggle(id, !!on);
   });
 
   updateLidarTile(host, r);
@@ -1390,6 +1398,23 @@ function updateLidarTile(host, r) {
     else toggle.removeAttribute('checked');
     if (offline) toggle.setAttribute('disabled', '');
     else toggle.removeAttribute('disabled');
+  }
+
+  // The depth overlay piggybacks on the live scene subscription, so it's only
+  // usable while the 3D stream is live. Disable it (and clear its checked state)
+  // when there's no live entry, and otherwise mirror the actual overlay state so
+  // the toggle can never read "on" without a `scene-depth` subscription.
+  const depthToggle = host.querySelector('[data-depth-toggle]');
+  if (depthToggle) {
+    const live = lidarLive.get(robotId(r));
+    if (!live) {
+      depthToggle.removeAttribute('checked');
+      depthToggle.setAttribute('disabled', '');
+    } else {
+      depthToggle.removeAttribute('disabled');
+      if (live.depthOn) depthToggle.setAttribute('checked', '');
+      else depthToggle.removeAttribute('checked');
+    }
   }
 
   renderLidarStatus(host, { enabled, available, offline, snapshotPoints, resolution });
@@ -1525,7 +1550,7 @@ async function ensureVoxel(container) {
     const live = lidarLive.get(selectedRobotId);
     if (live && voxelView) {
       if (live.lastScenePoints && voxelView.setMapPoints) {
-        try { voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount); } catch { /* ignore */ }
+        renderSceneUnion(selectedRobotId, live);
       } else if (live.lastPoints) {
         try { voxelView.setPoints(live.lastPoints, live.lastPointCount); } catch { /* ignore */ }
       }
@@ -2101,6 +2126,8 @@ function startRobotLidar(id) {
   const live = {
     unsub: null,
     sceneUnsub: null,
+    depthSceneUnsub: null,
+    depthOn: false,
     closed: false,
     resubTimer: null,
     resubUsed: false,
@@ -2111,6 +2138,8 @@ function startRobotLidar(id) {
     lastPoints: null,
     lastScenePoints: null,
     lastSceneCount: 0,
+    lastDepthPoints: null,
+    lastDepthCount: 0,
     timing: [],
   };
   lidarLive.set(id, live);
@@ -2208,14 +2237,140 @@ function onSceneChunk(id, live, body) {
   // init is async, and the server skips re-sending an unchanged map) can replay it.
   live.lastScenePoints = f.points ?? null;
   live.lastSceneCount = Number(f.pointCount ?? f.point_count ?? 0);
-  if (voxelView && id === selectedRobotId && live.lastScenePoints && voxelView.setMapPoints) {
-    try {
-      voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount);
-      applyRobotPose(id);
-    } catch (e) {
-      console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
-    }
+  renderSceneUnion(id, live);
+}
+
+// A camera depth-map snapshot (`scene:<id>-depth`): same canonical frame as the
+// LiDAR scene, but the cloud reconstructed from the camera. Stashed separately so
+// the calibration overlay can union it with the LiDAR cloud (see renderSceneUnion).
+function onDepthSceneChunk(id, live, body) {
+  if (!body || typeof body !== 'object') return;
+  if (body.variant !== 'StreamFrame') return;
+  const data = body.data;
+  if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
+  if (lidarLive.get(id) !== live) return;
+  let f;
+  try {
+    f = decodeLidarFrame(data);
+  } catch (e) {
+    console.warn('[robots] depth-scene decode failed:', e?.message ?? e);
+    return;
   }
+  if (!f || !(f.hasFrame ?? f.has_frame)) return;
+  live.lastDepthPoints = f.points ?? null;
+  live.lastDepthCount = Number(f.pointCount ?? f.point_count ?? 0);
+  renderSceneUnion(id, live);
+}
+
+// Render the shared map for `id`: the LiDAR scene cloud, optionally unioned with the
+// camera depth cloud when the calibration overlay is on. One authoritative
+// setMapPoints call (the renderer replaces; both clouds share the same colormap —
+// a distinct-colour overlay is a renderer follow-up). Used to eyeball whether the
+// camera cloud sits on the LiDAR surface (calibrated) or floats off it.
+function renderSceneUnion(id, live) {
+  if (!voxelView || id !== selectedRobotId || !voxelView.setMapPoints) return;
+  const a = live.lastScenePoints;
+  const an = live.lastSceneCount | 0;
+  const b = (live.depthOn && live.lastDepthPoints) ? live.lastDepthPoints : null;
+  const bn = b ? (live.lastDepthCount | 0) : 0;
+  let pts;
+  let cnt;
+  if (a && b) {
+    pts = new Float32Array(a.length + b.length);
+    pts.set(a, 0);
+    pts.set(b, a.length);
+    cnt = an + bn;
+  } else if (a) {
+    pts = a;
+    cnt = an;
+  } else if (b) {
+    pts = b;
+    cnt = bn;
+  } else {
+    // Neither cloud present (e.g. depth overlay turned off before any LiDAR
+    // snapshot) — clear the renderer so stale geometry never lingers.
+    pts = new Float32Array(0);
+    cnt = 0;
+  }
+  try {
+    voxelView.setMapPoints(pts, cnt);
+    applyRobotPose(id);
+  } catch (e) {
+    console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
+  }
+}
+
+// Toggle the camera-depth calibration overlay: subscribe/unsubscribe `scene:<id>-depth`
+// and re-render. Off clears the stashed depth cloud so it stops being unioned.
+function handleDepthToggle(id, on) {
+  const live = lidarLive.get(id);
+  if (!live) {
+    // No live scene subscription to overlay onto — reset the control so it can't
+    // sit visually "on" with nothing behind it.
+    const t = byId('robots-detail')?.querySelector('[data-depth-toggle]');
+    if (t) t.removeAttribute('checked');
+    return;
+  }
+  live.depthOn = !!on;
+  if (on) {
+    if (!live.depthSceneUnsub) openDepthSceneSubscription(id, live);
+  } else {
+    if (live.depthSceneUnsub) {
+      try { live.depthSceneUnsub(); } catch { /* ignore */ }
+      live.depthSceneUnsub = null;
+    }
+    live.lastDepthPoints = null;
+    live.lastDepthCount = 0;
+  }
+  renderSceneUnion(id, live);
+}
+
+// Reset the depth overlay to OFF after a subscribe error / terminal end so the
+// toggle reflects reality (not stuck "on") and a later toggle can retry. Clears the
+// stashed cloud, re-renders (LiDAR-only / empty), and resyncs the toggle UI.
+function resetDepthOverlay(id, live) {
+  if (lidarLive.get(id) !== live) return;
+  live.depthOn = false;
+  live.depthSceneUnsub = null;
+  live.lastDepthPoints = null;
+  live.lastDepthCount = 0;
+  renderSceneUnion(id, live);
+  refreshLidarUi(id);
+}
+
+// Subscribes to `scene-depth:<id>` (the camera-reconstructed cloud). Mirrors
+// openSceneSubscription's deferred-unsub guard.
+function openDepthSceneSubscription(id, live) {
+  const pending = { disposed: false };
+  live.depthSceneUnsub = () => { pending.disposed = true; };
+  ApiBinary.subscribe(
+    'streamSubscribeRequest',
+    { streamId: `scene-depth:${id}` },
+    {
+      onChunk: (body) => onDepthSceneChunk(id, live, body),
+      onEnd: () => { if (!pending.disposed) resetDepthOverlay(id, live); },
+      onError: (err) => {
+        console.warn('[robots] depth-scene subscribe error:', err?.message ?? err);
+        if (!pending.disposed) resetDepthOverlay(id, live);
+      },
+    },
+  )
+    .then((unsub) => {
+      if (pending.disposed || !lidarLive.has(id) || lidarLive.get(id) !== live) {
+        try { unsub(); } catch { /* ignore */ }
+        return;
+      }
+      live.depthSceneUnsub = () => {
+        pending.disposed = true;
+        try { unsub(); } catch (e) { console.warn('[robots] depth-scene unsub threw:', e); }
+      };
+    })
+    .catch((err) => {
+      console.warn('[robots] depth-scene subscribe failed:', err?.message ?? err);
+      // Only the CURRENT attempt may reset shared state — a stale promise that
+      // rejects after an off/on toggle must not clobber the newer subscription.
+      if (!pending.disposed) resetDepthOverlay(id, live);
+    });
 }
 
 // A pushed frame: decode the RAW canonical bytes, update live counters + timing,
@@ -2385,6 +2540,10 @@ function closeLidarSubscription(id, live) {
   if (live.sceneUnsub) {
     try { live.sceneUnsub(); } catch { /* ignore */ }
     live.sceneUnsub = null;
+  }
+  if (live.depthSceneUnsub) {
+    try { live.depthSceneUnsub(); } catch { /* ignore */ }
+    live.depthSceneUnsub = null;
   }
 }
 

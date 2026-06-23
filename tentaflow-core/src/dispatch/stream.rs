@@ -36,6 +36,11 @@ const LIDAR_PREFIX: &str = "lidar:";
 /// Stream-id prefix for a robot's server-side accumulated SHARED MAP
 /// (`scene:<robot_id>`). Gated by the same `robot.telemetry` grant as `lidar:`.
 const SCENE_PREFIX: &str = "scene:";
+/// Stream-id prefix for the CAMERA depth-reconstructed cloud of a robot, kept
+/// separate from its LiDAR map for calibration (`scene-depth:<robot_id>`). The
+/// id carries the BASE robot id (e.g. `go2`); it authorizes against that robot but
+/// streams the internal `scene:<robot_id>-depth` map the depth loop writes.
+const SCENE_DEPTH_PREFIX: &str = "scene-depth:";
 /// Permission required for `lidar:` stream ids. Reuses the SAME read grant the
 /// `RobotAction::LidarFrame` capability requires, so the pushed point cloud is
 /// gated exactly like the small lidar status — there is no separate `lidar.read`.
@@ -231,7 +236,9 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         // So for `lidar:` we coalesce to the newest buffered frame and drop on
         // backpressure. Camera fMP4 stays strictly lossless (MSE byte-stream
         // continuity breaks if a media segment is skipped).
-        let lossy = stream_id.starts_with(LIDAR_PREFIX) || stream_id.starts_with(SCENE_PREFIX);
+        let lossy = stream_id.starts_with(LIDAR_PREFIX)
+            || stream_id.starts_with(SCENE_PREFIX)
+            || stream_id.starts_with(SCENE_DEPTH_PREFIX);
         let final_reason = loop {
             match receiver.recv().await {
                 Ok(mut chunk) => {
@@ -679,6 +686,47 @@ fn enforce_scene_subscribe(ctx: &HandlerContext, robot_id: &str) -> Result<Strin
     Ok(register_local_scene_source(robot_id))
 }
 
+/// Authorize a CAMERA depth-cloud subscription. `robot_id` is the BASE robot
+/// (e.g. `go2`) — validated like a normal scene subscribe (registered, local,
+/// `robot.telemetry`) — but the registered source is the `<robot_id>-depth` map the
+/// depth-mapping loop writes, so the camera cloud streams separately from the LiDAR
+/// map for side-by-side calibration.
+fn enforce_scene_depth_subscribe(
+    ctx: &HandlerContext,
+    robot_id: &str,
+) -> Result<String, ProtocolError> {
+    if robot_id.is_empty() {
+        return Err(ProtocolError::bad_request("stream_id missing robot id"));
+    }
+    let org = ctx.org_context.as_ref().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+    })?;
+    if !org.has(PERM_ROBOT_TELEMETRY) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "robot.telemetry permission required",
+        ));
+    }
+    let local_node_id = ctx.state.local_node_id.to_string();
+    let robot = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .find(|r| r.org_id == org.org_id && r.robot_id == robot_id)
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!(
+                "stream_not_registered: {}{}",
+                SCENE_DEPTH_PREFIX, robot_id
+            ))
+        })?;
+    if robot.node_id != local_node_id {
+        return Err(ProtocolError::not_found(format!(
+            "stream_not_registered: {}{}",
+            SCENE_DEPTH_PREFIX, robot_id
+        )));
+    }
+    Ok(register_local_scene_source(&format!("{robot_id}-depth")))
+}
+
 /// Authorize a subscribe and resolve the INTERNAL StreamHub key to subscribe
 /// under. For local cameras (and the no-camera build) this is the bare public
 /// `stream_id`; for a remote relay it is the org/owner-scoped key returned by
@@ -689,6 +737,9 @@ fn enforce_subscribe_permission(
 ) -> Result<String, ProtocolError> {
     if let Some(rest) = stream_id.strip_prefix(LIDAR_PREFIX) {
         return enforce_lidar_subscribe(ctx, rest);
+    }
+    if let Some(rest) = stream_id.strip_prefix(SCENE_DEPTH_PREFIX) {
+        return enforce_scene_depth_subscribe(ctx, rest);
     }
     if let Some(rest) = stream_id.strip_prefix(SCENE_PREFIX) {
         return enforce_scene_subscribe(ctx, rest);
