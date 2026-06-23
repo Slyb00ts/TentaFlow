@@ -68,3 +68,21 @@ repo = "Intel/dpt-large"
 id = "midas-dpt-hybrid"
 display_name = "MiDaS — DPT Hybrid"
 repo = "Intel/dpt-hybrid-midas"
+
+# METRYCZNE modele — zwracają głębię w METRACH, więc chmura punktów jest od razu
+# kompatybilna z lidarem. WYMAGANE do budowy wspólnej mapy z kamery (depth_mapping).
+# `is_metric` wykrywany po nazwie repo ("metric"/"zoedepth").
+[[model_preset]]
+id = "depth-anything-v2-metric-indoor-large"
+display_name = "Depth Anything V2 Metric — Indoor Large (mapa wewnątrz)"
+repo = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+
+[[model_preset]]
+id = "depth-anything-v2-metric-outdoor-large"
+display_name = "Depth Anything V2 Metric — Outdoor Large (mapa na zewnątrz)"
+repo = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"
+
+[[model_preset]]
+id = "zoedepth-nyu-kitti"
+display_name = "ZoeDepth NYU+KITTI (metryczny)"
+repo = "Intel/zoedepth-nyu-kitti"

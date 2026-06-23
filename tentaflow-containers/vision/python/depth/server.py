@@ -26,8 +26,9 @@ from transformers import pipeline
 
 # Repo HF wybierane przez deploy (preset → env MODEL). Domyślnie DA V3 Large.
 MODEL = os.environ.get("MODEL", "depth-anything/Depth-Anything-V3-Large-hf")
-# Modele metryczne (np. *-metric-*) zwracają metry; pozostałe — głębię względną.
-IS_METRIC = "metric" in MODEL.lower()
+# Modele metryczne (Depth Anything V2/V3 *-Metric-*, ZoeDepth) zwracają metry;
+# pozostałe — głębię względną. Mapowanie z kamery wymaga modelu metrycznego.
+IS_METRIC = any(k in MODEL.lower() for k in ("metric", "zoedepth"))
 
 _DATA_URL_RE = re.compile(r"^data:[^;,]*(;base64)?,(?P<payload>.*)$", re.DOTALL)
 
