@@ -59,18 +59,25 @@ repo = "Intel/dpt-hybrid-midas"
 # METRYCZNE modele — zwracają głębię w METRACH, więc chmura punktów jest od razu
 # kompatybilna z lidarem. WYMAGANE do budowy wspólnej mapy z kamery (depth_mapping).
 # `is_metric` wykrywany po nazwie repo ("metric"/"zoedepth").
+#
+# Wybór indoor vs outdoor: ZoeDepth NK (NYU+KITTI) ma WBUDOWANY router domeny i
+# sam dobiera głowicę indoor/outdoor — dlatego jest DOMYŚLNY (serwis i zewnętrzny
+# integrator NIE muszą z góry wiedzieć, czy scena jest w środku czy na zewnątrz,
+# a robot może wchodzić/wychodzić). Domenowe DA V2 Metric Indoor/Outdoor dają
+# WIĘKSZĄ dokładność, ale TYLKO gdy z góry znasz scenę (stały robot w hali / znana
+# integracja) — w złej domenie skala jest błędna.
 [[model_preset]]
-id = "depth-anything-v2-metric-indoor-large"
-display_name = "Depth Anything V2 Metric — Indoor Large (mapa wewnątrz)"
-repo = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+id = "zoedepth-nyu-kitti"
+display_name = "ZoeDepth NYU+KITTI (metryczny, auto indoor/outdoor)"
+repo = "Intel/zoedepth-nyu-kitti"
 recommended = true
 
 [[model_preset]]
-id = "depth-anything-v2-metric-outdoor-large"
-display_name = "Depth Anything V2 Metric — Outdoor Large (mapa na zewnątrz)"
-repo = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"
+id = "depth-anything-v2-metric-indoor-large"
+display_name = "Depth Anything V2 Metric — Indoor Large (tylko wnętrza)"
+repo = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 
 [[model_preset]]
-id = "zoedepth-nyu-kitti"
-display_name = "ZoeDepth NYU+KITTI (metryczny)"
-repo = "Intel/zoedepth-nyu-kitti"
+id = "depth-anything-v2-metric-outdoor-large"
+display_name = "Depth Anything V2 Metric — Outdoor Large (tylko zewnątrz)"
+repo = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"
