@@ -84,12 +84,6 @@ vector-milvus = ["dep:milvus-sdk-rust"]
 # (runda 2 codex bug #1).
 graph = ["dep:cozo"]
 graph-rocksdb = ["graph", "cozo/storage-rocksdb"]
-# RAG E1.4 — rasteryzacja PDF → obrazy stron dla doc_parse. Opt-in (NIE w
-# default), bo pociąga libpdfium (native-libs/lib-dynamic, ładowany runtime'em
-# przez bind_to_library) i nie buduje się na targetach bez prebuilt pdfium
-# (mobile). `pdfium-render` z default-features=false + `pdfium_latest` nie
-# wymaga bindgen/clang przy buildzie. Współdzieli `image` 0.25 z resztą core.
-pdf = ["dep:pdfium-render"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -266,11 +260,13 @@ genpdf = "0.2"
 # Docker (optional)
 bollard = { version = "0.21.0", optional = true }
 
-# RAG E1.4 — rasteryzacja PDF (feature `pdf`). Dynamiczne ładowanie libpdfium
-# w runtime (bind_to_library) — brak feature `static` => bez bindgen/clang.
-# Features jak w spike _scratch/pdf-spike: `pdfium_latest` (najnowsze ABI),
-# `image_025` (zgodne z naszym `image` 0.25), `thread_safe` (mutex wokół FFI).
-pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"], optional = true }
+# RAG E1.4 — rasteryzacja PDF. BEZWARUNKOWE (PDF musi działać na każdym
+# urządzeniu). Dynamiczne ładowanie libpdfium w runtime (bind_to_library) —
+# brak feature `static` => bez bindgen/clang przy buildzie, więc kompiluje się
+# na każdym targecie (w tym mobile); libpdfium dostarcza native-libs per-platforma.
+# Features: `pdfium_latest` (najnowsze ABI), `image_025` (zgodne z `image` 0.25),
+# `thread_safe` (mutex wokół FFI).
+pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
 
 # Camera ingest — GStreamer 1.x Rust bindings (optional, feature `camera`).
 # Version 0.23 chosen over plan's 0.21: 0.21 is from 2024 and lacks fixes

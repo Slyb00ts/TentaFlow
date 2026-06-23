@@ -84,6 +84,9 @@ build_platform() {
 
   run_step zvec "$SCRIPT_DIR/build-zvec.sh" "$platform"
   run_step llama-cpp "$SCRIPT_DIR/build-llama-cpp.sh" "$platform"
+  # pdfium (rasteryzacja PDF w RAG) — prebuilt dla każdej platformy (linux/macos/
+  # android/ios). PDF musi działać na każdym urządzeniu, więc krok bezwarunkowy.
+  run_step pdfium "$SCRIPT_DIR/build-pdfium.sh" "$platform"
   case "$platform" in
     ios-*)
       run_step sherpa-onnx "$SCRIPT_DIR/build-sherpa-onnx.sh" "$platform"
