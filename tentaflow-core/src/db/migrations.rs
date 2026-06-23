@@ -1444,6 +1444,39 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              reference an account the receiving node has not materialized yet",
         ),
         t(
+            "skill_curator_snapshots",
+            "created_by",
+            "creator provenance marker born TEXT (post-flip, never held an INTEGER \
+             id); nullable, no user_accounts FK. Node-local maintenance audit trail, \
+             not synced, so it never needs the identity remap",
+        ),
+        t(
+            "camera_grants",
+            "created_by",
+            "granting ADDON id (e.g. 'go2'), not a user_accounts FK; born TEXT in \
+             v81 (post-flip), never held an INTEGER id",
+        ),
+        t(
+            "api_keys",
+            "subject_id",
+            "polymorphic user|group id discriminated by key_type (NULL for 'general'), \
+             not a single-table FK; born TEXT in v82 (rows wiped on the rebuild, \
+             never held an INTEGER id)",
+        ),
+        t(
+            "token_usage_daily",
+            "user_id",
+            "usage-counter key born TEXT in v86 (post-flip, never held an INTEGER id); \
+             no declared user_accounts FK — synced metric rows may reference an account \
+             a receiving node has not materialized yet",
+        ),
+        t(
+            "token_quota",
+            "subject_id",
+            "polymorphic quota subject discriminated by scope_type (NULL for org-wide), \
+             not a single-table FK; born TEXT in v86 (post-flip, never held an INTEGER id)",
+        ),
+        t(
             "agents",
             "flow_id",
             "agent harness flow id (flows.id is TEXT UUID); born TEXT in v64, no declared \
@@ -1946,6 +1979,12 @@ fn repair_admin_non_uuid_id(conn: &Connection, version: i64, name: &str) -> Resu
             if !table_exists(&tx, remap.table)? {
                 continue;
             }
+            // A later table rebuild may have dropped a still-listed child column
+            // (e.g. v82 rebuilt `api_keys` without `owner_user_id`). Nothing to
+            // remap then — skip rather than fail on a missing column.
+            if !column_exists(&tx, remap.table, remap.column)? {
+                continue;
+            }
             tx.execute(
                 &format!(
                     "UPDATE {} SET {} = ?1 WHERE {} = '1'",
@@ -2049,6 +2088,10 @@ fn repair_default_flow_random_id(conn: &Connection, version: i64, name: &str) ->
                 continue;
             }
             if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            // Skip a still-listed child column dropped by a later table rebuild.
+            if !column_exists(&tx, remap.table, remap.column)? {
                 continue;
             }
             tx.execute(
@@ -2333,6 +2376,10 @@ fn scan_untyped_orphans(
 
     for remap in child_remaps() {
         if !table_exists(conn, remap.table)? {
+            continue;
+        }
+        // Skip a still-listed child column dropped by a later table rebuild.
+        if !column_exists(conn, remap.table, remap.column)? {
             continue;
         }
         // Skip children the engine already checks via their REFERENCES clause.
