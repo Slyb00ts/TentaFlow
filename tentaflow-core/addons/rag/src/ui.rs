@@ -16,7 +16,7 @@
 use serde_json::{json, Value as JsonValue};
 
 use tentaflow_sdk_spec::protocol::control::CborMap;
-use tentaflow_sdk_spec::protocol::ui::a11y::EventKind;
+use tentaflow_sdk_spec::protocol::ui::a11y::{Accessibility, EventKind};
 use tentaflow_sdk_spec::protocol::ui::actions::Button;
 use tentaflow_sdk_spec::protocol::ui::bind::{BindRef, PathSegment, StatePath};
 use tentaflow_sdk_spec::protocol::ui::component::{Component, HandlerMap};
@@ -225,6 +225,17 @@ fn lit(text: &str) -> BindRef {
 
 fn bound(key: &str) -> BindRef {
     BindRef::Bound(state_path(key))
+}
+
+/// Nadaje komponentowi dostepna nazwe (ARIA label) przez pole `a11y`. Renderer
+/// wymaga jej dla pol formularza bez widocznego `label` (inaczej `tf-input`/`tf-select`
+/// odrzucaja caly SlotContent z bledem "without 'label' field requires a11y.label").
+fn with_a11y_label(mut c: Component, label: &str) -> Component {
+    c.a11y = Some(Accessibility {
+        label: Some(lit(label)),
+        ..Accessibility::default()
+    });
+    c
 }
 
 // =============================================================================
@@ -548,6 +559,7 @@ fn sidebar_view() -> Component {
             on_failure: FailurePolicy::Toast,
         },
     )]));
+    let search = with_a11y_label(search, "Szukaj bazy wiedzy");
 
     let collections = list_collections_data();
     let filter = sidebar_filter();
@@ -781,6 +793,7 @@ fn workspace_header() -> Component {
         EventKind::Change,
         "set-graph-enabled",
     )]));
+    let graph_toggle = with_a11y_label(graph_toggle, "Baza grafowa");
 
     let delete = action_button(
         "ws-delete",
@@ -900,6 +913,7 @@ fn chat_view() -> Component {
         set_field_handler(EventKind::Change, SP_CHAT_INPUT),
         set_field_handler(EventKind::Submit, SP_CHAT_INPUT),
     ]));
+    let input = with_a11y_label(input, "Tresc pytania");
 
     let send = action_button(
         "chat-send",
