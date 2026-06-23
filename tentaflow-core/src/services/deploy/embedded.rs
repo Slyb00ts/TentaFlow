@@ -86,6 +86,53 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
+        // Apple Vision OCR (`apple-ocr`) nie jest tract `LoadedEngine` ani
+        // camera-CV bundlem — to systemowy silnik bez modelu na dysku. Deploy
+        // rejestruje go jako globalny in-process OCR runner (set_ocr_runner),
+        // analogicznie do apple-tts ladowanego do shared_tts_manager. Brak
+        // libMLXBridge.dylib zglasza blad tutaj, zanim usluga bedzie RUNNING.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if engine_id == "apple-ocr" {
+            tokio::task::spawn_blocking(crate::vision::apple_ocr::register_as_ocr_runner)
+                .await
+                .map_err(|e| DeployError::Other(format!("apple-ocr register task: {e}")))?
+                .map_err(|e| DeployError::Other(format!("load embedded OCR 'apple-ocr': {e:#}")))?;
+            if let Some(s) = &self.log_sink {
+                s.info("[vision] apple-ocr registered as in-process OCR runner");
+            }
+            return Ok(());
+        }
+
+        // PP-OCRv5 (`onnx-ocr`) — embedded OCR runner dla nie-Apple. Najpierw
+        // pobieramy bundle (det/rec/cls/dict) do vision_models_dir(), potem
+        // rejestrujemy silnik tract jako globalny in-process OCR runner przez
+        // set_ocr_runner (mirror apple-ocr). Niedostepne modele/slownik zglaszaja
+        // blad tutaj, zanim usluga bedzie RUNNING.
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        if engine_id == "onnx-ocr" {
+            let base_url = self
+                .manifest
+                .model_presets
+                .iter()
+                .map(|p| p.repo.clone())
+                .find(|r| r.starts_with("http"))
+                .unwrap_or_default();
+            crate::vision::camera_cv_models::ensure_onnx_ocr_bundle(
+                &base_url,
+                self.log_sink.as_ref(),
+            )
+            .await
+            .map_err(|e| DeployError::Other(format!("onnx-ocr bundle: {e:#}")))?;
+            tokio::task::spawn_blocking(crate::vision::onnx_ocr::register_as_ocr_runner)
+                .await
+                .map_err(|e| DeployError::Other(format!("onnx-ocr register task: {e}")))?
+                .map_err(|e| DeployError::Other(format!("load embedded OCR 'onnx-ocr': {e:#}")))?;
+            if let Some(s) = &self.log_sink {
+                s.info("[vision] onnx-ocr registered as in-process OCR runner");
+            }
+            return Ok(());
+        }
+
         let kind = crate::vision::VisionEngineKind::from_id(&engine_id).ok_or_else(|| {
             DeployError::Manifest(format!(
                 "vision engine '{}' is not registered in runtime",
@@ -699,6 +746,14 @@ impl DeployStrategy for EmbeddedDeploy {
         for key in &self.registered_vision_keys {
             crate::vision::unregister_engine(key);
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.manifest.engine.id == "apple-ocr" {
+            crate::vision::apple_ocr::unregister_as_ocr_runner();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        if self.manifest.engine.id == "onnx-ocr" {
+            crate::vision::onnx_ocr::unregister_as_ocr_runner();
+        }
         Ok(())
     }
 }
@@ -807,6 +862,7 @@ mod tests {
                 speculator_method: None,
                 speculator_num_tokens: None,
                 vllm: None,
+                checkpoint_file: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

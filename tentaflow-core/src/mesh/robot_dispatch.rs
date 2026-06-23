@@ -191,6 +191,17 @@ pub struct RobotTelemetrySnapshot {
     pub imu: Option<RobotImuSnapshot>,
     #[serde(default)]
     pub battery: Option<RobotBatterySnapshot>,
+    /// Leg joint angles (rad), Go2 order FR/FL/RR/RL × hip/thigh/calf (empty absent).
+    /// APPENDED LAST for wire back-compat (new fields go at the end).
+    #[serde(default)]
+    pub joints: Vec<f64>,
+    /// World pose (odom frame) from the robot's lidar odometry: position [x,y,z] m.
+    /// APPENDED for wire back-compat — keep new fields after this.
+    #[serde(default)]
+    pub pose_position: Vec<f64>,
+    /// World orientation quaternion [x,y,z,w] paired with `pose_position`.
+    #[serde(default)]
+    pub pose_orientation: Vec<f64>,
 }
 
 /// One numeric parameter of a parametered robot action, with the inclusive range
@@ -271,14 +282,21 @@ pub enum RobotChange {
 #[derive(Default)]
 pub struct MeshRobotRegistry {
     /// `node_id` → that node's advertised robots. The local node's own entry is
-    /// kept here too (under the local node id) via `replace_local`.
+    /// kept here too (under the local node id) via `replace_local`. ONLINE robots
+    /// only — this is what the owner-resolver and peer pull-on-connect read.
     by_node: RwLock<HashMap<String, Vec<AdvertisedRobot>>>,
+    /// This node's configured-but-OFFLINE robots. Deliberately separate from
+    /// `by_node`: it must NOT feed owner-resolution, control routing, or peer
+    /// gossip — only the local robots-list handler merges it in so the owner can
+    /// see and open a powered-down robot it owns.
+    local_offline: RwLock<Vec<AdvertisedRobot>>,
 }
 
 impl MeshRobotRegistry {
     pub fn new() -> Self {
         Self {
             by_node: RwLock::new(HashMap::new()),
+            local_offline: RwLock::new(Vec::new()),
         }
     }
 
@@ -349,6 +367,18 @@ impl MeshRobotRegistry {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Replace this node's configured-but-offline robots (owner-local view only).
+    pub fn set_local_offline(&self, robots: Vec<AdvertisedRobot>) {
+        *self.local_offline.write() = robots;
+    }
+
+    /// This node's configured-but-offline robots — merged ONLY into the local
+    /// robots-list handler so the owner can see/open a powered-down robot. Never
+    /// used by the resolver, control routing, or peer gossip.
+    pub fn local_offline(&self) -> Vec<AdvertisedRobot> {
+        self.local_offline.read().clone()
+    }
 }
 
 /// Process-global robot registry. Self-contained (like `node_info_collector`'s
@@ -377,7 +407,13 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
     // 10 s), so a read-only tool call per owned robot is acceptable.
     let addon_manager = dispatch_context().map(|c| c.addon_manager);
     let candidates = crate::mesh::command_executor::collect_local_robot_addons(db);
+    // ONLINE robots only ever enter the shared registry + peer broadcast — the
+    // resolver and peer pull-on-connect must keep treating offline robots as
+    // non-existent (a powered-down robot must NOT make this node win ownership).
+    // Configured-but-offline robots go to a SEPARATE owner-local store
+    // (`set_local_offline`) that only this node's dashboard list reads.
     let mut robots: Vec<AdvertisedRobot> = Vec::with_capacity(candidates.len());
+    let mut offline: Vec<AdvertisedRobot> = Vec::new();
     for c in candidates {
         // Without a wired addon manager we cannot read the status tool, so we
         // cannot prove the robot is connected — do not advertise it.
@@ -385,7 +421,39 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             break;
         };
         let telemetry = read_robot_status(am, &c.addon_id, &c.package_id).await;
+        // Tenant of this robot — resolved the same way for online and offline
+        // entries (see the online push below for the full rationale).
+        let org_id = am
+            .instance_org_id(&c.addon_id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
         if !telemetry.is_online {
+            // Owner-local visibility: record the configured robot as offline so the
+            // owner's OWN dashboard can see and open it while it is powered down
+            // (status / detail review, auto-reconnect indicator). This goes to the
+            // SEPARATE owner-local store, never the shared registry — so it is
+            // never gossiped to peers AND never wins owner-resolution / control
+            // routing (which only consider online registry entries).
+            let status = if telemetry.status.is_empty() {
+                "offline".to_string()
+            } else {
+                telemetry.status
+            };
+            offline.push(AdvertisedRobot {
+                robot_id: c.addon_id,
+                package_id: c.package_id,
+                kind: c.kind,
+                node_id: local_node_id.to_string(),
+                org_id,
+                camera_id: None,
+                status,
+                battery_percent: None,
+                rtt_ms: None,
+                capabilities: Vec::new(),
+                actions_meta: Vec::new(),
+                telemetry: None,
+                lidar: None,
+            });
             continue;
         }
         // A successful online status may still omit camera_id (no camera yet);
@@ -396,16 +464,26 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             .camera_id
             .clone()
             .or_else(|| last_advertised_camera_id(&c.addon_id, local_node_id));
+        // Feed the robot's world pose into the shared SLAM scene (option B: the
+        // device's own odometry, trusted). Drives GlobalPose + marker placement; the
+        // map itself accumulates from the lidar frames at their own (faster) cadence.
+        if let Some(t) = telemetry.telemetry.as_ref() {
+            if t.pose_position.len() == 3 && t.pose_orientation.len() == 4 {
+                crate::services::slam_scene::SlamSceneManager::global().on_pose(
+                    &c.addon_id,
+                    &t.pose_position,
+                    &t.pose_orientation,
+                    now_us(),
+                );
+            }
+        }
         // Tenant of this robot, read from the running addon instance's
         // `AddonState`. A service/boot-started instance has no user org context
         // (`instance_org_id` is None), and an unscoped install carries an empty
         // org — both fall back to the default org so the robot is visible to the
         // default-org session (the same org a membership-less-default session
         // resolves to). A real multi-org install keeps its explicit org.
-        let org_id = am
-            .instance_org_id(&c.addon_id)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+        // (Resolved above for both online + offline entries.)
         robots.push(AdvertisedRobot {
             robot_id: c.addon_id,
             package_id: c.package_id,
@@ -422,7 +500,11 @@ pub async fn refresh_local_advertisement(db: &DbPool, local_node_id: &str) -> Ve
             lidar: telemetry.lidar,
         });
     }
+    // Shared registry + peer broadcast get ONLINE robots only (resolver and
+    // pull-on-connect stay online-only). Offline robots go to the owner-local
+    // store, read solely by this node's robots-list handler.
     global().replace_local(local_node_id, robots.clone());
+    global().set_local_offline(offline);
     robots
 }
 
@@ -649,6 +731,9 @@ fn parse_telemetry_snapshot(status: &serde_json::Value) -> Option<RobotTelemetry
         vyaw: vnum("vyaw"),
         position: arr("position"),
         foot_force: arr("foot_force"),
+        joints: arr("joints"),
+        pose_position: arr("pose_position"),
+        pose_orientation: arr("pose_orientation"),
         imu,
         battery,
     };
@@ -1011,6 +1096,14 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Wall-clock microseconds since the epoch (GlobalPose / pose-adopt timestamp).
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
 }
 

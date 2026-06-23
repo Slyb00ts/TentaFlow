@@ -20,6 +20,8 @@ web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "W
 # SDK spec types for UI channel CBOR encode/decode
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
 minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+# LZ4 block decode for the lidar wire body (matches the host's encoder features).
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
 
 # serde_json — for browser-side payload construction
 serde_json = "1"

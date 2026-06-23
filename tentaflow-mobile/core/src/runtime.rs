@@ -98,7 +98,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
         let services_runtime_cfg = config.services_runtime.clone();
 
         let mut excluded: HashSet<u16> = HashSet::new();
-        if let Ok(conn) = db.lock() {
+        if let Ok(conn) = db.read() {
             if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
                 for row in rows {
                     if let Some(p) = row.runtime_port {
@@ -306,6 +306,7 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
             node_id: node_id.clone(),
             role: "mobile".to_string(),
             mesh_config: config.mesh.as_ref().unwrap().clone(),
+            token_metrics: config.token_metrics.clone(),
         };
 
         match tokio::time::timeout(

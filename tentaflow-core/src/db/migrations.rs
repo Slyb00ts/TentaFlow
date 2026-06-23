@@ -464,26 +464,56 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             85,
+            "pii_rules_uuid_org_v2",
+            MigrationStep::RustSelfManaged(pii_rules_uuid_org_v2),
+        ),
+        (
+            86,
+            "token_metrics_tables",
+            MigrationStep::Sql(TOKEN_METRICS_SCHEMA),
+        ),
+        (
+            87,
+            "token_metrics_permissions",
+            MigrationStep::Rust(token_metrics_add_permissions),
+        ),
+        (
+            88,
+            "token_metrics_modalities",
+            MigrationStep::Sql(TOKEN_METRICS_MODALITIES),
+        ),
+        (
+            89,
+            "cameras_depth_mapping_columns",
+            MigrationStep::Rust(cameras_add_depth_mapping_columns),
+        ),
+        (
+            90,
+            "cameras_depth_pose_source_column",
+            MigrationStep::Rust(cameras_add_depth_pose_source_column),
+        ),
+        (
+            91,
             "addon_graph_collections",
             MigrationStep::Rust(create_addon_graph_collections),
         ),
         (
-            86,
+            92,
             "roles_add_graph_permissions",
             MigrationStep::Rust(roles_add_graph_permissions),
         ),
         (
-            87,
+            93,
             "addon_document_store_limits",
             MigrationStep::Rust(create_addon_document_store_limits),
         ),
         (
-            88,
+            94,
             "roles_add_document_permissions",
             MigrationStep::Rust(roles_add_document_permissions),
         ),
         (
-            89,
+            95,
             "scheduled_jobs_org_id",
             MigrationStep::Rust(scheduled_jobs_add_org_id_column),
         ),
@@ -584,6 +614,225 @@ CREATE INDEX IF NOT EXISTS idx_addon_graph_collections_addon
     Ok(())
 }
 
+// v88 — rozszerza per-dzienny licznik o pozostale modalnosci poza chatem LLM:
+// STT (milisekundy audio), generacja obrazow (sztuki) i embeddingi (tokeny).
+// Liczniki kumulatywne w zakresie i64 (audio_ms moze byc bardzo duze).
+const TOKEN_METRICS_MODALITIES: &str = r#"
+ALTER TABLE token_usage_daily ADD COLUMN audio_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN images INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE token_usage_daily ADD COLUMN embedding_tokens INTEGER NOT NULL DEFAULT 0;
+"#;
+
+// v87 — RBAC dla metryk tokenów. Admin/DPO dostają odczyt i zapis, operator
+// oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`.
+fn token_metrics_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["tokens.read", "tokens.write"],
+    )?;
+    roles_add_permissions(
+        conn,
+        &["org_operator", "org_viewer"],
+        &["tokens.read"],
+    )?;
+    Ok(())
+}
+
+// v86 — per-model/per-user/per-group token accounting that rides the Sync Ledger.
+// All three tables use TEXT primary keys (deterministic synthetic or UUID) so the
+// same logical row minted on different nodes never collides under an autoincrement
+// INTEGER. `token_usage_daily` is single-writer-per-row (only the owning node
+// mutates its own rows; the sum across all node rows is the global usage), while
+// quotas and leases are admin/coordinator edited and replicate LWW.
+const TOKEN_METRICS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    id                TEXT PRIMARY KEY,
+    node_id           TEXT NOT NULL,
+    org_id            TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id           TEXT NOT NULL,
+    model_id          TEXT NOT NULL,
+    usage_day         TEXT NOT NULL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    request_count     INTEGER NOT NULL DEFAULT 0,
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_token_usage_user ON token_usage_daily(org_id, user_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage_daily(org_id, model_id, usage_day);
+CREATE INDEX IF NOT EXISTS idx_token_usage_updated ON token_usage_daily(updated_at);
+
+CREATE TABLE IF NOT EXISTS token_quota (
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    scope_type       TEXT NOT NULL,
+    subject_id       TEXT,
+    model_id         TEXT,
+    period           TEXT NOT NULL,
+    max_total_tokens INTEGER NOT NULL,
+    is_active        INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, scope_type, subject_id, model_id, period)
+);
+
+CREATE TABLE IF NOT EXISTS token_lease (
+    id                  TEXT PRIMARY KEY,
+    org_id              TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    quota_id            TEXT NOT NULL,
+    node_id             TEXT NOT NULL,
+    period_key          TEXT NOT NULL,
+    base_used           INTEGER NOT NULL,
+    granted_tokens      INTEGER NOT NULL,
+    coordinator_node_id TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, quota_id, node_id, period_key)
+);
+"#;
+
+// v85 — rebuild pii_rules with a TEXT UUID primary key and an org_id column so
+// it can replicate as a per-org core sync resource. Existing INTEGER rows get a
+// fresh UUID and default to DEFAULT_ORG_ID; the name-unique index becomes a
+// (org_id, name)-unique index. Modeled on `api_keys_access_v2`.
+fn pii_rules_uuid_org_v2(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let already_done: bool = conn
+        .query_row(
+            "SELECT instr(sql, 'org_id') > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'pii_rules'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if already_done {
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_pii_rules_active;
+            DROP INDEX IF EXISTS idx_pii_rules_name_unique;
+            CREATE TABLE pii_rules_new (
+                id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                replacement TEXT NOT NULL DEFAULT '[UKRYTY]',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER DEFAULT 0,
+                description TEXT,
+                test_examples TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(org_id, name)
+            );
+            ",
+        )?;
+
+        // Carry over every existing row with a fresh UUID id and the default org.
+        let legacy: Vec<(
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = {
+            let mut stmt = tx.prepare(
+                "SELECT name, category, pattern, replacement, is_active, priority, \
+                        description, test_examples, created_at FROM pii_rules",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, String>(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (
+            rule_name,
+            category,
+            pattern,
+            replacement,
+            is_active,
+            priority,
+            description,
+            test_examples,
+            created_at,
+        ) in legacy
+        {
+            tx.execute(
+                "INSERT INTO pii_rules_new \
+                 (id, org_id, name, category, pattern, replacement, is_active, priority, description, test_examples, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    crate::services::org::DEFAULT_ORG_ID,
+                    rule_name,
+                    category,
+                    pattern,
+                    replacement,
+                    is_active,
+                    priority,
+                    description,
+                    test_examples,
+                    created_at,
+                ],
+            )?;
+        }
+
+        tx.execute_batch(
+            "
+            DROP TABLE pii_rules;
+            ALTER TABLE pii_rules_new RENAME TO pii_rules;
+            CREATE INDEX idx_pii_rules_active ON pii_rules(is_active, priority);
+            ",
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "pii_rules_uuid_org_v2: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
 // Write-behind backing store for the in-RAM `AddonStateStore` Durable tier
 // (A2). The store serves Durable entries from RAM and the periodic flusher
 // persists them here so a restart recovers them; Ephemeral entries are never
@@ -628,6 +877,46 @@ CREATE INDEX IF NOT EXISTS idx_camera_grants_camera ON camera_grants(camera_id);
 fn cameras_add_analysis_flow_id_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "analysis_flow_id")? {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN analysis_flow_id TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Adds the depth-mapping columns to `cameras`. When `depth_mapping_enabled`,
+/// the always-on depth loop pulls RGB frames, runs a metric depth model, and
+/// back-projects to a world point cloud fed into the shared SLAM map under
+/// `depth_robot_id`. `depth_camera_fov_deg` is the horizontal field of view used
+/// to derive pinhole intrinsics (no per-camera calibration table yet);
+/// `depth_fps` paces the loop (depth inference is far heavier than detection).
+/// Idempotent — each column guarded by a probe.
+fn cameras_add_depth_mapping_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_mapping_enabled")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_mapping_enabled INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !column_exists(conn, "cameras", "depth_robot_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_robot_id TEXT NULL;")?;
+    }
+    if !column_exists(conn, "cameras", "depth_camera_fov_deg")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_camera_fov_deg REAL NOT NULL DEFAULT 60.0;",
+        )?;
+    }
+    if !column_exists(conn, "cameras", "depth_fps")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_fps INTEGER NOT NULL DEFAULT 2;")?;
+    }
+    Ok(())
+}
+
+/// Adds `depth_pose_robot_id` to `cameras` — the robot whose POSE places the depth
+/// cloud, decoupled from `depth_robot_id` (where the cloud is STORED). They differ
+/// for calibration: a Go2 camera reuses the lidar robot's pose (`go2`) but stores
+/// its depth cloud under a separate id (`go2-depth`) so the two clouds can be
+/// overlaid and measured against each other. NULL ⇒ falls back to `depth_robot_id`
+/// (the merged case — a phone places and stores under its own id). Idempotent.
+fn cameras_add_depth_pose_source_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_pose_robot_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_pose_robot_id TEXT NULL;")?;
     }
     Ok(())
 }
@@ -1274,6 +1563,39 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              reference an account the receiving node has not materialized yet",
         ),
         t(
+            "skill_curator_snapshots",
+            "created_by",
+            "creator provenance marker born TEXT (post-flip, never held an INTEGER \
+             id); nullable, no user_accounts FK. Node-local maintenance audit trail, \
+             not synced, so it never needs the identity remap",
+        ),
+        t(
+            "camera_grants",
+            "created_by",
+            "granting ADDON id (e.g. 'go2'), not a user_accounts FK; born TEXT in \
+             v81 (post-flip), never held an INTEGER id",
+        ),
+        t(
+            "api_keys",
+            "subject_id",
+            "polymorphic user|group id discriminated by key_type (NULL for 'general'), \
+             not a single-table FK; born TEXT in v82 (rows wiped on the rebuild, \
+             never held an INTEGER id)",
+        ),
+        t(
+            "token_usage_daily",
+            "user_id",
+            "usage-counter key born TEXT in v86 (post-flip, never held an INTEGER id); \
+             no declared user_accounts FK — synced metric rows may reference an account \
+             a receiving node has not materialized yet",
+        ),
+        t(
+            "token_quota",
+            "subject_id",
+            "polymorphic quota subject discriminated by scope_type (NULL for org-wide), \
+             not a single-table FK; born TEXT in v86 (post-flip, never held an INTEGER id)",
+        ),
+        t(
             "agents",
             "flow_id",
             "agent harness flow id (flows.id is TEXT UUID); born TEXT in v64, no declared \
@@ -1776,6 +2098,12 @@ fn repair_admin_non_uuid_id(conn: &Connection, version: i64, name: &str) -> Resu
             if !table_exists(&tx, remap.table)? {
                 continue;
             }
+            // A later table rebuild may have dropped a still-listed child column
+            // (e.g. v82 rebuilt `api_keys` without `owner_user_id`). Nothing to
+            // remap then — skip rather than fail on a missing column.
+            if !column_exists(&tx, remap.table, remap.column)? {
+                continue;
+            }
             tx.execute(
                 &format!(
                     "UPDATE {} SET {} = ?1 WHERE {} = '1'",
@@ -1879,6 +2207,10 @@ fn repair_default_flow_random_id(conn: &Connection, version: i64, name: &str) ->
                 continue;
             }
             if !table_exists(&tx, remap.table)? {
+                continue;
+            }
+            // Skip a still-listed child column dropped by a later table rebuild.
+            if !column_exists(&tx, remap.table, remap.column)? {
                 continue;
             }
             tx.execute(
@@ -2163,6 +2495,10 @@ fn scan_untyped_orphans(
 
     for remap in child_remaps() {
         if !table_exists(conn, remap.table)? {
+            continue;
+        }
+        // Skip a still-listed child column dropped by a later table rebuild.
+        if !column_exists(conn, remap.table, remap.column)? {
             continue;
         }
         // Skip children the engine already checks via their REFERENCES clause.

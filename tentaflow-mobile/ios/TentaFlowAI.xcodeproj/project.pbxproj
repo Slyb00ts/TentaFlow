@@ -32,6 +32,8 @@
 		90187D738F58266106C4804F /* WhisperTokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AF3E069D016DA9BCC8E2468 /* WhisperTokenizer.swift */; };
 		A0000001 /* DeviceInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000002 /* DeviceInfo.swift */; };
 		A0000003 /* NativeDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000004 /* NativeDiscovery.swift */; };
+		A0000010 /* SensorBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000011 /* SensorBridge.swift */; };
+		A0000012 /* CameraEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000013 /* CameraEncoder.swift */; };
 		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* App.swift */; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
 		A1000003 /* libtentaflow_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003 /* libtentaflow_mobile.a */; };
@@ -69,6 +71,8 @@
 		6FF1F1B0AE2CC24E493179EC /* WhisperEngine.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperEngine.swift; sourceTree = "<group>"; };
 		A0000002 /* DeviceInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceInfo.swift; sourceTree = "<group>"; };
 		A0000004 /* NativeDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeDiscovery.swift; sourceTree = "<group>"; };
+		A0000011 /* SensorBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SensorBridge.swift; sourceTree = "<group>"; };
+		A0000013 /* CameraEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraEncoder.swift; sourceTree = "<group>"; };
 		A2000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A2000003 /* libtentaflow_mobile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libtentaflow_mobile.a; sourceTree = "<group>"; };
@@ -127,6 +131,8 @@
 				27E0000000000000000000C0 /* WhisperEngineBridge.swift */,
 				A0000002 /* DeviceInfo.swift */,
 				A0000004 /* NativeDiscovery.swift */,
+				A0000011 /* SensorBridge.swift */,
+				A0000013 /* CameraEncoder.swift */,
 				A2000001 /* App.swift */,
 				A2000002 /* ContentView.swift */,
 				A2000004 /* Assets.xcassets */,
@@ -253,6 +259,8 @@
 			files = (
 				A0000001 /* DeviceInfo.swift in Sources */,
 				A0000003 /* NativeDiscovery.swift in Sources */,
+				A0000010 /* SensorBridge.swift in Sources */,
+				A0000012 /* CameraEncoder.swift in Sources */,
 				A1000001 /* App.swift in Sources */,
 				275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */,
 				A3000011 /* AppleTTSEngine.swift in Sources */,

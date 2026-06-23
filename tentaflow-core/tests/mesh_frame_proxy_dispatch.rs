@@ -113,10 +113,10 @@ fn trust_each_other(sec_a: &MeshSecurity, sec_b: &MeshSecurity, id_a: &str, id_b
     let pub_a = sec_a.public_key_hex();
     let pub_b = sec_b.public_key_hex();
     sec_a
-        .add_trusted_key(id_b, &pub_b, "node-b")
+        .add_trusted_key(id_b, &pub_b, "node-b", None)
         .expect("A trusts B");
     sec_b
-        .add_trusted_key(id_a, &pub_a, "node-a")
+        .add_trusted_key(id_a, &pub_a, "node-a", None)
         .expect("B trusts A");
 }
 

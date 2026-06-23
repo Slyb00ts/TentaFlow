@@ -20,4 +20,22 @@ object NativeLib {
 
     /** Powiadomienie o niskiej pamieci */
     external fun onMemoryWarning()
+
+    /**
+     * Wpycha jedną zakodowaną KANONICZNĄ próbkę czujnika do hostowej kolejki; addon
+     * `phone` opróżnia ją co tick do silnika fuzji (ESKF) + wspólnej mapy.
+     * @param kind 1=IMU, 2=GNSS, 3=BARO, 4=DEPTH(LidarFrame) — zgodne ze SENSOR_KIND_*.
+     * @param data kanoniczne bajty little-endian (layout z tentaflow-sdk-spec).
+     */
+    external fun pushSensor(kind: Int, data: ByteArray): Boolean
+
+    /** Czyści bufor czujników (rozłączenie / pauza aplikacji). */
+    external fun clearSensors()
+
+    /**
+     * Wpycha jedną jednostkę dostępu H.264 (Annex-B) z natywnego enkodera kamery do
+     * zarejestrowanej kamery push (ten sam potok co każda kamera: kafelek MSE +
+     * skrzynka klatek dla TentaVision/AI-głębi). Kamerę rejestruje addon `phone`.
+     */
+    external fun pushCameraH264(data: ByteArray): Boolean
 }

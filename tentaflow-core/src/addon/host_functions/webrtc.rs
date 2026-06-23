@@ -164,6 +164,51 @@ fn remove_bound_camera(addon_id: &str, entry: &ChannelEntry) {
     }
 }
 
+/// Compute the local IPv4 addresses ICE is allowed to gather host candidates
+/// from, mirroring the mesh transport's interface selection so the offer only
+/// carries reachable candidates on a multi-homed host.
+///
+/// Base set: host IPv4s kept by the mesh `AddrFilterSnapshot`
+/// (`keep_transport_ip`) — honors a pinned `mesh.bind_ipv4`, else hides
+/// docker/link-local/loopback. When the peer IP is known and
+/// `prefer_same_subnet` is on, narrow to the SAME /24 as the peer; if that
+/// narrowing is non-empty use it, else fall back to the full kept set so a
+/// usable IP is never dropped. Empty result = no usable IPv4 (create() then
+/// keeps default gathering — fail open, never brick the connect).
+fn compute_ice_allowlist(
+    db: &crate::db::DbPool,
+    peer_ipv4: Option<&str>,
+) -> Vec<std::net::Ipv4Addr> {
+    use crate::mesh::network_interfaces;
+
+    let snap = network_interfaces::build_addr_filter_snapshot(db);
+    let kept: Vec<std::net::Ipv4Addr> = network_interfaces::list_interfaces()
+        .into_iter()
+        .flat_map(|iface| iface.ipv4_addrs)
+        .filter_map(|addr| addr.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| snap.keep_transport_ip(*ip))
+        .collect();
+
+    let peer = peer_ipv4.and_then(|raw| raw.parse::<std::net::Ipv4Addr>().ok());
+    if let Some(peer) = peer {
+        if network_interfaces::load_prefer_same_subnet(db) {
+            let po = peer.octets();
+            let narrowed: Vec<std::net::Ipv4Addr> = kept
+                .iter()
+                .copied()
+                .filter(|ip| {
+                    let o = ip.octets();
+                    o[0] == po[0] && o[1] == po[1] && o[2] == po[2]
+                })
+                .collect();
+            if !narrowed.is_empty() {
+                return narrowed;
+            }
+        }
+    }
+    kept
+}
+
 // =============================================================================
 // webrtc_connect_v1
 // =============================================================================
@@ -213,6 +258,14 @@ pub fn webrtc_connect_v1(
         return AbiError::QuotaExceeded.as_i32();
     }
 
+    let ice_ipv4_allowlist = compute_ice_allowlist(&caller.data().db, input.peer_ipv4.as_deref());
+    tracing::info!(
+        addon_id = %addon_id,
+        count = ice_ipv4_allowlist.len(),
+        ips = ?ice_ipv4_allowlist,
+        "webrtc: ICE IPv4 allowlist for connect"
+    );
+
     let keepalive = match (input.keepalive_text, input.keepalive_marker) {
         (Some(text), Some(marker)) if input.keepalive_interval_ms > 0 && !text.is_empty() => {
             Some(KeepaliveConfig {
@@ -230,6 +283,7 @@ pub fn webrtc_connect_v1(
         gather_timeout: Duration::from_millis(gather_ms),
         inbound_capacity: cap,
         keepalive,
+        ice_ipv4_allowlist,
     };
     let created = run_async(async { WebRtcChannel::create(cfg).await });
     let (chan, offer_sdp) = match created {

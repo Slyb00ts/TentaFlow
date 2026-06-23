@@ -1,24 +1,32 @@
 # =============================================================================
 # Plik: server.py
 # Opis: Serwer detekcji YOLOX (NVIDIA NeMo Retriever) liczacy inferencje
-#       BEZPOSREDNIO w PyTorch na GPU. Przy starcie pobiera wagi .pth dla
-#       wskazanego MODEL_REPO, buduje siec YOLOX (liczba klas odczytana z
-#       checkpointu), laduje state_dict na GPU i wystawia endpoint POST /detect
-#       zwracajacy bboxy, pewnosc i indeksy klas. Silnik WYMAGA GPU (CUDA/ROCm) —
-#       bez dostepnego GPU start jest przerywany, BEZ fallbacku CPU. onnxruntime
-#       nie jest uzywany (B300/sm_103 nie ma kerneli onnxruntime-gpu).
-# Przykład: curl -F image=@strona.png http://127.0.0.1:8086/detect
+#       BEZPOSREDNIO w PyTorch na GPU. Udostepnia kontrakt HTTP zgodny z NVIDIA
+#       NIM Object Detection. Przy starcie pobiera wagi .pth dla wskazanego
+#       MODEL_REPO, buduje siec YOLOX (liczba klas odczytana z checkpointu),
+#       laduje state_dict na GPU i wystawia POST /v1/infer zwracajacy ramki
+#       znormalizowane do [0,1] pogrupowane po NAZWIE klasy. Silnik WYMAGA GPU
+#       (CUDA/ROCm) — bez dostepnego GPU start jest przerywany, BEZ fallbacku CPU.
+#       onnxruntime nie jest uzywany (nowe GPU nie maja kerneli onnxruntime-gpu).
+# Przyklad: curl -X POST http://127.0.0.1:8086/v1/infer \
+#           -d '{"input":[{"type":"image_url","url":"data:image/png;base64,..."}]}'
 # =============================================================================
 
+import base64
+import logging
 import os
+import re
 
 import cv2
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from huggingface_hub import hf_hub_download, list_repo_files
+from pydantic import BaseModel
 from yolox.exp import get_exp
+
+logger = logging.getLogger("nemotron-yolox")
 
 # Rozmiar wejscia YOLOX dla detektorow dokumentowych NeMo Retriever.
 INPUT_SIZE = (1024, 1024)
@@ -27,6 +35,26 @@ DEFAULT_SCORE_THRESH = float(os.environ.get("SCORE_THRESHOLD", "0.3"))
 DEFAULT_NMS_THRESH = float(os.environ.get("NMS_THRESHOLD", "0.45"))
 
 BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Prefiks data-URL: "data:image/png;base64,<...>".
+_DATA_URL_RE = re.compile(r"^data:[^;,]*(;base64)?,(?P<payload>.*)$", re.DOTALL)
+
+# Autorytatywne listy nazw klas (w kolejnosci indeksow) odczytane z konfiguracji
+# w repozytoriach modeli NVIDIA (klasa Exp.labels). Wybor listy nastepuje per
+# MODEL_REPO; jesli liczba klas checkpointu nie pasuje do listy, padamy na
+# "class_<id>" i logujemy ostrzezenie (bez wywracania serwera).
+CLASS_LABELS_BY_REPO: dict[str, list[str]] = {
+    "nvidia/nemotron-page-elements-v3": [
+        "table", "chart", "title", "infographic", "text", "header_footer",
+    ],
+    "nvidia/nemotron-table-structure-v1": [
+        "border", "cell", "row", "column", "header",
+    ],
+    "nvidia/nemotron-graphic-elements-v1": [
+        "chart_title", "x_title", "y_title", "xlabel", "ylabel",
+        "other", "legend_label", "legend_title", "mark_label", "value_label",
+    ],
+}
 
 
 def _wymagaj_gpu() -> torch.device:
@@ -59,8 +87,9 @@ def _liczba_klas(state_dict: dict) -> int:
     raise ValueError("Nie udalo sie wyznaczyc liczby klas z checkpointu")
 
 
-def _zbuduj_model(repo: str, device: torch.device) -> torch.nn.Module:
+def _zbuduj_model(repo: str, device: torch.device) -> tuple[torch.nn.Module, int]:
     """Buduje siec YOLOX i laduje do niej state_dict z checkpointu .pth na GPU.
+    Zwraca model oraz liczbe klas (potrzebna do mapowania class_id -> nazwa).
 
     page-elements, graphic-elements i table-structure dziela ten sam backbone
     YOLOX-L; roznia sie tylko liczba klas, ktora odczytujemy z checkpointu.
@@ -85,7 +114,7 @@ def _zbuduj_model(repo: str, device: torch.device) -> torch.nn.Module:
     model.head.decode_in_inference = False
     model.eval()
     model.to(device)
-    return model
+    return model, liczba_klas
 
 
 def _letterbox(obraz: np.ndarray) -> tuple[np.ndarray, float]:
@@ -181,12 +210,54 @@ def _postprocess(wyjscie: np.ndarray, skala: float) -> list[dict]:
             x1, y1, x2, y2 = ramki[j].tolist()
             detekcje.append(
                 {
-                    "bbox": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
-                    "score": round(float(najlepszy_score[j]), 4),
+                    "bbox": [x1, y1, x2, y2],
+                    "score": float(najlepszy_score[j]),
                     "class_id": int(cls_id),
                 }
             )
     return detekcje
+
+
+def _wybierz_etykiety(repo: str, liczba_klas: int) -> list[str]:
+    """Dobiera liste nazw klas dla repo. Gdy liczba klas checkpointu nie zgadza
+    sie z lista referencyjna (lub repo jest nieznane), padamy na 'class_<id>' i
+    logujemy ostrzezenie — nigdy nie wywracamy serwera."""
+    etykiety = CLASS_LABELS_BY_REPO.get(repo)
+    if etykiety is not None and len(etykiety) == liczba_klas:
+        return etykiety
+    if etykiety is not None:
+        logger.warning(
+            "Liczba klas checkpointu (%d) dla %s nie pasuje do listy referencyjnej "
+            "(%d) — uzywam nazw class_<id>.",
+            liczba_klas, repo, len(etykiety),
+        )
+    else:
+        logger.warning(
+            "Nieznane MODEL_REPO '%s' — brak listy nazw klas, uzywam class_<id>.", repo
+        )
+    return [f"class_{i}" for i in range(liczba_klas)]
+
+
+def _bounding_boxes_nim(
+    detekcje: list[dict], etykiety: list[str], szer: int, wys: int
+) -> dict[str, list[dict]]:
+    """Grupuje detekcje po NAZWIE klasy i normalizuje ramki do [0,1] wzgledem
+    oryginalnego rozmiaru obrazu (format NVIDIA NIM Object Detection)."""
+    grupy: dict[str, list[dict]] = {}
+    for det in detekcje:
+        cls_id = det["class_id"]
+        nazwa = etykiety[cls_id] if 0 <= cls_id < len(etykiety) else f"class_{cls_id}"
+        x1, y1, x2, y2 = det["bbox"]
+        grupy.setdefault(nazwa, []).append(
+            {
+                "x_min": float(np.clip(x1 / szer, 0.0, 1.0)),
+                "y_min": float(np.clip(y1 / wys, 0.0, 1.0)),
+                "x_max": float(np.clip(x2 / szer, 0.0, 1.0)),
+                "y_max": float(np.clip(y2 / wys, 0.0, 1.0)),
+                "confidence": det["score"],
+            }
+        )
+    return grupy
 
 
 DEVICE = _wymagaj_gpu()
@@ -195,9 +266,34 @@ DEVICE = _wymagaj_gpu()
 MODEL_REPO = os.environ.get("MODEL_REPO") or os.environ.get("MODEL")
 if not MODEL_REPO:
     raise RuntimeError("Brak env MODEL_REPO/MODEL — nie wiadomo ktore repo modelu zaladowac.")
-MODEL = _zbuduj_model(MODEL_REPO, DEVICE)
+MODEL, LICZBA_KLAS = _zbuduj_model(MODEL_REPO, DEVICE)
+ETYKIETY = _wybierz_etykiety(MODEL_REPO, LICZBA_KLAS)
 
 app = FastAPI(title="nemotron-yolox")
+
+
+class InputImage(BaseModel):
+    type: str = "image_url"
+    url: str
+
+
+class InferRequest(BaseModel):
+    input: list[InputImage]
+
+
+def _decode_data_url(url: str) -> np.ndarray:
+    """Dekoduje data-URL (base64) lub czysty base64 do obrazu BGR (OpenCV)."""
+    dopasowanie = _DATA_URL_RE.match(url.strip())
+    payload = dopasowanie.group("payload") if dopasowanie else url.strip()
+    try:
+        surowe = base64.b64decode(payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Bledny base64 w url: {exc}")
+    bufor = np.frombuffer(surowe, dtype=np.uint8)
+    obraz = cv2.imdecode(bufor, cv2.IMREAD_COLOR)
+    if obraz is None:
+        raise HTTPException(status_code=400, detail="Nie udalo sie zdekodowac obrazu")
+    return obraz
 
 
 @app.get("/health")
@@ -205,26 +301,32 @@ def health() -> dict:
     return {
         "status": "ok",
         "model": MODEL_REPO,
+        "labels": ETYKIETY,
         "device": str(DEVICE),
         "cuda": torch.version.cuda,
         "hip": getattr(torch.version, "hip", None),
     }
 
 
-@app.post("/detect")
-async def detect(image: UploadFile = File(...)) -> dict:
-    surowe = await image.read()
-    bufor = np.frombuffer(surowe, dtype=np.uint8)
-    obraz = cv2.imdecode(bufor, cv2.IMREAD_COLOR)
-    if obraz is None:
-        raise HTTPException(status_code=400, detail="Nie udalo sie zdekodowac obrazu")
+@app.post("/v1/infer")
+async def infer(req: InferRequest) -> dict:
+    if not req.input:
+        raise HTTPException(status_code=400, detail="Pole 'input' nie moze byc puste.")
 
-    tensor, skala = _preprocess(obraz, DEVICE)
-    with torch.no_grad():
-        wyjscie = MODEL(tensor)
-    wyjscie = wyjscie.detach().to("cpu", dtype=torch.float32).numpy()
-    detekcje = _postprocess(wyjscie, skala)
-    return {"detections": detekcje, "image_size": [obraz.shape[1], obraz.shape[0]]}
+    data = []
+    for indeks, wejscie in enumerate(req.input):
+        obraz = _decode_data_url(wejscie.url)
+        wys, szer = obraz.shape[0], obraz.shape[1]
+        tensor, skala = _preprocess(obraz, DEVICE)
+        with torch.no_grad():
+            wyjscie = MODEL(tensor)
+        wyjscie = wyjscie.detach().to("cpu", dtype=torch.float32).numpy()
+        detekcje = _postprocess(wyjscie, skala)
+        data.append(
+            {"index": indeks, "bounding_boxes": _bounding_boxes_nim(detekcje, ETYKIETY, szer, wys)}
+        )
+
+    return {"data": data}
 
 
 if __name__ == "__main__":

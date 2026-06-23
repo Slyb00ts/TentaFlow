@@ -927,6 +927,13 @@ pub const MESH_MSG_ROBOTS_UPDATE: u8 = 0x51;
 /// NOT a UFP/2 channel kind — it never travels as a UFP/2 unicast envelope, so
 /// the channel-kind range is untouched (see `ufp2/discriminators.rs`).
 pub const MESH_MSG_CAMERA_STREAM_SUBSCRIBE: u8 = 0x52;
+/// Live LiDAR relay subscribe — raw bi-stream discriminator, mirror of
+/// `MESH_MSG_CAMERA_STREAM_SUBSCRIBE`. The observer (B) opens a QUIC bi-stream to
+/// the owner (A), writes `[0x53][u32 id_len][robot_id][CBOR LidarStreamSubscribePayload]`,
+/// then reads a `[u32 len][CBOR LidarStreamFrame]` loop until the stream closes.
+/// Like the camera relay this is NOT a UFP/2 channel kind — it never travels as a
+/// UFP/2 unicast envelope, so the channel-kind range is untouched.
+pub const MESH_MSG_LIDAR_STREAM_SUBSCRIBE: u8 = 0x53;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (CBOR zero-copy)
@@ -950,6 +957,35 @@ pub struct CameraStreamSubscribePayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct CameraStreamFrame {
     pub is_init: bool,
+    /// `serde_bytes` → CBOR byte string (bulk copy), not an array-of-integers
+    /// (per-element, ~100ns/byte). Same fix as `StreamFramePayload.data`: cross-node
+    /// relay of ~hundreds-of-KB frames would otherwise serialize byte-by-byte.
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// Observer→owner subscribe request body for the live LiDAR relay bi-stream.
+/// `robot_id` is the globally-unique addon-install id (== `addon_id`, single owner
+/// org); `org_id` is the caller's tenant. Both ends enforce org scope: the
+/// observer resolves the owner via `remote_lidar_owner` (org match) and the owner
+/// re-verifies the robot is advertised by itself in this org before serving.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct LidarStreamSubscribePayload {
+    pub robot_id: String,
+    pub org_id: String,
+}
+
+/// One frame on the LiDAR relay bi-stream. Carries the raw canonical L1 frame
+/// bytes (36-byte little-endian `LidarFrameHeader` + packed f32). Unlike the
+/// camera relay there is NO `is_init` flag: LiDAR frames are self-describing, so
+/// every frame is a complete, independently renderable point cloud and the
+/// observer simply treats the latest received frame as its dynamic init segment.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct LidarStreamFrame {
+    /// `serde_bytes` → CBOR byte string (bulk copy), not an array-of-integers.
+    /// Same root-cause fix as `StreamFramePayload.data` / `CameraStreamFrame.data`:
+    /// a ~300KB canonical cloud relayed cross-node must not serialize byte-by-byte.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
@@ -975,6 +1011,12 @@ pub struct KeyRotationResponsePayload {
 pub struct TrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at` (the time the key was FIRST locally paired on the
+    /// origin node), carried so a mirror re-add does not reset the trust-expiry TTL
+    /// clock to "now". Empty when received from an un-upgraded peer (serde default),
+    /// in which case the receiver falls back to its own current time.
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 /// Minimal payload dla `MESH_MSG_HELLO` — tylko hostname + platform + OS.
@@ -1123,6 +1165,11 @@ pub struct PairingFirstContactRequest {
 pub struct PairingTrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+    /// Originating `approved_at`, same purpose as `TrustedKeyEntry::approved_at`:
+    /// a key propagated during first-contact pairing must not reset the receiver's
+    /// trust-expiry TTL clock. Empty from un-upgraded peers (serde default).
+    #[serde(default)]
+    pub approved_at: String,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -1417,6 +1464,14 @@ pub struct BaselineElect {
     pub node_id: String,
     pub proposed_donor: String,
     pub epoch_seen: u64,
+    /// Number of ledger operations the sender (the dialing node) currently holds.
+    /// The donor side uses it to settle the role data-aware: the node with MORE
+    /// content is the donor, so an empty node that dials a data-holder is told it
+    /// is the joiner (it adopts), never the other way round — which would wipe the
+    /// data-holder. `serde(default)` keeps the frame readable from peers that
+    /// predate this field (they decode as `0` = "no content advertised").
+    #[serde(default)]
+    pub sender_op_count: u64,
 }
 
 /// Odpowiedz donora na `BaselineElect` — akceptacja albo odrzucenie roli donora.
@@ -1862,12 +1917,14 @@ mod tests {
             node_id: "joiner-1".to_string(),
             proposed_donor: "donor-1".to_string(),
             epoch_seen: 7,
+            sender_op_count: 42,
         };
         let bytes = crate::cbor::encode(&elect).expect("encode");
         let decoded = crate::cbor::decode::<BaselineElect>(&bytes).expect("decode");
         assert_eq!(decoded.node_id, "joiner-1");
         assert_eq!(decoded.proposed_donor, "donor-1");
         assert_eq!(decoded.epoch_seen, 7);
+        assert_eq!(decoded.sender_op_count, 42);
 
         let ack = BaselineAck {
             accepted: true,

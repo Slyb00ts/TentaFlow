@@ -31,6 +31,11 @@ pub struct WebRtcConnectInput {
     pub keepalive_interval_ms: u64,
     #[n(7)]
     pub keepalive_marker: Option<String>,
+    /// Target peer's IPv4 (the robot's LAN address). The host uses it to narrow
+    /// ICE candidate gathering to the local interface on the SAME subnet as the
+    /// peer, so a multi-homed host does not advertise unreachable candidates.
+    #[n(8)]
+    pub peer_ipv4: Option<String>,
 }
 
 /// Output of `webrtc_connect_v1`.
@@ -196,6 +201,7 @@ mod tests {
             keepalive_text: Some("ping".into()),
             keepalive_interval_ms: 1000,
             keepalive_marker: Some("pong".into()),
+            peer_ipv4: Some("192.168.0.188".into()),
         };
         let mut buf = Vec::new();
         minicbor::encode(&v, &mut buf).unwrap();

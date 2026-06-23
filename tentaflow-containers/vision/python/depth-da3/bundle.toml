@@ -1,0 +1,39 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle dla Depth Anything 3 (DA3). Wymaga własnego pakietu
+#       `depth_anything_3` (git, ByteDance-Seed) + xformers + torch>=2. Instalujemy
+#       go z --no-build-isolation (widzi już zainstalowany torch). Tylko CUDA —
+#       DA3 realnie wymaga GPU. server.py wystawia POST /v1/depth + GET /health.
+# =============================================================================
+
+[bundle]
+engine = "depth-da3"
+description = "Depth Anything 3 (DA3) server — custom depth_anything_3 package (CUDA)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "huggingface_hub"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8097}"]
+internal_port = 8097
+
+[requires]
+gpu_memory_gb = 12
+disk_gb = 20
+platforms = ["linux-x86_64"]
+
+# Tylko CUDA. Domyślne wheel'e torch na Linux/Windows zawierają CUDA, więc bez
+# osobnego extra_index. DA3 to pakiet hatchling (czysto-pythonowy, NIE buduje
+# rozszerzeń CUDA i NIE importuje torch przy buildzie), więc instalujemy go z
+# NORMALNĄ izolacją builda — pip sam dociąga hatchling/hatch-vcs do środowiska
+# builda (z `--no-build-isolation` venv nie miał hatchling → build padał z exit 1).
+# `numpy<2` bo DA3 tego wymaga; `hf_transfer` jako osobny pakiet (nowy
+# huggingface_hub nie ma extra `[hf_transfer]`, a env HF_HUB_ENABLE_HF_TRANSFER=1
+# bez niego wysypuje pobieranie modelu).
+[[install_variants]]
+backend = "cuda"
+extras = ["torch>=2", "torchvision", "xformers", "pillow>=12", "numpy<2", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "huggingface_hub", "hf_transfer", "depth-anything-3 @ git+https://github.com/ByteDance-Seed/depth-anything-3@41736238f5bced4debf3f2a12375d2466874866d"]
+env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }
+install_hint = "CUDA_VISIBLE_DEVICES=0; DA3 ciągnie ciężkie zależności (open3d, pycolmap, opencv); wymaga GPU"

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Plik: llm/native/ds4/server — native launcher dla antirez/ds4 (DeepSeek V4).
+# Opis: build-on-first-run (clone + make wg platformy/backendu), pobranie wag
+#       GGUF przez ds4 download_model.sh, exec ds4-server (OpenAI-compatible).
+#       Spawnowany przez BinaryDeploy z env: PORT, MODEL (target download_model.sh),
+#       DS4_BACKEND, DS4_CTX, DS4_SSD_STREAMING, DS4_SSD_CACHE_EXPERTS, DS4_MTP,
+#       DS4_MTP_DRAFT, DS4_POWER, DS4_THREADS, HF_TOKEN, HF_HOME.
+# =============================================================================
+
+set -eo pipefail
+
+log() { echo "[ds4] $*"; }
+
+# Persistent build/model cache (NIE w drzewie kontenerów — to się czyści przy
+# re-ekstrakcji). XDG cache albo HOME.
+DS4_HOME="${DS4_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow/ds4}"
+SRC_DIR="$DS4_HOME/src"
+GGUF_DIR="${DS4_GGUF_DIR:-$DS4_HOME/gguf}"
+DS4_REF="${DS4_REF:-main}"
+mkdir -p "$DS4_HOME" "$GGUF_DIR"
+
+# --- Backend autodetekcja -----------------------------------------------------
+BACKEND="${DS4_BACKEND:-auto}"
+if [[ "$BACKEND" == "auto" ]]; then
+  case "$(uname -s)" in
+    Darwin*) BACKEND=metal ;;
+    Linux*)
+      if command -v nvcc >/dev/null 2>&1 || command -v nvidia-smi >/dev/null 2>&1; then
+        BACKEND=cuda
+      elif command -v hipcc >/dev/null 2>&1; then
+        BACKEND=rocm
+      else
+        BACKEND=cpu
+      fi
+      ;;
+    *) BACKEND=cpu ;;
+  esac
+fi
+log "backend: $BACKEND"
+
+# --- Clone / update źródeł ----------------------------------------------------
+if [[ ! -d "$SRC_DIR/.git" ]]; then
+  log "clone antirez/ds4 ($DS4_REF) → $SRC_DIR"
+  git clone https://github.com/antirez/ds4.git "$SRC_DIR"
+  git -C "$SRC_DIR" checkout "$DS4_REF" || true
+else
+  git -C "$SRC_DIR" fetch --depth 1 origin "$DS4_REF" 2>/dev/null \
+    && git -C "$SRC_DIR" checkout FETCH_HEAD 2>/dev/null || true
+fi
+
+# --- Build (tylko gdy ds4-server brakuje) ------------------------------------
+SERVER_BIN="$SRC_DIR/ds4-server"
+if [[ ! -x "$SERVER_BIN" ]]; then
+  log "build ds4-server (backend=$BACKEND)"
+  case "$BACKEND" in
+    metal) make -C "$SRC_DIR" ds4-server ;;
+    cpu)   make -C "$SRC_DIR" cpu ;;
+    rocm)  make -C "$SRC_DIR" rocm ROCM_ARCH="${DS4_ROCM_ARCH:-gfx1151}" ;;
+    cuda)
+      # Explicit target/arch wygrywa. Inaczej: DGX Spark/GB10 → cuda-spark,
+      # zwykła karta CUDA → cuda-generic (CUDA_ARCH=native = arch hosta build).
+      if [[ -n "${DS4_MAKE_TARGET:-}" ]]; then
+        make -C "$SRC_DIR" "$DS4_MAKE_TARGET" ${DS4_CUDA_ARCH:+CUDA_ARCH="$DS4_CUDA_ARCH"}
+      elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -qiE 'GB10|Spark'; then
+        log "wykryto DGX Spark/GB10 → make cuda-spark"
+        make -C "$SRC_DIR" cuda-spark
+      else
+        make -C "$SRC_DIR" cuda-generic
+      fi
+      ;;
+  esac
+fi
+[[ -x "$SERVER_BIN" ]] || { log "FATAL: build nie utworzył ds4-server"; exit 1; }
+
+# --- Pobranie modelu ----------------------------------------------------------
+# MODEL = target download_model.sh (q2-imatrix / q2-q4-imatrix / q4-imatrix /
+# pro-q2-imatrix). download_model.sh linkuje ./ds4flash.gguf w repo dla tych
+# targetów. HF_TOKEN przekazujemy jawnie (repo bywa gated).
+TARGET="${MODEL:-q2-imatrix}"
+log "model target: $TARGET → $GGUF_DIR"
+DS4_GGUF_DIR="$GGUF_DIR" HF_TOKEN="${HF_TOKEN:-}" \
+  sh "$SRC_DIR/download_model.sh" "$TARGET" ${HF_TOKEN:+--token "$HF_TOKEN"}
+
+MODEL_GGUF="$SRC_DIR/ds4flash.gguf"
+[[ -e "$MODEL_GGUF" ]] || { log "FATAL: brak $MODEL_GGUF po pobraniu"; exit 1; }
+
+# --- Złóż argv ----------------------------------------------------------------
+ARGS=(-m "$MODEL_GGUF" --host 127.0.0.1 --port "${PORT:-8000}")
+
+case "$BACKEND" in
+  metal) ARGS+=(--metal) ;;
+  cuda)  ARGS+=(--cuda) ;;
+  rocm)  ARGS+=(--rocm) ;;
+  cpu)   ARGS+=(--cpu) ;;
+esac
+
+[[ -n "${DS4_CTX:-}" && "${DS4_CTX}" != "0" ]] && ARGS+=(--ctx "$DS4_CTX")
+
+# SSD streaming: on → włącz jawnie; auto/off → zostaw decyzję silnikowi (ds4
+# auto-streamuje gdy model nie mieści się w RAM). Cache experts tylko gdy podany.
+if [[ "${DS4_SSD_STREAMING:-auto}" == "on" ]]; then
+  ARGS+=(--ssd-streaming)
+  if [[ -n "${DS4_SSD_CACHE_EXPERTS:-}" && "${DS4_SSD_CACHE_EXPERTS}" != "auto" ]]; then
+    ARGS+=(--ssd-streaming-cache-experts "$DS4_SSD_CACHE_EXPERTS")
+  fi
+fi
+
+# MTP speculative decoding: pobierz komponent MTP i wskaż plik.
+if [[ "${DS4_MTP:-off}" == "on" ]]; then
+  DS4_GGUF_DIR="$GGUF_DIR" HF_TOKEN="${HF_TOKEN:-}" \
+    sh "$SRC_DIR/download_model.sh" mtp ${HF_TOKEN:+--token "$HF_TOKEN"}
+  MTP_FILE="$(ls -1 "$GGUF_DIR"/*MTP*.gguf 2>/dev/null | head -1 || true)"
+  if [[ -n "$MTP_FILE" ]]; then
+    ARGS+=(--mtp "$MTP_FILE" --mtp-draft "${DS4_MTP_DRAFT:-2}")
+  else
+    log "WARN: DS4_MTP=on ale nie znaleziono pliku MTP — pomijam"
+  fi
+fi
+
+[[ -n "${DS4_POWER:-}" && "${DS4_POWER}" != "0" ]] && ARGS+=(--power "$DS4_POWER")
+[[ -n "${DS4_THREADS:-}" && "${DS4_THREADS}" != "0" ]] && ARGS+=(--threads "$DS4_THREADS")
+
+log "exec ds4-server ${ARGS[*]}"
+exec "$SERVER_BIN" "${ARGS[@]}"

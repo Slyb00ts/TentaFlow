@@ -257,6 +257,7 @@ fn wrap_outcome_as_stream(
     use futures::stream::StreamExt;
     let payload = outcome.final_envelope.payload.clone();
     let usage = outcome.usage.clone();
+    let perf = outcome.perf;
     let finish = outcome.finish_reason.clone();
     let err = outcome.error.clone();
     let stream = futures::stream::once(async move {
@@ -293,6 +294,7 @@ fn wrap_outcome_as_stream(
                     reasoning_delta: None,
                     tool_calls: Vec::new(),
                     usage: Some(usage),
+                    perf,
                     finish_reason: Some(finish),
                     error: err,
                 }))

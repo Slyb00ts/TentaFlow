@@ -233,6 +233,21 @@ export function decodeEnvelope(bytes) {
 }
 
 /**
+ * Decode the RAW canonical LiDAR frame bytes pushed in a `StreamFrame.data`
+ * (L3a real-time PUSH stream `streamId = "lidar:<robot_id>"`) into the JS frame
+ * projection. Reuses the sdk-spec header layout via `lidar_frame_to_js`; a
+ * malformed/short frame returns `{hasFrame: false}` (no panic).
+ * @param {Uint8Array} bytes
+ * @returns {any}
+ */
+export function decodeLidarFrame(bytes) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeLidarFrame(ptr0, len0);
+    return ret;
+}
+
+/**
  * Dekoduje CBOR-zakodowany MessageBody na JS object.
  * Dla znanych variantow zwraca obiekt z polem `variant`, a dla nieznanego
  * variantu `{ variant: "Unknown" }`.
@@ -4783,6 +4798,32 @@ export function encodeRegistryListRequest() {
 }
 
 /**
+ * MessageBody::RerankBody(Request) — encoder rerankingu (Tier 1). `topN`
+ * opcjonalne (None = wszystkie dokumenty).
+ * @param {string} model
+ * @param {string} query
+ * @param {string[]} documents
+ * @param {number | null | undefined} top_n
+ * @param {boolean} return_documents
+ * @returns {Uint8Array}
+ */
+export function encodeRerankRequest(model, query, documents, top_n, return_documents) {
+    const ptr0 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(query, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArrayJsValueToWasm0(documents, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRerankRequest(ptr0, len0, ptr1, len1, ptr2, len2, isLikeNone(top_n) ? Number.MAX_SAFE_INTEGER : (top_n) >>> 0, return_documents);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
  * MessageBody::RobotsBody(CameraShareRequest) — expose a robot's camera to
  * TentaVision (local grant) or surface the remote-view note (remote robot).
  * @param {string} robot_id
@@ -4833,6 +4874,46 @@ export function encodeRobotControlRequest(robot_id, kind, vx, vy, vyaw, p1, p2, 
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
+}
+
+/**
+ * MessageBody::RobotsBody(GeoAnchorGetRequest) — read a robot's geo anchor + live
+ * real-world position.
+ * @param {string} robot_id
+ * @returns {Uint8Array}
+ */
+export function encodeRobotGeoAnchorGetRequest(robot_id) {
+    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRobotGeoAnchorGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::RobotsBody(GeoAnchorSetRequest) — pin the robot's scene origin to a
+ * real-world lat/lon/alt + heading (all `Some` = set; all `None` = clear).
+ * @param {string} robot_id
+ * @param {number | null} [lat]
+ * @param {number | null} [lon]
+ * @param {number | null} [alt]
+ * @param {number | null} [heading]
+ * @returns {Uint8Array}
+ */
+export function encodeRobotGeoAnchorSetRequest(robot_id, lat, lon, alt, heading) {
+    const ptr0 = passStringToWasm0(robot_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeRobotGeoAnchorSetRequest(ptr0, len0, !isLikeNone(lat), isLikeNone(lat) ? 0 : lat, !isLikeNone(lon), isLikeNone(lon) ? 0 : lon, !isLikeNone(alt), isLikeNone(alt) ? 0 : alt, !isLikeNone(heading), isLikeNone(heading) ? 0 : heading);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 /**
@@ -5804,6 +5885,100 @@ export function encodeTlsStatusRequest() {
 /**
  * @returns {Uint8Array}
  */
+export function encodeTokenCoordinatorStatusRequest() {
+    const ret = wasm.encodeTokenCoordinatorStatusRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} id
+ * @returns {Uint8Array}
+ */
+export function encodeTokenDeleteQuotaRequest(id) {
+    const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTokenDeleteQuotaRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeTokenListQuotasRequest() {
+    const ret = wasm.encodeTokenListQuotasRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string | null | undefined} id
+ * @param {string} scope_type
+ * @param {string | null | undefined} subject_id
+ * @param {string | null | undefined} model_id
+ * @param {string} period
+ * @param {bigint} max_total_tokens
+ * @param {boolean} is_active
+ * @returns {Uint8Array}
+ */
+export function encodeTokenUpsertQuotaRequest(id, scope_type, subject_id, model_id, period, max_total_tokens, is_active) {
+    var ptr0 = isLikeNone(id) ? 0 : passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(scope_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    var ptr2 = isLikeNone(subject_id) ? 0 : passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(model_id) ? 0 : passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(period, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTokenUpsertQuotaRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, max_total_tokens, is_active);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * @param {string} period
+ * @param {string} period_key
+ * @param {string} group_by
+ * @returns {Uint8Array}
+ */
+export function encodeTokenUsageSummaryRequest(period, period_key, group_by) {
+    const ptr0 = passStringToWasm0(period, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(period_key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(group_by, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTokenUsageSummaryRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
 export function encodeToolsCatalogRequest() {
     const ret = wasm.encodeToolsCatalogRequest();
     if (ret[3]) {
@@ -6272,6 +6447,10 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
+        __wbg_new_from_slice_0f99167330d1143b: function(arg0, arg1) {
+            const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
+            return ret;
+        },
         __wbg_new_from_slice_5a173c243af2e823: function(arg0, arg1) {
             const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
             return ret;
@@ -6462,6 +6641,11 @@ function debugString(val) {
     return className;
 }
 
+function getArrayF32FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
@@ -6473,6 +6657,14 @@ function getDataViewMemory0() {
         cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
     }
     return cachedDataViewMemory0;
+}
+
+let cachedFloat32ArrayMemory0 = null;
+function getFloat32ArrayMemory0() {
+    if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.byteLength === 0) {
+        cachedFloat32ArrayMemory0 = new Float32Array(wasm.memory.buffer);
+    }
+    return cachedFloat32ArrayMemory0;
 }
 
 function getStringFromWasm0(ptr, len) {
@@ -6595,6 +6787,7 @@ function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
     cachedDataViewMemory0 = null;
+    cachedFloat32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;

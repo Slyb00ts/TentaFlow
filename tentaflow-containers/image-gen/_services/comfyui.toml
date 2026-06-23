@@ -12,6 +12,9 @@ icon = "comfyui"
 default_port = 5000
 api = "comfyui"
 version = "0.3.10"
+service_surfaces = ["image_gen"]
+input_modalities = ["text"]
+output_modalities = ["image"]
 
 [deploy.docker]
 context_path = "image-gen/docker/comfyui"
@@ -26,5 +29,8 @@ bundle_path = "image-gen/python/comfyui"
 [[model_preset]]
 id = "sd-1-5"
 display_name = "Stable Diffusion 1.5"
-repo = "runwayml/stable-diffusion-v1-5"
+# Publiczne, niezbramkowane archiwum SD1.5 (oryginalne runwayml/ zostalo usuniete z HF).
+# checkpoint_file to plik pobierany na host i montowany w models/checkpoints kontenera.
+repo = "Comfy-Org/stable-diffusion-v1-5-archive"
+checkpoint_file = "v1-5-pruned-emaonly-fp16.safetensors"
 recommended = true

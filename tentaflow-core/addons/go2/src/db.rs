@@ -168,20 +168,23 @@ pub fn set_now_secs(secs: i64) {
     }
 }
 
-/// Current wall-clock seconds. Returns the cached tick time (zero SQL) once the
-/// service has ticked; cold callers before the first tick fall back to a
-/// one-shot host clock read and seed the cache.
+/// Current wall-clock seconds. The service instance seeds a cached tick time at
+/// the top of every `on_tick` (zero-cost atomic read on the hot path). Any
+/// instance that has NOT been tick-seeded — notably a pooled tool-call worker,
+/// which never runs `on_tick` — reads the real wall clock directly on every
+/// call. A one-shot cached read there would freeze at the worker's first call
+/// and drift arbitrarily from the service instance, making time-based watchdogs
+/// (connect / validation timeout) fire against a `last_update` stamped with a
+/// stale clock and tear down a healthy connection.
 pub fn now_secs() -> i64 {
     let cached = NOW_SECS.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
     }
-    let secs = match query("SELECT unixepoch()", &[]) {
-        Ok(rows) => rows.first().and_then(|r| r.first()).map(SqlValue::as_i64).unwrap_or(0),
-        Err(_) => 0,
-    };
-    NOW_SECS.store(secs, Ordering::Relaxed);
-    secs
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 // =============================================================================

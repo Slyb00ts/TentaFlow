@@ -285,6 +285,15 @@ pub fn audio_models_dir() -> PathBuf {
     models_root().join("audio")
 }
 
+/// Katalog checkpointow image-gen (ComfyUI) pobieranych przy deployu.
+/// Uklad: `<models_root>/image-gen/checkpoints/*.safetensors`. Montowany do
+/// `COMFYUI_CHECKPOINTS_PATH` w kontenerze, zeby ComfyUI widzial checkpoint w
+/// `models/checkpoints` od razu po starcie (inaczej `/v1/images` zwraca
+/// `ckpt_name not in []`).
+pub fn image_gen_checkpoints_dir() -> PathBuf {
+    models_root().join("image-gen").join("checkpoints")
+}
+
 /// Ensures the root and the torch subdir exist. HF creates its own `hub/`
 /// the first time a model is downloaded, so we do not pre-create it.
 pub fn ensure_models_dirs() -> std::io::Result<PathBuf> {
@@ -298,6 +307,11 @@ pub fn ensure_models_dirs() -> std::io::Result<PathBuf> {
 /// to. Kept in one place so the Dockerfile entrypoints and the deploy
 /// layer agree on it.
 pub const CONTAINER_MODELS_PATH: &str = "/data/models";
+
+/// Katalog checkpointow wewnatrz kontenera ComfyUI. ComfyUI czyta checkpointy
+/// wylacznie z `models/checkpoints` (nie z `/data/models`), wiec host-side
+/// `image_gen_checkpoints_dir()` montujemy wprost tutaj.
+pub const COMFYUI_CHECKPOINTS_PATH: &str = "/opt/ComfyUI/models/checkpoints";
 
 /// Container path that the host vLLM cache directory is mounted to. vLLM
 /// reads `VLLM_CACHE_ROOT` for compiled Triton kernels, torch.compile

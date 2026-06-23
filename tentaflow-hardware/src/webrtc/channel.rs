@@ -28,6 +28,7 @@ use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -121,6 +122,12 @@ pub struct WebRtcConfig {
     /// Optional app-level keepalive for precise RTT (replaces the unreliable
     /// transport-stats RTT when set).
     pub keepalive: Option<KeepaliveConfig>,
+    /// IPv4 addresses ICE is allowed to gather host candidates from. When
+    /// non-empty the channel restricts gathering to UDP/IPv4 on exactly these
+    /// local IPs — a multi-homed host would otherwise advertise candidates from
+    /// docker/link-local/unrelated interfaces and fail ICE against a LAN peer.
+    /// Empty = no restriction (default, so non-robot callers are unaffected).
+    pub ice_ipv4_allowlist: Vec<std::net::Ipv4Addr>,
 }
 
 impl Default for WebRtcConfig {
@@ -132,6 +139,7 @@ impl Default for WebRtcConfig {
             gather_timeout: Duration::from_secs(8),
             inbound_capacity: 2048,
             keepalive: None,
+            ice_ipv4_allowlist: Vec::new(),
         }
     }
 }
@@ -168,6 +176,20 @@ impl WebRtcChannel {
         let mut se = SettingEngine::default();
         if cfg.disable_mdns {
             se.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        }
+        // Constrain ICE gathering to the caller-chosen local IPv4s. The host
+        // computes these from the same interface-selection logic the mesh uses,
+        // so the offer only carries reachable host candidates. IPv4-UDP only
+        // eliminates the IPv6 link-local bind failures (`could not listen udp
+        // fe80::... os error 22`) on multi-homed hosts. Empty allowlist keeps
+        // default gathering for non-robot callers.
+        if !cfg.ice_ipv4_allowlist.is_empty() {
+            se.set_network_types(vec![NetworkType::Udp4]);
+            let allow = cfg.ice_ipv4_allowlist.clone();
+            se.set_ip_filter(Box::new(move |ip| match ip {
+                std::net::IpAddr::V4(v4) => allow.contains(&v4),
+                std::net::IpAddr::V6(_) => false,
+            }));
         }
 
         let api = APIBuilder::new()

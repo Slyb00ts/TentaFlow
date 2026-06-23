@@ -1,0 +1,17 @@
+[package]
+name = "tentaflow-slam"
+version = "0.1.0"
+edition = "2021"
+authors = ["TentaFlow"]
+description = "Unified SLAM core: frozen submaps + pose graph (spatial + positioning)"
+
+[dependencies]
+# SE(3) poses and linear algebra. f64 poses for global accuracy; f32 point geometry.
+nalgebra = "0.33"
+# Canonical LiDAR frame + GlobalPose wire types (shared with core + browser).
+tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
+# LZ4 block decode for compressed canonical lidar bodies (matches host encoder).
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
+
+[dev-dependencies]
+approx = "0.5"

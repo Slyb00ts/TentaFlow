@@ -77,6 +77,10 @@ impl EngineSink for StreamSink {
             is_final: token.is_final,
             finish_reason,
             error,
+            prompt_tokens: token.prompt_tokens,
+            completion_tokens: token.generated_tokens,
+            prefill_tps: token.prefill_tps,
+            completion_tps: token.completion_tps,
         };
         match self.tx.try_send(core) {
             Ok(()) => SinkStatus::Delivered,
@@ -86,6 +90,8 @@ impl EngineSink for StreamSink {
                 finish_reason: token.finish_reason,
                 generated_tokens: token.generated_tokens,
                 prompt_tokens: token.prompt_tokens,
+                prefill_tps: token.prefill_tps,
+                completion_tps: token.completion_tps,
             }),
             Err(mpsc::error::TrySendError::Closed(_)) => SinkStatus::Closed,
         }

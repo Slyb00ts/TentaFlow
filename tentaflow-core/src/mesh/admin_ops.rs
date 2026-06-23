@@ -105,26 +105,28 @@ pub fn mirror_trusted_peer_to_registry(
 /// moze trwac) i jest wznawialne przy starcie z trwalego stanu `Elected`.
 fn begin_baseline_adopt_after_confirm(
     db: &DbPool,
-    local_node_id: &str,
     remote_node_id: &str,
     quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) {
-    use crate::sync::core_baseline::{
-        begin_adopt_atomic, local_role, BaselinePhase, BaselineRole, BeginOutcome,
-    };
+    use crate::sync::core_baseline::{begin_adopt_atomic, BaselinePhase, BaselineRole, BeginOutcome};
 
     let donor_epoch = crate::sync::runtime::core_epoch();
-    let (donor, _joiner) =
-        crate::sync::core_baseline::decide_roles(local_node_id, remote_node_id, None);
-    let role = local_role(local_node_id, &donor);
 
-    // Atomowy single-flight: check+write w jednej transakcji zamiast goly zapis.
-    // Wywolywane przez OBIE strony pairingu (inicjator po confirm w
-    // `initiate_pairing`, RECEIVER po confirm w `confirm_pairing`) — kazda strona
-    // liczy te same role z `decide_roles`, wiec stan jest spojny po obu stronach.
+    // Content-aware auto-election. The old "lowest node_id is donor" rule was
+    // data-blind: a freshly installed (empty) node with a lower id was elected
+    // donor over a populated peer, so the data-holder adopted the empty baseline
+    // and lost its content. Instead BOTH sides arm as JOINER and dial the peer;
+    // the authoritative role is settled in the baseline transport, where the
+    // donor session compares ledger op counts (carried in `BaselineElect`) and
+    // serves only when it genuinely holds more content. The empty node's pull is
+    // answered with a snapshot; the data-holder's reciprocal pull is refused by
+    // the empty peer (it is not the rightful donor), so content flows one way:
+    // data-holder -> empty node. Two populated nodes auto-pairing do NOT auto-
+    // adopt (the would-be joiner's pull is refused both ways) — merging two
+    // populated nodes stays an explicit admin action (`admin_start_baseline_adopt`).
     match begin_adopt_atomic(
         db,
-        role,
+        BaselineRole::Joiner,
         remote_node_id,
         &donor_epoch,
         BaselinePhase::Elected,
@@ -139,38 +141,90 @@ fn begin_baseline_adopt_after_confirm(
             return;
         }
     }
-    match role {
-        BaselineRole::Joiner => {
-            info!(
-                peer = %remote_node_id,
-                "baseline adopt: lokalny nod jest JOINEREM — pobieram snapshot dawcy w tle"
-            );
-            if let Some(qm) = quic_mesh.clone() {
-                let donor_node_id = remote_node_id.to_string();
-                let epoch_seen = donor_epoch.counter;
-                tokio::spawn(async move {
-                    if let Err(e) = qm
-                        .pull_baseline_from_donor(&donor_node_id, epoch_seen)
-                        .await
-                    {
-                        warn!(
-                            donor = %donor_node_id,
-                            "baseline adopt: pobranie snapshotu nieudane (wznowi przy starcie): {}",
-                            e
-                        );
-                    }
-                });
-            } else {
+
+    info!(
+        peer = %remote_node_id,
+        "baseline adopt: arming as JOINER — pulling peer baseline in background (donor settled by content)"
+    );
+    if let Some(qm) = quic_mesh.clone() {
+        let donor_node_id = remote_node_id.to_string();
+        let epoch_seen = donor_epoch.counter;
+        tokio::spawn(async move {
+            pull_baseline_with_hint_retry(&qm, &donor_node_id, epoch_seen).await;
+        });
+    } else {
+        warn!(
+            peer = %remote_node_id,
+            "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
+        );
+    }
+}
+
+/// Pulls the donor baseline, retrying with backoff while the donor's contact hints
+/// have not yet been resolved. Right after pairing-confirm the donor's network address
+/// (contact hints) arrives a moment later via NodeInfo/mesh, so an immediate pull often
+/// fails with "no trusted contact hints" even though the donor is reachable seconds later.
+/// We retry SPECIFICALLY that not-yet-resolved case with a bounded backoff (~capped at
+/// roughly a minute), succeeding as soon as the hints land. Any other error (or exhausting
+/// the retries) falls through to the durable `Elected` state, which the startup resume
+/// finishes — so this only shortens the common "hints arrive late" delay, never replaces
+/// the resume fallback.
+async fn pull_baseline_with_hint_retry(
+    qm: &Arc<IrohMeshManager>,
+    donor_node_id: &str,
+    epoch_seen: u64,
+) {
+    // Backoff schedule between attempts: 2s, 4s, 8s, 16s, 16s — ~46s total wall time,
+    // bounded so a genuinely absent donor does not retry forever (startup resume covers it).
+    const BACKOFF_SECS: [u64; 5] = [2, 4, 8, 16, 16];
+    let mut attempt = 0usize;
+    loop {
+        match qm.pull_baseline_from_donor(donor_node_id, epoch_seen).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(
+                        donor = %donor_node_id,
+                        attempt = attempt + 1,
+                        "baseline adopt: pull succeeded after waiting for donor contact hints"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                // Retry transients that occur right after pairing while the iroh path is
+                // still settling: contact hints not yet resolved, OR the freshly-opened
+                // baseline stream dropping (relay->direct path switch) before/while the
+                // snapshot transfers. Both clear within seconds once the link stabilizes.
+                let es = e.to_string();
+                let retryable = es.contains("no trusted contact hints for donor")
+                    || es.contains("connection lost")
+                    || es.contains("connection reset")
+                    || es.contains("connection closed")
+                    || es.contains("ConnectionLost")
+                    || es.contains("timed out")
+                    || es.contains("timeout");
+                if retryable && attempt < BACKOFF_SECS.len() {
+                    let delay = BACKOFF_SECS[attempt];
+                    attempt += 1;
+                    info!(
+                        donor = %donor_node_id,
+                        attempt,
+                        delay_secs = delay,
+                        reason = %es,
+                        "baseline adopt: transient pull error — retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
                 warn!(
-                    peer = %remote_node_id,
-                    "baseline adopt: brak mesh managera — joiner wznowi pull przy starcie"
+                    donor = %donor_node_id,
+                    attempts = attempt + 1,
+                    "baseline adopt: pull failed (peer may be the joiner, or resume at startup): {}",
+                    e
                 );
+                return;
             }
         }
-        BaselineRole::Donor => info!(
-            peer = %remote_node_id,
-            "baseline adopt: lokalny nod jest DAWCA — odpowie na BaselineElect snapshotem"
-        ),
     }
 }
 
@@ -203,9 +257,10 @@ async fn send_pairing_bootstrap(
     if !all_keys.is_empty() {
         let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
             .iter()
-            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+            .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
                 node_id: nid.clone(),
                 public_key_hex: pk.clone(),
+                approved_at: approved_at.clone(),
             })
             .collect();
         let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
@@ -609,12 +664,7 @@ pub async fn initiate_pairing(
                         )
                     })?;
                 send_pairing_bootstrap(qm, security, &remote_hints.node_id, local_node_id).await?;
-                begin_baseline_adopt_after_confirm(
-                    &security.db,
-                    local_node_id,
-                    &remote_hints.node_id,
-                    quic_mesh,
-                );
+                begin_baseline_adopt_after_confirm(&security.db, &remote_hints.node_id, quic_mesh);
                 completed = true;
             }
             Ok(PairingAttemptOutcome::Pending) => {
@@ -743,7 +793,7 @@ pub async fn confirm_pairing(
     // durable `Elected` row that krok 2 can resume from — instead of a trusted peer
     // with no adopt state and no retry. `decide_roles` is pure, so both ends compute
     // the identical donor/joiner split.
-    begin_baseline_adopt_after_confirm(&security.db, local_node_id, remote_node_id, quic_mesh);
+    begin_baseline_adopt_after_confirm(&security.db, remote_node_id, quic_mesh);
 
     if let Some(ref qm) = quic_mesh {
         if let Some(ref hints) = pending_hints {
@@ -972,7 +1022,7 @@ mod baseline_adopt_admin_tests {
         let other_db = setup_test_db();
         let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
         security
-            .add_trusted_key(donor, &other.public_key_hex(), "donor-host")
+            .add_trusted_key(donor, &other.public_key_hex(), "donor-host", None)
             .unwrap();
         security
     }
@@ -1018,12 +1068,12 @@ mod baseline_adopt_admin_tests {
         let other_db = setup_test_db();
         let other = MeshSecurity::new(other_db, test_cipher()).unwrap();
         security
-            .add_trusted_key("donor-a", &other.public_key_hex(), "a")
+            .add_trusted_key("donor-a", &other.public_key_hex(), "a", None)
             .unwrap();
         let other_db2 = setup_test_db();
         let other2 = MeshSecurity::new(other_db2, test_cipher()).unwrap();
         security
-            .add_trusted_key("donor-b", &other2.public_key_hex(), "b")
+            .add_trusted_key("donor-b", &other2.public_key_hex(), "b", None)
             .unwrap();
 
         admin_start_baseline_adopt(&db, &security, "local-node", "donor-a", &None)

@@ -1,0 +1,40 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle dla serwisu głębi (Depth Anything V2 / ZoeDepth / MiDaS). Oba
+#       modele działają przez `transformers` `pipeline("depth-estimation")`, więc
+#       jeden server.py obsługuje wszystkie presety (MODEL = repo HF). Warianty:
+#       cuda (torch cu130) i cpu (torch CPU) — głębia działa też na CPU, wolniej.
+#       server.py wystawia POST /v1/depth + GET /health.
+# =============================================================================
+
+[bundle]
+engine = "depth"
+description = "Monocular depth estimation server (Depth Anything V2 / ZoeDepth / MiDaS via transformers)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "huggingface_hub"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8096}"]
+internal_port = 8096
+
+[requires]
+gpu_memory_gb = 4
+disk_gb = 8
+platforms = ["linux-x86_64", "windows-x86_64", "macos-arm64"]
+
+# CUDA — torch+torchvision z wheelami cu130 + transformers (depth-estimation).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub", "hf_transfer"]
+env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }
+install_hint = "CUDA_VISIBLE_DEVICES=0"
+
+# CPU — działa wszędzie (też macOS przez MPS z domyślnym torch); wolniejsze.
+[[install_variants]]
+backend = "cpu"
+extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub", "hf_transfer"]
+env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }

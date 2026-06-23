@@ -2773,11 +2773,17 @@ pub fn pii_rule_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let rules = repository::list_pii_rules(&ctx.state.db, 0, 1000).map_err(db_err)?;
+    let rules = repository::list_pii_rules(
+        &ctx.state.db,
+        crate::services::org::DEFAULT_ORG_ID,
+        0,
+        1000,
+    )
+    .map_err(db_err)?;
     let summaries: Vec<tentaflow_protocol::PiiRule> = rules
         .into_iter()
         .map(|r| tentaflow_protocol::PiiRule {
-            id: r.id.to_string(),
+            id: r.id,
             kind: r.category,
             regex: r.pattern,
             action: r.replacement,
@@ -2887,6 +2893,62 @@ pub fn vision_infer(
     };
     Ok(MessageBody::VisionBody(
         tentaflow_protocol::VisionInferPayload::InferResponse(resp),
+    ))
+}
+
+/// Rerank przez protokół binarny (Tier 1, dashboard / addony). Natywny
+/// odpowiednik REST `/v1/rerank` / `/v1/ranking`: rozwiązuje serwis o powierzchni
+/// `Rerank` i forwarduje na jego Cohere-style `/v1/rerank`. Współdzieli ścieżkę
+/// resolve+forward z handlerem REST przez `api::openai::server::rerank_forward`
+/// — zero duplikacji logiki HTTP.
+#[handler(variant = "RerankRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub async fn rerank(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::RerankBody(tentaflow_protocol::RerankExchange::Request(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request("expected RerankBody/Request"));
+        }
+    };
+
+    if payload.model.trim().is_empty() {
+        return Err(ProtocolError::bad_request("brak wymaganego pola 'model'"));
+    }
+    if payload.documents.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "lista 'documents' nie może być pusta",
+        ));
+    }
+
+    // ACL po modelu egzekwowany przez resolver (`resolve_proxy_target`) tak samo
+    // jak na ścieżce REST; tożsamość bierzemy z zalogowanej sesji.
+    let user_ctx = match &ctx.session {
+        SessionAuth::UserSession { user_id, role } => Some(crate::auth::acl::UserContext::new(
+            user_id_to_uuid(user_id),
+            role.clone().unwrap_or_else(|| "user".to_string()),
+        )),
+        _ => None,
+    };
+
+    let result = crate::api::openai::server::rerank_forward(
+        &ctx.state.router,
+        &payload.model,
+        &payload.query,
+        &payload.documents,
+        payload.top_n,
+        payload.return_documents,
+        user_ctx,
+        "rerank (binary)",
+    )
+    .await
+    .map_err(|msg| ProtocolError::internal(msg))?;
+
+    Ok(MessageBody::RerankBody(
+        tentaflow_protocol::RerankExchange::Response(result),
     ))
 }
 

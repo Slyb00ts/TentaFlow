@@ -403,6 +403,7 @@ pub async fn deploy(
             manifest.clone(),
             user_config.clone(),
             ports.clone(),
+            hf_token.clone(),
             sink.clone(),
         )),
         DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
@@ -569,6 +570,7 @@ pub async fn respawn(
             manifest,
             user_config,
             ports.clone(),
+            hf_token.clone(),
             None,
             preserved_port,
         )),
@@ -2535,6 +2537,7 @@ mod tests {
                 speculator_method: None,
                 speculator_num_tokens: None,
                 vllm: None,
+                checkpoint_file: None,
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

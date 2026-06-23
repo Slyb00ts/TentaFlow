@@ -1868,6 +1868,10 @@ pub struct WebRtcChannelConfig {
     pub keepalive_text: Option<String>,
     pub keepalive_interval_ms: u64,
     pub keepalive_marker: Option<String>,
+    /// Target peer IPv4. The host narrows ICE candidate gathering to the local
+    /// interface on the peer's subnet (matching the mesh transport selection),
+    /// avoiding ICE failures on multi-homed hosts.
+    pub peer_ipv4: Option<String>,
 }
 
 impl Default for WebRtcChannelConfig {
@@ -1881,6 +1885,7 @@ impl Default for WebRtcChannelConfig {
             keepalive_text: None,
             keepalive_interval_ms: 0,
             keepalive_marker: None,
+            peer_ipv4: None,
         }
     }
 }
@@ -1934,6 +1939,7 @@ pub fn webrtc_connect(cfg: &WebRtcChannelConfig) -> Result<(String, String), Abi
         keepalive_text: cfg.keepalive_text.clone(),
         keepalive_interval_ms: cfg.keepalive_interval_ms,
         keepalive_marker: cfg.keepalive_marker.clone(),
+        peer_ipv4: cfg.peer_ipv4.clone(),
     })?;
     let bytes = call_sql_with_one_input(webrtc_connect_v1, &payload)?;
     let out: tentaflow_sdk_spec::WebRtcConnectOutput = decode_cbor(&bytes)?;

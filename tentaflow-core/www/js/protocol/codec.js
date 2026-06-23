@@ -1071,6 +1071,44 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::RobotsBody(GeoAnchorSetRequest) — pin/clear the robot's scene
+   * origin in the real world. payload: { robotId, lat, lon, alt, heading } (all
+   * present = set; all null/undefined = clear).
+   */
+  robotGeoAnchorSetRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const num = (v) => (v == null ? undefined : Number(v));
+    const body = _wasm.encodeRobotGeoAnchorSetRequest(
+      payload.robotId,
+      num(payload.lat),
+      num(payload.lon),
+      num(payload.alt),
+      num(payload.heading),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::RobotsBody(GeoAnchorGetRequest) — read the robot's geo anchor +
+   * live real-world position. payload: { robotId }
+   */
+  robotGeoAnchorGetRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRobotGeoAnchorGetRequest(payload.robotId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Hub
   // -------------------------------------------------------------------------
@@ -1792,6 +1830,31 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::RerankBody(Request). Natywny rerank (Tier 1) — odpowiednik
+   * REST /v1/rerank. `topN` opcjonalne (pomiń = wszystkie dokumenty).
+   *
+   * @param {string} correlationId
+   * @param {{ model: string, query: string, documents: string[], topN?: number, returnDocuments?: boolean }} args
+   * @param {number} sequence
+   */
+  rerankRequest(correlationId, { model, query, documents, topN, returnDocuments }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeRerankRequest(
+      model,
+      query,
+      documents,
+      typeof topN === 'number' ? topN : undefined,
+      returnDocuments === true,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Fast-path patterns
   // -------------------------------------------------------------------------
@@ -2408,6 +2471,79 @@ export const encode = {
   schedulerJobRunNowRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(UsageSummaryRequest) — agregat zuzycia tokenow. */
+  tokenUsageSummaryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenUsageSummaryRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+      String(payload.groupBy ?? payload.group_by ?? 'user'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(ListQuotasRequest) — lista limitow org. */
+  tokenListQuotasRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenListQuotasRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(UpsertQuotaRequest) — utworz/aktualizuj limit. */
+  tokenUpsertQuotaRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const quota = payload.quota ?? payload;
+    const body = _wasm.encodeTokenUpsertQuotaRequest(
+      quota.id ?? null,
+      String(quota.scopeType ?? quota.scope_type ?? ''),
+      quota.subjectId ?? quota.subject_id ?? null,
+      quota.modelId ?? quota.model_id ?? null,
+      String(quota.period ?? 'daily'),
+      BigInt(quota.maxTotalTokens ?? quota.max_total_tokens ?? 0),
+      Boolean(quota.isActive ?? quota.is_active ?? true),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(DeleteQuotaRequest) — usun limit po id. */
+  tokenDeleteQuotaRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenDeleteQuotaRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TokenUsageBody(CoordinatorStatusRequest) — status koordynatora. */
+  tokenCoordinatorStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTokenCoordinatorStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -4375,6 +4511,19 @@ export function decodeFrame(bytes) {
 export function validateFrame(bytes) {
   assertReady();
   return _wasm.validateFrame(bytes);
+}
+
+/**
+ * Dekoduje SUROWE kanoniczne bajty klatki LiDAR niesione w `StreamFrame.data`
+ * (strumień PUSH `streamId = "lidar:<robotId>"`) do projekcji JS:
+ * `{ hasFrame, frameSeq, pointCount, layout, resolution, origin, timestampUs,
+ * raw, points }`. Layout 36-bajtowego nagłówka pochodzi z sdk-spec (jedno źródło
+ * prawdy) — JS nie powiela parsowania. Zniekształcona/za krótka klatka zwraca
+ * `{ hasFrame: false }`.
+ */
+export function decodeLidarFrame(bytes) {
+  assertReady();
+  return _wasm.decodeLidarFrame(bytes);
 }
 
 // =============================================================================

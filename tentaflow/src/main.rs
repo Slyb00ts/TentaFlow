@@ -111,6 +111,13 @@ fn main() -> Result<()> {
     let worker_threads = peek_worker_threads(&args.config);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
+    // Worker/blocking threads default to a 2 MiB stack, which the camera ingest path
+    // overflows: GStreamer/CUDA pipeline build runs SYNCHRONOUSLY on a worker (via
+    // `block_in_place`) and its deep C/glue call chain needs more — fatal in debug
+    // (larger frames) and uncomfortably tight in release. 16 MiB is reserved address
+    // space (committed lazily), so this is cheap and removes the RUST_MIN_STACK
+    // workaround for every thread the runtime spawns.
+    builder.thread_stack_size(16 * 1024 * 1024);
     if worker_threads > 0 {
         builder.worker_threads(worker_threads);
     }
@@ -200,6 +207,10 @@ async fn run_server(args: Args) -> Result<()> {
 
     info!("Konfiguracja wczytana pomyslnie");
 
+    tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
+        config.token_metrics.enabled,
+    );
+
     // Inicjalizacja bazy danych
     info!("Inicjalizacja bazy danych: {:?}", db_path);
     let db = db::init(&db_path).map_err(|e| {
@@ -242,6 +253,10 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger nie zarejestrował zaufanych nodów mesh: {}", e),
         _ => {}
     }
+
+    // Restore persisted robot geo anchors into the SLAM scene manager so robots keep
+    // their real-world georeference across restarts.
+    tentaflow_core::dispatch::robots::load_geo_anchors(&db);
 
     // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
     // iroh EndpointId z MeshSecurity.public_key_hex().
@@ -358,7 +373,7 @@ async fn run_server(args: Args) -> Result<()> {
         let _writer_handle = writer.spawn();
     }
 
-    for (node_id, public_key_hex) in mesh_security.get_all_trusted_keys() {
+    for (node_id, public_key_hex, _approved_at) in mesh_security.get_all_trusted_keys() {
         if node_id != local_node_id_str {
             mesh_peer_store.ensure_trusted_peer(&node_id, &public_key_hex, "");
         }
@@ -464,6 +479,9 @@ async fn run_server(args: Args) -> Result<()> {
     // === Phase 4 (cont.): wire the supervisor against the router's
     // `LiveHandlesCache` so reconcile() updates the same cache the routing
     // call sites read. Order matters: router first, supervisor second. ===
+    // Health-loop shutdown flag, set on graceful shutdown before stopping
+    // services so the loop does not respawn engines being torn down.
+    let mut services_supervisor_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let services_snapshot_rx_for_router: Option<
         tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
     > = if let Some(port_allocator) = services_port_allocator.clone() {
@@ -489,6 +507,10 @@ async fn run_server(args: Args) -> Result<()> {
             tracing::warn!("services supervisor: first_tick failed: {}", e);
         }
 
+        // Capture the shutdown flag BEFORE spawn() consumes the supervisor, so
+        // the graceful-shutdown path can stop the health loop before tearing
+        // down engines (otherwise the loop respawns them → orphans).
+        services_supervisor_shutdown = Some(supervisor.shutdown_flag());
         let supervisor_handle = supervisor.spawn();
         info!(
             "Services supervisor started (interval={}ms, port_range={:?})",
@@ -657,6 +679,7 @@ async fn run_server(args: Args) -> Result<()> {
                 node_id: node_id.clone(),
                 role: "router".to_string(),
                 mesh_config: mesh_config.clone(),
+                token_metrics: config.token_metrics.clone(),
             };
 
             match start_mesh_pipeline(
@@ -769,6 +792,29 @@ async fn run_server(args: Args) -> Result<()> {
                             },
                         )).await;
                         }
+
+                        // Owner-side live LiDAR relay: a trusted observer node opens
+                        // a bi-stream for `lidar:<robot_id>`; we subscribe to the
+                        // local StreamHub and pump canonical frames back. Registered
+                        // UNCONDITIONALLY (unlike the camera relay) because the LiDAR
+                        // pipeline (`services::lidar_push`/`lidar_hub`) is not behind
+                        // the `camera` feature — robots may carry LiDAR without a
+                        // camera. The closure captures this node's mesh id for the
+                        // owner-side org gate.
+                        let lidar_relay_node_id = mesh_mgr.node_id();
+                        mesh_mgr.set_lidar_stream_handler(std::sync::Arc::new(
+                            move |payload: Vec<u8>, tx: tokio::sync::mpsc::Sender<Vec<u8>>| {
+                                let local_node_id = lidar_relay_node_id.clone();
+                                Box::pin(async move {
+                                    tentaflow_core::services::lidar_relay::server::handle(
+                                        payload,
+                                        tx,
+                                        local_node_id,
+                                    )
+                                    .await;
+                                })
+                            },
+                        )).await;
 
                         if let Some(port_allocator) = services_port_allocator.clone() {
                             if let Some(executor) = mesh_mgr.command_executor().await {
@@ -939,6 +985,11 @@ async fn run_server(args: Args) -> Result<()> {
     // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB
     // dla 9B modelu) i nastepny deploy konkurowal o pamiec z poprzedniej
     // instancji.
+    // Stop the health loop FIRST so it cannot respawn the engines we are about
+    // to kill (the loop is otherwise leaked for the process lifetime).
+    if let Some(flag) = &services_supervisor_shutdown {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(ports) = services_port_allocator.clone() {
         let errors = tentaflow_core::services::deploy::stop_all_supervised(&db, ports).await;
         if !errors.is_empty() {

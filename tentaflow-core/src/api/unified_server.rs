@@ -29,9 +29,26 @@ use crate::metrics::RouterMetrics;
 use crate::routing::Router;
 use crate::services::runtime::quic_handle::ServiceManager;
 
-/// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
+/// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler.
+/// Obejmuje takze publiczna dokumentacje REST (/openapi.json, /docs i jej asety),
+/// ktora jest serwowana przez ten sam handler i — jak /health/ready — bez auth.
 pub fn is_openai_path(path: &str) -> bool {
-    path.starts_with("/v1/") || path == "/health" || path == "/ready"
+    path.starts_with("/v1/")
+        || path == "/health"
+        || path == "/ready"
+        || path == "/openapi.json"
+        || path == "/docs"
+        || path.starts_with("/docs/")
+}
+
+/// Sciezki OpenAI handlera, ktore sa publiczne i NIE wymagaja klucza API.
+/// /docs + /openapi.json sa dokumentacja (publiczna), /health + /ready to probe.
+fn is_public_openai_path(path: &str) -> bool {
+    path == "/health"
+        || path == "/ready"
+        || path == "/openapi.json"
+        || path == "/docs"
+        || path.starts_with("/docs/")
 }
 
 /// Uruchamia zunifikowany serwer HTTPS obslugujacy OpenAI API + Dashboard
@@ -376,8 +393,9 @@ pub fn start_unified_server_with_permissions(
                                 // captured for every key type so the per-key limiter
                                 // can be enforced after auth (NOT keyed by IP).
                                 let mut key_rate_limit: Option<(String, i64)> = None;
-                                // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
-                                if path != "/health" && path != "/ready" {
+                                // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz
+                                // publicznych: /health, /ready oraz dokumentacja /docs + /openapi.json)
+                                if !is_public_openai_path(&path) {
                                     let api_key = req
                                         .headers()
                                         .get("authorization")

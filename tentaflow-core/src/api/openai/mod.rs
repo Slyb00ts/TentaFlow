@@ -7,6 +7,12 @@
 
 pub mod types;
 
+pub mod anthropic;
+
+pub mod comfyui;
+
+pub mod openapi;
+
 pub mod server;
 
 pub use types::*;

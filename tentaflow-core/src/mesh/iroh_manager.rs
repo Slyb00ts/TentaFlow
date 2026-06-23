@@ -62,6 +62,19 @@ pub type CameraStreamHandler = Arc<
         + Sync,
 >;
 
+/// Owner-side LiDAR relay handler. Identical shape to `CameraStreamHandler`
+/// (payload → frames via a BOUNDED channel so a slow observer back-pressures the
+/// StreamHub broadcast drain instead of growing memory without limit) but a
+/// different payload (LiDAR subscribe) — kept separate so the two never alias.
+pub type LidarStreamHandler = Arc<
+    dyn Fn(
+            Vec<u8>,
+            mpsc::Sender<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Bounded capacity for the owner-side camera relay channel between the
 /// StreamHub broadcast drain and the QUIC writer. Matches the StreamHub
 /// broadcast capacity so the relay never queues more than one broadcast window
@@ -189,7 +202,9 @@ pub enum IrohMeshEvent {
     },
     TrustedKeysSyncReceived {
         node_id: String,
-        keys: Vec<(String, String)>,
+        /// (node_id, public_key_hex, origin_approved_at). `approved_at` keeps the
+        /// trust-expiry TTL anchored to the origin's first pairing across mirroring.
+        keys: Vec<(String, String, String)>,
     },
     /// F1b P3.B — peer pushed its HMAC issuer keys (pickup_token, frame_url,
     /// recording_url). Payload carries raw 32-byte secrets + optional
@@ -389,6 +404,10 @@ pub struct IrohMeshManager {
     /// `forward_stream_handler` (payload → frames via `tx`) but a different
     /// payload (camera subscribe) — kept separate so the two never alias.
     camera_stream_handler: Arc<AsyncRwLock<Option<CameraStreamHandler>>>,
+    /// Owner-side handler for live LiDAR relay bi-streams. Same shape as
+    /// `camera_stream_handler` (payload → frames via `tx`) but a different
+    /// payload (LiDAR subscribe) — kept separate so the two never alias.
+    lidar_stream_handler: Arc<AsyncRwLock<Option<LidarStreamHandler>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -477,6 +496,7 @@ impl IrohMeshManager {
             forward_handler: Arc::new(AsyncRwLock::new(None)),
             forward_stream_handler: Arc::new(AsyncRwLock::new(None)),
             camera_stream_handler: Arc::new(AsyncRwLock::new(None)),
+            lidar_stream_handler: Arc::new(AsyncRwLock::new(None)),
             command_waiters: DashMap::new(),
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
@@ -753,6 +773,7 @@ impl IrohMeshManager {
             forward_handler: Arc::clone(&self.forward_handler),
             forward_stream_handler: Arc::clone(&self.forward_stream_handler),
             camera_stream_handler: Arc::clone(&self.camera_stream_handler),
+            lidar_stream_handler: Arc::clone(&self.lidar_stream_handler),
         }
     }
 
@@ -1962,6 +1983,79 @@ impl IrohMeshManager {
         Ok(Box::pin(stream))
     }
 
+    /// Observer side of the live LiDAR relay. Opens a bi-stream to the owner node,
+    /// sends a `LidarStreamSubscribePayload`, and returns a stream of raw frame
+    /// bytes (each item is one CBOR `LidarStreamFrame` body — the caller decodes
+    /// it). Mirrors `camera_stream_request` with the LiDAR relay discriminator.
+    /// Trust-gated like every outbound bi-stream.
+    pub async fn lidar_stream_request(
+        &self,
+        owner_node_id: &str,
+        robot_id: &str,
+        org_id: &str,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>>> + Send>>> {
+        if !self.security.is_trusted(owner_node_id) {
+            return Err(anyhow::anyhow!(
+                "lidar stream relay refused: peer '{}' is not trusted",
+                owner_node_id
+            ));
+        }
+        let payload = tentaflow_protocol::cbor::encode(
+            &tentaflow_protocol::mesh::LidarStreamSubscribePayload {
+                robot_id: robot_id.to_string(),
+                org_id: org_id.to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("encode lidar subscribe: {e}"))?;
+
+        let connection = self
+            .connections
+            .get(owner_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", owner_node_id))?
+            .connection
+            .clone();
+
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        send.write_all(&[tentaflow_protocol::mesh::MESH_MSG_LIDAR_STREAM_SUBSCRIBE])
+            .await
+            .map_err(|e| anyhow::anyhow!("write disc: {e}"))?;
+        // Request id is informational here (no per-request correlation on the
+        // relay); use the robot id so owner-side logs are diagnosable.
+        let id_bytes = robot_id.as_bytes();
+        send.write_all(&(id_bytes.len() as u32).to_be_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("write id_len: {e}"))?;
+        send.write_all(id_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write id: {e}"))?;
+        send.write_all(&payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
+        send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+        let stream = async_stream::try_stream! {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                if len > MAX_MSG_BYTES {
+                    Err(anyhow::anyhow!("lidar relay frame too large: {}", len))?;
+                }
+                let mut frame = vec![0u8; len];
+                recv.read_exact(&mut frame)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read relay frame: {e}"))?;
+                yield frame;
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
     /// Zwraca snapshot EndpointId wszystkich znanych polaczonych peerow.
     pub async fn connected_peer_ids(&self) -> Vec<String> {
         self.connected_peers().await
@@ -1982,6 +2076,13 @@ impl IrohMeshManager {
     /// without limit (`CameraStreamHandler`).
     pub async fn set_camera_stream_handler(&self, handler: CameraStreamHandler) {
         *self.camera_stream_handler.write().await = Some(handler);
+    }
+
+    /// Installs the owner-side handler for live LiDAR relay bi-streams. Same
+    /// bounded-channel back-pressure contract as `set_camera_stream_handler`
+    /// (`LidarStreamHandler`).
+    pub async fn set_lidar_stream_handler(&self, handler: LidarStreamHandler) {
+        *self.lidar_stream_handler.write().await = Some(handler);
     }
 
     /// Pobiera RTT do peera w mikrosekundach. iroh udostepnia `remote_info`
@@ -2243,6 +2344,7 @@ struct IrohMeshManagerRef {
     forward_handler: Arc<AsyncRwLock<Option<ForwardHandler>>>,
     forward_stream_handler: Arc<AsyncRwLock<Option<ForwardStreamHandler>>>,
     camera_stream_handler: Arc<AsyncRwLock<Option<CameraStreamHandler>>>,
+    lidar_stream_handler: Arc<AsyncRwLock<Option<LidarStreamHandler>>>,
 }
 
 impl IrohMeshManagerRef {
@@ -2334,6 +2436,34 @@ impl IrohMeshManagerRef {
                 }
                 // Channel closed: the handler finished (source closed / observer
                 // gone). The guard's Drop aborts the (already-finished) task.
+                drop(task);
+                send.finish()
+                    .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+            }
+            x if x == tentaflow_protocol::mesh::MESH_MSG_LIDAR_STREAM_SUBSCRIBE => {
+                let handler = self.lidar_stream_handler.read().await.clone();
+                let Some(handler) = handler else {
+                    return Ok(());
+                };
+                // Owner side: same bounded-channel / abort-on-drop contract as the
+                // camera relay arm above. The handler subscribes to the local
+                // StreamHub and emits already-CBOR-encoded `LidarStreamFrame` blobs
+                // on a BOUNDED channel; a slow observer back-pressures the handler's
+                // broadcast drain (which drops the subscription rather than
+                // buffering) and QUIC flow-control on `write_all` bounds the wire.
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CAMERA_RELAY_CHANNEL_CAPACITY);
+                let task = AbortOnDrop(tokio::spawn(handler(payload, tx)));
+                while let Some(frame) = rx.recv().await {
+                    if frame.len() > MAX_MSG_BYTES {
+                        return Err(IrohStreamError::FrameTooLarge(frame.len()));
+                    }
+                    send.write_all(&(frame.len() as u32).to_be_bytes())
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                    send.write_all(&frame)
+                        .await
+                        .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
+                }
                 drop(task);
                 send.finish()
                     .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
@@ -2599,7 +2729,7 @@ impl IrohMeshManagerRef {
                         keys: p
                             .keys
                             .into_iter()
-                            .map(|e| (e.node_id, e.public_key_hex))
+                            .map(|e| (e.node_id, e.public_key_hex, e.approved_at))
                             .collect(),
                     },
                     Err(e) => {
