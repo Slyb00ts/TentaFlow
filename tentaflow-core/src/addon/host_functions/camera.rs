@@ -412,6 +412,24 @@ pub fn camera_register_backed_v1(
         );
         return AbiError::Operation.as_i32();
     }
+    // A robot that backs its camera (e.g. Go2) gets depth → map, but kept SEPARATE
+    // from its LiDAR cloud for calibration: cloud stored under `<addon>-depth`,
+    // placed with the robot's own pose (`<addon>`), so the two clouds can be overlaid
+    // and the FOV / scale tuned against the LiDAR ground truth. FOV defaults to a
+    // wide-angle 120° guess (Go2 front lens) — calibrate live via `depth_camera_fov_deg`.
+    // Non-fatal + idempotent: the camera is already live if this fails.
+    let depth_patch = CameraPatch {
+        depth_mapping_enabled: Some(true),
+        depth_robot_id: Some(Some(format!("{addon_id}-depth"))),
+        depth_pose_robot_id: Some(Some(addon_id.clone())),
+        depth_camera_fov_deg: Some(120.0),
+        ..Default::default()
+    };
+    if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
+        warn!("camera.register_backed depth-mapping enable failed (non-fatal): {e}");
+    } else {
+        crate::services::camera_ingest::depth_mapping::ensure_depth_mapping(&camera_id);
+    }
     audit(
         caller.data(),
         "camera.register_backed",
@@ -516,6 +534,8 @@ pub fn camera_register_pushed_v1(
     // A phone that pushes its camera IS a robot (addon_id == robot_id): bind the
     // stream to the shared SLAM map so its frames become a metric point cloud.
     // Idempotent and non-fatal — the camera is already live if this fails.
+    // Phone has no LiDAR to compare against → merged: pose source == store id
+    // (`depth_pose_robot_id` left default/NULL falls back to `depth_robot_id`).
     let depth_patch = CameraPatch {
         depth_mapping_enabled: Some(true),
         depth_robot_id: Some(Some(addon_id.clone())),
@@ -2537,6 +2557,7 @@ pub fn camera_update_v1(
         depth_robot_id: None,
         depth_camera_fov_deg: None,
         depth_fps: None,
+        depth_pose_robot_id: None,
     };
 
     if update_camera(
