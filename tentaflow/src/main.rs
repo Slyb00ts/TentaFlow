@@ -472,6 +472,9 @@ async fn run_server(args: Args) -> Result<()> {
     // === Phase 4 (cont.): wire the supervisor against the router's
     // `LiveHandlesCache` so reconcile() updates the same cache the routing
     // call sites read. Order matters: router first, supervisor second. ===
+    // Health-loop shutdown flag, set on graceful shutdown before stopping
+    // services so the loop does not respawn engines being torn down.
+    let mut services_supervisor_shutdown: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let services_snapshot_rx_for_router: Option<
         tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
     > = if let Some(port_allocator) = services_port_allocator.clone() {
@@ -497,6 +500,10 @@ async fn run_server(args: Args) -> Result<()> {
             tracing::warn!("services supervisor: first_tick failed: {}", e);
         }
 
+        // Capture the shutdown flag BEFORE spawn() consumes the supervisor, so
+        // the graceful-shutdown path can stop the health loop before tearing
+        // down engines (otherwise the loop respawns them → orphans).
+        services_supervisor_shutdown = Some(supervisor.shutdown_flag());
         let supervisor_handle = supervisor.spawn();
         info!(
             "Services supervisor started (interval={}ms, port_range={:?})",
@@ -968,6 +975,11 @@ async fn run_server(args: Args) -> Result<()> {
     // sglang subprocessy zostawaly zombie po Ctrl+C — trzymaly VRAM (~15 GiB
     // dla 9B modelu) i nastepny deploy konkurowal o pamiec z poprzedniej
     // instancji.
+    // Stop the health loop FIRST so it cannot respawn the engines we are about
+    // to kill (the loop is otherwise leaked for the process lifetime).
+    if let Some(flag) = &services_supervisor_shutdown {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(ports) = services_port_allocator.clone() {
         let errors = tentaflow_core::services::deploy::stop_all_supervised(&db, ports).await;
         if !errors.is_empty() {

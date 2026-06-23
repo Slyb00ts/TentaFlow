@@ -525,10 +525,14 @@ where
                             },
                         ));
                     }
-                    // include_usage=true: split na finish chunk + tail.
+                    // include_usage=true: split na finish chunk + tail. Perf
+                    // jedzie razem z usage na tailu (oba sa metrykami finalnymi),
+                    // wiec przenosimy je z finish chunka tak samo jak usage.
                     let metrics = next.usage.clone();
+                    let perf = next.perf.clone();
                     let mut finish_chunk = next;
                     finish_chunk.usage = None;
+                    finish_chunk.perf = None;
                     let tail = ChatCompletionChunk {
                         id: finish_chunk.id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -543,7 +547,7 @@ where
                         speaker_id: None,
                         speaker_name: None,
                         usage: metrics,
-                        perf: None,
+                        perf,
                     };
                     Some((
                         Ok(finish_chunk),
@@ -872,6 +876,7 @@ mod include_usage_tests {
 
     fn chunk_with_usage(text: &str, finish: bool, usage: Option<Usage>) -> ChatCompletionChunk {
         ChatCompletionChunk {
+            perf: None,
             id: "id1".into(),
             object: "chat.completion.chunk".into(),
             created: 0,
@@ -989,6 +994,7 @@ mod compliance_stream_tests {
 
     fn chunk(text: &str, usage: Option<Usage>) -> ChatCompletionChunk {
         ChatCompletionChunk {
+            perf: None,
             id: "stream-1".to_string(),
             object: "chat.completion.chunk".to_string(),
             created: 1,

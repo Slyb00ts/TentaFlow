@@ -7,6 +7,8 @@
 
 pub mod types;
 
+pub mod comfyui;
+
 pub mod server;
 
 pub use types::*;

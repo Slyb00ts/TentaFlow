@@ -1037,6 +1037,10 @@ mod services_manifest_build {
         pub speculator_method: Option<String>,
         #[serde(default)]
         pub speculator_num_tokens: Option<u32>,
+        /// Plik checkpointu image-gen (ComfyUI) pobierany z `repo` przy deployu.
+        /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
+        #[serde(default)]
+        pub checkpoint_file: Option<String>,
     }
 
     // Single source of truth for the three wire-string allow-lists is

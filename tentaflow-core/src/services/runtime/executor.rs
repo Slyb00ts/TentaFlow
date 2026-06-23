@@ -2463,10 +2463,18 @@ impl Stream for ExternalPerfStream {
         use std::task::Poll;
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(mut chunk))) => {
-                let has_content = chunk
-                    .choices
-                    .iter()
-                    .any(|c| c.delta.content.as_deref().is_some_and(|s| !s.is_empty()));
+                // Reasoning tokens ARE decode work (GPU/energy), so reasoning
+                // models (ds4, deepseek) that stream `reasoning_content` before
+                // any visible `content` must still mark TTFT / count as output —
+                // otherwise first_token_at never fires and decode_tps degenerates
+                // to 0 for an entire chain-of-thought.
+                let has_content = chunk.choices.iter().any(|c| {
+                    c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                        || c.delta
+                            .reasoning_content
+                            .as_deref()
+                            .is_some_and(|s| !s.is_empty())
+                });
                 if has_content {
                     if self.first_token_at.is_none() {
                         self.first_token_at = Some(std::time::Instant::now());

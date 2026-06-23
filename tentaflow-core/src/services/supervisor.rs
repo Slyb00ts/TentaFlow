@@ -9,6 +9,7 @@
 // `failed` permanently.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -215,6 +216,12 @@ pub struct Supervisor {
     restart_state: Arc<Mutex<HashMap<i64, RestartState>>>,
     embedded_probe: Option<Arc<dyn EmbeddedHealthProbe>>,
     health_timeout: Duration,
+    /// Set on process shutdown so the (intentionally leaked) health loop stops
+    /// respawning services. Without it, `stop_all_supervised` kills an engine
+    /// and the still-running loop immediately sees it `Failed` and respawns it —
+    /// the respawn then orphans when the process exits. Checked at the top of
+    /// the loop AND right before any restart in `apply_health`.
+    shutdown: Arc<AtomicBool>,
     /// Local node id stamped on `ServiceInfo` records published into the mesh
     /// services registry. Set via `Supervisor::new`.
     local_node_id: String,
@@ -271,6 +278,7 @@ impl Supervisor {
             restart_state: Arc::new(Mutex::new(HashMap::new())),
             embedded_probe: None,
             health_timeout: Duration::from_secs(3),
+            shutdown: Arc::new(AtomicBool::new(false)),
             local_node_id,
             mesh_registry,
             live_handles,
@@ -571,6 +579,13 @@ impl Supervisor {
         });
     }
 
+    /// Shared shutdown flag. Capture this BEFORE `spawn()` (which consumes
+    /// `self`) and set it on process shutdown — before `stop_all_supervised` —
+    /// so the health loop stops respawning the engines being torn down.
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
     /// Spawns the detached supervisor loop. The returned handle joins to `()`
     /// when the channel is dropped; in production we leak it intentionally.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
@@ -582,6 +597,12 @@ impl Supervisor {
     async fn run_loop(self) {
         loop {
             tokio::time::sleep(self.interval).await;
+
+            // Stop the moment shutdown begins so we never respawn an engine that
+            // `stop_all_supervised` is tearing down (would orphan on exit).
+            if self.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
 
             let services = match self.read_supervised().await {
                 Ok(v) => v,
@@ -1108,6 +1129,12 @@ impl Supervisor {
             HealthStatus::Failed(reason) => {
                 self.mark_health(svc.id, false, Some(&reason)).await;
                 if !allow_restart {
+                    return;
+                }
+                // Shutdown in progress: do not resurrect an engine that
+                // `stop_all_supervised` just killed (race with the still-live
+                // health tick). Closes the window the loop-top check can't.
+                if self.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 let mut states = self.restart_state.lock().await;

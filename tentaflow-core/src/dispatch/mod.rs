@@ -997,6 +997,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::VisionInferPayload::InferRequest(_) => "VisionInferRequest",
             tentaflow_protocol::VisionInferPayload::InferResponse(_) => "VisionInferResponse",
         },
+        MessageBody::RerankBody(p) => match p {
+            tentaflow_protocol::RerankExchange::Request(_) => "RerankRequest",
+            tentaflow_protocol::RerankExchange::Response(_) => "RerankResponse",
+        },
         MessageBody::FastPathListRequest => "FastPathListRequest",
         MessageBody::FastPathListResponse { .. } => "FastPathListResponse",
         MessageBody::SettingsListRequest => "SettingsListRequest",

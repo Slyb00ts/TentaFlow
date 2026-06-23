@@ -311,7 +311,7 @@ pub async fn handle_request(
         ("POST", "/v1/chat/completions") => handle_chat_completions(req, router).await,
 
         // Image generation
-        ("POST", "/v1/images/generations") => handle_image_generation(req).await,
+        ("POST", "/v1/images/generations") => handle_image_generation(req, router).await,
 
         // Audio TTS
         ("POST", "/v1/audio/speech") => handle_audio_tts(req, router).await,
@@ -555,9 +555,16 @@ async fn handle_chat_completions(
     }
 }
 
-/// Handler dla /v1/images/generations (placeholder)
+/// Handler dla `/v1/images/generations` (OpenAI-compatible) — generuje obrazy
+/// przez zdeployowany serwis ComfyUI. Resolve modelu idzie ta sama sciezka
+/// ACL/resolver co reszta `/v1` (`v1_authorize` + `ServiceSurface::ImageGen`,
+/// input `[Text]`, output `[Image]`). Workflow text2img SD1.5 budowany jest
+/// programowo; ComfyUI kolejkuje go, a Core czeka na PNG-i i zwraca je jako
+/// `b64_json` (domyslnie) — `response_format="url"` nie jest tu wspierany
+/// (brak trwalego storage na te bajty), wiec degradujemy do `b64_json`.
 async fn handle_image_generation(
-    _req: Request<Incoming>,
+    req: Request<Incoming>,
+    router: Arc<Router>,
 ) -> std::result::Result<
     Response<
         StreamBody<
@@ -568,11 +575,236 @@ async fn handle_image_generation(
     >,
     hyper::Error,
 > {
-    Ok(error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "Image generation nie jest jeszcze zaimplementowane".to_string(),
-    ))
+    use crate::api::openai::comfyui::{ComfyClient, ComfyError, Text2ImgParams, MAX_IMAGES};
+
+    let user_ctx = req
+        .extensions()
+        .get::<crate::auth::acl::UserContext>()
+        .cloned();
+    let principal = req.extensions().get::<Principal>().cloned();
+
+    let body_bytes = req.collect().await?.to_bytes();
+
+    let request: ImageGenerationRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Image-gen: niepoprawny JSON: {}", e);
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Niepoprawny JSON: {}", e),
+            ));
+        }
+    };
+
+    if request.prompt.trim().is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Pole 'prompt' nie moze byc puste".to_string(),
+        ));
+    }
+
+    if let Err(resp) = v1_authorize(&router, principal.as_ref(), &request.model) {
+        return Ok(resp);
+    }
+
+    // Resolve do lokalnego serwisu (target niesie handle + service_id). Surface
+    // ImageGen, wejscie Text, wyjscie Image — zgodnie z manifestem comfyui.
+    let context_label = "image-gen /v1/images/generations";
+    let target = match resolve_local_v1_target(
+        &router,
+        &request.model,
+        crate::services::catalog::ServiceSurface::ImageGen,
+        &[crate::services::catalog::InputModality::Text],
+        user_ctx,
+        context_label,
+    ) {
+        Ok(t) => t,
+        Err(resp) => return Ok(resp),
+    };
+
+    // Tylko serwisy ComfyUI (engine_id == "comfyui") sa obslugiwane. Inne
+    // backendy image-gen (np. stable-diffusion-cpp) maja inne API i sa poza
+    // zakresem tego endpointu — zwracamy jasny blad zamiast zgadywac protokol.
+    let service_id = match &target {
+        crate::services::runtime::target::ResolvedExecutionTarget::Local { service_id, .. } => {
+            *service_id
+        }
+        _ => {
+            // resolve_http_base_from_target i tak by to odrzucilo, ale dajemy
+            // dedykowany komunikat zanim odpytamy DB.
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                format!(
+                    "model '{}' nie jest lokalnym serwisem image-gen",
+                    request.model
+                ),
+            ));
+        }
+    };
+
+    // Odczyt engine_id + ewentualnego override checkpointu z config_json serwisu
+    // (ten sam store co kreator deployu). Brak DB → traktujemy jako nieznany
+    // backend i odrzucamy (fail-closed).
+    let (engine_id, checkpoint_override) = match router.db.as_ref() {
+        Some(db) => match db.read() {
+            Ok(conn) => match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(svc)) => {
+                    let override_name = serde_json::from_str::<serde_json::Value>(&svc.config_json)
+                        .ok()
+                        .and_then(|cfg| {
+                            cfg.get("checkpoint")
+                                .or_else(|| cfg.get("model_file"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+                    (svc.engine_id, override_name)
+                }
+                _ => (String::new(), None),
+            },
+            Err(_) => (String::new(), None),
+        },
+        None => (String::new(), None),
+    };
+
+    if engine_id != "comfyui" {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "model '{}' jest obslugiwany przez backend '{}', a /v1/images/generations wspiera tylko ComfyUI",
+                request.model, engine_id
+            ),
+        ));
+    }
+
+    // Bazowy URL ComfyUI (golе `endpoint_url`, BEZ `/v1`).
+    let base = match resolve_http_base_from_target(&target, &request.model, context_label) {
+        Ok(b) => b,
+        Err(resp) => return Ok(resp),
+    };
+
+    // Rozmiar "WxH" → (width, height); domyslnie 512x512 (natywny SD1.5).
+    let (width, height) = parse_image_size(request.size.as_deref());
+
+    // Liczba obrazow: clamp do [1, MAX_IMAGES].
+    let batch_size = request.n.unwrap_or(1).clamp(1, MAX_IMAGES);
+
+    // Checkpoint: jawny override z configu serwisu LUB nazwa-pliku podana jako
+    // `model` w requescie; inaczej klient wykryje zaladowany checkpoint przez
+    // /object_info, a w ostatecznosci uzyje domyslnego.
+    let checkpoint = checkpoint_override.or_else(|| {
+        let m = request.model.as_str();
+        if m.ends_with(".safetensors") || m.ends_with(".ckpt") {
+            Some(m.to_string())
+        } else {
+            None
+        }
+    });
+
+    // Seed losowy per-request (OpenAI nie wystawia seeda w tym kontrakcie).
+    let seed = rand::random::<u32>() as u64;
+
+    let params = Text2ImgParams {
+        prompt: request.prompt.clone(),
+        negative_prompt: String::new(),
+        width,
+        height,
+        batch_size,
+        steps: 20,
+        cfg: 7.0,
+        sampler: "euler".to_string(),
+        scheduler: "normal".to_string(),
+        seed,
+        checkpoint,
+    };
+
+    let wants_url = request.response_format.as_deref() == Some("url");
+    if wants_url {
+        warn!(
+            "Image-gen: response_format=url nie jest wspierany dla ComfyUI — zwracam b64_json"
+        );
+    }
+
+    let client = match ComfyClient::new(base) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Image-gen: budowa klienta ComfyUI: {}", e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                e.to_string(),
+            ));
+        }
+    };
+
+    info!(
+        "Image-gen: model={}, {}x{}, n={}",
+        request.model, width, height, batch_size
+    );
+
+    let images = match client.text2img(&params).await {
+        Ok(imgs) => imgs,
+        Err(e) => {
+            error!("Image-gen: ComfyUI: {}", e);
+            let (status, code) = match &e {
+                ComfyError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
+                ComfyError::Http(_) => (StatusCode::BAD_GATEWAY, "service_unavailable"),
+                ComfyError::Backend(_) => (StatusCode::BAD_GATEWAY, "service_unavailable"),
+            };
+            return Ok(error_response(status, code, e.to_string()));
+        }
+    };
+
+    use base64::Engine;
+    let data: Vec<ImageData> = images
+        .iter()
+        .map(|png| ImageData {
+            url: None,
+            b64_json: Some(base64::engine::general_purpose::STANDARD.encode(png)),
+            revised_prompt: None,
+        })
+        .collect();
+
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let response = ImageGenerationResponse { created, data };
+    let body = match serde_json::to_vec(&response) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Image-gen: serializacja odpowiedzi: {}", e);
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                e.to_string(),
+            ));
+        }
+    };
+    Ok(json_response(StatusCode::OK, body))
+}
+
+/// Parsuje OpenAI pole `size` ("WxH") na (width, height). Akceptuje tylko
+/// dodatnie wymiary; przy braku/niepoprawnym formacie wraca natywne 512x512
+/// SD1.5. Wymiary zaokraglane w dol do wielokrotnosci 8 (wymog VAE SD).
+fn parse_image_size(size: Option<&str>) -> (u32, u32) {
+    let default = (512u32, 512u32);
+    let s = match size {
+        Some(s) if !s.is_empty() => s,
+        _ => return default,
+    };
+    let (w, h) = match s.split_once(['x', 'X']) {
+        Some((w, h)) => (w.trim().parse::<u32>(), h.trim().parse::<u32>()),
+        None => return default,
+    };
+    match (w, h) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => ((w / 8) * 8, (h / 8) * 8),
+        _ => default,
+    }
 }
 
 /// Handler dla /v1/audio/speech (Text-to-Speech)
@@ -1405,14 +1637,43 @@ async fn handle_passthrough(
         return Ok(resp);
     }
 
-    let base = match resolve_local_v1_base(
+    let context_label = format!("passthrough {}", forward_path);
+    let target = match resolve_local_v1_target(
         &router,
         &model,
         surface,
         input_modalities,
         user_ctx,
-        &format!("passthrough {}", forward_path),
+        &context_label,
     ) {
+        Ok(t) => t,
+        Err(resp) => return Ok(resp),
+    };
+
+    // Embedded vision (`/v1/infer`): silniki wkompilowane w binarkę (detekcja
+    // twarzy/pozy/emocji + OCR) nie wystawiają HTTP — uruchamiamy je in-process
+    // przez `crate::vision`, zamiast forwardować po sieci. Reszta (`/v1/rerank`,
+    // kontenery HTTP) idzie niezmienioną ścieżką passthrough poniżej.
+    if let crate::services::runtime::target::ResolvedExecutionTarget::Local {
+        handle: crate::services::handles_cache::BackendHandle::Embedded { engine_id, .. },
+        model_name,
+        ..
+    } = &target
+    {
+        if forward_path == "/v1/infer" {
+            return Ok(infer_embedded_vision(&parsed, model_name, engine_id).await);
+        }
+        return Ok(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            format!(
+                "model '{}' jest serwisem embedded — {} obsługuje tylko serwisy HTTP",
+                model, context_label
+            ),
+        ));
+    }
+
+    let base = match resolve_http_base_from_target(&target, &model, &context_label) {
         Ok(b) => b,
         Err(resp) => return Ok(resp),
     };
@@ -1490,6 +1751,26 @@ fn resolve_local_v1_base(
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
 ) -> std::result::Result<String, Response<OpenAIBody>> {
+    resolve_local_v1_base_url(router, model, surface, input_modalities, user_ctx, context_label)
+        .map_err(|msg| error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg))
+}
+
+/// Rozwiązuje `ResolvedExecutionTarget` przez ten sam resolver/ACL co reszta
+/// `/v1` (autoryzacja MUSI być sprawdzona wcześniej przez `v1_authorize`).
+/// Współdzielone przez passthrough, który dla `/v1/infer` musi rozróżnić
+/// serwis HTTP od silnika embedded — `resolve_local_v1_base_url` tej różnicy
+/// nie zachowuje (zwraca tylko URL albo błąd).
+fn resolve_local_v1_target(
+    router: &Router,
+    model: &str,
+    surface: crate::services::catalog::ServiceSurface,
+    input_modalities: &[crate::services::catalog::InputModality],
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> std::result::Result<
+    crate::services::runtime::target::ResolvedExecutionTarget,
+    Response<OpenAIBody>,
+> {
     let executor = match router.executor() {
         Some(e) => e,
         None => {
@@ -1502,15 +1783,293 @@ fn resolve_local_v1_base(
     };
 
     let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            warn!("{} resolve dla '{}': {}", context_label, model, e);
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                format!("model '{}' niedostępny: {}", model, e),
+            ))
+        }
+    }
+}
+
+/// Wyciąga bazowy `<...>/v1` URL z już rozwiązanego targetu HTTP. Embedded jest
+/// obsłużony wcześniej przez caller, więc tu trafia tylko Local(HTTP/QUIC) lub
+/// zdalny/flow (oba dają błąd jak w poprzedniej, czysto-HTTP ścieżce).
+fn resolve_http_base_from_target(
+    target: &crate::services::runtime::target::ResolvedExecutionTarget,
+    model: &str,
+    context_label: &str,
+) -> std::result::Result<String, Response<OpenAIBody>> {
+    use crate::services::runtime::target::ResolvedExecutionTarget;
+    match target {
+        ResolvedExecutionTarget::Local { handle, .. } => {
+            match crate::services::runtime::transport_client::resolve_http_client(
+                handle,
+                context_label,
+            ) {
+                Ok(resolved) => Ok(resolved.client.url().trim_end_matches('/').to_string()),
+                Err(e) => Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    format!("model '{}' nie jest lokalnym serwisem HTTP: {}", model, e),
+                )),
+            }
+        }
+        ResolvedExecutionTarget::MeshForward { node_id, .. } => Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            format!(
+                "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+                model, node_id, context_label
+            ),
+        )),
+        ResolvedExecutionTarget::Flow { .. } => Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            format!("model '{}' rozwiązał się do flow, nie do serwisu HTTP", model),
+        )),
+    }
+}
+
+/// In-process inference dla wkompilowanych silników vision na `/v1/infer`.
+/// Dekoduje pierwszy obraz z `input[0].url` (data-URL → RGB8), wybiera ścieżkę:
+/// OCR (onnx-ocr/apple-ocr/plate-ocr) przez `VisionDispatcher`, a detekcję
+/// twarzy/pozy/emocji przez `crate::vision::infer`, i mapuje wynik na kontrakt
+/// NVIDIA NIM (z rozszerzeniami dla pozy/emocji, których NIM nie definiuje).
+async fn infer_embedded_vision(
+    parsed: &serde_json::Value,
+    model_name: &str,
+    engine_id: &str,
+) -> Response<OpenAIBody> {
+    let url = match parsed
+        .get("input")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|item| item.get("url"))
+        .and_then(|u| u.as_str())
+    {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "pole 'input[0].url' (data-URL obrazu) jest wymagane".to_string(),
+            );
+        }
+    };
+
+    let (bytes, _mime) = match crate::routing::decode_data_url(url) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("dekodowanie data-URL: {}", e),
+            );
+        }
+    };
+    let images_size_mb = bytes.len() as f64 / (1024.0 * 1024.0);
+
+    // Dekodujemy do RGB8 tym samym wzorcem co `dispatch/handlers.rs` (ścieżka
+    // Encoded) — `image` rozpoznaje format z nagłówka pliku.
+    let (rgb, width, height) = match image::load_from_memory(&bytes) {
+        Ok(img) => {
+            use image::GenericImageView;
+            let (w, h) = img.dimensions();
+            (img.to_rgb8().into_raw(), w, h)
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("dekodowanie obrazu: {}", e),
+            );
+        }
+    };
+
+    // OCR embedded (onnx-ocr/apple-ocr/plate-ocr) nie ma odpowiednika w
+    // `VisionEngineKind` — rozpoznajemy go po engine_id i obsługujemy przez
+    // `VisionDispatcher` (in-process runner / Burn PlateOcr), zwracając kontrakt
+    // OCR NVIDIA z pojedynczą detekcją obejmującą cały kadr (jak paddle-ocr).
+    if matches!(engine_id, "onnx-ocr" | "apple-ocr" | "plate-ocr") {
+        let dispatcher = crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new();
+        let req = crate::flow_engine::dispatchers::VisionOcrRequest {
+            rgb,
+            width,
+            height,
+            alias: model_name.to_string(),
+            caller_addon_id: None,
+        };
+        use crate::flow_engine::dispatchers::VisionDispatcher;
+        return match dispatcher.ocr(req).await {
+            Ok(text) => json_response(
+                StatusCode::OK,
+                ocr_response_json(text.unwrap_or_default(), images_size_mb),
+            ),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("embedded OCR '{}': {:#}", model_name, e),
+            ),
+        };
+    }
+
+    // Detekcja: silnik wybierany leniwie po nazwie modelu/serwisu w registry.
+    let out = match crate::vision::infer(model_name, &rgb, width, height) {
+        Ok(o) => o,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("embedded vision '{}': {:#}", model_name, e),
+            );
+        }
+    };
+
+    let body = vision_infer_to_json(out, width as f32, height as f32);
+    json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap())
+}
+
+/// Buduje kontrakt OCR NVIDIA NIM z pojedynczą detekcją obejmującą cały kadr
+/// (PaddleOCR/Apple Vision transkrybują całą stronę, bez ramek per-region) —
+/// identyczny kształt jak kontener `paddle-ocr`.
+fn ocr_response_json(text: String, images_size_mb: f64) -> Vec<u8> {
+    let body = serde_json::json!({
+        "data": [{
+            "index": 0,
+            "text_detections": [{
+                "text_prediction": { "text": text, "confidence": 1.0 },
+                "bounding_box": { "points": [
+                    { "x": 0.0, "y": 0.0 },
+                    { "x": 1.0, "y": 0.0 },
+                    { "x": 1.0, "y": 1.0 },
+                    { "x": 0.0, "y": 1.0 },
+                ] }
+            }]
+        }],
+        "usage": { "images_size_mb": images_size_mb }
+    });
+    serde_json::to_vec(&body).unwrap()
+}
+
+/// Mapuje `InferOutput` na JSON `/v1/infer`. Współrzędne normalizujemy do 0..1
+/// względem oryginalnych wymiarów (`w`/`h`), jak kontener nemotron-yolox.
+fn vision_infer_to_json(out: crate::vision::InferOutput, w: f32, h: f32) -> serde_json::Value {
+    use crate::vision::InferOutput;
+    let norm_x = |x: f32| (x / w).clamp(0.0, 1.0);
+    let norm_y = |y: f32| (y / h).clamp(0.0, 1.0);
+    match out {
+        InferOutput::Faces(faces) => {
+            // Kontrakt NVIDIA NIM Object Detection: ramki grupowane po nazwie
+            // klasy. Detektory twarzy mają jedną klasę → grupa "face".
+            let boxes: Vec<serde_json::Value> = faces
+                .iter()
+                .map(|f| {
+                    let (x1, y1, x2, y2) = f.bbox;
+                    let mut obj = serde_json::json!({
+                        "x_min": norm_x(x1),
+                        "y_min": norm_y(y1),
+                        "x_max": norm_x(x2),
+                        "y_max": norm_y(y2),
+                        "confidence": f.score,
+                    });
+                    // Keypointy to rozszerzenie poza NIM — dołączamy je gdy
+                    // detektor ma głowę keypointów (np. yolov8-face/scrfd).
+                    if let Some(kps) = f.keypoints {
+                        obj["keypoints"] = serde_json::Value::Array(
+                            kps.iter()
+                                .map(|(x, y)| {
+                                    serde_json::json!({ "x": norm_x(*x), "y": norm_y(*y) })
+                                })
+                                .collect(),
+                        );
+                    }
+                    obj
+                })
+                .collect();
+            serde_json::json!({
+                "data": [{ "index": 0, "bounding_boxes": { "face": boxes } }]
+            })
+        }
+        InferOutput::Poses(poses) => {
+            // NIM nie ma kontraktu pozy — emitujemy jawny, rozszerzony kształt.
+            let arr: Vec<serde_json::Value> = poses
+                .iter()
+                .map(|p| {
+                    let (x1, y1, x2, y2) = p.bbox;
+                    serde_json::json!({
+                        "bbox": {
+                            "x_min": norm_x(x1),
+                            "y_min": norm_y(y1),
+                            "x_max": norm_x(x2),
+                            "y_max": norm_y(y2),
+                            "confidence": p.score,
+                        },
+                        "keypoints": p.keypoints.iter().map(|k| serde_json::json!({
+                            "name": k.name,
+                            "x": norm_x(k.x),
+                            "y": norm_y(k.y),
+                            "confidence": k.score,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "data": [{ "index": 0, "poses": arr }] })
+        }
+        InferOutput::Emotion(em) => {
+            let probabilities: serde_json::Map<String, serde_json::Value> = em
+                .probabilities
+                .iter()
+                .map(|(label, p)| {
+                    (
+                        label.clone(),
+                        serde_json::Value::from(*p),
+                    )
+                })
+                .collect();
+            serde_json::json!({
+                "data": [{
+                    "index": 0,
+                    "emotion": {
+                        "label": em.label,
+                        "probabilities": probabilities,
+                        "valence": em.valence,
+                        "arousal": em.arousal,
+                    }
+                }]
+            })
+        }
+    }
+}
+
+/// Rdzeń rozwiązywania lokalnego `<base>/v1` — bez warstwy HTTP. Zwraca czysty
+/// `Err(String)` z gotowym komunikatem, żeby mógł go użyć zarówno HTTP handler
+/// (`resolve_local_v1_base` owija to w `error_response`) jak i handler
+/// protokołu binarnego (`ProtocolError`). Współdzielona, jedyna implementacja
+/// resolve dla obu tierów — bez duplikacji logiki katalogu/ACL.
+pub fn resolve_local_v1_base_url(
+    router: &Router,
+    model: &str,
+    surface: crate::services::catalog::ServiceSurface,
+    input_modalities: &[crate::services::catalog::InputModality],
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> std::result::Result<String, String> {
+    let executor = match router.executor() {
+        Some(e) => e,
+        None => return Err("Executor niedostępny".to_string()),
+    };
+
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
     let target = match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
         Ok(t) => t,
         Err(e) => {
             warn!("{} resolve dla '{}': {}", context_label, model, e);
-            return Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                format!("model '{}' niedostępny: {}", model, e),
-            ));
+            return Err(format!("model '{}' niedostępny: {}", model, e));
         }
     };
 
@@ -1526,31 +2085,132 @@ fn resolve_local_v1_base(
                 context_label,
             ) {
                 Ok(resolved) => Ok(resolved.client.url().trim_end_matches('/').to_string()),
-                Err(e) => Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "service_unavailable",
-                    format!("model '{}' nie jest lokalnym serwisem HTTP: {}", model, e),
+                Err(e) => Err(format!(
+                    "model '{}' nie jest lokalnym serwisem HTTP: {}",
+                    model, e
                 )),
             }
         }
         crate::services::runtime::target::ResolvedExecutionTarget::MeshForward { node_id, .. } => {
-            Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                format!(
-                    "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
-                    model, node_id, context_label
-                ),
+            Err(format!(
+                "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+                model, node_id, context_label
             ))
         }
-        crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => {
-            Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                format!("model '{}' rozwiązał się do flow, nie do serwisu HTTP", model),
-            ))
-        }
+        crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => Err(format!(
+            "model '{}' rozwiązał się do flow, nie do serwisu HTTP",
+            model
+        )),
     }
+}
+
+/// Współdzielona ścieżka forwardu rerankingu (resolve serwisu Rerank + POST na
+/// Cohere-style `<base>/v1/rerank` + parsowanie odpowiedzi vLLM). Używana przez
+/// HTTP `/v1/ranking` (Tier 2) ORAZ natywny handler `RerankRequest` (Tier 1) —
+/// jedna implementacja forwardu, zero duplikacji logiki HTTP.
+///
+/// Autoryzacja modelu (`v1_authorize` / `#[policy]`) MUSI być sprawdzona przez
+/// wywołującego przed wejściem tu.
+pub async fn rerank_forward(
+    router: &Router,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    top_n: Option<u32>,
+    return_documents: bool,
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> std::result::Result<tentaflow_protocol::RerankResult, String> {
+    let base = resolve_local_v1_base_url(
+        router,
+        model,
+        crate::services::catalog::ServiceSurface::Rerank,
+        &[crate::services::catalog::InputModality::Text],
+        user_ctx,
+        context_label,
+    )?;
+
+    // Forward leci ZAWSZE na Cohere-style `/v1/rerank` (kontener vLLM nie zna
+    // `/v1/ranking`). `endpoint_url` zwykle kończy się na `/v1`.
+    let target_url = if base.ends_with("/v1") {
+        format!("{}/rerank", base)
+    } else {
+        format!("{}/v1/rerank", base)
+    };
+
+    // vLLM przyjmuje `top_n` jako opcjonalne; przekazujemy gdy podane.
+    let mut upstream_body = serde_json::json!({
+        "model": model,
+        "query": query,
+        "documents": documents,
+        "return_documents": return_documents,
+    });
+    if let Some(n) = top_n {
+        upstream_body["top_n"] = serde_json::json!(n);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("budowa klienta HTTP: {}", e))?;
+
+    let resp = client
+        .post(&target_url)
+        .json(&upstream_body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("{} → {}: {}", context_label, target_url, e);
+            format!("błąd forwardu do serwisu: {}", e)
+        })?;
+
+    let upstream_status = resp.status();
+    let upstream_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("błąd odczytu odpowiedzi z serwisu: {}", e))?;
+
+    if !upstream_status.is_success() {
+        let detail = String::from_utf8_lossy(&upstream_bytes);
+        warn!(
+            "{}: upstream {} zwrócił {}: {}",
+            context_label, target_url, upstream_status, detail
+        );
+        return Err(format!(
+            "serwis rerank zwrócił {}: {}",
+            upstream_status, detail
+        ));
+    }
+
+    let vllm: serde_json::Value = serde_json::from_slice(&upstream_bytes)
+        .map_err(|e| format!("serwis rerank zwrócił niepoprawny JSON: {}", e))?;
+
+    let results_arr = vllm
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "serwis rerank nie zwrócił pola 'results'".to_string())?;
+
+    let results = results_arr
+        .iter()
+        .filter_map(|item| {
+            let index = item.get("index").and_then(|i| i.as_u64())? as usize;
+            let relevance_score = item.get("relevance_score").and_then(|s| s.as_f64())? as f32;
+            let document = item
+                .get("document")
+                .and_then(|d| d.get("text").and_then(|t| t.as_str()).or_else(|| d.as_str()))
+                .map(|s| s.to_string());
+            Some(tentaflow_protocol::RerankResultItem {
+                index,
+                relevance_score,
+                document,
+            })
+        })
+        .collect();
+
+    Ok(tentaflow_protocol::RerankResult {
+        results,
+        model: model.to_string(),
+    })
 }
 
 /// Handler dla `POST /v1/ranking` (kontrakt NVIDIA NeMo Retriever reranking).
@@ -1667,123 +2327,39 @@ async fn handle_ranking(
         return Ok(resp);
     }
 
-    let base = match resolve_local_v1_base(
+    // Resolve serwisu + forward na Cohere-style `/v1/rerank` współdzielony z
+    // natywnym handlerem `RerankRequest` — Tier 2 dokleja tylko tłumaczenie
+    // kontraktu NVIDIA (request `passages` → `documents`, response `results`
+    // → `rankings` z `logit`).
+    let rerank = match rerank_forward(
         &router,
         &model,
-        crate::services::catalog::ServiceSurface::Rerank,
-        &[crate::services::catalog::InputModality::Text],
+        &query,
+        &documents,
+        None,
+        false,
         user_ctx,
         "/v1/ranking",
-    ) {
-        Ok(b) => b,
-        Err(resp) => return Ok(resp),
-    };
-
-    // Forward leci ZAWSZE na Cohere-style `/v1/rerank` (kontener nie zna
-    // `/v1/ranking`). `endpoint_url` zwykle kończy się na `/v1`.
-    let target_url = if base.ends_with("/v1") {
-        format!("{}/rerank", base)
-    } else {
-        format!("{}/v1/rerank", base)
-    };
-
-    let upstream_body = serde_json::json!({
-        "model": model,
-        "query": query,
-        "documents": documents,
-    });
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
+    )
+    .await
     {
-        Ok(c) => c,
-        Err(e) => {
-            error!("/v1/ranking: budowa klienta HTTP: {}", e);
-            return Ok(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                e.to_string(),
-            ));
-        }
-    };
-
-    let upstream = client.post(&target_url).json(&upstream_body).send().await;
-
-    let resp = match upstream {
         Ok(r) => r,
-        Err(e) => {
-            error!("/v1/ranking → {}: {}", target_url, e);
+        Err(msg) => {
             return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
-                format!("błąd forwardu do serwisu: {}", e),
-            ));
-        }
-    };
-
-    let upstream_status = resp.status();
-    let upstream_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("/v1/ranking: odczyt body z upstream: {}", e);
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "service_unavailable",
-                format!("błąd odczytu odpowiedzi z serwisu: {}", e),
-            ));
-        }
-    };
-
-    // Upstream zwrócił błąd — przekazujemy jego treść w OpenAI-style error,
-    // żeby klient zobaczył powód (np. zły model / kontekst za długi).
-    if !upstream_status.is_success() {
-        let detail = String::from_utf8_lossy(&upstream_bytes);
-        warn!(
-            "/v1/ranking: upstream {} zwrócił {}: {}",
-            target_url, upstream_status, detail
-        );
-        let status =
-            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Ok(error_response(
-            status,
-            "service_unavailable",
-            format!("serwis rerank zwrócił {}: {}", upstream_status, detail),
-        ));
-    }
-
-    let vllm: serde_json::Value = match serde_json::from_slice(&upstream_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("/v1/ranking: niepoprawny JSON z upstream: {}", e);
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "service_unavailable",
-                format!("serwis rerank zwrócił niepoprawny JSON: {}", e),
+                msg,
             ));
         }
     };
 
     // vLLM zwraca `results` już posortowane malejąco po score; zachowujemy ten
     // porządek i oryginalny `index`, mapując `relevance_score` → `logit`.
-    let rankings: Vec<serde_json::Value> = match vllm.get("results").and_then(|r| r.as_array()) {
-        Some(results) => results
-            .iter()
-            .filter_map(|item| {
-                let index = item.get("index").and_then(|i| i.as_u64())?;
-                let score = item.get("relevance_score").and_then(|s| s.as_f64())?;
-                Some(serde_json::json!({ "index": index, "logit": score }))
-            })
-            .collect(),
-        None => {
-            error!("/v1/ranking: upstream nie zwrócił 'results'");
-            return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "service_unavailable",
-                "serwis rerank nie zwrócił pola 'results'".to_string(),
-            ));
-        }
-    };
+    let rankings: Vec<serde_json::Value> = rerank
+        .results
+        .iter()
+        .map(|item| serde_json::json!({ "index": item.index, "logit": item.relevance_score }))
+        .collect();
 
     let nvidia_response = serde_json::json!({ "rankings": rankings });
     let body = match serde_json::to_vec(&nvidia_response) {

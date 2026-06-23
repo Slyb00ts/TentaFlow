@@ -308,6 +308,31 @@ impl StreamingNodeAdapter for PiiFilterNodeAdapter {
                                     (upstream, compiled, buffers, max_chars, eof),
                                 ));
                             }
+                            // Metadata-only tail (the OpenAI `usage`/perf chunk
+                            // that arrives AFTER finish_reason, with empty
+                            // delta): nothing to flush, but it carries the real
+                            // token counts — INCLUDING reasoning tokens, which
+                            // are GPU/energy usage. Pass it straight through so
+                            // downstream accounting (usage_sink → outcome.usage →
+                            // token_usage_daily + flow_executions) isn't zeroed.
+                            // Dropping it here was why ds4 (reasoning model with
+                            // a post-finish usage tail) counted 0 tokens.
+                            if chunk.usage.is_some() || chunk.perf.is_some() {
+                                let tail = LlmStreamChunk {
+                                    choice_index: idx,
+                                    text_delta: String::new(),
+                                    reasoning_delta: None,
+                                    tool_calls: Vec::new(),
+                                    usage: chunk.usage,
+                                    perf: chunk.perf,
+                                    finish_reason: chunk.finish_reason,
+                                    error: chunk.error,
+                                };
+                                return Some((
+                                    Ok(EnvelopeDelta::Llm(tail)),
+                                    (upstream, compiled, buffers, max_chars, eof),
+                                ));
+                            }
                             continue;
                         }
                         Some(Ok(other)) => {
