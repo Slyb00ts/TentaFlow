@@ -517,7 +517,30 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "scheduled_jobs_org_id",
             MigrationStep::Rust(scheduled_jobs_add_org_id_column),
         ),
+        (
+            96,
+            "cameras_depth_extrinsics_columns",
+            MigrationStep::Rust(cameras_add_depth_extrinsics_columns),
+        ),
     ]
+}
+
+/// Adds camera extrinsic-calibration columns for depth mapping: `depth_camera_pitch_deg`
+/// (mount tilt of the camera vs the body forward axis — the Go2 front camera is angled
+/// down, which a 0-pitch model places wrong vs the lidar) and `depth_scale` (metric
+/// scale correction for the monocular depth — ZoeDepth's absolute scale is approximate).
+/// Both live-tunable so the camera cloud can be aligned to the lidar without a rebuild.
+/// Idempotent (column probes).
+fn cameras_add_depth_extrinsics_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_camera_pitch_deg")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_camera_pitch_deg REAL NOT NULL DEFAULT 0.0;",
+        )?;
+    }
+    if !column_exists(conn, "cameras", "depth_scale")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_scale REAL NOT NULL DEFAULT 1.0;")?;
+    }
+    Ok(())
 }
 
 /// v89 — `org_id` na scheduled_jobs (MemGraphRAG D3 / R4). Scheduled job musi niesc
