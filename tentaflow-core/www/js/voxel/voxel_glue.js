@@ -63,6 +63,20 @@ export class VoxelView {
         wasm.voxelview_setMapPoints(this.__wbg_ptr, ptr0, len0, count);
     }
     /**
+     * Replace the OVERLAY cloud (camera-depth `scene-depth:<id>` snapshot) — a
+     * second cloud rendered in one fixed colour over the lidar map for side-by-side
+     * calibration. Like `setMapPoints` it is authoritative-replace, but it never
+     * touches the camera framing, grid, or colormap (those stay driven by the map).
+     * An empty frame clears the overlay.
+     * @param {Float32Array} points
+     * @param {number} count
+     */
+    setOverlayPoints(points, count) {
+        const ptr0 = passArrayF32ToWasm0(points, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.voxelview_setOverlayPoints(this.__wbg_ptr, ptr0, len0, count);
+    }
+    /**
      * Accumulate a new LiDAR frame into the persistent occupancy map. `points` is
      * interleaved ODOM-FRAME world XYZ in meters (length = `count` * 3), exactly the
      * `Float32Array` the dashboard's `decodeLidarFrame(...).points` returns.
