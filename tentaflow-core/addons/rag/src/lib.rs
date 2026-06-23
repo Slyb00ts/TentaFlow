@@ -29,7 +29,7 @@ extern "C" {
     ) -> i32;
 }
 
-/// Bufor na odpowiedz embeddingu (wektor 1024 f32 jako JSON to ~kilkadziesiat KB).
+/// Bufor na odpowiedz embeddingu (wektor 2048 f32 jako JSON to ~kilkadziesiat KB).
 const EMBED_BUFFER_SIZE: usize = 262_144;
 
 /// Nazwa przestrzeni wektorowej (zgodna z [[vector_namespace]] w manifescie).
@@ -40,7 +40,7 @@ const PASSAGES_NS: &str = "passages";
 const ENTITIES_NS: &str = "entities";
 
 /// Wymiar wektora (zgodny z manifestem i suggested_default rag-embeddings).
-const EMBED_DIMENSIONS: usize = 1024;
+const EMBED_DIMENSIONS: usize = 2048;
 
 /// Domyslny rozmiar chunku w znakach i overlap (chunking po akapitach/zdaniach).
 /// ~512 tokenow * ~4 znaki/token.
@@ -7061,13 +7061,13 @@ mod tests {
     #[test]
     fn parse_embedding_accepts_exact_dimension() {
         let resp = array_response(EMBED_DIMENSIONS);
-        let v = parse_embedding_response(&resp).expect("powinien przejsc dla 1024");
+        let v = parse_embedding_response(&resp).expect("powinien przejsc dla 2048");
         assert_eq!(v.len(), EMBED_DIMENSIONS);
     }
 
     #[test]
     fn parse_embedding_rejects_wrong_dimension() {
-        for len in [1usize, 512, 1023, 1025, 2048] {
+        for len in [1usize, 512, 1024, 2047, 2049] {
             let resp = array_response(len);
             let res = parse_embedding_response(&resp);
             assert!(res.is_err(), "dlugosc {len} powinna byc odrzucona");
