@@ -15,7 +15,9 @@ use super::{
 };
 
 use crate::addon::rate_limiter::ResourceType;
-use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
+use crate::api::openai::types::{
+    ChatCompletionRequest, EmbeddingInput, EmbeddingRequest, Message, MessageContent,
+};
 
 /// MemGraphRAG D5 — twardy cap liczby par aliasow encji przepuszczanych z opcji wywolania do
 /// flow.meta (`entity_aliases`). Alias-rewrite seedow PPR to retrieval-side ulatwienie; addon
@@ -186,6 +188,91 @@ pub fn llm_generate(
             return ABI_ERR_OPERATION;
         }
     };
+
+    // Rozgałęzienie po zadaniu: `task=="embedding"` idzie przez dedykowaną ścieżkę
+    // embeddingów (FlowDispatcher / mesh-forward), a NIE przez chat completion.
+    // Bez tego embedding-only model dostaje request czatu i zwraca pusty tekst.
+    let task = _options_json
+        .as_ref()
+        .and_then(|o| o.get("task"))
+        .and_then(|v| v.as_str());
+
+    if task == Some("embedding") {
+        let dimensions = _options_json
+            .as_ref()
+            .and_then(|o| o.get("dimensions"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        // Alias przekazujemy bez zmian — dispatcher embeddingów rozwiązuje aliasy
+        // tak samo jak ścieżka czatu (`try_dispatch` po nazwie modelu).
+        let request = EmbeddingRequest {
+            model: model_name.clone().unwrap_or_else(|| "default".to_string()),
+            input: EmbeddingInput::Single(prompt),
+            encoding_format: None,
+            dimensions,
+            user: Some(format!("addon:{}", addon_id)),
+        };
+
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(request, None))
+        });
+
+        let route_result = match result {
+            Ok(rr) => rr,
+            Err(e) => {
+                error!(
+                    "llm_generate: blad routera (embeddings) dla addon='{}': {}",
+                    addon_id, e
+                );
+                audit_log(
+                    caller.data(),
+                    "llm.generate",
+                    Some("llm"),
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                );
+                return ABI_ERR_OPERATION;
+            }
+        };
+
+        let response = route_result.response;
+        let result_text = match serde_json::to_string(&response) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "llm_generate: serializacja embeddingu dla addon='{}': {}",
+                    addon_id, e
+                );
+                audit_log(
+                    caller.data(),
+                    "llm.generate",
+                    Some("llm"),
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                );
+                return ABI_ERR_OPERATION;
+            }
+        };
+
+        if let Some(ref rate_limiter) = caller.data().rate_limiter {
+            let estimated_tokens = (result_text.len() / 4).max(1) as u64;
+            rate_limiter.record_usage(&addon_id, ResourceType::LlmTokens, estimated_tokens);
+        }
+
+        audit_log(caller.data(), "llm.generate", Some("llm"), None, "ok", None);
+
+        return write_guest_output(
+            &memory,
+            &mut caller,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            result_text.as_bytes(),
+        );
+    }
 
     // Parsuj opcje z JSON
     let temperature = _options_json
