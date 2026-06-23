@@ -19900,6 +19900,8 @@ pub struct CameraPatch {
     pub depth_robot_id: Option<Option<String>>,
     pub depth_camera_fov_deg: Option<f64>,
     pub depth_fps: Option<i64>,
+    /// Pose source robot. Tri-state: `Some(None)` clears (merged: pose == store id).
+    pub depth_pose_robot_id: Option<Option<String>>,
 }
 
 #[cfg(feature = "camera")]
@@ -20532,7 +20534,11 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
 #[derive(Debug, Clone)]
 pub struct DepthMappingConfig {
     pub camera_id: String,
+    /// Robot the depth cloud is STORED under (the scene map key).
     pub robot_id: String,
+    /// Robot whose POSE places the cloud. Equals `robot_id` unless decoupled for
+    /// calibration (camera reuses another robot's pose, stores under its own id).
+    pub pose_robot_id: String,
     pub fov_deg: f32,
     pub fps: u32,
 }
@@ -20547,15 +20553,16 @@ pub fn camera_depth_mapping_config(
     camera_id: &str,
 ) -> Result<Option<DepthMappingConfig>> {
     let conn = acquire(pool)?;
-    let row: Option<(i64, Option<String>, f64, i64)> = conn
+    let row: Option<(i64, Option<String>, f64, i64, Option<String>)> = conn
         .query_row(
-            "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps \
+            "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps, \
+             depth_pose_robot_id \
              FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
             rusqlite::params![camera_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((enabled, robot_id, fov, fps)) = row else {
+    let Some((enabled, robot_id, fov, fps, pose_robot_id)) = row else {
         return Ok(None);
     };
     if enabled == 0 {
@@ -20565,9 +20572,13 @@ pub fn camera_depth_mapping_config(
     let Some(robot_id) = robot_id else {
         return Ok(None);
     };
+    let pose_robot_id = pose_robot_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| robot_id.clone());
     Ok(Some(DepthMappingConfig {
         camera_id: camera_id.to_string(),
         robot_id,
+        pose_robot_id,
         fov_deg: (fov as f32).clamp(20.0, 150.0),
         fps: (fps.clamp(1, 10)) as u32,
     }))
@@ -20579,16 +20590,22 @@ pub fn camera_depth_mapping_config(
 pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfig>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps \
+        "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps, depth_pose_robot_id \
          FROM cameras \
          WHERE depth_mapping_enabled = 1 AND depth_robot_id IS NOT NULL \
            AND depth_robot_id <> '' AND removed_at IS NULL",
     )?;
     let rows = stmt
         .query_map([], |r| {
+            let robot_id = r.get::<_, String>(1)?;
+            let pose_robot_id = r
+                .get::<_, Option<String>>(4)?
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| robot_id.clone());
             Ok(DepthMappingConfig {
                 camera_id: r.get::<_, String>(0)?,
-                robot_id: r.get::<_, String>(1)?,
+                robot_id,
+                pose_robot_id,
                 fov_deg: (r.get::<_, f64>(2)? as f32).clamp(20.0, 150.0),
                 fps: (r.get::<_, i64>(3)?.clamp(1, 10)) as u32,
             })
@@ -20696,6 +20713,10 @@ pub fn update_camera(
     if let Some(v) = patch.depth_fps {
         sets.push("depth_fps = ?");
         params.push(Box::new(v));
+    }
+    if let Some(v) = patch.depth_pose_robot_id.as_ref() {
+        sets.push("depth_pose_robot_id = ?");
+        params.push(Box::new(v.clone()));
     }
     sets.push("updated_at = ?");
     params.push(Box::new(now));

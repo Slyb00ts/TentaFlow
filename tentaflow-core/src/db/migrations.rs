@@ -487,6 +487,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_depth_mapping_columns",
             MigrationStep::Rust(cameras_add_depth_mapping_columns),
         ),
+        (
+            90,
+            "cameras_depth_pose_source_column",
+            MigrationStep::Rust(cameras_add_depth_pose_source_column),
+        ),
     ]
 }
 
@@ -780,6 +785,19 @@ fn cameras_add_depth_mapping_columns(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "cameras", "depth_fps")? {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_fps INTEGER NOT NULL DEFAULT 2;")?;
+    }
+    Ok(())
+}
+
+/// Adds `depth_pose_robot_id` to `cameras` — the robot whose POSE places the depth
+/// cloud, decoupled from `depth_robot_id` (where the cloud is STORED). They differ
+/// for calibration: a Go2 camera reuses the lidar robot's pose (`go2`) but stores
+/// its depth cloud under a separate id (`go2-depth`) so the two clouds can be
+/// overlaid and measured against each other. NULL ⇒ falls back to `depth_robot_id`
+/// (the merged case — a phone places and stores under its own id). Idempotent.
+fn cameras_add_depth_pose_source_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_pose_robot_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_pose_robot_id TEXT NULL;")?;
     }
     Ok(())
 }

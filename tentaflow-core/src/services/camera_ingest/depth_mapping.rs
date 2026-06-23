@@ -113,8 +113,9 @@ pub fn drain() {
     }
 }
 
-async fn run_loop(cfg: DepthMappingConfig) {
-    let interval = Duration::from_millis((1000 / cfg.fps.max(1)) as u64);
+async fn run_loop(initial: DepthMappingConfig) {
+    let camera_id = initial.camera_id.clone();
+    let interval = Duration::from_millis((1000 / initial.fps.max(1)) as u64);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Bound each request so a hung depth endpoint skips the tick instead of
@@ -128,9 +129,24 @@ async fn run_loop(cfg: DepthMappingConfig) {
     loop {
         tick.tick().await;
 
+        // Re-read config each tick so live edits (the FOV calibration knob, robot
+        // binding, disable) take effect WITHOUT a restart — the calibration workflow
+        // depends on tuning FOV against the lidar cloud in real time. `None` ⇒ mapping
+        // was disabled or the camera removed ⇒ exit the loop (frees the registry slot;
+        // `ensure_depth_mapping` restarts it if re-enabled). `fps` change needs a
+        // re-enable (the tick interval is fixed at spawn).
+        let cfg = match crate::db::global_pool()
+            .and_then(|p| crate::db::repository::camera_depth_mapping_config(&p, &camera_id).ok())
+            .flatten()
+        {
+            Some(c) => c,
+            None => return,
+        };
+
         // A pose is mandatory: without the camera's scene pose the cloud cannot be
-        // placed in the map frame. Skip quietly until the robot is localized.
-        let Some(pose) = SlamSceneManager::global().latest_scene_pose(&cfg.robot_id) else {
+        // placed in the map frame. Uses the POSE SOURCE robot (may differ from the
+        // store id during calibration). Skip quietly until that robot is localized.
+        let Some(pose) = SlamSceneManager::global().latest_scene_pose(&cfg.pose_robot_id) else {
             continue;
         };
         let Some((rgb, w, h)) =
