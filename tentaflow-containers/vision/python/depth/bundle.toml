@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: bundle.toml
-# Opis: Native Python bundle dla serwisu głębi (Depth Anything V3 / MiDaS). Oba
+# Opis: Native Python bundle dla serwisu głębi (Depth Anything V2 / ZoeDepth / MiDaS). Oba
 #       modele działają przez `transformers` `pipeline("depth-estimation")`, więc
 #       jeden server.py obsługuje wszystkie presety (MODEL = repo HF). Warianty:
 #       cuda (torch cu130) i cpu (torch CPU) — głębia działa też na CPU, wolniej.
@@ -9,7 +9,7 @@
 
 [bundle]
 engine = "depth"
-description = "Monocular depth estimation server (Depth Anything V3 / MiDaS via transformers)"
+description = "Monocular depth estimation server (Depth Anything V2 / ZoeDepth / MiDaS via transformers)"
 python_version = "3.12"
 source = "pypi"
 pypi_package = "huggingface_hub"

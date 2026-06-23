@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener serwisu głębi (Depth Anything V3 / MiDaS), direct-http (bez
+# Opis: Kontener serwisu głębi (Depth Anything V2 / ZoeDepth / MiDaS), direct-http (bez
 #       sidecara). server.py nasłuchuje HTTP na 0.0.0.0:${PORT}; Core gada HTTP
 #       wprost. Oba modele przez `transformers` depth-estimation; MODEL wybiera
 #       repo HF. Baza CUDA runtime (bez nvcc — brak rozszerzeń C++ do budowy).

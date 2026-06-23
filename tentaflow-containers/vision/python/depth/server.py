@@ -1,14 +1,15 @@
 # =============================================================================
 # Plik: server.py
-# Opis: Serwer FastAPI dla szacowania głębi (monocular depth) — Depth Anything V3
-#       i MiDaS (Intel DPT) przez `transformers` `pipeline("depth-estimation")`.
+# Opis: Serwer FastAPI dla szacowania głębi (monocular depth) — Depth Anything V2
+#       (relatywny i metryczny), ZoeDepth i MiDaS (Intel DPT) przez `transformers`
+#       `pipeline("depth-estimation")`.
 #       Model wybiera env MODEL (repo HF z presetu). Wystawia POST /v1/depth oraz
 #       GET /health. Wejście: obraz (data-URL/base64). Wyjście: mapa głębi jako
 #       surowy f32 little-endian (base64) + szerokość/wysokość + min/max + flaga
 #       is_metric. Konsument (Core/Robots) rzutuje głębię na chmurę punktów przez
 #       intrinsics kamery i skaluje metrycznie z ruchu ESKF.
 # Przyklad: curl -X POST http://127.0.0.1:8096/v1/depth \
-#           -d '{"model":"depth-anything-v3-large","input":[{"url":"data:image/png;base64,..."}]}'
+#           -d '{"model":"depth-anything-v2-metric-indoor-large","input":[{"url":"data:image/png;base64,..."}]}'
 # =============================================================================
 
 import base64
@@ -24,9 +25,10 @@ from PIL import Image
 from pydantic import BaseModel
 from transformers import pipeline
 
-# Repo HF wybierane przez deploy (preset → env MODEL). Domyślnie DA V3 Large.
-MODEL = os.environ.get("MODEL", "depth-anything/Depth-Anything-V3-Large-hf")
-# Modele metryczne (Depth Anything V2/V3 *-Metric-*, ZoeDepth) zwracają metry;
+# Repo HF wybierane przez deploy (preset → env MODEL). Domyślnie metryczny model
+# (mapowanie z kamery wymaga metrów); działa też dla zwykłego /v1/depth.
+MODEL = os.environ.get("MODEL", "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf")
+# Modele metryczne (Depth Anything V2 *-Metric-*, ZoeDepth) zwracają metry;
 # pozostałe — głębię względną. Mapowanie z kamery wymaga modelu metrycznego.
 IS_METRIC = any(k in MODEL.lower() for k in ("metric", "zoedepth"))
 
