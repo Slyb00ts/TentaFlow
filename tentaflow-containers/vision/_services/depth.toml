@@ -1,20 +1,24 @@
 # =============================================================================
 # Plik: depth.toml
 # Opis: Manifest serwisu szacowania GŁĘBI z obrazu (monocular depth) — Depth
-#       Anything V3 oraz MiDaS (Intel DPT). Jeden serwis, wiele presetów modeli;
-#       MODEL wybiera rodzinę. Surface "depth": wejście obraz, wyjście mapa głębi
-#       (image). Konsumowany wewnętrznie (Robots → chmura punktów → wspólna mapa)
-#       i na zewnątrz przez REST `POST /v1/depth`. Deploy: docker (direct-http) +
-#       native python-bundle. Oba modele działają przez `transformers`
+#       Anything V2 (relatywny i METRYCZNY), ZoeDepth oraz MiDaS (Intel DPT).
+#       Jeden serwis, wiele presetów modeli; MODEL wybiera rodzinę. Surface
+#       "depth": wejście obraz, wyjście mapa głębi (image). Konsumowany wewnętrznie
+#       (Robots → chmura punktów → wspólna mapa; WYMAGA modelu metrycznego) i na
+#       zewnątrz przez REST `POST /v1/depth`. Deploy: docker (direct-http) + native
+#       python-bundle. Wszystkie presety działają przez `transformers`
 #       `pipeline("depth-estimation")`, więc dzielą jeden server.py.
+#       UWAGA: Depth Anything V3 (repo `depth-anything/DA3-*`) to model
+#       WIELOWIDOKOWY (geometria + pozy) i NIE działa przez ten pipeline — wymaga
+#       osobnego serwera, więc nie ma go tu w presetach.
 # =============================================================================
 
 [engine]
 id = "depth"
 category = "vision"
 name = "Szacowanie głębi (Depth Anything / MiDaS)"
-description_pl = "Monocular depth z obrazu: Depth Anything V3 i MiDaS (Intel DPT). Zwraca mapę głębi (f32) do rekonstrukcji chmury punktów i map 3D z samej kamery."
-description_en = "Monocular depth from a single image: Depth Anything V3 and MiDaS (Intel DPT). Returns an f32 depth map for point-cloud reconstruction and camera-only 3D maps."
+description_pl = "Monocular depth z obrazu: Depth Anything V2 (relatywny i metryczny), ZoeDepth oraz MiDaS (Intel DPT). Zwraca mapę głębi (f32) do rekonstrukcji chmury punktów i map 3D z samej kamery."
+description_en = "Monocular depth from a single image: Depth Anything V2 (relative and metric), ZoeDepth and MiDaS (Intel DPT). Returns an f32 depth map for point-cloud reconstruction and camera-only 3D maps."
 homepage = "https://github.com/DepthAnything/Depth-Anything-V2"
 license = "apache-2.0"
 icon = "vision"
@@ -35,27 +39,10 @@ context_path = "vision/docker/depth"
 platforms = ["linux", "windows"]
 transport = "direct-http"
 
-# Depth Anything V3 — najnowsza rodzina, rekomendowana.
-[[model_preset]]
-id = "depth-anything-v3-large"
-display_name = "Depth Anything V3 Large"
-repo = "depth-anything/Depth-Anything-V3-Large-hf"
-recommended = true
-
-[[model_preset]]
-id = "depth-anything-v3-base"
-display_name = "Depth Anything V3 Base"
-repo = "depth-anything/Depth-Anything-V3-Base-hf"
-
-[[model_preset]]
-id = "depth-anything-v3-small"
-display_name = "Depth Anything V3 Small (szybki)"
-repo = "depth-anything/Depth-Anything-V3-Small-hf"
-
-# Depth Anything V2 — sprawdzony fallback gdy V3 niedostępne w danej wersji transformers.
+# Depth Anything V2 — relatywna głębia (dobra do podglądu / REST, NIE do mapy).
 [[model_preset]]
 id = "depth-anything-v2-large"
-display_name = "Depth Anything V2 Large"
+display_name = "Depth Anything V2 Large (relatywny)"
 repo = "depth-anything/Depth-Anything-V2-Large-hf"
 
 # MiDaS — rodzina Intel DPT (do porównania).
@@ -76,6 +63,7 @@ repo = "Intel/dpt-hybrid-midas"
 id = "depth-anything-v2-metric-indoor-large"
 display_name = "Depth Anything V2 Metric — Indoor Large (mapa wewnątrz)"
 repo = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+recommended = true
 
 [[model_preset]]
 id = "depth-anything-v2-metric-outdoor-large"
