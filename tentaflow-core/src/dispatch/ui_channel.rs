@@ -138,6 +138,10 @@ fn handle_panel_open(
 
     if let Some(addon_mgr) = ctx.state.addon_manager.as_ref() {
         let user_id = extract_user_id(ctx);
+        // Multi-tenant: instancja addona musi nieść org sesji, inaczej
+        // `instance_org_id` zwraca None i upload dokumentów z panelu odrzuca
+        // żądanie ("no running instance").
+        let org_id = ctx.org_context.as_ref().map(|o| o.org_id.clone());
 
         // WASM lifecycle (cold start + on_panel_open) is CPU-bound and runs
         // synchronously; off-load it from the async worker so concurrent panel
@@ -159,7 +163,7 @@ fn handle_panel_open(
                 if !has_handler {
                     let _ = addon_mgr.stop_addon(&panel_open.addon_id);
                     addon_mgr
-                        .start_addon(&panel_open.addon_id, user_id.clone(), None)
+                        .start_addon(&panel_open.addon_id, user_id.clone(), org_id.clone())
                         .map_err(|e| {
                             let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
                             sl.lock()
@@ -172,7 +176,7 @@ fn handle_panel_open(
                 }
             } else {
                 addon_mgr
-                    .start_addon(&panel_open.addon_id, user_id.clone(), None)
+                    .start_addon(&panel_open.addon_id, user_id.clone(), org_id.clone())
                     .map_err(|e| {
                         let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
                         sl.lock()
