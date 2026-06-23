@@ -387,6 +387,19 @@ pub async fn handle_request(
             .await
         }
 
+        // Depth — monocular depth estimation (Depth Anything V3 / MiDaS). Body
+        // (image in) forwarded verbatim to the depth service; returns a depth map.
+        ("POST", "/v1/depth") => {
+            handle_passthrough(
+                req,
+                router,
+                crate::services::catalog::ServiceSurface::Depth,
+                &[crate::services::catalog::InputModality::Image],
+                "/v1/depth",
+            )
+            .await
+        }
+
         // Rerank — reverse-proxy do serwisów vLLM `--task score`
         // (nemotron-rerank, nemotron-rerank-vl). Body forwardowane verbatim.
         ("POST", "/v1/rerank") => {
