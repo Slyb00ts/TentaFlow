@@ -16,6 +16,8 @@ icon = "yolo"
 default_port = 0
 api = "custom"
 version = "n-2024"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]

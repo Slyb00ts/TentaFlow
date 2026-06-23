@@ -109,6 +109,12 @@ export async function openDeployWizard(engineId, opts = {}) {
     // Subscription OAuth: set once the browser login completes on the node.
     oauthFlowId: null,
     oauthAccount: null,
+    // Generic engine parameters: wartosci dla silnikow ktore deklaruja
+    // manifestowe [[parameter]] i NIE naleza do rodziny vLLM/MLX (np. ds4).
+    // Klucz = `parameter.key`, trafiaja 1:1 do config_json.parameters{} i tam
+    // `apply_parameters_deploy` mapuje je wg bindingow na env/flagi silnika.
+    // Pusty na start; render czyta default z manifestu gdy brak wpisu.
+    genericParams: {},
     // Advanced (vLLM Auto-tuned) - wartosci uzywane do build vllm_args.
     // `lockedParam` = ostatnio dotkniety przez usera slider/chip — backend
     // dostaje `lock_<param>: true` tylko dla niego, reszte parametrow
@@ -392,12 +398,39 @@ function renderStepBody() {
 // Step Advanced wyswietlamy TYLKO dla LLM silnikow ktore akceptuja
 // VLLM_ARGS-style override (vllm/sglang/llama-cpp). Inne silniki (TTS/STT/
 // vision/image-gen) maja stalsze konfiguracje i nie maja kalkulatora VRAM.
+/// Manifest [[parameter]] list for engines outside the vLLM/MLX families
+/// (generated manifest serializes them under the singular key `parameter`).
+/// Drives a generic Advanced step (enum/int/float/bool/string) — ds4 uses this
+/// for backend / ctx / SSD streaming / MTP knobs.
+function manifestParams() {
+  const p = engineEntry?.parameter;
+  return Array.isArray(p) ? p : [];
+}
+
+// Engines whose Advanced step is the bespoke VRAM/KV calculator (vLLM family +
+// llama.cpp + MLX). They must NOT fall into the generic manifest-param renderer.
+const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'];
+
+function hasGenericParams() {
+  if (ADV_CALC_ENGINES.includes(engineId())) return false;
+  return manifestParams().length > 0;
+}
+
+/// Current value for a generic param, falling back to its manifest default.
+function genericParamValue(p) {
+  const cur = selection.genericParams[p.key];
+  return cur === undefined || cur === null ? p.default : cur;
+}
+
 function shouldSkipAdvancedStep() {
   const eng = engineEntry?.engine || {};
   const id = String(eng.id || '').toLowerCase();
+  // Engines with manifest [[parameter]] (ds4 etc.) get a generic Advanced step
+  // that needs neither a VRAM calc nor a GPU selection.
+  if (hasGenericParams()) return false;
   // MLX (embedded, Apple unified memory) reuzywa ten sam krok, ale liczy
   // "ile tokenow kontekstu zmiesci sie w budzecie pamieci" zamiast vLLM args.
-  if (!['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'].includes(id)) return true;
+  if (!ADV_CALC_ENGINES.includes(id)) return true;
   // Bez wybranego modelu nie ma jak liczyc VRAM/KV
   if (!selection.modelRepo && !selection.modelPresetId) return true;
   // Bez wybranych GPU tez nie — ale MLX nie ma dyskretnego GPU (unified memory),
@@ -851,7 +884,55 @@ function renderMlxAdvanced() {
   `;
 }
 
+/// Generic Advanced step driven purely by manifest [[parameter]] (ds4 and any
+/// future engine outside the vLLM/MLX families). Renders one tf-* control per
+/// declared parameter; values flow into selection.genericParams and then into
+/// config_json.parameters{} verbatim.
+function renderGenericAdvanced() {
+  const isPl = I18n.getLanguage() === 'pl';
+  const label = (p) => (isPl ? (p.label_pl || p.label_en) : (p.label_en || p.label_pl)) || p.key;
+
+  const controls = manifestParams().map((p) => {
+    const v = genericParamValue(p);
+    const common = `id="edw-gp-${escapeAttr(p.key)}" data-gp-key="${escapeAttr(p.key)}" data-gp-kind="${escapeAttr(p.kind)}"`;
+    let field = '';
+    if (p.kind === 'enum') {
+      const opts = (p.options || [])
+        .map((o) => `<option value="${escapeAttr(String(o))}"${String(o) === String(v) ? ' selected' : ''}>${escapeHtml(String(o))}</option>`)
+        .join('');
+      field = `<tf-select ${common} value="${escapeAttr(String(v))}">${opts}</tf-select>`;
+    } else if (p.kind === 'bool') {
+      field = `<tf-toggle ${common} ${v === true || v === 'true' ? 'checked' : ''}></tf-toggle>`;
+    } else if (p.kind === 'int' || p.kind === 'float') {
+      const r = p.range || {};
+      const step = p.kind === 'int' ? (r.step || 1) : (r.step || 'any');
+      const minA = r.min !== undefined ? ` min="${r.min}"` : '';
+      const maxA = r.max !== undefined ? ` max="${r.max}"` : '';
+      field = `<tf-input ${common} type="number"${minA}${maxA} step="${step}" value="${escapeAttr(String(v ?? ''))}" style="max-width:220px;"></tf-input>`;
+    } else {
+      field = `<tf-input ${common} type="text" value="${escapeAttr(String(v ?? ''))}" style="max-width:320px;"></tf-input>`;
+    }
+    return `
+      <div class="adv-field" style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">
+        <label for="edw-gp-${escapeAttr(p.key)}" style="font-weight:600;">${escapeHtml(label(p))}</label>
+        ${field}
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        ${escapeHtml(engineEntry?.engine?.name || engineId())}
+      </div>
+      ${controls}
+    </div>`;
+}
+
 function renderStepAdvanced() {
+  if (hasGenericParams()) {
+    return renderGenericAdvanced();
+  }
   if (isMlxEngine()) {
     return renderMlxAdvanced();
   }
@@ -1418,6 +1499,32 @@ function renderAdvancedManualControls(adv, rec) {
 }
 
 function bindAdvancedHandlers() {
+  // Generic manifest params (ds4 etc.): one change handler per declared control,
+  // value coerced by kind and stored in selection.genericParams.
+  if (hasGenericParams()) {
+    document.querySelectorAll('[data-gp-key]').forEach((el) => {
+      const key = el.getAttribute('data-gp-key');
+      const kind = el.getAttribute('data-gp-kind');
+      const handler = (e) => {
+        let val;
+        if (kind === 'bool') {
+          val = e.detail?.checked ?? el.checked ?? el.hasAttribute('checked');
+        } else if (kind === 'int' || kind === 'float') {
+          const raw = e.detail?.value ?? el.value;
+          const num = Number(raw);
+          val = Number.isFinite(num) ? (kind === 'int' ? Math.round(num) : num) : null;
+        } else {
+          val = e.detail?.value ?? el.value ?? '';
+        }
+        selection.genericParams[key] = val;
+      };
+      el.addEventListener('change', handler);
+      if (kind === 'int' || kind === 'float' || kind === 'string') {
+        el.addEventListener('input', handler);
+      }
+    });
+    return;
+  }
   // MLX: budzet pamieci / kv-bits / seqs -> backend liczy pule KV i pool_tokens,
   // readout odczytuje max kontekst z odpowiedzi. Debounce, zeby kazdy ruch
   // suwaka nie odpalal HF fetchu.
@@ -2625,8 +2732,16 @@ async function startDeploy() {
       max_context_tokens: mlxMaxContextFromBackend() || 0,
     };
   }
+  // Generic manifest params (ds4 etc.): emit the full key→value map (manifest
+  // default for any control the user didn't touch) so apply_parameters_deploy
+  // resolves each binding deterministically.
+  let genericParameters = null;
+  if (hasGenericParams()) {
+    genericParameters = {};
+    manifestParams().forEach((p) => { genericParameters[p.key] = genericParamValue(p); });
+  }
   const configJson = JSON.stringify({
-    parameters: mlxParameters,
+    parameters: genericParameters || mlxParameters,
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
     model_file: selection.modelFile || null,

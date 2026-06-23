@@ -17,6 +17,8 @@ icon = "vision"
 default_port = 0
 api = "custom"
 version = "fast-plate-2026"
+service_surfaces = ["documents"]
+input_modalities = ["image"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]

@@ -28,6 +28,10 @@ pub struct BinaryDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    /// HF token forwarded to the engine process as `HF_TOKEN` when the engine
+    /// pulls its weights from Hugging Face (e.g. ds4 GGUF repos). `None` for
+    /// model-less binaries (teams-bot) and engines bundling their own weights.
+    hf_token: Option<String>,
     log_sink: Option<LogSink>,
     /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
     /// alive across the await boundary in `deploy()`. Rollback consumes it.
@@ -41,15 +45,17 @@ impl BinaryDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
     ) -> Self {
-        Self::new_with_port(manifest, user_config, ports, log_sink, None)
+        Self::new_with_port(manifest, user_config, ports, hf_token, log_sink, None)
     }
 
     pub fn new_with_port(
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        hf_token: Option<String>,
         log_sink: Option<LogSink>,
         preserved_port: Option<u16>,
     ) -> Self {
@@ -57,6 +63,7 @@ impl BinaryDeploy {
             manifest,
             user_config,
             ports,
+            hf_token,
             log_sink,
             child: std::sync::Mutex::new(None),
             preserved_port,
@@ -135,13 +142,57 @@ impl DeployStrategy for BinaryDeploy {
                 ))
             })?;
 
-        let mut env = standard_engine_env();
+        // Typed schema params → env (Env bindings) + request_time → config_json.
+        // Computed before spawn so the launch script receives the engine's
+        // tuning knobs (ds4: backend, ctx, SSD streaming, MTP) as env vars.
+        let (param_app, request_time) = super::apply_parameters_deploy(
+            &self.manifest,
+            &self.user_config,
+            super::DeployTarget::NativeBinary,
+        )
+        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+
+        // Mirror python_bundle's env assembly: param Env bindings + standard
+        // engine cache env + PORT + MODEL/SERVED_MODEL_NAME + HF token + engine
+        // tuning passthrough + GPU visibility. The launch script maps these to
+        // the engine binary's CLI flags.
+        let mut env = param_app.env;
+        for (k, v) in standard_engine_env() {
+            env.entry(k).or_insert(v);
+        }
         env.insert("PORT".to_string(), port.to_string());
+        if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
+            env.insert("MODEL".to_string(), model);
+        }
+        if let Some(served) =
+            super::resolve_served_model_name(&self.manifest, &self.user_config)
+        {
+            env.insert("SERVED_MODEL_NAME".to_string(), served);
+        }
+        // HF_TOKEN only for engines that actually pull weights from HF.
+        if super::engine_uses_hf_model(&self.manifest, &self.user_config) {
+            if let Some(token) = self
+                .hf_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                env.insert("HF_TOKEN".to_string(), token.to_string());
+            }
+        }
+        super::apply_engine_env(&self.user_config, &mut env);
+        super::apply_gpu_selection_env(&self.user_config, &mut env);
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
         cmd.envs(env);
-        cmd.kill_on_drop(true);
+        // NO kill_on_drop: a successful deploy drops this strategy object once
+        // commit() returns, and kill_on_drop would then SIGKILL the engine we
+        // just launched — fatal for slow-loading engines (ds4 loads ~80 GB over
+        // ~minute, so the supervisor probe + respawn never let it stay up). The
+        // process is tracked by PID in RuntimeHandle; failure/rollback paths
+        // kill it explicitly via kill_child(). Mirrors python_bundle (detach +
+        // PID-tracked stop).
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -244,15 +295,7 @@ impl DeployStrategy for BinaryDeploy {
             models_from_manifest(&self.manifest, &self.user_config)
         };
 
-        // Typed schema params + request_time → config_json. Dla binary
-        // engines (sherpa-onnx, stable-diffusion-cpp, teams-bot) zwykle
-        // pusta `parameters` w manifescie, wiec request_time = default.
-        let (_param_app, request_time) = super::apply_parameters_deploy(
-            &self.manifest,
-            &self.user_config,
-            super::DeployTarget::NativeBinary,
-        )
-        .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+        // `request_time` params (computed before spawn) → config_json.
         let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
@@ -408,7 +451,7 @@ fi
         // Use 49800..49900 (private/dynamic range, free na typowych dev hostach)
         // — 47000..47050 koliduje z wieloma lokalnymi serwisami (tentaflow itself).
         let ports = Arc::new(PortAllocator::new((49_800, 49_900), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None);
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None, None);
         let prepared = s.prepare().await.expect("prepare succeeds");
         assert!(prepared.runtime.pid.is_some());
         assert!(prepared.runtime.port.is_some());
@@ -422,7 +465,7 @@ fi
         let dir = tempfile::tempdir().unwrap();
         let manifest = make_manifest("bin-no-script", dir.path().to_str().unwrap());
         let ports = Arc::new(PortAllocator::new((49_910, 49_920), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None);
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports, None, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Spawn(_)));
     }
@@ -441,7 +484,7 @@ fi
         write_fake_server(dir.path());
         let manifest = make_manifest("bin-rb", dir.path().to_str().unwrap());
         let ports = Arc::new(PortAllocator::new((49_700, 49_799), HashSet::new()).unwrap());
-        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone(), None);
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone(), None, None);
         let prepared = s.prepare().await.unwrap();
         let used = prepared.runtime.port.unwrap();
         s.rollback(prepared).await.unwrap();

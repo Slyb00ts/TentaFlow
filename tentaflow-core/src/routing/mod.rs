@@ -217,7 +217,7 @@ async fn build_initial_envelope_inner(
 /// - `http://` lub `https://` URLs (3b nie robi fetch — klient encoduje
 ///   po swojej stronie).
 /// - innych formatów (file://, blob:, broken data URL).
-fn decode_data_url(url: &str) -> Result<(Vec<u8>, String)> {
+pub fn decode_data_url(url: &str) -> Result<(Vec<u8>, String)> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return Err(crate::error::CoreError::InvalidRequest {
             message: "image_url.url must be a base64 data URL — HTTP/HTTPS \
