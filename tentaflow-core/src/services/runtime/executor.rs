@@ -1832,8 +1832,18 @@ impl ModelRuntimeExecutor {
         // stronę → PNG → `blocking_send` na kanał o pojemności 2; konsument
         // (tu, async) odbiera PNG i parsuje POZA pdfium-lockiem. Backpressure
         // kanału ogranicza szczyt pamięci do ~2 stron, nie O(N).
+        use futures::StreamExt as _;
+
+        // Współbieżność parsowania stron. Model parse (885M VLM) NIE wysyca GPU
+        // na pojedynczej stronie (util ~25% — bottleneck to narzut Pythona per
+        // token, nie compute), więc kilka stron równolegle wypełnia GPU i
+        // wall-clock wielostronicowego dokumentu spada wielokrotnie. Kanał ma tę
+        // samą pojemność, by producent (rasteryzer) trzymał strony gotowe dla
+        // workerów; szczyt pamięci ~PARSE_PAGE_CONCURRENCY stron PNG (bounded).
+        const PARSE_PAGE_CONCURRENCY: usize = 6;
+
         let pdf_bytes = request.image_bytes.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PageRender>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PageRender>(PARSE_PAGE_CONCURRENCY);
 
         let producer = tokio::task::spawn_blocking(move || {
             rasterize_pdf_streaming(&pdf_bytes, DEFAULT_RENDER_DPI, MAX_PDF_PAGES, |page| {
@@ -1844,39 +1854,57 @@ impl ModelRuntimeExecutor {
             })
         });
 
-        // Konsument: parsuje każdą stronę przez `execute_documents` jako obraz
-        // PNG — ta sama ścieżka resolve→rank→failover co dla wejścia obrazowego.
-        // Sekwencyjnie (kanał wydaje strony po kolei), żeby self-referencyjny
-        // parse-flow nie zalał backendu i żeby `flow_depth` był deterministyczny.
-        // Numery stron narastają z `page.index` (0..N), merge je przepisuje.
-        let mut page_responses: Vec<DocumentParseResponse> = Vec::new();
+        // Konsument RÓWNOLEGŁY: parsujemy do PARSE_PAGE_CONCURRENCY stron naraz.
+        // Każda strona to NIEZALEŻNY dispatch: własny KLON ctx z resetem hopa
+        // (enter_hop inkrementuje hop_count TRWALE; współdzielony ctx tripnąłby
+        // MAX_HOP_COUNT po kilku stronach). Wyniki wracają NIEUPORZĄDKOWANE, więc
+        // niesiemy `page.index` i sortujemy przed merge — `merge_page_responses`
+        // nadaje numery stron po kolejności w Vec.
+        let base_hop = ctx.hop_count;
+        let base_ctx = ctx.clone();
+        let model = request.model.clone();
+        let flow_depth = request.flow_depth;
+        let page_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|page| (page, rx))
+        });
+        let mut indexed: Vec<(u32, Result<DocumentParseResponse, ExecutorError>)> = page_stream
+            .map(|page| {
+                let mut page_ctx = base_ctx.clone();
+                page_ctx.hop_count = base_hop;
+                let model = model.clone();
+                async move {
+                    let page_request = DocumentParseRequest {
+                        model,
+                        image_bytes: page.png,
+                        mime: "image/png".to_string(),
+                        flow_depth,
+                    };
+                    // `Box::pin` — rekurencyjna async fn (execute_documents wołane
+                    // z execute_documents_pdf); bez tego typ future byłby
+                    // nieskończenie zagnieżdżony.
+                    let res = Box::pin(self.execute_documents(page_request, &mut page_ctx)).await;
+                    (page.index, res)
+                }
+            })
+            .buffer_unordered(PARSE_PAGE_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Strumień skonsumował `rx` (drop wewnątrz unfold po wyczerpaniu) →
+        // producent dostaje Closed i kończy.
+        indexed.sort_by_key(|(idx, _)| *idx);
+        let mut page_responses: Vec<DocumentParseResponse> = Vec::with_capacity(indexed.len());
         let mut failed_pages = 0usize;
         let mut last_page_err: Option<ExecutorError> = None;
-        // Każda strona to NIEZALEŻNY dispatch (jeden mesh-hop my→serwis parse),
-        // nie ogniwo jednego łańcucha re-forward. Współdzielony mutowalny `ctx`
-        // kumulowałby `hop_count` (enter_hop inkrementuje trwale) → po
-        // MAX_HOP_COUNT stron mesh-forward byłby odrzucony ("hop limit reached").
-        // Resetujemy hop do wartości bazowej PRZED każdą stroną.
-        let base_hop = ctx.hop_count;
-        while let Some(page) = rx.recv().await {
-            ctx.hop_count = base_hop;
-            let page_request = DocumentParseRequest {
-                model: request.model.clone(),
-                image_bytes: page.png,
-                mime: "image/png".to_string(),
-                flow_depth: request.flow_depth,
-            };
-            // `Box::pin` — rekurencyjna async fn (execute_documents wywołuje
-            // execute_documents_pdf, który tu woła execute_documents); bez tego
-            // typ future byłby nieskończenie zagnieżdżony.
-            match Box::pin(self.execute_documents(page_request, ctx)).await {
+        for (_idx, res) in indexed {
+            match res {
                 Ok(resp) => page_responses.push(resp),
                 Err(e) => {
                     // Tolerancja per-strona: pojedyncza felerna strona (np. bug
                     // postprocessingu modelu parse na konkretnym layoutcie, albo
                     // chwilowy błąd backendu) NIE może ubić całego wielostronicowego
-                    // dokumentu. Logujemy i kontynuujemy; dokument fail-uje TYLKO
-                    // gdy ŻADNA strona się nie sparsowała (sprawdzenie niżej).
+                    // dokumentu. Logujemy i pomijamy; dokument fail-uje TYLKO gdy
+                    // ŻADNA strona się nie sparsowała (sprawdzenie niżej).
                     failed_pages += 1;
                     tracing::warn!(
                         error = %e,
@@ -1887,9 +1915,6 @@ impl ModelRuntimeExecutor {
                 }
             }
         }
-        // Zamknięcie `rx` (drop po wyjściu z pętli) odblokuje producenta na
-        // `blocking_send` (Closed) — nie zostawiamy wiszącego wątku blocking.
-        drop(rx);
 
         let rasterize_result = producer
             .await
