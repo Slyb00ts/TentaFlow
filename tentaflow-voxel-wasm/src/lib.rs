@@ -2275,10 +2275,14 @@ fn install_pointer_handlers(
             d.last_x = x;
             d.last_y = y;
 
-            let mut st = state.borrow_mut();
-            st.camera.azimuth -= dx * 0.01;
-            st.camera.elevation = (st.camera.elevation + dy * 0.01)
-                .clamp(-1.5533, 1.5533); // keep just inside ±90° to avoid gimbal flip
+            // try_borrow: a pointer event can fire while a render/upload holds the
+            // State borrow; skip this frame's orbit rather than panic (a hard borrow
+            // panic aborts the whole wasm renderer).
+            if let Ok(mut st) = state.try_borrow_mut() {
+                st.camera.azimuth -= dx * 0.01;
+                st.camera.elevation = (st.camera.elevation + dy * 0.01)
+                    .clamp(-1.5533, 1.5533); // keep just inside ±90° to avoid gimbal flip
+            }
         }) as Box<dyn FnMut(web_sys::Event)>);
         canvas.add_event_listener_with_callback("pointermove", cb.as_ref().unchecked_ref())?;
         closures.push(cb);
@@ -2300,9 +2304,11 @@ fn install_pointer_handlers(
         let cb = Closure::wrap(Box::new(move |ev: web_sys::Event| {
             let we: web_sys::WheelEvent = ev.unchecked_into();
             we.prevent_default();
-            let mut st = state.borrow_mut();
-            let factor = if we.delta_y() > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            st.camera.distance = (st.camera.distance * factor).clamp(0.05, 5000.0);
+            // try_borrow: skip the zoom rather than panic if State is mid-borrow.
+            if let Ok(mut st) = state.try_borrow_mut() {
+                let factor = if we.delta_y() > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                st.camera.distance = (st.camera.distance * factor).clamp(0.05, 5000.0);
+            }
         }) as Box<dyn FnMut(web_sys::Event)>);
         // passive:false so prevent_default actually suppresses page scroll.
         let opts = web_sys::AddEventListenerOptions::new();

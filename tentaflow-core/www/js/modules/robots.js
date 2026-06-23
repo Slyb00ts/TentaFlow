@@ -683,7 +683,9 @@ function renderSharedClouds() {
   }
 }
 
-// Concatenate `[points, count]` parts into one packed buffer and hand it to `fn`.
+// Sample `[points, count]` parts into ONE capped packed buffer and hand it to `fn`.
+// Strides during the copy so the full (possibly millions-of-points) union is NEVER
+// materialized — that big intermediate alloc could itself OOM the browser.
 function unionInto(fn, parts) {
   let total = 0;
   for (const [, n] of parts) total += n;
@@ -691,13 +693,21 @@ function unionInto(fn, parts) {
     try { fn(new Float32Array(0), 0); } catch { /* ignore */ }
     return;
   }
-  const buf = new Float32Array(total * 3);
-  let off = 0;
+  const stride = total > MAX_RENDER_POINTS ? Math.ceil(total / MAX_RENDER_POINTS) : 1;
+  const outN = Math.floor(total / stride);
+  const buf = new Float32Array(outN * 3);
+  let o = 0; // output point index
+  let gi = 0; // global input point index across all parts
   for (const [pts, n] of parts) {
-    buf.set(pts.subarray(0, n * 3), off);
-    off += n * 3;
+    for (let i = 0; i < n; i += 1, gi += 1) {
+      if (gi % stride !== 0 || o >= outN) continue;
+      buf[o * 3] = pts[i * 3];
+      buf[o * 3 + 1] = pts[i * 3 + 1];
+      buf[o * 3 + 2] = pts[i * 3 + 2];
+      o += 1;
+    }
   }
-  try { fn(buf, total); } catch (e) { console.warn('[robots] shared map union render threw:', e?.message ?? e); }
+  try { fn(buf, o); } catch (e) { console.warn('[robots] shared map union render threw:', e?.message ?? e); }
 }
 
 // =============================================================================
@@ -2451,13 +2461,33 @@ function onDepthSceneChunk(id, live, body) {
   renderOverlay(id, live);
 }
 
+// Hard ceiling on points pushed to the wgpu renderer in ONE call. The accumulated
+// camera-depth map can grow to millions of voxels; feeding that raw (×union of
+// several robots) exhausts the wasm renderer's linear memory and OOMs it mid robot-
+// model load. Downsample by stride above this — visually equivalent for a dense map.
+const MAX_RENDER_POINTS = 300000;
+function capPoints(pts, count) {
+  const n = count | 0;
+  if (!pts || n <= MAX_RENDER_POINTS) return [pts, n];
+  const stride = Math.ceil(n / MAX_RENDER_POINTS);
+  const outN = Math.floor(n / stride);
+  const out = new Float32Array(outN * 3);
+  for (let i = 0, o = 0; o < outN; i += stride, o += 1) {
+    out[o * 3] = pts[i * 3];
+    out[o * 3 + 1] = pts[i * 3 + 1];
+    out[o * 3 + 2] = pts[i * 3 + 2];
+  }
+  return [out, outN];
+}
+
 // Render the LiDAR shared map (authoritative replace, radial colormap).
 function renderMap(id, live) {
   if (sharedMapMode) { renderSharedClouds(); return; }
   if (!voxelView || id !== selectedRobotId || !voxelView.setMapPoints) return;
   if (!live.lastScenePoints) return;
   try {
-    voxelView.setMapPoints(live.lastScenePoints, live.lastSceneCount | 0);
+    const [pts, cnt] = capPoints(live.lastScenePoints, live.lastSceneCount);
+    voxelView.setMapPoints(pts, cnt);
     applyRobotPose(id);
   } catch (e) {
     console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
@@ -2472,7 +2502,8 @@ function renderOverlay(id, live) {
   if (!voxelView || id !== selectedRobotId || !voxelView.setOverlayPoints) return;
   try {
     if (live.depthOn && live.lastDepthPoints) {
-      voxelView.setOverlayPoints(live.lastDepthPoints, live.lastDepthCount | 0);
+      const [pts, cnt] = capPoints(live.lastDepthPoints, live.lastDepthCount);
+      voxelView.setOverlayPoints(pts, cnt);
     } else {
       voxelView.setOverlayPoints(new Float32Array(0), 0);
     }
