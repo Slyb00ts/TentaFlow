@@ -41,6 +41,10 @@ _Bool tentaflow_mobile_push_sensor(int kind, const unsigned char* ptr, int len);
 // Czyści bufor czujników (rozłączenie / pauza).
 void tentaflow_mobile_clear_sensors(void);
 
+// Wpycha jedną jednostkę dostępu H.264 (Annex-B) z natywnego enkodera kamery do
+// zarejestrowanej kamery push (ten sam potok co każda kamera).
+_Bool tentaflow_mobile_push_camera_h264(const unsigned char* ptr, int len);
+
 // =============================================================================
 // Swift MLX bridge — typy callbackow i rejestracja
 // =============================================================================

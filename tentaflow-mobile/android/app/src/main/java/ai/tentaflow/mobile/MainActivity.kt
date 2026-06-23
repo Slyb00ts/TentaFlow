@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     // Phone-as-sensor-robot: native capture → core fusion engine + shared map.
     private var sensorBridge: SensorBridge? = null
     private var depthCapture: DepthCapture? = null
+    private var cameraEncoder: CameraEncoder? = null
 
     private val sensorPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -131,6 +132,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        cameraEncoder?.stop()
         depthCapture?.stop()
         sensorBridge?.stop()
         if (::webView.isInitialized) {
@@ -162,6 +164,13 @@ class MainActivity : AppCompatActivity() {
         ) return
         depthCapture = DepthCapture(this, bridge).also {
             if (!it.start()) depthCapture = null
+        }
+        // The camera is one device: if ARCore depth claimed it, it maps via hardware
+        // depth. Otherwise stream the camera (tile + TentaVision + AI-depth path).
+        if (depthCapture == null && cameraEncoder == null) {
+            cameraEncoder = CameraEncoder(applicationContext).also {
+                if (!it.start()) cameraEncoder = null
+            }
         }
     }
 
