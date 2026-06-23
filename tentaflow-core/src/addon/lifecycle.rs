@@ -3278,6 +3278,22 @@ fn register_engine_flows(
                 addon_id
             );
         }
+        // Install nie startuje instancji, więc durable write powyżej siedzi tylko
+        // w RAM jako dirty i czeka na periodyczny flush (2 s) albo flush-na-stopie.
+        // Jeśli proces/shard zniknie wcześniej (reinstall, restart przed tickiem),
+        // engine_flow_model przepada i query-flow staje się nieosiągalny mimo
+        // istniejącego wiązania. Install to rzadkie zdarzenie, więc flushujemy ten
+        // klucz synchronicznie — gwarancja trwałości natychmiast po rejestracji.
+        if let Err(e) = crate::addon::state_flusher::flush_addon(
+            db.as_ref(),
+            crate::addon::state_store::AddonStateStore::global(),
+            addon_id,
+        ) {
+            tracing::warn!(
+                "engine_flow: synchroniczny flush KV instancji '{}' nieudany: {e}",
+                addon_id
+            );
+        }
     }
 
     // Świeży flow w katalogu modeli + invalidacja cache resolvera.
