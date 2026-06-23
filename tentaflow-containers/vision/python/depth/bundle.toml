@@ -29,12 +29,12 @@ platforms = ["linux-x86_64", "windows-x86_64", "macos-arm64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub[hf_transfer]"]
+extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub", "hf_transfer"]
 env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }
 install_hint = "CUDA_VISIBLE_DEVICES=0"
 
 # CPU — działa wszędzie (też macOS przez MPS z domyślnym torch); wolniejsze.
 [[install_variants]]
 backend = "cpu"
-extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub[hf_transfer]"]
+extras = ["torch==2.11.0", "torchvision==0.26.0", "transformers>=4.45", "pillow>=12", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "accelerate", "huggingface_hub", "hf_transfer"]
 env = { HF_HUB_ENABLE_HF_TRANSFER = "1" }
