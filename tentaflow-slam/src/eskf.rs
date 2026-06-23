@@ -17,7 +17,7 @@
 
 use nalgebra::{Matrix3, SMatrix, SVector, UnitQuaternion, Vector3};
 use tentaflow_sdk_spec::{
-    BaroSample, GnssFix, GlobalPoseFrame, ImuSample, GLOBAL_POSE_VERSION, POSE_SRC_GNSS,
+    BaroSample, GnssFix, GlobalPoseFrame, ImuSample, MagSample, GLOBAL_POSE_VERSION, POSE_SRC_GNSS,
     POSE_SRC_IMU, POSE_STATE_GLOBAL, POSE_STATE_SCENE_LOCAL,
 };
 
@@ -47,6 +47,10 @@ pub struct EskfConfig {
     pub gyro_bias_rw: f64,
     /// Gravity magnitude (m/s²) in the ENU nav frame (acts along −Up).
     pub gravity: f64,
+    /// Magnetic declination (degrees east of true North) at the operating area, used
+    /// to turn a magnetometer heading into a true-North yaw. 0 is a safe default
+    /// (small error away from the poles); set per region for accuracy.
+    pub mag_declination_deg: f64,
 }
 
 impl Default for EskfConfig {
@@ -57,7 +61,20 @@ impl Default for EskfConfig {
             accel_bias_rw: 1.0e-4,
             gyro_bias_rw: 1.0e-5,
             gravity: 9.81,
+            mag_declination_deg: 0.0,
         }
+    }
+}
+
+/// Wrap an angle to (−π, π].
+#[inline]
+fn wrap_pi(a: f64) -> f64 {
+    let twopi = std::f64::consts::TAU;
+    let x = (a + std::f64::consts::PI).rem_euclid(twopi) - std::f64::consts::PI;
+    if x <= -std::f64::consts::PI {
+        x + twopi
+    } else {
+        x
     }
 }
 
@@ -315,6 +332,38 @@ impl EskfEngine {
         true
     }
 
+    /// Fold a magnetometer sample as a YAW measurement (tilt-compensated): rotate the
+    /// body field into the nav frame using the current attitude, take its horizontal
+    /// bearing, and compare to magnetic North (= declination east of true North). The
+    /// mismatch is the yaw error → a 1-DoF update on the yaw component of the
+    /// orientation error. Skips a near-vertical field (no horizontal heading info).
+    /// Heading indoors is unreliable; the honest noise model (∝ 1/horizontal-strength)
+    /// keeps a weak reading from dominating.
+    pub fn ingest_mag(&mut self, s: &MagSample) -> bool {
+        if !s.is_finite() {
+            return false;
+        }
+        let m_b = Vector3::new(s.field_ut[0] as f64, s.field_ut[1] as f64, s.field_ut[2] as f64);
+        let m_n = self.q.to_rotation_matrix() * m_b; // body → nav (ENU)
+        let horiz = (m_n.x * m_n.x + m_n.y * m_n.y).sqrt();
+        if horiz < 1.0 {
+            return false; // < 1 µT horizontal → heading unobservable
+        }
+        // Measured bearing of the field (east-of-North) vs expected (declination).
+        let bearing = m_n.x.atan2(m_n.y); // predicted field bearing from the estimate
+        let decl = self.cfg.mag_declination_deg.to_radians();
+        // ∂bearing/∂δθ_z = −1 (a +yaw error rotates the nav-frame field by −yaw), so
+        // with H = +1 the innovation is (bearing − declination): a +yaw error yields a
+        // −bearing → negative residual → the update rotates yaw back toward truth.
+        let residual = SVector::<f64, 1>::new(wrap_pi(bearing - decl));
+        let mut h = SMatrix::<f64, 1, 15>::zeros();
+        h[(0, ITH + 2)] = 1.0; // yaw component of the orientation error
+        // Angular noise (rad) from field-strength-normalised µT noise, floored/capped.
+        let ang = ((s.noise_std_ut.max(0.1) as f64) / horiz).clamp(0.02, 1.0);
+        self.update(h, residual, SVector::<f64, 1>::new(ang * ang).into());
+        true
+    }
+
     /// Diagonal covariance `[σ²x σ²y σ²z σ²roll σ²pitch σ²yaw]` for the output frame.
     fn cov_diag(&self) -> [f32; 6] {
         [
@@ -477,6 +526,34 @@ mod tests {
             e.ingest_baro(&baro);
         }
         assert!((e.position_enu()[2] - 5.0).abs() < 1.0, "baro pulls Up toward 5 m");
+    }
+
+    #[test]
+    fn mag_update_corrects_yaw_error() {
+        use tentaflow_sdk_spec::MAG_SAMPLE_VERSION;
+        use nalgebra::UnitQuaternion;
+        let mag = |f: [f32; 3]| MagSample {
+            version: MAG_SAMPLE_VERSION,
+            flags: 0,
+            timestamp_us: 0,
+            field_ut: f,
+            noise_std_ut: 0.5,
+        };
+        let mut e = EskfEngine::new(EskfConfig::default());
+        e.ingest_imu(&imu(0, LEVEL_ACCEL, [0.0; 3])); // level, seed
+        // Inject a +30° yaw error into the nominal state.
+        let yaw_err = 30.0_f64.to_radians();
+        e.q = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw_err);
+        // The device is TRULY level facing North (true yaw 0), so its magnetometer
+        // reads the world field directly in the body frame. The estimate's +30° yaw
+        // error makes the predicted nav field bearing 30° off → the update corrects it.
+        let body = [0.0_f32, 25.0, -40.0]; // North + downward dip, body == world at true R=I
+        for _ in 0..15 {
+            e.ingest_mag(&mag(body));
+        }
+        // Yaw should be pulled back toward 0 (the field's true North bearing).
+        let (_, _, yaw) = e.q.euler_angles();
+        assert!(yaw.abs() < yaw_err * 0.5, "mag pulled yaw from 30° toward 0: {}", yaw.to_degrees());
     }
 
     #[test]
