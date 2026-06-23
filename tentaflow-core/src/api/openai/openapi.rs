@@ -67,6 +67,7 @@ pub fn build_spec() -> Value {
         "tags": [
             { "name": "Models", "description": "Lista modeli dostepnych dla klucza API." },
             { "name": "Chat", "description": "Chat completions (tekst i vision), blocking lub SSE streaming." },
+            { "name": "Anthropic (Messages API)", "description": "Zgodne z Anthropic Messages API (`POST /v1/messages` + `count_tokens`). Auth `x-api-key` + `anthropic-version`. Warstwa tlumaczaca ponad ta sama sciezka chatu — te same modele/ACL." },
             { "name": "Embeddings", "description": "Generowanie wektorow embeddingow." },
             { "name": "Reranking", "description": "Rerank dokumentow wzgledem zapytania (kontrakty Cohere/Jina oraz NVIDIA NeMo)." },
             { "name": "Vision", "description": "Wizyjny inference NVIDIA NIM (OCR, detekcja, poza, emocje)." },
@@ -82,7 +83,7 @@ pub fn build_spec() -> Value {
 
 /// Definicje wszystkich tras (paths) z opisami, schematami i przykladami.
 fn build_paths() -> Value {
-    json!({
+    let mut paths = json!({
         "/v1/models": {
             "get": {
                 "tags": ["Models"],
@@ -590,6 +591,110 @@ fn build_paths() -> Value {
                 }
             }
         }
+    });
+    // Anthropic Messages API — osobne wywolanie `json!`, zeby nie przekroczyc
+    // recursion_limit makra w jednym wyrazeniu (jak `build_infer_response_schema`).
+    if let Value::Object(map) = &mut paths {
+        if let Value::Object(anthropic) = build_anthropic_paths() {
+            map.extend(anthropic);
+        }
+    }
+    paths
+}
+
+/// Sciezki Anthropic Messages API (`/v1/messages` + `count_tokens`).
+fn build_anthropic_paths() -> Value {
+    json!({
+        "/v1/messages": {
+            "post": {
+                "tags": ["Anthropic (Messages API)"],
+                "summary": "Anthropic Messages (tekst i vision)",
+                "description": "Zgodne z Anthropic Messages API. Auth naglowkiem `x-api-key` \
+                    (+ `anthropic-version`). `messages[].content` to string albo lista blokow: \
+                    `{type:\"text\",text}` oraz `{type:\"image\",source:{type:\"base64\",media_type,data}}`. \
+                    `system` jest top-level (string albo lista blokow text). `max_tokens` jest wymagane. \
+                    Gdy `stream:true`, odpowiedz to strumien SSE z sekwencja zdarzen Anthropic: \
+                    `message_start` -> `content_block_start` -> `content_block_delta`* -> \
+                    `content_block_stop` -> `message_delta` -> `message_stop`.",
+                "operationId": "createAnthropicMessage",
+                "security": [ { "apiKeyAuth": [] } ],
+                "parameters": [
+                    { "name": "anthropic-version", "in": "header", "required": false,
+                      "description": "Wersja Anthropic API (np. `2023-06-01`).",
+                      "schema": { "type": "string" } }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" },
+                        "example": {
+                            "model": "qwen3-27b",
+                            "max_tokens": 128,
+                            "system": "You are a helpful assistant.",
+                            "messages": [
+                                { "role": "user", "content": "Say hello in Polish." }
+                            ]
+                        }
+                    } }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Anthropic message (JSON) lub strumien SSE gdy `stream:true`",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AnthropicMessagesResponse" },
+                                "example": {
+                                    "id": "msg_0123456789abcdef",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [ { "type": "text", "text": "Czesc!" } ],
+                                    "model": "qwen3-27b",
+                                    "stop_reason": "end_turn",
+                                    "stop_sequence": null,
+                                    "usage": { "input_tokens": 21, "output_tokens": 3 }
+                                }
+                            },
+                            "text/event-stream": {
+                                "schema": { "type": "string" },
+                                "example": "event: message_start\ndata: {\"type\":\"message_start\",...}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Czesc\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                            }
+                        }
+                    },
+                    "401": { "$ref": "#/components/responses/Unauthorized" }
+                }
+            }
+        },
+        "/v1/messages/count_tokens": {
+            "post": {
+                "tags": ["Anthropic (Messages API)"],
+                "summary": "Anthropic count_tokens",
+                "description": "Zwraca estymacje liczby tokenow wejsciowych dla podanych \
+                    `messages` (+ opcjonalnego `system`). Bloki text sa liczone, bloki image \
+                    pomijane.",
+                "operationId": "countAnthropicTokens",
+                "security": [ { "apiKeyAuth": [] } ],
+                "requestBody": {
+                    "required": true,
+                    "content": { "application/json": {
+                        "schema": { "$ref": "#/components/schemas/AnthropicCountTokensRequest" },
+                        "example": {
+                            "model": "qwen3-27b",
+                            "messages": [ { "role": "user", "content": "hello" } ]
+                        }
+                    } }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Estymowana liczba tokenow wejsciowych",
+                        "content": { "application/json": {
+                            "schema": { "$ref": "#/components/schemas/AnthropicCountTokensResponse" },
+                            "example": { "input_tokens": 8 }
+                        } }
+                    },
+                    "401": { "$ref": "#/components/responses/Unauthorized" }
+                }
+            }
+        }
     })
 }
 
@@ -608,6 +713,14 @@ fn build_components() -> Value {
                 "in": "header",
                 "name": "X-Pickup-Token",
                 "description": "Jednorazowy HMAC SHA-256 token dla `/core/frame/pickup` (TTL 30 s, w produkcji + mTLS)."
+            },
+            "apiKeyAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "x-api-key",
+                "description": "Klucz API w naglowku `x-api-key` (kontrakt Anthropic SDK). \
+                    Wymagany dla `/v1/messages` oraz `/v1/messages/count_tokens` \
+                    (obok naglowka `anthropic-version`)."
             }
         },
         "responses": {
@@ -850,8 +963,99 @@ fn build_schemas() -> Value {
     // przekroczyc recursion_limit makra w jednym wyrazeniu.
     if let Value::Object(map) = &mut schemas {
         map.insert("InferResponse".to_string(), build_infer_response_schema());
+        if let Value::Object(anthropic) = build_anthropic_schemas() {
+            map.extend(anthropic);
+        }
     }
     schemas
+}
+
+/// Schematy Anthropic Messages API — osobne wywolanie `json!` (recursion_limit).
+fn build_anthropic_schemas() -> Value {
+    json!({
+        "AnthropicContentBlock": {
+            "oneOf": [
+                { "type": "object", "properties": {
+                    "type": { "type": "string", "enum": ["text"] },
+                    "text": { "type": "string" }
+                }, "required": ["type", "text"] },
+                { "type": "object", "properties": {
+                    "type": { "type": "string", "enum": ["image"] },
+                    "source": { "type": "object", "properties": {
+                        "type": { "type": "string", "enum": ["base64"] },
+                        "media_type": { "type": "string", "example": "image/png" },
+                        "data": { "type": "string", "description": "Obraz zakodowany base64." }
+                    }, "required": ["type", "media_type", "data"] }
+                }, "required": ["type", "source"] }
+            ]
+        },
+        "AnthropicMessage": {
+            "type": "object",
+            "properties": {
+                "role": { "type": "string", "enum": ["user", "assistant"] },
+                "content": { "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicContentBlock" } }
+                ] }
+            },
+            "required": ["role", "content"]
+        },
+        "AnthropicMessagesRequest": {
+            "type": "object",
+            "properties": {
+                "model": { "type": "string" },
+                "max_tokens": { "type": "integer", "description": "Wymagane — limit tokenow odpowiedzi." },
+                "messages": { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicMessage" } },
+                "system": { "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "object", "properties": { "type": { "type": "string", "enum": ["text"] }, "text": { "type": "string" } } } }
+                ], "description": "Systemowy prompt (top-level)." },
+                "temperature": { "type": "number" },
+                "top_p": { "type": "number" },
+                "top_k": { "type": "integer", "description": "Brak odpowiednika w sciezce chatu — pomijane." },
+                "stop_sequences": { "type": "array", "items": { "type": "string" } },
+                "stream": { "type": "boolean" }
+            },
+            "required": ["model", "max_tokens", "messages"]
+        },
+        "AnthropicMessagesResponse": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "example": "msg_0123456789abcdef" },
+                "type": { "type": "string", "example": "message" },
+                "role": { "type": "string", "example": "assistant" },
+                "content": { "type": "array", "items": { "type": "object", "properties": {
+                    "type": { "type": "string", "enum": ["text"] },
+                    "text": { "type": "string" }
+                } } },
+                "model": { "type": "string" },
+                "stop_reason": { "type": ["string", "null"] },
+                "stop_sequence": { "type": ["string", "null"] },
+                "usage": { "type": "object", "properties": {
+                    "input_tokens": { "type": "integer" },
+                    "output_tokens": { "type": "integer" }
+                } }
+            },
+            "required": ["id", "type", "role", "content", "model", "usage"]
+        },
+        "AnthropicCountTokensRequest": {
+            "type": "object",
+            "properties": {
+                "model": { "type": "string" },
+                "messages": { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicMessage" } },
+                "system": { "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "object", "properties": { "type": { "type": "string", "enum": ["text"] }, "text": { "type": "string" } } } }
+                ] }
+            },
+            "required": ["model", "messages"]
+        },
+        "AnthropicCountTokensResponse": {
+            "type": "object",
+            "properties": { "input_tokens": { "type": "integer" } },
+            "required": ["input_tokens"]
+        }
+    })
 }
 
 /// Schemat odpowiedzi wizyjnej `/v1/infer` (oneOf: OCR / detekcja / poza / emocje).
