@@ -7,7 +7,7 @@
 # =============================================================================
 set -euo pipefail
 
-export MODEL="${MODEL:-depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf}"
+export MODEL="${MODEL:-Intel/zoedepth-nyu-kitti}"
 export PORT="${PORT:-8096}"
 
 exec uvicorn --app-dir /app server:app --host 0.0.0.0 --port "$PORT"
