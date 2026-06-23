@@ -17,6 +17,12 @@ tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
 minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+# Office: czysto-rustowe parsery dla wasm32-wasip1 (bez natywnych zaleznosci C,
+# bez FS — czytamy z bajtow w pamieci).
+calamine = { version = "0.26", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+quick-xml = { version = "0.36", default-features = false }
 
 [profile.release]
 opt-level = "s"

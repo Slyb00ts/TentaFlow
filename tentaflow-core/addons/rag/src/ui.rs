@@ -1265,6 +1265,8 @@ fn documents_tab() -> Component {
             "text/plain".into(),
             "text/markdown".into(),
             "application/json".into(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
         ],
         max_size_bytes: 64 * 1024 * 1024,
         max_files: 10,
@@ -1272,8 +1274,10 @@ fn documents_tab() -> Component {
         drag_and_drop: true,
         capture: None,
         upload_action_id: "ingest-uploaded".into(),
-        label: Some(lit("Wgraj dokumenty (PDF / obraz / tekst)")),
-        hint: Some(lit("Po wgraniu uruchamiany jest pelny ingest: parse -> chunk -> embedding.")),
+        label: Some(lit("Wgraj dokumenty (PDF / obrazy / xlsx / docx / tekst)")),
+        hint: Some(lit(
+            "Po wgraniu uruchamiany jest pelny ingest (PDF / obrazy / xlsx / docx / tekst): parse -> chunk -> embedding.",
+        )),
     }
     .into_component("doc-upload")
     .expect("kodowanie FileInput");
