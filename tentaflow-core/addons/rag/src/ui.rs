@@ -533,10 +533,21 @@ fn sidebar_view() -> Component {
     }
     .into_component("sb-search")
     .expect("kodowanie Input search");
-    search.handlers = Some(HandlerMap(vec![
-        set_field_handler(EventKind::Change, SP_SIDEBAR_SEARCH),
-        backend_handler(EventKind::Change, "filter-collections"),
-    ]));
+    // HandlerMap dopuszcza JEDEN handler na EventKind, wiec zapis wartosci i
+    // re-render listy lacza sie w jedna akcje: `filter-collections` niesie `field`
+    // i sam zapisuje value do KV przed przerenderowaniem sidebara.
+    search.handlers = Some(HandlerMap(vec![(
+        EventKind::Change,
+        Handler::Backend {
+            action_id: "filter-collections".into(),
+            params: CborMap(vec![(
+                "field".into(),
+                CborValue::Text(SP_SIDEBAR_SEARCH.into()),
+            )]),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
 
     let collections = list_collections_data();
     let filter = sidebar_filter();
@@ -1682,8 +1693,9 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
             json!({"ok": true})
         }
         "filter-collections" => {
-            // Wartosc wyszukiwarki zostala juz zapisana do KV przez `set-field`;
-            // filtr tylko przerenderowuje sidebar wg aktualnego SP_SIDEBAR_SEARCH.
+            // Jeden handler `change` na inpucie: najpierw utrwala value pola (jak
+            // `set-field`), potem przerenderowuje sidebar wg aktualnego filtra.
+            action_set_field(params);
             send_sidebar();
             json!({"ok": true})
         }
