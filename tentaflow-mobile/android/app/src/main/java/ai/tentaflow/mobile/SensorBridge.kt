@@ -38,11 +38,13 @@ class SensorBridge(private val context: Context) : SensorEventListener {
         const val KIND_BARO = 3
         const val KIND_DEPTH = 4
         const val KIND_POSE = 5
+        const val KIND_MAG = 6
 
         // Domyślne modele szumu MEMS (1σ). Addon/silnik mogą je później dostroić.
         const val ACCEL_NOISE = 0.02f   // m/s²
         const val GYRO_NOISE = 0.002f   // rad/s
         const val BARO_NOISE = 0.6f     // m
+        const val MAG_NOISE = 1.5f      // µT
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -60,6 +62,10 @@ class SensorBridge(private val context: Context) : SensorEventListener {
             }
             sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            }
+            // Magnetometer: a heading aid riding the IMU grant.
+            sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
             }
         }
         if (baro) {
@@ -100,6 +106,9 @@ class SensorBridge(private val context: Context) : SensorEventListener {
                     SensorManager.PRESSURE_STANDARD_ATMOSPHERE, event.values[0]
                 )
                 NativeLib.pushSensor(KIND_BARO, encodeBaro(tsUs, pressurePa, relAlt))
+            }
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                NativeLib.pushSensor(KIND_MAG, encodeMag(tsUs, event.values))
             }
         }
     }
@@ -143,6 +152,16 @@ class SensorBridge(private val context: Context) : SensorEventListener {
         b.put(1).put(0).put(0).put(0)
         b.putLong(tsUs)
         b.putFloat(pressurePa); b.putFloat(relAltM); b.putFloat(BARO_NOISE)
+        return b.array()
+    }
+
+    /** MagSample (28 B): field µT [x,y,z] + noise. */
+    private fun encodeMag(tsUs: Long, field: FloatArray): ByteArray {
+        val b = buf(28)
+        b.put(1).put(0).put(0).put(0)
+        b.putLong(tsUs)
+        b.putFloat(field[0]); b.putFloat(field[1]); b.putFloat(field[2])
+        b.putFloat(MAG_NOISE)
         return b.array()
     }
 

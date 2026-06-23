@@ -20,10 +20,12 @@ private let KIND_GNSS: Int32 = 2
 private let KIND_BARO: Int32 = 3
 private let KIND_DEPTH: Int32 = 4
 private let KIND_POSE: Int32 = 5
+private let KIND_MAG: Int32 = 6
 
 private let ACCEL_NOISE: Float = 0.02
 private let GYRO_NOISE: Float = 0.002
 private let BARO_NOISE: Float = 0.6
+private let MAG_NOISE: Float = 1.5
 private let GRAVITY: Double = 9.81
 
 // ----- Mały koder little-endian (Data) -----
@@ -64,6 +66,7 @@ final class SensorBridge: NSObject, CLLocationManagerDelegate, ARSessionDelegate
     func stop() {
         motion.stopGyroUpdates()
         motion.stopAccelerometerUpdates()
+        motion.stopMagnetometerUpdates()
         altimeter.stopRelativeAltitudeUpdates()
         location.stopUpdatingLocation()
         arSession?.pause()
@@ -81,6 +84,19 @@ final class SensorBridge: NSObject, CLLocationManagerDelegate, ARSessionDelegate
         motion.gyroUpdateInterval = 0.01
         motion.startGyroUpdates(to: motionQueue) { [weak self] data, _ in
             if let d = data { self?.latestGyro = d.rotationRate }
+        }
+        // Magnetometer: a heading aid riding the IMU grant.
+        if motion.isMagnetometerAvailable {
+            motion.magnetometerUpdateInterval = 0.05
+            motion.startMagnetometerUpdates(to: motionQueue) { data, _ in
+                guard let m = data else { return }
+                var b = LE()
+                b.u8(1); b.u8(0); b.u8(0); b.u8(0)
+                b.i64(nowUs())
+                b.f32(Float(m.magneticField.x)); b.f32(Float(m.magneticField.y)); b.f32(Float(m.magneticField.z))
+                b.f32(MAG_NOISE)
+                push(KIND_MAG, b.data)
+            }
         }
         motion.startAccelerometerUpdates(to: motionQueue) { [weak self] data, _ in
             guard let self = self, let a = data, let g = self.latestGyro else { return }
