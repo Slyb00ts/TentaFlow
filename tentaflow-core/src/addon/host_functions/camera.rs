@@ -2558,6 +2558,8 @@ pub fn camera_update_v1(
         depth_camera_fov_deg: None,
         depth_fps: None,
         depth_pose_robot_id: None,
+        depth_camera_pitch_deg: None,
+        depth_scale: None,
     };
 
     if update_camera(

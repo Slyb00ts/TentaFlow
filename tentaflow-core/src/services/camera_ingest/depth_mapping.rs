@@ -181,7 +181,7 @@ async fn run_loop(initial: DepthMappingConfig) {
             return;
         }
 
-        let points = backproject_to_scene(&depth, cfg.fov_deg, &pose);
+        let points = backproject_to_scene(&depth, cfg.fov_deg, cfg.pitch_deg, cfg.scale, &pose);
         if points.is_empty() {
             continue;
         }
@@ -288,8 +288,17 @@ async fn request_depth(
 /// Intrinsics come from the horizontal FOV (no per-camera calibration table yet):
 /// `fx = (w/2) / tan(fov/2)`, `fy = fx` (square pixels), principal point at centre.
 /// Optical convention is `+x right, +y down, +z forward`; it maps to the pose's
-/// body frame (FLU, Z-up) as `body = (z, -x, -y)` before the scene transform.
-fn backproject_to_scene(depth: &DepthMap, fov_deg: f32, pose: &Pose) -> Vec<f32> {
+/// body frame (FLU, Z-up) as `body = (z, -x, -y)`. Extrinsic calibration: `scale`
+/// corrects the monocular metric scale; `pitch_deg` rotates the camera frame about
+/// the body LEFT axis (a down-angled mount like the Go2's needs negative pitch) so
+/// the cloud lands on the lidar instead of floating off. Then the scene transform.
+fn backproject_to_scene(
+    depth: &DepthMap,
+    fov_deg: f32,
+    pitch_deg: f32,
+    scale: f32,
+    pose: &Pose,
+) -> Vec<f32> {
     let w = depth.width as usize;
     let h = depth.height as usize;
     if w == 0 || h == 0 || depth.depth.len() != w * h {
@@ -299,6 +308,10 @@ fn backproject_to_scene(depth: &DepthMap, fov_deg: f32, pose: &Pose) -> Vec<f32>
     let cy = depth.height as f32 / 2.0;
     let fx = (depth.width as f32 / 2.0) / (fov_deg.to_radians() / 2.0).tan();
     let fy = fx;
+    // Mount-pitch rotation about the body LEFT (+Y) axis. Sign convention: NEGATIVE
+    // pitch tilts the forward +X ray DOWN (toward -Z) — the Go2 camera case — and
+    // positive tilts up. (Angle negated so the forward ray's bz = bx*sin(pitch).)
+    let (sp, cp) = (-pitch_deg).to_radians().sin_cos();
 
     let mut out: Vec<f32> = Vec::with_capacity((w / PIXEL_STRIDE) * (h / PIXEL_STRIDE) * 3);
     let mut v = 0usize;
@@ -306,15 +319,18 @@ fn backproject_to_scene(depth: &DepthMap, fov_deg: f32, pose: &Pose) -> Vec<f32>
         let row = v * w;
         let mut u = 0usize;
         while u < w {
-            let d = depth.depth[row + u];
+            let d = depth.depth[row + u] * scale;
             if d.is_finite() && d > 0.05 && d <= MAX_DEPTH_M {
                 let x_opt = (u as f32 - cx) * d / fx;
                 let y_opt = (v as f32 - cy) * d / fy;
                 let z_opt = d;
                 // optical → body (FLU, Z-up)
-                let bx = z_opt;
+                let bx0 = z_opt;
                 let by = -x_opt;
-                let bz = -y_opt;
+                let bz0 = -y_opt;
+                // apply mount pitch about +Y (left)
+                let bx = bx0 * cp + bz0 * sp;
+                let bz = -bx0 * sp + bz0 * cp;
                 let world = pose.transform_point([bx as f64, by as f64, bz as f64]);
                 out.push(world[0] as f32);
                 out.push(world[1] as f32);
@@ -378,7 +394,7 @@ mod tests {
         // x_opt=y_opt=(0-1.5)*2/1.5=-2, z_opt=2 → body (z,-x,-y)=(2,2,2) → world (2,2,2).
         // The key invariant: depth maps to +X (forward) in the Z-up body/scene frame.
         let dm = flat_depth(3, 3, 2.0);
-        let pts = backproject_to_scene(&dm, 90.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
         assert_eq!(pts.len(), 3, "one sampled pixel → one point");
         assert!((pts[0] - 2.0).abs() < 1e-4, "x forward = depth, got {}", pts[0]);
         assert!((pts[1] - 2.0).abs() < 1e-4, "y from -x_opt, got {}", pts[1]);
@@ -392,7 +408,7 @@ mod tests {
         // (0,0) and (3,3); pixel (3,3) sits at cx=cy=3.0 → optical (0,0,d) →
         // body (d,0,0) → world (d,0,0).
         let dm = flat_depth(6, 6, 4.0);
-        let pts = backproject_to_scene(&dm, 90.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
         // Find the on-axis point (the one with ~zero y and z).
         let mut found = false;
         for p in pts.chunks_exact(3) {
@@ -408,7 +424,7 @@ mod tests {
     fn out_of_range_and_nonfinite_depth_dropped() {
         let mut dm = flat_depth(3, 3, f32::NAN);
         dm.depth[4] = 0.0; // centre zero → dropped
-        let pts = backproject_to_scene(&dm, 90.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
         assert!(pts.is_empty(), "no finite in-range samples → empty cloud");
     }
 
