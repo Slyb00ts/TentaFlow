@@ -111,6 +111,13 @@ fn main() -> Result<()> {
     let worker_threads = peek_worker_threads(&args.config);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
+    // Worker/blocking threads default to a 2 MiB stack, which the camera ingest path
+    // overflows: GStreamer/CUDA pipeline build runs SYNCHRONOUSLY on a worker (via
+    // `block_in_place`) and its deep C/glue call chain needs more — fatal in debug
+    // (larger frames) and uncomfortably tight in release. 16 MiB is reserved address
+    // space (committed lazily), so this is cheap and removes the RUST_MIN_STACK
+    // workaround for every thread the runtime spawns.
+    builder.thread_stack_size(16 * 1024 * 1024);
     if worker_threads > 0 {
         builder.worker_threads(worker_threads);
     }
