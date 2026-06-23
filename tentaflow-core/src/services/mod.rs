@@ -34,6 +34,7 @@ pub mod key_storage;
 pub mod legal;
 pub mod lidar_hub;
 pub mod localization;
+pub mod mobile_camera;
 pub mod mobile_sensors;
 pub mod lidar_push;
 pub mod lidar_relay;

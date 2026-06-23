@@ -11,6 +11,7 @@
 // =============================================================================
 
 use serde_json::{json, Value as JsonValue};
+use std::sync::OnceLock;
 
 // Host imports (module "tentaflow").
 #[link(wasm_import_module = "tentaflow")]
@@ -19,6 +20,44 @@ extern "C" {
     /// Drain the native sensor queue into the fusion engine + shared map, gated by
     /// THIS addon's per-sensor permissions. Returns the number of samples consumed.
     fn mobile_sensor_drain_v1() -> i32;
+    /// Register a pushed camera (native encoder feeds H.264 over the FFI). Writes the
+    /// new camera_id (UTF-8) to the out buffer; returns 0 on success.
+    fn camera_register_pushed_v1(
+        name_ptr: i32,
+        name_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
+    ) -> i32;
+}
+
+/// The camera_id registered in `on_start`, advertised in `status` so the phone shows
+/// a camera tile (fed by the native H.264 push) like any robot.
+static CAMERA_ID: OnceLock<String> = OnceLock::new();
+
+/// Register the phone's camera as a normal (pushed) camera source. Best-effort: if it
+/// fails (e.g. cameras.write not granted), the phone simply has no camera tile.
+fn register_camera() {
+    let name = b"Telefon";
+    let cap: i32 = 128;
+    let out = alloc(cap);
+    let len_ptr = alloc(4);
+    if out != 0 && len_ptr != 0 {
+        let ret = unsafe {
+            camera_register_pushed_v1(name.as_ptr() as i32, name.len() as i32, out, cap, len_ptr)
+        };
+        if ret == 0 {
+            let n = unsafe { *(len_ptr as *const i32) } as usize;
+            if n > 0 && n <= cap as usize {
+                let bytes = unsafe { core::slice::from_raw_parts(out as *const u8, n) };
+                if let Ok(s) = core::str::from_utf8(bytes) {
+                    let _ = CAMERA_ID.set(s.to_string());
+                }
+            }
+        }
+    }
+    dealloc(out, cap);
+    dealloc(len_ptr, 4);
 }
 
 fn info(msg: &str) {
@@ -81,6 +120,7 @@ pub extern "C" fn on_install() -> i32 {
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
     info("phone: addon started — draining native sensors into the fusion engine");
+    register_camera();
     0
 }
 
@@ -131,6 +171,7 @@ fn handle(tool: &str) -> JsonValue {
             "status": "online",
             "kind": "phone",
             "capabilities": ["pose", "imu", "gnss", "lidar", "camera"],
+            "camera_id": CAMERA_ID.get().cloned(),
             "actions_meta": []
         }),
         _ => json!({ "error": "unknown tool" }),
