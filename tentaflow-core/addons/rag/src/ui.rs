@@ -634,7 +634,9 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         label: lit(if graph_on { "graf" } else { "wektor" }),
         icon: None,
         count: None,
-        max: 0,
+        // Dot badge nie pokazuje liczby, ale renderer (data-stat-labels-renderer.js:495)
+        // wymaga `max > 0` dla KAZDEGO wariantu Badge — stad sentinel 99.
+        max: 99,
         pulse: false,
     }
     .into_component(format!("cc-badge-{index}"))
