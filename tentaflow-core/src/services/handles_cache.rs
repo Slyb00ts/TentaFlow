@@ -21,6 +21,12 @@ use crate::services::runtime::quic_handle::{QuicServiceHandle, QuicServiceState}
 use crate::services::runtime::CircuitBreakerConfig;
 use crate::services::transport::Transport;
 
+/// Timeout pojedynczego requestu inferencyjnego (chat/embeddings/rerank/transcription)
+/// do backendu LLM. Budżet jest PER-CALL: jeden chat/extraction może trwać do 600 s,
+/// a w pętli RAG każda iteracja to osobny request z własnym, świeżym budżetem — nie
+/// istnieje globalna ściana czasu, w którą musi zmieścić się suma wszystkich wywołań.
+const INFERENCE_TIMEOUT_MS: u64 = 600_000;
+
 /// Live runtime handle dla pojedynczej (node_id, service_id) pary. Jednolity
 /// enum nad trzema kanalami transportu uzywanymi przez routing path.
 #[derive(Clone)]
@@ -261,7 +267,7 @@ pub fn build_handle(svc: &ServiceInfo, creds: Option<ExternalProviderCreds>) -> 
                     tts_config: None,
                 },
                 max_concurrent: 8,
-                timeout_ms: 120_000,
+                timeout_ms: INFERENCE_TIMEOUT_MS,
                 weight: 1,
                 model_name_override: None,
                 health_check_path: None,
@@ -287,7 +293,7 @@ pub fn build_handle(svc: &ServiceInfo, creds: Option<ExternalProviderCreds>) -> 
                 tls_ca: None,
                 server_name: None,
                 alpn: "tentaflow-service/v1".to_string(),
-                timeout_ms: 120_000,
+                timeout_ms: INFERENCE_TIMEOUT_MS,
                 auto_reconnect: true,
                 reconnect_interval_ms: 1_000,
                 keepalive_interval_ms: 5_000,

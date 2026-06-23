@@ -1091,6 +1091,22 @@ fn last_assistant_has_tool_calls(envelope: &FlowEnvelope) -> bool {
         .is_some_and(|calls| !calls.is_empty())
 }
 
+/// Timeout pojedynczego node'a-liścia (np. jeden call LLM / extraction / embeddings).
+/// Budżet jest PER-CALL, nie globalny dla całego flow: jeden chat/extraction może
+/// trwać do 600 s. W pętli każda iteracja to świeży node LLM, więc każda dostaje
+/// własne 600 s — nie ma globalnej ściany czasu, w którą musi zmieścić się suma
+/// wszystkich wywołań.
+const NODE_TIMEOUT_SECS: u64 = 600;
+
+/// Node'y-kontenery, które ORKIESTRUJĄ wiele iteracji/podflow. Ich wewnętrzne
+/// nody-liście są już indywidualnie limitowane przez `NODE_TIMEOUT_SECS`, więc
+/// nałożenie 600 s na sam kontener błędnie ograniczyłoby CAŁĄ pętlę do 600 s
+/// łącznie. Te typy są zwolnione z per-node timeoutu (ich czas trwania jest
+/// ograniczony przez `max_iterations` + per-node budżet ich wewnętrznych nodów).
+fn is_container_node_type(node_type: &str) -> bool {
+    matches!(node_type, "loop" | "subflow" | "map" | "spawn")
+}
+
 /// Generic io-mapping seam (§3.12) shared by the blocking and streaming paths.
 /// Evaluates `input_mapping` against `inbound`, runs the adapter on a config
 /// with the results overlaid, then evaluates `output_mapping` against the
@@ -1098,6 +1114,35 @@ fn last_assistant_has_tool_calls(envelope: &FlowEnvelope) -> bool {
 /// zero-cost fast path (no scope built, no node clone). io-mapping expression
 /// failures become node errors (with node name + expression + cause).
 async fn run_node_with_io_mapping(
+    adapter: &dyn NodeAdapter,
+    node: &FlowNode,
+    inbound: &FlowEnvelope,
+    inputs: &[NodeInput],
+    ctx: &ExecutionContext,
+) -> Result<FlowEnvelope> {
+    // Kontenery (loop/subflow/map/spawn) napędzają wiele wewnętrznych nodów,
+    // z których każdy ma własne 600 s — nie limitujemy ich tu, inaczej cała
+    // pętla padłaby po 600 s zamiast po wyczerpaniu `max_iterations`.
+    if is_container_node_type(node.node_type.as_str()) {
+        return run_node_io_inner(adapter, node, inbound, inputs, ctx).await;
+    }
+
+    let node_id = node.id.clone();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(NODE_TIMEOUT_SECS),
+        run_node_io_inner(adapter, node, inbound, inputs, ctx),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!(
+            "node '{node_id}' timeout after {NODE_TIMEOUT_SECS}s"
+        )),
+    }
+}
+
+/// Wewnętrzna ścieżka io-mapping bez wrapu timeoutu (timeout nakłada wołający).
+async fn run_node_io_inner(
     adapter: &dyn NodeAdapter,
     node: &FlowNode,
     inbound: &FlowEnvelope,
