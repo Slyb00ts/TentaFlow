@@ -218,6 +218,17 @@ fn v1_authorize(
     }
 }
 
+/// Publiczny wrapper bramy `/v1` dla modulow obok serwera (np. Anthropic
+/// Messages API). Reuzywa te sama logike ACL co handlery OpenAI — ten sam
+/// 404 `model_not_found` przy braku/odmowie modelu.
+pub fn v1_authorize_public(
+    router: &Router,
+    principal: Option<&Principal>,
+    requested_model: &str,
+) -> std::result::Result<(), Response<OpenAIBody>> {
+    v1_authorize(router, principal, requested_model)
+}
+
 /// HTTP Server dla OpenAI API Protocol
 pub struct OpenAIServer {
     /// Konfiguracja protokolu
@@ -327,6 +338,18 @@ pub async fn handle_request(
     let response = match (method.as_str(), path) {
         // Chat completions (text & vision)
         ("POST", "/v1/chat/completions") => handle_chat_completions(req, router).await,
+
+        // Anthropic Messages API (zewnetrzne, zgodne z Anthropic SDK). Inna
+        // sciezka i naglowek auth (`x-api-key` + `anthropic-version`) niz OpenAI,
+        // wiec wspolistnieje z `/v1/chat/completions` bez kolizji.
+        ("POST", "/v1/messages") => {
+            crate::api::openai::anthropic::handle_messages(req, router).await
+        }
+
+        // Anthropic count_tokens — estymacja tokenow wejsciowych.
+        ("POST", "/v1/messages/count_tokens") => {
+            crate::api::openai::anthropic::handle_count_tokens(req, router).await
+        }
 
         // Image generation
         ("POST", "/v1/images/generations") => handle_image_generation(req, router).await,
