@@ -4,6 +4,7 @@
 //       Serwer HTTPS na porcie 8090 dostepny z zewnatrz.
 // =============================================================================
 
+import ARKit
 import SwiftUI
 import WebKit
 
@@ -43,6 +44,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     /// Natywne przechwytywanie czujników (telefon jako robot-czujnik). Trzymane przy
     /// życiu przez cały cykl aplikacji; rdzeń bramkuje czujniki uprawnieniami addonu.
     private var sensorBridge: SensorBridge?
+    /// Enkoder kamery — uruchamiany na urządzeniach BEZ głębi ARKit (kamera wolna).
+    private var cameraEncoder: CameraEncoder?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         NSLog("[TentaFlow] didFinishLaunching — start")
@@ -99,6 +102,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             let bridge = SensorBridge()
             bridge.start(imu: true, baro: true, gnss: true, depth: true)
             self.sensorBridge = bridge
+            // The camera is one device: with ARKit depth the camera maps via hardware
+            // depth; without it, stream the camera (tile + TentaVision + AI-depth path).
+            if !ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                let enc = CameraEncoder()
+                if enc.start() { self.cameraEncoder = enc }
+            }
         }
 
         // Sprawdz port 8090 po kilku sekundach
