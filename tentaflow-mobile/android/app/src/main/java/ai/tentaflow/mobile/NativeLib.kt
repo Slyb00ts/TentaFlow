@@ -31,4 +31,11 @@ object NativeLib {
 
     /** Czyści bufor czujników (rozłączenie / pauza aplikacji). */
     external fun clearSensors()
+
+    /**
+     * Wpycha jedną jednostkę dostępu H.264 (Annex-B) z natywnego enkodera kamery do
+     * zarejestrowanej kamery push (ten sam potok co każda kamera: kafelek MSE +
+     * skrzynka klatek dla TentaVision/AI-głębi). Kamerę rejestruje addon `phone`.
+     */
+    external fun pushCameraH264(data: ByteArray): Boolean
 }
