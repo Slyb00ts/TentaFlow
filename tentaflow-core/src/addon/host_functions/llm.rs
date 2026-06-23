@@ -90,37 +90,27 @@ pub fn llm_generate(
         return ABI_ERR_PERMISSION;
     }
 
-    // Sprawdz uprawnienie do konkretnego modelu jesli podany
-    if let Some(ref model) = model_name {
-        if !check_permission(caller.data(), "llm_model", Some(model)) {
-            audit_log(
-                caller.data(),
-                "llm.generate",
-                Some("llm_model"),
-                Some(model),
-                "denied",
-                None,
-            );
-            return ABI_ERR_PERMISSION;
-        }
-    }
-
     let addon_id = caller.data().addon_id.clone();
 
     // F1a §6.6 alias gate. If the requested name resolves to an active
     // alias, enforce visibility + addon_uses_alias for the calling addon.
     // Non-alias names return Ok(None) → pass-through. Denial is audited
     // inside the resolver (alias_calls + audit_log risk_class=A).
+    //
+    // An alias name is authorized SOLELY by this gate (the addon declared
+    // [[uses_alias]] + admin-approved visibility). The "llm_model" permission
+    // applies only to raw (non-alias) model overrides, so it runs below only
+    // when the name did not resolve to an alias.
     if let Some(ref model) = model_name {
         let db = caller.data().db.clone();
-        match crate::db::repository::resolve_model_alias_for_addon(
+        let is_alias = match crate::db::repository::resolve_model_alias_for_addon(
             &db,
             model,
             Some(&addon_id),
             Some("llm.generate"),
             None,
         ) {
-            Ok(_) => {}
+            Ok(resolved) => resolved.is_some(),
             Err(e) => {
                 if e.downcast_ref::<crate::db::repository::AliasPermissionDenied>()
                     .is_some()
@@ -138,6 +128,20 @@ pub fn llm_generate(
                 warn!("llm_generate: alias gate error for '{}': {}", model, e);
                 return ABI_ERR_OPERATION;
             }
+        };
+
+        // Raw model override: gate on the per-model permission. Aliases skip
+        // this — they passed the alias gate above.
+        if !is_alias && !check_permission(caller.data(), "llm_model", Some(model)) {
+            audit_log(
+                caller.data(),
+                "llm.generate",
+                Some("llm_model"),
+                Some(model),
+                "denied",
+                None,
+            );
+            return ABI_ERR_PERMISSION;
         }
     }
 
