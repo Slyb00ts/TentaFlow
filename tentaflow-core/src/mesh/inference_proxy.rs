@@ -331,6 +331,13 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        ModelPayload::Rerank(ref rerank_payload) => {
+            match router.route_rerank_via_quic(rerank_payload).await {
+                Ok(response) => response,
+                Err(e) => make_error_response(request_id, &format!("Blad rerank: {}", e)),
+            }
+        }
+
         _ => make_error_response(
             request_id,
             &format!(

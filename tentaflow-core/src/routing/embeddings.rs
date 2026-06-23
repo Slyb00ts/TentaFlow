@@ -203,6 +203,64 @@ impl Router {
 
         Ok(proto_response)
     }
+
+    /// Protocol-native rerank API uzywane przez `mesh/inference_proxy.rs` gdy
+    /// peer wysyla `RerankPayload` przez reverse stream. Lustro
+    /// `route_embeddings_via_quic`: ten sam executor co `/v1/rerank`, mesh-forward
+    /// guard (`hop_count = MAX_HOP_COUNT`) przeciw re-forward loopowi. Bez tego
+    /// rerank na zdalnym wezle pada (odbiorca nie obslugiwal Discriminant Rerank)
+    /// i retrieval degradowal do czystego vector order.
+    pub async fn route_rerank_via_quic(
+        &self,
+        payload: &RerankPayload,
+    ) -> Result<ModelResponse> {
+        use crate::api::openai::types::RerankRequest;
+        use crate::services::runtime::context::ExecutionContext;
+
+        let executor =
+            self.executor
+                .read()
+                .clone()
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: payload.model.clone(),
+                })?;
+
+        let request = RerankRequest {
+            model: payload.model.clone(),
+            query: payload.query.clone(),
+            documents: payload.documents.clone(),
+            top_n: payload.top_n.map(|n| n as u32),
+        };
+
+        let mut exec_ctx = ExecutionContext {
+            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+            ..ExecutionContext::default()
+        };
+
+        let response = match executor.execute_rerank(request, &mut exec_ctx).await {
+            Ok(r) => r,
+            Err(e) => return Err(executor_err_to_core(e, &payload.model).into()),
+        };
+
+        let results = response
+            .results
+            .into_iter()
+            .map(|e| RerankResultItem {
+                index: e.index,
+                relevance_score: e.relevance_score,
+                document: None,
+            })
+            .collect();
+
+        Ok(ModelResponse {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            result: ModelResult::Rerank(RerankResult {
+                results,
+                model: payload.model.clone(),
+            }),
+            metrics: None,
+        })
+    }
 }
 
 /// Map executor errors onto typed `CoreError` variants so the OpenAI HTTP
