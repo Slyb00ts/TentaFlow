@@ -20,6 +20,9 @@ import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
 
+// Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
+const SHOW_ENGINE_COL = false;
+
 let services = [];
 let aliases = [];
 let meshNodes = [];
@@ -309,14 +312,25 @@ function bindTabEvents() {
   body.querySelectorAll('[data-svc-redeploy]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      const engineId = b.dataset.svcEngine;
+      const svcId = b.dataset.svcRedeploy;
       const nodeId = b.dataset.svcNode || undefined;
-      const deployMethod = b.dataset.svcMethod || undefined;
-      if (!engineId) return;
-      // Ten sam kreator wdrozenia co w katalogu — pozwala wybrac model/parametry
-      // i wdrozyc serwis ponownie ze zaktualizowanego zrodla bundla.
-      import('/js/modules/catalog/engine-deploy-wizard.js').then((mod) => {
-        mod.openDeployWizard(engineId, { nodeId, deployMethod });
+      const svc = (services || []).find((s) =>
+        String(s.id) === String(svcId)
+        && String(s.node_id || s.nodeId || '') === String(nodeId || '')
+      );
+      if (!svc) return;
+      // Redeploy w miejscu z ta sama konfiguracja, ale ze zaktualizowanego zrodla
+      // bundla — bez przechodzenia kreatora od nowa.
+      import('/js/modules/services/update-modal.js').then((mod) => {
+        mod.openUpdateModal({
+          service: {
+            id: svc.id,
+            name: svc.display_name || svc.engine_id || String(svc.id),
+            engineId: svc.engine_id || svc.engineId || '',
+            deployMethod: svc.deploy_method || svc.deployMethod || '',
+          },
+          onUpdated: refreshServiceList,
+        });
       });
     };
   });
@@ -661,11 +675,10 @@ function renderListTab() {
       <thead>
         <tr>
           <th>${escapeHtml(I18n.t('services.col_node'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_engine'))}</th>
+          ${SHOW_ENGINE_COL ? `<th>${escapeHtml(I18n.t('services.col_engine'))}</th>` : ''}
           <th>${escapeHtml(I18n.t('services.col_display_name'))}</th>
           <th>${escapeHtml(I18n.t('services.col_category'))}</th>
           <th>${escapeHtml(I18n.t('services.col_status'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_endpoint'))}</th>
           <th>${escapeHtml(I18n.t('services.col_models'))}</th>
           <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
@@ -744,9 +757,6 @@ function renderRow(s) {
   const deployProgress = statusInfo.key === 'deploying'
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(String(Math.max(0, Math.min(100, deployPct))))}%</div>`
     : '';
-  const endpoint = s.endpoint_url
-    ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
-    : '<span style="color:var(--text-3);">—</span>';
   const models = Array.isArray(s.models) ? s.models : [];
   const modelChips = models.length === 0
     ? '<span style="color:var(--text-3);">—</span>'
@@ -829,9 +839,9 @@ function renderRow(s) {
   return `
     <tr data-key="${rowKey}">
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
+      ${SHOW_ENGINE_COL ? `<td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
         <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
-      </td>
+      </td>` : ''}
       <td data-label="${escapeAttr(I18n.t('services.col_display_name'))}">
         ${escapeHtml(displayName)}
       </td>
@@ -844,7 +854,6 @@ function renderRow(s) {
         ${progressBadge}
         ${deployProgress}
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
         <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
       </td>
@@ -881,13 +890,6 @@ function renderRow(s) {
       </td>
     </tr>
   `;
-}
-
-// Truncate a long string in the middle so both prefix and suffix remain visible.
-function truncateMiddle(value, max) {
-  if (!value || value.length <= max) return value || '';
-  const half = Math.floor((max - 1) / 2);
-  return value.slice(0, half) + '…' + value.slice(value.length - half);
 }
 
 // ---- Aliases tab ----------------------------------------------------------
