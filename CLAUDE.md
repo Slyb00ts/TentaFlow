@@ -13,7 +13,7 @@ cd tentaflow-core && cargo build                              # core lib + dashb
 # Browser protocol glue (tentaflow-protocol-wasm). Without these two, build.rs
 # skips www/js/protocol/wasm_glue.{js,wasm} and the dashboard won't load.
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.120 --locked     # MUST match the pinned crate
+cargo install wasm-bindgen-cli --version 0.2.125 --locked     # MUST match the pinned crate
 
 rustup target add wasm32-wasip1                               # WASM addons
 
