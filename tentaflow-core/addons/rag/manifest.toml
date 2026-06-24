@@ -1,7 +1,7 @@
 [addon]
 id = "rag"
 name = "RAG"
-version = "0.1.0"
+version = "0.1.1"
 description = "Niezalezne instancje RAG — kolekcje, ingest dokumentow (parse + chunk + embedding), wyszukiwanie wektorowe i graf wiedzy."
 category = "AI"
 keywords = ["rag", "retrieval", "embeddings", "vector", "graph", "ingest", "dokumenty"]

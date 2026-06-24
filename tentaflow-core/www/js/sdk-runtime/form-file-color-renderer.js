@@ -443,8 +443,34 @@ function renderFileInput(component, ctx) {
     // ustawiamy tu od razu, gdyby walidacja odrzuciła nowy wybór — stary upload
     // i tak musi paść, bo użytkownik zmienił intencję).
     if (activeUpload) activeUpload.aborted = true;
-    const validated = validateAndEmit(e.detail && e.detail.files);
-    if (validated && validated.length > 0) void uploadFiles(validated);
+    // Fallback źródła plików: realny wybór (drop / setInputFiles / niektóre
+    // przeglądarki) potrafi dostarczyć `change` z pustym `detail.files`, choć
+    // natywny `<input>` tf-file-input ma już wypełnione `files`. Bez tego
+    // `validateAndEmit(undefined)` zwracało `null` i upload cicho zamierał.
+    // tf-file-input trzyma natywny input w `this._input`; sięgamy po niego z
+    // celu eventu, a w ostateczności po dowolny `input[type=file]` w komponencie.
+    const target = e.target;
+    const files =
+      (e.detail && e.detail.files && e.detail.files.length && e.detail.files) ||
+      (target && target._input && target._input.files && target._input.files.length && target._input.files) ||
+      (target && typeof target.querySelector === 'function'
+        ? (target.querySelector('input[type=file]') || {}).files
+        : null);
+    const validated = validateAndEmit(files);
+    if (validated && validated.length > 0) {
+      void uploadFiles(validated);
+      return;
+    }
+    // Gdy walidacja niczego nie zwróciła z POWODU braku plików (a nie odrzucenia
+    // przez accept/rozmiar — tam leci osobny `reject`), nie wolno zamilknąć:
+    // emitujemy `upload_error`, żeby użytkownik / Playwright zobaczyli porażkę
+    // zamiast cichego zgonu dropzone'a.
+    if (!files || files.length === 0) {
+      wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('upload_error', {
+        bubbles: false,
+        detail: { reason: 'no_files', message: 'Brak plików w zdarzeniu wyboru — nic nie wgrano.' },
+      }));
+    }
   };
   fileEl.addEventListener('change', onChange);
   ctx.registerCleanup(() => fileEl.removeEventListener('change', onChange));
