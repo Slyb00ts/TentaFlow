@@ -12,10 +12,14 @@ crate-type = ["cdylib", "rlib"]
 # Core protocol types
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
-# WASM bindings
+# WASM bindings. The trio (wasm-bindgen / js-sys / web-sys) is version-locked: js-sys
+# and web-sys 0.3.98+ require wasm-bindgen 0.2.125, so they MUST stay pinned to the
+# 0.3.97 set that pairs with the pinned wasm-bindgen 0.2.120 (= the installed
+# wasm-bindgen-cli). A float here breaks the build.rs glue generation (the dashboard
+# then ships a stale protocol → "schema version mismatch" in the browser).
 wasm-bindgen = "=0.2.120"
-js-sys = "0.3.102"
-web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
+js-sys = "=0.3.97"
+web-sys = { version = "=0.3.97", features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
 
 # SDK spec types for UI channel CBOR encode/decode
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
