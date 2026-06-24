@@ -3039,6 +3039,30 @@ impl AddonManager {
         // czytamy je i sciezke wasm z manifestu.
         let manifest = self.load_addon_manifest(addon_id)?;
         let (package_id, package_version) = self.addon_package_ref(addon_id)?;
+
+        // SECURITY GATE: an instance must never RUN code that differs from what the user
+        // approved. The reconciler materializes the package on disk and can overwrite a
+        // version's bytes IN PLACE (e.g. a bundled addon edited without a version bump),
+        // so the on-disk wasm can change underneath a running instance. We refuse to load
+        // unless the catalog's current bundle hash (= what's on disk now) equals the
+        // instance's `installed_bundle_hash` (= what was approved at install/"Aktualizuj").
+        // A content change without a manual update is rejected, not silently executed.
+        let catalog_hash =
+            crate::db::repository::get_package_bundle_hash(&self.db, &package_id, &package_version)?;
+        let approved_hash =
+            crate::db::repository::get_instance_installed_bundle_hash(&self.db, addon_id)?;
+        if let Some(catalog) = catalog_hash.as_deref() {
+            if !approved_hash.is_empty() && approved_hash != catalog {
+                bail!(
+                    "Addon '{addon_id}': kod na dysku ({}…) rozni sie od zatwierdzonego ({}…) \
+                     — pakiet zmieniono bez recznej aktualizacji. Kliknij 'Aktualizuj' aby \
+                     zatwierdzic zanim instancja sie uruchomi.",
+                    &catalog[..catalog.len().min(8)],
+                    &approved_hash[..approved_hash.len().min(8)],
+                );
+            }
+        }
+
         let wasm_path =
             bundled::package_dir(&package_id, &package_version).join(&manifest.wasm_file);
         let wasm_bytes = std::fs::read(&wasm_path).with_context(|| {
