@@ -452,6 +452,10 @@ function renderFileInput(component, ctx) {
     const target = e.target;
     const files =
       (e.detail && e.detail.files && e.detail.files.length && e.detail.files) ||
+      // Natywny `<input type=file>` tf-file-input emituje WŁASNY bąbelkujący
+      // `change`; wtedy `e.target` to sam input i pliki są wprost w `target.files`
+      // (brak `detail`, brak `_input`, brak zagnieżdżonego inputa do querySelector).
+      (target && target.files && target.files.length && target.files) ||
       (target && target._input && target._input.files && target._input.files.length && target._input.files) ||
       (target && typeof target.querySelector === 'function'
         ? (target.querySelector('input[type=file]') || {}).files
