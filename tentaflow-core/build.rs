@@ -1595,6 +1595,23 @@ fn hash_should_skip(name: &str) -> bool {
 /// Computes a deterministic sha256 of all files under `root`. The relative
 /// path (with `/` separators) is mixed into the hash, so renames and moves
 /// change the digest. Returns an empty string when `root` does not exist.
+/// Emituje `cargo:rerun-if-changed` dla KAŻDEGO pliku w drzewie `root`.
+/// `rerun-if-changed=<katalog>` śledzi tylko mtime katalogu (add/remove), więc
+/// edycja treści istniejącego pliku (np. lib.rs codec wasm) nie triggeruje
+/// rerun build.rs → wygenerowany `wasm_glue.wasm` zostaje stary. Per-plik to
+/// naprawia.
+fn rerun_if_changed_recursive(root: &Path) {
+    use walkdir::WalkDir;
+    if !root.exists() {
+        return;
+    }
+    for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
+}
+
 fn compute_source_hash(root: &Path) -> String {
     use sha2::{Digest, Sha256};
     use walkdir::WalkDir;
@@ -1927,10 +1944,12 @@ fn build_protocol_wasm_bindings() {
         return;
     }
 
-    // Rerun-if-changed hooks na zrodlach
-    println!("cargo:rerun-if-changed={}/src", crate_dir.display());
+    // Rerun-if-changed hooks na zrodlach — PER PLIK (rerun na katalogu nie
+    // wykrywa edycji treści istniejacych plikow, wiec wasm_glue.wasm zostawalby
+    // stary po zmianie codeca).
+    rerun_if_changed_recursive(&crate_dir.join("src"));
     println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
-    println!("cargo:rerun-if-changed={}/src", protocol_dir.display());
+    rerun_if_changed_recursive(&protocol_dir.join("src"));
     println!(
         "cargo:rerun-if-changed={}/Cargo.toml",
         protocol_dir.display()
