@@ -47,7 +47,7 @@ function Invoke-NativeCapture {
 
 # Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
 # oraz z hardkodowana wartoscia w tentaflow-core/build.rs.
-$WasmBindgenVersion = '0.2.120'
+$WasmBindgenVersion = '0.2.125'
 
 # Lista zainstalowanych komponentow (do podsumowania)
 $script:Installed = @()
