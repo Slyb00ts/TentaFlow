@@ -758,10 +758,19 @@ pub async fn stop(
     }
 
     // Process shutdown: only the process-owning transports actually have a PID.
-    if let Some(pid) = svc.runtime_pid {
-        if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+        if let Some(pid) = svc.runtime_pid {
             // SIGTERM with short grace then SIGKILL — handled inside terminate.
             let _ = crate::deploy::process_ctl::terminate(pid as u32);
+        }
+        // Belt-and-suspenders: `terminate(runtime_pid)` misses the real port-holder
+        // when the tracked PID is stale/None (crash + un-recorded respawn) or when a
+        // non-group-leader engine orphaned a worker. Kill whatever still LISTENS on the
+        // service's port so a delete/stop can't leave a zombie that blocks the next
+        // deploy with "port already in use". The port is leased to THIS service, so the
+        // listener is ours. Mirrors the respawn path's `kill_listener_on_port`.
+        if let Some(port) = svc.runtime_port {
+            kill_listener_on_port(port).await;
         }
     }
 
