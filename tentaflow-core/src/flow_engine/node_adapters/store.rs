@@ -365,12 +365,30 @@ impl NodeAdapter for StoreNodeAdapter {
             }
         }
 
+        // Markdown rekonstrukcji + per-chunk teksty echo'wane w wyniku: ingest
+        // (`flow_outcome_to_ingest_response`) zwraca je przez `IngestInvokeOutput`,
+        // a addon po ingescie potrzebuje TEKSTÓW chunków (z ich indeksami) do
+        // ekstrakcji grafu — store jest jedynym węzłem, który widzi finalny zestaw
+        // zapisanych chunków, więc to on je raportuje (jedno źródło prawdy).
+        let chunk_texts: Vec<serde_json::Value> = prepared
+            .iter()
+            .map(|c| serde_json::json!({ "index": c.chunk_index, "text": c.text }))
+            .collect();
+        let markdown = prepared
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
         let mut out = (**envelope).clone();
         out.payload = FlowValue::Json(serde_json::json!({
             "op": "store",
             "namespace": namespace,
             "doc_id": doc_id,
             "written": written_refs.len(),
+            "markdown": markdown,
+            "chunks": written_refs.len(),
+            "chunk_texts": chunk_texts,
         }));
         out.meta.insert(
             "stored_chunks".to_string(),

@@ -170,6 +170,9 @@ pub struct IngestResponse {
     pub markdown: String,
     pub chunks: u32,
     pub page_count: u32,
+    /// Teksty zapisanych chunków (index, text) — addon używa ich do ekstrakcji
+    /// grafu PO ingescie bez ponownego parsowania dokumentu.
+    pub chunk_texts: Vec<(u32, String)>,
 }
 
 /// PARTIA 0 — żądanie detekcji struktury dokumentu przez typed surface
@@ -3366,10 +3369,26 @@ pub(crate) fn flow_outcome_to_ingest_response(
         .and_then(|v| v.as_u64())
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(1);
+    // `chunk_texts` echo'wane przez węzeł store (jedno źródło prawdy o realnie
+    // zapisanym zestawie chunków). Brak pola = pusta lista (np. flow bez store).
+    let chunk_texts = json
+        .get("chunk_texts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let index = u32::try_from(item.get("index")?.as_u64()?).ok()?;
+                    let text = item.get("text")?.as_str()?.to_string();
+                    Some((index, text))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(IngestResponse {
         markdown,
         chunks,
         page_count,
+        chunk_texts,
     })
 }
 
