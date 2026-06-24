@@ -92,11 +92,16 @@ pub fn ensure_depth_mapping(camera_id: &str) {
     {
         static PREWARM: std::sync::Once = std::sync::Once::new();
         PREWARM.call_once(|| {
-            std::thread::spawn(|| {
-                if let Err(e) = crate::vision::depth_anything::prewarm() {
-                    warn!("[depth_mapping] depth prewarm failed: {e}");
-                }
-            });
+            // Large stack for the same reason as acquire_depth_batch: the burn-generated
+            // `forward()` frame overruns a default thread stack in debug builds.
+            let _ = std::thread::Builder::new()
+                .name("depth-prewarm".into())
+                .stack_size(64 * 1024 * 1024)
+                .spawn(|| {
+                    if let Err(e) = crate::vision::depth_anything::prewarm() {
+                        warn!("[depth_mapping] depth prewarm failed: {e}");
+                    }
+                });
         });
     }
     // Add this camera to the work-list and make sure the single central worker is
@@ -263,7 +268,9 @@ async fn acquire_depth_batch(jobs: &[Job], _client: &reqwest::Client) -> Vec<Opt
     let inputs: Vec<(std::sync::Arc<[u8]>, u32, u32)> =
         jobs.iter().map(|j| (j.rgb.clone(), j.w, j.h)).collect();
     let n = inputs.len();
-    let result = tokio::task::spawn_blocking(move || {
+    // Runs on a large-stack thread — the burn-generated forward overruns the default
+    // blocking-thread stack in debug builds. See `burn_backend::run_blocking`.
+    let result = crate::vision::burn_backend::run_blocking(move || {
         let refs: Vec<(&[u8], u32, u32)> =
             inputs.iter().map(|(r, w, h)| (r.as_ref(), *w, *h)).collect();
         crate::vision::depth_anything::infer_global_batch(&refs)
@@ -279,7 +286,7 @@ async fn acquire_depth_batch(jobs: &[Job], _client: &reqwest::Client) -> Vec<Opt
             (0..n).map(|_| None).collect()
         }
         Err(e) => {
-            debug!("[depth_mapping] batch depth join failed: {e}");
+            debug!("[depth_mapping] depth-infer thread dropped: {e}");
             (0..n).map(|_| None).collect()
         }
     }
