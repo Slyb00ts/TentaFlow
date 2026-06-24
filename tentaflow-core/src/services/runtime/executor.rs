@@ -145,6 +145,55 @@ pub struct DocumentParseResponse {
     pub usage: Option<crate::api::openai::types::Usage>,
 }
 
+/// RAG Partia 3 (prerequisite) — żądanie ingestu JEDNEGO dokumentu jako flow.
+/// Niesie surowe bajty pliku (PDF/xlsx/docx/obraz — pobrane przez host fn z
+/// per-instance document store), `mime`, nazwę flow `model` (`<model>:ingest`)
+/// oraz `options` (collection_id, graph toggle, parametry chunkingu) wstrzykiwane
+/// do flow.meta. `flow_depth` dziedziczy głębokość zagnieżdżenia (guard rekursji,
+/// jak `DocumentParseRequest`). To JEDYNA ścieżka wywołania flow-ingestu z
+/// binarnym dokumentem — Partia 3 podmieni `run_ingest_pipeline` na to wywołanie.
+#[derive(Debug, Clone)]
+pub struct IngestRequest {
+    pub model: String,
+    pub document_bytes: Vec<u8>,
+    pub mime: String,
+    pub options: serde_json::Map<String, serde_json::Value>,
+    pub flow_depth: u8,
+}
+
+/// RAG Partia 3 — wynik flow-ingestu: markdown rekonstrukcji dokumentu + liczba
+/// chunków zapisanych do indeksu wektorowego przez węzeł store flow. `page_count`
+/// = liczba stron (1 dla pojedynczego obrazu). Flow zwraca to jako
+/// `Json{markdown, chunks, page_count}` w finalnym envelope.
+#[derive(Debug, Clone)]
+pub struct IngestResponse {
+    pub markdown: String,
+    pub chunks: u32,
+    pub page_count: u32,
+}
+
+/// PARTIA 0 — żądanie detekcji struktury dokumentu przez typed surface
+/// `Documents` (`/v1/infer`). Niesie surowe bajty obrazu strony + `mime` + `task`
+/// (jeden z detektorów: page_elements / table_structure / graphic_elements / ocr).
+/// `flow_depth` dziedziczy głębokość zagnieżdżenia z caller-flow (guard rekursji,
+/// jak `DocumentParseRequest`). To fundament node-adapterów flow-ingestu RAG.
+#[derive(Debug, Clone)]
+pub struct DocumentInferRequest {
+    pub model: String,
+    pub image_bytes: Vec<u8>,
+    pub mime: String,
+    pub task: String,
+    pub flow_depth: u8,
+}
+
+/// PARTIA 0 — odpowiedź detektora: lista wykrytych regionów strony (layout boxes,
+/// komórki tabel, grafika, OCR spany). Reużywa typów drutu z `tentaflow_protocol`,
+/// bo ta sama struktura leci przez mesh (`ModelResult::Documents`).
+#[derive(Debug, Clone)]
+pub struct DocumentInferResponse {
+    pub regions: Vec<tentaflow_protocol::DocRegion>,
+}
+
 /// Top-level orchestrator. Holds Arc references to every collaborator;
 /// no state of its own beyond a per-alias `StrategyState` map. The
 /// resolver already owns `LiveHandlesCache` for hydrating Local
@@ -1813,6 +1862,223 @@ impl ModelRuntimeExecutor {
         })
     }
 
+    /// RAG Partia 3 (prerequisite) — uruchamia flow-ingest JEDNEGO dokumentu z
+    /// BINARNYM payloadem. To JEDYNA ścieżka, która potrafi wywołać flow `rag:ingest`
+    /// z surowymi bajtami pliku (PDF/xlsx/docx/obraz) — dotąd addon mógł wołać flow
+    /// tylko przez `llm_generate`, które buduje wyłącznie tekstową wiadomość.
+    ///
+    /// Seeduje binarny envelope (`ingest_request_to_initial_envelope`: bajty →
+    /// `ctx.blobs.put` → `FlowValue::Image`/`Other`), resolwuje flow po stałej
+    /// modality `"document"` (`<model>:ingest:document` — jeden flow niezależnie od
+    /// typu pliku) przez `FlowDispatcher::try_dispatch_with_modality`, wykonuje go
+    /// blocking i mapuje wynik na `IngestResponse`. Blob dokumentu jest kasowany po
+    /// flow (także przy błędzie), żeby nie zostawiać osieroconych plików w trwałym
+    /// store. Guard rekursji przez `enter_flow`/`leave_flow` (jak parse/embeddings).
+    ///
+    /// **ACL po stronie callera** — host fn `ingest_invoke_v1` bramkuje uprawnienie
+    /// zanim zbuduje request. Tożsamość addona-callera przeprowadzana do flow.meta.
+    pub async fn execute_ingest(
+        &self,
+        request: IngestRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<IngestResponse, ExecutorError> {
+        let dispatcher = self
+            .flow_dispatcher
+            .as_ref()
+            .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+
+        // Pseudo flow_id dla guardu rekursji: ingest nie resolwuje po flow_id
+        // (jak parse/embeddings przez catalog), tylko po nazwie `<model>:ingest`.
+        // `enter_flow` potrzebuje stabilnego identyfikatora w stosie — używamy
+        // nazwy modelu, by self-referencyjny ingest narastał `subflow_depth`.
+        let flow_key = format!("{}:ingest", request.model);
+        ctx.enter_flow(&flow_key)
+            .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
+
+        let blobs = dispatcher.blobs();
+        let (initial, mut meta) =
+            match ingest_request_to_initial_envelope(&request, ctx.user.clone(), blobs).await {
+                Ok(seed) => seed,
+                Err(e) => {
+                    ctx.leave_flow();
+                    return Err(ExecutorError::Internal(e.to_string()));
+                }
+            };
+        meta.flow_depth = ctx.flow_stack.len() as u8;
+        meta.addon_id = ctx.addon_id.clone();
+        meta.org_id = ctx.org_id.clone();
+
+        // Blob dokumentu MUSI być skasowany po flow — `put` ląduje w trwałym
+        // `CompositeBlobStore`, więc bez `delete` każdy ingest zostawia osierocony
+        // plik do grubego GC.
+        let doc_blob_ref = match &initial.payload {
+            crate::flow_engine::envelope::FlowValue::Image { blob_ref, .. }
+            | crate::flow_engine::envelope::FlowValue::Other { blob_ref, .. } => {
+                Some(blob_ref.clone())
+            }
+            _ => None,
+        };
+
+        let dispatch_result = dispatcher
+            .try_dispatch_with_modality(&request.model, "ingest", "document", initial, meta)
+            .await;
+        ctx.leave_flow();
+
+        if let Some(blob_ref) = doc_blob_ref {
+            if let Err(e) = dispatcher.blobs().delete(&blob_ref).await {
+                tracing::warn!(error = %e, "ingest: failed to delete document blob after flow");
+            }
+        }
+
+        let outcome = dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        flow_outcome_to_ingest_response(outcome)
+    }
+
+    /// PARTIA 0 — typed-surface `Documents` detektor (`/v1/infer`). Lustro
+    /// `execute_rerank`: resoluje żądany model przez `ServiceSurface::Documents`
+    /// (input Image / output Text), rankuje kandydatów per alias-strategy i próbuje
+    /// każdego aż któryś zadziała. Local → HTTP `POST /v1/infer`; MeshForward →
+    /// `ModelPayload::Documents` (obraz ZACHOWANY przez mesh — binarnie, serde_bytes).
+    /// To NIE jest vision-parse (`execute_documents`, surface Chat) — to osobna,
+    /// strukturalna ścieżka dla node-adapterów flow-ingestu RAG (PARTIA 2).
+    pub async fn execute_document_infer(
+        &self,
+        request: DocumentInferRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentInferResponse, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Documents,
+                required_input_modalities: &[InputModality::Image],
+                required_output_modalities: &[OutputModality::Text],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_document_infer_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "document infer dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target document-infer dispatch — lustro `dispatch_rerank_blocking`.
+    /// Detektory struktury są serwowane przez zewnętrzne runtime'y (yolox/OCR przez
+    /// `/v1/infer`), więc HTTP/mesh niosą request; embedded engines nie mają tej
+    /// powierzchni i surface'ują błąd, żeby fallback szedł dalej.
+    async fn dispatch_document_infer_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: DocumentInferRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentInferResponse, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
+                    "embedded backend does not support document infer".into(),
+                )),
+                BackendHandle::Http(client) => {
+                    let result = client
+                        .document_infer(
+                            &request.model,
+                            &request.image_bytes,
+                            &request.task,
+                            &request.mime,
+                        )
+                        .await
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                    Ok(DocumentInferResponse {
+                        regions: result.regions,
+                    })
+                }
+                BackendHandle::Quic(handle) => {
+                    let quic_client = handle.get_client().await.ok_or_else(|| {
+                        ExecutorError::Internal(format!(
+                            "QUIC client not connected for service '{}'",
+                            handle.config.name
+                        ))
+                    })?;
+                    let model_request = document_infer_model_request(&request);
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("QUIC document infer: {}", e)))?;
+                    document_infer_result_to_response(response.result)
+                }
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let mut forwarded = request.clone();
+                forwarded.model = model_name.clone();
+                let model_request = document_infer_model_request(&forwarded);
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
+                document_infer_result_to_response(response.result)
+            }
+            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
+                "document infer has no flow-target surface".into(),
+            )),
+        }
+    }
+
     /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
     /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
@@ -2863,6 +3129,45 @@ fn rerank_result_to_response(
     }
 }
 
+/// PARTIA 0 — buduje `ModelRequest` (QUIC/mesh) z `DocumentInferRequest`.
+/// Obraz leci binarnie w `image_bytes` (serde_bytes → CBOR byte-string).
+fn document_infer_model_request(
+    request: &DocumentInferRequest,
+) -> tentaflow_protocol::ModelRequest {
+    use tentaflow_protocol::*;
+    ModelRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        payload: ModelPayload::Documents(DocumentInferPayload {
+            model: request.model.clone(),
+            image_bytes: request.image_bytes.clone(),
+            mime: request.mime.clone(),
+            task: request.task.clone(),
+        }),
+        stream: false,
+        metadata: None,
+        session_id: None,
+    }
+}
+
+/// PARTIA 0 — mapuje `ModelResult` (QUIC/mesh) na `DocumentInferResponse`.
+fn document_infer_result_to_response(
+    result: tentaflow_protocol::ModelResult,
+) -> Result<DocumentInferResponse, ExecutorError> {
+    use tentaflow_protocol::ModelResult;
+    match result {
+        ModelResult::Documents(r) => Ok(DocumentInferResponse {
+            regions: r.regions,
+        }),
+        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+            "document infer error: {}",
+            err.message
+        ))),
+        _ => Err(ExecutorError::Internal(
+            "document infer returned unexpected result type".into(),
+        )),
+    }
+}
+
 /// Buduje seed envelope + meta dla rerank-as-flow path. Query na payload (Text),
 /// dokumenty + model + top_n w meta — flow-owy adapter rerankera czyta je stamtąd.
 pub(crate) fn rerank_request_to_initial_envelope(
@@ -2971,6 +3276,106 @@ pub(crate) async fn document_request_to_initial_envelope(
         meta.user_role = Some(u.role);
     }
     Ok((env, meta))
+}
+
+/// RAG Partia 3 — buduje seed envelope + meta dla ingest-as-flow path. Dokument
+/// (binarny, potencjalnie duży) ląduje w BlobStore jak obraz w parse/audio w STT:
+/// payload nosi sentinel `FlowValue::Image{blob_ref}` dla obrazów albo
+/// `FlowValue::Other{blob_ref}` dla generycznych plików (PDF/xlsx/docx), a węzeł
+/// parsera flow pobiera bajty z `ctx.blobs.get(&blob_ref)`. Nazwa flow ląduje w
+/// `parse_model`/`ingest_model`; `options` (collection_id, graph toggle, params)
+/// wsiąka do `envelope.meta` — to JEDYNE miejsce wstrzyknięcia opcji ingestu do
+/// core'owego flow. Wzór: `document_request_to_initial_envelope`.
+pub(crate) async fn ingest_request_to_initial_envelope(
+    request: &IngestRequest,
+    user: Option<crate::auth::acl::UserContext>,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<(
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+)> {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let blob_ref = blobs
+        .put(request.document_bytes.clone(), &request.mime)
+        .await
+        .map_err(|e| anyhow::anyhow!("ingest blob put: {e}"))?;
+    let mut env = FlowEnvelope::empty();
+    // Obraz → Image (modality vision na parse-węźle), inne pliki → Other (PDF
+    // rasteryzowany / xlsx/docx czytany przez wyspecjalizowany węzeł parsera).
+    // Typ bierzemy z mime (source-of-truth), nie z rozszerzenia.
+    env.payload = if request.mime.starts_with("image/") {
+        FlowValue::Image {
+            blob_ref,
+            mime: request.mime.clone(),
+            dims: None,
+        }
+    } else {
+        FlowValue::Other {
+            blob_ref,
+            mime: request.mime.clone(),
+            filename: None,
+        }
+    };
+    env.meta.insert(
+        "ingest_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    // Opcje ingestu z addona (collection_id, graph_enabled, chunking) wstrzyknięte
+    // do flow.meta pod kluczami źródłowymi — węzły flow czytają je przez fallback
+    // `node.config -> envelope.meta`, jak parametry seedów query.
+    for (key, value) in &request.options {
+        env.meta.insert(key.clone(), value.clone());
+    }
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    Ok((env, meta))
+}
+
+/// RAG Partia 3 — konwertuje `FlowExecutionOutcome` (ingest-as-flow) na
+/// `IngestResponse`. Flow output to `Json{markdown, chunks, page_count}` — węzeł
+/// store ingestu raportuje markdown rekonstrukcji + liczbę zapisanych chunków.
+/// Brakujące `chunks`/`page_count` dekoduje do 0/1 (tolerancja kształtu).
+pub(crate) fn flow_outcome_to_ingest_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<IngestResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let json = match &outcome.final_envelope.payload {
+        FlowValue::Json(v) => v.clone(),
+        _ => {
+            return Err(ExecutorError::Internal(
+                "ingest flow returned no Json payload".into(),
+            ))
+        }
+    };
+    let markdown = json
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let chunks = json
+        .get("chunks")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    let page_count = json
+        .get("page_count")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
+    // Teksty chunków NIE wracają przez ABI: duży dokument przekroczyłby cap 8 MiB
+    // (PayloadTooLarge) i addon oznaczyłby ingest jako failed mimo zapisanych
+    // wektorów (niespójność). Addon czyta teksty chunków z przestrzeni wektorowej
+    // `passages` po `doc_id` (to samo źródło prawdy co cleanup/delete) — graf nie
+    // potrzebuje ich z odpowiedzi.
+    Ok(IngestResponse {
+        markdown,
+        chunks,
+        page_count,
+    })
 }
 
 /// RAG E1.2 — konwertuje `FlowExecutionOutcome` (parse-as-flow) na

@@ -326,6 +326,15 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Ingest-as-flow API (RAG Partia 3) — uruchamia flow `<model>:ingest` z
+    /// BINARNYM dokumentem. Addon podaje `doc_id_blob` (referencja do document
+    /// store), a host pobiera bajty po swojej stronie i seeduje binarny envelope.
+    /// Wymaga `document.read`. Wire format: CBOR (`IngestInvokeInput`/`Output`).
+    fn ingest_invoke_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Document/blob store API (RAG E1.3) — per-instance store for user-uploaded
     /// files (PDF/image > the 1 MB KV ceiling). Requires `document.read`
     /// (get/list) / `document.write` (put/delete). CBOR carries only chunk
@@ -3352,6 +3361,39 @@ pub fn doc_parse(
         model_alias: model_alias.map(str::to_string),
     })?;
     let bytes = call_sql_with_one_input(doc_parse_v1, &payload)?;
+    decode_cbor(&bytes)
+}
+
+// =============================================================================
+// Ingest-as-flow API wrapper (RAG Partia 3)
+// =============================================================================
+
+pub use tentaflow_sdk_spec::IngestInvokeOutput;
+
+/// Uruchamia flow-ingest JEDNEGO dokumentu z BINARNYM payloadem. `doc_id_blob`
+/// to id pliku w per-instance document store (zwrócone przez upload /
+/// [`document_put`]); host pobiera bajty po swojej stronie (zero podwójnego
+/// transferu przez ABI), seeduje binarny envelope (`FlowValue::Image` dla obrazu,
+/// `Other` dla PDF/xlsx/docx) i dispatchuje flow `<model>:ingest:document`.
+/// `options` to opaque JSON (collection_id, graph toggle, parametry chunkingu)
+/// wstrzyknięty do flow.meta. Wymaga `document.read`. Zwraca markdown
+/// rekonstrukcji + liczbę zapisanych chunków ([`IngestInvokeOutput`]).
+///
+/// To JEDYNA ścieżka wywołania flow-ingestu z surowym dokumentem — `llm_generate`
+/// buduje wyłącznie tekstową wiadomość.
+pub fn ingest_invoke(
+    doc_id_blob: &str,
+    mime: &str,
+    model: &str,
+    options: Option<&str>,
+) -> Result<IngestInvokeOutput, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::IngestInvokeInput {
+        doc_id_blob: doc_id_blob.to_string(),
+        mime: mime.to_string(),
+        model: model.to_string(),
+        options_json: options.map(str::to_string),
+    })?;
+    let bytes = call_sql_with_one_input(ingest_invoke_v1, &payload)?;
     decode_cbor(&bytes)
 }
 

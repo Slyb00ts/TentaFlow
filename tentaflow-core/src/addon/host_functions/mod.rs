@@ -22,6 +22,7 @@ pub mod gate;
 pub mod graph;
 pub mod http;
 pub mod image;
+pub mod ingest_invoke;
 pub mod lidar;
 pub mod llm;
 pub mod log;
@@ -342,6 +343,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker
         .func_wrap("tentaflow", "doc_parse_v1", doc_parse::doc_parse_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja doc_parse_v1: {e}"))?;
+
+    // --- Ingest-as-flow API (RAG Partia 3 — binarny dokument → flow rag:ingest) ---
+    linker
+        .func_wrap("tentaflow", "ingest_invoke_v1", ingest_invoke::ingest_invoke_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja ingest_invoke_v1: {e}"))?;
 
     // --- Document/blob store API (RAG E1.3 — per-instancja upload pliku) ---
     linker

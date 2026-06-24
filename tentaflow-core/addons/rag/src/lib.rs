@@ -1,17 +1,17 @@
 // =============================================================================
 // Plik: addons/rag/src/lib.rs
-// Opis: Addon RAG (WASM). Fundament: kolekcje + pipeline INGESTU dokumentow.
-//       Ingest: doc_parse (alias rag-parse) -> chunking markdown -> embedding
-//       (alias rag-embeddings via llm_generate) -> vector_upsert("passages") +
-//       zapis chunkow i statusu do per-instance SQLite. Query-flow i bogate GUI
-//       to osobne slice'y. Komentarze po polsku.
+// Opis: Addon RAG (WASM). Fundament: kolekcje + INGEST dokumentow oparty o
+//       flow-ingest core. Ingest: `ingest_invoke` wykonuje caly DAG (router ->
+//       parse/extract -> combine -> chunk -> embed -> store("passages")) po stronie
+//       core, a addon dokleja TYLKO ekstrakcje grafu wiedzy z tekstow chunkow
+//       zwroconych przez flow. Query-flow i GUI to osobne slice'y. Komentarze PL.
 // =============================================================================
 
 mod ui;
 
 use tentaflow_addon_sdk::prelude::*;
 use tentaflow_addon_sdk::{
-    doc_parse, document_get, graph_delete_edge, graph_delete_node, graph_neighbors,
+    graph_delete_edge, graph_delete_node, graph_neighbors,
     graph_upsert_edge, graph_upsert_node, vector_delete, vector_upsert, GraphDirection, GraphNode,
     GraphProp, Provenance, VectorField, VectorFieldValue,
 };
@@ -41,11 +41,6 @@ const ENTITIES_NS: &str = "entities";
 
 /// Wymiar wektora (zgodny z manifestem i suggested_default rag-embeddings).
 const EMBED_DIMENSIONS: usize = 2048;
-
-/// Domyslny rozmiar chunku w znakach i overlap (chunking po akapitach/zdaniach).
-/// ~512 tokenow * ~4 znaki/token.
-const CHUNK_SIZE_CHARS: usize = 2048;
-const CHUNK_OVERLAP_CHARS: usize = 200;
 
 // --- Ekstrakcja encji/relacji do grafu wiedzy (GraphRAG, Etap 2 / slice E3.0) ---
 
@@ -364,6 +359,11 @@ fn handle_list_collections() -> Value {
 /// odczytuje gotowa nazwe modelu stad.
 const ENGINE_FLOW_STATE_KEY: &str = "engine_flow_model";
 
+/// Klucz KV (durable), pod ktorym Core zapisuje published-name flow-INGESTU tej
+/// instancji (`{addon_id}:ingest`). Osobny od query, bo `flow_model_bindings`
+/// matchuje po DOKLADNEJ nazwie published, nie po literalnym aliasie modelu.
+const INGEST_FLOW_STATE_KEY: &str = "engine_flow_model:ingest";
+
 /// Bufor na odpowiedz query-flow (odpowiedz LLM + kontekst moga byc spore).
 const ASK_BUFFER_SIZE: usize = 262_144;
 
@@ -592,7 +592,7 @@ fn handle_ingest_document(params: &Value) -> Value {
                 // Sciezka bledu: czyscimy artefakty best-effort. Ewentualny blad cleanupu
                 // tylko logujemy (juz raportujemy 'failed') — nie nadpisujemy pierwotnej
                 // przyczyny, ale partial graf jest wychwytywany przez status failed.
-                if let Err(ce) = cleanup_document_artifacts(&document_id, &[]) {
+                if let Err(ce) = cleanup_document_artifacts(&document_id) {
                     log::warn(&format!("rag: cleanup po nieudanym mark_ingested dokumentu '{document_id}' nieudany: {ce}"));
                 }
                 let msg = format!("Ingest zakonczony, ale zapis statusu sie nie powiodl: {e}");
@@ -624,14 +624,11 @@ fn handle_ingest_document(params: &Value) -> Value {
     }
 }
 
-/// Realny pipeline: pobranie pliku -> parse/text -> chunking -> embedding ->
-/// vector_upsert + zapis chunkow. Zwraca liczbe chunkow albo komunikat bledu.
-///
-/// Spojnosc: kazdy krok ktory moze cze ciowo zapisac artefakty (chunki/wektory)
-/// jest opakowany tak, by przy bledzie skasowac WSZYSTKIE artefakty TEGO dokumentu
-/// PRZED zwroceniem bledu (cleanup-on-failure). Lista upsertowanych ref_id jest
-/// zbierana w trakcie, dzieki czemu po failu zostaje zero orphan wektorow i zero
-/// chunkow wskazujacych nieistniejacy wektor.
+/// Pipeline ingestu jednego dokumentu zbudowany na flow-ingescie core
+/// (`ingest_invoke`): jedno wywolanie wykonuje DAG parse -> chunk -> embedding ->
+/// store (wektory `passages` w tozsamosci TEJ instancji). Addon dokleja TYLKO to,
+/// czego flow nie robi: ekstrakcje grafu wiedzy z tekstow chunkow zwroconych przez
+/// flow (gdy graf wlaczony). Zwraca liczbe zapisanych chunkow albo komunikat bledu.
 fn run_ingest_pipeline(
     collection_id: &str,
     document_id: &str,
@@ -640,105 +637,114 @@ fn run_ingest_pipeline(
     mime: &str,
 ) -> Result<usize, String> {
     // Re-ingest tego samego document_id: czysty start — kasujemy ewentualne
-    // wczesniejsze artefakty zanim cokolwiek zapiszemy (cleanup-then-reingest).
-    // Blad cleanupu przerywa pipeline: ingest na niespojnym stanie (stare artefakty
-    // grafu/wektorow) dalby graf z duplikatami i orphanami.
-    cleanup_document_artifacts(document_id, &[])
+    // wczesniejsze artefakty (graf, chunki, wektory) zanim flow zapisze nowe. Flow
+    // store robi wlasny cleanup-then-reingest wektorow po doc_id, ale graf i rejestr
+    // graph_artifacts to domena addona — bez tego re-ingest dalby graf z duplikatami.
+    cleanup_document_artifacts(document_id)
         .map_err(|e| format!("Cleanup przed re-ingestem nieudany: {e}"))?;
-
-    // 1. Pobierz surowe bajty pliku z document store.
-    let (bytes, _stored_mime) =
-        document_get(doc_id_blob).map_err(|e| format!("Blad pobrania pliku ({doc_id_blob}): {e}"))?;
-    if bytes.is_empty() {
-        return Err("Plik zrodlowy jest pusty".to_string());
-    }
     update_progress(job_id, 10);
 
-    // 2. Klasyfikacja MIME wg allowlisty. Nieobslugiwane typy (DOCX/binarka/
-    //    nieznane) odrzucamy czytelnym bledem zamiast ingestowac jako smieci UTF-8.
-    let kind = classify_mime(mime)
-        .ok_or_else(|| format!("Nieobslugiwany typ pliku (mime): {mime}"))?;
-    let (markdown, page_count) = match kind {
-        SourceKind::Parse => {
-            let parsed = doc_parse(&bytes, mime, None)
-                .map_err(|e| format!("Blad parsowania dokumentu: {e}"))?;
-            (parsed.markdown, parsed.page_count.max(1))
+    // Nazwa published flow-ingestu TEJ instancji (`{addon_id}:ingest`), zapisana
+    // przez Core przy install pod `engine_flow_model:ingest`. Binding flow_model_bindings
+    // matchuje DOKLADNIE te nazwe — literalny "rag" by sie nie rozwiazal.
+    let model = match state_get(INGEST_FLOW_STATE_KEY) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(s) if !s.is_empty() => s,
+            _ => return Err("Nazwa flow-ingestu w stanie instancji jest nieprawidlowa".to_string()),
+        },
+        Ok(None) => {
+            return Err(
+                "Flow-ingest nie jest zarejestrowany dla tej instancji (brak engine_flow_model:ingest w stanie)".to_string(),
+            )
         }
-        SourceKind::Text => (String::from_utf8_lossy(&bytes).to_string(), 1),
-        SourceKind::Xlsx => (xlsx_to_markdown(&bytes)?, 1),
-        SourceKind::Docx => (docx_to_markdown(&bytes)?, 1),
+        Err(e) => return Err(format!("Blad odczytu stanu instancji: {e:?}")),
     };
+
+    // Bramka grafu (JEDNO zrodlo prawdy per-instancja). Flow zawsze robi czysty RAG
+    // wektorowy; ekstrakcje triple'ow dokleja addon TYLKO gdy graf wlaczony.
+    let graph_on = graph_enabled();
+
+    // Opcje przeprowadzane do flow.meta: collection_id (store zapisuje je jako pole
+    // wektora pod filtr per-kolekcja), doc_id (store wymaga go do cleanup-then-reingest
+    // i izolacji per-dokument) oraz graph_enabled (informacyjnie). Flow nie pobiera
+    // pliku przez ABI — Core czyta bajty po swojej stronie po doc_id_blob.
+    let options = json!({
+        "collection_id": collection_id,
+        "doc_id": document_id,
+        "graph_enabled": graph_on,
+    });
+    let options_str = options.to_string();
+
+    // Jedno wywolanie = caly DAG parse->chunk->embed->store. Bledy flow (zly mime,
+    // pusty parse, blad store) wracaja jako AbiError -> czytelny komunikat.
+    let result = tentaflow_addon_sdk::ingest_invoke(doc_id_blob, mime, &model, Some(&options_str))
+        .map_err(|e| format!("Flow-ingest nieudany: {e:?}"))?;
+    update_progress(job_id, 70);
+
+    if result.page_count > 0 {
+        let _ = sql_exec(
+            "UPDATE documents SET page_count = ? WHERE id = ?",
+            &[SqlValue::I64(result.page_count as i64), SqlValue::String(document_id.to_string())],
+        );
+    }
+
+    let total = result.chunks as usize;
+    if total == 0 {
+        return Err("Flow-ingest nie zapisal zadnego chunka".to_string());
+    }
+
+    // Liczbe chunkow utrwalamy na wierszu dokumentu — addonowa tabela `chunks` nie
+    // jest zapelniana (wektory pisze wezel store wprost do `passages`), wiec lista
+    // dokumentow czyta `documents.chunk_count` zamiast COUNT(*) z pustej `chunks`.
     let _ = sql_exec(
-        "UPDATE documents SET page_count = ? WHERE id = ?",
-        &[SqlValue::I64(page_count as i64), SqlValue::String(document_id.to_string())],
+        "UPDATE documents SET chunk_count = ? WHERE id = ?",
+        &[SqlValue::I64(total as i64), SqlValue::String(document_id.to_string())],
     );
-    update_progress(job_id, 30);
 
-    if markdown.trim().is_empty() {
-        return Err("Parsowanie nie zwrocilo tekstu".to_string());
-    }
-
-    // 3. Chunking markdown (po akapitach/zdaniach z overlap).
-    let chunks = split_into_chunks(&markdown, CHUNK_SIZE_CHARS, CHUNK_OVERLAP_CHARS);
-    if chunks.is_empty() {
-        return Err("Chunking nie wyprodukowal zadnego chunka".to_string());
-    }
-    let total = chunks.len();
-    let now = now_unix();
-
-    // 4. Dla kazdego chunku: embedding -> walidacja dim -> INSERT chunka (rowid =
-    //    ref_id) -> vector_upsert -> UPDATE vector_ref (ze sprawdzeniem wyniku).
-    //    Wszystkie upsertowane ref_id zbieramy, by po failu wyczyscic wektory.
-    let mut upserted: Vec<u64> = Vec::with_capacity(total);
-
-    // Akumulatory ekstrakcji grafu (best-effort). doc_triples pilnuje globalnego
-    // capa MAX_TRIPLES_PER_DOC; graph_failed zaznacza, ze graf jest czesciowy.
+    // Ekstrakcja grafu wiedzy z tekstow chunkow zwroconych przez flow (jego store to
+    // jedyne miejsce, ktore widzi finalny zestaw zapisanych chunkow). BEST-EFFORT:
+    // wektory sa juz w indeksie, wiec blad ekstrakcji NIE wywala ingestu — znaczy
+    // tylko graf jako czesciowy. Pomijane przy grafie OFF.
     let mut total_entities = 0usize;
     let mut total_relations = 0usize;
     let mut doc_triples = 0usize;
     let mut graph_partial = false;
 
-    // Bramka grafu (per-instancja, JEDNO zrodlo prawdy): gdy graf wylaczony, robimy
-    // CZYSTY RAG wektorowy — zero ekstrakcji triple'ow, zero reconcile, zero zapisu do
-    // grafu/schema_registry/fact_state. Chunki + wektory leca normalnie. graph_partial
-    // pozostaje false: graf nie jest "czesciowy", tylko swiadomie wylaczony.
-    let graph_on = graph_enabled();
-
-    // Reconcile na starcie ingestu (samonaprawa po crashu): domyka zalegle promocje/
-    // aktywacje i re-drain outboxu (applied=0) sprzed ewentualnego crashu poprzedniego
-    // ingestu (R3), zanim dolozymy nowe fakty. Best-effort — nieudany reconcile nie wywala
-    // ingestu wektorowego, tylko znaczy graf jako czesciowy. Pomijany przy grafie OFF.
     if graph_on {
+        // Reconcile na starcie (samonaprawa po crashu): domyka zalegle promocje/
+        // aktywacje i re-drain outboxu (applied=0) sprzed crashu, zanim dolozymy fakty.
         if let Err(e) = reconcile_schemas() {
             graph_partial = true;
             log::warn(&format!(
-                "rag: reconcile na starcie ingestu dok {document_id} nieudany (graf czesciowy): {e}"
+                "rag: reconcile na starcie grafu dok {document_id} nieudany (graf czesciowy): {e}"
             ));
         }
-    }
 
-    for (index, chunk_text) in chunks.iter().enumerate() {
-        let step = ingest_one_chunk(collection_id, document_id, index, chunk_text, now, &mut upserted);
-        if let Err(msg) = step {
-            // Cleanup-on-failure: skasuj wszystkie wektory + chunki + graf dokumentu.
-            // Blad samego cleanupu doklejamy do komunikatu (ingest i tak konczy sie Err).
-            if let Err(ce) = cleanup_document_artifacts(document_id, &upserted) {
-                return Err(format!("Blad chunka {index}: {msg}; dodatkowo cleanup nieudany: {ce}"));
+        // Teksty chunkow czytamy z przestrzeni wektorowej `passages` po `doc_id`
+        // (to samo zrodlo prawdy co cleanup/delete) — NIE z odpowiedzi ABI. Duzy
+        // dokument przekroczylby cap 8 MiB w `chunk_texts` (PayloadTooLarge) i
+        // oznaczylby ingest jako failed mimo zapisanych wektorow. Blad odczytu =>
+        // graf czesciowy (wektory sa juz w indeksie).
+        let doc_chunks = match fetch_document_chunks(document_id) {
+            Ok(c) => c,
+            Err(e) => {
+                graph_partial = true;
+                log::warn(&format!(
+                    "rag: odczyt chunkow dok {document_id} do ekstrakcji grafu nieudany (graf czesciowy): {e}"
+                ));
+                Vec::new()
             }
-            return Err(format!("Blad chunka {index}: {msg}"));
-        }
-
-        // Ekstrakcja grafu — BEST-EFFORT, TYLKO przy grafie ON. Wektor chunku jest juz
-        // zapisany; blad ekstrakcji (LLM/parsowanie/upsert) NIE wywala ingestu, tylko
-        // oznacza graf jako czesciowy i leci dalej (wektory > graf).
-        // graph_partial sluzy tu DWOM zrodlom niekompletnosci: blad ekstrakcji (Err)
-        // ORAZ obciecie capem/za-dluga relacja (truncated, bug 5/6). Przekazujemy je
-        // jako wspolna flage `truncated` ustawiana wewnatrz extract_chunk_graph.
-        if graph_on {
-            let chunk_result =
-                extract_chunk_graph(document_id, index, chunk_text, &mut doc_triples, &mut graph_partial);
-            // Blad ekstrakcji chunku (w tym blad REJESTRU graph_artifacts, bug 4)
-            // oznacza graf jako czesciowy — nigdy nie ginie cicho.
+        };
+        let chunk_total = doc_chunks.len().max(1);
+        for (i, chunk) in doc_chunks.iter().enumerate() {
+            let index = chunk.index as usize;
+            let chunk_result = extract_chunk_graph(
+                document_id,
+                index,
+                &chunk.text,
+                &mut doc_triples,
+                &mut graph_partial,
+            );
             if chunk_extraction_marks_partial(&chunk_result) {
                 graph_partial = true;
             }
@@ -753,29 +759,22 @@ fn run_ingest_pipeline(
                     ));
                 }
             }
+            // Postep 70..95% rozlozony na ekstrakcje grafu.
+            let progress = 70 + ((i + 1) * 25 / chunk_total) as i64;
+            update_progress(job_id, progress.min(95));
         }
 
-        // Postep 30..95% rozlozony na chunki.
-        let progress = 30 + ((index + 1) * 65 / total) as i64;
-        update_progress(job_id, progress.min(95));
-    }
-
-    // Reconcile PO petli chunkow (zamiast dawnego per-chunk drainu): promocja schematow
-    // ktore osiagnely prog tau w tym ingescie + aktywacja partiami WSZYSTKICH zalegych
-    // krawedzi stabilnych schematow + materializacja do grafu. Idempotentny i globalny —
-    // sprzata tez zaleglosci rownoleglych ingestow. Best-effort (graf < wektory): blad
-    // znaczy graf jako czesciowy, nie wywala ingestu. Pomijany przy grafie OFF.
-    if graph_on {
+        // Reconcile PO petli: promocja schematow ktore osiagnely prog tau + aktywacja
+        // zalegych krawedzi + materializacja do grafu. Idempotentny i globalny.
         if let Err(e) = reconcile_schemas() {
             graph_partial = true;
             log::warn(&format!(
-                "rag: reconcile po ingescie dok {document_id} nieudany (graf czesciowy): {e}"
+                "rag: reconcile po grafie dok {document_id} nieudany (graf czesciowy): {e}"
             ));
         }
     }
 
-    // Zapisz liczniki ekstrakcji + flage czesciowosci na dokumencie (best-effort
-    // statystyka; brak trafienia nie jest bledem ingestu wektorowego).
+    // Liczniki ekstrakcji + flaga czesciowosci (best-effort statystyka).
     let _ = sql_exec(
         "UPDATE documents SET entity_count = ?, relation_count = ?, graph_partial = ? WHERE id = ?",
         &[
@@ -789,109 +788,111 @@ fn run_ingest_pipeline(
     Ok(total)
 }
 
-/// Przetwarza pojedynczy chunk: embedding -> walidacja dim (w parse) -> INSERT
-/// chunka -> vector_upsert -> UPDATE vector_ref. Po udanym upsercie dopisuje ref_id
-/// do `upserted`, by cleanup-on-failure mogl go skasowac. Bledy UPDATE/upsertu nie
-/// sa lykane — chunk wskazujacy nieistniejacy wektor jest tu niemozliwy.
-fn ingest_one_chunk(
-    collection_id: &str,
-    document_id: &str,
-    index: usize,
-    chunk_text: &str,
-    now: i64,
-    upserted: &mut Vec<u64>,
-) -> Result<(), String> {
-    // Embedding + walidacja wymiaru (parse_embedding_response sprawdza dlugosc).
-    let vector = generate_embedding(chunk_text).map_err(|e| format!("embedding: {e}"))?;
-
-    // INSERT chunka z placeholderem vector_ref=0 — rowid (=ref_id) powstaje teraz.
-    let exec = sql_exec(
-        "INSERT INTO chunks (document_id, collection_id, chunk_index, text, vector_ref, created_at) \
-         VALUES (?, ?, ?, ?, 0, ?)",
-        &[
-            SqlValue::String(document_id.to_string()),
-            SqlValue::String(collection_id.to_string()),
-            SqlValue::I64(index as i64),
-            SqlValue::String(chunk_text.to_string()),
-            SqlValue::I64(now),
-        ],
-    )
-    .map_err(|e| format!("zapis chunka: {e}"))?;
-
-    let rowid = exec.last_insert_id;
-    if rowid <= 0 {
-        // Bez poprawnego rowid nie ma stabilnego ref_id — usun wlasnie wstawiony
-        // chunk (gdyby jednak powstal) i przerwij.
-        let _ = sql_exec(
-            "DELETE FROM chunks WHERE document_id = ? AND chunk_index = ?",
-            &[SqlValue::String(document_id.to_string()), SqlValue::I64(index as i64)],
-        );
-        return Err(format!("INSERT chunka zwrocil nieprawidlowy rowid: {rowid}"));
-    }
-    let ref_id = rowid as u64;
-
-    // Upsert wektora pod rowid. Przy bledzie usun wlasnie wstawiony chunk, by nie
-    // zostawic chunku bez wektora.
-    let fields = [
-        VectorField { name: "doc_id".to_string(), value: VectorFieldValue::Str(document_id.to_string()) },
-        VectorField { name: "chunk_index".to_string(), value: VectorFieldValue::Int(index as i64) },
-        VectorField { name: "created_at".to_string(), value: VectorFieldValue::Int(now) },
-        // collection_id — pozwala query-flow filtrowac retrieval po kolekcji.
-        VectorField { name: "collection_id".to_string(), value: VectorFieldValue::Str(collection_id.to_string()) },
-        // text — tresc chunka przy wektorze, by vector search w query-flow zwrocil
-        // ja przez output_fields i zbudowal kontekst dla LLM (bez siegania do SQLite).
-        VectorField { name: "text".to_string(), value: VectorFieldValue::Str(chunk_text.to_string()) },
-    ];
-    if let Err(e) = vector_upsert(PASSAGES_NS, ref_id, &vector, &fields) {
-        let _ = sql_exec("DELETE FROM chunks WHERE id = ?", &[SqlValue::I64(rowid)]);
-        return Err(format!("upsert wektora: {e}"));
-    }
-    upserted.push(ref_id);
-
-    // UPDATE vector_ref = rowid ze SPRAWDZENIEM wyniku — bez tego chunk moglby
-    // wskazywac placeholder 0 przy cichym bledzie.
-    let updated = sql_exec(
-        "UPDATE chunks SET vector_ref = ? WHERE id = ?",
-        &[SqlValue::I64(rowid), SqlValue::I64(rowid)],
-    )
-    .map_err(|e| format!("aktualizacja vector_ref: {e}"))?;
-    if updated.rows_affected == 0 {
-        return Err("aktualizacja vector_ref nie objela zadnego wiersza".to_string());
-    }
-
-    Ok(())
+/// Pojedynczy chunk dokumentu odczytany z przestrzeni wektorowej `passages`:
+/// jego `ref_id` (klucz wektora), `index` (pozycja w dokumencie) i `text`.
+struct DocChunk {
+    ref_id: u64,
+    index: u32,
+    text: String,
 }
 
-/// Kasuje wszystkie artefakty dokumentu: wektory (po przekazanej liscie ref_id
-/// oraz po vector_ref chunkow z bazy) i chunki. Idempotentny — wolany przy
-/// czystym starcie (re-ingest) i przy cleanup-on-failure.
-fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) -> Result<(), String> {
+/// Enumeruje WSZYSTKIE chunki dokumentu z przestrzeni `passages` po filtrze
+/// `doc_id`. To JEDNO zrodlo prawdy o zapisanych chunkach: wezel `store` (Core)
+/// pisze wektory wprost do tej przestrzeni z polami `doc_id`/`chunk_index`/`text`,
+/// wiec addon czyta je stad zarowno do ekstrakcji grafu (P1-3, bez przepychania
+/// tekstow przez ABI i ryzyka PayloadTooLarge), jak i do kasowania (P1-2).
+///
+/// `vector_search` wymaga wektora zapytania — przy enumeracji po filtrze sam
+/// porzadek wynikow jest bez znaczenia, wiec podajemy wektor zerowy o wymiarze
+/// przestrzeni (EMBED_DIMENSIONS). Filtr `doc_id == X` zaweza do tego dokumentu.
+/// `k` JEST OGRANICZONE host-capem `MAX_SEARCH_K`=1000 (vector_search_v1 odrzuca
+/// `k>1000` jako AbiError::Operation) — zwracamy do 1000 chunkow na wywolanie.
+/// Pelna enumeracja dokumentu >1000 chunkow: kasowanie robi to partiami w petli
+/// (cleanup_document_artifacts), a graf czyta pierwsze 1000 (wystarcza realnie).
+fn fetch_document_chunks(document_id: &str) -> Result<Vec<DocChunk>, String> {
+    const FETCH_K: u32 = 1000;
+    let zero_query = vec![0.0f32; EMBED_DIMENSIONS];
+    let filter = VectorFilter::Eq(
+        "doc_id".to_string(),
+        VectorFieldValue::Str(document_id.to_string()),
+    );
+    let hits = vector_search(
+        PASSAGES_NS,
+        &zero_query,
+        FETCH_K,
+        None,
+        Some(&filter),
+        &["chunk_index", "text"],
+    )
+    .map_err(|e| format!("enumeracja chunkow dokumentu '{document_id}': {e}"))?;
+
+    let mut chunks = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let index = hit
+            .fields
+            .iter()
+            .find(|f| f.name == "chunk_index")
+            .and_then(|f| match &f.value {
+                VectorFieldValue::Int(i) => u32::try_from(*i).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let text = hit
+            .fields
+            .iter()
+            .find(|f| f.name == "text")
+            .and_then(|f| match &f.value {
+                VectorFieldValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        chunks.push(DocChunk {
+            ref_id: hit.ref_id,
+            index,
+            text,
+        });
+    }
+    // Deterministyczna kolejnosc po indeksie chunka (search zwraca po dystansie).
+    chunks.sort_by_key(|c| c.index);
+    Ok(chunks)
+}
+
+/// Kasuje wszystkie artefakty dokumentu: wektory (enumerowane z przestrzeni
+/// `passages` po `doc_id`), graf i chunki. Idempotentny — wolany przy czystym
+/// starcie (re-ingest) i przy usuwaniu dokumentu/kolekcji.
+fn cleanup_document_artifacts(document_id: &str) -> Result<(), String> {
     // Inwariant: nic nie znika z metadanych dopoki artefakty (wektory+graf+chunki)
     // nie sa bezpiecznie usuniete/zakolejkowane. Blad KTOREGOKOLWIEK kroku => Err =>
     // caller (handle_delete_document) NIE usuwa wiersza dokumentu, wiec nie zostaje
-    // osierocony wektor. Dlatego bledy vector_delete i odczytu chunks propagujemy.
+    // osierocony wektor. Dlatego bledy vector_delete i odczytu propagujemy.
 
-    // Najpierw skasuj wektory po juz-upsertowanych ref_id (znane z biezacego biegu).
-    for &ref_id in known_refs {
-        if ref_id > 0 {
-            vector_delete(PASSAGES_NS, ref_id)
-                .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
+    // Wektory pisze wezel `store` (Core) WPROST do przestrzeni `passages` z polem
+    // `doc_id` — addonowy `chunks` ich NIE rejestruje. Zrodlem prawdy jest wiec
+    // przestrzen: enumerujemy ref_id po filtrze `doc_id` i kasujemy je. Bez tego
+    // (kasowanie tylko po pustym `chunks.vector_ref`) re-ingest i delete zostawialy
+    // wektory osierocone.
+    //
+    // Enumeracja jest ograniczona host-capem `MAX_SEARCH_K`=1000, wiec kasujemy
+    // PARTIAMI: fetch (<=1000) + delete, az przestrzen dla tego doc_id bedzie pusta.
+    // Usuwanie zmniejsza zbior, wiec kolejny fetch zwraca nastepna partie — petla
+    // konczy sie dla dokumentu DOWOLNEJ wielkosci (kompletny cleanup, bez osierocen).
+    loop {
+        let batch = fetch_document_chunks(document_id)?;
+        if batch.is_empty() {
+            break;
         }
-    }
-
-    // Dodatkowo skasuj wektory po vector_ref zapisanych w chunkach (np. z
-    // wczesniejszego ingestu przy re-ingescie) — pokrywa refy spoza known_refs.
-    let rows = sql_query(
-        "SELECT vector_ref FROM chunks WHERE document_id = ? AND vector_ref > 0",
-        &[SqlValue::String(document_id.to_string())],
-    )
-    .map_err(|e| format!("odczyt vector_ref chunkow '{document_id}': {e}"))?;
-    for row in &rows {
-        if let Some(ref_id) = row.first().and_then(|v| v.as_i64()) {
-            if ref_id > 0 && !known_refs.contains(&(ref_id as u64)) {
-                vector_delete(PASSAGES_NS, ref_id as u64)
-                    .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
+        let mut deleted_any = false;
+        for chunk in batch {
+            if chunk.ref_id > 0 {
+                vector_delete(PASSAGES_NS, chunk.ref_id)
+                    .map_err(|e| format!("usuniecie wektora ref={}: {e}", chunk.ref_id))?;
+                deleted_any = true;
             }
+        }
+        // Ochrona przed petla nieskonczona: gdyby partia miala same ref_id==0
+        // (nic do skasowania), zbior sie nie zmniejszy — przerywamy.
+        if !deleted_any {
+            break;
         }
     }
 
@@ -1025,7 +1026,7 @@ fn handle_list_documents(params: &Value) -> Value {
 
     let rows = match sql_query(
         "SELECT d.id, d.filename, d.mime, d.status, d.page_count, d.created_at, \
-         (SELECT COUNT(*) FROM chunks ch WHERE ch.document_id = d.id), \
+         d.chunk_count, \
          d.entity_count, d.relation_count, d.graph_partial \
          FROM documents d WHERE d.collection_id = ? ORDER BY d.created_at DESC",
         &[SqlValue::String(collection_id.to_string())],
@@ -1196,7 +1197,7 @@ fn handle_delete_collection(params: &Value) -> Value {
         // spojnie wyczyszczony — inaczej zostalyby osierocone artefakty grafu. Juz
         // usuniete (wczesniejsze) dokumenty pozostaja usuniete; kolekcja zostaje, bo
         // jej DELETE jest na koncu — admin moze ponowic.
-        if let Err(e) = cleanup_document_artifacts(doc_id, &[]) {
+        if let Err(e) = cleanup_document_artifacts(doc_id) {
             return err(&format!("Cleanup dokumentu '{doc_id}' nieudany; usuwanie kolekcji przerwane: {e}"));
         }
         if let Err(e) = sql_exec(
@@ -1242,7 +1243,7 @@ fn handle_delete_document(params: &Value) -> Value {
     // Blad cleanupu grafu/outboxu PRZERYWA usuwanie — nie usuwamy wiersza dokumentu
     // nad osieroconymi artefaktami grafu (inwariant: graf TYLKO przez outbox, spojny
     // refcount). Admin moze ponowic po usunieciu przyczyny.
-    if let Err(e) = cleanup_document_artifacts(document_id, &[]) {
+    if let Err(e) = cleanup_document_artifacts(document_id) {
         return err(&format!("Cleanup dokumentu nieudany; usuwanie przerwane: {e}"));
     }
     if let Err(e) = sql_exec(
@@ -6583,46 +6584,6 @@ fn delete_canonical_if_unreferenced_stmts(new_fact_key: &str, src: &str, rel: &s
 // Embeddingi — mechanizm jak embeddings-chunker (llm_generate, task=embedding)
 // =============================================================================
 
-/// Generuje embedding chunka przez alias rag-embeddings. Model = nazwa aliasu,
-/// Core rozwiazuje go na realny serwis embeddingow; options.task == "embedding"
-/// kieruje wywolanie na sciezke embeddingow (identycznie jak embeddings-chunker).
-fn generate_embedding(text: &str) -> Result<Vec<f32>, String> {
-    let prefixed = format!("Document: {text}");
-    let model = "rag-embeddings";
-    let options = json!({
-        "task": "embedding",
-        "dimensions": EMBED_DIMENSIONS,
-        "adapter": "retrieval"
-    });
-    let options_str =
-        serde_json::to_string(&options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
-
-    let prompt_bytes = prefixed.as_bytes();
-    let model_bytes = model.as_bytes();
-    let options_bytes = options_str.as_bytes();
-    let mut buffer = vec![0u8; EMBED_BUFFER_SIZE];
-    let mut out_len: i32 = 0;
-
-    let rc = unsafe {
-        llm_generate(
-            prompt_bytes.as_ptr() as i32, prompt_bytes.len() as i32,
-            model_bytes.as_ptr() as i32, model_bytes.len() as i32,
-            options_bytes.as_ptr() as i32, options_bytes.len() as i32,
-            buffer.as_mut_ptr() as i32, EMBED_BUFFER_SIZE as i32,
-            &mut out_len as *mut i32 as i32,
-        )
-    };
-    if rc < 0 {
-        return Err(format!("llm_generate zwrocil blad: {rc}"));
-    }
-    if out_len <= 0 {
-        return Err("llm_generate zwrocil pusta odpowiedz".to_string());
-    }
-
-    let response = String::from_utf8_lossy(&buffer[..out_len as usize]).to_string();
-    parse_embedding_response(&response)
-}
-
 /// Wyciaga wektor f32 z odpowiedzi embeddingu (tablica floatow albo obiekt z
 /// polem embedding/vector/data[0].embedding) i waliduje jego wymiar. Zla dlugosc
 /// (!= EMBED_DIMENSIONS = dim namespace 'passages') to twardy blad — wektor o zlym
@@ -6686,134 +6647,11 @@ fn floats_from(arr: &[Value]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
-// =============================================================================
-// Chunking markdown — po akapitach/zdaniach z overlap (wzor z embeddings-chunker)
-// =============================================================================
+// Chunking, klasyfikacja MIME (SourceKind/classify_mime) i ekstraktory office
+// (xlsx_to_markdown/docx_to_markdown) zostaly PRZENIESIONE do core jako
+// node-adaptery flow-ingestu (chunk / document_router / excel_extract /
+// word_extract). Addon wola caly DAG jednym `ingest_invoke` — zero duplikacji.
 
-/// Dzieli tekst na chunki po zdaniach/akapitach z overlap. Granice liczone w
-/// znakach (UTF-8 safe — operujemy na zdaniach, nie na bajtach).
-fn split_into_chunks(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    let sentences = split_into_sentences(text);
-    if sentences.is_empty() {
-        return vec![text.trim().to_string()];
-    }
-
-    // Pojedyncze zdanie/akapit dluzsze niz chunk_size lamiemy twardo PRZED
-    // skladaniem, by zaden segment nie przekroczyl chunk_size (nadwymiarowy chunk
-    // = ryzyko przekroczenia limitu kontekstu embeddingu). Limit segmentu zmniejszamy
-    // o overlap (+1 na spacje laczaca), bo do segmentu doklejany jest ogon overlap
-    // poprzedniego chunka — inaczej zlozony chunk moglby przekroczyc chunk_size.
-    let seg_max = chunk_size.saturating_sub(overlap + 1).max(1);
-    let segments: Vec<String> = sentences
-        .iter()
-        .flat_map(|s| hard_split(s, seg_max))
-        .collect();
-
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
-
-    for sentence in &segments {
-        if current.chars().count() + sentence.chars().count() <= chunk_size || current.is_empty() {
-            if !current.is_empty() && !current.ends_with(' ') {
-                current.push(' ');
-            }
-            current.push_str(sentence);
-        } else {
-            chunks.push(current.trim().to_string());
-            current = overlap_tail(chunks.last().unwrap(), overlap);
-            if !current.is_empty() && !current.ends_with(' ') {
-                current.push(' ');
-            }
-            current.push_str(sentence);
-        }
-    }
-
-    let tail = current.trim().to_string();
-    if !tail.is_empty() {
-        chunks.push(tail);
-    }
-    if chunks.is_empty() {
-        chunks.push(text.trim().to_string());
-    }
-    chunks
-}
-
-/// Twardo lamie nadwymiarowy segment na kawalki <= chunk_size (granice liczone w
-/// znakach, UTF-8 safe). Segmenty miesczace sie w limicie zwraca bez zmian.
-fn hard_split(segment: &str, chunk_size: usize) -> Vec<String> {
-    if chunk_size == 0 || segment.chars().count() <= chunk_size {
-        return vec![segment.to_string()];
-    }
-    let chars: Vec<char> = segment.chars().collect();
-    chars
-        .chunks(chunk_size)
-        .map(|c| c.iter().collect::<String>())
-        .collect()
-}
-
-/// Zwraca ogon poprzedniego chunka (overlap) zaczynajacy sie od granicy slowa.
-fn overlap_tail(prev: &str, overlap: usize) -> String {
-    if overlap == 0 {
-        return String::new();
-    }
-    let chars: Vec<char> = prev.chars().collect();
-    if chars.len() <= overlap {
-        return prev.to_string();
-    }
-    let start = chars.len() - overlap;
-    let tail: String = chars[start..].iter().collect();
-    // Przesun do granicy slowa, by nie urywac w polowie wyrazu.
-    match tail.find(' ') {
-        Some(pos) => tail[pos + 1..].to_string(),
-        None => tail,
-    }
-}
-
-/// Rozdziela tekst na zdania po (. ! ?) i granicach akapitow (podwojny newline).
-fn split_into_sentences(text: &str) -> Vec<String> {
-    let mut sentences = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        let ch = chars[i];
-        if ch == '\n' && i + 1 < len && chars[i + 1] == '\n' {
-            if !current.trim().is_empty() {
-                sentences.push(current.trim().to_string());
-                current.clear();
-            }
-            i += 2;
-            continue;
-        }
-        current.push(ch);
-        if (ch == '.' || ch == '!' || ch == '?')
-            && (i + 1 >= len || chars[i + 1] == ' ' || chars[i + 1] == '\n')
-        {
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                sentences.push(trimmed);
-                current.clear();
-            }
-        }
-        i += 1;
-    }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        sentences.push(trimmed);
-    }
-    sentences
-}
-
-// =============================================================================
-// Panel UI — minimalny (lista kolekcji). Pelne GUI to osobny slice.
-// =============================================================================
-
-/// Renderuje minimalny panel: naglowek + lista nazw kolekcji.
 // =============================================================================
 // Helpery
 // =============================================================================
@@ -6881,397 +6719,6 @@ fn fail_job(document_id: &str, job_id: &str, message: &str) {
         Err(e) => log::error(&format!("rag: blad zapisu statusu failed joba {job_id}: {e}")),
         _ => {}
     }
-}
-
-/// Klasa zrodla wg MIME — wyznacza sciezke ekstrakcji tekstu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    /// Tekst wprost (UTF-8) — text/*, application/json.
-    Text,
-    /// Obraz/PDF -> doc_parse (alias rag-parse renderuje strony na markdown).
-    Parse,
-    /// Arkusz XLSX -> calamine -> tabele markdown (liczby przez parser, nie OCR).
-    Xlsx,
-    /// Dokument DOCX -> unzip word/document.xml -> markdown (akapity + tabele).
-    Docx,
-}
-
-/// Klasyfikuje MIME wg allowlisty. Zwraca `None` dla nieobslugiwanych typow
-/// (DOCX/binarki/nieznane) — takie zrodlo NIE jest ingestowane jako smieci UTF-8.
-/// PDF rozpoznajemy odpornie: po prefiksie `application/pdf`, ignorujac parametry
-/// (np. `application/pdf; charset=...`).
-fn classify_mime(mime: &str) -> Option<SourceKind> {
-    let base = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
-    if base.starts_with("image/") || base == "application/pdf" {
-        return Some(SourceKind::Parse);
-    }
-    if base.starts_with("text/") || base == "application/json" {
-        return Some(SourceKind::Text);
-    }
-    // Office: rozpoznajemy oba warianty MIME (OOXML i starszy ms-*). Niektorzy
-    // klienci wysylaja generyczne typy, wiec tolerujemy tez fallback po MIME ms-*.
-    if base == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        || base == "application/vnd.ms-excel"
-    {
-        return Some(SourceKind::Xlsx);
-    }
-    if base == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        || base == "application/msword"
-    {
-        return Some(SourceKind::Docx);
-    }
-    None
-}
-
-/// Escapuje tresc komorki tabeli markdown: `|` rozwala kolumny, znaki nowej linii
-/// rozwalaja wiersz — oba zamieniamy na bezpieczne odpowiedniki.
-fn md_table_cell_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace('\r', " ")
-        .replace('\n', "<br>")
-        .trim()
-        .to_string()
-}
-
-/// Formatuje liczbe z calamine bez notacji naukowej tam, gdzie to rozsadne.
-/// Calowite -> bez kropki; ulamki -> domyslny `{}` f64 (Rust nie uzywa `e` dla
-/// typowych zakresow danych emisyjnych).
-fn xlsx_format_float(f: f64) -> String {
-    if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e15 {
-        format!("{}", f as i64)
-    } else {
-        let s = format!("{f}");
-        s
-    }
-}
-
-/// Zamienia pojedyncza komorke calamine na tekst (liczby przez parser, nie OCR).
-fn xlsx_cell_to_string(cell: &calamine::Data) -> String {
-    use calamine::Data;
-    match cell {
-        Data::Empty => String::new(),
-        Data::String(s) => s.clone(),
-        Data::Float(f) => xlsx_format_float(*f),
-        Data::Int(i) => i.to_string(),
-        Data::Bool(b) => b.to_string(),
-        Data::DateTime(d) => xlsx_format_float(d.as_f64()),
-        Data::DateTimeIso(s) => s.clone(),
-        Data::DurationIso(s) => s.clone(),
-        Data::Error(e) => format!("#ERR({e:?})"),
-    }
-}
-
-/// XLSX -> markdown: kazdy arkusz jako `## <nazwa>` + tabela GFM. Pierwszy wiersz
-/// arkusza traktujemy jako naglowek. Puste arkusze pomijamy. To kluczowa sciezka
-/// dla danych emisyjnych — liczby maja przejsc dokladnie jako komorki tabeli.
-fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, String> {
-    use calamine::{Reader, Xlsx};
-    use std::io::Cursor;
-
-    let cursor = Cursor::new(bytes.to_vec());
-    let mut workbook: Xlsx<_> =
-        Xlsx::new(cursor).map_err(|e| format!("Blad odczytu xlsx: {e}"))?;
-
-    let sheet_names = workbook.sheet_names().to_vec();
-    let mut out = String::new();
-
-    for name in sheet_names {
-        let range = match workbook.worksheet_range(&name) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(format!("Blad odczytu arkusza '{name}': {e}"));
-            }
-        };
-        if range.is_empty() {
-            continue;
-        }
-
-        // Zbierz wiersze, pomijajac calkowicie puste; liczba kolumn = najszerszy wiersz.
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        let mut max_cols = 0usize;
-        for row in range.rows() {
-            let cells: Vec<String> = row.iter().map(xlsx_cell_to_string).collect();
-            if cells.iter().all(|c| c.trim().is_empty()) {
-                continue;
-            }
-            max_cols = max_cols.max(cells.len());
-            rows.push(cells);
-        }
-        if rows.is_empty() || max_cols == 0 {
-            continue;
-        }
-
-        out.push_str("## ");
-        out.push_str(&name);
-        out.push_str("\n\n");
-
-        // Naglowek = pierwszy niepusty wiersz; reszta jako wiersze danych.
-        let header = &rows[0];
-        let mut header_cells: Vec<String> = (0..max_cols)
-            .map(|i| {
-                let c = header.get(i).map(|s| s.as_str()).unwrap_or("");
-                let esc = md_table_cell_escape(c);
-                if esc.is_empty() {
-                    format!("col{}", i + 1)
-                } else {
-                    esc
-                }
-            })
-            .collect();
-        // Zapewnij niepuste id kolumn (gdy caly naglowek byl pusty, juz wypelnione wyzej).
-        for cell in &mut header_cells {
-            if cell.is_empty() {
-                *cell = "col".to_string();
-            }
-        }
-
-        out.push('|');
-        for h in &header_cells {
-            out.push(' ');
-            out.push_str(h);
-            out.push_str(" |");
-        }
-        out.push('\n');
-        out.push('|');
-        for _ in 0..max_cols {
-            out.push_str(" --- |");
-        }
-        out.push('\n');
-
-        for row in &rows[1..] {
-            out.push('|');
-            for i in 0..max_cols {
-                let c = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                out.push(' ');
-                out.push_str(&md_table_cell_escape(c));
-                out.push_str(" |");
-            }
-            out.push('\n');
-        }
-        out.push('\n');
-    }
-
-    if out.trim().is_empty() {
-        return Err("Plik xlsx nie zawiera danych".to_string());
-    }
-    Ok(out)
-}
-
-/// DOCX -> markdown: rozpakuj `word/document.xml` i przejdz po `w:p`/`w:tbl`.
-/// Akapity (z mapowaniem styli Heading na `#`/`##`) i tabele (pierwszy wiersz jako
-/// naglowek) — zachowuje tabele z dokumentow Wykaz/Prompty.
-fn docx_to_markdown(bytes: &[u8]) -> Result<String, String> {
-    use quick_xml::events::Event;
-    use quick_xml::Reader as XmlReader;
-    use std::io::{Cursor, Read};
-
-    let cursor = Cursor::new(bytes.to_vec());
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|e| format!("Blad odczytu docx (zip): {e}"))?;
-    let mut xml = String::new();
-    {
-        let mut file = archive
-            .by_name("word/document.xml")
-            .map_err(|e| format!("Brak word/document.xml w docx: {e}"))?;
-        file.read_to_string(&mut xml)
-            .map_err(|e| format!("Blad odczytu document.xml: {e}"))?;
-    }
-
-    let mut reader = XmlReader::from_str(&xml);
-    reader.config_mut().trim_text(false);
-
-    let mut out = String::new();
-
-    // Stan biezacego akapitu.
-    let mut para_text = String::new();
-    let mut para_heading: u8 = 0; // 0 = brak, 1..=6 poziom naglowka
-    let mut in_text = false;
-
-    // Stan tabeli.
-    let mut in_table = false;
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let mut cur_row: Vec<String> = Vec::new();
-    let mut cur_cell = String::new();
-    let mut in_cell = false;
-
-    // Tagi porownujemy po local-name (ignorujemy prefiks `w:`), bo namespace bywa rozny.
-    fn local_name(name: &[u8]) -> &[u8] {
-        match name.iter().rposition(|&b| b == b':') {
-            Some(p) => &name[p + 1..],
-            None => name,
-        }
-    }
-
-    // Domyka akapit do markdown (z naglowkiem lub jako zwykly tekst).
-    fn flush_para(out: &mut String, para_text: &mut String, para_heading: &mut u8) {
-        let t = para_text.trim();
-        if !t.is_empty() {
-            if *para_heading >= 1 {
-                let hashes = "#".repeat((*para_heading).min(6) as usize);
-                out.push_str(&hashes);
-                out.push(' ');
-            }
-            out.push_str(t);
-            out.push_str("\n\n");
-        }
-        para_text.clear();
-        *para_heading = 0;
-    }
-
-    // Renderuje zebrana tabele jako markdown GFM (pierwszy wiersz = naglowek).
-    fn flush_table(out: &mut String, rows: &mut Vec<Vec<String>>) {
-        if !rows.is_empty() {
-            let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-            if cols > 0 {
-                let header = &rows[0];
-                out.push('|');
-                for i in 0..cols {
-                    let c = header.get(i).map(|s| s.as_str()).unwrap_or("");
-                    out.push(' ');
-                    out.push_str(&md_table_cell_escape(c));
-                    out.push_str(" |");
-                }
-                out.push('\n');
-                out.push('|');
-                for _ in 0..cols {
-                    out.push_str(" --- |");
-                }
-                out.push('\n');
-                for row in &rows[1..] {
-                    out.push('|');
-                    for i in 0..cols {
-                        let c = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                        out.push(' ');
-                        out.push_str(&md_table_cell_escape(c));
-                        out.push_str(" |");
-                    }
-                    out.push('\n');
-                }
-                out.push('\n');
-            }
-        }
-        rows.clear();
-    }
-
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Err(e) => return Err(format!("Blad parsowania document.xml: {e}")),
-            Ok(Event::Eof) => break,
-            Ok(Event::Start(e)) => {
-                let ln = local_name(e.name().as_ref()).to_vec();
-                match ln.as_slice() {
-                    b"tbl" => {
-                        flush_para(&mut out, &mut para_text, &mut para_heading);
-                        in_table = true;
-                        table_rows.clear();
-                    }
-                    b"tr" if in_table => {
-                        cur_row.clear();
-                    }
-                    b"tc" if in_table => {
-                        in_cell = true;
-                        cur_cell.clear();
-                    }
-                    b"t" => in_text = true,
-                    b"pStyle" => {
-                        // <w:pStyle w:val="Heading1"> -> poziom naglowka.
-                        for attr in e.attributes().flatten() {
-                            if local_name(attr.key.as_ref()) == b"val" {
-                                if let Ok(val) = attr.unescape_value() {
-                                    if let Some(rest) = val
-                                        .strip_prefix("Heading")
-                                        .or_else(|| val.strip_prefix("heading"))
-                                    {
-                                        if let Ok(n) = rest.trim().parse::<u8>() {
-                                            para_heading = n.clamp(1, 6);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let ln = local_name(e.name().as_ref()).to_vec();
-                match ln.as_slice() {
-                    // Self-closing pStyle (czeste): <w:pStyle w:val="..."/>.
-                    b"pStyle" => {
-                        for attr in e.attributes().flatten() {
-                            if local_name(attr.key.as_ref()) == b"val" {
-                                if let Ok(val) = attr.unescape_value() {
-                                    if let Some(rest) = val
-                                        .strip_prefix("Heading")
-                                        .or_else(|| val.strip_prefix("heading"))
-                                    {
-                                        if let Ok(n) = rest.trim().parse::<u8>() {
-                                            para_heading = n.clamp(1, 6);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // <w:br/> wewnatrz runu -> spacja (nie lamiemy akapitu).
-                    b"br" | b"tab" => {
-                        if in_cell {
-                            cur_cell.push(' ');
-                        } else {
-                            para_text.push(' ');
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(t)) if in_text => {
-                let s = t
-                    .unescape()
-                    .map(|c| c.into_owned())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
-                if in_cell {
-                    cur_cell.push_str(&s);
-                } else {
-                    para_text.push_str(&s);
-                }
-            }
-            Ok(Event::End(e)) => {
-                let ln = local_name(e.name().as_ref()).to_vec();
-                match ln.as_slice() {
-                    b"t" => in_text = false,
-                    b"tc" if in_table => {
-                        in_cell = false;
-                        cur_row.push(cur_cell.trim().to_string());
-                        cur_cell.clear();
-                    }
-                    b"tr" if in_table => {
-                        if !cur_row.is_empty() {
-                            table_rows.push(std::mem::take(&mut cur_row));
-                        }
-                    }
-                    b"tbl" => {
-                        in_table = false;
-                        flush_table(&mut out, &mut table_rows);
-                    }
-                    b"p" if !in_table => {
-                        flush_para(&mut out, &mut para_text, &mut para_heading);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
-    // Domknij ewentualny ostatni akapit poza tabela.
-    flush_para(&mut out, &mut para_text, &mut para_heading);
-
-    if out.trim().is_empty() {
-        return Err("Dokument docx nie zawiera tekstu".to_string());
-    }
-    Ok(out)
 }
 
 /// Generuje unikalny id z prefiksem (czas + licznik monotoniczny).
@@ -7509,91 +6956,6 @@ mod tests {
         let (a2, c2) = parse_flow_response(r#"{"content":"B"}"#);
         assert_eq!(a2, "B");
         assert!(c2.is_empty());
-    }
-
-    #[test]
-    fn classify_mime_text_paths() {
-        for m in ["text/plain", "text/markdown", "text/html", "application/json"] {
-            assert_eq!(classify_mime(m), Some(SourceKind::Text), "{m}");
-        }
-        // Parametry MIME ignorowane.
-        assert_eq!(classify_mime("text/plain; charset=utf-8"), Some(SourceKind::Text));
-        assert_eq!(classify_mime("TEXT/PLAIN"), Some(SourceKind::Text));
-    }
-
-    #[test]
-    fn classify_mime_parse_paths() {
-        for m in ["image/png", "image/jpeg", "application/pdf"] {
-            assert_eq!(classify_mime(m), Some(SourceKind::Parse), "{m}");
-        }
-        // PDF odporny na parametry i wielkosc liter.
-        assert_eq!(classify_mime("application/pdf; version=1.7"), Some(SourceKind::Parse));
-        assert_eq!(classify_mime("Application/PDF"), Some(SourceKind::Parse));
-    }
-
-    #[test]
-    fn classify_mime_rejects_unsupported() {
-        for m in ["application/octet-stream", "application/zip", ""] {
-            assert_eq!(classify_mime(m), None, "{m} powinien byc nieobslugiwany");
-        }
-    }
-
-    #[test]
-    fn classify_mime_office_paths() {
-        assert_eq!(
-            classify_mime("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            Some(SourceKind::Xlsx)
-        );
-        assert_eq!(classify_mime("application/vnd.ms-excel"), Some(SourceKind::Xlsx));
-        assert_eq!(
-            classify_mime(
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            ),
-            Some(SourceKind::Docx)
-        );
-        assert_eq!(classify_mime("application/msword"), Some(SourceKind::Docx));
-    }
-
-    #[test]
-    fn hard_split_keeps_small_segment() {
-        let out = hard_split("krotkie zdanie", 100);
-        assert_eq!(out, vec!["krotkie zdanie".to_string()]);
-    }
-
-    #[test]
-    fn hard_split_breaks_oversized_segment() {
-        let big: String = "a".repeat(5000);
-        let parts = hard_split(&big, 2048);
-        assert_eq!(parts.len(), 3);
-        for p in &parts {
-            assert!(p.chars().count() <= 2048, "kawalek nie moze przekraczac chunk_size");
-        }
-        let joined: String = parts.concat();
-        assert_eq!(joined, big, "twardy split nie moze gubic znakow");
-    }
-
-    #[test]
-    fn split_into_chunks_never_exceeds_chunk_size_for_oversized_sentence() {
-        // Pojedyncze "zdanie" bez separatorow, dluzsze niz chunk_size.
-        let text: String = "x".repeat(7000);
-        let chunks = split_into_chunks(&text, 2048, 200);
-        assert!(!chunks.is_empty());
-        for c in &chunks {
-            assert!(
-                c.chars().count() <= 2048,
-                "zaden chunk nie moze przekroczyc chunk_size (byl {})",
-                c.chars().count()
-            );
-        }
-    }
-
-    #[test]
-    fn split_into_chunks_basic_paragraphs() {
-        let text = "Pierwsze zdanie. Drugie zdanie.\n\nNowy akapit tutaj.";
-        let chunks = split_into_chunks(text, 2048, 100);
-        assert_eq!(chunks.len(), 1, "krotki tekst miesci sie w jednym chunku");
-        assert!(chunks[0].contains("Pierwsze"));
-        assert!(chunks[0].contains("akapit"));
     }
 
     // --- Ekstrakcja encji/relacji (slice E3.0) ---

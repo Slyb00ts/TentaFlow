@@ -166,6 +166,15 @@ pub struct DeployJob {
     pub deploy_id: String,
     pub deployment_id: i64,
     pub service_id: i64,
+    /// In-place redeploy istniejącego serwisu (`create_redeploy_job`) vs świeży
+    /// deploy placeholdera (`create_deploy_job`). Ścieżka błędu `deploy()` musi
+    /// rozróżnić oba: dla redeployu stary runtime został już UBITY przed startem
+    /// workera, więc po nieudanym `deploy()` pola runtime'u (pid/port/endpoint)
+    /// na wierszu są STALE i muszą zostać wyzerowane (`mark_failed_clear_runtime`),
+    /// inaczej resolver routowałby ruch do martwego endpointu. Dla świeżego
+    /// deployu placeholder nigdy nie miał żywego runtime'u → generyczny
+    /// `mark_deploy_failed` (zachowanie bez zmian).
+    pub is_redeploy: bool,
 }
 
 /// Runtime descriptor produced during prepare. Owned by `PreparedDeploy` so
@@ -322,6 +331,7 @@ pub fn create_deploy_job(
         deploy_id: slug,
         deployment_id,
         service_id,
+        is_redeploy: false,
     })
 }
 
@@ -372,6 +382,7 @@ pub fn create_redeploy_job(
         deploy_id: slug,
         deployment_id,
         service_id: existing_service_id,
+        is_redeploy: true,
     })
 }
 
@@ -437,7 +448,7 @@ pub async fn deploy(
                 )
                 .map_err(|e| DeployError::Database(format!("mark_finished: {}", e)))
             })?;
-            mark_service_deploy_failed(db, job.service_id, &slug, &err.to_string(), false);
+            mark_worker_deploy_failed(db, &job, &slug, &err.to_string());
             return Err(DeployError::Manifest(err.to_string()));
         }
     }
@@ -490,7 +501,7 @@ pub async fn deploy(
                 DeploymentStatus::Failed,
                 Some(&e.to_string()),
             );
-            mark_service_deploy_failed(db, job.service_id, &slug, &e.to_string(), false);
+            mark_worker_deploy_failed(db, &job, &slug, &e.to_string());
             return Err(e);
         }
     };
@@ -503,6 +514,11 @@ pub async fn deploy(
     //    deployments.finish. Any failure triggers rollback of side effects.
     let commit_result: DeployResult<()> = with_tx(db, |tx| {
         strategy.commit(tx, job.service_id, &prepared)?;
+        // Czyścimy stare model_registry tego service_id PRZED re-insertem. Każdy
+        // deploy ponownie wskazujący na istniejący wiersz (redeploy in-place,
+        // startowy re-deploy, retry) trafiłby inaczej w UNIQUE(service_id,
+        // model_name). Świeży deploy ma nowy service_id, więc to no-op.
+        models_repo::delete_for_service_in_tx(tx, job.service_id)?;
         for m in &prepared.models {
             let mut model = m.clone();
             model.service_id = job.service_id;
@@ -532,7 +548,7 @@ pub async fn deploy(
                 DeploymentStatus::Failed,
                 Some(&rb_msg),
             );
-            mark_service_deploy_failed(db, job.service_id, &slug, &rb_msg, false);
+            mark_worker_deploy_failed(db, &job, &slug, &rb_msg);
             return Err(commit_err);
         }
     };
@@ -971,21 +987,30 @@ fn mark_finished(db: &DbPool, id: i64, status: DeploymentStatus, err: Option<&st
     });
 }
 
-fn mark_service_deploy_failed(
-    db: &DbPool,
-    service_id: i64,
-    deploy_id: &str,
-    message: &str,
-    interrupted: bool,
-) {
+/// Marks a service row `failed` after the async `deploy()` worker failed.
+///
+/// Redeploy vs świeży deploy rozchodzą się TUTAJ. Dla redeployu stary runtime
+/// został UBITY (`stop_checked`) zanim worker wystartował — gdyby `deploy()`
+/// padło, pola runtime'u (pid/port/sidecar/endpoint) na wierszu wskazują na ten
+/// martwy runtime. Bez ich wyzerowania `reconcile` dalej trzyma live handle, a
+/// resolver routuje ruch do martwego/stale endpointu. Stąd
+/// `mark_failed_clear_runtime` (failed + NULL na polach runtime'u). Dla świeżego
+/// deployu placeholder nigdy nie miał żywego runtime'u, więc generyczny
+/// `mark_deploy_failed` (zachowuje pola/active_deploy_id) jest poprawny — zero
+/// regresji.
+fn mark_worker_deploy_failed(db: &DbPool, job: &DeployJob, deploy_id: &str, message: &str) {
     if let Ok(conn) = db.write() {
-        let status = if interrupted {
-            ServiceStatus::Interrupted
+        if job.is_redeploy {
+            let _ = services_repo::mark_failed_clear_runtime(&conn, job.service_id, message);
         } else {
-            ServiceStatus::Failed
-        };
-        let _ =
-            services_repo::mark_deploy_failed(&conn, service_id, deploy_id, status, Some(message));
+            let _ = services_repo::mark_deploy_failed(
+                &conn,
+                job.service_id,
+                deploy_id,
+                ServiceStatus::Failed,
+                Some(message),
+            );
+        }
     }
 }
 

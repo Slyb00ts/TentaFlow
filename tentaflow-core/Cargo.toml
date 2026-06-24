@@ -324,6 +324,11 @@ which = "8.0.4"
 # python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
 zstd = "0.13.3"
 zip = "8.6.0"
+# Parser XML dla ekstrakcji DOCX (word/document.xml) i PPTX (ppt/slides/slideN.xml)
+# w node-adapterach flow-ingestu RAG. default-features=false wyłącza `encoding`,
+# co odsłania `unescape_value`/`config_mut` (API używane przez ekstraktor; zgodne
+# z wersją w addonie RAG).
+quick-xml = { version = "0.36", default-features = false }
 rcgen = "0.14.8"
 
 # Pobieranie modeli z HuggingFace. `tokio` = async API (model_manager, stt);

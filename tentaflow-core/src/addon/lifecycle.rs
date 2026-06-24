@@ -1891,6 +1891,17 @@ fn upgrade_core(
     // finish.
     crate::flow_runtime::registry::global().replace_addon_flows(addon_id, new_compiled_flows);
 
+    // RAG E2.0 — hot-update instancji (zmiana bundla przy tej samej wersji)
+    // odswieza tylko rejestr `flow_runtime` powyzej, ale `[[engine_flow]]` zyja
+    // jako published modele flow_engine + KV `engine_flow_model:<id>`. Bez tego
+    // wywolania nowy `[[engine_flow]]` z manifestu (np. `ingest`) nigdy nie
+    // trafia do publikacji na hot-update — tylko pelna instalacja / mesh
+    // reconcile go materializuja (materialize_addon_derived_state). Funkcja jest
+    // idempotentna (usuwa stary published flow + binding i tworzy od nowa wraz z
+    // synchronicznym flushem KV), wiec re-rejestracja query/retrieval-round jest
+    // bezpieczna. Manifest i katalog jak reszta upgrade'u: `new_manifest`/`new_dir`.
+    register_engine_flows(db, &new_manifest, new_dir)?;
+
     info!(
         "Addon '{}' zaktualizowany do v{}",
         addon_id, new_manifest.version
@@ -3170,6 +3181,14 @@ pub(crate) fn engine_flow_published_name(addon_id: &str, engine_flow_id: &str) -
 /// własnego `addon_id` — odbiera gotową nazwę modelu do wyzwolenia flow.
 const ENGINE_FLOW_STATE_KEY: &str = "engine_flow_model";
 
+/// Prefiks klucza KV (durable), pod którym instancja zapisuje published-name
+/// KAŻDEGO swojego engine-flow indywidualnie (`engine_flow_model:<id>`). Pierwszy
+/// flow ma dodatkowo skrót `engine_flow_model` (legacy, query). Addon wołający
+/// konkretny flow (np. `ingest`) odczytuje jego nazwę przez `engine_flow_model:ingest`,
+/// bo `flow_model_bindings` matchuje po dokładnym `{addon_id}:{id}`, a nie po
+/// literalnym aliasie modelu.
+const ENGINE_FLOW_STATE_KEY_PREFIX: &str = "engine_flow_model:";
+
 /// Rejestruje wszystkie `[[engine_flow]]` instancji jako published modele
 /// flow_engine. Dla każdego flow: wczytuje JSON z katalogu addona, WALIDUJE go
 /// przez rejestr adapterów (R1–R10), wstawia/aktualizuje wiersz `flows` z
@@ -3253,6 +3272,21 @@ fn register_engine_flows(
             &published_name,
             100,
         )?;
+
+        // Per-flow published-name do durable KV (`engine_flow_model:<id>`), żeby
+        // addon mógł wyzwolić KONKRETNY engine-flow (np. ingest) bez znajomości
+        // własnego addon_id i bez zgadywania, który flow jest „pierwszy".
+        let per_id_key = format!("{ENGINE_FLOW_STATE_KEY_PREFIX}{}", spec.id);
+        if let Err(e) = crate::addon::state_store::AddonStateStore::global().set(
+            addon_id,
+            &per_id_key,
+            published_name.clone().into_bytes(),
+            crate::addon::state_store::Tier::Durable,
+        ) {
+            tracing::warn!(
+                "engine_flow: nie udało się zapisać '{per_id_key}' do KV instancji '{addon_id}': {e}"
+            );
+        }
 
         tracing::info!(
             "engine_flow '{}' instancji '{}' zarejestrowany jako model '{}' (flow_id={})",

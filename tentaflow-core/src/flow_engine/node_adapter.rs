@@ -16,9 +16,9 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::dispatchers::{
-    AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, PiiRulesStore, ProgressSink, PromptStore, RerankDispatcher, SttDispatcher,
-    TtsCleaningStore, TtsDispatcher, VisionDispatcher,
+    AuditSink, Clock, ConversationHistoryStore, DocumentsDispatcher, EmbeddingsDispatcher,
+    LlmDispatcher, MemoryStore, MetricsSink, PiiRulesStore, ProgressSink, PromptStore,
+    RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
@@ -163,6 +163,9 @@ pub struct ExecutionContext {
     /// RAG C2 — cross-encoder reranker (/v1/rerank, alias `rag-reranker`).
     /// Krok retrievalu między vector-search a LLM.
     pub reranker: Arc<dyn RerankDispatcher>,
+    /// PARTIA 0 (flow-ingest RAG) — typed surface `Documents` (`/v1/infer`).
+    /// Detektory struktury strony dla node-adapterów page_detect/table/ocr (PARTIA 2).
+    pub documents: Arc<dyn DocumentsDispatcher>,
     pub stt: Arc<dyn SttDispatcher>,
     pub tts: Arc<dyn TtsDispatcher>,
     pub vision: Arc<dyn VisionDispatcher>,
@@ -630,6 +633,25 @@ pub mod test_support {
         }
     }
 
+    /// Stub typed-surface Documents: zwraca pusty `regions` — inne węzły z
+    /// `stub_ctx` mają działać (nie panickuje). Realna detekcja idzie przez
+    /// `DocumentsDispatcherImpl` wpięty w Router::new.
+    pub struct StubDocuments;
+    #[async_trait]
+    impl DocumentsDispatcher for StubDocuments {
+        async fn infer(
+            &self,
+            _model: &str,
+            _image: &[u8],
+            _mime: &str,
+            _task: &str,
+        ) -> std::result::Result<tentaflow_protocol::DocumentInferResult, String> {
+            Ok(tentaflow_protocol::DocumentInferResult {
+                regions: Vec::new(),
+            })
+        }
+    }
+
     pub struct StubStt;
     #[async_trait]
     impl SttDispatcher for StubStt {
@@ -779,6 +801,7 @@ pub mod test_support {
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),
+            documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
             vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),

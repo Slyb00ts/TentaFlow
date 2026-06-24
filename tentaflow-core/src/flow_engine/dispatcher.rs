@@ -21,15 +21,16 @@ use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
 use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
-    AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
-    RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
+    AuditSink, Clock, ConversationHistoryStore, DocumentsDispatcher, EmbeddingsDispatcher,
+    LlmDispatcher, MemoryStore, MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore,
+    ProgressSink, PromptStore, RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher,
+    VisionDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
-    AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
-    MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, RerankDispatcherImpl,
-    ServiceManagerQuicFinder, SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
-    VisionDispatcherImpl,
+    AuditSinkImpl, ConversationHistoryImpl, DocumentsDispatcherImpl, EmbeddingsDispatcherImpl,
+    LlmDispatcherImpl, MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl,
+    RerankDispatcherImpl, ServiceManagerQuicFinder, SttDispatcherImpl, TtsCleaningStoreImpl,
+    TtsDispatcherImpl, VisionDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -38,18 +39,26 @@ use crate::flow_engine::executor::{execute_blocking, execute_streaming, Streamin
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
-    AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter,
+    AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
-    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
-    OutputNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
+    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentRouterNodeAdapter,
+    EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter,
+    GraphicElementsNodeAdapter, IntervalNodeAdapter,
+    LlmNodeAdapter,
+    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
+    OnSubagentCompleteNodeAdapter,
+    OutputNodeAdapter, PageDetectNodeAdapter, PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter,
+    PersistTurnNodeAdapter,
+    PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
     RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
-    SpeakerContextNodeAdapter,
-    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
+    SpeakerContextNodeAdapter, StoreNodeAdapter,
+    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
+    TextExtractNodeAdapter,
+    ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
-    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter,
+    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, VisionParseNodeAdapter,
+    VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -214,6 +223,7 @@ struct ContextFactory {
     llm: Arc<dyn LlmDispatcher>,
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     reranker: Arc<dyn RerankDispatcher>,
+    documents: Arc<dyn DocumentsDispatcher>,
     stt: Arc<dyn SttDispatcher>,
     tts: Arc<dyn TtsDispatcher>,
     vision: Arc<dyn VisionDispatcher>,
@@ -252,6 +262,7 @@ impl ContextFactory {
             llm: self.llm.clone(),
             embeddings: self.embeddings.clone(),
             reranker: self.reranker.clone(),
+            documents: self.documents.clone(),
             stt: self.stt.clone(),
             tts: self.tts.clone(),
             vision: self.vision.clone(),
@@ -325,6 +336,8 @@ impl FlowDispatcher {
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let reranker: Arc<dyn RerankDispatcher> =
             Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
+        let documents: Arc<dyn DocumentsDispatcher> =
+            Arc::new(DocumentsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
@@ -351,6 +364,7 @@ impl FlowDispatcher {
             llm,
             embeddings,
             reranker,
+            documents,
             stt,
             tts,
             vision,
@@ -483,6 +497,23 @@ impl FlowDispatcher {
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let modality = derive_modality(&initial);
+        self.try_dispatch_with_modality(model_name, service_type, modality, initial, meta)
+            .await
+    }
+
+    /// Wariant `try_dispatch` z JAWNĄ modality zamiast wyprowadzanej z payloadu.
+    /// RAG ingest seeduje binarny payload, który może być `Image` ALBO `Other`
+    /// (PDF/xlsx/docx) — `derive_modality` rozszczepiłoby to na dwa różne flow
+    /// (`:image` vs `:text`). Ingest chce JEDNEGO flow `<model>:ingest:document`
+    /// niezależnie od typu pliku, więc resolwuje po stałej modality `"document"`.
+    pub async fn try_dispatch_with_modality(
+        &self,
+        model_name: &str,
+        service_type: &str,
+        modality: &'static str,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         match self
             .resolve_cached(&cache_key, model_name, service_type, modality)
@@ -1080,6 +1111,35 @@ fn build_registry(
         Arc::new(RagGraphFactsNodeAdapter::new()),
         // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
         Arc::new(VectorNodeAdapter::new()),
+        // PARTIA 1 (flow-ingest RAG) — czysto-rustowe węzły ingestu bez modeli:
+        // klasyfikacja+routing pliku, rasteryzacja PDF, ekstrakcja office,
+        // chunking, scalanie stron i zapis chunków do przestrzeni wektorowej.
+        Arc::new(DocumentRouterNodeAdapter::new()),
+        Arc::new(TextExtractNodeAdapter::new()),
+        Arc::new(PdfRasterizeNodeAdapter::new()),
+        Arc::new(ExcelExtractNodeAdapter::new()),
+        Arc::new(WordExtractNodeAdapter::new()),
+        Arc::new(PptxExtractNodeAdapter::new()),
+        Arc::new(ChunkNodeAdapter::new()),
+        Arc::new(DocumentMergeNodeAdapter::new()),
+        // Mostek chunk→store: wektoryzuje listę chunków i dokłada `embedding` do
+        // każdego, dając kształt wprost konsumowalny przez `store`.
+        Arc::new(EmbedChunksNodeAdapter::new()),
+        // PARTIA 2 (flow-ingest RAG) — węzły zależne od modeli: parsowanie strony
+        // na markdown przez VLM (vision-chat) oraz detektory struktury dokumentu
+        // (layout / tabele / grafika / OCR) przez typed surface Documents.
+        Arc::new(VisionParseNodeAdapter::new()),
+        Arc::new(PageDetectNodeAdapter::new()),
+        Arc::new(TableStructureNodeAdapter::new()),
+        Arc::new(GraphicElementsNodeAdapter::new()),
+        Arc::new(OcrNodeAdapter::new()),
+        // Batch-owe warianty gałęzi PDF (cardinality 1:1): cała lista stron
+        // (Json{pages:[blob_refs]}) jako JEDEN envelope → wzbogacona lista stron
+        // konsumowalna przez `document_merge`. Reużywają ścieżki single-image.
+        Arc::new(VisionParsePagesNodeAdapter::new()),
+        Arc::new(PageDetectPagesNodeAdapter::new()),
+        Arc::new(OcrPagesNodeAdapter::new()),
+        Arc::new(StoreNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
         Arc::new(PersistTurnNodeAdapter::new()),
@@ -1180,8 +1240,8 @@ mod tests {
         use crate::flow_engine::dispatchers::clock::SystemClock;
         use crate::flow_engine::dispatchers::metrics::NoopMetrics;
         use crate::flow_engine::node_adapter::test_support::{
-            stub_vectors, StubAudit, StubEmbeddings, StubHistory, StubLlm, StubMemory,
-            StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
+            stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm,
+            StubMemory, StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
         };
         ContextFactory {
             clock: Arc::new(SystemClock),
@@ -1192,6 +1252,7 @@ mod tests {
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),
+            documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
             vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
