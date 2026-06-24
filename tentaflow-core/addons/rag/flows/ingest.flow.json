@@ -1,0 +1,213 @@
+{
+  "id": "ingest",
+  "name": "RAG — ingest dokumentu",
+  "description": "Flow-ingest JEDNEGO dokumentu (Partia 3). trigger seeduje binarny payload: Image dla image/* (gałąź vision_parse), Other dla reszty (gałąź document_router, który klasyfikuje mime+magic-bytes i aktywuje DOKŁADNIE jeden port: pdf/xlsx/docx/pptx/text/unknown). PDF -> rasteryzacja stron -> vision_parse_pages -> document_merge. xlsx/docx/pptx -> office-ekstraktory. Wszystkie gałęzie rekonwergują w combine (fan-in, R4-exempt), który skleja tekst -> chunk -> embed_chunks -> store. store jest węzłem terminalnym: jego Json{markdown,chunks,page_count} staje się final_envelope, który flow_outcome_to_ingest_response mapuje na IngestResponse. Brak węzła output: store.full ma typ Json, a output nie ma portu Json (R8 odrzuciłby krawędź) i nie jest tu potrzebny (żadnego emit_citations).",
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "trigger",
+      "config": {},
+      "position": { "x": 0, "y": 0 }
+    },
+    {
+      "id": "router",
+      "type": "document_router",
+      "config": {},
+      "position": { "x": 220, "y": 120 }
+    },
+    {
+      "id": "vision_image",
+      "type": "vision_parse",
+      "config": { "model": "rag-parse" },
+      "position": { "x": 220, "y": -120 }
+    },
+    {
+      "id": "pdf_pages",
+      "type": "pdf_rasterize",
+      "config": {},
+      "position": { "x": 440, "y": -40 }
+    },
+    {
+      "id": "vision_pages",
+      "type": "vision_parse_pages",
+      "config": { "model": "rag-parse" },
+      "position": { "x": 660, "y": -40 }
+    },
+    {
+      "id": "pdf_merge",
+      "type": "document_merge",
+      "config": {},
+      "position": { "x": 880, "y": -40 }
+    },
+    {
+      "id": "xlsx",
+      "type": "excel_extract",
+      "config": {},
+      "position": { "x": 440, "y": 60 }
+    },
+    {
+      "id": "docx",
+      "type": "word_extract",
+      "config": {},
+      "position": { "x": 440, "y": 160 }
+    },
+    {
+      "id": "pptx",
+      "type": "pptx_extract",
+      "config": {},
+      "position": { "x": 440, "y": 260 }
+    },
+    {
+      "id": "combine",
+      "type": "combine",
+      "config": {},
+      "position": { "x": 1100, "y": 60 }
+    },
+    {
+      "id": "chunk",
+      "type": "chunk",
+      "config": {},
+      "position": { "x": 1320, "y": 60 }
+    },
+    {
+      "id": "embed",
+      "type": "embed_chunks",
+      "config": { "model": "rag-embeddings" },
+      "position": { "x": 1540, "y": 60 }
+    },
+    {
+      "id": "store",
+      "type": "store",
+      "config": { "namespace": "passages" },
+      "position": { "x": 1760, "y": 60 }
+    }
+  ],
+  "edges": [
+    {
+      "from_node": "trigger",
+      "to_node": "vision_image",
+      "from_port": "image",
+      "to_port": "in",
+      "data_type": "image"
+    },
+    {
+      "from_node": "trigger",
+      "to_node": "router",
+      "from_port": "other",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "router",
+      "to_node": "pdf_pages",
+      "from_port": "pdf",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "pdf_pages",
+      "to_node": "vision_pages",
+      "from_port": "images",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "vision_pages",
+      "to_node": "pdf_merge",
+      "from_port": "pages",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "router",
+      "to_node": "xlsx",
+      "from_port": "xlsx",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "router",
+      "to_node": "docx",
+      "from_port": "docx",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "router",
+      "to_node": "pptx",
+      "from_port": "pptx",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "vision_image",
+      "to_node": "combine",
+      "from_port": "markdown",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "pdf_merge",
+      "to_node": "combine",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "xlsx",
+      "to_node": "combine",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "docx",
+      "to_node": "combine",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "pptx",
+      "to_node": "combine",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "router",
+      "to_node": "combine",
+      "from_port": "text",
+      "to_port": "in",
+      "data_type": "other"
+    },
+    {
+      "from_node": "router",
+      "to_node": "combine",
+      "from_port": "unknown",
+      "to_port": "in",
+      "data_type": "any"
+    },
+    {
+      "from_node": "combine",
+      "to_node": "chunk",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "chunk",
+      "to_node": "embed",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "embed",
+      "to_node": "store",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    }
+  ]
+}

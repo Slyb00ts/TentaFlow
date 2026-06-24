@@ -41,10 +41,25 @@ pub struct IngestInvokeInput {
 // Output payload
 // -----------------------------------------------------------------------------
 
+/// A single persisted chunk echoed back to the addon: its stable `index` (the
+/// position the store node wrote it under) and `text`. The addon needs the raw
+/// chunk texts to run knowledge-graph extraction AFTER the ingest flow — the
+/// flow's store node is the only stage that sees the final chunk set, so it is
+/// the source of truth for what was actually persisted.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct IngestChunk {
+    #[n(0)]
+    pub index: u32,
+    #[n(1)]
+    pub text: String,
+}
+
 /// Output of `ingest_invoke_v1`. `markdown` is the document reconstruction the
 /// ingest flow produced (parse → markdown); `chunks` is the number of chunks
 /// the flow's store node persisted to the vector index. `page_count` mirrors
-/// the parser's page tally (1 for a single image).
+/// the parser's page tally (1 for a single image). `chunk_texts` carries the
+/// per-chunk text so the addon can run graph extraction without re-parsing.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct IngestInvokeOutput {
@@ -54,6 +69,8 @@ pub struct IngestInvokeOutput {
     pub chunks: u32,
     #[n(2)]
     pub page_count: u32,
+    #[n(3)]
+    pub chunk_texts: Vec<IngestChunk>,
 }
 
 #[cfg(test)]
@@ -92,6 +109,10 @@ mod tests {
             markdown: "# Faktura\n\nKwota: 100".into(),
             chunks: 7,
             page_count: 3,
+            chunk_texts: vec![
+                IngestChunk { index: 0, text: "# Faktura".into() },
+                IngestChunk { index: 1, text: "Kwota: 100".into() },
+            ],
         });
     }
 }

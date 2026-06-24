@@ -132,6 +132,36 @@ methods = ["parse"]
 suggested_default = "nemotron-parse-v1-2"
 visibility = "private"
 
+# Detektory struktury strony (PARTIA 0 typed-surface Documents) — pod przyszle
+# nody page_detect_pages / table_structure / ocr_pages w flow-ingescie. Wzor rag-parse.
+[[alias]]
+id = "rag-page-elements"
+display_name = "RAG — elementy strony"
+methods = ["documents"]
+suggested_default = "nemotron-page-elements"
+visibility = "private"
+
+[[alias]]
+id = "rag-table-structure"
+display_name = "RAG — struktura tabel"
+methods = ["documents"]
+suggested_default = "nemotron-table-structure"
+visibility = "private"
+
+[[alias]]
+id = "rag-graphic-elements"
+display_name = "RAG — elementy graficzne"
+methods = ["documents"]
+suggested_default = "nemotron-graphic-elements"
+visibility = "private"
+
+[[alias]]
+id = "rag-ocr"
+display_name = "RAG — OCR"
+methods = ["documents"]
+suggested_default = "nemotron-ocr"
+visibility = "private"
+
 # --- Aliasy konsumowane przez addon ---
 # rag-llm i rag-reranker sa dla query slice (Etap 1) — swiadomie required=false.
 
@@ -154,6 +184,27 @@ reason = "Re-ranking kandydatow w retrievalu (Etap 1)."
 id = "rag-parse"
 required = true
 reason = "Parsowanie obrazow stron PDF/skanow na markdown (ingest image/PDF go wymaga)."
+
+# Detektory struktury — required=false (pod przyszle nody flow-ingestu page/table/ocr).
+[[uses_alias]]
+id = "rag-page-elements"
+required = false
+reason = "Detekcja elementow strony w flow-ingescie (page_detect_pages)."
+
+[[uses_alias]]
+id = "rag-table-structure"
+required = false
+reason = "Detekcja struktury tabel w flow-ingescie (table_structure)."
+
+[[uses_alias]]
+id = "rag-graphic-elements"
+required = false
+reason = "Detekcja elementow graficznych w flow-ingescie."
+
+[[uses_alias]]
+id = "rag-ocr"
+required = false
+reason = "OCR stron w flow-ingescie (ocr_pages)."
 
 # --- Przestrzen wektorowa chunkow ---
 
@@ -242,6 +293,17 @@ id = "retrieval-round"
 path = "flows/retrieval_round.flow.json"
 service_type = "chat"
 description = "Cialo jednego hopu petli multi-hop: embed -> vector -> rerank -> akumulacja -> sedzia."
+
+# ingest — flow-ingest JEDNEGO dokumentu. Published-name `{addon_id}:ingest`,
+# wiazanie flow_model_bindings matchuje DOKLADNIE te nazwe. Addon czyta ja z KV
+# (`engine_flow_model:ingest`) i podaje jako `model` do `ingest_invoke`, ktory
+# dispatchuje po (model, service_type="ingest", modality="document"). service_type
+# musi byc "ingest" — execute_ingest resolwuje dokladnie pod tym typem.
+[[engine_flow]]
+id = "ingest"
+path = "flows/ingest.flow.json"
+service_type = "ingest"
+description = "Flow-ingest dokumentu: router -> parse/extract -> combine -> chunk -> embed -> store."
 
 # --- Kolekcja grafowa: aktywny widok MemGraphRAG, materializowany z outboxu ---
 # 'kg_active' zawiera TYLKO aktywne fakty (w D1 = wszystkie); pelny ledger faktow

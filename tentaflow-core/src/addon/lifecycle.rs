@@ -3170,6 +3170,14 @@ pub(crate) fn engine_flow_published_name(addon_id: &str, engine_flow_id: &str) -
 /// własnego `addon_id` — odbiera gotową nazwę modelu do wyzwolenia flow.
 const ENGINE_FLOW_STATE_KEY: &str = "engine_flow_model";
 
+/// Prefiks klucza KV (durable), pod którym instancja zapisuje published-name
+/// KAŻDEGO swojego engine-flow indywidualnie (`engine_flow_model:<id>`). Pierwszy
+/// flow ma dodatkowo skrót `engine_flow_model` (legacy, query). Addon wołający
+/// konkretny flow (np. `ingest`) odczytuje jego nazwę przez `engine_flow_model:ingest`,
+/// bo `flow_model_bindings` matchuje po dokładnym `{addon_id}:{id}`, a nie po
+/// literalnym aliasie modelu.
+const ENGINE_FLOW_STATE_KEY_PREFIX: &str = "engine_flow_model:";
+
 /// Rejestruje wszystkie `[[engine_flow]]` instancji jako published modele
 /// flow_engine. Dla każdego flow: wczytuje JSON z katalogu addona, WALIDUJE go
 /// przez rejestr adapterów (R1–R10), wstawia/aktualizuje wiersz `flows` z
@@ -3253,6 +3261,21 @@ fn register_engine_flows(
             &published_name,
             100,
         )?;
+
+        // Per-flow published-name do durable KV (`engine_flow_model:<id>`), żeby
+        // addon mógł wyzwolić KONKRETNY engine-flow (np. ingest) bez znajomości
+        // własnego addon_id i bez zgadywania, który flow jest „pierwszy".
+        let per_id_key = format!("{ENGINE_FLOW_STATE_KEY_PREFIX}{}", spec.id);
+        if let Err(e) = crate::addon::state_store::AddonStateStore::global().set(
+            addon_id,
+            &per_id_key,
+            published_name.clone().into_bytes(),
+            crate::addon::state_store::Tier::Durable,
+        ) {
+            tracing::warn!(
+                "engine_flow: nie udało się zapisać '{per_id_key}' do KV instancji '{addon_id}': {e}"
+            );
+        }
 
         tracing::info!(
             "engine_flow '{}' instancji '{}' zarejestrowany jako model '{}' (flow_id={})",

@@ -183,6 +183,11 @@ pub fn ingest_invoke_v1(
         markdown: response.markdown,
         chunks: response.chunks,
         page_count: response.page_count,
+        chunk_texts: response
+            .chunk_texts
+            .into_iter()
+            .map(|(index, text)| tentaflow_sdk_spec::IngestChunk { index, text })
+            .collect(),
     };
 
     // Audyt "ok" DOPIERO po udanym zapisie wyniku do pamięci WASM.
