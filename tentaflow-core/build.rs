@@ -1595,6 +1595,23 @@ fn hash_should_skip(name: &str) -> bool {
 /// Computes a deterministic sha256 of all files under `root`. The relative
 /// path (with `/` separators) is mixed into the hash, so renames and moves
 /// change the digest. Returns an empty string when `root` does not exist.
+/// Emituje `cargo:rerun-if-changed` dla KAŻDEGO pliku w drzewie `root`.
+/// `rerun-if-changed=<katalog>` śledzi tylko mtime katalogu (add/remove), więc
+/// edycja treści istniejącego pliku (np. lib.rs codec wasm) nie triggeruje
+/// rerun build.rs → wygenerowany `wasm_glue.wasm` zostaje stary. Per-plik to
+/// naprawia.
+fn rerun_if_changed_recursive(root: &Path) {
+    use walkdir::WalkDir;
+    if !root.exists() {
+        return;
+    }
+    for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
+}
+
 fn compute_source_hash(root: &Path) -> String {
     use sha2::{Digest, Sha256};
     use walkdir::WalkDir;
@@ -1620,6 +1637,12 @@ fn compute_source_hash(root: &Path) -> String {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
+        // rerun-if-changed PER PLIK: `rerun-if-changed=<katalog>` (emitowane przez
+        // wołającego) śledzi tylko mtime KATALOGU — zmienia się przy add/remove,
+        // NIE przy edycji treści zagnieżdżonego pliku. Bez tego edycja entrypoint.sh
+        // / server.py nie triggeruje rerun build.rs → `*_source_hash` zostaje stary
+        // → dashboard NIE pokazuje "Aktualizuj". Śledzimy każdy plik z osobna.
+        println!("cargo:rerun-if-changed={}", entry.path().display());
         files.push((rel, entry.path().to_path_buf()));
     }
 
@@ -1639,6 +1662,21 @@ fn compute_source_hash(root: &Path) -> String {
                 );
             }
         }
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Łączy hashe źródeł z wielu katalogów w jeden (deterministycznie, w kolejności
+/// podania). Każdy `compute_source_hash` emituje też rerun-if-changed per plik,
+/// więc edycja treści w DOWOLNYM z katalogów triggeruje rerun build.rs. Używane
+/// dla docker_source_hash obejmującego context (Dockerfile/entrypoint) + python
+/// bundle (server.py), które obraz dockera materializuje razem.
+fn compute_source_hash_multi(roots: &[PathBuf]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for root in roots {
+        hasher.update(compute_source_hash(root).as_bytes());
         hasher.update([0u8]);
     }
     hex::encode(hasher.finalize())
@@ -1746,8 +1784,20 @@ fn generate_services_manifest(out_dir: &Path) {
         if let Some(docker) = manifest.deploy.docker.as_ref() {
             if let Some(ctx) = docker.context_path.as_deref() {
                 let ctx_path = containers_dir.join(ctx);
-                println!("cargo:rerun-if-changed={}", ctx_path.display());
-                manifest.docker_source_hash = compute_source_hash(&ctx_path);
+                // docker_source_hash MUSI obejmować WSZYSTKIE źródła, które obraz
+                // dockera materializuje — context_path (Dockerfile, entrypoint.sh)
+                // ORAZ python-bundle (server.py + helpery), bo Dockerfile COPY'uje
+                // go z `deploy.native.bundle_path`. Bez bundla zmiana server.py
+                // była niewykrywalna → dashboard nie pokazywał "Aktualizuj".
+                let mut roots = vec![ctx_path];
+                if let Some(native) = manifest.deploy.native.as_ref() {
+                    if let Some(rel) =
+                        native.binary_path.as_deref().or(native.bundle_path.as_deref())
+                    {
+                        roots.push(containers_dir.join(rel));
+                    }
+                }
+                manifest.docker_source_hash = compute_source_hash_multi(&roots);
             }
         }
         if let Some(native) = manifest.deploy.native.as_ref() {
@@ -1894,10 +1944,12 @@ fn build_protocol_wasm_bindings() {
         return;
     }
 
-    // Rerun-if-changed hooks na zrodlach
-    println!("cargo:rerun-if-changed={}/src", crate_dir.display());
+    // Rerun-if-changed hooks na zrodlach — PER PLIK (rerun na katalogu nie
+    // wykrywa edycji treści istniejacych plikow, wiec wasm_glue.wasm zostawalby
+    // stary po zmianie codeca).
+    rerun_if_changed_recursive(&crate_dir.join("src"));
     println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
-    println!("cargo:rerun-if-changed={}/src", protocol_dir.display());
+    rerun_if_changed_recursive(&protocol_dir.join("src"));
     println!(
         "cargo:rerun-if-changed={}/Cargo.toml",
         protocol_dir.display()

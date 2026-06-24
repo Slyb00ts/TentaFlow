@@ -71,9 +71,20 @@ def _ensure_model() -> None:
         if _state["model"] is not None:
             return
         _require_cuda()
-        model = AutoModel.from_pretrained(
-            MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
-        ).to("cuda").eval()
+        # UWAGA: model NemotronParse (custom trust_remote_code) NIE wspiera
+        # `attn_implementation`, a `torch.compile(reduce-overhead)` (CUDA graphs)
+        # NIE jest thread-safe — współbieżne generate() w jednym workerze (wątki
+        # FastAPI) dzielą stan grafu → race → PUSTE/uszkodzone wyjście. Oba
+        # próbowane i ODRZUCONE: bez zysku (direct call 15.7s tak czy tak), a
+        # compile psuł concurrency. Skalowanie idzie przez WIELE WORKERÓW
+        # (entrypoint.sh `--workers`) = osobne procesy = brak współdzielenia stanu.
+        model = (
+            AutoModel.from_pretrained(
+                MODEL_ID, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+            .to("cuda")
+            .eval()
+        )
         _state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_ID)
         _state["processor"] = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
         _state["gen"] = GenerationConfig.from_pretrained(MODEL_ID, trust_remote_code=True)

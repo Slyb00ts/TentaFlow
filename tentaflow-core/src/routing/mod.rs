@@ -370,6 +370,56 @@ pub(crate) fn openai_messages_to_protocol(
         .collect()
 }
 
+/// Czy którakolwiek wiadomość niesie obraz (request vision/multimodal). Decyduje
+/// czy MeshForward ma iść jako `ModelPayload::Vision` (niesie obrazy) zamiast
+/// `Completion` (tekst-only) — bez tego obraz gubi się na hopie mesh.
+pub(crate) fn messages_have_image(messages: &[crate::api::openai::types::Message]) -> bool {
+    messages.iter().any(|m| {
+        matches!(
+            &m.content,
+            Some(MessageContent::Parts(parts))
+                if parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+        )
+    })
+}
+
+/// Konwertuje OpenAI messages na protocol `VisionMessage` (tekst + obrazy
+/// ZACHOWANE). Lustro `openai_messages_to_protocol`, ale dla ścieżki vision —
+/// CompletionPayload niesie tylko tekst, więc multimodal idzie przez VisionPayload.
+pub(crate) fn openai_messages_to_vision(
+    messages: &[crate::api::openai::types::Message],
+) -> Vec<tentaflow_protocol::VisionMessage> {
+    messages
+        .iter()
+        .map(|m| {
+            let content: Vec<tentaflow_protocol::VisionContentPart> = match &m.content {
+                Some(MessageContent::Text(text)) => {
+                    vec![tentaflow_protocol::VisionContentPart::Text { text: text.clone() }]
+                }
+                Some(MessageContent::Parts(parts)) => parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text { text } => {
+                            tentaflow_protocol::VisionContentPart::Text { text: text.clone() }
+                        }
+                        ContentPart::ImageUrl { image_url } => {
+                            tentaflow_protocol::VisionContentPart::ImageUrl {
+                                url: image_url.url.clone(),
+                                detail: image_url.detail.clone(),
+                            }
+                        }
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            tentaflow_protocol::VisionMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect()
+}
+
 /// Wyciaga tekst z pierwszego choice w ChatCompletionResponse.
 pub(crate) fn extract_response_text(response: &ChatCompletionResponse) -> String {
     response
