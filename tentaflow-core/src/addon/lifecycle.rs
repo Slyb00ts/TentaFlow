@@ -1891,6 +1891,17 @@ fn upgrade_core(
     // finish.
     crate::flow_runtime::registry::global().replace_addon_flows(addon_id, new_compiled_flows);
 
+    // RAG E2.0 — hot-update instancji (zmiana bundla przy tej samej wersji)
+    // odswieza tylko rejestr `flow_runtime` powyzej, ale `[[engine_flow]]` zyja
+    // jako published modele flow_engine + KV `engine_flow_model:<id>`. Bez tego
+    // wywolania nowy `[[engine_flow]]` z manifestu (np. `ingest`) nigdy nie
+    // trafia do publikacji na hot-update — tylko pelna instalacja / mesh
+    // reconcile go materializuja (materialize_addon_derived_state). Funkcja jest
+    // idempotentna (usuwa stary published flow + binding i tworzy od nowa wraz z
+    // synchronicznym flushem KV), wiec re-rejestracja query/retrieval-round jest
+    // bezpieczna. Manifest i katalog jak reszta upgrade'u: `new_manifest`/`new_dir`.
+    register_engine_flows(db, &new_manifest, new_dir)?;
+
     info!(
         "Addon '{}' zaktualizowany do v{}",
         addon_id, new_manifest.version
