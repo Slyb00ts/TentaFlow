@@ -1255,6 +1255,7 @@ async fn resume_interrupted_deployments(
             deploy_id,
             deployment_id: row.id,
             service_id,
+            is_redeploy: false,
         };
         let sender_task = tentaflow_core::deploy::log_bus::sender_for(&deploy_id_task);
         {
