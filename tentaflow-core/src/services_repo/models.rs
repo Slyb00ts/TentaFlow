@@ -131,6 +131,15 @@ pub fn delete_for_service(conn: &Connection, service_id: i64) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_for_service_in_tx(tx: &Transaction<'_>, service_id: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM model_registry WHERE service_id = ?1",
+        params![service_id],
+    )
+    .context("delete_for_service model_registry (tx)")?;
+    Ok(())
+}
+
 /// One model the admin chose to expose for an external provider service.
 /// `modality` (chat/embedding/tts/stt/...) becomes the single capability tag.
 #[derive(Debug, Clone)]

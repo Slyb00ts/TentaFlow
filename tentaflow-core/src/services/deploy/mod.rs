@@ -514,6 +514,11 @@ pub async fn deploy(
     //    deployments.finish. Any failure triggers rollback of side effects.
     let commit_result: DeployResult<()> = with_tx(db, |tx| {
         strategy.commit(tx, job.service_id, &prepared)?;
+        // Czyścimy stare model_registry tego service_id PRZED re-insertem. Każdy
+        // deploy ponownie wskazujący na istniejący wiersz (redeploy in-place,
+        // startowy re-deploy, retry) trafiłby inaczej w UNIQUE(service_id,
+        // model_name). Świeży deploy ma nowy service_id, więc to no-op.
+        models_repo::delete_for_service_in_tx(tx, job.service_id)?;
         for m in &prepared.models {
             let mut model = m.clone();
             model.service_id = job.service_id;
