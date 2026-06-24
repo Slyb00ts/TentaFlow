@@ -54,6 +54,7 @@ use crate::flow_engine::node_adapters::{
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter, StoreNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
+    TextExtractNodeAdapter,
     ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
     VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, VisionParseNodeAdapter,
@@ -1114,6 +1115,7 @@ fn build_registry(
         // klasyfikacja+routing pliku, rasteryzacja PDF, ekstrakcja office,
         // chunking, scalanie stron i zapis chunków do przestrzeni wektorowej.
         Arc::new(DocumentRouterNodeAdapter::new()),
+        Arc::new(TextExtractNodeAdapter::new()),
         Arc::new(PdfRasterizeNodeAdapter::new()),
         Arc::new(ExcelExtractNodeAdapter::new()),
         Arc::new(WordExtractNodeAdapter::new()),

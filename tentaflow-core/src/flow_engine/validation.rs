@@ -442,6 +442,15 @@ pub fn validate(
         if node.node_type == "combine" {
             continue;
         }
+        // `text_extract` stoi na fan-inie z `document_router`: zbiera krawędzie z
+        // portów `text` ORAZ `unknown`, ale router aktywuje DOKŁADNIE jeden port
+        // (lustro combine), więc w runtime zawsze żyje co najwyżej jedna krawędź.
+        // Zwolnienie z R4 pozwala kierować nieobsługiwany typ (`unknown`) w ten sam
+        // węzeł, który dla tekstu dekoduje treść, a dla nieznanego binarnego rzuca
+        // twardy błąd ingestu — zamiast cichego placeholdera w indeksie.
+        if node.node_type == "text_extract" {
+            continue;
+        }
         // `output` ma 6 typed input portow (text/audio/image/video/embedding
         // /other) — kazdy branch flow moze emitowac inny typ jednoczesnie
         // (np. text z LLM + audio z TTS w streamingu). Wymaga zwolnienia z

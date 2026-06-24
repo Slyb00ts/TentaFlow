@@ -1,7 +1,7 @@
 {
   "id": "ingest",
   "name": "RAG — ingest dokumentu",
-  "description": "Flow-ingest JEDNEGO dokumentu (Partia 3). trigger seeduje binarny payload: Image dla image/* (gałąź vision_parse), Other dla reszty (gałąź document_router, który klasyfikuje mime+magic-bytes i aktywuje DOKŁADNIE jeden port: pdf/xlsx/docx/pptx/text/unknown). PDF -> rasteryzacja stron -> vision_parse_pages -> document_merge. xlsx/docx/pptx -> office-ekstraktory. Wszystkie gałęzie rekonwergują w combine (fan-in, R4-exempt), który skleja tekst -> chunk -> embed_chunks -> store. store jest węzłem terminalnym: jego Json{markdown,chunks,page_count} staje się final_envelope, który flow_outcome_to_ingest_response mapuje na IngestResponse. Brak węzła output: store.full ma typ Json, a output nie ma portu Json (R8 odrzuciłby krawędź) i nie jest tu potrzebny (żadnego emit_citations).",
+  "description": "Flow-ingest JEDNEGO dokumentu (Partia 3). trigger seeduje binarny payload: Image dla image/* (gałąź vision_parse), Other dla reszty (gałąź document_router, który klasyfikuje mime+magic-bytes i aktywuje DOKŁADNIE jeden port: pdf/xlsx/docx/pptx/text/unknown). PDF -> rasteryzacja stron -> vision_parse_pages -> document_merge. xlsx/docx/pptx -> office-ekstraktory. text ORAZ unknown -> text_extract (fan-in z routera, R4-exempt jak combine): dla rozpoznanego tekstu dekoduje treść (UTF-8 lossy), a dla nieobsługiwanego typu binarnego (unknown) rzuca TWARDY błąd ingestu — zamiast cichego placeholdera '<file: mime>'. Wszystkie gałęzie rekonwergują w combine (fan-in, R4-exempt), który skleja tekst -> chunk -> embed_chunks -> store. store jest węzłem terminalnym: jego Json{markdown,chunks,page_count} staje się final_envelope, który flow_outcome_to_ingest_response mapuje na IngestResponse. Brak węzła output: store.full ma typ Json, a output nie ma portu Json (R8 odrzuciłby krawędź) i nie jest tu potrzebny (żadnego emit_citations).",
   "nodes": [
     {
       "id": "trigger",
@@ -56,6 +56,12 @@
       "type": "pptx_extract",
       "config": {},
       "position": { "x": 440, "y": 260 }
+    },
+    {
+      "id": "text_extract",
+      "type": "text_extract",
+      "config": {},
+      "position": { "x": 660, "y": 360 }
     },
     {
       "id": "combine",
@@ -176,17 +182,24 @@
     },
     {
       "from_node": "router",
-      "to_node": "combine",
+      "to_node": "text_extract",
       "from_port": "text",
       "to_port": "in",
       "data_type": "other"
     },
     {
       "from_node": "router",
-      "to_node": "combine",
+      "to_node": "text_extract",
       "from_port": "unknown",
       "to_port": "in",
       "data_type": "any"
+    },
+    {
+      "from_node": "text_extract",
+      "to_node": "combine",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
     },
     {
       "from_node": "combine",

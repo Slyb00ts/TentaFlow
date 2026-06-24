@@ -3364,7 +3364,7 @@ pub fn doc_parse(
 // Ingest-as-flow API wrapper (RAG Partia 3)
 // =============================================================================
 
-pub use tentaflow_sdk_spec::{IngestChunk, IngestInvokeOutput};
+pub use tentaflow_sdk_spec::IngestInvokeOutput;
 
 /// Uruchamia flow-ingest JEDNEGO dokumentu z BINARNYM payloadem. `doc_id_blob`
 /// to id pliku w per-instance document store (zwrócone przez upload /

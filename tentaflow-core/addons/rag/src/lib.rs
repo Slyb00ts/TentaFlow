@@ -592,7 +592,7 @@ fn handle_ingest_document(params: &Value) -> Value {
                 // Sciezka bledu: czyscimy artefakty best-effort. Ewentualny blad cleanupu
                 // tylko logujemy (juz raportujemy 'failed') — nie nadpisujemy pierwotnej
                 // przyczyny, ale partial graf jest wychwytywany przez status failed.
-                if let Err(ce) = cleanup_document_artifacts(&document_id, &[]) {
+                if let Err(ce) = cleanup_document_artifacts(&document_id) {
                     log::warn(&format!("rag: cleanup po nieudanym mark_ingested dokumentu '{document_id}' nieudany: {ce}"));
                 }
                 let msg = format!("Ingest zakonczony, ale zapis statusu sie nie powiodl: {e}");
@@ -640,7 +640,7 @@ fn run_ingest_pipeline(
     // wczesniejsze artefakty (graf, chunki, wektory) zanim flow zapisze nowe. Flow
     // store robi wlasny cleanup-then-reingest wektorow po doc_id, ale graf i rejestr
     // graph_artifacts to domena addona — bez tego re-ingest dalby graf z duplikatami.
-    cleanup_document_artifacts(document_id, &[])
+    cleanup_document_artifacts(document_id)
         .map_err(|e| format!("Cleanup przed re-ingestem nieudany: {e}"))?;
     update_progress(job_id, 10);
 
@@ -693,6 +693,14 @@ fn run_ingest_pipeline(
         return Err("Flow-ingest nie zapisal zadnego chunka".to_string());
     }
 
+    // Liczbe chunkow utrwalamy na wierszu dokumentu — addonowa tabela `chunks` nie
+    // jest zapelniana (wektory pisze wezel store wprost do `passages`), wiec lista
+    // dokumentow czyta `documents.chunk_count` zamiast COUNT(*) z pustej `chunks`.
+    let _ = sql_exec(
+        "UPDATE documents SET chunk_count = ? WHERE id = ?",
+        &[SqlValue::I64(total as i64), SqlValue::String(document_id.to_string())],
+    );
+
     // Ekstrakcja grafu wiedzy z tekstow chunkow zwroconych przez flow (jego store to
     // jedyne miejsce, ktore widzi finalny zestaw zapisanych chunkow). BEST-EFFORT:
     // wektory sa juz w indeksie, wiec blad ekstrakcji NIE wywala ingestu — znaczy
@@ -712,8 +720,23 @@ fn run_ingest_pipeline(
             ));
         }
 
-        let chunk_total = result.chunk_texts.len().max(1);
-        for (i, chunk) in result.chunk_texts.iter().enumerate() {
+        // Teksty chunkow czytamy z przestrzeni wektorowej `passages` po `doc_id`
+        // (to samo zrodlo prawdy co cleanup/delete) — NIE z odpowiedzi ABI. Duzy
+        // dokument przekroczylby cap 8 MiB w `chunk_texts` (PayloadTooLarge) i
+        // oznaczylby ingest jako failed mimo zapisanych wektorow. Blad odczytu =>
+        // graf czesciowy (wektory sa juz w indeksie).
+        let doc_chunks = match fetch_document_chunks(document_id) {
+            Ok(c) => c,
+            Err(e) => {
+                graph_partial = true;
+                log::warn(&format!(
+                    "rag: odczyt chunkow dok {document_id} do ekstrakcji grafu nieudany (graf czesciowy): {e}"
+                ));
+                Vec::new()
+            }
+        };
+        let chunk_total = doc_chunks.len().max(1);
+        for (i, chunk) in doc_chunks.iter().enumerate() {
             let index = chunk.index as usize;
             let chunk_result = extract_chunk_graph(
                 document_id,
@@ -765,36 +788,90 @@ fn run_ingest_pipeline(
     Ok(total)
 }
 
-/// Kasuje wszystkie artefakty dokumentu: wektory (po przekazanej liscie ref_id
-/// oraz po vector_ref chunkow z bazy) i chunki. Idempotentny — wolany przy
-/// czystym starcie (re-ingest) i przy cleanup-on-failure.
-fn cleanup_document_artifacts(document_id: &str, known_refs: &[u64]) -> Result<(), String> {
+/// Pojedynczy chunk dokumentu odczytany z przestrzeni wektorowej `passages`:
+/// jego `ref_id` (klucz wektora), `index` (pozycja w dokumencie) i `text`.
+struct DocChunk {
+    ref_id: u64,
+    index: u32,
+    text: String,
+}
+
+/// Enumeruje WSZYSTKIE chunki dokumentu z przestrzeni `passages` po filtrze
+/// `doc_id`. To JEDNO zrodlo prawdy o zapisanych chunkach: wezel `store` (Core)
+/// pisze wektory wprost do tej przestrzeni z polami `doc_id`/`chunk_index`/`text`,
+/// wiec addon czyta je stad zarowno do ekstrakcji grafu (P1-3, bez przepychania
+/// tekstow przez ABI i ryzyka PayloadTooLarge), jak i do kasowania (P1-2).
+///
+/// `vector_search` wymaga wektora zapytania — przy enumeracji po filtrze sam
+/// porzadek wynikow jest bez znaczenia, wiec podajemy wektor zerowy o wymiarze
+/// przestrzeni (EMBED_DIMENSIONS). Filtr `doc_id == X` zaweza do tego dokumentu;
+/// `k` ustawione wysoko, by zlapac wszystkie chunki nawet duzego dokumentu.
+fn fetch_document_chunks(document_id: &str) -> Result<Vec<DocChunk>, String> {
+    const FETCH_K: u32 = 100_000;
+    let zero_query = vec![0.0f32; EMBED_DIMENSIONS];
+    let filter = VectorFilter::Eq(
+        "doc_id".to_string(),
+        VectorFieldValue::Str(document_id.to_string()),
+    );
+    let hits = vector_search(
+        PASSAGES_NS,
+        &zero_query,
+        FETCH_K,
+        None,
+        Some(&filter),
+        &["chunk_index", "text"],
+    )
+    .map_err(|e| format!("enumeracja chunkow dokumentu '{document_id}': {e}"))?;
+
+    let mut chunks = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let index = hit
+            .fields
+            .iter()
+            .find(|f| f.name == "chunk_index")
+            .and_then(|f| match &f.value {
+                VectorFieldValue::Int(i) => u32::try_from(*i).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let text = hit
+            .fields
+            .iter()
+            .find(|f| f.name == "text")
+            .and_then(|f| match &f.value {
+                VectorFieldValue::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        chunks.push(DocChunk {
+            ref_id: hit.ref_id,
+            index,
+            text,
+        });
+    }
+    // Deterministyczna kolejnosc po indeksie chunka (search zwraca po dystansie).
+    chunks.sort_by_key(|c| c.index);
+    Ok(chunks)
+}
+
+/// Kasuje wszystkie artefakty dokumentu: wektory (enumerowane z przestrzeni
+/// `passages` po `doc_id`), graf i chunki. Idempotentny — wolany przy czystym
+/// starcie (re-ingest) i przy usuwaniu dokumentu/kolekcji.
+fn cleanup_document_artifacts(document_id: &str) -> Result<(), String> {
     // Inwariant: nic nie znika z metadanych dopoki artefakty (wektory+graf+chunki)
     // nie sa bezpiecznie usuniete/zakolejkowane. Blad KTOREGOKOLWIEK kroku => Err =>
     // caller (handle_delete_document) NIE usuwa wiersza dokumentu, wiec nie zostaje
-    // osierocony wektor. Dlatego bledy vector_delete i odczytu chunks propagujemy.
+    // osierocony wektor. Dlatego bledy vector_delete i odczytu propagujemy.
 
-    // Najpierw skasuj wektory po juz-upsertowanych ref_id (znane z biezacego biegu).
-    for &ref_id in known_refs {
-        if ref_id > 0 {
-            vector_delete(PASSAGES_NS, ref_id)
-                .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
-        }
-    }
-
-    // Dodatkowo skasuj wektory po vector_ref zapisanych w chunkach (np. z
-    // wczesniejszego ingestu przy re-ingescie) — pokrywa refy spoza known_refs.
-    let rows = sql_query(
-        "SELECT vector_ref FROM chunks WHERE document_id = ? AND vector_ref > 0",
-        &[SqlValue::String(document_id.to_string())],
-    )
-    .map_err(|e| format!("odczyt vector_ref chunkow '{document_id}': {e}"))?;
-    for row in &rows {
-        if let Some(ref_id) = row.first().and_then(|v| v.as_i64()) {
-            if ref_id > 0 && !known_refs.contains(&(ref_id as u64)) {
-                vector_delete(PASSAGES_NS, ref_id as u64)
-                    .map_err(|e| format!("usuniecie wektora ref={ref_id}: {e}"))?;
-            }
+    // Wektory pisze wezel `store` (Core) WPROST do przestrzeni `passages` z polem
+    // `doc_id` — addonowy `chunks` ich NIE rejestruje. Zrodlem prawdy jest wiec
+    // przestrzen: enumerujemy ref_id po filtrze `doc_id` i kasujemy je. Bez tego
+    // (kasowanie tylko po pustym `chunks.vector_ref`) re-ingest i delete zostawialy
+    // wektory osierocone.
+    for chunk in fetch_document_chunks(document_id)? {
+        if chunk.ref_id > 0 {
+            vector_delete(PASSAGES_NS, chunk.ref_id)
+                .map_err(|e| format!("usuniecie wektora ref={}: {e}", chunk.ref_id))?;
         }
     }
 
@@ -928,7 +1005,7 @@ fn handle_list_documents(params: &Value) -> Value {
 
     let rows = match sql_query(
         "SELECT d.id, d.filename, d.mime, d.status, d.page_count, d.created_at, \
-         (SELECT COUNT(*) FROM chunks ch WHERE ch.document_id = d.id), \
+         d.chunk_count, \
          d.entity_count, d.relation_count, d.graph_partial \
          FROM documents d WHERE d.collection_id = ? ORDER BY d.created_at DESC",
         &[SqlValue::String(collection_id.to_string())],
@@ -1099,7 +1176,7 @@ fn handle_delete_collection(params: &Value) -> Value {
         // spojnie wyczyszczony — inaczej zostalyby osierocone artefakty grafu. Juz
         // usuniete (wczesniejsze) dokumenty pozostaja usuniete; kolekcja zostaje, bo
         // jej DELETE jest na koncu — admin moze ponowic.
-        if let Err(e) = cleanup_document_artifacts(doc_id, &[]) {
+        if let Err(e) = cleanup_document_artifacts(doc_id) {
             return err(&format!("Cleanup dokumentu '{doc_id}' nieudany; usuwanie kolekcji przerwane: {e}"));
         }
         if let Err(e) = sql_exec(
@@ -1145,7 +1222,7 @@ fn handle_delete_document(params: &Value) -> Value {
     // Blad cleanupu grafu/outboxu PRZERYWA usuwanie — nie usuwamy wiersza dokumentu
     // nad osieroconymi artefaktami grafu (inwariant: graf TYLKO przez outbox, spojny
     // refcount). Admin moze ponowic po usunieciu przyczyny.
-    if let Err(e) = cleanup_document_artifacts(document_id, &[]) {
+    if let Err(e) = cleanup_document_artifacts(document_id) {
         return err(&format!("Cleanup dokumentu nieudany; usuwanie przerwane: {e}"));
     }
     if let Err(e) = sql_exec(
