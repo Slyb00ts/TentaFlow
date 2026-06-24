@@ -159,7 +159,7 @@ function renderKeysTab(body) {
         const status = k.isActive === false
           ? `<span class="tf-chip danger">${escapeHtml(t('access_keys.revoked', 'zrewokowany'))}</span>`
           : `<span class="tf-chip success">${escapeHtml(t('access_keys.active', 'aktywny'))}</span>`;
-        const last = k.lastUsedAtEpoch ? new Date(k.lastUsedAtEpoch * 1000).toLocaleString() : '—';
+        const last = k.lastUsedAtEpoch ? new Date(Number(k.lastUsedAtEpoch) * 1000).toLocaleString() : '—';
         const scopeBtn = k.keyType === 'general'
           ? `<tf-button size="sm" variant="ghost" icon="shield" data-scope="${escapeAttr(k.keyId)}">${escapeHtml(t('access_keys.scope', 'Zakres'))}</tf-button>`
           : '';
