@@ -777,11 +777,6 @@ function renderRow(s) {
   // update_available (snake_case z protokolu binarnego) = zdeployowany bundle
   // rozni sie od aktualnego zrodla w binarce, wiec serwis trzeba wdrozyc ponownie.
   const updateAvailable = !!s.update_available;
-  const updateBadge = updateAvailable
-    ? `<tf-chip status="warn" icon="alert"
-          style="margin-top:4px;"
-          title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
-    : '';
 
   const displayName = s.display_name || s.engine_id || '';
   const engineLabel = s.engine_id || '';
@@ -817,15 +812,14 @@ function renderRow(s) {
   const svcNodeLabel = escapeAttr(nodeInfo.label);
   const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
   const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
-  // Akcja redeploy widoczna tylko gdy zrodlo bundla sie zmienilo — otwiera ten
-  // sam kreator wdrozenia co katalog, dla danego silnika i wezla.
-  const redeployAction = updateAvailable
-    ? `<tf-button variant="ghost" size="sm" icon="rotate"
+  // Badge "Aktualizacja dostepna" jest klikalny — otwiera one-click in-place
+  // redeploy z aktualnego zrodla bundla (handler [data-svc-redeploy]).
+  const updateBadge = updateAvailable
+    ? `<tf-chip status="warn" icon="alert" clickable
+          style="cursor:pointer;"
           data-svc-redeploy="${svcId}"
-          data-svc-engine="${escapeAttr(s.engine_id || '')}"
-          data-svc-method="${escapeAttr(s.deploy_method || '')}"
           data-svc-node="${svcNodeId}"
-          title="${escapeAttr(I18n.t('services.btn_redeploy'))}"></tf-button>`
+          title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
     : '';
   const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
   const deployAction = deployId
@@ -849,8 +843,10 @@ function renderRow(s) {
         <span class="scope-chip ${categoryChipClass(category)}">${escapeHtml(category.toUpperCase() || '—')}</span>
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
-        <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
-        ${updateBadge}
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+          ${updateBadge}
+        </div>
         ${progressBadge}
         ${deployProgress}
       </td>
@@ -878,7 +874,6 @@ function renderRow(s) {
           data-svc-engine="${escapeAttr(s.engine_id || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
-        ${redeployAction}
         ${deployAction}
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${svcId}"
