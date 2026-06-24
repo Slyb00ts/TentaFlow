@@ -196,6 +196,15 @@ impl DeployStrategy for BinaryDeploy {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // New process group with the engine as leader (pgid = child pid). Native
+        // engines fork worker processes (inference servers, GPU workers) that inherit
+        // this group; without it `terminate`'s group-kill `kill(-pid)` returns ESRCH
+        // and only the parent dies, orphaning workers that keep holding the port (the
+        // "zombie blocks respawn: port already in use" bug). The python-bundle path
+        // does the same via `setsid()` in pre_exec.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         if let Some(s) = &self.log_sink {
             s.info(&format!("[binary] spawn {} (PORT={})", exe.display(), port));
         }
