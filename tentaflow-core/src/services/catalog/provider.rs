@@ -428,10 +428,23 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "image_gen",
     "image_generation",
     "embeddings",
+    // Mostek chunk→store: wektoryzuje chunki (text input → embedding output).
+    "embed_chunks",
     "llm",
     "chat",
     "memory",
     "conversation_history",
+    // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF emituje obrazy stron.
+    "pdf_rasterize",
+    // PARTIA 2 (flow-ingest RAG): węzły zależne od modeli biorą obraz strony.
+    // vision_parse / table_structure / ocr produkują też tekst; page_detect /
+    // graphic_elements zwracają JSON regionów (brak medialnego outputu, samo
+    // Image-input constraint).
+    "vision_parse",
+    "page_detect",
+    "table_structure",
+    "graphic_elements",
+    "ocr",
 ];
 
 /// Node types that intentionally do not contribute modalities — they do
@@ -469,6 +482,23 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "subagent_status",
     "subflow",
     "tool_exec",
+    // PARTIA 1 (flow-ingest RAG): czysto-rustowe węzły ingestu bez własnej
+    // modalności medialnej — klasyfikują/routują plik, ekstrahują tekst,
+    // chunkują, scalają strony i zapisują wektory (transform/side-effect).
+    "document_router",
+    "text_extract",
+    "excel_extract",
+    "word_extract",
+    "pptx_extract",
+    "chunk",
+    "document_merge",
+    "store",
+    // Batch-owe warianty gałęzi PDF: operują na liście stron jako JSON (nie
+    // pojedynczy obraz), więc nie deklarują medialnej modalności wejścia —
+    // ograniczenie Image jest już w `pdf_rasterize`/single-image węzłach.
+    "vision_parse_pages",
+    "page_detect_pages",
+    "ocr_pages",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks
@@ -513,11 +543,33 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             "image_gen" | "image_generation" => {
                 outputs.insert(OutputModality::Image);
             }
+            // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF bierze plik PDF i emituje
+            // obrazy stron — wejście to plik (Other ≈ brak deklarowanej modalności
+            // medialnej), wyjście to obrazy.
+            "pdf_rasterize" => {
+                outputs.insert(OutputModality::Image);
+            }
+            // PARTIA 2 (flow-ingest RAG): biorą obraz strony. vision_parse /
+            // table_structure / ocr emitują tekst; page_detect / graphic_elements
+            // zwracają JSON regionów (brak medialnego outputu — deklarujemy tylko
+            // ograniczenie wejścia Image).
+            "vision_parse" | "table_structure" | "ocr" => {
+                inputs.insert(InputModality::Image);
+                has_text_output = true;
+            }
+            "page_detect" | "graphic_elements" => {
+                inputs.insert(InputModality::Image);
+            }
             "embeddings" => {
                 // Codex R3b.1 round 2 M2: declare text input so
                 // `execute_embeddings` (which requires `Text` input) can
                 // resolve embedding flows. Without this the resolver
                 // filters every embeddings flow out before dispatch.
+                inputs.insert(InputModality::Text);
+                outputs.insert(OutputModality::Embedding);
+            }
+            // Mostek chunk→store: bierze tekst chunków, emituje wektory.
+            "embed_chunks" => {
                 inputs.insert(InputModality::Text);
                 outputs.insert(OutputModality::Embedding);
             }
@@ -880,6 +932,7 @@ mod tests {
                     context_length: None,
                     quantization: None,
                     is_default: true,
+                    service_surfaces: Vec::new(),
                 }],
                 update_available: false,
                 created_at: String::new(),
@@ -955,6 +1008,7 @@ mod tests {
                     context_length: None,
                     quantization: None,
                     is_default: true,
+                    service_surfaces: Vec::new(),
                 }],
                 update_available: false,
                 created_at: String::new(),
@@ -1016,6 +1070,7 @@ mod tests {
                 context_length: None,
                 quantization: None,
                 is_default: true,
+                service_surfaces: Vec::new(),
             }],
             update_available: false,
             created_at: String::new(),
@@ -1175,6 +1230,7 @@ mod tests {
                 context_length: None,
                 quantization: None,
                 is_default: true,
+                service_surfaces: Vec::new(),
             }],
             update_available: false,
             created_at: String::new(),

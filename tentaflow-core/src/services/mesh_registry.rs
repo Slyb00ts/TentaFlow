@@ -549,6 +549,7 @@ mod tests {
             context_length: None,
             quantization: None,
             is_default: false,
+            service_surfaces: Vec::new(),
         });
         s
     }

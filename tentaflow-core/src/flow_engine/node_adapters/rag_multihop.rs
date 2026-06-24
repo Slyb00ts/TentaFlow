@@ -818,6 +818,12 @@ mod tests {
         validate_flow_json(json).expect("body retrieval_round.flow.json musi przejść R1-R10");
     }
 
+    #[test]
+    fn ingest_flow_validates() {
+        let json = include_str!("../../../addons/rag/flows/ingest.flow.json");
+        validate_flow_json(json).expect("ingest.flow.json musi przejść R1-R10");
+    }
+
     /// Outer flow naprawdę używa loop block z `body_flow_engine_id=retrieval_round`
     /// i `max_iterations` <= twardego capu (anti-DoS). Asercja na realnej
     /// konfiguracji, nie na opisie.

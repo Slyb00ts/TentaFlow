@@ -306,7 +306,7 @@ impl Router {
 /// Map executor errors onto typed `CoreError` variants so the OpenAI HTTP
 /// layer can serve a precise status code (404 / 400 / 503) instead of a
 /// catch-all 500.
-fn executor_err_to_core(
+pub(crate) fn executor_err_to_core(
     err: crate::services::runtime::executor::ExecutorError,
     model: &str,
 ) -> CoreError {

@@ -5,6 +5,7 @@
 //       BEZWARUNKOWY — PDF musi działać na każdym urządzeniu.
 // =============================================================================
 
+pub mod extract;
 pub mod rasterize;
 
 use crate::services::runtime::executor::{DocBlock, DocumentParseResponse};

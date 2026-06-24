@@ -191,6 +191,44 @@ pub fn blob_path(dir: &std::path::Path, sha256: &str) -> PathBuf {
         .join(format!("{sha256}.bin"))
 }
 
+/// Wczytuje CAŁY dokument instancji (org_id, addon_id) po `doc_id` z document
+/// store. Zwraca `(bajty, mime)`. Używane przez host fn `ingest_invoke_v1`,
+/// który pobiera bajty PO STRONIE HOSTA (zamiast strumieniować je przez ABI z
+/// addona, jak robi `run_ingest_pipeline` przez `document_get`), żeby zseedować
+/// binarny envelope flow-ingestu. Reużywa DOKŁADNIE tę samą warstwę co
+/// `document_get_v1` (rejestr instancji + content-addressed blob) — jeden store,
+/// żaden obcy `doc_id` nie jest osiągalny (rejestr widzi tylko dokumenty tej
+/// instancji). `NotFound` gdy wiersza nie ma; `Operation` przy błędzie I/O.
+/// Mutex instancji wzajemnie wyklucza odczyt z równoległym `delete` (czytelnik
+/// widzący wiersz ZAWSZE ma istniejący blob).
+pub fn read_full_document(
+    org_id: &str,
+    addon_id: &str,
+    doc_id: &str,
+) -> Result<(Vec<u8>, String), AbiError> {
+    validate_doc_id(doc_id)?;
+    let dir = documents_dir(org_id, addon_id)?;
+    let conn = open_registry(&dir)?;
+
+    let inst_lock = instance_lock(org_id, addon_id);
+    let _inst_guard = inst_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT sha256, mime, size_bytes FROM documents WHERE doc_id = ?1",
+            rusqlite::params![doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    let (sha256, mime, size_bytes) = row.ok_or(AbiError::NotFound)?;
+
+    let path = blob_path(&dir, &sha256);
+    let mut f = std::fs::File::open(&path).map_err(|_| AbiError::Operation)?;
+    let mut bytes = Vec::with_capacity(size_bytes.max(0) as usize);
+    f.read_to_end(&mut bytes).map_err(|_| AbiError::Operation)?;
+    Ok((bytes, mime))
+}
+
 // =============================================================================
 // Stan pending uploadów — TYLKO metadane (bajty leżą na dysku w partialu)
 // =============================================================================

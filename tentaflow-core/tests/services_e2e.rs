@@ -137,6 +137,7 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
             context_length: None,
             quantization: None,
             is_default: true,
+            service_surfaces: Vec::new(),
         }],
         created_at: String::new(),
         updated_at: String::new(),
