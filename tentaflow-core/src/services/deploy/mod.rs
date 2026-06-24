@@ -325,6 +325,56 @@ pub fn create_deploy_job(
     })
 }
 
+/// In-place redeploy: tworzy nowy slug deployu wskazujący na ISTNIEJĄCY wiersz
+/// serwisu (`existing_service_id`) zamiast insertować duplikat. Wiersz services
+/// jest aktualizowany w miejscu (`begin_redeploy_in_tx`): nowy `active_deploy_id`,
+/// nadpisany `config_json`, status zostaje `deploying`. Reszta potoku (`deploy`
+/// → `commit` → `finish_deploy_in_tx`) trafia w TEN sam `service_id`, więc po
+/// sukcesie wiersz przechodzi w `running`, a po błędzie zostaje `failed` —
+/// serwis NIGDY nie znika (odwrotnie niż delete+create_deploy_job).
+pub fn create_redeploy_job(
+    method: DeployMethod,
+    manifest: &ServiceManifest,
+    user_config: &serde_json::Value,
+    db: &DbPool,
+    local_node_id: &str,
+    user_id: Option<&str>,
+    existing_service_id: i64,
+) -> DeployResult<DeployJob> {
+    let slug = uuid::Uuid::new_v4().to_string();
+    // Sekret nigdy do config_json — strip przed serializacją do services +
+    // deployments (token HF leci dalej tylko jako ENV w `deploy()`).
+    let sanitized_config = strip_hf_token(user_config);
+    let config_json = serde_json::to_string(&sanitized_config)
+        .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+    let deployment_id = with_tx(db, |tx| {
+        services_repo::begin_redeploy_in_tx(tx, existing_service_id, &slug, &config_json)
+            .map_err(|e| DeployError::Database(e.to_string()))?;
+        let did = deployments_repo::create_with_slug(
+            tx,
+            &manifest.engine.id,
+            method.as_db_tag(),
+            &slug,
+            local_node_id,
+            existing_service_id,
+            &config_json,
+        )?;
+        if let Some(uid) = user_id {
+            tx.execute(
+                "UPDATE deployments SET user_id = ?2 WHERE id = ?1",
+                rusqlite::params![did, uid],
+            )
+            .map_err(DeployError::from)?;
+        }
+        Ok(did)
+    })?;
+    Ok(DeployJob {
+        deploy_id: slug,
+        deployment_id,
+        service_id: existing_service_id,
+    })
+}
+
 pub async fn deploy(
     job: DeployJob,
     method: DeployMethod,
@@ -745,6 +795,89 @@ pub async fn stop(
     // zeby kolejny respawn dostal dokladnie ten sam port przez
     // `acquire_or_specific(svc.runtime_port)`.
     let _ = ports;
+
+    Ok(())
+}
+
+/// Wariant `stop` z weryfikacją wyniku dla ścieżki redeploy. `stop` jest
+/// best-effort (świadomie zjada błędy Dockera, bo delete-row ma się udać nawet
+/// gdy daemon nie odpowiada), ale przy redeployu MUSIMY wiedzieć, czy stary
+/// kontener naprawdę zniknął — inaczej nowy deploy na tej samej maszynie GPU
+/// wystartuje obok osieroconego kontenera i wpadną razem w OOM. Najpierw
+/// wykonujemy normalny `stop`, potem dla docker-deployów potwierdzamy w
+/// daemonie, że żaden kontener pasujący do wzorca nazwy już nie istnieje.
+pub async fn stop_checked(
+    svc: &crate::services_repo::services::ServiceRow,
+    ports: Arc<PortAllocator>,
+) -> DeployResult<()> {
+    use crate::services_repo::services::DeployMethod as DM;
+
+    stop(svc, ports).await?;
+
+    // Native (binary / python-bundle): `stop()` woła `terminate()` best-effort i
+    // ZJADA jego błąd, więc sam stop nie gwarantuje, że proces naprawdę zniknął.
+    // Przy redeployu to krytyczne — żywy stary proces trzymałby port/VRAM i nowy
+    // deploy wpadłby w duplikat runtime'u / OOM. Reużywamy detektora żywotności
+    // supervisora (`process_ctl::is_alive`, który wykrywa też zombie przez
+    // /proc/<pid>/status), żeby potwierdzić śmierć po stopie.
+    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+        if let Some(pid) = svc.runtime_pid {
+            let pid = pid as u32;
+            if crate::deploy::process_ctl::is_alive(pid) {
+                return Err(DeployError::Other(format!(
+                    "stop_checked: native process pid={} still alive after stop",
+                    pid
+                )));
+            }
+        }
+    }
+
+    #[cfg(feature = "docker")]
+    if svc.deploy_method == DM::Docker {
+        // Compose-stacki znikają jako cały projekt — `docker compose down`
+        // wyżej już to zrobił i nie mamy stabilnej nazwy pojedynczego
+        // kontenera do sprawdzenia, więc weryfikujemy tylko single-container.
+        let is_compose = crate::services::manifest::registry()
+            .by_id(&svc.engine_id)
+            .and_then(|m| m.deploy.docker.as_ref())
+            .map(|d| d.compose_path.is_some() && d.context_path.is_none())
+            .unwrap_or(false);
+        if !is_compose {
+            let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
+                DeployError::Other(format!("stop_checked: cannot reach docker daemon: {}", e))
+            })?;
+            let prefix = format!("tentaflow-{}-", svc.engine_id);
+            let expected = svc
+                .runtime_port
+                .map(|port| format!("tentaflow-{}-{}", svc.engine_id, port));
+            let listed = docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    all: true,
+                    ..Default::default()
+                }))
+                .await
+                .map_err(|e| {
+                    DeployError::Other(format!("stop_checked: list containers: {}", e))
+                })?;
+            // Nazwy w bollard mają wiodący `/`; normalizujemy przed porównaniem.
+            let lingering: Vec<String> = listed
+                .into_iter()
+                .filter_map(|c| c.names)
+                .flatten()
+                .map(|n| n.trim_start_matches('/').to_string())
+                .filter(|n| match &expected {
+                    Some(name) => n == name,
+                    None => n.starts_with(&prefix),
+                })
+                .collect();
+            if !lingering.is_empty() {
+                return Err(DeployError::Other(format!(
+                    "stop_checked: container still present after stop: {}",
+                    lingering.join(", ")
+                )));
+            }
+        }
+    }
 
     Ok(())
 }

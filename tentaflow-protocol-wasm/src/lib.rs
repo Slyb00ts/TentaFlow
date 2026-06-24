@@ -988,17 +988,13 @@ pub fn encode_deployment_log_stream_request(
 }
 
 /// Redeploy in-place: backend reużywa zapisany `config_json` serwisu, więc
-/// frontend wysyła tylko `service_id` + flagę wymuszenia mimo aktywnych sesji.
+/// frontend wysyła tylko `service_id`.
 #[wasm_bindgen(js_name = encodeServiceRedeployRequest)]
-pub fn encode_service_redeploy_request(
-    service_id: f64,
-    force_if_active_sessions: bool,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_service_redeploy_request(service_id: f64) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::DeploymentBody(
         tentaflow_protocol::DeploymentPayload::ReqRedeploy(
             tentaflow_protocol::ServiceRedeployRequest {
                 service_id: service_id as i64,
-                force_if_active_sessions,
             },
         ),
     ))
@@ -9947,7 +9943,6 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
         DP::ReqRedeploy(req) => {
             set(obj, "variant", "ServiceRedeployRequest".into());
             set(obj, "serviceId", (req.service_id as f64).into());
-            set(obj, "forceIfActiveSessions", req.force_if_active_sessions.into());
         }
         DP::ResRedeploy(resp) => {
             set(obj, "variant", "ServiceRedeployResponse".into());

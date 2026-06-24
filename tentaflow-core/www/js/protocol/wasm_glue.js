@@ -5367,13 +5367,12 @@ export function encodeServicePinRequest(service_id, pinned, node_id) {
 
 /**
  * Redeploy in-place: backend reużywa zapisany `config_json` serwisu, więc
- * frontend wysyła tylko `service_id` + flagę wymuszenia mimo aktywnych sesji.
+ * frontend wysyła tylko `service_id`.
  * @param {number} service_id
- * @param {boolean} force_if_active_sessions
  * @returns {Uint8Array}
  */
-export function encodeServiceRedeployRequest(service_id, force_if_active_sessions) {
-    const ret = wasm.encodeServiceRedeployRequest(service_id, force_if_active_sessions);
+export function encodeServiceRedeployRequest(service_id) {
+    const ret = wasm.encodeServiceRedeployRequest(service_id);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
