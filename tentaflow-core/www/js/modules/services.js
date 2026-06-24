@@ -312,25 +312,14 @@ function bindTabEvents() {
   body.querySelectorAll('[data-svc-redeploy]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
-      const svcId = b.dataset.svcRedeploy;
+      const engineId = b.dataset.svcEngine;
       const nodeId = b.dataset.svcNode || undefined;
-      const svc = (services || []).find((s) =>
-        String(s.id) === String(svcId)
-        && String(s.node_id || s.nodeId || '') === String(nodeId || '')
-      );
-      if (!svc) return;
-      // Redeploy w miejscu z ta sama konfiguracja, ale ze zaktualizowanego zrodla
-      // bundla — bez przechodzenia kreatora od nowa.
-      import('/js/modules/services/update-modal.js').then((mod) => {
-        mod.openUpdateModal({
-          service: {
-            id: svc.id,
-            name: svc.display_name || svc.engine_id || String(svc.id),
-            engineId: svc.engine_id || svc.engineId || '',
-            deployMethod: svc.deploy_method || svc.deployMethod || '',
-          },
-          onUpdated: refreshServiceList,
-        });
+      const deployMethod = b.dataset.svcMethod || undefined;
+      if (!engineId) return;
+      // Kreator wdrozenia pre-targetowany na ten silnik/wezel — wdraza serwis
+      // ponownie ze zaktualizowanego zrodla bundla.
+      import('/js/modules/catalog/engine-deploy-wizard.js').then((mod) => {
+        mod.openDeployWizard(engineId, { nodeId, deployMethod });
       });
     };
   });
@@ -812,12 +801,15 @@ function renderRow(s) {
   const svcNodeLabel = escapeAttr(nodeInfo.label);
   const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
   const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
-  // Badge "Aktualizacja dostepna" jest klikalny — otwiera one-click in-place
-  // redeploy z aktualnego zrodla bundla (handler [data-svc-redeploy]).
+  // Badge "Aktualizacja dostepna" jest klikalny — otwiera kreator wdrozenia
+  // (pre-targetowany na ten silnik/wezel) zeby wdrozyc serwis ponownie ze
+  // zaktualizowanego zrodla bundla (handler [data-svc-redeploy]).
   const updateBadge = updateAvailable
     ? `<tf-chip status="warn" icon="alert" clickable
           style="cursor:pointer;"
           data-svc-redeploy="${svcId}"
+          data-svc-engine="${escapeAttr(s.engine_id || '')}"
+          data-svc-method="${escapeAttr(s.deploy_method || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
     : '';
