@@ -365,31 +365,42 @@ impl NodeAdapter for StoreNodeAdapter {
             }
         }
 
-        // Markdown rekonstrukcji + per-chunk teksty echo'wane w wyniku: ingest
-        // (`flow_outcome_to_ingest_response`) zwraca je przez `IngestInvokeOutput`,
-        // a addon po ingescie potrzebuje TEKSTÓW chunków (z ich indeksami) do
-        // ekstrakcji grafu — store jest jedynym węzłem, który widzi finalny zestaw
-        // zapisanych chunków, więc to on je raportuje (jedno źródło prawdy).
-        let chunk_texts: Vec<serde_json::Value> = prepared
-            .iter()
-            .map(|c| serde_json::json!({ "index": c.chunk_index, "text": c.text }))
-            .collect();
+        // Markdown rekonstrukcji do raportu. Tekstów chunków NIE przepychamy przez
+        // ABI (cap 8 MiB → PayloadTooLarge na dużym dokumencie): addon czyta je z
+        // przestrzeni wektorowej `passages` po `doc_id` (te same pola doc_id/
+        // chunk_index/text, które tu zapisaliśmy) do ekstrakcji grafu.
         let markdown = prepared
             .iter()
             .map(|c| c.text.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let mut out = (**envelope).clone();
-        out.payload = FlowValue::Json(serde_json::json!({
+        // page_count: ustawia go `pdf_rasterize` w meta (`pdf_page_count`) i
+        // przenosi przez vision_parse_pages -> document_merge -> combine -> chunk
+        // -> embed -> store (każdy klonuje base envelope). store, jako terminalny
+        // węzeł, przepisuje go do finalnego JSON, by `flow_outcome_to_ingest_response`
+        // zwrócił REALNĄ liczbę stron zamiast defaultu 1. Brak meta (obraz/office/
+        // tekst — pojedyncza "strona") = mapper defaultuje na 1.
+        let page_count = envelope
+            .meta
+            .get("pdf_page_count")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0);
+
+        let mut payload = serde_json::json!({
             "op": "store",
             "namespace": namespace,
             "doc_id": doc_id,
             "written": written_refs.len(),
             "markdown": markdown,
             "chunks": written_refs.len(),
-            "chunk_texts": chunk_texts,
-        }));
+        });
+        if let Some(pc) = page_count {
+            payload["page_count"] = serde_json::json!(pc);
+        }
+
+        let mut out = (**envelope).clone();
+        out.payload = FlowValue::Json(payload);
         out.meta.insert(
             "stored_chunks".to_string(),
             serde_json::json!(written_refs.len()),

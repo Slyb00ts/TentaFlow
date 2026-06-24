@@ -564,6 +564,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "",
         ),
         (
+            "text_extract",
+            "transform",
+            "Ekstrakcja tekstu",
+            "Dekoduje plik tekstowy (text/plain, markdown, JSON) na czysty tekst. Nieobsługiwany typ binarny = twardy błąd ingestu. Bez modelu.",
+            r#"{}"#,
+            "file-text",
+            "",
+        ),
+        (
             "pdf_rasterize",
             "transform",
             "Rasteryzacja PDF",

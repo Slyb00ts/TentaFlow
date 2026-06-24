@@ -486,6 +486,7 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     // modalności medialnej — klasyfikują/routują plik, ekstrahują tekst,
     // chunkują, scalają strony i zapisują wektory (transform/side-effect).
     "document_router",
+    "text_extract",
     "excel_extract",
     "word_extract",
     "pptx_extract",

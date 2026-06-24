@@ -42,7 +42,9 @@ fn audit(state: &AddonState, result: &str, reason: Option<&str>) {
 /// ABI: (input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 ///
 /// Input CBOR: `IngestInvokeInput { doc_id_blob, mime, model, options_json? }`.
-/// Output CBOR: `IngestInvokeOutput { markdown, chunks, page_count }`.
+/// Output CBOR: `IngestInvokeOutput { markdown, chunks, page_count }` (teksty
+/// chunków NIE wracają przez ABI — addon czyta je z przestrzeni `passages` po
+/// `doc_id`, by duży dokument nie przekroczył capu 8 MiB).
 /// Wymaga `document.read`. Risk class B — dokumenty mogą nieść dane regulowane.
 pub fn ingest_invoke_v1(
     mut caller: WasmCaller<'_, AddonState>,
@@ -183,11 +185,6 @@ pub fn ingest_invoke_v1(
         markdown: response.markdown,
         chunks: response.chunks,
         page_count: response.page_count,
-        chunk_texts: response
-            .chunk_texts
-            .into_iter()
-            .map(|(index, text)| tentaflow_sdk_spec::IngestChunk { index, text })
-            .collect(),
     };
 
     // Audyt "ok" DOPIERO po udanym zapisie wyniku do pamięci WASM.
