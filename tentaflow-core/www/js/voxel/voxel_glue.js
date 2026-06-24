@@ -35,6 +35,23 @@ export class VoxelView {
         wasm.voxelview_dispose(this.__wbg_ptr);
     }
     /**
+     * Voxel count currently rendered for the MAP layer (lidar/scene). Lets the UI
+     * show how many points the renderer is actually processing.
+     * @returns {number}
+     */
+    mapPointCount() {
+        const ret = wasm.voxelview_mapPointCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Voxel count currently rendered for the OVERLAY layer (camera depth).
+     * @returns {number}
+     */
+    overlayPointCount() {
+        const ret = wasm.voxelview_overlayPointCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * Reconfigure the surface and depth buffer for a new backing size in
      * physical pixels. Pass the device-pixel-ratio-scaled canvas dimensions.
      * @param {number} width

@@ -12,15 +12,15 @@ path = "src/lib.rs"
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
 # Transport
-iroh = { version = "=1.0.0-rc.1", default-features = false, features = ["portmapper", "tls-ring"] }
-iroh-mdns-address-lookup = "0.3.0"
-iroh-mainline-address-lookup = "0.3.0"
+iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh-mdns-address-lookup = "0.4.0"
+iroh-mainline-address-lookup = "0.4.0"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 
 # Async runtime
-tokio = { version = "1.52.2", features = ["rt", "sync", "time", "macros", "io-util"] }
+tokio = { version = "1.52.3", features = ["rt", "sync", "time", "macros", "io-util"] }
 async-trait = "0.1"
 
 # Utils

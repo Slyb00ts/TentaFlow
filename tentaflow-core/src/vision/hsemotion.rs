@@ -33,7 +33,7 @@ pub const EMOTION_LABELS: [&str; 8] = [
     "Surprise",
 ];
 
-type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 pub struct HsemotionEngine {
     model: Arc<Runnable>,
@@ -60,7 +60,7 @@ impl EmotionClassifier for HsemotionEngine {
             .context("HSEmotion: tract forward failed")?;
 
         let logits = outputs[0]
-            .as_slice::<f32>()
+            .view().as_slice::<f32>()
             .context("HSEmotion: output nie jest f32")?;
         if logits.len() < EMOTION_LABELS.len() {
             return Err(anyhow!(
@@ -126,6 +126,6 @@ pub fn load(model_path: &Path) -> Result<HsemotionEngine> {
         .into_optimized()?
         .into_runnable()?;
     Ok(HsemotionEngine {
-        model: Arc::new(model),
+        model,
     })
 }

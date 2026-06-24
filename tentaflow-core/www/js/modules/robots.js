@@ -23,7 +23,6 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { decodeLidarFrame } from '/js/protocol/codec.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-badge.js';
@@ -163,7 +162,7 @@ let sharedMapMode = false;
 // subscription leaks on unmount / back / offline / toggle-off.
 // Shape: { unsub:fn|null, closed:bool, resubTimer:number|null, resubUsed:bool,
 //          frameTimes:number[], lastPointCount, lastFrameAtMs,
-//          lastRaw:Uint8Array|null, lastPoints:Float32Array|null,
+//          lastPoints:Float32Array|null,
 //          timing:{atMs,decodeMs,intervalMs,e2eMs,hostMs,netMs}[] }.
 let lidarLive = new Map();
 // Single shared slow timer that re-renders the open detail's LiDAR status so the
@@ -633,20 +632,32 @@ function renderMapSidePanel() {
     })
     .join('');
   // Aggregate occupied-cell counts across robots as a coarse "coverage" proxy.
-  let cells = 0;
-  for (const live of lidarLive.values()) {
-    cells += (live.lastSceneCount | 0) + (live.lastDepthCount | 0);
-  }
+  // Live render metrics: actual voxel counts the GPU renders (from the renderer),
+  // FPS (main-thread rAF), and decode/upload cost — so the bottleneck is visible.
+  const mapN = voxelView?.mapPointCount ? voxelView.mapPointCount() : 0;
+  const ovN = voxelView?.overlayPointCount ? voxelView.overlayPointCount() : 0;
+  const fmt = (n) => Number(n || 0).toLocaleString('pl-PL');
+  const fpsTone = perfStats.fps >= 50 ? 'success' : perfStats.fps >= 25 ? 'warning' : 'danger';
   side.innerHTML = `
     <div class="robots-map-card">
       <h3>Sceny i roboty</h3>
       <div class="robots-map-tree">${rows || '<span class="robots-map-muted">Brak robotów</span>'}</div>
     </div>
     <div class="robots-map-card">
+      <h3>Render</h3>
+      <dl class="robots-map-kv">
+        <dt>FPS</dt><dd><tf-badge tone="${fpsTone}" value="${perfStats.fps}"></tf-badge></dd>
+        <dt>LiDAR voxele</dt><dd>${fmt(mapN)}</dd>
+        <dt>Kamera voxele</dt><dd>${fmt(ovN)}</dd>
+        <dt>Razem na GPU</dt><dd>${fmt(mapN + ovN)}</dd>
+        <dt>Decode</dt><dd>${perfStats.decodeMs.toFixed(1)} ms</dd>
+        <dt>Upload</dt><dd>${perfStats.uploadMs.toFixed(2)} ms</dd>
+      </dl>
+    </div>
+    <div class="robots-map-card">
       <h3>Scena</h3>
       <dl class="robots-map-kv">
         <dt>Roboty</dt><dd>${robots.length}</dd>
-        <dt>Punkty (lidar+kamera)</dt><dd>${cells.toLocaleString('pl-PL')}</dd>
         <dt>Georef</dt><dd>lokalna (brak GPS)</dd>
         <dt>Aktualizacja</dt><dd>na żywo</dd>
       </dl>
@@ -694,17 +705,35 @@ function unionInto(fn, parts) {
     return;
   }
   const stride = total > MAX_RENDER_POINTS ? Math.ceil(total / MAX_RENDER_POINTS) : 1;
+
+  // Fast path: a single cloud within the render cap (the common 1-robot case) — hand
+  // its Float32Array straight to the renderer, no per-frame copy/downsample at all.
+  if (stride === 1 && parts.length === 1) {
+    const [pts, n] = parts[0];
+    try { fn(pts, n); } catch (e) { console.warn('[robots] shared map union render threw:', e?.message ?? e); }
+    return;
+  }
+
   const outN = Math.floor(total / stride);
   const buf = new Float32Array(outN * 3);
   let o = 0; // output point index
-  let gi = 0; // global input point index across all parts
-  for (const [pts, n] of parts) {
-    for (let i = 0; i < n; i += 1, gi += 1) {
-      if (gi % stride !== 0 || o >= outN) continue;
-      buf[o * 3] = pts[i * 3];
-      buf[o * 3 + 1] = pts[i * 3 + 1];
-      buf[o * 3 + 2] = pts[i * 3 + 2];
-      o += 1;
+  if (stride === 1) {
+    // No downsample: bulk-copy each part with a typed-array memcpy instead of an
+    // element-by-element triple-assign.
+    for (const [pts, n] of parts) {
+      buf.set(pts.subarray(0, n * 3), o * 3);
+      o += n;
+    }
+  } else {
+    let gi = 0; // global input point index across all parts
+    for (const [pts, n] of parts) {
+      for (let i = 0; i < n; i += 1, gi += 1) {
+        if (gi % stride !== 0 || o >= outN) continue;
+        buf[o * 3] = pts[i * 3];
+        buf[o * 3 + 1] = pts[i * 3 + 1];
+        buf[o * 3 + 2] = pts[i * 3 + 2];
+        o += 1;
+      }
     }
   }
   try { fn(buf, o); } catch (e) { console.warn('[robots] shared map union render threw:', e?.message ?? e); }
@@ -1105,6 +1134,20 @@ function bindDetailActionRow(shell, id) {
   estop.textContent = 'E-STOP';
   estop.addEventListener('click', () => handleControl(id, 'estop', estop));
   host.appendChild(estop);
+
+  // Clearing the latch has no on-screen path otherwise (the gamepad reset button is
+  // the only one), which strands the robot whenever the pad is absent or disarmed.
+  // `reset_estop` is a NON_CONTROL_KIND, so look it up in the full meta, not the
+  // filtered control surface.
+  if (meta.some((a) => a.kind === 'reset_estop')) {
+    const reset = document.createElement('tf-button');
+    reset.setAttribute('variant', 'outline');
+    reset.setAttribute('icon', 'refresh');
+    reset.dataset.control = 'reset_estop';
+    reset.textContent = 'Reset e-stop';
+    reset.addEventListener('click', () => handleControl(id, 'reset_estop', reset, null, 'Reset e-stop'));
+    host.appendChild(reset);
+  }
 
   const stand = byKind('stand_up') || byKind('recovery_stand') || byKind('balance_stand');
   if (stand && actionParams(stand).length === 0) {
@@ -1703,6 +1746,45 @@ function applyRobotPose(id) {
   }
 }
 
+// Render perf instrumentation. `fps` is measured by a JS rAF on the SAME main
+// thread the wgpu render loop runs on, so a stutter (heavy upload blocking the
+// thread) shows up here. decode/upload are timed in the stream handlers.
+const perfStats = { fps: 0, decodeMs: 0, uploadMs: 0, sceneN: 0, depthN: 0, liveN: 0 };
+let perfRaf = null;
+let perfFrames = 0;
+let perfT0 = 0;
+function startPerfMeter() {
+  if (perfRaf != null) return;
+  perfFrames = 0;
+  perfT0 = performance.now();
+  const tick = (t) => {
+    perfFrames += 1;
+    const dt = t - perfT0;
+    if (dt >= 500) {
+      perfStats.fps = Math.round((perfFrames * 1000) / dt);
+      perfFrames = 0;
+      perfT0 = t;
+      // Surface live metrics: refresh the shared-map panel, else console for the detail.
+      if (sharedMapMode) {
+        try { renderMapSidePanel(); } catch { /* ignore */ }
+      } else if (voxelView) {
+        const m = voxelView.mapPointCount ? voxelView.mapPointCount() : perfStats.sceneN;
+        const o = voxelView.overlayPointCount ? voxelView.overlayPointCount() : perfStats.depthN;
+        console.debug(
+          `[voxel] fps=${perfStats.fps} lidar=${m} kamera=${o} `
+          + `decode=${perfStats.decodeMs.toFixed(1)}ms upload=${perfStats.uploadMs.toFixed(2)}ms`,
+        );
+      }
+    }
+    perfRaf = window.requestAnimationFrame(tick);
+  };
+  perfRaf = window.requestAnimationFrame(tick);
+}
+function stopPerfMeter() {
+  if (perfRaf != null) { window.cancelAnimationFrame(perfRaf); perfRaf = null; }
+  perfStats.fps = 0;
+}
+
 async function ensureVoxel(container) {
   if (!container) return;
   if (voxelView && voxelCanvas && container.contains(voxelCanvas)) return;
@@ -1733,6 +1815,7 @@ async function ensureVoxel(container) {
     }
     voxelView = view;
     voxelCanvas = canvas;
+    startPerfMeter();
     if (ph) ph.hidden = true;
     // Keep the renderer sized to its container.
     voxelResizeObs = new ResizeObserver(() => resizeVoxel());
@@ -1791,6 +1874,7 @@ function disposeVoxel() {
     try { voxelCanvas.remove(); } catch { /* ignore */ }
     voxelCanvas = null;
   }
+  stopPerfMeter();
 }
 
 // =============================================================================
@@ -2333,7 +2417,6 @@ function startRobotLidar(id) {
     frameTimes: [],
     lastPointCount: 0,
     lastFrameAtMs: 0,
-    lastRaw: null,
     lastPoints: null,
     lastScenePoints: null,
     lastSceneCount: 0,
@@ -2424,19 +2507,17 @@ function onSceneChunk(id, live, body) {
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
   if (lidarLive.get(id) !== live) return;
-  let f;
-  try {
-    f = decodeLidarFrame(data);
-  } catch (e) {
-    console.warn('[robots] scene decode failed:', e?.message ?? e);
-    return;
-  }
-  if (!f || !(f.hasFrame ?? f.has_frame)) return;
-  // Stash the authoritative map so a view that mounts AFTER this snapshot (renderer
-  // init is async, and the server skips re-sending an unchanged map) can replay it.
-  live.lastScenePoints = f.points ?? null;
-  live.lastSceneCount = Number(f.pointCount ?? f.point_count ?? 0);
-  renderMap(id, live);
+  const t = performance.now();
+  decodeFrameAsync(`scene:${id}`, data, (f) => {
+    perfStats.decodeMs = performance.now() - t;
+    if (lidarLive.get(id) !== live) return;
+    if (!f || !f.hasFrame) return;
+    // Stash the authoritative map so a view that mounts AFTER this snapshot (renderer
+    // init is async, and the server skips re-sending an unchanged map) can replay it.
+    live.lastScenePoints = f.points ?? null;
+    live.lastSceneCount = Number(f.pointCount ?? 0);
+    renderMap(id, live);
+  });
 }
 
 // A camera depth-map snapshot (`scene:<id>-depth`): same canonical frame as the
@@ -2448,17 +2529,13 @@ function onDepthSceneChunk(id, live, body) {
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
   if (lidarLive.get(id) !== live) return;
-  let f;
-  try {
-    f = decodeLidarFrame(data);
-  } catch (e) {
-    console.warn('[robots] depth-scene decode failed:', e?.message ?? e);
-    return;
-  }
-  if (!f || !(f.hasFrame ?? f.has_frame)) return;
-  live.lastDepthPoints = f.points ?? null;
-  live.lastDepthCount = Number(f.pointCount ?? f.point_count ?? 0);
-  renderOverlay(id, live);
+  decodeFrameAsync(`depth:${id}`, data, (f) => {
+    if (lidarLive.get(id) !== live) return;
+    if (!f || !f.hasFrame) return;
+    live.lastDepthPoints = f.points ?? null;
+    live.lastDepthCount = Number(f.pointCount ?? 0);
+    renderOverlay(id, live);
+  });
 }
 
 // Hard ceiling on points pushed to the wgpu renderer in ONE call. The accumulated
@@ -2487,7 +2564,10 @@ function renderMap(id, live) {
   if (!live.lastScenePoints) return;
   try {
     const [pts, cnt] = capPoints(live.lastScenePoints, live.lastSceneCount);
+    const t = performance.now();
     voxelView.setMapPoints(pts, cnt);
+    perfStats.uploadMs = performance.now() - t;
+    perfStats.sceneN = cnt;
     applyRobotPose(id);
   } catch (e) {
     console.warn('[robots] voxel setMapPoints threw:', e?.message ?? e);
@@ -2503,9 +2583,13 @@ function renderOverlay(id, live) {
   try {
     if (live.depthOn && live.lastDepthPoints) {
       const [pts, cnt] = capPoints(live.lastDepthPoints, live.lastDepthCount);
+      const t = performance.now();
       voxelView.setOverlayPoints(pts, cnt);
+      perfStats.uploadMs = performance.now() - t;
+      perfStats.depthN = cnt;
     } else {
       voxelView.setOverlayPoints(new Float32Array(0), 0);
+      perfStats.depthN = 0;
     }
   } catch (e) {
     console.warn('[robots] voxel setOverlayPoints threw:', e?.message ?? e);
@@ -2585,9 +2669,72 @@ function openDepthSceneSubscription(id, live) {
     });
 }
 
-// A pushed frame: decode the RAW canonical bytes, update live counters + timing,
-// stash the decoded points and feed the wgpu voxel view (if mounted), then refresh
-// the open LiDAR status in place.
+// Off-main-thread frame decode (see lidar-decode-worker.js). One worker owns its own
+// protocol-wasm instance; `decodeFrameAsync` posts a frame's raw bytes (transferable)
+// and runs `cb` on the main thread with the decoded cloud for GPU upload. Latest-wins:
+// a newer frame for the same streamKey supersedes an in-flight one (stale result
+// dropped), so a burst never queues redundant uploads and the main thread never blocks
+// on the ~8 ms i16→world reconstruction.
+let lidarWorker = null;
+let lidarWorkerSeq = 0;
+const lidarDecodePending = new Map(); // id → { streamKey, cb }
+const lidarDecodeBusy = new Set(); // streamKeys with an in-flight worker decode
+const lidarDecodeQueued = new Map(); // streamKey → { buf, cb } latest NOT-YET-posted frame
+
+function ensureLidarWorker() {
+  if (lidarWorker) return lidarWorker;
+  lidarWorker = new Worker(new URL('./lidar-decode-worker.js', import.meta.url), { type: 'module' });
+  lidarWorker.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.fatal) { console.error('[robots] lidar decode worker fatal:', d.fatal); return; }
+    const pend = lidarDecodePending.get(d.id);
+    if (!pend) return;
+    lidarDecodePending.delete(d.id);
+    lidarDecodeBusy.delete(pend.streamKey);
+    // Render the just-decoded frame — it is the freshest DECODED data available.
+    // (Intermediate frames that arrived while the worker was busy were already
+    // dropped BEFORE decode in `decodeFrameAsync`, so this never renders stale work
+    // and a continuous producer can't starve the render: every decode is shown.)
+    pend.cb(d);
+    // If a newer frame is queued, start decoding it now (latest-wins next).
+    const q = lidarDecodeQueued.get(pend.streamKey);
+    if (q) {
+      lidarDecodeQueued.delete(pend.streamKey);
+      postDecode(pend.streamKey, q.buf, q.cb);
+    }
+  };
+  lidarWorker.onerror = (e) => console.error('[robots] lidar decode worker error:', e?.message ?? e);
+  return lidarWorker;
+}
+
+function postDecode(streamKey, buf, cb) {
+  const w = ensureLidarWorker();
+  const reqId = (lidarWorkerSeq += 1);
+  lidarDecodePending.set(reqId, { streamKey, cb });
+  lidarDecodeBusy.add(streamKey);
+  w.postMessage({ id: reqId, streamKey, bytes: buf }, [buf]);
+}
+
+// Decode `data` (a Uint8Array slice of a StreamFrame body) off-thread; `cb(frame)`
+// runs on the main thread with { hasFrame, points, pointCount, frameSeq, ... }. While
+// the worker is busy on this stream the newest frame is COALESCED (older one dropped
+// BEFORE decode), so a fast producer never backs up the worker with stale frames.
+function decodeFrameAsync(streamKey, data, cb) {
+  ensureLidarWorker();
+  // Copy the frame bytes into a fresh transferable buffer NOW (the source may be a
+  // view into a larger WS buffer that gets reused/detached before we post). One small
+  // copy buys a full off-thread decode of the whole cloud.
+  const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  if (lidarDecodeBusy.has(streamKey)) {
+    lidarDecodeQueued.set(streamKey, { buf, cb }); // keep only the newest; drop older
+    return;
+  }
+  postDecode(streamKey, buf, cb);
+}
+
+// A pushed frame: decode the RAW canonical bytes OFF-THREAD, then (on the main
+// thread) update live counters + timing, stash points, feed the wgpu voxel view and
+// refresh the open LiDAR status in place.
 function onLidarChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
   if (body.variant !== 'StreamFrame') return;
@@ -2597,17 +2744,15 @@ function onLidarChunk(id, live, body) {
   const tOnChunk = Date.now() * 1000;
   const arrivalMs = performance.now();
   const intervalMs = live.lastFrameAtMs ? arrivalMs - live.lastFrameAtMs : 0;
-  const decodeStart = performance.now();
-  let f;
-  try {
-    f = decodeLidarFrame(data);
-  } catch (e) {
-    console.warn('[robots] lidar decode failed:', e?.message ?? e);
-    return;
-  }
-  const decodeMs = performance.now() - decodeStart;
-  if (!f || !(f.hasFrame ?? f.has_frame)) return;
-  live.lastPointCount = Number(f.pointCount ?? f.point_count ?? 0);
+  decodeFrameAsync(`lidar:${id}`, data, (f) => onLidarDecoded(id, live, f, tOnChunk, arrivalMs, intervalMs));
+}
+
+// Main-thread continuation once the worker returns a decoded live-lidar frame.
+function onLidarDecoded(id, live, f, tOnChunk, arrivalMs, intervalMs) {
+  if (lidarLive.get(id) !== live) return;
+  const decodeMs = (performance.now() - arrivalMs);
+  if (!f || !f.hasFrame) return;
+  live.lastPointCount = Number(f.pointCount ?? 0);
   live.lastFrameAtMs = arrivalMs;
   live.frameTimes.push(live.lastFrameAtMs);
   const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
@@ -2639,7 +2784,6 @@ function onLidarChunk(id, live, body) {
   const e2eMs = totalMs;
   live.timing.push({ atMs: live.lastFrameAtMs, decodeMs, intervalMs, e2eMs, hostMs, netMs });
   while (live.timing.length && live.timing[0].atMs < cutoff) live.timing.shift();
-  live.lastRaw = f.raw ?? null;
   live.lastPoints = f.points ?? null;
 
   // Feed the wgpu voxel renderer. In shared-map mode union every robot's live
@@ -2885,6 +3029,8 @@ function buildPadSection(host, r) {
         </div>
         <dl class="robots-kv robots-pad-kv">
           <dt>Urządzenie</dt><dd data-pad-rd-id>—</dd>
+          <dt>Stan</dt><dd data-pad-rd-armed>—</dd>
+          <dt>Kierunek</dt><dd data-pad-rd-dir>—</dd>
           <dt>Maks. prędkość</dt><dd data-pad-rd-max>—</dd>
           <dt>Prędkość (rampa)</dt><dd data-pad-rd-speed>—</dd>
           <dt>Pochylenie</dt><dd data-pad-rd-pitch>—</dd>
@@ -3427,6 +3573,37 @@ function renderPadReadout() {
       .map((v, i) => (v > 0.5 ? i : -1))
       .filter((i) => i >= 0);
     buttonsEl.textContent = downIdx.length ? downIdx.join(', ') : '—';
+  }
+
+  // Surface the EXACT arm gate `padTick` uses, so a silently-disarmed pad (input
+  // shows in the readout but the robot never gets a command) explains itself.
+  const armedEl = section.querySelector('[data-pad-rd-armed]');
+  const dirEl = section.querySelector('[data-pad-rd-dir]');
+  const pad = firstGamepad();
+  let reason;
+  if (!on) reason = 'sterowanie padem wyłączone';
+  else if (!pad) reason = 'brak pada';
+  else if (!selectedRobotId) reason = 'brak otwartego robota';
+  else if (!padState || padState.robotId !== selectedRobotId) reason = 'pad przypięty do innego robota';
+  else {
+    const r = findRobot(padState.robotId);
+    if (!r) reason = 'robot nieznany';
+    else if (!isControllable(r.status || '')) reason = `niesterowalny (${r.status || '?'})`;
+    else reason = null;
+  }
+  const armed = reason === null;
+  if (armedEl) {
+    armedEl.textContent = armed ? '● uzbrojony' : `○ ${reason}`;
+    armedEl.dataset.state = armed ? 'live' : 'off';
+  }
+  if (dirEl) {
+    if (pad) {
+      const { fwd, turn } = readPadDirection(pad);
+      const word = (v, pos, neg) => (v > 0 ? pos : v < 0 ? neg : '0');
+      dirEl.textContent = `przód/tył ${word(fwd, '+1 przód', '-1 tył')} · obrót ${word(turn, '+1 lewo', '-1 prawo')}`;
+    } else {
+      dirEl.textContent = '—';
+    }
   }
 }
 

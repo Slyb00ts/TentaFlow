@@ -19,10 +19,12 @@
 
 #![cfg(feature = "camera")]
 
+#[cfg(not(feature = "inference-vision-gpu"))]
 use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(not(feature = "inference-vision-gpu"))]
 use base64::{engine::general_purpose::STANDARD, Engine};
 use dashmap::DashMap;
 use tokio::task::JoinHandle;
@@ -49,11 +51,19 @@ const MAX_DEPTH_M: f32 = 12.0;
 /// voxel grid dedups the rest anyway.
 const PIXEL_STRIDE: usize = 3;
 
-/// Registry of running per-camera loops, so `ensure_depth_mapping` is idempotent
-/// and `stop`/`drain` can abort cleanly.
-fn registry() -> &'static DashMap<String, JoinHandle<()>> {
-    static REG: OnceLock<DashMap<String, JoinHandle<()>>> = OnceLock::new();
-    REG.get_or_init(DashMap::new)
+/// Set of cameras with depth mapping ON — the work-list the SINGLE central worker
+/// iterates each tick. One shared model + ONE GPU launch is amortized across ALL of
+/// them, so adding a camera/robot does NOT spin up another inference loop.
+fn active() -> &'static DashMap<String, ()> {
+    static A: OnceLock<DashMap<String, ()>> = OnceLock::new();
+    A.get_or_init(DashMap::new)
+}
+
+/// The single central batched worker handle. Started lazily by the first active
+/// camera; self-exits when `active` empties; `ensure_depth_mapping` restarts it.
+fn worker() -> &'static std::sync::Mutex<Option<JoinHandle<()>>> {
+    static W: OnceLock<std::sync::Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+    W.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Start the depth-mapping loop for a camera IF mapping is enabled for it (and a
@@ -65,61 +75,87 @@ pub fn ensure_depth_mapping(camera_id: &str) {
     };
     let cfg = match crate::db::repository::camera_depth_mapping_config(&pool, camera_id) {
         Ok(Some(c)) => c,
-        Ok(None) => return,
+        Ok(None) => {
+            active().remove(camera_id);
+            return;
+        }
         Err(e) => {
             warn!("[depth_mapping] config read failed for {camera_id}: {e}");
             return;
         }
     };
-    // Atomic check-and-spawn: hold the entry across the liveness check + insert so
-    // two concurrent calls (hydrate racing pushed-camera re-register) can't both
-    // spawn a loop and leak the loser as an untracked duplicate.
-    use dashmap::mapref::entry::Entry;
-    match registry().entry(camera_id.to_string()) {
-        Entry::Occupied(mut e) => {
-            if !e.get().is_finished() {
-                return; // a live loop already owns this camera
-            }
-            info!(
-                "[depth_mapping] restarting loop camera={} robot={} fps={} fov={:.0}",
-                cfg.camera_id, cfg.robot_id, cfg.fps, cfg.fov_deg
-            );
-            e.insert(tokio::spawn(run_loop(cfg)));
-        }
-        Entry::Vacant(e) => {
-            info!(
-                "[depth_mapping] starting loop camera={} robot={} fps={} fov={:.0}",
-                cfg.camera_id, cfg.robot_id, cfg.fps, cfg.fov_deg
-            );
-            e.insert(tokio::spawn(run_loop(cfg)));
-        }
+    // Pre-load + autotune the native depth model ONCE, off the loop (the first GPU
+    // forward compiles kernels, ~20 s on wgpu). Doing it here — as soon as ANY camera
+    // enables depth mapping, before frames/pose flow — means the loop's first real
+    // frame is already fast instead of stalling on autotune.
+    #[cfg(feature = "inference-vision-gpu")]
+    {
+        static PREWARM: std::sync::Once = std::sync::Once::new();
+        PREWARM.call_once(|| {
+            std::thread::spawn(|| {
+                if let Err(e) = crate::vision::depth_anything::prewarm() {
+                    warn!("[depth_mapping] depth prewarm failed: {e}");
+                }
+            });
+        });
+    }
+    // Add this camera to the work-list and make sure the single central worker is
+    // running. The worker batches ALL active cameras into one forward per tick.
+    let newly = active().insert(camera_id.to_string(), ()).is_none();
+    if newly {
+        info!(
+            "[depth_mapping] camera {} enabled (robot={} fov={:.0}) — {} active",
+            cfg.camera_id,
+            cfg.robot_id,
+            cfg.fov_deg,
+            active().len()
+        );
+    }
+    let mut w = worker().lock().unwrap_or_else(|e| e.into_inner());
+    if w.as_ref().map(|h| h.is_finished()).unwrap_or(true) {
+        *w = Some(tokio::spawn(central_worker()));
     }
 }
 
-/// Stop one camera's depth-mapping loop (camera removed / mapping disabled).
+/// Disable depth mapping for one camera (removed / toggled off). The central worker
+/// stays alive idling on an empty work-list; `drain` stops it at shutdown.
 pub fn stop_depth_mapping(camera_id: &str) {
-    if let Some((_, h)) = registry().remove(camera_id) {
+    active().remove(camera_id);
+}
+
+/// Stop all depth mapping (process shutdown). Mirrors `vision_analysis::drain`.
+pub fn drain() {
+    active().clear();
+    if let Some(h) = worker().lock().unwrap_or_else(|e| e.into_inner()).take() {
         h.abort();
     }
 }
 
-/// Abort every depth-mapping loop (process shutdown). Mirrors `vision_analysis::drain`.
-pub fn drain() {
-    let keys: Vec<String> = registry().iter().map(|e| e.key().clone()).collect();
-    for k in keys {
-        if let Some((_, h)) = registry().remove(&k) {
-            h.abort();
-        }
-    }
+/// One camera's per-tick inputs, gathered before the shared batched forward.
+struct Job {
+    cfg: DepthMappingConfig,
+    pose: Pose,
+    rgb: std::sync::Arc<[u8]>,
+    w: u32,
+    h: u32,
 }
 
-async fn run_loop(initial: DepthMappingConfig) {
-    let camera_id = initial.camera_id.clone();
-    let interval = Duration::from_millis((1000 / initial.fps.max(1)) as u64);
+/// Central batched depth worker. Each tick it gathers the FRESHEST frame + pose from
+/// EVERY active depth-mapped camera, runs ONE batched forward (GPU: a single
+/// `[N,3,518,518]` launch amortized across all sources; HTTP: per-camera serial),
+/// and folds each resulting cloud into its robot's scene. Model-paced with
+/// frame-skip (always the latest frame, intermediates dropped). Exits when no camera
+/// is active — `ensure_depth_mapping` restarts it.
+async fn central_worker() {
+    // Native depth is in-process + fast (~30 ms/batch) — let the MODEL pace the loop,
+    // not an artificial fps cap; a tight tick + `Skip` keeps each pass on the freshest
+    // frames. The HTTP path is heavier/remote, so pace it slower.
+    #[cfg(feature = "inference-vision-gpu")]
+    let interval = Duration::from_millis(33);
+    #[cfg(not(feature = "inference-vision-gpu"))]
+    let interval = Duration::from_millis(500);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Bound each request so a hung depth endpoint skips the tick instead of
-    // wedging the loop forever (inference is heavy but should finish in seconds).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -129,65 +165,83 @@ async fn run_loop(initial: DepthMappingConfig) {
     loop {
         tick.tick().await;
 
-        // Re-read config each tick so live edits (the FOV calibration knob, robot
-        // binding, disable) take effect WITHOUT a restart — the calibration workflow
-        // depends on tuning FOV against the lidar cloud in real time. `None` ⇒ mapping
-        // was disabled or the camera removed ⇒ exit the loop (frees the registry slot;
-        // `ensure_depth_mapping` restarts it if re-enabled). `fps` change needs a
-        // re-enable (the tick interval is fixed at spawn).
-        let cfg = match crate::db::global_pool()
-            .and_then(|p| crate::db::repository::camera_depth_mapping_config(&p, &camera_id).ok())
-            .flatten()
-        {
-            Some(c) => c,
-            None => return,
-        };
+        let cams: Vec<String> = active().iter().map(|e| e.key().clone()).collect();
+        if cams.is_empty() {
+            continue; // idle — stay alive so a re-enabled camera needs no restart race
+        }
 
-        // A pose is mandatory: without the camera's scene pose the cloud cannot be
-        // placed in the map frame. Uses the POSE SOURCE robot (may differ from the
-        // store id during calibration). Skip quietly until that robot is localized.
-        let Some(pose) = SlamSceneManager::global().latest_scene_pose(&cfg.pose_robot_id) else {
+        // Gather one job per camera that has a live config + pose + frame. Config is
+        // re-read each tick so live edits (FOV/pitch/scale calibration, robot binding,
+        // disable) take effect with no restart.
+        let t_gather = std::time::Instant::now();
+        let mut jobs: Vec<Job> = Vec::with_capacity(cams.len());
+        for cam in &cams {
+            let Some(cfg) = crate::db::global_pool()
+                .and_then(|p| crate::db::repository::camera_depth_mapping_config(&p, cam).ok())
+                .flatten()
+            else {
+                active().remove(cam); // mapping turned off / camera gone
+                continue;
+            };
+            let Some(pose) = SlamSceneManager::global().latest_scene_pose(&cfg.pose_robot_id) else {
+                continue; // robot not localized yet
+            };
+            let Some((rgb, w, h)) =
+                crate::addon::host_functions::camera::latest_frame_global(cam).await
+            else {
+                continue; // no frame yet
+            };
+            jobs.push(Job { cfg, pose, rgb, w, h });
+        }
+        if jobs.is_empty() {
             continue;
-        };
-        let Some((rgb, w, h)) =
-            crate::addon::host_functions::camera::latest_frame_global(&cfg.camera_id).await
-        else {
-            continue;
-        };
-        let Some(endpoint) = resolve_depth_endpoint() else {
-            continue;
-        };
-        let Some(jpeg) = encode_jpeg(&rgb, w, h) else {
-            continue;
-        };
+        }
+        let t_pull_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
 
-        let depth = match request_depth(&client, &endpoint, &jpeg).await {
-            Ok(d) => d,
-            Err(e) => {
-                debug!("[depth_mapping] depth request failed ({}): {e}", cfg.camera_id);
+        // ONE batched inference across all gathered cameras.
+        let t_infer = std::time::Instant::now();
+        let depths = acquire_depth_batch(&jobs, &client).await;
+        let t_infer_ms = t_infer.elapsed().as_secs_f64() * 1000.0;
+
+        // Per-camera back-project + fold into each robot's scene.
+        let t_rest = std::time::Instant::now();
+        let mut total_pts = 0usize;
+        for (job, depth) in jobs.iter().zip(depths) {
+            let Some(depth) = depth else { continue };
+            if !depth.is_metric {
+                // A non-metric model can't build a metre-scaled map — drop this camera
+                // from the work-list instead of burning a batch slot on it every tick.
+                warn!(
+                    "[depth_mapping] non-metric depth for {} — disabling its mapping (deploy a *-Metric-* model)",
+                    job.cfg.camera_id
+                );
+                active().remove(&job.cfg.camera_id);
                 continue;
             }
-        };
-        if !depth.is_metric {
-            // A non-metric model can't produce a lidar-compatible (metre-scaled) map.
-            // Stop the loop entirely rather than burn GPU on results we always discard;
-            // deploying a metric model + re-registering the camera restarts it (the
-            // finished handle lets `ensure_depth_mapping` spawn a fresh loop).
-            warn!(
-                "[depth_mapping] depth service model is not metric — stopping mapping for {} \
-                 (deploy a *-Metric-* / ZoeDepth model to build a map from this camera)",
-                cfg.camera_id
-            );
-            return;
+            let points =
+                backproject_to_scene(&depth, job.cfg.fov_deg, job.cfg.pitch_deg, job.cfg.scale, &job.pose);
+            if points.is_empty() {
+                continue;
+            }
+            seq = seq.wrapping_add(1);
+            let frame = encode_lidar_frame(&points, MAP_RESOLUTION_M, seq, depth_timestamp_us());
+            SlamSceneManager::global().on_lidar_frame(&job.cfg.robot_id, &frame);
+            total_pts += points.len() / 3;
         }
+        let t_rest_ms = t_rest.elapsed().as_secs_f64() * 1000.0;
 
-        let points = backproject_to_scene(&depth, cfg.fov_deg, cfg.pitch_deg, cfg.scale, &pose);
-        if points.is_empty() {
-            continue;
-        }
-        seq = seq.wrapping_add(1);
-        let frame = encode_lidar_frame(&points, MAP_RESOLUTION_M, seq, depth_timestamp_us());
-        SlamSceneManager::global().on_lidar_frame(&cfg.robot_id, &frame);
+        // Batch-level host latency breakdown. The browser logs net + decode + render
+        // separately (`[lidar latency]`).
+        info!(
+            "[depth_pipeline] batch={n} pull={pull:.1} infer={infer:.1} \
+             backproject+fold={rest:.1} host_total={tot:.1}ms pts={pts}",
+            n = jobs.len(),
+            pull = t_pull_ms,
+            infer = t_infer_ms,
+            rest = t_rest_ms,
+            tot = t_pull_ms + t_infer_ms + t_rest_ms,
+            pts = total_pts,
+        );
     }
 }
 
@@ -200,8 +254,62 @@ struct DepthMap {
     depth: Vec<f32>,
 }
 
+/// Metric depth for a BATCH of camera frames, in input order. GPU build: one
+/// `[N,3,518,518]` Burn forward (zero IPC) on a blocking thread — the whole point of
+/// batching is one GPU launch for all sources. A per-frame failure is `None` at that
+/// slot (the batch as a whole succeeds or all-`None`).
+#[cfg(feature = "inference-vision-gpu")]
+async fn acquire_depth_batch(jobs: &[Job], _client: &reqwest::Client) -> Vec<Option<DepthMap>> {
+    let inputs: Vec<(std::sync::Arc<[u8]>, u32, u32)> =
+        jobs.iter().map(|j| (j.rgb.clone(), j.w, j.h)).collect();
+    let n = inputs.len();
+    let result = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&[u8], u32, u32)> =
+            inputs.iter().map(|(r, w, h)| (r.as_ref(), *w, *h)).collect();
+        crate::vision::depth_anything::infer_global_batch(&refs)
+    })
+    .await;
+    match result {
+        Ok(Ok(maps)) => maps
+            .into_iter()
+            .map(|(depth, width, height)| Some(DepthMap { width, height, is_metric: true, depth }))
+            .collect(),
+        Ok(Err(e)) => {
+            debug!("[depth_mapping] batch depth inference failed: {e}");
+            (0..n).map(|_| None).collect()
+        }
+        Err(e) => {
+            debug!("[depth_mapping] batch depth join failed: {e}");
+            (0..n).map(|_| None).collect()
+        }
+    }
+}
+
+/// HTTP build (no GPU vision stack): the local `depth` service is per-request, so the
+/// "batch" is just each camera in turn.
+#[cfg(not(feature = "inference-vision-gpu"))]
+async fn acquire_depth_batch(jobs: &[Job], client: &reqwest::Client) -> Vec<Option<DepthMap>> {
+    let mut out = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        let endpoint = match resolve_depth_endpoint() {
+            Some(e) => e,
+            None => {
+                out.push(None);
+                continue;
+            }
+        };
+        let depth = match encode_jpeg(&j.rgb, j.w, j.h) {
+            Some(jpeg) => request_depth(client, &endpoint, &jpeg).await.ok(),
+            None => None,
+        };
+        out.push(depth);
+    }
+    out
+}
+
 /// Resolve a running local `depth` service endpoint (Running first, then Degraded),
 /// mirroring `web_research::resolve_local_service_endpoint`. `None` when none is up.
+#[cfg(not(feature = "inference-vision-gpu"))]
 fn resolve_depth_endpoint() -> Option<String> {
     let pool = crate::db::global_pool()?;
     let conn = pool.read().ok()?;
@@ -228,6 +336,7 @@ fn resolve_depth_endpoint() -> Option<String> {
 
 /// Encode an RGB24 buffer as JPEG (small payload, lossless detail is irrelevant
 /// for depth). `None` on a size mismatch or encoder error.
+#[cfg(not(feature = "inference-vision-gpu"))]
 fn encode_jpeg(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     if w == 0 || h == 0 || rgb.len() != (w as usize) * (h as usize) * 3 {
         return None;
@@ -241,6 +350,7 @@ fn encode_jpeg(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 /// POST a JPEG to the depth service `/v1/depth` and parse the f32 depth map.
+#[cfg(not(feature = "inference-vision-gpu"))]
 async fn request_depth(
     client: &reqwest::Client,
     endpoint: &str,

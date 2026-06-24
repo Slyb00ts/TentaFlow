@@ -21,15 +21,15 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std", 
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 
 # Secret material zeroization on drop.
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 
 # UFP/2 compression per §8 — lz4 frame format (not raw block). Pure Rust.
-lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+lz4_flex = { version = "0.13.1", default-features = false, features = ["frame"] }
 
 [dev-dependencies]
 # Deterministic CSPRNG for sign/verify tests.
 rand_core = { version = "0.6", features = ["getrandom"] }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "canonical_bench"

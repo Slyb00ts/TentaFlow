@@ -34,7 +34,7 @@ use tracing::info;
 use super::resize::resize_rgb_image;
 use super::OcrRunner;
 
-type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 /// Laduje model ONNX PP-OCRv5 z USTALONYM rozmiarem wejscia (NCHW f32).
 ///
@@ -47,7 +47,7 @@ type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn
 /// nie unifikuje sie z `1`. Czyscimy wiec wszystkie fakty wyjsc posrednich
 /// (kasujac symboliczne podpowiedzi z `value_info`) i pozwalamy tractowi
 /// wywnioskowac ksztalty wylacznie z konkretnego wejscia.
-fn load_fixed_input(path: &Path, h: u32, w: u32) -> Result<Runnable> {
+fn load_fixed_input(path: &Path, h: u32, w: u32) -> Result<Arc<Runnable>> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
         .with_context(|| format!("tract: PP-OCRv5 ONNX z {}", path.display()))?;
@@ -122,7 +122,7 @@ struct TextBox {
 }
 
 struct DetSession {
-    model: Runnable,
+    model: Arc<Runnable>,
     /// Statyczny rozmiar wejscia wyznaczony z `DET_LIMIT_SIDE`.
     input_side: u32,
 }
@@ -137,7 +137,7 @@ pub struct OnnxOcrEngine {
     // jest stabilne na std::OnceLock, a budowa sesji moze sie nie powiesc (I/O).
     det: Mutex<Option<Arc<DetSession>>>,
     rec: Mutex<Option<Arc<Runnable>>>,
-    cls: Mutex<Option<Arc<Option<Runnable>>>>,
+    cls: Mutex<Option<Option<Arc<Runnable>>>>,
 }
 
 impl OnnxOcrEngine {
@@ -198,14 +198,13 @@ impl OnnxOcrEngine {
         if let Some(s) = slot.as_ref() {
             return Ok(s.clone());
         }
-        let model = load_fixed_input(&self.rec_path, REC_INPUT_H, REC_INPUT_W)
+        let session = load_fixed_input(&self.rec_path, REC_INPUT_H, REC_INPUT_W)
             .with_context(|| format!("tract: PP-OCRv5 rec z {}", self.rec_path.display()))?;
-        let session = Arc::new(model);
         *slot = Some(session.clone());
         Ok(session)
     }
 
-    fn cls_session(&self) -> Result<Arc<Option<Runnable>>> {
+    fn cls_session(&self) -> Result<Option<Arc<Runnable>>> {
         let mut slot = self.cls.lock();
         if let Some(s) = slot.as_ref() {
             return Ok(s.clone());
@@ -218,9 +217,8 @@ impl OnnxOcrEngine {
                 Some(model)
             }
         };
-        let session = Arc::new(built);
-        *slot = Some(session.clone());
-        Ok(session)
+        *slot = Some(built.clone());
+        Ok(built)
     }
 
     /// Pelny pipeline na obrazku RGB: det -> (cls) -> rec -> konkatenacja linii.
@@ -303,7 +301,7 @@ impl OnnxOcrEngine {
             .run(tvec!(input.into()))
             .context("onnx-ocr: det forward")?;
         let prob = outputs[0]
-            .as_slice::<f32>()
+            .view().as_slice::<f32>()
             .context("onnx-ocr: det output nie jest f32")?;
         // DB zwraca (1,1,side,side) — mapa prawdopodobienstwa.
         if prob.len() < (side * side) as usize {
@@ -358,7 +356,7 @@ impl OnnxOcrEngine {
             .run(tvec!(input.into()))
             .context("onnx-ocr: cls forward")?;
         let logits = outputs[0]
-            .as_slice::<f32>()
+            .view().as_slice::<f32>()
             .context("onnx-ocr: cls output nie jest f32")?;
         // PP-OCRv5 cls: 2 klasy [0, 180]. Softmax i sprawdzenie progu na "180".
         if logits.len() >= 2 {
@@ -407,7 +405,7 @@ impl OnnxOcrEngine {
         let t_steps = shape[1];
         let classes = shape[2];
         let data = out
-            .as_slice::<f32>()
+            .view().as_slice::<f32>()
             .context("onnx-ocr: rec output nie jest f32")?;
 
         Ok(ctc_greedy_decode(

@@ -14,17 +14,17 @@ tentaflow-protocol = { path = "../tentaflow-protocol" }
 
 # WASM bindings
 wasm-bindgen = "=0.2.120"
-js-sys = "0.3.97"
+js-sys = "0.3.102"
 web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
 
 # SDK spec types for UI channel CBOR encode/decode
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
 minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
 # LZ4 block decode for the lidar wire body (matches the host's encoder features).
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
+lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-decode"] }
 
 # serde_json — for browser-side payload construction
-serde_json = "1"
+serde_json = "1.0.150"
 
 # Ed25519 identity (node keypair) — generowany w browser i persistowany w localStorage
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["rand_core"] }

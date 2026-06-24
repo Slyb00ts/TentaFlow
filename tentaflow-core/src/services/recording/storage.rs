@@ -67,7 +67,7 @@ pub fn camera_subdir(base: &Path, camera_id: &str, kind: RecordingKind) -> PathB
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Camera ids accepted by the recording API. F1a stays permissive: non-empty,

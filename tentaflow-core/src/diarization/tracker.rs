@@ -697,12 +697,12 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn test_pool() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
-        Arc::new(Mutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     fn dummy_emb(seed: f32) -> Vec<f32> {

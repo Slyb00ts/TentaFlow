@@ -7894,6 +7894,8 @@ mod tests {
                     current: Some(-2.1),
                     temperature: Some(36.0),
                 }),
+                pose_position: vec![1.0, 2.0, 0.31],
+                pose_orientation: vec![0.0, 0.0, 0.0, 1.0],
             }),
             lidar: Some(RobotLidarStatus {
                 enabled: true,

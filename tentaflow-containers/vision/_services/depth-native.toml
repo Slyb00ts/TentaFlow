@@ -1,0 +1,39 @@
+# =============================================================================
+# Plik: depth-native.toml
+# Opis: Natywny (in-process) serwis szacowania GŁĘBI — Depth Anything V2 Metric
+#       uruchamiany BEZPOŚREDNIO w Rust przez Burn (cubecl: CUDA/Metal/ROCm,
+#       wgpu/Vulkan fallback). Architektura wkompilowana w binarkę (build-time
+#       ONNX→Burn codegen), deploy embedded TYLKO rejestruje serwis + model w
+#       registry (żeby inne nody w mesh wiedziały) i pobiera wagi `.bpk` — nie
+#       odpala osobnego procesu ani portu. To samo podejście co llama.cpp/whisper.
+#       Konsumowany wewnętrznie: kamera → metryczna głębia → chmura punktów →
+#       wspólna mapa (zero IPC, zero HTTP/JSON). Zastępuje serwis Python `depth`
+#       na węzłach z GPU (vision-gpu).
+# =============================================================================
+
+[engine]
+id = "depth-native"
+category = "vision"
+name = "Głębia natywna (Depth Anything V2, Burn)"
+description_pl = "Metryczna głębia z obrazu w czystym Rust (Burn, GPU) — bez Pythona, HTTP i JSON. ~27 ms/klatkę. Buduje chmurę punktów i mapę 3D z samej kamery, in-process."
+description_en = "Metric monocular depth fully in Rust (Burn, GPU) — no Python/HTTP/JSON, ~27 ms/frame. Builds a point cloud + 3D map from a single camera, in-process."
+homepage = "https://github.com/DepthAnything/Depth-Anything-V2"
+license = "apache-2.0"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "v2-metric-2026"
+service_surfaces = ["depth"]
+input_modalities = ["image"]
+output_modalities = ["image"]
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-vision-gpu"
+
+[[model_preset]]
+id = "depth-anything-v2-metric-indoor-small"
+display_name = "DA V2 Metric Indoor Small (518, Burn)"
+repo = "https://models.tentaflow.local/depth/depth-anything-v2-metric/v1"
+recommended = true

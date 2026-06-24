@@ -295,7 +295,7 @@ pub fn blob_content_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// Pakuje pojedynczy blob do zip-a (jedna pozycja `name`) — do transferu mesh
@@ -709,7 +709,7 @@ pub fn coco_content_hash(dir: &Path) -> anyhow::Result<String> {
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// B-side (odbiorca komendy mesh `MlTrainStart`): startuje trening na LOKALNYM

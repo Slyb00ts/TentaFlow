@@ -10,7 +10,7 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -80,7 +80,7 @@ impl PickupVerifyError {
 /// HMAC-SHA256 over `payload_b64` ASCII bytes. Returning a Vec keeps the API
 /// independent of the underlying digest size (32 bytes).
 pub(crate) fn hmac_sign(key: &[u8], payload_b64: &str) -> Vec<u8> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key any size");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC key any size");
     mac.update(payload_b64.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }

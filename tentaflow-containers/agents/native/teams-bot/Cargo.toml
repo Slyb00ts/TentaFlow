@@ -12,7 +12,7 @@ path = "src/main.rs"
 # Protokol i transport iroh
 tentaflow-protocol = { path = "../../../../tentaflow-protocol" }
 tentaflow-transport = { path = "../../../../tentaflow-transport" }
-iroh = { version = "=1.0.0-rc.1", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
 
 # Async runtime
 tokio = { version = "1.52.2", features = ["full"] }

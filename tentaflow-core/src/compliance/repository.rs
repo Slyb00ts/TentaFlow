@@ -18,7 +18,7 @@ fn now_utc() -> String {
 fn hash_text(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn default_record_id(org_id: &str, base_id: &str) -> String {

@@ -38,7 +38,7 @@ const NMS_IOU_THRESHOLD: f32 = 0.4;
 const STRIDES: [u32; 3] = [8, 16, 32];
 const NUM_ANCHORS: usize = 2;
 
-type RunnableScrfd = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type RunnableScrfd = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 pub struct ScrfdEngine {
     model: Arc<RunnableScrfd>,
@@ -60,7 +60,7 @@ impl ScrfdEngine {
             .into_optimized()?
             .into_runnable()?;
         Ok(Self {
-            model: Arc::new(model),
+            model,
         })
     }
 }
@@ -188,14 +188,14 @@ impl FaceDetector for ScrfdEngine {
 
             let scores = score
                 .tensor
-                .as_slice::<f32>()
+                .view().as_slice::<f32>()
                 .context("SCRFD: score tensor nie jest f32")?;
             let bboxes = bbox
                 .tensor
-                .as_slice::<f32>()
+                .view().as_slice::<f32>()
                 .context("SCRFD: bbox tensor nie jest f32")?;
             let kps_slice = match kps {
-                Some(k) => k.tensor.as_slice::<f32>().ok(),
+                Some(k) => k.tensor.view().as_slice::<f32>().ok(),
                 None => None,
             };
 

@@ -95,11 +95,28 @@ pub struct SlamSceneManager {
     /// robot's `SlamService` (set before the robot ever streams) and is applied to the
     /// service on creation; also the source the persistence layer serializes.
     anchors: DashMap<String, GeoAnchor>,
+    /// Per-robot map-change signal. `on_lidar_frame` fires it whenever a fold advances
+    /// the map generation, so the scene-push pump streams the new snapshot AS SOON AS a
+    /// frame is processed (event-driven) instead of polling on a fixed timer.
+    change: DashMap<String, std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl SlamSceneManager {
     fn new() -> Self {
-        Self { robots: DashMap::new(), anchors: DashMap::new() }
+        Self {
+            robots: DashMap::new(),
+            anchors: DashMap::new(),
+            change: DashMap::new(),
+        }
+    }
+
+    /// The map-change notifier for `robot_id` (created on first use). The scene-push
+    /// pump awaits it; `on_lidar_frame` fires `notify_one` on every real map change.
+    pub fn change_notifier(&self, robot_id: &str) -> std::sync::Arc<tokio::sync::Notify> {
+        self.change
+            .entry(robot_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .clone()
     }
 
     /// Process-wide singleton.
@@ -188,11 +205,19 @@ impl SlamSceneManager {
             slam.last_frame_us = gp.timestamp_us;
             // Bump generation only if this frame actually changed the occupied set; a
             // pre-fused sensor re-sending the same cells must not churn the push.
+            let prev_gen = slam.generation;
             slam.sync_generation();
+            let changed = slam.generation != prev_gen;
             // Only surface a GlobalPose once a real device pose has been adopted; the
             // frame path otherwise carries the identity seed pose.
             if slam.has_pose {
                 slam.latest_global = Some(gp);
+            }
+            drop(slam);
+            // Wake the scene-push pump immediately when the map actually changed, so a
+            // freshly processed frame reaches the front without waiting for a timer.
+            if changed {
+                self.change_notifier(robot_id).notify_one();
             }
         }
     }

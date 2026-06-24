@@ -688,6 +688,14 @@ pub fn execute_robot_call(
     };
     match exec {
         Ok(json) => {
+            // The wasm block/tool call SUCCEEDS (Ok) even when the addon REFUSES the
+            // action in-band (e-stop latched, robot offline, data-channel send failed):
+            // the refusal is an `{"error": ...}` in the result body. Without surfacing
+            // it, a rejected move is reported as success and the operator sees a ✓ toast
+            // while the robot never receives the command.
+            if let Some(err) = robot_call_inband_error(&json) {
+                return RobotControlResponse::failed(err);
+            }
             if read_only {
                 match serde_json::to_string(&json) {
                     Ok(s) => RobotControlResponse::ok_with(s),
@@ -699,6 +707,23 @@ pub fn execute_robot_call(
         }
         Err(e) => RobotControlResponse::failed(e.to_string()),
     }
+}
+
+/// Extract an addon-reported in-band error from a robot call result. The go2 TOOL
+/// path returns the raw result (`{"error": ...}`); the BLOCK path nests its result
+/// under `meta.go2`. Returns the error string when the action was refused.
+fn robot_call_inband_error(json: &serde_json::Value) -> Option<String> {
+    fn err_str(v: &serde_json::Value) -> Option<String> {
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+    err_str(json).or_else(|| {
+        json.get("meta")
+            .and_then(|m| m.get("go2"))
+            .and_then(err_str)
+    })
 }
 
 #[cfg(test)]

@@ -92,6 +92,18 @@ const BUNDLES: &[CvBundle] = &[
             },
         ],
     },
+    CvBundle {
+        // Depth Anything V2 Metric (Burn). Architecture is compiled in; only the
+        // `.bpk` weights are distributed. Deploying `depth-native` (embedded) provisions
+        // this file into `vision_models_dir()` and registers the service for mesh
+        // discovery. Host the .bpk at the release URL.
+        engine_id: "depth-native",
+        files: &[CvFile {
+            name: "depth-anything-v2-metric.bpk",
+            remote: true,
+            embedded: None,
+        }],
+    },
 ];
 
 /// True when `engine_id` is one of the camera-CV pipeline services. Lets the

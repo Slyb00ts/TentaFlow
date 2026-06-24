@@ -8504,16 +8504,6 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
     set(&obj, "timestamp_us", (header.timestamp_us as f64).into());
     set(&obj, "hostSendUs", (header.host_send_us as f64).into());
     set(&obj, "host_send_us", (header.host_send_us as f64).into());
-    // Raw canonical frame = header + UNCOMPRESSED body. For an LZ4 frame this
-    // reconstructs the inflated canonical bytes so downstream (the L4 GPU upload)
-    // never sees the compressed wire form. The LZ4 flag is CLEARED in the rebuilt
-    // header so `raw` is a self-consistent uncompressed frame — re-decoding it must
-    // not try to inflate an already-inflated body.
-    let mut raw = Vec::with_capacity(LIDAR_HEADER_LEN + body.len());
-    raw.extend_from_slice(&bytes[..LIDAR_HEADER_LEN]);
-    raw.extend_from_slice(body);
-    raw[tentaflow_sdk_spec::LIDAR_FLAGS_OFFSET] &= !tentaflow_sdk_spec::LIDAR_FLAG_LZ4_BODY;
-    set(&obj, "raw", js_sys::Uint8Array::from(&raw[..]).into());
     // World-space XYZ as a Float32Array (what the renderer uploads). We build a
     // Rust `Vec<f32>` first and hand it over with a SINGLE bulk `Float32Array::from`
     // copy — per-element `set_index` across the wasm/JS boundary was the dominant
