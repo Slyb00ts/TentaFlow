@@ -4447,11 +4447,6 @@ pub async fn service_redeploy(
         }
     };
 
-    // Reużywamy ZAPISANY config_json (zero re-pick). Pusty/uszkodzony JSON =>
-    // pusty obiekt, żeby deploy nie wywrócił się na danych z bazy.
-    let user_config: serde_json::Value =
-        serde_json::from_str(&row.config_json).unwrap_or_else(|_| serde_json::json!({}));
-
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
     })?;
@@ -4462,64 +4457,145 @@ pub async fn service_redeploy(
         user_id.as_deref(),
         "service.redeploy",
         Some(&row.engine_id),
-        Some(&format!(
-            "service_id={} force={}",
-            payload.service_id, payload.force_if_active_sessions
-        )),
+        Some(&format!("service_id={}", payload.service_id)),
     );
 
-    // Stop + usuń stary serwis PRZED świeżym deployem — bez tego zostałby
-    // duplikat wiersza i dwa równoległe procesy/kontenery na tym samym porcie.
-    // Reużywamy tę samą ścieżkę co handler `ServiceDeleteRequest`
-    // (stop best-effort → delete row → rebuild katalogu → broadcast Removed).
-    let stop_err = crate::services::deploy::stop(&row, port_allocator.clone())
-        .await
-        .err()
-        .map(|e| e.to_string());
-    if let Some(err) = stop_err.as_deref() {
-        tracing::warn!(target: "tentaflow::deploy", service_id = payload.service_id, error = err, "redeploy: stop old service failed (continuing)");
-    }
-    {
+    let engine_id = row.engine_id.clone();
+    let deploy_method = row.deploy_method;
+    let deploy_method_tag = row.deploy_method.as_db_tag().to_string();
+
+    let failed = |message: &str| {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ResRedeploy(
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: "failed".to_string(),
+                deploy_id: String::new(),
+                engine_id: engine_id.clone(),
+                deploy_method: deploy_method_tag.clone(),
+                node_id: ctx.state.local_node_id.to_string(),
+                message: message.to_string(),
+            },
+        ))
+    };
+
+    // (1) Atomowy claim per-service: ustaw status='deploying' tylko gdy serwis
+    // NIE jest już w trakcie redeployu. To serializacja na poziomie bazy —
+    // drugi równoległy klik odbije się jako in_progress, bez insertu drugiego
+    // wiersza/kontenera. Stary status czytamy w TEJ SAMEJ transakcji co UPDATE
+    // (P2: bez tego współbieżna zmiana statusu między read a claim mogłaby zostać
+    // nadpisana przez późniejszy restore).
+    let prev_status = {
         let conn = ctx
             .state
             .db
             .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-        crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+        crate::services_repo::services::claim_for_redeploy(&conn, payload.service_id)
+            .map_err(db_err)?
+    };
+    let prev_status = match prev_status {
+        Some(s) => s,
+        None => {
+            return Ok(MessageBody::DeploymentBody(
+                tentaflow_protocol::DeploymentPayload::ResRedeploy(
+                    tentaflow_protocol::ServiceRedeployResponse {
+                        status: "in_progress".to_string(),
+                        deploy_id: String::new(),
+                        engine_id: engine_id.clone(),
+                        deploy_method: deploy_method_tag.clone(),
+                        node_id: ctx.state.local_node_id.to_string(),
+                        message: "redeploy already running".to_string(),
+                    },
+                ),
+            ));
+        }
+    };
+
+    // Dwie fazy obsługi błędu po udanym claimie:
+    //
+    // `restore_status` — błąd PRZED rozpoczęciem stopu (parse config). Stary
+    // runtime jest NIETKNIĘTY, więc bezpiecznie oddajemy wiersz na poprzedni
+    // status (np. z powrotem `running`).
+    let restore_status = |status: crate::services_repo::services::ServiceStatus| {
+        if let Ok(conn) = ctx.state.db.write() {
+            let _ = crate::services_repo::services::set_status(&conn, payload.service_id, status);
+        }
+    };
+    // `mark_dead` — błąd PO UDANYM stopie (np. create_redeploy_job). Stary runtime
+    // jest na pewno UBITY, więc NIE wolno przywracać `running` (DB kłamałaby o żywym
+    // serwisie) — `failed` + czyszczenie stale pól runtime'u (pid/port/endpoint).
+    let mark_dead = |err_msg: &str| {
+        if let Ok(conn) = ctx.state.db.write() {
+            let _ = crate::services_repo::services::mark_failed_clear_runtime(
+                &conn,
+                payload.service_id,
+                err_msg,
+            );
+        }
+    };
+    // `mark_failed_alive` — stop NIE potwierdził ubicia (native proces nadal żyje /
+    // kontener nie zniknął). Runtime MOŻE wciąż żyć → `failed`, ale ZACHOWUJEMY
+    // pid/port, bo zerowanie ich osierociłoby żywy proces (brak danych do cleanup,
+    // a supervisor/redeploy odpaliłby drugi runtime obok).
+    let mark_failed_alive = |err_msg: &str| {
+        if let Ok(conn) = ctx.state.db.write() {
+            let _ = crate::services_repo::services::mark_failed_keep_runtime(
+                &conn,
+                payload.service_id,
+                err_msg,
+            );
+        }
+    };
+
+    // (4) Zły zapisany config_json: nie podstawiamy `{}` (zgubiłoby parametry /
+    // enc api_key i wdrożyłoby pusty serwis) — przywracamy status i raportujemy.
+    // To błąd PRZED stopem → runtime nietknięty → restore.
+    let user_config: serde_json::Value = match serde_json::from_str(&row.config_json) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            restore_status(prev_status);
+            return Ok(failed("invalid stored config"));
+        }
+    };
+
+    // (2) Stop jako PRECONDITION: stary kontener/proces musi faktycznie zniknąć
+    // przed świeżym deployem. `stop_checked` weryfikuje, że kontenera/procesu już
+    // nie ma (dwa runtime'y GPU naraz = OOM). Padło → runtime MOŻE wciąż żyć →
+    // `failed` ale ZACHOWUJEMY pid/port (zerowanie osierociłoby żywy proces).
+    if let Err(err) = crate::services::deploy::stop_checked(&row, port_allocator.clone()).await {
+        tracing::warn!(target: "tentaflow::deploy", service_id = payload.service_id, error = %err, "redeploy: could not stop existing runtime");
+        mark_failed_alive(&format!("redeploy stop failed: {}", err));
+        return Ok(failed("could not stop existing runtime"));
     }
-    ctx.state.router.rebuild_catalog();
-    broadcast_service_change(
-        ctx,
-        tentaflow_protocol::ServiceChange::Removed {
-            service_id: payload.service_id,
-        },
-    );
 
-    // Wiersz DB trzyma już sparsowany `DeployMethod` — bierzemy go wprost,
-    // bez ponownego mapowania z wire-tagu (zachowujemy oryginalny tryb deployu).
-    let deploy_method = row.deploy_method;
-
-    let job = crate::services::deploy::create_deploy_job(
+    // (3) Reuse wiersza: NIE delete + NIE create_deploy_job (insert duplikatu).
+    // `create_redeploy_job` aktualizuje TEN sam wiersz (nowy active_deploy_id,
+    // config_json), a `deploy()`→`commit`→`finish_deploy_in_tx` trafia w ten
+    // service_id. Stop już się powiódł (runtime ubity), więc błąd setupu też NIE
+    // restore `running` — wiersz na `failed` + czyszczenie runtime'u.
+    let job = match crate::services::deploy::create_redeploy_job(
         deploy_method,
         &manifest,
         &user_config,
         &ctx.state.db,
         ctx.state.local_node_id.as_ref(),
         user_id.as_deref(),
-        None,
-    )
-    .map_err(|e| ProtocolError::internal(e.to_string()))?;
+        payload.service_id,
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            mark_dead(&format!("redeploy setup failed: {}", e));
+            return Ok(failed(&format!("redeploy setup failed: {}", e)));
+        }
+    };
 
     if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
         &ctx.state.db,
         job.service_id,
         ctx.state.local_node_id.as_ref(),
     ) {
-        broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Added(info));
+        broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Updated(info));
     }
 
-    let engine_id = row.engine_id.clone();
-    let deploy_method_tag = row.deploy_method.as_db_tag().to_string();
     let slug = spawn_deploy_pipeline(ctx, job, deploy_method, &manifest, &user_config, port_allocator);
 
     Ok(MessageBody::DeploymentBody(

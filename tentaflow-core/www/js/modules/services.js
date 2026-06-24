@@ -322,7 +322,6 @@ function bindTabEvents() {
       try {
         const resp = await ApiBinary.one('serviceRedeployRequest', {
           serviceId: Number(svcId),
-          forceIfActiveSessions: false,
         });
         const status = resp?.status || '';
         if (status === 'started' && resp.deployId) {
