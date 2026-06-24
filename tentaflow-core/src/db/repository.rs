@@ -20080,6 +20080,7 @@ pub struct CameraPatch {
     /// `analysis_flow_id`: `Some(None)` clears the binding (disables mapping).
     pub depth_robot_id: Option<Option<String>>,
     pub depth_camera_fov_deg: Option<f64>,
+    pub depth_camera_fov_v_deg: Option<f64>,
     pub depth_fps: Option<i64>,
     /// Pose source robot. Tri-state: `Some(None)` clears (merged: pose == store id).
     pub depth_pose_robot_id: Option<Option<String>>,
@@ -20723,11 +20724,27 @@ pub struct DepthMappingConfig {
     /// calibration (camera reuses another robot's pose, stores under its own id).
     pub pose_robot_id: String,
     pub fov_deg: f32,
+    /// Vertical field of view (deg). `0` ⇒ square pixels (`fy = fx`); a positive value
+    /// decouples vertical from horizontal (the depth model's 518² frame is stretched
+    /// from the camera's wide 16:9 stream, so the true vertical FOV is far narrower).
+    pub fov_v_deg: f32,
     pub fps: u32,
     /// Camera mount pitch (deg) vs body forward — corrects a down-angled camera.
     pub pitch_deg: f32,
     /// Metric scale correction for the (approximate) monocular depth.
     pub scale: f32,
+}
+
+/// Vertical FOV is optional: `0` (or non-positive) means "square pixels" (`fy = fx`);
+/// any real value is clamped to a sane optics range.
+#[cfg(feature = "camera")]
+fn clamp_fov_v(v: f64) -> f32 {
+    let v = v as f32;
+    if v <= 0.0 {
+        0.0
+    } else {
+        v.clamp(20.0, 150.0)
+    }
 }
 
 /// Reads the depth-mapping config for one camera, or `None` when mapping is off,
@@ -20740,16 +20757,16 @@ pub fn camera_depth_mapping_config(
     camera_id: &str,
 ) -> Result<Option<DepthMappingConfig>> {
     let conn = acquire(pool)?;
-    let row: Option<(i64, Option<String>, f64, i64, Option<String>, f64, f64)> = conn
+    let row: Option<(i64, Option<String>, f64, i64, Option<String>, f64, f64, f64)> = conn
         .query_row(
             "SELECT depth_mapping_enabled, depth_robot_id, depth_camera_fov_deg, depth_fps, \
-             depth_pose_robot_id, depth_camera_pitch_deg, depth_scale \
+             depth_pose_robot_id, depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg \
              FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
             rusqlite::params![camera_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )
         .optional()?;
-    let Some((enabled, robot_id, fov, fps, pose_robot_id, pitch, scale)) = row else {
+    let Some((enabled, robot_id, fov, fps, pose_robot_id, pitch, scale, fov_v)) = row else {
         return Ok(None);
     };
     if enabled == 0 {
@@ -20767,6 +20784,7 @@ pub fn camera_depth_mapping_config(
         robot_id,
         pose_robot_id,
         fov_deg: (fov as f32).clamp(20.0, 150.0),
+        fov_v_deg: clamp_fov_v(fov_v),
         fps: (fps.clamp(1, 10)) as u32,
         pitch_deg: (pitch as f32).clamp(-89.0, 89.0),
         scale: (scale as f32).clamp(0.1, 10.0),
@@ -20780,7 +20798,7 @@ pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfi
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT camera_id, depth_robot_id, depth_camera_fov_deg, depth_fps, depth_pose_robot_id, \
-         depth_camera_pitch_deg, depth_scale \
+         depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg \
          FROM cameras \
          WHERE depth_mapping_enabled = 1 AND depth_robot_id IS NOT NULL \
            AND depth_robot_id <> '' AND removed_at IS NULL",
@@ -20797,6 +20815,7 @@ pub fn list_depth_mapping_cameras(pool: &DbPool) -> Result<Vec<DepthMappingConfi
                 robot_id,
                 pose_robot_id,
                 fov_deg: (r.get::<_, f64>(2)? as f32).clamp(20.0, 150.0),
+                fov_v_deg: clamp_fov_v(r.get::<_, f64>(7)?),
                 fps: (r.get::<_, i64>(3)?.clamp(1, 10)) as u32,
                 pitch_deg: (r.get::<_, f64>(5)? as f32).clamp(-89.0, 89.0),
                 scale: (r.get::<_, f64>(6)? as f32).clamp(0.1, 10.0),
@@ -20900,6 +20919,10 @@ pub fn update_camera(
     }
     if let Some(v) = patch.depth_camera_fov_deg {
         sets.push("depth_camera_fov_deg = ?");
+        params.push(Box::new(v));
+    }
+    if let Some(v) = patch.depth_camera_fov_v_deg {
+        sets.push("depth_camera_fov_v_deg = ?");
         params.push(Box::new(v));
     }
     if let Some(v) = patch.depth_fps {

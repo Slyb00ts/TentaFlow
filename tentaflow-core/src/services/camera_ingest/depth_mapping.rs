@@ -43,8 +43,10 @@ use crate::services::slam_scene::SlamSceneManager;
 const MAP_RESOLUTION_M: f32 = 0.05;
 
 /// Drop depth samples beyond this range (m). Monocular metric models grow noisy
-/// far out; near walls/objects carry the useful structure for an indoor map.
-const MAX_DEPTH_M: f32 = 12.0;
+/// far out AND the camera's wide lens makes a pinhole back-projection over-spread far
+/// edge pixels into a diagonal "spray"; near walls/objects carry the useful structure
+/// for an indoor map. 6 m keeps ~all reliable depth (Go2 indoor p90 ≈ 2.7 m).
+const MAX_DEPTH_M: f32 = 6.0;
 
 /// Pixel stride when sampling the depth map. A dense map (e.g. 504×378 ≈ 190k px)
 /// is decimated to keep the per-frame cloud near a LiDAR's point budget; the
@@ -92,16 +94,19 @@ pub fn ensure_depth_mapping(camera_id: &str) {
     {
         static PREWARM: std::sync::Once = std::sync::Once::new();
         PREWARM.call_once(|| {
-            // Large stack for the same reason as acquire_depth_batch: the burn-generated
-            // `forward()` frame overruns a default thread stack in debug builds.
-            let _ = std::thread::Builder::new()
-                .name("depth-prewarm".into())
-                .stack_size(64 * 1024 * 1024)
-                .spawn(|| {
-                    if let Err(e) = crate::vision::depth_anything::prewarm() {
-                        warn!("[depth_mapping] depth prewarm failed: {e}");
-                    }
-                });
+            // Prewarm the model on the shared inference thread (not a one-off thread), so
+            // its first forward runs on the same thread/cubecl state as real inference.
+            tokio::spawn(async {
+                match crate::vision::burn_backend::run_blocking(
+                    crate::vision::depth_anything::prewarm,
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("[depth_mapping] depth prewarm failed: {e}"),
+                    Err(e) => warn!("[depth_mapping] depth prewarm thread dropped: {e}"),
+                }
+            });
         });
     }
     // Add this camera to the work-list and make sure the single central worker is
@@ -223,8 +228,15 @@ async fn central_worker() {
                 active().remove(&job.cfg.camera_id);
                 continue;
             }
-            let points =
-                backproject_to_scene(&depth, job.cfg.fov_deg, job.cfg.pitch_deg, job.cfg.scale, &job.pose);
+            maybe_dump_calibration(&depth, job);
+            let points = backproject_to_scene(
+                &depth,
+                job.cfg.fov_deg,
+                job.cfg.fov_v_deg,
+                job.cfg.pitch_deg,
+                job.cfg.scale,
+                &job.pose,
+            );
             if points.is_empty() {
                 continue;
             }
@@ -400,6 +412,62 @@ async fn request_depth(
     Ok(DepthMap { width, height, is_metric, depth })
 }
 
+/// One-shot calibration capture (env `TENTAFLOW_CALIB_DUMP=1`): writes the raw metric
+/// depth map + camera pose + current (fov,pitch,scale) and the real robot's accumulated
+/// lidar cloud (ground truth) to `/tmp/tf_calib/{depth,lidar}.bin`. Lets the offline
+/// `depth_calib` example optimize the extrinsics against lidar without the robot live.
+fn maybe_dump_calibration(depth: &DepthMap, job: &Job) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if std::env::var("TENTAFLOW_CALIB_DUMP").is_err() {
+        return;
+    }
+    let lidar = match SlamSceneManager::global().snapshot(&job.cfg.pose_robot_id) {
+        Some(s) if s.points.len() >= 300 => s.points, // need a real lidar cloud to fit against
+        _ => return,
+    };
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let dir = std::path::Path::new("/tmp/tf_calib");
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let t = job.pose.translation();
+    let q = job.pose.quat_xyzw();
+    let mut d = Vec::with_capacity(64 + depth.depth.len() * 4);
+    d.extend_from_slice(&0x4445_5054u32.to_le_bytes()); // "DEPT"
+    d.extend_from_slice(&depth.width.to_le_bytes());
+    d.extend_from_slice(&depth.height.to_le_bytes());
+    for v in [job.cfg.fov_deg, job.cfg.pitch_deg, job.cfg.scale] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in t {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in q {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &depth.depth {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut l = Vec::with_capacity(8 + lidar.len() * 4);
+    l.extend_from_slice(&0x4C49_4441u32.to_le_bytes()); // "LIDA"
+    l.extend_from_slice(&((lidar.len() / 3) as u32).to_le_bytes());
+    for v in &lidar {
+        l.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::write(dir.join("depth.bin"), &d);
+    let _ = std::fs::write(dir.join("lidar.bin"), &l);
+    info!(
+        "[depth_calib] dumped capture: depth {}x{}, lidar {} pts, pose t={:?} -> /tmp/tf_calib",
+        depth.width,
+        depth.height,
+        lidar.len() / 3,
+        t
+    );
+}
+
 /// Back-project a metric depth map into the robot's SCENE frame.
 ///
 /// Intrinsics come from the horizontal FOV (no per-camera calibration table yet):
@@ -412,6 +480,7 @@ async fn request_depth(
 fn backproject_to_scene(
     depth: &DepthMap,
     fov_deg: f32,
+    fov_v_deg: f32,
     pitch_deg: f32,
     scale: f32,
     pose: &Pose,
@@ -424,7 +493,14 @@ fn backproject_to_scene(
     let cx = depth.width as f32 / 2.0;
     let cy = depth.height as f32 / 2.0;
     let fx = (depth.width as f32 / 2.0) / (fov_deg.to_radians() / 2.0).tan();
-    let fy = fx;
+    // Vertical FOV is decoupled when set (>0): the depth model runs on a square frame
+    // STRETCHED from the camera's wide 16:9 stream, so the true vertical FOV is far
+    // narrower than the horizontal. `0` ⇒ square pixels (legacy `fy = fx`).
+    let fy = if fov_v_deg > 0.0 {
+        (depth.height as f32 / 2.0) / (fov_v_deg.to_radians() / 2.0).tan()
+    } else {
+        fx
+    };
     // Mount-pitch rotation about the body LEFT (+Y) axis. Sign convention: NEGATIVE
     // pitch tilts the forward +X ray DOWN (toward -Z) — the Go2 camera case — and
     // positive tilts up. (Angle negated so the forward ray's bz = bx*sin(pitch).)
@@ -511,7 +587,7 @@ mod tests {
         // x_opt=y_opt=(0-1.5)*2/1.5=-2, z_opt=2 → body (z,-x,-y)=(2,2,2) → world (2,2,2).
         // The key invariant: depth maps to +X (forward) in the Z-up body/scene frame.
         let dm = flat_depth(3, 3, 2.0);
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
         assert_eq!(pts.len(), 3, "one sampled pixel → one point");
         assert!((pts[0] - 2.0).abs() < 1e-4, "x forward = depth, got {}", pts[0]);
         assert!((pts[1] - 2.0).abs() < 1e-4, "y from -x_opt, got {}", pts[1]);
@@ -525,7 +601,7 @@ mod tests {
         // (0,0) and (3,3); pixel (3,3) sits at cx=cy=3.0 → optical (0,0,d) →
         // body (d,0,0) → world (d,0,0).
         let dm = flat_depth(6, 6, 4.0);
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
         // Find the on-axis point (the one with ~zero y and z).
         let mut found = false;
         for p in pts.chunks_exact(3) {
@@ -541,7 +617,7 @@ mod tests {
     fn out_of_range_and_nonfinite_depth_dropped() {
         let mut dm = flat_depth(3, 3, f32::NAN);
         dm.depth[4] = 0.0; // centre zero → dropped
-        let pts = backproject_to_scene(&dm, 90.0, 0.0, 1.0, &Pose::identity());
+        let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
         assert!(pts.is_empty(), "no finite in-range samples → empty cloud");
     }
 

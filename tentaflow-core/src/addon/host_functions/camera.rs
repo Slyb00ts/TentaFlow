@@ -415,14 +415,16 @@ pub fn camera_register_backed_v1(
     // A robot that backs its camera (e.g. Go2) gets depth → map, but kept SEPARATE
     // from its LiDAR cloud for calibration: cloud stored under `<addon>-depth`,
     // placed with the robot's own pose (`<addon>`), so the two clouds can be overlaid
-    // and the FOV / scale tuned against the LiDAR ground truth. FOV defaults to a
-    // wide-angle 120° guess (Go2 front lens) — calibrate live via `depth_camera_fov_deg`.
-    // Non-fatal + idempotent: the camera is already live if this fails.
+    // and verified against the LiDAR ground truth. Camera intrinsics (H/V FOV) come from
+    // the ADDON, which knows its own lens — so they persist across re-registration
+    // instead of needing per-session live calibration. `None` ⇒ core's wide-angle
+    // default (and square pixels). Non-fatal + idempotent.
     let depth_patch = CameraPatch {
         depth_mapping_enabled: Some(true),
         depth_robot_id: Some(Some(format!("{addon_id}-depth"))),
         depth_pose_robot_id: Some(Some(addon_id.clone())),
-        depth_camera_fov_deg: Some(120.0),
+        depth_camera_fov_deg: Some(input.camera_fov_deg.unwrap_or(120.0) as f64),
+        depth_camera_fov_v_deg: input.camera_fov_v_deg.map(|v| v as f64),
         ..Default::default()
     };
     if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
@@ -2556,6 +2558,7 @@ pub fn camera_update_v1(
         depth_mapping_enabled: None,
         depth_robot_id: None,
         depth_camera_fov_deg: None,
+        depth_camera_fov_v_deg: None,
         depth_fps: None,
         depth_pose_robot_id: None,
         depth_camera_pitch_deg: None,
