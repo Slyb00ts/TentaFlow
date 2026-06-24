@@ -987,14 +987,22 @@ pub fn encode_deployment_log_stream_request(
     .map_err(|e| JsError::new(&e))
 }
 
-// `encodeServiceRedeployRequest` was removed alongside the legacy
-// `DeploymentPayload::ReqRedeploy` variant — Krok N2 keeps deploy as a one-shot
-// request; rerunning a deploy is "delete service + deploy fresh".
-#[allow(dead_code)]
-fn _service_redeploy_request_removed() -> Result<Vec<u8>, JsError> {
-    Err(JsError::new(
-        "encodeServiceRedeployRequest removed in Krok N2",
+/// Redeploy in-place: backend reużywa zapisany `config_json` serwisu, więc
+/// frontend wysyła tylko `service_id` + flagę wymuszenia mimo aktywnych sesji.
+#[wasm_bindgen(js_name = encodeServiceRedeployRequest)]
+pub fn encode_service_redeploy_request(
+    service_id: f64,
+    force_if_active_sessions: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ReqRedeploy(
+            tentaflow_protocol::ServiceRedeployRequest {
+                service_id: service_id as i64,
+                force_if_active_sessions,
+            },
+        ),
     ))
+    .map_err(|e| JsError::new(&e))
 }
 
 // ---- Meeting VNC tunnel (same-node websockify bridge) ----
@@ -9935,8 +9943,21 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "containerName", e.container_name.into());
             set(obj, "errorMessage", e.error_message.into());
             set(obj, "durationMs", e.duration_ms.clone().into());
-        } // ReqRedeploy/ResRedeploy were removed when DeploymentPayload was
-          // trimmed; kept as a comment so future searches find the change.
+        }
+        DP::ReqRedeploy(req) => {
+            set(obj, "variant", "ServiceRedeployRequest".into());
+            set(obj, "serviceId", (req.service_id as f64).into());
+            set(obj, "forceIfActiveSessions", req.force_if_active_sessions.into());
+        }
+        DP::ResRedeploy(resp) => {
+            set(obj, "variant", "ServiceRedeployResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "deployId", resp.deploy_id.into());
+            set(obj, "engineId", resp.engine_id.into());
+            set(obj, "deployMethod", resp.deploy_method.into());
+            set(obj, "nodeId", resp.node_id.into());
+            set(obj, "message", resp.message.into());
+        }
     }
 }
 

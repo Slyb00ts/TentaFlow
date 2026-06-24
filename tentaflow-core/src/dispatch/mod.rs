@@ -855,6 +855,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::DeploymentPayload::ReqLogStream(_) => "DeploymentLogStreamRequest",
             tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
             tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
+            tentaflow_protocol::DeploymentPayload::ReqRedeploy(_) => "ServiceRedeployRequest",
+            tentaflow_protocol::DeploymentPayload::ResRedeploy(_) => "ServiceRedeployResponse",
         },
         MessageBody::ServiceBody(p) => match p {
             tentaflow_protocol::ServicePayload::ReqList(_) => "ServiceListRequest",
