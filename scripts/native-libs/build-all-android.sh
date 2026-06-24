@@ -22,7 +22,7 @@ Uzycie:
 
 Opcje:
   --platform <id>    Buduj tylko jeden target: android-arm64 | android-armv7 | android-x86_64
-  --only <name>      Buduj tylko: zvec | llama-cpp | whisper-cpp
+  --only <name>      Buduj tylko: zvec | llama-cpp | whisper-cpp | pdfium
   --api <level>      Android API level dla NDK/CMake (domyslnie 26)
   --cache <dir>      Katalog cache dla zrodel i buildow
 
@@ -143,6 +143,9 @@ for platform in "${PLATFORMS[@]}"; do
   run_step zvec "$SCRIPT_DIR/build-zvec.sh" "$platform"
   run_step llama-cpp "$SCRIPT_DIR/build-llama-cpp.sh" "$platform"
   run_step whisper-cpp "$SCRIPT_DIR/build-whisper-cpp.sh" "$platform"
+  # pdfium (rasteryzacja PDF w RAG) — prebuilt android-arm64/armv7/x86_64.
+  # PDF musi działać też na telefonie, więc krok bezwarunkowy.
+  run_step pdfium "$SCRIPT_DIR/build-pdfium.sh" "$platform"
   copy_android_runtime "$platform"
 
   echo "Gotowe: $NATIVE_ROOT/$platform"

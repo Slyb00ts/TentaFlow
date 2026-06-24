@@ -202,7 +202,7 @@ async function loadEntries() {
 function prependLiveEvent(ev) {
   entries.unshift({
     id: 0,
-    timestamp: new Date((ev.tsEpoch || 0) * 1000).toISOString(),
+    timestamp: new Date(Number(ev.tsEpoch || 0) * 1000).toISOString(),
     action: ev.eventKind,
     userId: null,
     addonId: null,

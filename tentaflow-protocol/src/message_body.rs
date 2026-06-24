@@ -64,7 +64,7 @@ pub struct ModelSummary {
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
-#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServiceModelEntry {
     pub model_name: String,
     pub display_name: Option<String>,
@@ -72,6 +72,15 @@ pub struct ServiceModelEntry {
     pub context_length: Option<u32>,
     pub quantization: Option<String>,
     pub is_default: bool,
+    /// Powierzchnie usługi (`chat`/`documents`/`embeddings`/…) policzone przez
+    /// anonsujący node z JEGO manifestu (`effective_service_surfaces`). Peer
+    /// może NIE mieć manifestu tego silnika (np. zdalny model na innym zestawie
+    /// kontenerów), a `category` typu `vision` nie mapuje się na ServiceSurface —
+    /// dlatego anonsujemy surfaces WPROST, by zdalny model był resolwowalny
+    /// (np. nemotron-parse: category=vision, surface=chat). `#[serde(default)]`
+    /// zachowuje kompat ze starszymi peerami, którzy tego pola nie wysyłają.
+    #[serde(default)]
+    pub service_surfaces: Vec<String>,
 }
 
 /// Runtime view of one deployed service. Aggregates the `services` row with

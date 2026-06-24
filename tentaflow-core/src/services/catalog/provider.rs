@@ -217,6 +217,14 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             let mut svc_surfaces: HashSet<ServiceSurface> = HashSet::new();
             let mut svc_inputs: HashSet<InputModality> = HashSet::new();
             let mut svc_outputs: HashSet<OutputModality> = HashSet::new();
+            // Surfaces anonsowane przez właściciela (policzone z JEGO manifestu)
+            // są autorytatywne — działają nawet gdy TEN node nie ma manifestu
+            // silnika, a `category` (np. `vision`) nie mapuje się na ServiceSurface.
+            for s in &model.service_surfaces {
+                if let Some(v) = ServiceSurface::from_wire_str(s) {
+                    svc_surfaces.insert(v);
+                }
+            }
             if let Some(m) = manifest {
                 // Wiersz modelu moze nosic nazwe presetu (`p.id`, lokalne
                 // silniki) albo realny identyfikator API providera (`p.repo`,

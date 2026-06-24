@@ -20,6 +20,9 @@ import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
 
+// Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
+const SHOW_ENGINE_COL = false;
+
 let services = [];
 let aliases = [];
 let meshNodes = [];
@@ -313,8 +316,8 @@ function bindTabEvents() {
       const nodeId = b.dataset.svcNode || undefined;
       const deployMethod = b.dataset.svcMethod || undefined;
       if (!engineId) return;
-      // Ten sam kreator wdrozenia co w katalogu — pozwala wybrac model/parametry
-      // i wdrozyc serwis ponownie ze zaktualizowanego zrodla bundla.
+      // Kreator wdrozenia pre-targetowany na ten silnik/wezel — wdraza serwis
+      // ponownie ze zaktualizowanego zrodla bundla.
       import('/js/modules/catalog/engine-deploy-wizard.js').then((mod) => {
         mod.openDeployWizard(engineId, { nodeId, deployMethod });
       });
@@ -661,11 +664,10 @@ function renderListTab() {
       <thead>
         <tr>
           <th>${escapeHtml(I18n.t('services.col_node'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_engine'))}</th>
+          ${SHOW_ENGINE_COL ? `<th>${escapeHtml(I18n.t('services.col_engine'))}</th>` : ''}
           <th>${escapeHtml(I18n.t('services.col_display_name'))}</th>
           <th>${escapeHtml(I18n.t('services.col_category'))}</th>
           <th>${escapeHtml(I18n.t('services.col_status'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_endpoint'))}</th>
           <th>${escapeHtml(I18n.t('services.col_models'))}</th>
           <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
@@ -744,9 +746,6 @@ function renderRow(s) {
   const deployProgress = statusInfo.key === 'deploying'
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(String(Math.max(0, Math.min(100, deployPct))))}%</div>`
     : '';
-  const endpoint = s.endpoint_url
-    ? `<code style="font-size:11px;" title="${escapeAttr(s.endpoint_url)}">${escapeHtml(truncateMiddle(s.endpoint_url, 36))}</code>`
-    : '<span style="color:var(--text-3);">—</span>';
   const models = Array.isArray(s.models) ? s.models : [];
   const modelChips = models.length === 0
     ? '<span style="color:var(--text-3);">—</span>'
@@ -767,11 +766,6 @@ function renderRow(s) {
   // update_available (snake_case z protokolu binarnego) = zdeployowany bundle
   // rozni sie od aktualnego zrodla w binarce, wiec serwis trzeba wdrozyc ponownie.
   const updateAvailable = !!s.update_available;
-  const updateBadge = updateAvailable
-    ? `<tf-chip status="warn" icon="alert"
-          style="margin-top:4px;"
-          title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
-    : '';
 
   const displayName = s.display_name || s.engine_id || '';
   const engineLabel = s.engine_id || '';
@@ -807,15 +801,17 @@ function renderRow(s) {
   const svcNodeLabel = escapeAttr(nodeInfo.label);
   const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
   const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
-  // Akcja redeploy widoczna tylko gdy zrodlo bundla sie zmienilo — otwiera ten
-  // sam kreator wdrozenia co katalog, dla danego silnika i wezla.
-  const redeployAction = updateAvailable
-    ? `<tf-button variant="ghost" size="sm" icon="rotate"
+  // Badge "Aktualizacja dostepna" jest klikalny — otwiera kreator wdrozenia
+  // (pre-targetowany na ten silnik/wezel) zeby wdrozyc serwis ponownie ze
+  // zaktualizowanego zrodla bundla (handler [data-svc-redeploy]).
+  const updateBadge = updateAvailable
+    ? `<tf-chip status="warn" icon="alert" clickable
+          style="cursor:pointer;"
           data-svc-redeploy="${svcId}"
           data-svc-engine="${escapeAttr(s.engine_id || '')}"
           data-svc-method="${escapeAttr(s.deploy_method || '')}"
           data-svc-node="${svcNodeId}"
-          title="${escapeAttr(I18n.t('services.btn_redeploy'))}"></tf-button>`
+          title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
     : '';
   const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
   const deployAction = deployId
@@ -829,9 +825,9 @@ function renderRow(s) {
   return `
     <tr data-key="${rowKey}">
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
+      ${SHOW_ENGINE_COL ? `<td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
         <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
-      </td>
+      </td>` : ''}
       <td data-label="${escapeAttr(I18n.t('services.col_display_name'))}">
         ${escapeHtml(displayName)}
       </td>
@@ -839,12 +835,13 @@ function renderRow(s) {
         <span class="scope-chip ${categoryChipClass(category)}">${escapeHtml(category.toUpperCase() || '—')}</span>
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
-        <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
-        ${updateBadge}
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+          ${updateBadge}
+        </div>
         ${progressBadge}
         ${deployProgress}
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
         <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
       </td>
@@ -869,7 +866,6 @@ function renderRow(s) {
           data-svc-engine="${escapeAttr(s.engine_id || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
-        ${redeployAction}
         ${deployAction}
         <tf-button variant="danger" size="sm" icon="trash"
           data-svc-delete="${svcId}"
@@ -881,13 +877,6 @@ function renderRow(s) {
       </td>
     </tr>
   `;
-}
-
-// Truncate a long string in the middle so both prefix and suffix remain visible.
-function truncateMiddle(value, max) {
-  if (!value || value.length <= max) return value || '';
-  const half = Math.floor((max - 1) / 2);
-  return value.slice(0, half) + '…' + value.slice(value.length - half);
 }
 
 // ---- Aliases tab ----------------------------------------------------------

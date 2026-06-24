@@ -338,6 +338,17 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        // Vision-chat (VLM przez /v1/chat/completions, np. nemotron-parse) — peer
+        // forwarduje obraz strony w VisionPayload. Bez tego ramienia parse PDF z
+        // węzła bez lokalnego modelu vision padał (catch-all). Mesh hop binarny;
+        // route_vision_via_protocol gada z lokalnym serwisem przez REST.
+        ModelPayload::Vision(ref vision_payload) => {
+            match router.route_vision_via_protocol(vision_payload).await {
+                Ok(response) => response,
+                Err(e) => make_error_response(request_id, &format!("Blad vision: {}", e)),
+            }
+        }
+
         _ => make_error_response(
             request_id,
             &format!(

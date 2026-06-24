@@ -72,15 +72,31 @@ pub fn project_service_row(
     local_node_id: &str,
 ) -> Result<ServiceInfo> {
     let model_rows = services_repo::models::list_for_service(conn, svc.id)?;
+    // Manifest TEGO silnika (anonsujący node go ma) — liczymy z niego
+    // service_surfaces per model i wysyłamy WPROST, żeby peer bez manifestu
+    // (albo z `category` nie-mapowalną jak `vision`) mógł resolwować zdalny model.
+    let engine_manifest = crate::services::manifest::registry().by_id(&svc.engine_id);
     let models: Vec<ServiceModelEntry> = model_rows
         .into_iter()
-        .map(|m| ServiceModelEntry {
-            model_name: m.model_name,
-            display_name: m.display_name,
-            capabilities: parse_capabilities_array(&m.capabilities),
-            context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
-            quantization: m.quantization,
-            is_default: m.is_default,
+        .map(|m| {
+            let service_surfaces = engine_manifest
+                .map(|em| {
+                    let preset = em
+                        .model_presets
+                        .iter()
+                        .find(|p| p.id == m.model_name || p.repo == m.model_name);
+                    em.engine.effective_service_surfaces(preset)
+                })
+                .unwrap_or_default();
+            ServiceModelEntry {
+                model_name: m.model_name,
+                display_name: m.display_name,
+                capabilities: parse_capabilities_array(&m.capabilities),
+                context_length: m.context_length.and_then(|v| u32::try_from(v).ok()),
+                quantization: m.quantization,
+                is_default: m.is_default,
+                service_surfaces,
+            }
         })
         .collect();
 

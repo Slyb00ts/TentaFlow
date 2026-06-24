@@ -918,14 +918,22 @@ impl ModelRuntimeExecutor {
                 ..
             } => {
                 use tentaflow_protocol::*;
-                let protocol_messages =
-                    crate::routing::openai_messages_to_protocol(&request.messages);
-                let model_request = ModelRequest {
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    payload: ModelPayload::Completion(CompletionPayload {
+                // Vision-chat (np. nemotron-parse): CompletionPayload niesie tylko
+                // tekst, więc obraz zgubiłby się na hopie mesh. Gdy request niesie
+                // obraz, forwardujemy jako ModelPayload::Vision (peer ma ramię
+                // Vision -> route_vision_via_protocol). Inaczej zwykły Completion.
+                let payload = if crate::routing::messages_have_image(&request.messages) {
+                    ModelPayload::Vision(VisionPayload {
+                        model: model_name.clone(),
+                        messages: crate::routing::openai_messages_to_vision(&request.messages),
+                        max_tokens: request.max_tokens,
+                        temperature: request.temperature,
+                    })
+                } else {
+                    ModelPayload::Completion(CompletionPayload {
                         model: model_name.clone(),
                         prompt: None,
-                        messages: protocol_messages,
+                        messages: crate::routing::openai_messages_to_protocol(&request.messages),
                         temperature: request.temperature,
                         max_tokens: request.max_tokens,
                         top_p: request.top_p,
@@ -937,7 +945,11 @@ impl ModelRuntimeExecutor {
                         audio_input: None,
                         prefix_cache_id: None,
                         prefix_text: None,
-                    }),
+                    })
+                };
+                let model_request = ModelRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    payload,
                     stream: false,
                     metadata: None,
                     session_id: None,
@@ -1738,77 +1750,74 @@ impl ModelRuntimeExecutor {
         if crate::services::document::is_pdf_mime(&request.mime) {
             return self.execute_documents_pdf(request, ctx).await;
         }
-        let outcome = {
-            let snapshot = self.catalog.snapshot();
-            let req = ResolveRequest {
-                requested_model: &request.model,
-                required_surface: ServiceSurface::Documents,
-                required_input_modalities: &[InputModality::Image],
-                required_output_modalities: &[OutputModality::Text],
-            };
-            self.resolver.resolve(&req, &snapshot, ctx)?
+        // Vision-parse to model CHAT (VLM przez /v1/chat/completions, np.
+        // nemotron-parse — zgodnie z NVIDIA nv-ingest, które serwuje
+        // nemoretriever-parse jako VLM na /v1/chat/completions z obrazem). Budujemy
+        // vision-chat request (obraz strony jako image_url base64 + instrukcja) i
+        // idziemy przez `execute_chat`: resolve Chat-surface, Local→HTTP
+        // /v1/chat/completions, MeshForward→ModelPayload::Vision (obraz ZACHOWANY
+        // przez mesh — binarnie). Markdown = tekst odpowiedzi. Detektory
+        // YOLOX/table/OCR (`/v1/infer`) to osobna typed ścieżka Documents —
+        // patrz docs/RAG_INGEST_FLOW_PLAN.md.
+        use crate::api::openai::types::{
+            ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent,
+        };
+        use base64::Engine as _;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&request.image_bytes);
+        let data_uri = format!("data:{};base64,{}", request.mime, b64);
+        let instruction = "Wyodrębnij całą treść tej strony dokumentu jako czysty Markdown. \
+             Zachowaj strukturę tabel (GFM), nagłówki, listy i kolejność czytania. \
+             Zwróć WYŁĄCZNIE treść dokumentu, bez komentarza.";
+
+        let chat_request = ChatCompletionRequest {
+            model: request.model.clone(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: instruction.to_string(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: data_uri,
+                            detail: None,
+                        },
+                    },
+                ])),
+                ..Default::default()
+            }],
+            temperature: Some(0.0),
+            max_tokens: Some(8192),
+            top_p: None,
+            n: None,
+            stream: false,
+            stream_options: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            memory_options: None,
+            audio_input: None,
         };
 
-        let state = self.strategy_state_for(&request.model);
-        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
-
-        let mut last_err: Option<String> = None;
-        let mut attempts = 0usize;
-        let mut last_kind: &'static str = "unknown";
-        let mut deferred_cutover: Option<&'static str> = None;
-
-        for target in ranked {
-            attempts += 1;
-            last_kind = target.telemetry_tag();
-            match self
-                .dispatch_documents_blocking(&target, request.clone(), ctx)
-                .await
-            {
-                Ok(response) => {
-                    ctx.route_metadata.served_by_node = served_by(&target);
-                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
-                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
-                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
-                    note_fallback(
-                        &request.model,
-                        outcome.requested_is_alias,
-                        attempts,
-                        target.telemetry_tag(),
-                    );
-                    return Ok(response);
-                }
-                Err(e) if e.aborts_fallback_chain() => return Err(e),
-                Err(ExecutorError::TransportPendingCutover(kind)) => {
-                    deferred_cutover.get_or_insert(kind);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target_kind = target.telemetry_tag(),
-                        error = %e,
-                        "document parse dispatch failed; trying next candidate"
-                    );
-                    last_err = Some(e.to_string());
-                }
-            }
-        }
-
-        if let Some(kind) = deferred_cutover {
-            return Err(ExecutorError::TransportPendingCutover(kind));
-        }
-
-        Err(ExecutorError::AllCandidatesFailed {
-            target_kind: last_kind,
-            attempts,
-            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        let response = self.execute_chat(chat_request, ctx).await?;
+        let markdown = crate::routing::extract_response_text(&response);
+        Ok(DocumentParseResponse {
+            markdown,
+            blocks: Vec::new(),
+            usage: response.usage,
         })
     }
 
-    /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium za
-    /// feature `pdf`), parsuje każdą stronę przez `execute_documents` (ten sam
+    /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
+    /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
     /// (`merge_page_responses`). Cap stron egzekwowany na poziomie rasteryzera
-    /// ([`MAX_PDF_PAGES`]). Bez feature `pdf` zwraca czytelny błąd zamiast crashu.
-    #[cfg(feature = "pdf")]
+    /// ([`MAX_PDF_PAGES`]).
     async fn execute_documents_pdf(
         &self,
         request: DocumentParseRequest,
@@ -1823,8 +1832,18 @@ impl ModelRuntimeExecutor {
         // stronę → PNG → `blocking_send` na kanał o pojemności 2; konsument
         // (tu, async) odbiera PNG i parsuje POZA pdfium-lockiem. Backpressure
         // kanału ogranicza szczyt pamięci do ~2 stron, nie O(N).
+        use futures::StreamExt as _;
+
+        // Współbieżność parsowania stron. Model parse (885M VLM) NIE wysyca GPU
+        // na pojedynczej stronie (util ~25% — bottleneck to narzut Pythona per
+        // token, nie compute), więc kilka stron równolegle wypełnia GPU i
+        // wall-clock wielostronicowego dokumentu spada wielokrotnie. Kanał ma tę
+        // samą pojemność, by producent (rasteryzer) trzymał strony gotowe dla
+        // workerów; szczyt pamięci ~PARSE_PAGE_CONCURRENCY stron PNG (bounded).
+        const PARSE_PAGE_CONCURRENCY: usize = 6;
+
         let pdf_bytes = request.image_bytes.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PageRender>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<PageRender>(PARSE_PAGE_CONCURRENCY);
 
         let producer = tokio::task::spawn_blocking(move || {
             rasterize_pdf_streaming(&pdf_bytes, DEFAULT_RENDER_DPI, MAX_PDF_PAGES, |page| {
@@ -1835,66 +1854,94 @@ impl ModelRuntimeExecutor {
             })
         });
 
-        // Konsument: parsuje każdą stronę przez `execute_documents` jako obraz
-        // PNG — ta sama ścieżka resolve→rank→failover co dla wejścia obrazowego.
-        // Sekwencyjnie (kanał wydaje strony po kolei), żeby self-referencyjny
-        // parse-flow nie zalał backendu i żeby `flow_depth` był deterministyczny.
-        // Numery stron narastają z `page.index` (0..N), merge je przepisuje.
-        let mut page_responses: Vec<DocumentParseResponse> = Vec::new();
-        let mut parse_err: Option<ExecutorError> = None;
-        while let Some(page) = rx.recv().await {
-            let page_request = DocumentParseRequest {
-                model: request.model.clone(),
-                image_bytes: page.png,
-                mime: "image/png".to_string(),
-                flow_depth: request.flow_depth,
-            };
-            // `Box::pin` — rekurencyjna async fn (execute_documents wywołuje
-            // execute_documents_pdf, który tu woła execute_documents); bez tego
-            // typ future byłby nieskończenie zagnieżdżony.
-            match Box::pin(self.execute_documents(page_request, ctx)).await {
+        // Konsument RÓWNOLEGŁY: parsujemy do PARSE_PAGE_CONCURRENCY stron naraz.
+        // Każda strona to NIEZALEŻNY dispatch: własny KLON ctx z resetem hopa
+        // (enter_hop inkrementuje hop_count TRWALE; współdzielony ctx tripnąłby
+        // MAX_HOP_COUNT po kilku stronach). Wyniki wracają NIEUPORZĄDKOWANE, więc
+        // niesiemy `page.index` i sortujemy przed merge — `merge_page_responses`
+        // nadaje numery stron po kolejności w Vec.
+        let base_hop = ctx.hop_count;
+        let base_ctx = ctx.clone();
+        let model = request.model.clone();
+        let flow_depth = request.flow_depth;
+        let page_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|page| (page, rx))
+        });
+        let mut indexed: Vec<(u32, Result<DocumentParseResponse, ExecutorError>)> = page_stream
+            .map(|page| {
+                let mut page_ctx = base_ctx.clone();
+                page_ctx.hop_count = base_hop;
+                let model = model.clone();
+                async move {
+                    let page_request = DocumentParseRequest {
+                        model,
+                        image_bytes: page.png,
+                        mime: "image/png".to_string(),
+                        flow_depth,
+                    };
+                    // `Box::pin` — rekurencyjna async fn (execute_documents wołane
+                    // z execute_documents_pdf); bez tego typ future byłby
+                    // nieskończenie zagnieżdżony.
+                    let res = Box::pin(self.execute_documents(page_request, &mut page_ctx)).await;
+                    (page.index, res)
+                }
+            })
+            .buffer_unordered(PARSE_PAGE_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Strumień skonsumował `rx` (drop wewnątrz unfold po wyczerpaniu) →
+        // producent dostaje Closed i kończy.
+        indexed.sort_by_key(|(idx, _)| *idx);
+        let mut page_responses: Vec<DocumentParseResponse> = Vec::with_capacity(indexed.len());
+        let mut failed_pages = 0usize;
+        let mut last_page_err: Option<ExecutorError> = None;
+        for (_idx, res) in indexed {
+            match res {
                 Ok(resp) => page_responses.push(resp),
                 Err(e) => {
-                    parse_err = Some(e);
-                    break;
+                    // Tolerancja per-strona: pojedyncza felerna strona (np. bug
+                    // postprocessingu modelu parse na konkretnym layoutcie, albo
+                    // chwilowy błąd backendu) NIE może ubić całego wielostronicowego
+                    // dokumentu. Logujemy i pomijamy; dokument fail-uje TYLKO gdy
+                    // ŻADNA strona się nie sparsowała (sprawdzenie niżej).
+                    failed_pages += 1;
+                    tracing::warn!(
+                        error = %e,
+                        failed_pages,
+                        "document parse: strona nie sparsowana, pomijam (tolerancja per-strona)"
+                    );
+                    last_page_err = Some(e);
                 }
             }
         }
-        // Zamknięcie `rx` (drop po wyjściu z pętli) odblokuje producenta na
-        // `blocking_send` (Closed) — nie zostawiamy wiszącego wątku blocking.
-        drop(rx);
 
         let rasterize_result = producer
             .await
             .map_err(|e| ExecutorError::Internal(format!("rasterize join: {e}")))?;
 
-        // Najpierw raportuj błąd parse strony (failover wewnątrz już wyczerpany),
-        // potem ewentualny błąd rasteryzacji (np. EmptyDocument, PDF uszkodzony).
-        if let Some(e) = parse_err {
-            return Err(e);
-        }
         let page_count =
             rasterize_result.map_err(|e| ExecutorError::Internal(format!("PDF rasterize: {e}")))?;
 
-        if page_count == 0 || page_responses.is_empty() {
+        // Dokument fail-uje TYLKO gdy żadna strona się nie sparsowała. Gdy choć
+        // jedna przeszła, scalamy co mamy — felerne strony zostały pominięte
+        // (raportujemy ile), zamiast tracić cały dokument przez jedną stronę.
+        if page_responses.is_empty() {
+            if let Some(e) = last_page_err {
+                return Err(e);
+            }
             return Err(ExecutorError::Internal("PDF has no renderable pages".into()));
+        }
+        if failed_pages > 0 {
+            tracing::warn!(
+                failed_pages,
+                ok_pages = page_responses.len(),
+                page_count,
+                "document parse: dokument ukończony z pominiętymi stronami"
+            );
         }
 
         Ok(document::merge_page_responses(page_responses))
-    }
-
-    /// Bez feature `pdf` PDF nie jest wspierany — zwracamy czytelny błąd
-    /// (deploy bez pdfium/mobile nie crashuje, tylko odrzuca PDF z jasną
-    /// informacją że trzeba zbudować z `--features pdf`).
-    #[cfg(not(feature = "pdf"))]
-    async fn execute_documents_pdf(
-        &self,
-        _request: DocumentParseRequest,
-        _ctx: &mut ExecutionContext,
-    ) -> Result<DocumentParseResponse, ExecutorError> {
-        Err(ExecutorError::Internal(
-            "PDF parsing requires 'pdf' feature".into(),
-        ))
     }
 
     /// Per-target document-parse dispatch. Serwer obsługuje parsowanie przez
@@ -3750,7 +3797,6 @@ mod tests {
 
     /// RAG E1.4 — buduje `DocumentParseRequest` z realnym, minimalnym PDF
     /// (jedna strona A4) i mime `application/pdf`.
-    #[cfg(feature = "pdf")]
     fn make_pdf_request(model: &str) -> DocumentParseRequest {
         let pdf = crate::services::document::rasterize::minimal_pdf(1);
         DocumentParseRequest {
@@ -3766,7 +3812,6 @@ mod tests {
     /// a parse per-strona idzie przez resolver. Na pustym katalogu pierwsza
     /// strona surface'uje `Resolve` (brak serwisu documents) — to dowód, że
     /// rasteryzacja się powiodła (gdyby pdfium padł, dostalibyśmy `Internal`).
-    #[cfg(feature = "pdf")]
     #[tokio::test]
     async fn execute_documents_pdf_rasterizes_then_resolves_per_page() {
         let exec = dummy_executor();
@@ -3779,31 +3824,6 @@ mod tests {
             matches!(err, ExecutorError::Resolve(_)),
             "po udanej rasteryzacji per-strona idzie przez resolver: {err:?}"
         );
-    }
-
-    /// RAG E1.4 — bez feature `pdf` mime PDF zwraca czytelny `Internal`
-    /// ("PDF parsing requires 'pdf' feature"), NIE crash i NIE resolve.
-    #[cfg(not(feature = "pdf"))]
-    #[tokio::test]
-    async fn execute_documents_pdf_without_feature_returns_readable_error() {
-        let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
-        let req = DocumentParseRequest {
-            model: "rag-parse".into(),
-            image_bytes: vec![0x25, 0x50, 0x44, 0x46], // "%PDF"
-            mime: crate::services::document::PDF_MIME.to_string(),
-            flow_depth: 0,
-        };
-        let err = exec
-            .execute_documents(req, &mut ctx)
-            .await
-            .expect_err("PDF bez feature musi być błędem");
-        match err {
-            ExecutorError::Internal(msg) => {
-                assert!(msg.contains("'pdf' feature"), "czytelny komunikat: {msg}");
-            }
-            other => panic!("oczekiwano Internal, dostano {other:?}"),
-        }
     }
 
     /// `execute_documents` dla aliasu `rag-parse` na pustym katalogu surface'uje
