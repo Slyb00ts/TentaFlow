@@ -42,16 +42,19 @@ use crate::flow_engine::node_adapters::{
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
     ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentRouterNodeAdapter,
-    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
-    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
-    OutputNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
+    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter,
+    LlmNodeAdapter,
+    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OnSubagentCompleteNodeAdapter,
+    OutputNodeAdapter, PageDetectNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
     RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
     SpeakerContextNodeAdapter, StoreNodeAdapter,
-    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
+    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
+    ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
-    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, WordExtractNodeAdapter,
+    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, VisionParseNodeAdapter,
+    WordExtractNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -1097,6 +1100,14 @@ fn build_registry(
         Arc::new(PptxExtractNodeAdapter::new()),
         Arc::new(ChunkNodeAdapter::new()),
         Arc::new(DocumentMergeNodeAdapter::new()),
+        // PARTIA 2 (flow-ingest RAG) — węzły zależne od modeli: parsowanie strony
+        // na markdown przez VLM (vision-chat) oraz detektory struktury dokumentu
+        // (layout / tabele / grafika / OCR) przez typed surface Documents.
+        Arc::new(VisionParseNodeAdapter::new()),
+        Arc::new(PageDetectNodeAdapter::new()),
+        Arc::new(TableStructureNodeAdapter::new()),
+        Arc::new(GraphicElementsNodeAdapter::new()),
+        Arc::new(OcrNodeAdapter::new()),
         Arc::new(StoreNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),

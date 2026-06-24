@@ -434,6 +434,15 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "conversation_history",
     // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF emituje obrazy stron.
     "pdf_rasterize",
+    // PARTIA 2 (flow-ingest RAG): węzły zależne od modeli biorą obraz strony.
+    // vision_parse / table_structure / ocr produkują też tekst; page_detect /
+    // graphic_elements zwracają JSON regionów (brak medialnego outputu, samo
+    // Image-input constraint).
+    "vision_parse",
+    "page_detect",
+    "table_structure",
+    "graphic_elements",
+    "ocr",
 ];
 
 /// Node types that intentionally do not contribute modalities — they do
@@ -530,6 +539,17 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             // medialnej), wyjście to obrazy.
             "pdf_rasterize" => {
                 outputs.insert(OutputModality::Image);
+            }
+            // PARTIA 2 (flow-ingest RAG): biorą obraz strony. vision_parse /
+            // table_structure / ocr emitują tekst; page_detect / graphic_elements
+            // zwracają JSON regionów (brak medialnego outputu — deklarujemy tylko
+            // ograniczenie wejścia Image).
+            "vision_parse" | "table_structure" | "ocr" => {
+                inputs.insert(InputModality::Image);
+                has_text_output = true;
+            }
+            "page_detect" | "graphic_elements" => {
+                inputs.insert(InputModality::Image);
             }
             "embeddings" => {
                 // Codex R3b.1 round 2 M2: declare text input so
