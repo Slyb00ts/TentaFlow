@@ -3748,6 +3748,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "created_at", s.created_at.into());
                 set(&item, "updatedAt", s.updated_at.clone().into());
                 set(&item, "updated_at", s.updated_at.into());
+                set(&item, "updateAvailable", s.update_available.into());
+                set(&item, "update_available", s.update_available.into());
 
                 let models = js_sys::Array::new();
                 for m in s.models {
