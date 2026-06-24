@@ -807,7 +807,7 @@ fn detect_only(
     let batch = {
         let refs: Vec<(&[u8], u32, u32)> =
             frames.iter().map(|(_, rgb, w, h)| (&rgb[..], *w, *h)).collect();
-        let mut guard = detector.lock().unwrap();
+        let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
         match guard.detect_batch(&refs) {
             Ok(b) => b,
             Err(e) => {
@@ -849,7 +849,7 @@ fn enrich_detections(
         if wants_state(&det.klasa) {
             if let Some(classifier) = classifier.as_ref() {
                 let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match classifier.lock().unwrap().classify(&crop, cw, ch) {
+                match classifier.lock().unwrap_or_else(|e| e.into_inner()).classify(&crop, cw, ch) {
                     Ok(stany) => det.stan = stany,
                     Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
                 }
@@ -858,7 +858,7 @@ fn enrich_detections(
         if det.klasa == "tablica_rejestracyjna" {
             if let Some(ocr) = ocr.as_ref() {
                 let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match ocr.lock().unwrap().read(&crop, cw, ch) {
+                match ocr.lock().unwrap_or_else(|e| e.into_inner()).read(&crop, cw, ch) {
                     Ok(Some(plate)) => det.tekst = Some(plate),
                     Ok(None) => {}
                     Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
