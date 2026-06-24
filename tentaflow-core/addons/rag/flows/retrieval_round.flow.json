@@ -25,8 +25,7 @@
       "id": "embed_query",
       "type": "embeddings",
       "config": {
-        "model": "rag-embeddings",
-        "dimensions": 1024
+        "model": "rag-embeddings"
       },
       "position": { "x": 400, "y": 0 }
     },
