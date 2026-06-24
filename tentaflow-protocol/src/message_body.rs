@@ -4274,6 +4274,25 @@ pub struct ServiceManifestDeployResponse {
     pub websocket_url: String,
 }
 
+/// Request: redeploy in-place lokalnego serwisu (Admin). Reużywa zapisanego
+/// `config_json` z wiersza DB — zero ponownego wyboru parametrów przez usera.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceRedeployRequest {
+    pub service_id: i64,
+    pub force_if_active_sessions: bool,
+}
+
+/// Response: deskryptor świeżego deployu po redeploy (lub kod błędu w `status`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceRedeployResponse {
+    pub status: String,
+    pub deploy_id: String,
+    pub engine_id: String,
+    pub deploy_method: String,
+    pub node_id: String,
+    pub message: String,
+}
+
 // =============================================================================
 // MessageBody — wszystkie warianty
 // =============================================================================
@@ -5446,6 +5465,8 @@ pub enum DeploymentPayload {
     ReqLogStream(DeploymentLogStreamRequest),
     StreamChunk(DeploymentStreamChunk),
     StreamEnd(DeploymentStreamEnd),
+    ReqRedeploy(ServiceRedeployRequest),
+    ResRedeploy(ServiceRedeployResponse),
 }
 
 // =============================================================================

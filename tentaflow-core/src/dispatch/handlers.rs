@@ -4140,6 +4140,34 @@ pub async fn service_manifest_deploy(
         broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Added(info));
     }
 
+    let slug = spawn_deploy_pipeline(ctx, job, deploy_method, &manifest, &user_config, port_allocator);
+
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResStart(
+            tentaflow_protocol::ServiceManifestDeployResponse {
+                status: "started".to_string(),
+                deploy_id: slug.clone(),
+                engine_id: payload.engine_id.clone(),
+                deploy_method: payload.deploy_method.clone(),
+                node_id: payload.node_id.clone(),
+                websocket_url: format!("/ws/deploy?id={}", slug),
+            },
+        ),
+    ))
+}
+
+/// Spawnuje pełny pipeline deployu (status-watcher + worker) i zwraca slug
+/// (`deploy_id`) do streamu logów. Wyodrębnione z `service_manifest_deploy`,
+/// żeby `service_redeploy` reużywał DOKŁADNIE tę samą ścieżkę — zero duplikacji
+/// logiki post-deploy (rejestr mesh, live handles, rebuild katalogu).
+fn spawn_deploy_pipeline(
+    ctx: &HandlerContext,
+    job: crate::services::deploy::DeployJob,
+    deploy_method: crate::services_repo::services::DeployMethod,
+    manifest: &crate::services::manifest::ServiceManifest,
+    user_config: &serde_json::Value,
+    port_allocator: std::sync::Arc<crate::services::ports::PortAllocator>,
+) -> String {
     let slug = job.deploy_id.clone();
     let log_sender = crate::deploy::log_bus::sender_for(&slug);
     {
@@ -4351,15 +4379,158 @@ pub async fn service_manifest_deploy(
         }
     });
 
+    slug
+}
+
+#[handler(variant = "ServiceRedeployRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_redeploy(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqRedeploy(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected DeploymentBody::ReqRedeploy",
+            ));
+        }
+    };
+
+    let not_found = |message: &str| {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ResRedeploy(
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: "not_found".to_string(),
+                deploy_id: String::new(),
+                engine_id: String::new(),
+                deploy_method: String::new(),
+                node_id: ctx.state.local_node_id.to_string(),
+                message: message.to_string(),
+            },
+        ))
+    };
+
+    // v1: redeploy local-only; cross-node forward TODO. Brak wiersza lokalnie =
+    // "not_found" zamiast forwardu do innego noda.
+    let row = {
+        let conn = ctx
+            .state
+            .db
+            .read()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::get(&conn, payload.service_id).map_err(db_err)?
+    };
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(not_found("service not found")),
+    };
+
+    let manifest = match crate::services::manifest::registry().by_id(&row.engine_id).cloned() {
+        Some(m) => m,
+        None => {
+            return Ok(MessageBody::DeploymentBody(
+                tentaflow_protocol::DeploymentPayload::ResRedeploy(
+                    tentaflow_protocol::ServiceRedeployResponse {
+                        status: "no_source".to_string(),
+                        deploy_id: String::new(),
+                        engine_id: row.engine_id.clone(),
+                        deploy_method: row.deploy_method.as_db_tag().to_string(),
+                        node_id: ctx.state.local_node_id.to_string(),
+                        message: format!(
+                            "engine '{}' nie istnieje w manifescie",
+                            row.engine_id
+                        ),
+                    },
+                ),
+            ));
+        }
+    };
+
+    // Reużywamy ZAPISANY config_json (zero re-pick). Pusty/uszkodzony JSON =>
+    // pusty obiekt, żeby deploy nie wywrócił się na danych z bazy.
+    let user_config: serde_json::Value =
+        serde_json::from_str(&row.config_json).unwrap_or_else(|_| serde_json::json!({}));
+
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    audit(
+        ctx,
+        user_id.as_deref(),
+        "service.redeploy",
+        Some(&row.engine_id),
+        Some(&format!(
+            "service_id={} force={}",
+            payload.service_id, payload.force_if_active_sessions
+        )),
+    );
+
+    // Stop + usuń stary serwis PRZED świeżym deployem — bez tego zostałby
+    // duplikat wiersza i dwa równoległe procesy/kontenery na tym samym porcie.
+    // Reużywamy tę samą ścieżkę co handler `ServiceDeleteRequest`
+    // (stop best-effort → delete row → rebuild katalogu → broadcast Removed).
+    let stop_err = crate::services::deploy::stop(&row, port_allocator.clone())
+        .await
+        .err()
+        .map(|e| e.to_string());
+    if let Some(err) = stop_err.as_deref() {
+        tracing::warn!(target: "tentaflow::deploy", service_id = payload.service_id, error = err, "redeploy: stop old service failed (continuing)");
+    }
+    {
+        let conn = ctx
+            .state
+            .db
+            .write()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+    }
+    ctx.state.router.rebuild_catalog();
+    broadcast_service_change(
+        ctx,
+        tentaflow_protocol::ServiceChange::Removed {
+            service_id: payload.service_id,
+        },
+    );
+
+    // Wiersz DB trzyma już sparsowany `DeployMethod` — bierzemy go wprost,
+    // bez ponownego mapowania z wire-tagu (zachowujemy oryginalny tryb deployu).
+    let deploy_method = row.deploy_method;
+
+    let job = crate::services::deploy::create_deploy_job(
+        deploy_method,
+        &manifest,
+        &user_config,
+        &ctx.state.db,
+        ctx.state.local_node_id.as_ref(),
+        user_id.as_deref(),
+        None,
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?;
+
+    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+        &ctx.state.db,
+        job.service_id,
+        ctx.state.local_node_id.as_ref(),
+    ) {
+        broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Added(info));
+    }
+
+    let engine_id = row.engine_id.clone();
+    let deploy_method_tag = row.deploy_method.as_db_tag().to_string();
+    let slug = spawn_deploy_pipeline(ctx, job, deploy_method, &manifest, &user_config, port_allocator);
+
     Ok(MessageBody::DeploymentBody(
-        tentaflow_protocol::DeploymentPayload::ResStart(
-            tentaflow_protocol::ServiceManifestDeployResponse {
+        tentaflow_protocol::DeploymentPayload::ResRedeploy(
+            tentaflow_protocol::ServiceRedeployResponse {
                 status: "started".to_string(),
-                deploy_id: slug.clone(),
-                engine_id: payload.engine_id.clone(),
-                deploy_method: payload.deploy_method.clone(),
-                node_id: payload.node_id.clone(),
-                websocket_url: format!("/ws/deploy?id={}", slug),
+                deploy_id: slug,
+                engine_id,
+                deploy_method: deploy_method_tag,
+                node_id: ctx.state.local_node_id.to_string(),
+                message: String::new(),
             },
         ),
     ))
