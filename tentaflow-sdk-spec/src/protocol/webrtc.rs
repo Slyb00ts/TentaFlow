@@ -176,6 +176,15 @@ pub struct WebRtcRegisterCameraInput {
     pub target_fps: u32,
     #[n(3)]
     pub analysis_fps: u32,
+    /// Camera horizontal field of view (deg). The robot addon knows its own lens, so
+    /// it supplies the intrinsics instead of core guessing. `None` ⇒ core default.
+    #[n(4)]
+    pub camera_fov_deg: Option<f32>,
+    /// Camera vertical field of view (deg). Differs sharply from horizontal because the
+    /// depth model runs on a square frame stretched from a wide 16:9 stream. `None` ⇒
+    /// square pixels (`fy = fx`).
+    #[n(5)]
+    pub camera_fov_v_deg: Option<f32>,
 }
 
 /// Output of `webrtc_register_camera_v1`.

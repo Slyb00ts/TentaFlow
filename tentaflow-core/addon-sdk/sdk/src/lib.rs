@@ -2041,6 +2041,10 @@ pub fn webrtc_register_camera(
         display_name: display_name.to_string(),
         target_fps,
         analysis_fps,
+        // Generic webrtc cameras don't report their lens; an addon that knows its
+        // intrinsics (e.g. go2) constructs the input directly with the FOV set.
+        camera_fov_deg: None,
+        camera_fov_v_deg: None,
     })?;
     let bytes = call_sql_with_one_input(webrtc_register_camera_v1, &payload)?;
     let out: tentaflow_sdk_spec::WebRtcRegisterCameraOutput = decode_cbor(&bytes)?;

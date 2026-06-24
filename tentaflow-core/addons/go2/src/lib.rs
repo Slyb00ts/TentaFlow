@@ -2127,6 +2127,12 @@ fn tick() {
                                 display_name: "Unitree Go2".into(),
                                 target_fps: 25,
                                 analysis_fps: 5,
+                                // Go2 front camera streaming FOV (spec): H 100°, V 56°.
+                                // The depth model runs on a square frame stretched from
+                                // the 16:9 stream, so vertical ≪ horizontal — supplying
+                                // both stops the depth cloud over-spreading off the floor.
+                                camera_fov_deg: Some(100.0),
+                                camera_fov_v_deg: Some(56.0),
                             };
                             let cam_id = match call_cbor_in_out::<_, WebRtcRegisterCameraOutput>(&reg, webrtc_register_camera_v1) {
                                 Ok(o) => o.camera_id,

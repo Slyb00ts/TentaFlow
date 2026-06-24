@@ -522,6 +522,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_depth_extrinsics_columns",
             MigrationStep::Rust(cameras_add_depth_extrinsics_columns),
         ),
+        (
+            97,
+            "cameras_depth_fov_v",
+            MigrationStep::Rust(cameras_add_depth_fov_v_column),
+        ),
     ]
 }
 
@@ -539,6 +544,21 @@ fn cameras_add_depth_extrinsics_columns(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "cameras", "depth_scale")? {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_scale REAL NOT NULL DEFAULT 1.0;")?;
+    }
+    Ok(())
+}
+
+/// Adds `depth_camera_fov_v_deg` — the camera's VERTICAL field of view. The depth
+/// model runs on a square 518² frame STRETCHED from the camera's wide 16:9 stream, so
+/// the vertical FOV differs sharply from the horizontal (Go2: 100° H, 56° V). The old
+/// back-projection assumed square pixels (`fy = fx`), over-spreading the cloud
+/// vertically off the floor. `0.0` keeps that legacy square behaviour; a positive
+/// value sets the true vertical FOV. Idempotent (column probe).
+fn cameras_add_depth_fov_v_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "depth_camera_fov_v_deg")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_camera_fov_v_deg REAL NOT NULL DEFAULT 0.0;",
+        )?;
     }
     Ok(())
 }
