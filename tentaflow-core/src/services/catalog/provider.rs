@@ -432,6 +432,8 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "chat",
     "memory",
     "conversation_history",
+    // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF emituje obrazy stron.
+    "pdf_rasterize",
 ];
 
 /// Node types that intentionally do not contribute modalities — they do
@@ -469,6 +471,16 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "subagent_status",
     "subflow",
     "tool_exec",
+    // PARTIA 1 (flow-ingest RAG): czysto-rustowe węzły ingestu bez własnej
+    // modalności medialnej — klasyfikują/routują plik, ekstrahują tekst,
+    // chunkują, scalają strony i zapisują wektory (transform/side-effect).
+    "document_router",
+    "excel_extract",
+    "word_extract",
+    "pptx_extract",
+    "chunk",
+    "document_merge",
+    "store",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks
@@ -511,6 +523,12 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
                 has_text_output = true;
             }
             "image_gen" | "image_generation" => {
+                outputs.insert(OutputModality::Image);
+            }
+            // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF bierze plik PDF i emituje
+            // obrazy stron — wejście to plik (Other ≈ brak deklarowanej modalności
+            // medialnej), wyjście to obrazy.
+            "pdf_rasterize" => {
                 outputs.insert(OutputModality::Image);
             }
             "embeddings" => {

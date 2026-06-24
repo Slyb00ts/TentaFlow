@@ -39,18 +39,19 @@ use crate::flow_engine::executor::{execute_blocking, execute_streaming, Streamin
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
-    AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter,
+    AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, EmbeddingsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
+    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentRouterNodeAdapter,
+    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OnSubagentCompleteNodeAdapter,
-    OutputNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
+    OutputNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
+    PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
     RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
-    SpeakerContextNodeAdapter,
+    SpeakerContextNodeAdapter, StoreNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
-    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter,
+    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, WordExtractNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -1086,6 +1087,17 @@ fn build_registry(
         Arc::new(RagGraphFactsNodeAdapter::new()),
         // RAG E1.0 — węzeł retrievalu scoped do (org, addon_instance, namespace).
         Arc::new(VectorNodeAdapter::new()),
+        // PARTIA 1 (flow-ingest RAG) — czysto-rustowe węzły ingestu bez modeli:
+        // klasyfikacja+routing pliku, rasteryzacja PDF, ekstrakcja office,
+        // chunking, scalanie stron i zapis chunków do przestrzeni wektorowej.
+        Arc::new(DocumentRouterNodeAdapter::new()),
+        Arc::new(PdfRasterizeNodeAdapter::new()),
+        Arc::new(ExcelExtractNodeAdapter::new()),
+        Arc::new(WordExtractNodeAdapter::new()),
+        Arc::new(PptxExtractNodeAdapter::new()),
+        Arc::new(ChunkNodeAdapter::new()),
+        Arc::new(DocumentMergeNodeAdapter::new()),
+        Arc::new(StoreNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
         Arc::new(PersistTurnNodeAdapter::new()),
