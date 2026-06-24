@@ -145,6 +145,33 @@ pub struct DocumentParseResponse {
     pub usage: Option<crate::api::openai::types::Usage>,
 }
 
+/// RAG Partia 3 (prerequisite) — żądanie ingestu JEDNEGO dokumentu jako flow.
+/// Niesie surowe bajty pliku (PDF/xlsx/docx/obraz — pobrane przez host fn z
+/// per-instance document store), `mime`, nazwę flow `model` (`<model>:ingest`)
+/// oraz `options` (collection_id, graph toggle, parametry chunkingu) wstrzykiwane
+/// do flow.meta. `flow_depth` dziedziczy głębokość zagnieżdżenia (guard rekursji,
+/// jak `DocumentParseRequest`). To JEDYNA ścieżka wywołania flow-ingestu z
+/// binarnym dokumentem — Partia 3 podmieni `run_ingest_pipeline` na to wywołanie.
+#[derive(Debug, Clone)]
+pub struct IngestRequest {
+    pub model: String,
+    pub document_bytes: Vec<u8>,
+    pub mime: String,
+    pub options: serde_json::Map<String, serde_json::Value>,
+    pub flow_depth: u8,
+}
+
+/// RAG Partia 3 — wynik flow-ingestu: markdown rekonstrukcji dokumentu + liczba
+/// chunków zapisanych do indeksu wektorowego przez węzeł store flow. `page_count`
+/// = liczba stron (1 dla pojedynczego obrazu). Flow zwraca to jako
+/// `Json{markdown, chunks, page_count}` w finalnym envelope.
+#[derive(Debug, Clone)]
+pub struct IngestResponse {
+    pub markdown: String,
+    pub chunks: u32,
+    pub page_count: u32,
+}
+
 /// PARTIA 0 — żądanie detekcji struktury dokumentu przez typed surface
 /// `Documents` (`/v1/infer`). Niesie surowe bajty obrazu strony + `mime` + `task`
 /// (jeden z detektorów: page_elements / table_structure / graphic_elements / ocr).
@@ -1835,6 +1862,78 @@ impl ModelRuntimeExecutor {
         })
     }
 
+    /// RAG Partia 3 (prerequisite) — uruchamia flow-ingest JEDNEGO dokumentu z
+    /// BINARNYM payloadem. To JEDYNA ścieżka, która potrafi wywołać flow `rag:ingest`
+    /// z surowymi bajtami pliku (PDF/xlsx/docx/obraz) — dotąd addon mógł wołać flow
+    /// tylko przez `llm_generate`, które buduje wyłącznie tekstową wiadomość.
+    ///
+    /// Seeduje binarny envelope (`ingest_request_to_initial_envelope`: bajty →
+    /// `ctx.blobs.put` → `FlowValue::Image`/`Other`), resolwuje flow po stałej
+    /// modality `"document"` (`<model>:ingest:document` — jeden flow niezależnie od
+    /// typu pliku) przez `FlowDispatcher::try_dispatch_with_modality`, wykonuje go
+    /// blocking i mapuje wynik na `IngestResponse`. Blob dokumentu jest kasowany po
+    /// flow (także przy błędzie), żeby nie zostawiać osieroconych plików w trwałym
+    /// store. Guard rekursji przez `enter_flow`/`leave_flow` (jak parse/embeddings).
+    ///
+    /// **ACL po stronie callera** — host fn `ingest_invoke_v1` bramkuje uprawnienie
+    /// zanim zbuduje request. Tożsamość addona-callera przeprowadzana do flow.meta.
+    pub async fn execute_ingest(
+        &self,
+        request: IngestRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<IngestResponse, ExecutorError> {
+        let dispatcher = self
+            .flow_dispatcher
+            .as_ref()
+            .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
+
+        // Pseudo flow_id dla guardu rekursji: ingest nie resolwuje po flow_id
+        // (jak parse/embeddings przez catalog), tylko po nazwie `<model>:ingest`.
+        // `enter_flow` potrzebuje stabilnego identyfikatora w stosie — używamy
+        // nazwy modelu, by self-referencyjny ingest narastał `subflow_depth`.
+        let flow_key = format!("{}:ingest", request.model);
+        ctx.enter_flow(&flow_key)
+            .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
+
+        let blobs = dispatcher.blobs();
+        let (initial, mut meta) =
+            match ingest_request_to_initial_envelope(&request, ctx.user.clone(), blobs).await {
+                Ok(seed) => seed,
+                Err(e) => {
+                    ctx.leave_flow();
+                    return Err(ExecutorError::Internal(e.to_string()));
+                }
+            };
+        meta.flow_depth = ctx.flow_stack.len() as u8;
+        meta.addon_id = ctx.addon_id.clone();
+        meta.org_id = ctx.org_id.clone();
+
+        // Blob dokumentu MUSI być skasowany po flow — `put` ląduje w trwałym
+        // `CompositeBlobStore`, więc bez `delete` każdy ingest zostawia osierocony
+        // plik do grubego GC.
+        let doc_blob_ref = match &initial.payload {
+            crate::flow_engine::envelope::FlowValue::Image { blob_ref, .. }
+            | crate::flow_engine::envelope::FlowValue::Other { blob_ref, .. } => {
+                Some(blob_ref.clone())
+            }
+            _ => None,
+        };
+
+        let dispatch_result = dispatcher
+            .try_dispatch_with_modality(&request.model, "ingest", "document", initial, meta)
+            .await;
+        ctx.leave_flow();
+
+        if let Some(blob_ref) = doc_blob_ref {
+            if let Err(e) = dispatcher.blobs().delete(&blob_ref).await {
+                tracing::warn!(error = %e, "ingest: failed to delete document blob after flow");
+            }
+        }
+
+        let outcome = dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        flow_outcome_to_ingest_response(outcome)
+    }
+
     /// PARTIA 0 — typed-surface `Documents` detektor (`/v1/infer`). Lustro
     /// `execute_rerank`: resoluje żądany model przez `ServiceSurface::Documents`
     /// (input Image / output Text), rankuje kandydatów per alias-strategy i próbuje
@@ -3177,6 +3276,101 @@ pub(crate) async fn document_request_to_initial_envelope(
         meta.user_role = Some(u.role);
     }
     Ok((env, meta))
+}
+
+/// RAG Partia 3 — buduje seed envelope + meta dla ingest-as-flow path. Dokument
+/// (binarny, potencjalnie duży) ląduje w BlobStore jak obraz w parse/audio w STT:
+/// payload nosi sentinel `FlowValue::Image{blob_ref}` dla obrazów albo
+/// `FlowValue::Other{blob_ref}` dla generycznych plików (PDF/xlsx/docx), a węzeł
+/// parsera flow pobiera bajty z `ctx.blobs.get(&blob_ref)`. Nazwa flow ląduje w
+/// `parse_model`/`ingest_model`; `options` (collection_id, graph toggle, params)
+/// wsiąka do `envelope.meta` — to JEDYNE miejsce wstrzyknięcia opcji ingestu do
+/// core'owego flow. Wzór: `document_request_to_initial_envelope`.
+pub(crate) async fn ingest_request_to_initial_envelope(
+    request: &IngestRequest,
+    user: Option<crate::auth::acl::UserContext>,
+    blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
+) -> anyhow::Result<(
+    crate::flow_engine::envelope::FlowEnvelope,
+    crate::flow_engine::dispatcher::FlowRequestMeta,
+)> {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    let blob_ref = blobs
+        .put(request.document_bytes.clone(), &request.mime)
+        .await
+        .map_err(|e| anyhow::anyhow!("ingest blob put: {e}"))?;
+    let mut env = FlowEnvelope::empty();
+    // Obraz → Image (modality vision na parse-węźle), inne pliki → Other (PDF
+    // rasteryzowany / xlsx/docx czytany przez wyspecjalizowany węzeł parsera).
+    // Typ bierzemy z mime (source-of-truth), nie z rozszerzenia.
+    env.payload = if request.mime.starts_with("image/") {
+        FlowValue::Image {
+            blob_ref,
+            mime: request.mime.clone(),
+            dims: None,
+        }
+    } else {
+        FlowValue::Other {
+            blob_ref,
+            mime: request.mime.clone(),
+            filename: None,
+        }
+    };
+    env.meta.insert(
+        "ingest_model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    // Opcje ingestu z addona (collection_id, graph_enabled, chunking) wstrzyknięte
+    // do flow.meta pod kluczami źródłowymi — węzły flow czytają je przez fallback
+    // `node.config -> envelope.meta`, jak parametry seedów query.
+    for (key, value) in &request.options {
+        env.meta.insert(key.clone(), value.clone());
+    }
+    let mut meta =
+        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    if let Some(u) = user {
+        meta.user_id = Some(u.user_id);
+        meta.user_role = Some(u.role);
+    }
+    Ok((env, meta))
+}
+
+/// RAG Partia 3 — konwertuje `FlowExecutionOutcome` (ingest-as-flow) na
+/// `IngestResponse`. Flow output to `Json{markdown, chunks, page_count}` — węzeł
+/// store ingestu raportuje markdown rekonstrukcji + liczbę zapisanych chunków.
+/// Brakujące `chunks`/`page_count` dekoduje do 0/1 (tolerancja kształtu).
+pub(crate) fn flow_outcome_to_ingest_response(
+    outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
+) -> Result<IngestResponse, ExecutorError> {
+    use crate::flow_engine::envelope::FlowValue;
+    let json = match &outcome.final_envelope.payload {
+        FlowValue::Json(v) => v.clone(),
+        _ => {
+            return Err(ExecutorError::Internal(
+                "ingest flow returned no Json payload".into(),
+            ))
+        }
+    };
+    let markdown = json
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let chunks = json
+        .get("chunks")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    let page_count = json
+        .get("page_count")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
+    Ok(IngestResponse {
+        markdown,
+        chunks,
+        page_count,
+    })
 }
 
 /// RAG E1.2 — konwertuje `FlowExecutionOutcome` (parse-as-flow) na
