@@ -4348,6 +4348,29 @@ fn spawn_deploy_pipeline(
                     error_message: err.to_string(),
                     duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
                 });
+
+                // Redeploy-specific cleanup: stary runtime został UBITY przez
+                // `stop_checked` PRZED startem workera, a `deploy()` już
+                // wyzerowało pola runtime'u na wierszu (`mark_failed_clear_runtime`).
+                // W pamięci jednak wciąż żyje stary `BackendHandle` (z poprzedniego
+                // udanego deployu) i wpis katalogu — bez ich zdjęcia resolver dalej
+                // routowałby ruch do MARTWEGO endpointu aż do następnego ticku
+                // supervisora (a desktop supervisora nie ma). Lustrzymy ścieżkę
+                // delete: drop live handle + rebuild katalogu. Świeży deploy NIE
+                // miał wcześniej żywego handle'a, więc to dotyczy tylko redeployu.
+                if job_task.is_redeploy {
+                    if let Some(handle) =
+                        live_handles_task.remove(&local_node_id_task, job_task.service_id)
+                    {
+                        handle.shutdown();
+                    }
+                    if let Err(e) =
+                        catalog_provider_task.rebuild(&mesh_services_registry_task, &db_clone)
+                    {
+                        tracing::warn!(error = %e, "failed-redeploy catalog rebuild failed");
+                    }
+                }
+
                 if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
                     &db_clone,
                     job_task.service_id,
