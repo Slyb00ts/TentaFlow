@@ -94,3 +94,6 @@ opt-level = 0
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
 whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
+# Upstream 0.9.2 (latest) hardcodes `as *const i8`; c_char is u8 on aarch64, so it
+# fails to compile on ARM (DGX/mobile). Vendored copy uses `c_char` — portable.
+pdfium-render = { path = "../vendor/crates/pdfium-render" }

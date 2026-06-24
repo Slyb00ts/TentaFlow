@@ -481,3 +481,5 @@ required-features = ["test-support"]
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
 whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
+# aarch64 c_char fix (upstream 0.9.2 hardcodes `*const i8`) — see vendored crate.
+pdfium-render = { path = "../vendor/crates/pdfium-render" }
