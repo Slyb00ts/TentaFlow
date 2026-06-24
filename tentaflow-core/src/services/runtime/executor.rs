@@ -145,6 +145,28 @@ pub struct DocumentParseResponse {
     pub usage: Option<crate::api::openai::types::Usage>,
 }
 
+/// PARTIA 0 — żądanie detekcji struktury dokumentu przez typed surface
+/// `Documents` (`/v1/infer`). Niesie surowe bajty obrazu strony + `mime` + `task`
+/// (jeden z detektorów: page_elements / table_structure / graphic_elements / ocr).
+/// `flow_depth` dziedziczy głębokość zagnieżdżenia z caller-flow (guard rekursji,
+/// jak `DocumentParseRequest`). To fundament node-adapterów flow-ingestu RAG.
+#[derive(Debug, Clone)]
+pub struct DocumentInferRequest {
+    pub model: String,
+    pub image_bytes: Vec<u8>,
+    pub mime: String,
+    pub task: String,
+    pub flow_depth: u8,
+}
+
+/// PARTIA 0 — odpowiedź detektora: lista wykrytych regionów strony (layout boxes,
+/// komórki tabel, grafika, OCR spany). Reużywa typów drutu z `tentaflow_protocol`,
+/// bo ta sama struktura leci przez mesh (`ModelResult::Documents`).
+#[derive(Debug, Clone)]
+pub struct DocumentInferResponse {
+    pub regions: Vec<tentaflow_protocol::DocRegion>,
+}
+
 /// Top-level orchestrator. Holds Arc references to every collaborator;
 /// no state of its own beyond a per-alias `StrategyState` map. The
 /// resolver already owns `LiveHandlesCache` for hydrating Local
@@ -1813,6 +1835,151 @@ impl ModelRuntimeExecutor {
         })
     }
 
+    /// PARTIA 0 — typed-surface `Documents` detektor (`/v1/infer`). Lustro
+    /// `execute_rerank`: resoluje żądany model przez `ServiceSurface::Documents`
+    /// (input Image / output Text), rankuje kandydatów per alias-strategy i próbuje
+    /// każdego aż któryś zadziała. Local → HTTP `POST /v1/infer`; MeshForward →
+    /// `ModelPayload::Documents` (obraz ZACHOWANY przez mesh — binarnie, serde_bytes).
+    /// To NIE jest vision-parse (`execute_documents`, surface Chat) — to osobna,
+    /// strukturalna ścieżka dla node-adapterów flow-ingestu RAG (PARTIA 2).
+    pub async fn execute_document_infer(
+        &self,
+        request: DocumentInferRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentInferResponse, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::Documents,
+                required_input_modalities: &[InputModality::Image],
+                required_output_modalities: &[OutputModality::Text],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_document_infer_blocking(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "document infer dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target document-infer dispatch — lustro `dispatch_rerank_blocking`.
+    /// Detektory struktury są serwowane przez zewnętrzne runtime'y (yolox/OCR przez
+    /// `/v1/infer`), więc HTTP/mesh niosą request; embedded engines nie mają tej
+    /// powierzchni i surface'ują błąd, żeby fallback szedł dalej.
+    async fn dispatch_document_infer_blocking(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: DocumentInferRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<DocumentInferResponse, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
+                    "embedded backend does not support document infer".into(),
+                )),
+                BackendHandle::Http(client) => {
+                    let result = client
+                        .document_infer(
+                            &request.model,
+                            &request.image_bytes,
+                            &request.task,
+                            &request.mime,
+                        )
+                        .await
+                        .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                    Ok(DocumentInferResponse {
+                        regions: result.regions,
+                    })
+                }
+                BackendHandle::Quic(handle) => {
+                    let quic_client = handle.get_client().await.ok_or_else(|| {
+                        ExecutorError::Internal(format!(
+                            "QUIC client not connected for service '{}'",
+                            handle.config.name
+                        ))
+                    })?;
+                    let model_request = document_infer_model_request(&request);
+                    let response = quic_client
+                        .send_request(model_request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("QUIC document infer: {}", e)))?;
+                    document_infer_result_to_response(response.result)
+                }
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let mut forwarded = request.clone();
+                forwarded.model = model_name.clone();
+                let model_request = document_infer_model_request(&forwarded);
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
+                document_infer_result_to_response(response.result)
+            }
+            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
+                "document infer has no flow-target surface".into(),
+            )),
+        }
+    }
+
     /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
     /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
@@ -2859,6 +3026,45 @@ fn rerank_result_to_response(
         }
         _ => Err(ExecutorError::Internal(
             "rerank returned unexpected result type".into(),
+        )),
+    }
+}
+
+/// PARTIA 0 — buduje `ModelRequest` (QUIC/mesh) z `DocumentInferRequest`.
+/// Obraz leci binarnie w `image_bytes` (serde_bytes → CBOR byte-string).
+fn document_infer_model_request(
+    request: &DocumentInferRequest,
+) -> tentaflow_protocol::ModelRequest {
+    use tentaflow_protocol::*;
+    ModelRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        payload: ModelPayload::Documents(DocumentInferPayload {
+            model: request.model.clone(),
+            image_bytes: request.image_bytes.clone(),
+            mime: request.mime.clone(),
+            task: request.task.clone(),
+        }),
+        stream: false,
+        metadata: None,
+        session_id: None,
+    }
+}
+
+/// PARTIA 0 — mapuje `ModelResult` (QUIC/mesh) na `DocumentInferResponse`.
+fn document_infer_result_to_response(
+    result: tentaflow_protocol::ModelResult,
+) -> Result<DocumentInferResponse, ExecutorError> {
+    use tentaflow_protocol::ModelResult;
+    match result {
+        ModelResult::Documents(r) => Ok(DocumentInferResponse {
+            regions: r.regions,
+        }),
+        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+            "document infer error: {}",
+            err.message
+        ))),
+        _ => Err(ExecutorError::Internal(
+            "document infer returned unexpected result type".into(),
         )),
     }
 }

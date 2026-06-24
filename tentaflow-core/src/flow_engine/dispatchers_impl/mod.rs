@@ -8,6 +8,7 @@
 
 pub mod audit_impl;
 pub mod conversation_impl;
+pub mod documents_impl;
 pub mod embeddings_impl;
 pub mod llm_impl;
 pub mod memory_impl;
@@ -44,6 +45,7 @@ pub(crate) fn build_user_context(
 
 pub use audit_impl::AuditSinkImpl;
 pub use conversation_impl::ConversationHistoryImpl;
+pub use documents_impl::DocumentsDispatcherImpl;
 pub use embeddings_impl::EmbeddingsDispatcherImpl;
 pub use llm_impl::LlmDispatcherImpl;
 pub use memory_impl::MemoryStoreImpl;

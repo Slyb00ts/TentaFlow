@@ -241,6 +241,10 @@ pub enum ModelPayload {
     /// Rerank - rerankowanie dokumentów względem zapytania (cross-encoder)
     Rerank(RerankPayload),
 
+    /// Documents - detekcja struktury dokumentu (layout/tabele/grafika/OCR).
+    /// Typed surface `Documents` (`/v1/infer`), fundament flow-ingestu RAG.
+    Documents(DocumentInferPayload),
+
     /// Memory - operacje na pamięci AI (graf wiedzy, embeddingi, multi-hop reasoning)
     Memory(MemoryPayload),
 
@@ -561,6 +565,35 @@ pub struct RerankPayload {
 
     /// Czy zwrócić tekst dokumentów w wyniku (domyślnie false)
     pub return_documents: bool,
+}
+
+// ============================================================================
+// DOCUMENTS PAYLOAD
+// ============================================================================
+
+/// Payload dla typed surface `Documents` (`/v1/infer`) — detektory struktury
+/// dokumentu (yolox layout, table structure, graphic elements, OCR).
+///
+/// Fundament flow-ingestu RAG: node-adaptery (page_detect/table_structure/
+/// graphic_elements/ocr) wybierają `task`, a serwis zwraca regiony.
+///
+/// `image_bytes` używa `serde_bytes` → CBOR koduje to jako byte-string (bulk
+/// copy), a nie array-of-integers (znany błąd przy Vec<u8> bez tej adnotacji).
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct DocumentInferPayload {
+    /// Nazwa modelu/serwisu detektora (klucz katalogu Documents, ACL po nim).
+    pub model: String,
+
+    /// Surowe bajty obrazu strony (PNG/JPEG itp.).
+    #[serde(with = "serde_bytes")]
+    pub image_bytes: Vec<u8>,
+
+    /// MIME typu obrazu (np. "image/png", "image/jpeg").
+    pub mime: String,
+
+    /// Zadanie detekcji: "page_elements" | "table_structure" |
+    /// "graphic_elements" | "ocr".
+    pub task: String,
 }
 
 // ============================================================================
@@ -1563,6 +1596,9 @@ pub enum ModelResult {
     /// Rerank result
     Rerank(RerankResult),
 
+    /// Documents result - regiony struktury dokumentu (layout/tabele/OCR).
+    Documents(DocumentInferResult),
+
     /// Memory result
     Memory(MemoryResult),
 
@@ -1659,6 +1695,55 @@ pub struct RerankRequest {
 
     /// Czy zwrócić tekst dokumentów w wyniku.
     pub return_documents: bool,
+}
+
+/// Result dla typed surface `Documents` — lista wykrytych regionów strony.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct DocumentInferResult {
+    /// Wykryte regiony (layout boxes / komórki tabel / grafika / OCR spany).
+    pub regions: Vec<DocRegion>,
+}
+
+/// Pojedynczy region wykryty przez detektor dokumentu.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct DocRegion {
+    /// Klasa regionu (np. "text", "table", "figure", "title").
+    pub class: String,
+
+    /// Bounding box [x1, y1, x2, y2] w pikselach obrazu.
+    pub bbox: [f32; 4],
+
+    /// Pewność detekcji (0.0 - 1.0).
+    pub score: f32,
+
+    /// Komórki tabeli (tylko dla `task=table_structure`).
+    pub cells: Option<Vec<DocCell>>,
+
+    /// Spany OCR (tylko dla `task=ocr`).
+    pub ocr_spans: Option<Vec<OcrSpan>>,
+}
+
+/// Komórka tabeli wykryta przez `table_structure`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct DocCell {
+    /// Bounding box komórki [x1, y1, x2, y2].
+    pub bbox: [f32; 4],
+
+    /// Tekst komórki (może być pusty jeśli OCR nie był uruchomiony).
+    pub text: String,
+}
+
+/// Span tekstowy wykryty przez OCR.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct OcrSpan {
+    /// Bounding box spanu [x1, y1, x2, y2].
+    pub bbox: [f32; 4],
+
+    /// Rozpoznany tekst.
+    pub text: String,
+
+    /// Pewność rozpoznania (0.0 - 1.0).
+    pub score: f32,
 }
 
 /// Inner-enum pack rerankingu — jeden slot w `MessageBody`. CBOR 0.8 ma twardy
