@@ -804,10 +804,13 @@ struct DocChunk {
 ///
 /// `vector_search` wymaga wektora zapytania — przy enumeracji po filtrze sam
 /// porzadek wynikow jest bez znaczenia, wiec podajemy wektor zerowy o wymiarze
-/// przestrzeni (EMBED_DIMENSIONS). Filtr `doc_id == X` zaweza do tego dokumentu;
-/// `k` ustawione wysoko, by zlapac wszystkie chunki nawet duzego dokumentu.
+/// przestrzeni (EMBED_DIMENSIONS). Filtr `doc_id == X` zaweza do tego dokumentu.
+/// `k` JEST OGRANICZONE host-capem `MAX_SEARCH_K`=1000 (vector_search_v1 odrzuca
+/// `k>1000` jako AbiError::Operation) — zwracamy do 1000 chunkow na wywolanie.
+/// Pelna enumeracja dokumentu >1000 chunkow: kasowanie robi to partiami w petli
+/// (cleanup_document_artifacts), a graf czyta pierwsze 1000 (wystarcza realnie).
 fn fetch_document_chunks(document_id: &str) -> Result<Vec<DocChunk>, String> {
-    const FETCH_K: u32 = 100_000;
+    const FETCH_K: u32 = 1000;
     let zero_query = vec![0.0f32; EMBED_DIMENSIONS];
     let filter = VectorFilter::Eq(
         "doc_id".to_string(),
@@ -868,10 +871,28 @@ fn cleanup_document_artifacts(document_id: &str) -> Result<(), String> {
     // przestrzen: enumerujemy ref_id po filtrze `doc_id` i kasujemy je. Bez tego
     // (kasowanie tylko po pustym `chunks.vector_ref`) re-ingest i delete zostawialy
     // wektory osierocone.
-    for chunk in fetch_document_chunks(document_id)? {
-        if chunk.ref_id > 0 {
-            vector_delete(PASSAGES_NS, chunk.ref_id)
-                .map_err(|e| format!("usuniecie wektora ref={}: {e}", chunk.ref_id))?;
+    //
+    // Enumeracja jest ograniczona host-capem `MAX_SEARCH_K`=1000, wiec kasujemy
+    // PARTIAMI: fetch (<=1000) + delete, az przestrzen dla tego doc_id bedzie pusta.
+    // Usuwanie zmniejsza zbior, wiec kolejny fetch zwraca nastepna partie — petla
+    // konczy sie dla dokumentu DOWOLNEJ wielkosci (kompletny cleanup, bez osierocen).
+    loop {
+        let batch = fetch_document_chunks(document_id)?;
+        if batch.is_empty() {
+            break;
+        }
+        let mut deleted_any = false;
+        for chunk in batch {
+            if chunk.ref_id > 0 {
+                vector_delete(PASSAGES_NS, chunk.ref_id)
+                    .map_err(|e| format!("usuniecie wektora ref={}: {e}", chunk.ref_id))?;
+                deleted_any = true;
+            }
+        }
+        // Ochrona przed petla nieskonczona: gdyby partia miala same ref_id==0
+        // (nic do skasowania), zbior sie nie zmniejszy — przerywamy.
+        if !deleted_any {
+            break;
         }
     }
 
