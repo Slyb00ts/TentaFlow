@@ -549,6 +549,8 @@ pub use message_body::{
     ServiceListResponse,
     ServiceManifestDeployRequest,
     ServiceManifestDeployResponse,
+    ServiceRedeployRequest,
+    ServiceRedeployResponse,
     ServiceModelCatalogEntry,
     ServiceModelCatalogRequest,
     ServiceModelCatalogResponse,

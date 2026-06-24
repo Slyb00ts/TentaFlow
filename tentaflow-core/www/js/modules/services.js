@@ -310,17 +310,39 @@ function bindTabEvents() {
     };
   });
   body.querySelectorAll('[data-svc-redeploy]').forEach((b) => {
-    b.onclick = (e) => {
+    b.onclick = async (e) => {
       e.stopPropagation();
-      const engineId = b.dataset.svcEngine;
-      const nodeId = b.dataset.svcNode || undefined;
-      const deployMethod = b.dataset.svcMethod || undefined;
-      if (!engineId) return;
-      // Kreator wdrozenia pre-targetowany na ten silnik/wezel — wdraza serwis
-      // ponownie ze zaktualizowanego zrodla bundla.
-      import('/js/modules/catalog/engine-deploy-wizard.js').then((mod) => {
-        mod.openDeployWizard(engineId, { nodeId, deployMethod });
-      });
+      const svcId = b.dataset.svcRedeploy;
+      const engineId = b.dataset.svcEngine || '';
+      const deployMethod = b.dataset.svcMethod || '';
+      if (!svcId) return;
+      // One-click in-place redeploy: backend zatrzymuje stary serwis i wdraza
+      // fresh z zachowanym config_json, zwraca deployId. Strumien logow przez
+      // istniejacy deploy-progress-modal (ten sam co kreator).
+      try {
+        const resp = await ApiBinary.one('serviceRedeployRequest', {
+          serviceId: Number(svcId),
+          forceIfActiveSessions: false,
+        });
+        const status = resp?.status || '';
+        if (status === 'started' && resp.deployId) {
+          const mod = await import('/js/modules/catalog/deploy-progress-modal.js');
+          mod.openDeployProgressModal({
+            deployId: resp.deployId,
+            engineId: resp.engineId || engineId,
+            deployMethod: resp.deployMethod || deployMethod,
+          });
+          refreshServiceList();
+        } else if (status === 'no_source') {
+          toast(I18n.t('services.update_no_source') || 'Brak źródła bundla do aktualizacji', 'error');
+        } else if (status === 'not_found') {
+          toast(I18n.t('services.update_not_found') || 'Nie znaleziono serwisu', 'error');
+        } else {
+          toast(resp?.message || I18n.t('services.update_failed') || 'Aktualizacja nie powiodła się', 'error');
+        }
+      } catch (err) {
+        toast(err?.message || I18n.t('services.update_failed') || 'Aktualizacja nie powiodła się', 'error');
+      }
     };
   });
   body.querySelectorAll('[data-svc-deploy-log]').forEach((b) => {
