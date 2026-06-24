@@ -608,6 +608,147 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Atomowo przejmuje serwis do redeployu: ustawia `status='deploying'` TYLKO
+/// gdy aktualny status NIE jest już `deploying`. To jest serializacja na
+/// poziomie bazy — dwa równoległe kliki redeploy nie mogą oba przejść.
+///
+/// Zwraca `Some(stary_status)` gdy ten wywołujący przejął serwis (odczyt starego
+/// statusu I warunkowy UPDATE w JEDNEJ transakcji — handler użyje tej wartości
+/// jako `prev_status` do ewentualnego restore). `None` gdy redeploy już trwa.
+///
+/// Odczyt starego statusu MUSI być w tej samej transakcji co UPDATE: gdyby
+/// `prev_status` pochodził z osobnego, wcześniejszego SELECT-a, współbieżna
+/// zmiana statusu między odczytem a claimem zostałaby później nadpisana przez
+/// `restore_status(prev_status)` (race).
+pub fn claim_for_redeploy(conn: &Connection, id: i64) -> Result<Option<ServiceStatus>> {
+    let tx = conn.unchecked_transaction()?;
+    let prev: Option<String> = tx
+        .query_row(
+            "SELECT status FROM services WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let prev = match prev {
+        Some(s) => s,
+        None => {
+            tx.commit()?;
+            return Ok(None);
+        }
+    };
+    if prev == ServiceStatus::Deploying.as_db_tag() {
+        tx.commit()?;
+        return Ok(None);
+    }
+    tx.execute(
+        "UPDATE services SET status = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, ServiceStatus::Deploying.as_db_tag()],
+    )?;
+    tx.commit()?;
+    Ok(Some(parse_status(&prev)?))
+}
+
+/// Oznacza serwis jako trwale nieżywy po nieudanym redeployu, KTÓRY już ubił
+/// stary runtime: status `failed` i WYCZYSZCZENIE pól runtime'u
+/// (`runtime_pid/runtime_port/sidecar_quic_port/endpoint_url`). Bez tego wiersz
+/// wskazywałby na ubity proces/kontener (stale runtime), a snapshot/health
+/// raportowałby martwy serwis jako żywy. Używane gdy stop się powiódł, ale
+/// kolejny krok redeployu padł — przywracanie `status='running'` byłoby kłamstwem.
+pub fn mark_failed_clear_runtime(conn: &Connection, id: i64, err_msg: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services
+            SET status = ?2,
+                runtime_pid = NULL,
+                runtime_port = NULL,
+                sidecar_quic_port = NULL,
+                endpoint_url = NULL,
+                health_last_err = ?3,
+                progress_message = ?3,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![id, ServiceStatus::Failed.as_db_tag(), err_msg],
+    )?;
+    if n == 0 {
+        return Err(anyhow!(
+            "mark_failed_clear_runtime: service id={} not found",
+            id
+        ));
+    }
+    Ok(())
+}
+
+/// Oznacza serwis jako `failed`, ale ZACHOWUJE pola runtime'u (pid/port/endpoint).
+/// Używane gdy stop NIE potwierdził ubicia runtime'u (np. native proces nadal
+/// żyje) — zerowanie pid/port zgubiłoby dane potrzebne do późniejszego
+/// sprzątnięcia osieroconego procesu i pozwoliłoby supervisorowi/redeployowi
+/// odpalić drugi runtime obok wciąż żywego.
+pub fn mark_failed_keep_runtime(conn: &Connection, id: i64, err_msg: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services
+            SET status = ?2,
+                health_last_err = ?3,
+                progress_message = ?3,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![id, ServiceStatus::Failed.as_db_tag(), err_msg],
+    )?;
+    if n == 0 {
+        return Err(anyhow!(
+            "mark_failed_keep_runtime: service id={} not found",
+            id
+        ));
+    }
+    Ok(())
+}
+
+/// Przywraca status serwisu (np. gdy claim się powiódł, ale stop/parse padł i
+/// musimy oddać wiersz). Bezwarunkowy UPDATE po id — wołane tylko po udanym
+/// `claim_for_redeploy`, więc wiersz na pewno istnieje.
+pub fn set_status(conn: &Connection, id: i64, status: ServiceStatus) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET status = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, status.as_db_tag()],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("set_status: service id={} not found", id));
+    }
+    Ok(())
+}
+
+/// In-place start redeployu na ISTNIEJĄCYM wierszu: podpina nowy slug deployu
+/// jako `active_deploy_id` ORAZ `last_deploy_id`, nadpisuje `config_json` i zeruje
+/// progres. NIE insertuje nowego wiersza — reuse jest celowy, bo serwisy GPU nie
+/// mogą mieć dwóch kontenerów naraz (OOM). Status zostaje `deploying` (ustawiony
+/// wcześniej przez claim).
+///
+/// `last_deploy_id` celowo dostaje NOWY slug (nie stary `active_deploy_id`, który
+/// dla stabilnego serwisu jest pusty). Inaczej po sukcesie `finish_deploy_in_tx`
+/// zeruje `active_deploy_id=''` i pustym `?15` zachowuje pusty `last_deploy_id` —
+/// id deployu znika i przycisk logów deployu w GUI nie ma do czego się odwołać.
+/// To lustrzane zachowanie do `build_placeholder_service` przy świeżym deployu.
+pub fn begin_redeploy_in_tx(
+    tx: &Transaction<'_>,
+    id: i64,
+    new_deploy_id: &str,
+    config_json: &str,
+) -> Result<()> {
+    let n = tx.execute(
+        "UPDATE services
+            SET last_deploy_id = ?2,
+                active_deploy_id = ?2,
+                config_json = ?3,
+                deployment_progress_pct = 0,
+                progress_message = NULL,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1",
+        params![id, new_deploy_id, config_json],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("begin_redeploy_in_tx: service id={} not found", id));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

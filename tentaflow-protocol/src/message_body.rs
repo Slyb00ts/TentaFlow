@@ -4279,7 +4279,6 @@ pub struct ServiceManifestDeployResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceRedeployRequest {
     pub service_id: i64,
-    pub force_if_active_sessions: bool,
 }
 
 /// Response: deskryptor świeżego deployu po redeploy (lub kod błędu w `status`).

@@ -1323,10 +1323,10 @@ export const encode = {
     );
   },
 
-  /** MessageBody::DeploymentBody(ReqRedeploy { serviceId, forceIfActiveSessions }) */
-  serviceRedeployRequest(correlationId, { serviceId, forceIfActiveSessions = false }, sequence = 1) {
+  /** MessageBody::DeploymentBody(ReqRedeploy { serviceId }) */
+  serviceRedeployRequest(correlationId, { serviceId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceRedeployRequest(Number(serviceId), !!forceIfActiveSessions);
+    const body = _wasm.encodeServiceRedeployRequest(Number(serviceId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
