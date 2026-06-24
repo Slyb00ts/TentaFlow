@@ -44,7 +44,7 @@ impl VisionParseNodeAdapter {
     /// > domyślny alias `rag-parse`. Alias zawsze istnieje (failover po stronie
     /// dispatchera), więc — w odróżnieniu od `llm` — brak konfiguracji NIE jest
     /// błędem; ten node jest częścią flow-ingestu RAG z ustalonym aliasem.
-    fn pick_model(node: &FlowNode, envelope: &FlowEnvelope) -> String {
+    pub(crate) fn pick_model(node: &FlowNode, envelope: &FlowEnvelope) -> String {
         if let Some(m) = node
             .config
             .get("model")
@@ -64,7 +64,7 @@ impl VisionParseNodeAdapter {
         DEFAULT_MODEL.to_string()
     }
 
-    fn pick_max_tokens(node: &FlowNode, envelope: &FlowEnvelope) -> u32 {
+    pub(crate) fn pick_max_tokens(node: &FlowNode, envelope: &FlowEnvelope) -> u32 {
         node.config
             .get("max_tokens")
             .and_then(|v| v.as_u64())
@@ -76,7 +76,7 @@ impl VisionParseNodeAdapter {
 
     /// Tryb wyodrębniania: markdown_bbox (domyślny) / markdown → markdown,
     /// text → czysty tekst.
-    fn instruction(node: &FlowNode) -> &'static str {
+    pub(crate) fn instruction(node: &FlowNode) -> &'static str {
         match node
             .config
             .get("tools")
@@ -97,6 +97,71 @@ impl VisionParseNodeAdapter {
             )),
         }
     }
+}
+
+/// Parsuje JEDEN obraz (blob) na markdown przez vision-chat. Wydzielone z
+/// `execute`, żeby batch-owy `vision_parse_pages` reużywał DOKŁADNIE tę samą
+/// ścieżkę (instrukcja + multimodal message + ctx.llm.execute_chat), bez
+/// duplikacji budowania requestu ani kodowania obrazu. `envelope` służy tylko do
+/// odczytu meta (flow_id/correlation_id) — payload obrazu przekazujemy osobno
+/// w `blob_ref`, bo batch iteruje po wielu stronach jednego envelope.
+pub(crate) async fn parse_image_to_markdown(
+    ctx: &ExecutionContext,
+    node: &FlowNode,
+    envelope: &FlowEnvelope,
+    blob_ref: BlobRef,
+    model: String,
+    max_tokens: u32,
+    instruction: &'static str,
+) -> Result<(String, crate::flow_engine::envelope::TokenUsage)> {
+    let messages = vec![ChatMessage::user_multimodal(vec![
+        MessagePart::Text {
+            text: instruction.to_string(),
+        },
+        MessagePart::Image {
+            blob_ref,
+            detail: "high".to_string(),
+        },
+    ])];
+
+    let req = LlmRequest {
+        model,
+        messages,
+        temperature: Some(0.0),
+        max_tokens: Some(max_tokens),
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        deadline: ctx.deadline,
+        cancel_token: ctx.cancel_token.clone(),
+        user_id: ctx.user_id.clone(),
+        user_role: ctx.user_role.clone(),
+        flow_id: envelope
+            .meta
+            .get("flow_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        flow_node_id: Some(node.id.clone()),
+        agent_id: None,
+        agent_run_id: None,
+        correlation_id: envelope
+            .meta
+            .get("correlation_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    };
+
+    let response = ctx
+        .llm
+        .execute_chat(req)
+        .await
+        .map_err(|e| anyhow!("vision_parse: dispatcher failed: {e}"))?;
+    Ok((response.content, response.usage))
 }
 
 impl Default for VisionParseNodeAdapter {
@@ -133,64 +198,20 @@ impl NodeAdapter for VisionParseNodeAdapter {
         let max_tokens = Self::pick_max_tokens(node, envelope);
         let instruction = Self::instruction(node);
 
-        // Vision-chat: jeden user message z instrukcją + obrazem. Dispatcher
-        // (LlmDispatcher) zamienia blob na image_url/data-URL — ta sama ścieżka
-        // co `vision_llm`, więc bez duplikacji kodowania base64. temperature=0
-        // (deterministyczny parse, nie kreatywne pisanie).
-        let messages = vec![ChatMessage::user_multimodal(vec![
-            MessagePart::Text {
-                text: instruction.to_string(),
-            },
-            MessagePart::Image {
-                blob_ref,
-                detail: "high".to_string(),
-            },
-        ])];
+        // Vision-chat: jeden obraz → markdown. Ścieżka (instrukcja + multimodal
+        // message + ctx.llm.execute_chat) jest wspólna z batch-owym
+        // `vision_parse_pages` przez `parse_image_to_markdown`. temperature=0
+        // (deterministyczny parse) jest wewnątrz helpera.
+        let (content, usage) =
+            parse_image_to_markdown(ctx, node, envelope, blob_ref, model, max_tokens, instruction)
+                .await?;
 
-        let req = LlmRequest {
-            model,
-            messages,
-            temperature: Some(0.0),
-            max_tokens: Some(max_tokens),
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stop: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            deadline: ctx.deadline,
-            cancel_token: ctx.cancel_token.clone(),
-            user_id: ctx.user_id.clone(),
-            user_role: ctx.user_role.clone(),
-            flow_id: envelope
-                .meta
-                .get("flow_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string()),
-            flow_node_id: Some(node.id.clone()),
-            agent_id: None,
-            agent_run_id: None,
-            correlation_id: envelope
-                .meta
-                .get("correlation_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string()),
-        };
-
-        let response = ctx
-            .llm
-            .execute_chat(req)
-            .await
-            .map_err(|e| anyhow!("vision_parse: dispatcher failed: {e}"))?;
-
-        ctx.usage_sink.record(&node.id, response.usage);
+        ctx.usage_sink.record(&node.id, usage);
 
         // Markdown = treść odpowiedzi. Payload staje się Text (kolejny node —
         // chunk / document_merge — czyta go bez znajomości obrazu).
         let mut out: FlowEnvelope = (**envelope).clone();
-        out.payload = FlowValue::Text(response.content);
+        out.payload = FlowValue::Text(content);
         Ok(out)
     }
 }
