@@ -424,6 +424,7 @@ mod tests {
                 context_length: None,
                 quantization: None,
                 is_default: true,
+                service_surfaces: Vec::new(),
             }],
             update_available: false,
             created_at: "2026-01-01 00:00:00".into(),

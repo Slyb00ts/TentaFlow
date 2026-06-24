@@ -59,6 +59,7 @@ fn svc_with_caps(
         context_length: None,
         quantization: None,
         is_default: true,
+        service_surfaces: Vec::new(),
     });
     s
 }
@@ -178,6 +179,7 @@ fn service_list_projects_capabilities_unique_sorted() {
                 context_length: None,
                 quantization: None,
                 is_default: false,
+                service_surfaces: Vec::new(),
             });
             s
         }],
