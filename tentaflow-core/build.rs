@@ -1969,7 +1969,7 @@ fn build_protocol_wasm_bindings() {
     if bindgen_version == "unknown" {
         println!(
             "cargo:warning=tentaflow-protocol-wasm: brak wasm-bindgen CLI w PATH \
-             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.120 --locked), pomijam"
+             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.125 --locked), pomijam"
         );
         return;
     }
@@ -2101,7 +2101,7 @@ fn build_voxel_wasm_bindings() {
     if bindgen_version == "unknown" {
         println!(
             "cargo:warning=tentaflow-voxel-wasm: brak wasm-bindgen CLI w PATH \
-             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.120 --locked), pomijam"
+             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.125 --locked), pomijam"
         );
         return;
     }

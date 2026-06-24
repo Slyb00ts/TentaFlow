@@ -805,7 +805,7 @@ install_wasm_target() {
 # oraz z hardkodowana wartoscia w tentaflow-core/build.rs (funkcja
 # build_protocol_wasm_bindings). Bez tego narzedzia GUI nie dostanie
 # plikow www/js/protocol/wasm_glue.{js,wasm} i codec.js rzuci ImportError.
-WASM_BINDGEN_VERSION="0.2.120"
+WASM_BINDGEN_VERSION="0.2.125"
 
 install_wasm_bindgen_cli() {
     log_section "wasm-bindgen CLI (v${WASM_BINDGEN_VERSION})"
