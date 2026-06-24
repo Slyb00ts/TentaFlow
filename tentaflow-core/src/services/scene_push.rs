@@ -33,9 +33,19 @@ use crate::services::lidar_push::prepare_wire_frame;
 use crate::services::slam_scene::{SceneMapSnapshot, SlamSceneManager};
 use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
 
-/// Full-map snapshot cadence. The live feel comes from the separate `lidar:` stream;
-/// the shared map only needs to refresh "the room so far" at a human rate.
-const SCENE_PUSH_INTERVAL: Duration = Duration::from_millis(1000);
+/// Throttle on the EVENT-DRIVEN push: a fold wakes the pump immediately, but the
+/// (large) full-map snapshot is never re-broadcast faster than this — a burst of
+/// frames coalesces into one trailing snapshot. Small enough to feel real-time
+/// (camera depth lands within ~one interval of being processed), bounded enough that
+/// a growing map can't saturate the wire. The push is also change-gated, so a static
+/// scene sends nothing between heartbeats regardless.
+const SCENE_MIN_PUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Fallback poll: the per-frame `Notify` covers the hot path, but the map can also
+/// change WITHOUT a frame (clear, pose-driven rebuild, grid change) and those sites
+/// don't signal. A cheap 1 s generation re-check catches them within the same worst
+/// case the old fixed-timer pump had — it only BROADCASTS if the generation moved.
+const SCENE_CHANGE_POLL: Duration = Duration::from_millis(1000);
 
 /// Re-broadcast the current map at least this often EVEN IF unchanged. Scene frames
 /// are delivered latest-wins/lossy (a full snapshot supersedes any backlog), so a
@@ -142,8 +152,7 @@ impl SceneMapStreamSource {
 /// the hub drops the source (upgrade fails).
 async fn spawn_pump(source: Weak<SceneMapStreamSource>, robot_id: String) {
     let mgr = SlamSceneManager::global();
-    let mut interval = tokio::time::interval(SCENE_PUSH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let notify = mgr.change_notifier(&robot_id);
     let mut last_gen: Option<u64> = None;
     let mut last_sent = tokio::time::Instant::now();
     // True once the robot has produced a snapshot. After that, a `None` snapshot means
@@ -152,7 +161,18 @@ async fn spawn_pump(source: Weak<SceneMapStreamSource>, robot_id: String) {
     // snapshot, `None` just means "not started yet" — keep waiting.
     let mut seen = false;
     loop {
-        interval.tick().await;
+        // Wake the moment a fold changes the map (fast path), else poll every second
+        // to catch non-frame map changes + drive the heartbeat re-send.
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(SCENE_CHANGE_POLL) => {}
+        }
+        // Throttle: coalesce a burst into one trailing snapshot so the large full-map
+        // frame never re-broadcasts faster than the min interval.
+        let since = last_sent.elapsed();
+        if since < SCENE_MIN_PUSH_INTERVAL {
+            tokio::time::sleep(SCENE_MIN_PUSH_INTERVAL - since).await;
+        }
         let Some(src) = source.upgrade() else {
             return;
         };
@@ -165,8 +185,7 @@ async fn spawn_pump(source: Weak<SceneMapStreamSource>, robot_id: String) {
         };
         seen = true;
         // Send when the map changed (`!=`, so a generation reset / grid rebuild still
-        // re-sends), OR on the heartbeat so a snapshot dropped under lossy
-        // backpressure recovers even while the scene is static.
+        // re-sends), OR on the heartbeat.
         let changed = last_gen != Some(snap.generation);
         let heartbeat_due = last_sent.elapsed() >= SCENE_HEARTBEAT;
         if !changed && !heartbeat_due {

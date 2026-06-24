@@ -33,11 +33,16 @@ pub mod burn_stan;
 #[cfg(feature = "vision-burn")]
 #[path = "generated/plate.rs"]
 pub mod burn_plate;
+#[cfg(feature = "vision-burn")]
+#[path = "generated/depth_anything.rs"]
+pub mod burn_depth_anything;
 
 #[cfg(feature = "inference-vision-gpu")]
 pub mod classifier_stan;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
+#[cfg(feature = "inference-vision-gpu")]
+pub mod depth_anything;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;
 

@@ -6,7 +6,7 @@ description = "Schema typed primitives for TentaFlow addon UI (PanelTree, UiComp
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1.0.150"
 # `anyhow` is used by host-side validators (`parse_and_validate_ui_json`,
 # `validate_and_normalize_component`). It is wasm-compatible, so guest
 # addons that only build PanelTree values still link cleanly — LTO strips
@@ -14,5 +14,5 @@ serde_json = "1"
 anyhow = "1"
 # Used by `form::validate_validation` to reject malformed regex patterns
 # submitted by addons (host-side validation only).
-regex = "1"
+regex = "1.12.4"
 ciborium = "0.2"

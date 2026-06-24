@@ -12,7 +12,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["camera"] }
-chrono = "0.4"
+chrono = "0.4.45"
 rand = "0.10.1"
 
 [dev-dependencies]
@@ -20,5 +20,5 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 base64 = "0.22.1"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 ed25519-dalek = { version = "=3.0.0-pre.7", features = ["rand_core"] }

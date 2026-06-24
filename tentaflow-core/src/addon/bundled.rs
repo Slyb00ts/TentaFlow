@@ -246,7 +246,7 @@ fn compute_bundle_hash(addon: &BundledAddon) -> String {
     for (name, content) in addon.flows {
         hash_chunk(&mut hasher, name.as_bytes(), content.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn write_bundled_migrations(addon_dir: &std::path::Path, addon: &BundledAddon) -> Result<()> {

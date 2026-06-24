@@ -131,7 +131,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(b);
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     }
 
     #[tokio::test]

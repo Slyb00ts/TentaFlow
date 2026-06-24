@@ -88,6 +88,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             display_name: "Preset A".into(),
             repo: "org/model".into(),
             quantization: None,
+            checkpoint_file: None,
             recommended: true,
             featured: false,
             service_surfaces: None,

@@ -29,7 +29,7 @@ const HEAD_HEATMAP: &str = "StatefulPartitionedCall/kpt_heatmap_0/conv2d_5/BiasA
 const HEAD_REGRESS: &str = "StatefulPartitionedCall/kpt_regress_0/conv2d_6/BiasAdd:0";
 const HEAD_OFFSET: &str = "StatefulPartitionedCall/kpt_offset_0/conv2d_7/BiasAdd:0";
 
-type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 pub struct MovenetEngine {
     model: Arc<Runnable>,
@@ -71,10 +71,10 @@ impl PoseEstimator for MovenetEngine {
         if outputs.len() < 4 {
             return Err(anyhow!("MoveNet: expected 4 head tensors, got {}", outputs.len()));
         }
-        let center = outputs[0].as_slice::<f32>().context("MoveNet: center not f32")?;
-        let heatmap = outputs[1].as_slice::<f32>().context("MoveNet: heatmap not f32")?;
-        let regress = outputs[2].as_slice::<f32>().context("MoveNet: regress not f32")?;
-        let offset = outputs[3].as_slice::<f32>().context("MoveNet: offset not f32")?;
+        let center = outputs[0].view().as_slice::<f32>().context("MoveNet: center not f32")?;
+        let heatmap = outputs[1].view().as_slice::<f32>().context("MoveNet: heatmap not f32")?;
+        let regress = outputs[2].view().as_slice::<f32>().context("MoveNet: regress not f32")?;
+        let offset = outputs[3].view().as_slice::<f32>().context("MoveNet: offset not f32")?;
 
         let keypoints = decode_pose(center, heatmap, regress, offset, width, height);
         if keypoints.is_empty() {
@@ -113,13 +113,13 @@ pub fn load(model_path: &Path) -> Result<MovenetEngine> {
             tvec!(1, 3, INPUT_SIZE as i32, INPUT_SIZE as i32),
         ),
     )?;
-    model.set_output_names(&[HEAD_CENTER, HEAD_HEATMAP, HEAD_REGRESS, HEAD_OFFSET])?;
+    model.select_outputs_by_name([HEAD_CENTER, HEAD_HEATMAP, HEAD_REGRESS, HEAD_OFFSET])?;
     // compact() fizycznie usuwa osierocony prefiks preprocessingu — bez tego analiza
     // tracta wciaz przetwarza martwe wezly int32 i nie konczy optymalizacji.
     model.compact()?;
     let model = model.into_optimized()?.into_runnable()?;
     Ok(MovenetEngine {
-        model: Arc::new(model),
+        model,
     })
 }
 

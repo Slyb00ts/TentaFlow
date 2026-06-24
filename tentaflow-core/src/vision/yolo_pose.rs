@@ -19,7 +19,7 @@ const NMS_IOU_THRESHOLD: f32 = 0.45;
 const NUM_KEYPOINTS: usize = 17;
 const ATTRS: usize = 5 + NUM_KEYPOINTS * 3;
 
-type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 pub const COCO_KEYPOINT_NAMES: [&str; NUM_KEYPOINTS] = [
     "nose",
@@ -75,7 +75,7 @@ impl PoseEstimator for YoloPoseEngine {
             .ok_or_else(|| anyhow!("YOLO-pose: missing output tensor"))?;
         let shape = out.shape().to_vec();
         let data = out
-            .as_slice::<f32>()
+            .view().as_slice::<f32>()
             .context("YOLO-pose: output is not f32")?;
 
         let (attrs, anchors, transposed) = match shape.as_slice() {
@@ -151,7 +151,7 @@ pub fn load(model_path: &Path) -> Result<YoloPoseEngine> {
         .into_optimized()?
         .into_runnable()?;
     Ok(YoloPoseEngine {
-        model: Arc::new(model),
+        model,
     })
 }
 

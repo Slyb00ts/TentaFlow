@@ -464,6 +464,14 @@ struct State {
     instance_capacity: u32,
     instance_count: u32,
 
+    // Live-lidar cloud: the low-latency union of `lidar:<id>` frames (`cells`),
+    // drawn on top of the authoritative scene map with the SAME radial-colormap
+    // pipeline. Its own buffer so a 1 Hz `setMapPoints` REPLACE never clears the
+    // live accumulation between snapshots (no flicker), and vice-versa.
+    live_instance_buffer: wgpu::Buffer,
+    live_instance_capacity: u32,
+    live_instance_count: u32,
+
     // Overlay (camera-depth) cloud: its own uniform (fixed-colour mode) + instance
     // buffer + cell set, drawn with the SAME pipeline as the map after it. Kept fully
     // separate from `cells` so it never affects framing, the grid, or the colormap.
@@ -744,6 +752,17 @@ impl State {
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.instance_count);
+            }
+
+            // Live-lidar union on top of the scene map, same radial-colormap pipeline
+            // and bind group: the low-latency fill between 1 Hz scene snapshots.
+            if self.live_instance_count > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.live_instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..self.live_instance_count);
             }
 
             // Overlay cloud (camera depth) on top, same pipeline + fixed-colour bind
@@ -1178,13 +1197,15 @@ impl State {
         changed
     }
 
-    // Re-upload the instance buffer from the full accumulated set. Grows the buffer
-    // if the cell count outpaced the current capacity. Only called when the set
-    // actually changed (the dirty flag), so a static scene never re-uploads.
-    fn rebuild_instance_buffer(&mut self) {
+    // Re-upload the LIVE instance buffer from the accumulated live-lidar set. Grows
+    // the buffer if the cell count outpaced capacity. Only called when the set
+    // actually changed (the dirty flag), so a static scene never re-uploads. Kept
+    // separate from the authoritative `instance_buffer` (scene map) so the two never
+    // clobber each other.
+    fn rebuild_live_buffer(&mut self) {
         let count = self.cells.len();
         if count == 0 {
-            self.instance_count = 0;
+            self.live_instance_count = 0;
             return;
         }
         let mut instances: Vec<Instance> = Vec::with_capacity(count);
@@ -1194,52 +1215,100 @@ impl State {
             });
         }
 
-        if count as u32 > self.instance_capacity {
-            let new_cap = (count as u32).next_power_of_two();
-            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("voxel-instances"),
+        Self::grow_buffer(
+            &mut self.live_instance_buffer,
+            &mut self.live_instance_capacity,
+            &self.device,
+            count as u32,
+            "voxel-live-instances",
+        );
+
+        self.queue
+            .write_buffer(&self.live_instance_buffer, 0, bytemuck::cast_slice(&instances));
+        self.live_instance_count = count as u32;
+    }
+
+    // FAST PATH for an authoritative-replace cloud: the server already deduplicated
+    // the points into voxel cells, and `Instance` is exactly `[f32; 3]`, so the
+    // incoming `[x,y,z,...]` slice IS the instance buffer. Upload it in ONE
+    // `write_buffer` instead of rebuilding a HashMap + Vec per snapshot (the old path
+    // did ~N HashMap inserts + an N-element Vec copy every frame — the render stutter).
+    fn grow_buffer(buf: &mut wgpu::Buffer, cap: &mut u32, device: &wgpu::Device, n: u32, label: &str) {
+        if n > *cap {
+            let new_cap = n.next_power_of_two();
+            *buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
                 size: (new_cap as u64) * std::mem::size_of::<Instance>() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.instance_capacity = new_cap;
+            *cap = new_cap;
         }
-
-        self.queue
-            .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
-        self.instance_count = count as u32;
     }
 
-    // Re-upload the overlay (camera-depth) instance buffer from its cell set. Mirrors
-    // `rebuild_instance_buffer` but on the overlay buffers; called on each replace.
-    fn rebuild_overlay_buffer(&mut self) {
-        let count = self.overlay_cells.len();
-        if count == 0 {
+    /// Direct upload of the MAP cloud → returns (min, max) bounds for grid/framing.
+    fn upload_map_direct(&mut self, points: &[f32], n: usize) -> Option<(Vec3, Vec3)> {
+        let n = n.min(MAX_ACCUMULATED_CELLS);
+        if n == 0 {
+            self.instance_count = 0;
+            // An empty authoritative snapshot is a map clear: drop stale extents so the
+            // next cloud re-frames from scratch instead of merging old geometry.
+            self.accum_min = Vec3::splat(f32::INFINITY);
+            self.accum_max = Vec3::splat(f32::NEG_INFINITY);
+            return None;
+        }
+        Self::grow_buffer(
+            &mut self.instance_buffer,
+            &mut self.instance_capacity,
+            &self.device,
+            n as u32,
+            "voxel-instances",
+        );
+        self.queue
+            .write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&points[..n * 3]));
+        self.instance_count = n as u32;
+        // Cheap single pass for bounds (no HashMap); skip non-finite so a stray NaN
+        // can't poison the grid/framing extent.
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for i in 0..n {
+            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+            if p.is_finite() {
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
+        }
+        self.accum_min = mn;
+        self.accum_max = mx;
+        if mn.is_finite() && mx.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    }
+
+    /// Direct upload of the OVERLAY (camera-depth) cloud — no bounds/grid needed.
+    fn upload_overlay_direct(&mut self, points: &[f32], n: usize) {
+        let n = n.min(MAX_ACCUMULATED_CELLS);
+        self.overlay_cells.clear();
+        self.overlay_cell_order.clear();
+        if n == 0 {
             self.overlay_instance_count = 0;
             return;
         }
-        let mut instances: Vec<Instance> = Vec::with_capacity(count);
-        for center in self.overlay_cells.values() {
-            instances.push(Instance {
-                translation: center.to_array(),
-            });
-        }
-        if count as u32 > self.overlay_instance_capacity {
-            let new_cap = (count as u32).next_power_of_two();
-            self.overlay_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("voxel-overlay-instances"),
-                size: (new_cap as u64) * std::mem::size_of::<Instance>() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.overlay_instance_capacity = new_cap;
-        }
+        Self::grow_buffer(
+            &mut self.overlay_instance_buffer,
+            &mut self.overlay_instance_capacity,
+            &self.device,
+            n as u32,
+            "voxel-overlay-instances",
+        );
         self.queue.write_buffer(
             &self.overlay_instance_buffer,
             0,
-            bytemuck::cast_slice(&instances),
+            bytemuck::cast_slice(&points[..n * 3]),
         );
-        self.overlay_instance_count = count as u32;
+        self.overlay_instance_count = n as u32;
     }
 
     // Recompute the radial colormap origin + adaptive range from the current robot
@@ -1247,7 +1316,7 @@ impl State {
     // accumulated cells. Called both when a new frame arrives and when the pose
     // advances on its own, so colors keep radiating from the live robot position.
     fn refresh_color_field(&mut self) {
-        if self.cells.is_empty() || !self.accum_min.is_finite() || !self.accum_max.is_finite() {
+        if !self.accum_min.is_finite() || !self.accum_max.is_finite() {
             return;
         }
         let center = (self.accum_min + self.accum_max) * 0.5;
@@ -1257,13 +1326,18 @@ impl State {
             center
         };
         self.heatmap_origin = color_origin;
+        // Range = farthest XY distance from the origin to the accumulated-bounds
+        // corners. Cheap and cell-free, so the direct scene-map upload (which keeps
+        // no CPU cell copy) still gets a correct radial colormap span.
         let mut max_radius = 0.0f32;
-        for c in self.cells.values() {
-            let dx = c.x - color_origin.x;
-            let dy = c.y - color_origin.y;
-            let r = (dx * dx + dy * dy).sqrt();
-            if r > max_radius {
-                max_radius = r;
+        for &x in &[self.accum_min.x, self.accum_max.x] {
+            for &y in &[self.accum_min.y, self.accum_max.y] {
+                let dx = x - color_origin.x;
+                let dy = y - color_origin.y;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r > max_radius {
+                    max_radius = r;
+                }
             }
         }
         self.heatmap_range = max_radius.max(0.3);
@@ -1804,6 +1878,14 @@ pub async fn init_voxel_view(
         mapped_at_creation: false,
     });
 
+    let live_instance_capacity = 65_536u32;
+    let live_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("voxel-live-instances"),
+        size: (live_instance_capacity as u64) * std::mem::size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let overlay_instance_capacity = 65_536u32;
     let overlay_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("voxel-overlay-instances"),
@@ -1828,6 +1910,9 @@ pub async fn init_voxel_view(
         uniform_buffer,
         bind_group,
         instance_buffer,
+        live_instance_buffer,
+        live_instance_capacity,
+        live_instance_count: 0,
         instance_capacity,
         instance_count: 0,
         overlay_pipeline,
@@ -1966,7 +2051,7 @@ impl VoxelView {
         }
 
         if st.cells_dirty {
-            st.rebuild_instance_buffer();
+            st.rebuild_live_buffer();
             st.cells_dirty = false;
         }
 
@@ -2057,6 +2142,7 @@ impl VoxelView {
         st.cell_order.clear();
         st.cells_dirty = false;
         st.instance_count = 0;
+        st.live_instance_count = 0;
         st.accum_min = Vec3::splat(f32::INFINITY);
         st.accum_max = Vec3::splat(f32::NEG_INFINITY);
         st.capped_logged = false;
@@ -2066,6 +2152,25 @@ impl VoxelView {
         st.grid_bounds = None;
         // Allow the next accumulated cloud to re-frame the camera to the fresh map.
         st.framed = false;
+    }
+
+    /// Voxel count currently rendered for the MAP layer (lidar/scene). Lets the UI
+    /// show how many points the renderer is actually processing.
+    #[wasm_bindgen(js_name = mapPointCount)]
+    pub fn map_point_count(&self) -> u32 {
+        self.state
+            .as_ref()
+            .map(|s| {
+                let st = s.borrow();
+                st.instance_count + st.live_instance_count
+            })
+            .unwrap_or(0)
+    }
+
+    /// Voxel count currently rendered for the OVERLAY layer (camera depth).
+    #[wasm_bindgen(js_name = overlayPointCount)]
+    pub fn overlay_point_count(&self) -> u32 {
+        self.state.as_ref().map(|s| s.borrow().overlay_instance_count).unwrap_or(0)
     }
 
     /// Render the AUTHORITATIVE server scene map: a full REPLACE of the occupied set
@@ -2085,42 +2190,33 @@ impl VoxelView {
             None => return,
         };
         let mut st = state.borrow_mut();
-
-        // Full replace: drop the prior set + bounds, but KEEP `framed` so the camera
-        // is not re-framed on every snapshot.
+        st.capped_logged = false;
+        st.cells_dirty = false;
+        // Authoritative replace reconciles the live-lidar union away: the scene buffer
+        // now subsumes it, so restart the live accumulation from this snapshot. No
+        // flicker — the scene `instance_buffer` persists independently of the live one.
         st.cells.clear();
         st.cell_order.clear();
-        st.accum_min = Vec3::splat(f32::INFINITY);
-        st.accum_max = Vec3::splat(f32::NEG_INFINITY);
-        st.capped_logged = false;
+        st.live_instance_count = 0;
 
         let usable = (count as usize).min(points.len() / 3);
-        if usable == 0 {
-            // An empty authoritative map clears the render (server says nothing yet).
-            st.instance_count = 0;
-            st.cells_dirty = false;
-            st.grid_vertex_count = 0;
-            st.grid_bounds = None;
-            return;
-        }
-
-        st.accumulate_cells(points, usable);
-        st.rebuild_instance_buffer();
-        st.cells_dirty = false;
-
-        if !st.accum_min.is_finite() || !st.accum_max.is_finite() {
-            return;
-        }
-        let min = st.accum_min;
-        let max = st.accum_max;
-        let center = (min + max) * 0.5;
-        let extent = (max - min).length().max(0.5);
-        st.refresh_color_field();
-        st.update_grid(min, max);
-        if !st.framed {
-            st.camera.target = center;
-            st.camera.distance = extent * 1.2;
-            st.framed = true;
+        // FAST PATH: server-deduped points uploaded straight to the GPU (no HashMap).
+        match st.upload_map_direct(points, usable) {
+            None => {
+                st.grid_vertex_count = 0;
+                st.grid_bounds = None;
+            }
+            Some((min, max)) => {
+                let center = (min + max) * 0.5;
+                let extent = (max - min).length().max(0.5);
+                st.refresh_color_field();
+                st.update_grid(min, max);
+                if !st.framed {
+                    st.camera.target = center;
+                    st.camera.distance = extent * 1.2;
+                    st.framed = true;
+                }
+            }
         }
     }
 
@@ -2136,35 +2232,9 @@ impl VoxelView {
             None => return,
         };
         let mut st = state.borrow_mut();
-        st.overlay_cells.clear();
-        st.overlay_cell_order.clear();
-
         let usable = (count as usize).min(points.len() / 3);
-        if usable == 0 {
-            st.overlay_instance_count = 0;
-            return;
-        }
-        for i in 0..usable {
-            let p = Vec3::new(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
-            if !p.is_finite() {
-                continue;
-            }
-            let key = st.cell_key(p);
-            let center = st.cell_center(key);
-            if st.overlay_cells.insert(key, center).is_none() {
-                st.overlay_cell_order.push_back(key);
-            }
-        }
-        // FIFO cap, same bound as the map set.
-        while st.overlay_cells.len() > MAX_ACCUMULATED_CELLS {
-            match st.overlay_cell_order.pop_front() {
-                Some(old) => {
-                    st.overlay_cells.remove(&old);
-                }
-                None => break,
-            }
-        }
-        st.rebuild_overlay_buffer();
+        // FAST PATH: server-deduped depth voxels uploaded straight to the GPU.
+        st.upload_overlay_direct(points, usable);
     }
 
     /// Reconfigure the surface and depth buffer for a new backing size in

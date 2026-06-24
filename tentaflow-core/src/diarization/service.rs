@@ -440,12 +440,12 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use rusqlite::Connection;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     fn test_pool() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
-        Arc::new(StdMutex::new(conn))
+        Arc::new(crate::db::Db::from_connection(conn))
     }
 
     #[test]

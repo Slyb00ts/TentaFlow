@@ -970,12 +970,12 @@ mod tests {
     fn enrollment_flow_end_to_end() {
         use crate::db::{migrations, DbPool};
         use rusqlite::Connection;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
 
         // 1. In-memory DB z migracjami
         let conn = Connection::open_in_memory().expect("open db");
         migrations::run(&conn).expect("run migrations");
-        let pool: DbPool = Arc::new(Mutex::new(conn));
+        let pool: DbPool = Arc::new(crate::db::Db::from_connection(conn));
 
         // 2. Wczytaj audio — glos 1 (0-4.5s), glos 2 (5-end)
         let samples = read_wav_s16_mono_16k_priv("/tmp/sample_voices.wav").expect("wav");

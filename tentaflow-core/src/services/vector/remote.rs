@@ -605,7 +605,7 @@ mod owner {
             h.update(f.name.as_bytes());
             h.update([0u8]);
         }
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     }
 
     fn open(db: &DbPool, req: &VectorOpRequest) -> Result<(String, Arc<dyn VectorBackend>)> {

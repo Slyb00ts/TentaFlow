@@ -7,4 +7,4 @@ license = "Apache-2.0"
 links = "zvec_c_api"
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72.1"

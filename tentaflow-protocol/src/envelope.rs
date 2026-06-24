@@ -142,7 +142,11 @@ mod serde_array64 {
 // `ApiKeySummary` gained required fields (`key_type`, `subject_id`,
 // `subject_label`, `scope_count`, `is_active`). Old peers cannot decode the new
 // struct layout, so the handshake must reject mixed old/new nodes.
-pub const SCHEMA_VERSION: u16 = 17;
+// v18: `Envelope.body` switched from plain `Vec<u8>` (CBOR array-of-ints) to
+// `serde_bytes` (CBOR byte string) — a wire-format change for EVERY frame. A stale
+// peer would pass the version check yet misdecode every body, so the handshake must
+// reject mixed old/new.
+pub const SCHEMA_VERSION: u16 = 18;
 
 // =============================================================================
 // Message kind discriminants
@@ -364,7 +368,11 @@ pub struct Envelope {
     pub routing: Routing,
     /// Wypelniane gdy Node A forwarduje do Node B. Node B re-checks policy.
     pub forwarded_session_claim: Option<SignedSessionClaim>,
-    /// CBOR-serializowany MessageBody jako opaque bytes.
+    /// CBOR-serializowany MessageBody jako opaque bytes. `serde_bytes` wymusza CBOR
+    /// byte string (jeden bulk copy przy encode/decode) zamiast tablicy integerow
+    /// per-bajt — bez tego KAZDA klatka (do ~1 MB lidar/depth/fMP4) dekoduje sie
+    /// bajt-po-bajcie w ciborium na main-thready (zacinanie renderu).
+    #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
 }
 
@@ -527,12 +535,14 @@ mod tests {
     fn corrupted_tail_rejected() {
         let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, vec![1, 2, 3, 4]);
         let mut bytes = crate::cbor::encode(&env).expect("encode").to_vec();
-        // Uszkodzenie ostatniego bajtu (relative pointer / len trailer w CBOR)
-        if let Some(last) = bytes.last_mut() {
-            *last = last.wrapping_add(0x7F);
-        }
+        // Truncate the tail: a short frame leaves a CBOR item (the body byte string's
+        // declared length) unsatisfied, so the structural decode must reject it.
+        // (Flipping a body CONTENT byte would NOT be caught — ciborium validates
+        // structure, not data integrity; that is HMAC's job — so truncation is the
+        // meaningful corrupted-tail case.)
+        bytes.pop();
         let result = crate::cbor::decode::<Envelope>(&bytes);
-        assert!(result.is_err(), "corrupted tail must fail bytecheck");
+        assert!(result.is_err(), "truncated tail must fail structural decode");
     }
 
     #[test]

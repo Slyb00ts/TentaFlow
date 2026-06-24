@@ -14,7 +14,7 @@ egui_extras = { version = "0.34.2", features = ["image"] }
 serde = { version = "1.0", features = ["derive"] }
 
 # Async (komunikacja z Core w background)
-tokio = { version = "1.52.2", features = ["sync", "rt"] }
+tokio = { version = "1.52.3", features = ["sync", "rt"] }
 
 # Utils
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }

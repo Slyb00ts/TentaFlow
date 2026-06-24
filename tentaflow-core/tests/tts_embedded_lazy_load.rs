@@ -61,6 +61,8 @@ async fn embedded_sherpa_loads_and_registers_under_engine_id() {
                 text: "Cześć Jarvis.".to_string(),
                 speaker_id: 0,
                 speed: 1.0,
+                voice: None,
+                language: None,
             },
         )
         .expect("synthesize must succeed for the registered engine");

@@ -7,12 +7,11 @@
 use std::io::Cursor;
 
 use anyhow::{bail, Context, Result};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Docelowa czestotliwosc probkowania dla whisper.cpp
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -82,36 +81,39 @@ fn decode_symphonia(data: &[u8], format: &AudioFormat) -> Result<Vec<f32>> {
         _ => &mut hint,
     };
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format_reader = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .context("Nie udalo sie rozpoznac formatu audio")?;
 
-    let mut format_reader = probed.format;
-
     let track = format_reader
-        .default_track()
+        .default_track(TrackType::Audio)
         .context("Brak sciezki audio w pliku")?;
 
-    let sample_rate = track
+    let audio_params = track
         .codec_params
+        .as_ref()
+        .and_then(|cp| cp.audio())
+        .context("Sciezka nie zawiera parametrow audio")?;
+
+    let sample_rate = audio_params
         .sample_rate
         .context("Brak informacji o sample rate")?;
 
-    let channels = track
-        .codec_params
+    let channels = audio_params
         .channels
+        .as_ref()
         .map(|ch| ch.count())
         .unwrap_or(1);
 
     let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
         .context("Nie udalo sie utworzyc dekodera audio")?;
 
     let mut all_samples: Vec<f32> = Vec::new();
@@ -119,7 +121,8 @@ fn decode_symphonia(data: &[u8], format: &AudioFormat) -> Result<Vec<f32>> {
     // Dekoduj wszystkie pakiety
     loop {
         let packet = match format_reader.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(symphonia::core::errors::Error::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -128,7 +131,7 @@ fn decode_symphonia(data: &[u8], format: &AudioFormat) -> Result<Vec<f32>> {
             Err(_) => break,
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -137,13 +140,13 @@ fn decode_symphonia(data: &[u8], format: &AudioFormat) -> Result<Vec<f32>> {
             Err(_) => continue,
         };
 
-        let spec = *decoded.spec();
-        let duration = decoded.capacity();
-
-        let mut sample_buf = SampleBuffer::<f32>::new(duration as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        all_samples.extend_from_slice(sample_buf.samples());
+        let n = decoded.samples_interleaved();
+        if n == 0 {
+            continue;
+        }
+        let mut buf = vec![0f32; n];
+        decoded.copy_to_slice_interleaved::<f32, _>(buf.as_mut_slice());
+        all_samples.extend_from_slice(&buf);
     }
 
     if all_samples.is_empty() {

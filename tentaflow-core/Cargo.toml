@@ -120,18 +120,18 @@ tokio = { version = "1.52.2", features = ["full"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
 async-stream = "0.3.6"
-bytes = "1.11"
+bytes = "1.12.0"
 # LZ4 block codec for the lidar wire (host-side body compression). Block-only:
 # no std `frame`/io needed, so it also matches the wasm decoder's feature set.
-lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-encode", "safe-decode"] }
 
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "=1.0.0-rc.1", default-features = false, features = ["portmapper", "tls-ring"] }
-iroh-relay = { version = "=1.0.0-rc.1", default-features = false, features = ["server"] }
-iroh-mdns-address-lookup = "0.3.0"
-iroh-mainline-address-lookup = "0.3.0"
+iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh-relay = { version = "1.0.0", default-features = false, features = ["server"] }
+iroh-mdns-address-lookup = "0.4.0"
+iroh-mainline-address-lookup = "0.4.0"
 tentaflow-transport = { path = "../tentaflow-transport" }
 rustls = { version = "0.23.40", features = ["ring"] }
 tokio-rustls = "0.26.4"
@@ -146,13 +146,13 @@ reqwest = { version = "0.13.3", default-features = false, features = ["json", "s
 # ("Cannot drop a runtime in a context where blocking is not allowed").
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 readability = { version = "0.3.0", default-features = false }
-hyper = { version = "1.9.0", features = ["full"] }
+hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.3"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 
 # CEL expression engine (flow variables / io-mapping / condition / loop / map —
 # HARNESS_PLAN §3.12). Crate "cel" is the renamed continuation of
@@ -165,7 +165,7 @@ ciborium = "0.2"
 
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled"] }
-fjall = "3.1.4"
+fjall = "3.1.5"
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
 # konfigurowane w addon/storage_sql.rs.
@@ -175,7 +175,7 @@ r2d2_sqlite = "0.34.0"
 # Tabular dataset parsing for ML Studio data profiling (CSV + XLSX). Calamine
 # reads the first worksheet without spawning a process; csv streams rows.
 csv = "1.3"
-calamine = "0.26"
+calamine = "0.35.0"
 
 # Klasyczny ML on-device — smartcore to czysty Rust (drzewa cargo: num/rand,
 # zero C/Python/sys), wiec kompiluje sie tak samo na Androidzie jak na desktopie.
@@ -186,13 +186,13 @@ smartcore = { version = "0.5.0", default-features = false }
 
 # Crypto
 argon2 = "0.5.3"
-sha2 = "0.10.9"
-sha1 = "0.10.6"
-hmac = "0.12.1"
+sha2 = "0.11.0"
+sha1 = "0.11.0"
+hmac = "0.13.0"
 aes-gcm = "0.10.3"
-hkdf = "0.12.4"
-zeroize = "1.8.2"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+hkdf = "0.13.0"
+zeroize = "1.9.0"
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
@@ -205,7 +205,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Error handling
-shlex = "1.3"
+shlex = "2.0.1"
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 
@@ -214,12 +214,12 @@ thiserror = "2.0.18"
 # Uzywany do YOLOv8-face / SCRFD / MiVOLO v2 / HSEmotion / EmoNet — modele
 # embedowane w binarce przez build.rs::embed_vision_models. Latencja CPU
 # ~10-30 ms/twarz na M1; akceptowalnie szybko, jednolicie cross-platform.
-tract-onnx = { version = "0.22.1", default-features = false }
+tract-onnx = { version = "0.23.3", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Embedowanie kontekstu kontenerow w binarce (deploy::bundle)
 flate2 = "1.1.9"
-tar = "0.4.45"
+tar = "0.4.46"
 tempfile = "3.27.0"
 
 # Vector storage — embedded zvec engine (safe wrapper over the vendored C API).
@@ -234,23 +234,23 @@ milvus-sdk-rust = { git = "https://github.com/milvus-io/milvus-sdk-rust", rev = 
 
 # Synchronizacja
 parking_lot = "0.12.5"
-dashmap = "6.1.0"
-lru = "0.12"
-blake3 = "1.5"
+dashmap = "6.2.1"
+lru = "0.18.0"
+blake3 = "1.8.5"
 arc-swap = "1.7.1"
-smallvec = "1.13"
+smallvec = "1.15.2"
 rustc-hash = "2.1.2"
 
 # Utils
-uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-chrono = { version = "0.4.44", features = ["serde"] }
+uuid = { version = "1.23.3", features = ["v4", "v5", "v7"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 rand = "0.10.1"
 rand_core = "0.10"
-getrandom = "0.4"
+getrandom = "0.4.3"
 base64 = "0.22.1"
 hex = "0.4.3"
-regex = "1.12.3"
-semver = "1.0"
+regex = "1.12.4"
+semver = "1.0.28"
 
 # Multipart form data parsing
 multer = "3.1"
@@ -260,7 +260,7 @@ multer = "3.1"
 # top of printpdf so we get paragraphs / pagination without writing low-level
 # text positioning code. DejaVu fonts are vendored under assets/fonts/dejavu/
 # for full Polish-diacritic coverage on every platform.
-handlebars = "5"
+handlebars = "6.4.2"
 genpdf = "0.2"
 
 # Docker (optional)
@@ -277,8 +277,8 @@ pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfi
 # for GStreamer 1.24+; 0.23 targets GStreamer 1.22/1.24/1.26 which matches
 # our system (1.28). 0.25 also exists but landed too recently for stable
 # ecosystem alignment.
-gstreamer = { version = "0.23", optional = true }
-gstreamer-app = { version = "0.23", optional = true }
+gstreamer = { version = "0.25.2", optional = true }
+gstreamer-app = { version = "0.25.2", optional = true }
 
 # Inference — llama.cpp (optional)
 tentaflow-wrappers = { path = "../tentaflow-wrappers", optional = true }
@@ -311,7 +311,7 @@ burn = { version = "0.21", default-features = false, optional = true }
 burn-store = { version = "0.21", default-features = false, features = ["std", "burnpack"], optional = true }
 rand_distr = { version = "0.6.0", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
-symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
+symphonia = { version = "0.6.0", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
 
 # Speaker diarization — pure Rust forward pass przez tentaflow-voice
 # Cross-platform (Linux/macOS/Windows/iOS/Android), bez ort/onnxruntime ABI hell
@@ -322,13 +322,13 @@ tentaflow-voice = { path = "../tentaflow-voice", optional = true }
 
 # Mesh
 hostname = "0.4.2"
-sysinfo = "0.38.4"
+sysinfo = "0.39.5"
 num_cpus = "1"
-which = "8.0.2"
+which = "8.0.4"
 # python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
 zstd = "0.13.3"
-zip = "8.5.1"
-rcgen = "0.14.7"
+zip = "8.6.0"
+rcgen = "0.14.8"
 
 # Pobieranie modeli z HuggingFace. `tokio` = async API (model_manager, stt);
 # `ureq` = sync API (`api::sync`) wymagane przez loader Apple MLX Kokoro
@@ -342,7 +342,7 @@ dirs = "6.0.0"
 subtle = "2"
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
-netdev = "0.43.0"
+netdev = "0.45.0"
 
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
@@ -373,12 +373,12 @@ libloading = "0.9.0"
 
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-wasmtime = "45.0.1"
-wasmtime-wasi = "45.0.1"
+wasmtime = "46.0.0"
+wasmtime-wasi = "46.0.0"
 wgpu = "29.0.3"
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
-wasmi = "1.0.9"
+wasmi = "1.1.0"
 
 # Embedded graph database (services/graph) — only pulled in by the `graph`
 # feature (`optional = true` + `dep:cozo`). The persistent `sled` backend is
@@ -405,18 +405,18 @@ rcgen = "0.14.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.2+spec-1.1.0"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 hex = "0.4"
 walkdir = "2"
 
 [dev-dependencies]
 rusqlite = { version = "0.39.0", features = ["bundled"] }
-wasmtime = "45.0.1"
+wasmtime = "46.0.0"
 tempfile = "3"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 wiremock = "0.6"
 dhat = "0.3"
-filetime = "0.2"
+filetime = "0.2.29"
 
 [[bench]]
 name = "noop"

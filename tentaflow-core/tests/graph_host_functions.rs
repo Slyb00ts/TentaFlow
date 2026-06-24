@@ -195,7 +195,7 @@ fn e2e_ppr_with_seeds_biases_toward_seed_neighborhood() {
     m.upsert_edge_with_quota(ORG_A, "ad", "g", "c", "R", "d", 1.0, "{}", "null").unwrap();
 
     let seeded = m
-        .ppr(ORG_A, "ad", "g", &["a".to_string()], 10, 0.85, 30)
+        .ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, 30)
         .unwrap();
     let score = |id: &str| seeded.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap_or(0.0);
     // Mass concentrated on the seed's component (a/b) over the unrelated (c/d).
@@ -273,7 +273,7 @@ fn e2e_tombstone_excluded_from_all_retrieval_paths() {
     assert!(pr.iter().all(|(id, _)| id != "z"), "z absent from pagerank");
 
     // 3) ppr: seed a — z nie pojawia się w wyniku.
-    let ppr = m.ppr(ORG_A, "ad", "g", &["a".to_string()], 10, 0.85, 20).unwrap();
+    let ppr = m.ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, 20).unwrap();
     assert!(ppr.iter().all(|(id, _)| id != "z"), "z absent from ppr");
 
     // 4) export_csr: z ani jego krawędzie nie wchodzą do CSR.
@@ -331,7 +331,7 @@ fn ppr_iterations_and_seed_caps_are_finite() {
     m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
     // Host-fn clampuje iteracje do MAX_RANK_ITERATIONS; tu podajemy już cap.
     let ranked = m
-        .ppr(ORG_A, "ad", "g", &["a".to_string()], 10, 0.85, graph_api::MAX_RANK_ITERATIONS)
+        .ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, graph_api::MAX_RANK_ITERATIONS)
         .unwrap();
     assert!(!ranked.is_empty());
 }

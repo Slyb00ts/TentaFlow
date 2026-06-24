@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ecb::cipher::block_padding::Pkcs7;
-use ecb::cipher::{BlockDecryptMut, BlockEncryptMut};
+use ecb::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit as EcbKeyInit};
 use md5::{Digest, Md5};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
@@ -85,18 +85,20 @@ fn parse_robot_pubkey(data1: &str) -> Result<RsaPublicKey> {
 fn aes256_ecb_encrypt(key: &[u8], data: &[u8]) -> Vec<u8> {
     Aes256EcbEnc::new_from_slice(key)
         .expect("32-byte key")
-        .encrypt_padded_vec_mut::<Pkcs7>(data)
+        .encrypt_padded_vec::<Pkcs7>(data)
 }
 
 fn aes256_ecb_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     Aes256EcbDec::new_from_slice(key)
         .expect("32-byte key")
-        .decrypt_padded_vec_mut::<Pkcs7>(data)
+        .decrypt_padded_vec::<Pkcs7>(data)
         .map_err(|_| anyhow!("AES-256-ECB unpad failed"))
 }
 
 fn rsa_encrypt_pkcs1v15(pk: &RsaPublicKey, data: &[u8]) -> Result<Vec<u8>> {
-    let mut rng = rand::thread_rng();
+    // RSA (0.9) speaks rand_core 0.6; use its OS CSPRNG directly instead of rand 0.10's
+    // ThreadRng (rand_core 0.9), which doesn't implement rsa's `CryptoRngCore`.
+    let mut rng = rsa::rand_core::OsRng;
     pk.encrypt(&mut rng, Pkcs1v15Encrypt, data)
         .map_err(|e| anyhow!("RSA encrypt failed: {e}"))
 }

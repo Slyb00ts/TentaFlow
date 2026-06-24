@@ -108,7 +108,7 @@ impl BlobStore for FileBlobStore {
     async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = hex::encode(hasher.finalize());
         let blob_ref = BlobRef {
             id: uuid::Uuid::new_v4().to_string(),
             size_bytes: bytes.len() as u64,
@@ -190,7 +190,7 @@ impl BlobStore for FileBlobStore {
         // Integrity check — corrupted file would silently propagate otherwise.
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hex::encode(hasher.finalize());
         if actual != blob_ref.sha256 {
             return Err(anyhow!(
                 "blob sha256 mismatch: expected {}, got {}",
@@ -269,7 +269,7 @@ async fn verify_sha_on_disk(path: &std::path::Path, expected_sha: &str) -> Resul
     let bytes = fs::read(path).await?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = hex::encode(hasher.finalize());
     Ok(actual == expected_sha)
 }
 
@@ -301,7 +301,7 @@ impl BlobStore for InMemoryBlobStore {
     async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = hex::encode(hasher.finalize());
 
         let size_bytes = bytes.len() as u64;
         self.inner
@@ -368,7 +368,7 @@ impl BlobStore for EphemeralBlobStore {
     async fn put(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobRef> {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let sha256 = format!("{:x}", hasher.finalize());
+        let sha256 = hex::encode(hasher.finalize());
         let id = uuid::Uuid::new_v4().to_string();
         let size_bytes = bytes.len() as u64;
         self.inner

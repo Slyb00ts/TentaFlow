@@ -997,7 +997,7 @@ async fn handle_child_command(
     let parts = line.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         ["TRUST", node_id, public_key] => {
-            security.add_trusted_key(node_id, public_key, "process-e2e")?;
+            security.add_trusted_key(node_id, public_key, "process-e2e", None)?;
             Ok("TRUST".to_string())
         }
         ["CONNECT", node_id, addr] => {
