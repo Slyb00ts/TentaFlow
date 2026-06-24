@@ -701,10 +701,11 @@ impl State {
         self.write_uniforms();
 
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             // Surface lost/outdated (e.g. canvas resize race) — skip this frame;
             // the next configure/resize restores it.
-            Err(_) => return,
+            _ => return,
         };
         let view = frame
             .texture
@@ -718,6 +719,7 @@ impl State {
                 label: Some("voxel-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
@@ -734,6 +736,7 @@ impl State {
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
 
             // Ground grid (wireframe) first so voxels and the robot draw over it.
@@ -1399,7 +1402,7 @@ pub async fn init_voxel_view(
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // GL backend = WebGL2 in the browser; works without native WebGPU.
         backends: wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU,
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     let surface = instance
@@ -1413,20 +1416,20 @@ pub async fn init_voxel_view(
             force_fallback_adapter: false,
         })
         .await
-        .ok_or_else(|| JsValue::from_str("no compatible GPU adapter (WebGL2/WebGPU)"))?;
+        .map_err(|e| JsValue::from_str(&format!("no compatible GPU adapter (WebGL2/WebGPU): {e}")))?;
 
     // WebGL has no downlevel storage/compute; request the GL-compatible limits so
     // device creation succeeds on browsers without native WebGPU.
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("voxel-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
-            },
-            None,
-        )
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("voxel-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                .using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        })
         .await
         .map_err(|e| JsValue::from_str(&format!("request_device failed: {e}")))?;
 
@@ -1519,8 +1522,8 @@ pub async fn init_voxel_view(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("voxel-pl"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1528,7 +1531,7 @@ pub async fn init_voxel_view(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[
                 wgpu::VertexBufferLayout {
@@ -1545,7 +1548,7 @@ pub async fn init_voxel_view(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1567,13 +1570,14 @@ pub async fn init_voxel_view(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     });
 
     // Overlay (camera-depth) pipeline: identical to the map pipeline but with a
@@ -1587,7 +1591,7 @@ pub async fn init_voxel_view(
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[
                 wgpu::VertexBufferLayout {
@@ -1604,7 +1608,7 @@ pub async fn init_voxel_view(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1623,13 +1627,14 @@ pub async fn init_voxel_view(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     });
 
     // --- Colored line/solid pipelines (grid, robot) ---
@@ -1649,8 +1654,8 @@ pub async fn init_voxel_view(
         });
     let model_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("model-pl"),
-        bind_group_layouts: &[&model_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&model_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let colored_vertex_layout = wgpu::VertexBufferLayout {
@@ -1665,13 +1670,13 @@ pub async fn init_voxel_view(
         layout: Some(&model_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &colored_shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[colored_vertex_layout.clone()],
         },
         fragment: Some(wgpu::FragmentState {
             module: &colored_shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1693,13 +1698,14 @@ pub async fn init_voxel_view(
             // Lines are overlays/underlays: depth-test so they hide behind solid
             // obstacles, but do NOT write depth, so they never punch holes through
             // voxels drawn later (floor voxels extend below the grid's z).
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     });
 
     // Solid triangles (robot marker): no culling so the two-sided nose shows.
@@ -1708,13 +1714,13 @@ pub async fn init_voxel_view(
         layout: Some(&model_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &colored_shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[colored_vertex_layout],
         },
         fragment: Some(wgpu::FragmentState {
             module: &colored_shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1733,13 +1739,14 @@ pub async fn init_voxel_view(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     });
 
     // --- Dedicated robot-mesh pipeline (positions + normals + color) ---
@@ -1763,15 +1770,15 @@ pub async fn init_voxel_view(
         });
     let robot_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("robot-pl"),
-        bind_group_layouts: &[&robot_model_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&robot_model_bind_group_layout)],
+        immediate_size: 0,
     });
     let robot_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("robot-pipeline"),
         layout: Some(&robot_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &robot_shader,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<RobotVertex>() as u64,
@@ -1781,7 +1788,7 @@ pub async fn init_voxel_view(
         },
         fragment: Some(wgpu::FragmentState {
             module: &robot_shader,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1800,13 +1807,14 @@ pub async fn init_voxel_view(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     });
 
     let mesh_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
