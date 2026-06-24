@@ -120,9 +120,9 @@ impl StateClassifier {
         let input =
             Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [1, 3, s, s]), &self.device);
 
-        let logits: Vec<f32> = self
-            .model
-            .forward(input)
+        let out =
+            crate::vision::burn_backend::guarded_forward("state-classifier", || self.model.forward(input))?;
+        let logits: Vec<f32> = out
             .to_data()
             .to_vec()
             .map_err(|e| anyhow!("state logits to_vec: {e:?}"))?;

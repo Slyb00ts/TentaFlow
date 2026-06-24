@@ -127,9 +127,9 @@ impl PlateOcr {
         let input =
             Tensor::<VisionBackend, 4, Int>::from_data(TensorData::new(data, shape), &self.device);
 
-        let logits: Vec<f32> = self
-            .model
-            .forward(input)
+        let out =
+            crate::vision::burn_backend::guarded_forward("plate-ocr", || self.model.forward(input))?;
+        let logits: Vec<f32> = out
             .to_data()
             .to_vec()
             .map_err(|e| anyhow!("plate logits to_vec: {e:?}"))?;

@@ -112,7 +112,8 @@ impl RfDetrDetector {
         let input =
             Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [n, 3, res, res]), &self.device);
 
-        let (o0, o1) = self.model.forward(input);
+        let (o0, o1) =
+            crate::vision::burn_backend::guarded_forward("rfdetr", || self.model.forward(input))?;
         // dets last dim = 4 (cxcywh), labels last dim = num_classes + background.
         let (dets_t, labels_t) = if o0.dims()[2] == 4 { (o0, o1) } else { (o1, o0) };
         let queries = dets_t.dims()[1];
