@@ -356,7 +356,7 @@ async fn engine_loop() {
         // Empty events drop the frame buffer so they cost no memory.
         let detector = detector.clone();
         let detected =
-            tokio::task::spawn_blocking(move || detect_only(detector, frames)).await;
+            crate::vision::burn_backend::run_blocking(move || detect_only(detector, frames)).await;
         match detected {
             Ok(per_cam) => {
                 for (id, frame, w, h, dets) in per_cam {
@@ -637,7 +637,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         let _slot = slot;
         let classifier = classifier.clone();
         let ocr = ocr.clone();
-        let res = tokio::task::spawn_blocking(move || {
+        let res = crate::vision::burn_backend::run_blocking(move || {
             let mut dets = detections;
             enrich_detections(&classifier, &ocr, &frame, w, h, &mut dets);
             (camera_id, dets)

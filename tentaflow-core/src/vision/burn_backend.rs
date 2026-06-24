@@ -40,3 +40,27 @@ pub type VisionDevice = burn::backend::wgpu::WgpuDevice;
 pub fn device() -> VisionDevice {
     Default::default()
 }
+
+/// Run a model `forward()` (or any CPU/GPU-bound vision closure) on a dedicated
+/// thread with a large stack, awaiting its result.
+///
+/// burn-onnx emits each model as ONE multi-thousand-line `forward()`. Unoptimized
+/// (debug) builds give every intermediate tensor its own stack slot (no reuse), so
+/// the frame overruns tokio's 2 MB blocking-thread stack and the process aborts with
+/// a stack overflow. A 64 MB stack holds even the largest generated graph (rfdetr).
+/// `Err` means the worker thread died before sending (e.g. it panicked).
+pub async fn run_blocking<T, F>(f: F) -> Result<T, tokio::sync::oneshot::error::RecvError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("vision-infer".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .expect("spawn vision-infer thread");
+    rx.await
+}
