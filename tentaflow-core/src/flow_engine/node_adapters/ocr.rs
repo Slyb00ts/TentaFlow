@@ -32,7 +32,7 @@ impl OcrNodeAdapter {
         Self
     }
 
-    fn pick_model(node: &FlowNode, envelope: &FlowEnvelope) -> String {
+    pub(crate) fn pick_model(node: &FlowNode, envelope: &FlowEnvelope) -> String {
         if let Some(m) = node
             .config
             .get("model")
@@ -55,7 +55,7 @@ impl OcrNodeAdapter {
     /// Składa tekst ze wszystkich spanów wszystkich regionów w reading-order.
     /// Spany grupujemy w linie po środku y (z tolerancją), w linii sortujemy po
     /// x; linie sortujemy po y. Pusto → pusty string.
-    fn spans_to_text(regions: &[DocRegion]) -> String {
+    pub(crate) fn spans_to_text(regions: &[DocRegion]) -> String {
         let mut spans: Vec<&OcrSpan> = regions
             .iter()
             .filter_map(|r| r.ocr_spans.as_ref())

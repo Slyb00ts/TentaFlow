@@ -28,7 +28,7 @@ impl PageDetectNodeAdapter {
     /// Model-picking wzorem `llm`, ale z domyślnym aliasem (alias zawsze
     /// rozwiązywalny przez failover dispatchera, więc brak konfiguracji nie jest
     /// błędem — node ma ustaloną rolę w flow-ingeście RAG).
-    fn pick_model(node: &FlowNode, envelope: &FlowEnvelope, default: &str) -> String {
+    pub(crate) fn pick_model(node: &FlowNode, envelope: &FlowEnvelope, default: &str) -> String {
         if let Some(m) = node
             .config
             .get("model")

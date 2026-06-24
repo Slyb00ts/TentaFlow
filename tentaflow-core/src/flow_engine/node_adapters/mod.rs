@@ -21,6 +21,7 @@ pub mod condition;
 pub mod conversation_history;
 pub mod document_merge;
 pub mod document_router;
+pub mod embed_chunks;
 pub mod embeddings;
 pub mod graphic_elements;
 #[cfg(feature = "graph")]
@@ -31,10 +32,13 @@ pub mod loop_block;
 pub mod map_block;
 pub mod memory;
 pub mod ocr;
+pub mod ocr_pages;
 pub mod office_extract;
 pub mod on_subagent_complete;
 pub mod output;
+pub mod page_branch;
 pub mod page_detect;
+pub mod page_detect_pages;
 pub mod pdf_rasterize;
 pub mod persist_turn;
 pub mod pii_filter;
@@ -61,6 +65,7 @@ pub mod vision_crop;
 pub mod vision_llm;
 pub mod vision_ocr;
 pub mod vision_parse;
+pub mod vision_parse_pages;
 
 pub use addon::AddonNodeAdapter;
 pub use agent_block::{AgentNodeAdapter, AGENT_RUN_FLOW_ID};
@@ -77,6 +82,7 @@ pub use condition::ConditionNodeAdapter;
 pub use conversation_history::ConversationHistoryNodeAdapter;
 pub use document_merge::DocumentMergeNodeAdapter;
 pub use document_router::DocumentRouterNodeAdapter;
+pub use embed_chunks::EmbedChunksNodeAdapter;
 pub use embeddings::EmbeddingsNodeAdapter;
 pub use graphic_elements::GraphicElementsNodeAdapter;
 #[cfg(feature = "graph")]
@@ -87,12 +93,14 @@ pub use loop_block::LoopNodeAdapter;
 pub use map_block::MapNodeAdapter;
 pub use memory::MemoryNodeAdapter;
 pub use ocr::OcrNodeAdapter;
+pub use ocr_pages::OcrPagesNodeAdapter;
 pub use office_extract::{
     ExcelExtractNodeAdapter, PptxExtractNodeAdapter, WordExtractNodeAdapter,
 };
 pub use on_subagent_complete::{CompletionFilter, OnSubagentCompleteNodeAdapter};
 pub use output::OutputNodeAdapter;
 pub use page_detect::PageDetectNodeAdapter;
+pub use page_detect_pages::PageDetectPagesNodeAdapter;
 pub use pdf_rasterize::PdfRasterizeNodeAdapter;
 pub use persist_turn::PersistTurnNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
@@ -120,3 +128,4 @@ pub use vision_classify::VisionClassifyNodeAdapter;
 pub use vision_llm::VisionNodeAdapter;
 pub use vision_ocr::VisionOcrNodeAdapter;
 pub use vision_parse::VisionParseNodeAdapter;
+pub use vision_parse_pages::VisionParsePagesNodeAdapter;

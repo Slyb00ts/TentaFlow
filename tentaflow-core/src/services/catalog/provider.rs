@@ -428,6 +428,8 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "image_gen",
     "image_generation",
     "embeddings",
+    // Mostek chunk→store: wektoryzuje chunki (text input → embedding output).
+    "embed_chunks",
     "llm",
     "chat",
     "memory",
@@ -490,6 +492,12 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "chunk",
     "document_merge",
     "store",
+    // Batch-owe warianty gałęzi PDF: operują na liście stron jako JSON (nie
+    // pojedynczy obraz), więc nie deklarują medialnej modalności wejścia —
+    // ograniczenie Image jest już w `pdf_rasterize`/single-image węzłach.
+    "vision_parse_pages",
+    "page_detect_pages",
+    "ocr_pages",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks
@@ -556,6 +564,11 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
                 // `execute_embeddings` (which requires `Text` input) can
                 // resolve embedding flows. Without this the resolver
                 // filters every embeddings flow out before dispatch.
+                inputs.insert(InputModality::Text);
+                outputs.insert(OutputModality::Embedding);
+            }
+            // Mostek chunk→store: bierze tekst chunków, emituje wektory.
+            "embed_chunks" => {
                 inputs.insert(InputModality::Text);
                 outputs.insert(OutputModality::Embedding);
             }

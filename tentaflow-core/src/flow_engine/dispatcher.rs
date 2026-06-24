@@ -42,10 +42,13 @@ use crate::flow_engine::node_adapters::{
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
     ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentRouterNodeAdapter,
-    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter,
+    EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter,
+    GraphicElementsNodeAdapter, IntervalNodeAdapter,
     LlmNodeAdapter,
-    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OnSubagentCompleteNodeAdapter,
-    OutputNodeAdapter, PageDetectNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
+    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
+    OnSubagentCompleteNodeAdapter,
+    OutputNodeAdapter, PageDetectNodeAdapter, PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter,
+    PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
     RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
     RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
@@ -54,7 +57,7 @@ use crate::flow_engine::node_adapters::{
     ToolExecNodeAdapter,
     TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
     VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, VisionParseNodeAdapter,
-    WordExtractNodeAdapter,
+    VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -1100,6 +1103,9 @@ fn build_registry(
         Arc::new(PptxExtractNodeAdapter::new()),
         Arc::new(ChunkNodeAdapter::new()),
         Arc::new(DocumentMergeNodeAdapter::new()),
+        // Mostek chunk→store: wektoryzuje listę chunków i dokłada `embedding` do
+        // każdego, dając kształt wprost konsumowalny przez `store`.
+        Arc::new(EmbedChunksNodeAdapter::new()),
         // PARTIA 2 (flow-ingest RAG) — węzły zależne od modeli: parsowanie strony
         // na markdown przez VLM (vision-chat) oraz detektory struktury dokumentu
         // (layout / tabele / grafika / OCR) przez typed surface Documents.
@@ -1108,6 +1114,12 @@ fn build_registry(
         Arc::new(TableStructureNodeAdapter::new()),
         Arc::new(GraphicElementsNodeAdapter::new()),
         Arc::new(OcrNodeAdapter::new()),
+        // Batch-owe warianty gałęzi PDF (cardinality 1:1): cała lista stron
+        // (Json{pages:[blob_refs]}) jako JEDEN envelope → wzbogacona lista stron
+        // konsumowalna przez `document_merge`. Reużywają ścieżki single-image.
+        Arc::new(VisionParsePagesNodeAdapter::new()),
+        Arc::new(PageDetectPagesNodeAdapter::new()),
+        Arc::new(OcrPagesNodeAdapter::new()),
         Arc::new(StoreNodeAdapter::new()),
         Arc::new(MemoryNodeAdapter::new()),
         Arc::new(ConversationHistoryNodeAdapter::new()),
