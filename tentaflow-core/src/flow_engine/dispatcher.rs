@@ -21,15 +21,16 @@ use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
 use crate::flow_engine::dispatchers::clock::SystemClock;
 use crate::flow_engine::dispatchers::{
-    AuditSink, Clock, ConversationHistoryStore, EmbeddingsDispatcher, LlmDispatcher, MemoryStore,
-    MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore, ProgressSink, PromptStore,
-    RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
+    AuditSink, Clock, ConversationHistoryStore, DocumentsDispatcher, EmbeddingsDispatcher,
+    LlmDispatcher, MemoryStore, MetricsSink, NoopMetrics, NoopProgress, PiiRulesStore,
+    ProgressSink, PromptStore, RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher,
+    VisionDispatcher,
 };
 use crate::flow_engine::dispatchers_impl::{
-    AuditSinkImpl, ConversationHistoryImpl, EmbeddingsDispatcherImpl, LlmDispatcherImpl,
-    MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl, RerankDispatcherImpl,
-    ServiceManagerQuicFinder, SttDispatcherImpl, TtsCleaningStoreImpl, TtsDispatcherImpl,
-    VisionDispatcherImpl,
+    AuditSinkImpl, ConversationHistoryImpl, DocumentsDispatcherImpl, EmbeddingsDispatcherImpl,
+    LlmDispatcherImpl, MemoryStoreImpl, ModelRuntimeSlot, PiiRulesStoreImpl, PromptsImpl,
+    RerankDispatcherImpl, ServiceManagerQuicFinder, SttDispatcherImpl, TtsCleaningStoreImpl,
+    TtsDispatcherImpl, VisionDispatcherImpl,
 };
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
@@ -214,6 +215,7 @@ struct ContextFactory {
     llm: Arc<dyn LlmDispatcher>,
     embeddings: Arc<dyn EmbeddingsDispatcher>,
     reranker: Arc<dyn RerankDispatcher>,
+    documents: Arc<dyn DocumentsDispatcher>,
     stt: Arc<dyn SttDispatcher>,
     tts: Arc<dyn TtsDispatcher>,
     vision: Arc<dyn VisionDispatcher>,
@@ -252,6 +254,7 @@ impl ContextFactory {
             llm: self.llm.clone(),
             embeddings: self.embeddings.clone(),
             reranker: self.reranker.clone(),
+            documents: self.documents.clone(),
             stt: self.stt.clone(),
             tts: self.tts.clone(),
             vision: self.vision.clone(),
@@ -325,6 +328,8 @@ impl FlowDispatcher {
             Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
         let reranker: Arc<dyn RerankDispatcher> =
             Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
+        let documents: Arc<dyn DocumentsDispatcher> =
+            Arc::new(DocumentsDispatcherImpl::new(runtime_slot.clone()));
         let tts: Arc<dyn TtsDispatcher> =
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
@@ -351,6 +356,7 @@ impl FlowDispatcher {
             llm,
             embeddings,
             reranker,
+            documents,
             stt,
             tts,
             vision,
@@ -1180,8 +1186,8 @@ mod tests {
         use crate::flow_engine::dispatchers::clock::SystemClock;
         use crate::flow_engine::dispatchers::metrics::NoopMetrics;
         use crate::flow_engine::node_adapter::test_support::{
-            stub_vectors, StubAudit, StubEmbeddings, StubHistory, StubLlm, StubMemory,
-            StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
+            stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm,
+            StubMemory, StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
         };
         ContextFactory {
             clock: Arc::new(SystemClock),
@@ -1192,6 +1198,7 @@ mod tests {
             llm: Arc::new(StubLlm),
             embeddings: Arc::new(StubEmbeddings),
             reranker: Arc::new(StubReranker),
+            documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
             vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),

@@ -66,6 +66,10 @@ pub struct BackendClient {
     /// Pre-built URL dla /parse (RAG E1.2 — vision document parse, multipart image)
     parse_url: String,
 
+    /// Pre-built URL dla /infer (typed surface Documents — detektory struktury
+    /// yolox/table/graphic/OCR; fundament flow-ingestu RAG)
+    infer_url: String,
+
     /// Typed request-time parameters z `services.config_json` propagowane
     /// przez `LiveHandlesCache`. Backend materializuje je przy kazdym
     /// requestcie:
@@ -103,6 +107,105 @@ fn validate_document_parse_shape(body: &serde_json::Value) -> std::result::Resul
         Ok(())
     } else {
         Err("missing markdown(string)/blocks(array)".to_string())
+    }
+}
+
+/// Mapuje NIM-owy response `/v1/infer` (`{"data":[{index, …}]}`) na płaską listę
+/// `DocRegion`. Obsługuje OBA kształty z serwerów `tentaflow-containers/vision`:
+/// yolox (`bounding_boxes`: mapa klasa→boxy 0..1) i OCR (`text_detections`:
+/// poligon + tekst). Brak rozpoznanego kształtu = brak regionów dla wpisu (nie
+/// błąd — pusta strona jest legalna), więc parser nigdy nie panikuje.
+fn parse_nim_infer_regions(body: &serde_json::Value) -> Vec<tentaflow_protocol::DocRegion> {
+    use tentaflow_protocol::{DocRegion, OcrSpan};
+
+    let mut regions = Vec::new();
+    let Some(data) = body.get("data").and_then(|v| v.as_array()) else {
+        return regions;
+    };
+
+    for entry in data {
+        // yolox: bounding_boxes = { "<class>": [ {x_min,y_min,x_max,y_max,confidence}, … ] }.
+        if let Some(by_class) = entry.get("bounding_boxes").and_then(|v| v.as_object()) {
+            for (class_name, boxes) in by_class {
+                let Some(boxes) = boxes.as_array() else { continue };
+                for b in boxes {
+                    let bbox = [
+                        json_f32(b.get("x_min")),
+                        json_f32(b.get("y_min")),
+                        json_f32(b.get("x_max")),
+                        json_f32(b.get("y_max")),
+                    ];
+                    regions.push(DocRegion {
+                        class: class_name.clone(),
+                        bbox,
+                        score: json_f32(b.get("confidence")),
+                        cells: None,
+                        ocr_spans: None,
+                    });
+                }
+            }
+        }
+
+        // OCR: text_detections = [ { text_prediction:{text,confidence},
+        //                            bounding_box:{points:[{x,y}×4]} }, … ].
+        if let Some(detections) = entry.get("text_detections").and_then(|v| v.as_array()) {
+            for det in detections {
+                let pred = det.get("text_prediction");
+                let text = pred
+                    .and_then(|p| p.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let score = json_f32(pred.and_then(|p| p.get("confidence")));
+                // Poligon 0..1 → osiowo-równoległa obwiednia (min/max po punktach).
+                let bbox = polygon_bbox(
+                    det.get("bounding_box")
+                        .and_then(|bb| bb.get("points"))
+                        .and_then(|v| v.as_array()),
+                );
+                regions.push(DocRegion {
+                    class: "text".to_string(),
+                    bbox,
+                    score,
+                    cells: None,
+                    ocr_spans: Some(vec![OcrSpan { bbox, text, score }]),
+                });
+            }
+        }
+    }
+
+    regions
+}
+
+/// Konwersja liczby JSON na f32 z domyślnym 0.0 (brakujące/nie-liczbowe pole).
+fn json_f32(v: Option<&serde_json::Value>) -> f32 {
+    v.and_then(|v| v.as_f64()).unwrap_or(0.0) as f32
+}
+
+/// Obwiednia [x_min,y_min,x_max,y_max] z listy punktów poligonu `[{x,y}, …]`.
+/// Pusta/niepoprawna lista → zerowy bbox (region i tak niesie tekst+score).
+fn polygon_bbox(points: Option<&Vec<serde_json::Value>>) -> [f32; 4] {
+    let Some(points) = points else {
+        return [0.0; 4];
+    };
+    let mut x_min = f32::INFINITY;
+    let mut y_min = f32::INFINITY;
+    let mut x_max = f32::NEG_INFINITY;
+    let mut y_max = f32::NEG_INFINITY;
+    let mut seen = false;
+    for p in points {
+        let x = json_f32(p.get("x"));
+        let y = json_f32(p.get("y"));
+        x_min = x_min.min(x);
+        y_min = y_min.min(y);
+        x_max = x_max.max(x);
+        y_max = y_max.max(y);
+        seen = true;
+    }
+    if seen {
+        [x_min, y_min, x_max, y_max]
+    } else {
+        [0.0; 4]
     }
 }
 
@@ -211,6 +314,7 @@ impl BackendClient {
         let audio_speech_url = format!("{}/audio/speech", base);
         let rerank_url = format!("{}/rerank", base);
         let parse_url = format!("{}/parse", base);
+        let infer_url = format!("{}/infer", base);
 
         debug!(
             "Backend client utworzony dla: {} (timeout: {}ms, circuit breaker: enabled)",
@@ -232,6 +336,7 @@ impl BackendClient {
             audio_speech_url,
             rerank_url,
             parse_url,
+            infer_url,
             request_overrides,
             codex_creds: tokio::sync::RwLock::new(None),
         })
@@ -937,6 +1042,92 @@ impl BackendClient {
             blocks,
             usage: None,
         })
+    }
+
+    /// Typed surface `Documents` — POST `/v1/infer` do detektorów NVIDIA NIM
+    /// (yolox: page-elements / table-structure / graphic-elements, oraz OCR).
+    /// Kontrakt jest NIM-owy, NIE `{model,image,task}`: `model`/`task` służą
+    /// WYŁĄCZNIE routingowi (rozdzielenie yolox vs OCR przy parsowaniu), a body
+    /// to wyłącznie `{"input":[{"type":"image_url","url":"data:<mime>;base64,…"}]}`.
+    ///
+    /// Response jest też NIM-owy `{"data":[{index, …}]}`:
+    /// - yolox (page/table/graphic): `bounding_boxes` to mapa `nazwa_klasy ->
+    ///   [{x_min,y_min,x_max,y_max,confidence}]` (współrzędne znormalizowane 0..1)
+    ///   → po jednym `DocRegion{class, bbox, score}` na box.
+    /// - OCR: `text_detections: [{text_prediction:{text,confidence},
+    ///   bounding_box:{points:[{x,y}×4]}}]` → jeden `DocRegion{class:"text",
+    ///   ocr_spans}` z bboxem z obwiedni poligonu i `score` z confidence.
+    ///
+    /// Reużywa circuit-breakera jak `rerank_request`/`parse_document` — 5xx i
+    /// błąd transportu otwierają obwód, 4xx nie.
+    pub async fn document_infer(
+        &self,
+        model: &str,
+        image_bytes: &[u8],
+        task: &str,
+        mime: &str,
+    ) -> Result<tentaflow_protocol::DocumentInferResult> {
+        use base64::Engine as _;
+        self.check_circuit_breaker()?;
+
+        let url = &self.infer_url;
+        let image_b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+        let data_url = format!("data:{};base64,{}", mime, image_b64);
+        let body = serde_json::json!({
+            "input": [ { "type": "image_url", "url": data_url } ],
+        });
+        debug!(
+            "Wysylanie document infer request do: {} (model: {}, task: {}, mime: {}, rozmiar: {} bajtow)",
+            url,
+            model,
+            task,
+            mime,
+            image_bytes.len()
+        );
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header_value.as_str())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                let error = self.map_reqwest_error(e);
+                self.circuit_breaker.record_failure();
+                error
+            })?;
+
+        let status = response.status();
+        debug!("Document infer response status: {}", status);
+
+        if !status.is_success() {
+            if status.is_server_error() {
+                self.circuit_breaker.record_failure();
+            }
+            let error_body = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Document infer API error ({}): {}", status, error_body),
+                source: None,
+            }
+            .into());
+        }
+
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Nie mozna sparsowac document infer response: {}", e),
+                source: Some(e.into()),
+            })?;
+
+        let regions = parse_nim_infer_regions(&body);
+
+        self.circuit_breaker.record_success();
+        Ok(tentaflow_protocol::DocumentInferResult { regions })
     }
 
     /// Wysyla audio transcription request do backendu (Whisper).

@@ -338,6 +338,17 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        // Documents (typed surface `/v1/infer`, detektory struktury) — peer bez
+        // lokalnego serwisu Documents forwarduje obraz strony w DocumentInferPayload.
+        // Mesh hop binarny (image_bytes serde_bytes); route_documents_via_protocol
+        // gada z lokalnym serwisem przez REST `/v1/infer`. Fundament flow-ingestu RAG.
+        ModelPayload::Documents(ref documents_payload) => {
+            match router.route_documents_via_protocol(documents_payload).await {
+                Ok(response) => response,
+                Err(e) => make_error_response(request_id, &format!("Blad documents: {}", e)),
+            }
+        }
+
         // Vision-chat (VLM przez /v1/chat/completions, np. nemotron-parse) — peer
         // forwarduje obraz strony w VisionPayload. Bez tego ramienia parse PDF z
         // węzła bez lokalnego modelu vision padał (catch-all). Mesh hop binarny;

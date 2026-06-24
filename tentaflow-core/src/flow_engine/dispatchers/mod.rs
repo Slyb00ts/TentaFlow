@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod clock;
 pub mod conversation;
+pub mod documents;
 pub mod embeddings;
 pub mod llm;
 pub mod memory;
@@ -25,6 +26,7 @@ pub mod vision;
 pub use audit::{AuditEvent, AuditSink};
 pub use clock::Clock;
 pub use conversation::ConversationHistoryStore;
+pub use documents::DocumentsDispatcher;
 pub use embeddings::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
 pub use llm::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 pub use memory::{
