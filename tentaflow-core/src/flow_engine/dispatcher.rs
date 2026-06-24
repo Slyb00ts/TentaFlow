@@ -496,6 +496,23 @@ impl FlowDispatcher {
         meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let modality = derive_modality(&initial);
+        self.try_dispatch_with_modality(model_name, service_type, modality, initial, meta)
+            .await
+    }
+
+    /// Wariant `try_dispatch` z JAWNĄ modality zamiast wyprowadzanej z payloadu.
+    /// RAG ingest seeduje binarny payload, który może być `Image` ALBO `Other`
+    /// (PDF/xlsx/docx) — `derive_modality` rozszczepiłoby to na dwa różne flow
+    /// (`:image` vs `:text`). Ingest chce JEDNEGO flow `<model>:ingest:document`
+    /// niezależnie od typu pliku, więc resolwuje po stałej modality `"document"`.
+    pub async fn try_dispatch_with_modality(
+        &self,
+        model_name: &str,
+        service_type: &str,
+        modality: &'static str,
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let cache_key = format!("{}:{}:{}", model_name, service_type, modality);
         match self
             .resolve_cached(&cache_key, model_name, service_type, modality)

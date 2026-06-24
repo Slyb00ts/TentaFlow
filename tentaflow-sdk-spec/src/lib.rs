@@ -49,6 +49,7 @@ pub use protocol::{
     envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion, PROTOCOL_VERSION},
     flow::{FlowCancelOutput, FlowInvocationIdInput, FlowInvocationOutput, FlowInvokeInput},
     gate::{GateCheckInput, GateCheckOutput, GateSignerOut},
+    ingest::{IngestInvokeInput, IngestInvokeOutput},
     global_pose::{
         GlobalPoseFrame, GLOBAL_POSE_LEN, GLOBAL_POSE_VERSION, POSE_SRC_GNSS, POSE_SRC_IMU,
         POSE_SRC_LIDAR, POSE_SRC_MAP, POSE_SRC_ODOM, POSE_SRC_VISION, POSE_SRC_WIFI,
