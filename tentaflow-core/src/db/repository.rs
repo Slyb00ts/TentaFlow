@@ -6452,15 +6452,20 @@ pub fn create_flow_model_binding(
 }
 
 /// RAG E2.0 (bug 3 — rejestracja atomowa) — (re)rejestruje engine-flow jako
-/// published model + wiązanie W JEDNEJ TRANSAKCJI. Sekwencja w środku jednego
-/// `BEGIN`/`COMMIT`: (1) skasuj stary flow o tej `published_model_name` (kasuje
-/// też jego wiązania przez ON DELETE CASCADE / dodatkowo jawnie po wzorcu), (2)
-/// wstaw nowy flow, (3) wstaw wiązanie `model_pattern == published_model_name`.
+/// published model + wiązanie W JEDNEJ TRANSAKCJI. Gdy flow o tej
+/// `published_model_name` już istnieje, AKTUALIZUJE go W MIEJSCU (zachowuje
+/// `flows.id`) i upsertuje jego wiązanie; w przeciwnym razie wstawia nowy komplet.
 /// Brak okna „flow bez wiązania" / „model niedostępny": albo widoczny jest stary
-/// komplet, albo nowy komplet — nigdy stan pośredni. Zwraca id nowego flow.
+/// komplet, albo nowy komplet — nigdy stan pośredni. Zwraca id flow.
 ///
-/// `published_model_name` jest UNIQUE w `flows`, więc krok (1) usuwa dokładnie
-/// poprzednią rejestrację tej instancji (idempotencja install/upgrade/reconcile).
+/// `published_model_name` jest UNIQUE w `flows`, więc dopasowanie wskazuje
+/// dokładnie poprzednią rejestrację tej instancji (idempotencja
+/// install/upgrade/reconcile). Aktualizacja w miejscu, a NIE delete+insert, jest
+/// wymuszona przez FK: `flow_executions.flow_id REFERENCES flows(id)` NIE ma
+/// `ON DELETE CASCADE`, więc skasowanie flow który już się wykonał (istnieją
+/// wiersze historii) naruszałoby FK przy upgrade używanej instancji. Zachowanie
+/// `id` utrzymuje historię wykonań spójną i pozwala bezpiecznie re-rejestrować
+/// nową treść `flow_json` (np. poprawiony retrieval-round).
 pub fn register_engine_flow_atomic(
     pool: &DbPool,
     params: &FlowParams<'_>,
@@ -6470,97 +6475,108 @@ pub fn register_engine_flow_atomic(
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
 
-    // (1) Skasuj stary flow o tej published-name (jeśli istnieje) + jego wiązania.
-    let old_flow_id: Option<String> = tx
+    let existing_flow_id: Option<String> = tx
         .query_row(
             "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
             rusqlite::params![published_model_name],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    if let Some(ref old_id) = old_flow_id {
-        // Wiązania starego flow po wzorcu == published-name (kasujemy jawnie z
-        // capture, niezależnie od CASCADE, żeby ledger zobaczył usunięcie).
-        let old_binding_ids: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT id FROM flow_model_bindings WHERE model_pattern = ?1")?;
-            let rows = stmt
-                .query_map(rusqlite::params![published_model_name], |row| {
-                    row.get::<_, String>(0)
-                })?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()?
-        };
-        for bid in &old_binding_ids {
-            tx.execute(
-                "DELETE FROM flow_model_bindings WHERE id = ?1",
-                rusqlite::params![bid],
-            )?;
-            let mut fields = BTreeMap::new();
-            fields.insert("id".to_string(), field_string(bid));
-            record_core_capture_tx(
-                &tx,
-                crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
-                bid.to_string(),
-                crate::sync::runtime::SqlWriteAction::Delete,
-                fields,
-                None,
-            )?;
-        }
+
+    let flow_id = if let Some(existing_id) = existing_flow_id {
+        // (1a) Aktualizacja w miejscu — zachowujemy id, więc FK z flow_executions
+        // (bez CASCADE) pozostaje spełniony, a historia wykonań nie znika.
         tx.execute(
-            "DELETE FROM flows WHERE id = ?1",
-            rusqlite::params![old_id],
+            "UPDATE flows SET name = ?2, description = ?3, is_default = ?4, service_type = ?5, \
+             flow_json = ?6, status = ?7, published_model_name = ?8 WHERE id = ?1",
+            rusqlite::params![
+                existing_id,
+                params.name,
+                params.description,
+                params.is_default,
+                params.service_type,
+                params.flow_json,
+                params.status,
+                params.published_model_name,
+            ],
         )?;
-        let mut fields = BTreeMap::new();
-        fields.insert("id".to_string(), field_string(old_id));
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::Flow,
-            old_id.to_string(),
-            crate::sync::runtime::SqlWriteAction::Delete,
-            fields,
+            existing_id.clone(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            flow_changed_fields(params),
+            params.actor_user_id.map(|id| id.to_string()),
+        )?;
+        existing_id
+    } else {
+        // (1b) Wstaw nowy flow.
+        let new_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO flows (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                new_id,
+                params.name,
+                params.description,
+                params.is_default,
+                params.service_type,
+                params.flow_json,
+                params.status,
+                params.published_model_name,
+            ],
+        )?;
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::Flow,
+            new_id.clone(),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            flow_changed_fields(params),
+            params.actor_user_id.map(|id| id.to_string()),
+        )?;
+        new_id
+    };
+
+    // (2) Upsert wiązania modelu na published-name. Wiązanie jest identyfikowane
+    // przez (unikalny) `model_pattern == published_model_name` — re-rejestracja
+    // utrzymuje pojedynczy wiersz wiązania i tylko podmienia `flow_id`/priorytet,
+    // bez delete+insert (spójny binding, brak osieroconych wierszy).
+    let existing_binding_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM flow_model_bindings WHERE model_pattern = ?1 LIMIT 1",
+            rusqlite::params![published_model_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+
+    if let Some(binding_id) = existing_binding_id {
+        tx.execute(
+            "UPDATE flow_model_bindings SET flow_id = ?2, priority = ?3 WHERE id = ?1",
+            rusqlite::params![binding_id, flow_id, binding_priority],
+        )?;
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            binding_id,
+            crate::sync::runtime::SqlWriteAction::Update,
+            flow_binding_changed_fields(&flow_id, published_model_name, binding_priority),
+            None,
+        )?;
+    } else {
+        let binding_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![binding_id, flow_id, published_model_name, binding_priority],
+        )?;
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
+            binding_id,
+            crate::sync::runtime::SqlWriteAction::Insert,
+            flow_binding_changed_fields(&flow_id, published_model_name, binding_priority),
             None,
         )?;
     }
-
-    // (2) Wstaw nowy flow.
-    let flow_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO flows (id, name, description, is_default, service_type, flow_json, status, published_model_name) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            flow_id,
-            params.name,
-            params.description,
-            params.is_default,
-            params.service_type,
-            params.flow_json,
-            params.status,
-            params.published_model_name,
-        ],
-    )?;
-    record_core_capture_tx(
-        &tx,
-        crate::sync::core_registry::CoreSyncResourceKind::Flow,
-        flow_id.clone(),
-        crate::sync::runtime::SqlWriteAction::Insert,
-        flow_changed_fields(params),
-        params.actor_user_id.map(|id| id.to_string()),
-    )?;
-
-    // (3) Wstaw wiązanie modelu na published-name.
-    let binding_id = uuid::Uuid::new_v4().to_string();
-    tx.execute(
-        "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![binding_id, flow_id, published_model_name, binding_priority],
-    )?;
-    record_core_capture_tx(
-        &tx,
-        crate::sync::core_registry::CoreSyncResourceKind::FlowModelBinding,
-        binding_id.clone(),
-        crate::sync::runtime::SqlWriteAction::Insert,
-        flow_binding_changed_fields(&flow_id, published_model_name, binding_priority),
-        None,
-    )?;
 
     tx.commit()?;
     Ok(flow_id)
@@ -23566,28 +23582,53 @@ mod engine_flow_binding_tests {
         }
     }
 
-    /// Bug 3 — atomowa rejestracja podmienia flow+wiązanie; po podmianie model
-    /// rozwiązuje się na NOWY flow, a stare wiązanie znika (brak duplikatów).
+    /// Bug 3 — atomowa rejestracja jest idempotentna: re-rejestracja tej samej
+    /// `published_model_name` AKTUALIZUJE flow W MIEJSCU (ten sam `flows.id`,
+    /// zachowany dla FK `flow_executions.flow_id` bez CASCADE) i podmienia treść
+    /// `flow_json`, utrzymując pojedyncze wiązanie (brak duplikatów).
     #[test]
     fn register_engine_flow_atomic_replaces_in_one_shot() {
         let db = fresh_db();
         let name = "rag-aaaa:query";
         let id1 = register_engine_flow_atomic(&db, &params("v1", name), name, 100).unwrap();
-        assert_eq!(get_flow_for_model(&db, name).unwrap().unwrap().id, id1);
+        let flow1 = get_flow_for_model(&db, name).unwrap().unwrap();
+        assert_eq!(flow1.id, id1);
+        assert_eq!(flow1.name, "v1");
 
         let id2 = register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
-        assert_ne!(id1, id2);
-        assert_eq!(
-            get_flow_for_model(&db, name).unwrap().unwrap().id,
-            id2,
-            "model rozwiązuje się na nowy flow"
-        );
+        assert_eq!(id1, id2, "re-rejestracja zachowuje stabilny flow id (FK-safe)");
+        let flow2 = get_flow_for_model(&db, name).unwrap().unwrap();
+        assert_eq!(flow2.id, id2, "model rozwiązuje się na ten sam flow");
+        assert_eq!(flow2.name, "v2", "treść flow zaktualizowana w miejscu");
         let count = list_flow_model_bindings(&db)
             .unwrap()
             .iter()
             .filter(|b| b.model_pattern == name)
             .count();
-        assert_eq!(count, 1, "jedno wiązanie po podmianie");
+        assert_eq!(count, 1, "jedno wiązanie po re-rejestracji");
+    }
+
+    /// FK-safety: re-rejestracja engine-flow który MA wiersze historii w
+    /// `flow_executions` (FK bez CASCADE) NIE może naruszyć FK — odtwarza objaw
+    /// upgrade'u używanej instancji RAG.
+    #[test]
+    fn register_engine_flow_atomic_survives_existing_executions() {
+        let db = fresh_db();
+        let name = "rag-bbbb:retrieval-round";
+        let flow_id = register_engine_flow_atomic(&db, &params("v1", name), name, 100).unwrap();
+        {
+            let conn = acquire(&db).unwrap();
+            conn.execute(
+                "INSERT INTO flow_executions (flow_id, status) VALUES (?1, 'success')",
+                rusqlite::params![flow_id],
+            )
+            .unwrap();
+        }
+        // Bez in-place update poniższe rzuciłoby FOREIGN KEY constraint failed.
+        let flow_id2 =
+            register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
+        assert_eq!(flow_id, flow_id2, "id zachowane mimo historii wykonań");
+        assert_eq!(get_flow_for_model(&db, name).unwrap().unwrap().name, "v2");
     }
 
     /// Bug 5 — `_` we wzorcu jest LITERALNY (nie wildcard LIKE). Wzorzec
