@@ -42,11 +42,11 @@ use crate::services::slam_scene::SlamSceneManager;
 /// grid so a phone's map and a robot's map share one cell size.
 const MAP_RESOLUTION_M: f32 = 0.05;
 
-/// Drop depth samples beyond this range (m). Monocular metric models grow noisy
-/// far out AND the camera's wide lens makes a pinhole back-projection over-spread far
-/// edge pixels into a diagonal "spray"; near walls/objects carry the useful structure
-/// for an indoor map. 6 m keeps ~all reliable depth (Go2 indoor p90 ≈ 2.7 m).
-const MAX_DEPTH_M: f32 = 6.0;
+/// Drop depth samples beyond this range (m, AFTER scale). Monocular metric depth grows
+/// unreliable with range (error ∝ distance) and over-spreads under a pinhole model, so
+/// the far tail is the sprawling "garbage" — only the near structure is trustworthy.
+/// 3 m keeps the reliable bulk (Go2 indoor p50 ≈ 2.2 m after scale) and cuts the tail.
+const MAX_DEPTH_M: f32 = 3.0;
 
 /// Pixel stride when sampling the depth map. A dense map (e.g. 504×378 ≈ 190k px)
 /// is decimated to keep the per-frame cloud near a LiDAR's point budget; the
@@ -248,7 +248,7 @@ async fn central_worker() {
             }
             seq = seq.wrapping_add(1);
             let frame = encode_lidar_frame(&points, MAP_RESOLUTION_M, seq, depth_timestamp_us());
-            SlamSceneManager::global().on_lidar_frame(&job.cfg.robot_id, &frame);
+            SlamSceneManager::global().on_depth_frame(&job.cfg.robot_id, &frame);
             total_pts += points.len() / 3;
         }
         let t_rest_ms = t_rest.elapsed().as_secs_f64() * 1000.0;
