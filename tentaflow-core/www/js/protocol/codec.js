@@ -3100,6 +3100,67 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(RecogStageMediaRequest) — jeden fragment surowego
+   * pliku media (obraz/wideo) wgrywanego do staging projektu recognition.
+   * payload: { projectId, filename, uploadId, seq, totalChunks, bytes }.
+   */
+  mlStudioRecogStageMediaRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogStageMediaRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.filename ?? ''),
+      String(payload.uploadId ?? payload.upload_id ?? ''),
+      Number(payload.seq ?? 0) >>> 0,
+      Number(payload.totalChunks ?? payload.total_chunks ?? 0) >>> 0,
+      payload.bytes instanceof Uint8Array ? payload.bytes : new Uint8Array(payload.bytes ?? []),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogBuildDatasetRequest) — buduje dataset COCO z
+   * wcześniej wgranych plików staging (kopia obrazów, dekodowanie HEIC, ekstrakcja
+   * klatek wideo). payload: { projectId, datasetName, fps }.
+   */
+  mlStudioRecogBuildDatasetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogBuildDatasetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetName ?? payload.dataset_name ?? ''),
+      Number(payload.fps ?? 5) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogBuildStatusRequest) — polling postępu
+   * asynchronicznej budowy datasetu COCO. payload: { buildId }. Zwraca status
+   * (running|succeeded|failed), licznik plików/klatek i dataset po sukcesie.
+   */
+  mlStudioRecogBuildStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogBuildStatusRequest(
+      String(payload.buildId ?? payload.build_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(FtExportRequest) — startuje ASYNCHRONICZNY eksport
    * wytrenowanego modelu FT do GGUF. Odpowiedź wraca natychmiast ze statusem
    * 'running'; postęp odpytuj przez mlStudioFtExportStatusRequest.

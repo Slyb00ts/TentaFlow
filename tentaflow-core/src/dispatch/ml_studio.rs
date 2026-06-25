@@ -17,6 +17,7 @@ use crate::ml_studio::models::{
     Dataset, ModelSummary, ProjectMember, ProjectRole, ProjectSummary, ProjectType, ResourceGrant,
     TrainingRunSummary,
 };
+use crate::ml_studio::build_recog_dataset;
 use crate::ml_studio::profile::{self, TableProfile};
 use crate::ml_studio::repository;
 use crate::ml_studio::train_autogluon;
@@ -502,7 +503,7 @@ fn profile_coco_zip(zip_bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
 
 /// Profiluje dataset COCO leżący jako KATALOG na dysku (splity z
 /// `_annotations.coco.json`). Zwraca ten sam kształt co `profile_coco_zip`.
-fn profile_coco_dir(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn profile_coco_dir(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     if !path.is_dir() {
         anyhow::bail!("ścieżka nie jest katalogiem: {}", path.display());
     }
@@ -877,6 +878,227 @@ pub fn ml_studio_dataset_upload_chunk(
             received_chunks,
             received_bytes,
             dataset,
+        },
+    )))
+}
+
+// Staging accumulator for raw media uploads of recognition projects. Distinct
+// from UPLOAD_ACCUM: on completion the reassembled file is WRITTEN TO DISK in the
+// project staging dir (not turned into a dataset). The same DoS limits apply.
+struct StageAccum {
+    project_id: String,
+    filename: String,
+    total_chunks: u32,
+    chunks: Vec<Option<Vec<u8>>>,
+    received_bytes: u64,
+    last_touch: std::time::Instant,
+}
+
+static STAGE_ACCUM: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, StageAccum>>,
+> = std::sync::OnceLock::new();
+
+fn stage_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, StageAccum>> {
+    STAGE_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[handler(variant = "MlStudioRecogStageMediaRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_stage_media(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogStageMediaRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogStageMediaRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if payload.total_chunks == 0 || payload.seq >= payload.total_chunks {
+        return Err(ProtocolError::bad_request("invalid chunk seq/total"));
+    }
+    if payload.total_chunks > MAX_UPLOAD_CHUNKS {
+        return Err(ProtocolError::bad_request("too many chunks"));
+    }
+    if payload.upload_id.trim().is_empty() || payload.upload_id.len() > 128 {
+        return Err(ProtocolError::bad_request("invalid upload_id"));
+    }
+
+    let (received_chunks, received_bytes, complete) = {
+        let mut map = stage_accum().lock().unwrap();
+
+        let now = std::time::Instant::now();
+        map.retain(|_, e| now.duration_since(e.last_touch) < UPLOAD_TTL);
+
+        let other_bytes: u64 = map
+            .iter()
+            .filter(|(k, _)| *k != &payload.upload_id)
+            .map(|(_, e)| e.received_bytes)
+            .sum();
+        if other_bytes + payload.bytes.len() as u64 > MAX_TOTAL_UPLOAD_BYTES {
+            return Err(ProtocolError::bad_request("server upload buffer full, retry later"));
+        }
+
+        let entry = map.entry(payload.upload_id.clone()).or_insert_with(|| StageAccum {
+            project_id: payload.project_id.clone(),
+            filename: payload.filename.clone(),
+            total_chunks: payload.total_chunks,
+            chunks: (0..payload.total_chunks).map(|_| None).collect(),
+            received_bytes: 0,
+            last_touch: now,
+        });
+
+        if entry.project_id != payload.project_id
+            || entry.filename != payload.filename
+            || entry.total_chunks != payload.total_chunks
+        {
+            map.remove(&payload.upload_id);
+            return Err(ProtocolError::bad_request("chunk metadata mismatch for upload_id"));
+        }
+        entry.last_touch = now;
+
+        let idx = payload.seq as usize;
+        match &entry.chunks[idx] {
+            Some(existing) if existing.as_slice() != payload.bytes.as_slice() => {
+                map.remove(&payload.upload_id);
+                return Err(ProtocolError::bad_request("conflicting bytes for chunk seq"));
+            }
+            Some(_) => {}
+            None => {
+                entry.received_bytes += payload.bytes.len() as u64;
+                if entry.received_bytes > MAX_UPLOAD_BYTES {
+                    map.remove(&payload.upload_id);
+                    return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                }
+                entry.chunks[idx] = Some(payload.bytes.clone());
+            }
+        }
+
+        let received_chunks = entry.chunks.iter().filter(|c| c.is_some()).count() as u32;
+        let received_bytes = entry.received_bytes;
+
+        let complete = if received_chunks == entry.total_chunks {
+            let mut joined = Vec::with_capacity(entry.received_bytes as usize);
+            for c in &entry.chunks {
+                joined.extend_from_slice(c.as_ref().unwrap());
+            }
+            let meta = map.remove(&payload.upload_id).unwrap();
+            Some((meta.filename, joined))
+        } else {
+            None
+        };
+        (received_chunks, received_bytes, complete)
+    };
+
+    let staged = if let Some((filename, bytes)) = complete {
+        build_recog_dataset::stage_file(&payload.project_id, &filename, &bytes)
+            .map_err(|e| ProtocolError::internal(format!("stage file failed: {}", e)))?;
+        true
+    } else {
+        false
+    };
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogStageMediaResponse(
+        tentaflow_protocol::MlStudioRecogStageMediaResponse {
+            upload_id: payload.upload_id.clone(),
+            received_chunks,
+            received_bytes,
+            staged,
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioRecogBuildDatasetRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_build_dataset(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogBuildDatasetRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    let dataset_name = if payload.dataset_name.trim().is_empty() {
+        "dataset".to_string()
+    } else {
+        payload.dataset_name.trim().to_string()
+    };
+
+    // Building decodes HEIC and runs ffmpeg per video — minutes of work for many
+    // files — so it runs as an async background job. Return a build id immediately;
+    // the UI polls progress via RecogBuildStatus. Server-side caps + a per-project
+    // single-build guard live in `spawn_build`.
+    match build_recog_dataset::spawn_build(
+        payload.project_id.clone(),
+        org.user_id.clone(),
+        dataset_name,
+        payload.fps,
+    ) {
+        Ok(build_id) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetResponse(
+            tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
+                build_id,
+                status: "running".to_string(),
+                error: None,
+            },
+        ))),
+        Err(e) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetResponse(
+            tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
+                build_id: String::new(),
+                status: "failed".to_string(),
+                error: Some(e.to_string()),
+            },
+        ))),
+    }
+}
+
+#[handler(variant = "MlStudioRecogBuildStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_build_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogBuildStatusRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogBuildStatusRequest")),
+    };
+    let _org = require_org(ctx)?;
+
+    let prog = build_recog_dataset::build_progress(&payload.build_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "build not found"))?;
+
+    // Resolve the registered dataset summary once the build succeeded.
+    let dataset = match prog.dataset_id.as_deref() {
+        Some(id) => repository::get_dataset(&_org.user_id, id)
+            .map_err(db_err)?
+            .as_ref()
+            .map(to_dataset_summary),
+        None => None,
+    };
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildStatusResponse(
+        tentaflow_protocol::MlStudioRecogBuildStatusResponse {
+            build_id: payload.build_id.clone(),
+            status: prog.status,
+            files_total: prog.files_total,
+            files_done: prog.files_done,
+            frames_extracted: prog.frames_extracted,
+            dataset,
+            image_count: prog.image_count,
+            category_count: prog.category_count,
+            error: prog.error,
         },
     )))
 }

@@ -2236,6 +2236,58 @@ pub fn encode_ml_studio_recog_dataset_register_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioRecogStageMediaRequest)]
+pub fn encode_ml_studio_recog_stage_media_request(
+    project_id: String,
+    filename: String,
+    upload_id: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogStageMediaRequest(
+            tentaflow_protocol::MlStudioRecogStageMediaRequest {
+                project_id,
+                filename,
+                upload_id,
+                seq,
+                total_chunks,
+                bytes,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogBuildDatasetRequest)]
+pub fn encode_ml_studio_recog_build_dataset_request(
+    project_id: String,
+    dataset_name: String,
+    fps: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogBuildDatasetRequest(
+            tentaflow_protocol::MlStudioRecogBuildDatasetRequest {
+                project_id,
+                dataset_name,
+                fps,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogBuildStatusRequest)]
+pub fn encode_ml_studio_recog_build_status_request(build_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogBuildStatusRequest(
+            tentaflow_protocol::MlStudioRecogBuildStatusRequest { build_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -9251,6 +9303,73 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
         tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterResponse(resp) => {
             set(obj, "variant", "MlStudioRecogDatasetRegisterResponse".into());
             set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogStageMediaRequest(req) => {
+            set(obj, "variant", "MlStudioRecogStageMediaRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "filename", req.filename.into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "seq", req.seq.into());
+            set(obj, "totalChunks", req.total_chunks.into());
+            set(obj, "total_chunks", req.total_chunks.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogStageMediaResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogStageMediaResponse".into());
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            set(obj, "staged", resp.staged.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogBuildDatasetRequest(req) => {
+            set(obj, "variant", "MlStudioRecogBuildDatasetRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetName", req.dataset_name.clone().into());
+            set(obj, "dataset_name", req.dataset_name.into());
+            set(obj, "fps", req.fps.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogBuildDatasetResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogBuildDatasetResponse".into());
+            set(obj, "buildId", resp.build_id.clone().into());
+            set(obj, "build_id", resp.build_id.into());
+            set(obj, "status", resp.status.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::RecogBuildStatusRequest(req) => {
+            set(obj, "variant", "MlStudioRecogBuildStatusRequest".into());
+            set(obj, "buildId", req.build_id.clone().into());
+            set(obj, "build_id", req.build_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogBuildStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogBuildStatusResponse".into());
+            set(obj, "buildId", resp.build_id.clone().into());
+            set(obj, "build_id", resp.build_id.into());
+            set(obj, "status", resp.status.into());
+            set(obj, "filesTotal", (resp.files_total as f64).into());
+            set(obj, "files_total", (resp.files_total as f64).into());
+            set(obj, "filesDone", (resp.files_done as f64).into());
+            set(obj, "files_done", (resp.files_done as f64).into());
+            set(obj, "framesExtracted", (resp.frames_extracted as f64).into());
+            set(obj, "frames_extracted", (resp.frames_extracted as f64).into());
+            if let Some(ds) = &resp.dataset {
+                set(obj, "dataset", ml_studio_dataset_summary_to_js(ds).into());
+            }
+            set(obj, "imageCount", (resp.image_count as f64).into());
+            set(obj, "image_count", (resp.image_count as f64).into());
+            set(obj, "categoryCount", resp.category_count.into());
+            set(obj, "category_count", resp.category_count.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
         }
         tentaflow_protocol::MlStudioPayload::RecogDetectRequest(req) => {
             set(obj, "variant", "MlStudioRecogDetectRequest".into());

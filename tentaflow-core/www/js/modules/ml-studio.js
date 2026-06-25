@@ -1376,6 +1376,75 @@ async function uploadDataset(pid, file) {
   }
 }
 
+// Stages ONE raw media file server-side via the recognition staging endpoint,
+// always chunked over the WS frame limit. Does NOT create a dataset (that is the
+// separate build step). Reuses CHUNK_SIZE.
+async function stageRecogMedia(pid, file) {
+  const filename = file.name || 'media';
+  const buf = await file.arrayBuffer();
+  const all = new Uint8Array(buf);
+  const totalChunks = Math.max(1, Math.ceil(all.length / CHUNK_SIZE));
+  const uploadId = (crypto.randomUUID && crypto.randomUUID())
+    || `stg-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+  for (let seq = 0; seq < totalChunks; seq += 1) {
+    const start = seq * CHUNK_SIZE;
+    const slice = all.subarray(start, Math.min(start + CHUNK_SIZE, all.length));
+    await ApiBinary.one('mlStudioRecogStageMediaRequest', {
+      projectId: pid,
+      filename,
+      uploadId,
+      seq,
+      totalChunks,
+      bytes: slice,
+    });
+  }
+}
+
+// Odpytuje status asynchronicznej budowy datasetu COCO do zakończenia. Pokazuje
+// postęp ("Przetwarzanie N / total", liczba klatek), na końcu toast i odświeża
+// listę zbiorów. Rozwiązuje się dopiero po stanie terminalnym (succeeded/failed).
+function pollRecogBuild(pid, buildId, prog) {
+  return new Promise((resolve) => {
+    const tick = async () => {
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioRecogBuildStatusRequest', { buildId });
+      } catch (err) {
+        if (prog) prog.textContent = '';
+        toast(`Budowa datasetu: ${err.message}`, 'error');
+        resolve();
+        return;
+      }
+      const status = st.status || 'running';
+      const total = st.filesTotal ?? st.files_total ?? 0;
+      const doneN = st.filesDone ?? st.files_done ?? 0;
+      const frames = st.framesExtracted ?? st.frames_extracted ?? 0;
+      if (status === 'succeeded') {
+        const imgs = st.imageCount ?? st.image_count ?? 0;
+        const cats = st.categoryCount ?? st.category_count ?? 0;
+        if (prog) prog.textContent = '';
+        toast(`Dataset zbudowany: ${imgs} obrazów, ${cats} klas.`, 'success');
+        loadDatasets(pid);
+        resolve();
+        return;
+      }
+      if (status === 'failed') {
+        if (prog) prog.textContent = '';
+        toast(`Budowa datasetu: ${st.error || 'nieznany błąd'}`, 'error');
+        resolve();
+        return;
+      }
+      if (prog) {
+        prog.textContent = total
+          ? `Przetwarzanie ${doneN} / ${total} (klatek: ${frames})…`
+          : 'Budowanie datasetu (dekodowanie HEIC, klatki z wideo)…';
+      }
+      setTimeout(tick, 2000);
+    };
+    tick();
+  });
+}
+
 async function onDatasetUploaded(pid, filename, resp) {
   toast(`Wgrano „${filename}" — sprofilowano`, 'success');
   await loadDatasets(pid);
@@ -2310,11 +2379,76 @@ function renderRecogDataTab(panel, p) {
         </div>
       </section>
       <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('cloud')} Zbuduj dataset z plików
+          <span class="ml-studio-data-hint">obrazy + wideo → katalog COCO train/ z pustymi anotacjami</span>
+        </div>
+        <p class="ml-studio-data-origin-text" style="margin:0 0 10px">Wgraj wiele plików (jpg/png/heic, mp4/mov). Obrazy są kopiowane, HEIC dekodowane, a z wideo wycinane klatki. Powstaje dataset COCO gotowy do auto-etykietowania, ręcznej anotacji i treningu.</p>
+        <tf-file-input id="ml-studio-recog-build-files" accept=".jpg,.jpeg,.png,.heic,.mp4,.mov" multiple label="Przeciągnij pliki lub kliknij, aby wgrać"></tf-file-input>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
+          <tf-input id="ml-studio-recog-build-name" label="Nazwa datasetu" placeholder="np. ADR z terenu" style="flex:1;min-width:200px"></tf-input>
+          <tf-input id="ml-studio-recog-build-fps" type="number" label="Klatki/s z wideo" value="5" min="1" max="60" style="min-width:140px"></tf-input>
+          <tf-button variant="primary" icon="plus" id="ml-studio-recog-build">Zbuduj dataset</tf-button>
+        </div>
+        <div id="ml-studio-recog-build-progress" class="ml-studio-data-hint" style="margin-top:8px"></div>
+      </section>
+      <section class="ml-studio-data-card">
         <div class="ml-studio-data-head">${sprite('database')} Zarejestrowane zbiory</div>
         <div id="ml-studio-datasets"></div>
       </section>
     </div>
   `;
+
+  let recogBuildFiles = [];
+  byId('ml-studio-recog-build-files')?.addEventListener('change', (e) => {
+    const files = e.detail?.files;
+    recogBuildFiles = files && files.length ? Array.from(files) : [];
+    const prog = byId('ml-studio-recog-build-progress');
+    if (prog) prog.textContent = recogBuildFiles.length ? `Wybrano plików: ${recogBuildFiles.length}` : '';
+  });
+
+  byId('ml-studio-recog-build')?.addEventListener('click', async () => {
+    const name = (byId('ml-studio-recog-build-name')?.value || '').trim();
+    const fps = Math.max(1, parseInt(byId('ml-studio-recog-build-fps')?.value || '5', 10) || 5);
+    // Read the current selection straight from the live <input> at click time. The
+    // change-captured `recogBuildFiles` can be stale if the tab re-rendered (e.g. the
+    // datasets list refreshed) after the user picked files, so the DOM is the source
+    // of truth here; fall back to the captured list if the input is gone.
+    const liveInput = byId('ml-studio-recog-build-files')?.querySelector('input[type="file"]');
+    const files = liveInput && liveInput.files && liveInput.files.length
+      ? Array.from(liveInput.files)
+      : recogBuildFiles;
+    if (!files.length) { toast('Wybierz pliki do zbudowania datasetu.', 'error'); return; }
+    if (!name) { toast('Podaj nazwę datasetu.', 'error'); return; }
+    const btn = byId('ml-studio-recog-build');
+    const prog = byId('ml-studio-recog-build-progress');
+    btn?.setAttribute('disabled', '');
+    try {
+      const total = files.length;
+      for (let i = 0; i < total; i += 1) {
+        if (prog) prog.textContent = `Wysyłanie ${i + 1} / ${total}: ${files[i].name}`;
+        await stageRecogMedia(pid, files[i]);
+      }
+      if (prog) prog.textContent = 'Uruchamianie budowy datasetu…';
+      const resp = await ApiBinary.one('mlStudioRecogBuildDatasetRequest', {
+        projectId: pid, datasetName: name, fps,
+      });
+      const buildId = resp.buildId ?? resp.build_id ?? '';
+      if (resp.error || !buildId) {
+        toast(`Budowa datasetu: ${resp.error || 'nie udało się uruchomić'}`, 'error');
+        if (prog) prog.textContent = '';
+        return;
+      }
+      // Budowa biegnie ASYNCHRONICZNIE w tle — odpytuj postęp do zakończenia.
+      await pollRecogBuild(pid, buildId, prog);
+      recogBuildFiles = [];
+    } catch (err) {
+      toast(`Budowa datasetu: ${err.message}`, 'error');
+      if (prog) prog.textContent = '';
+    } finally {
+      btn?.removeAttribute('disabled');
+    }
+  });
+
   byId('ml-studio-recog-register')?.addEventListener('click', async () => {
     const path = (byId('ml-studio-recog-path')?.value || '').trim();
     const name = (byId('ml-studio-recog-name')?.value || '').trim();

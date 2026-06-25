@@ -1620,6 +1620,72 @@ pub struct MlStudioRecogDatasetRegisterResponse {
     pub dataset: DatasetSummary,
 }
 
+/// Stages ONE raw media file (image/video) server-side for a recognition
+/// project, chunked over the WS frame limit (~0.9 MB). Reuses the chunked-upload
+/// metadata shape (`upload_id`/`seq`/`total_chunks`); on the final chunk the
+/// reassembled bytes are written to the project staging dir (NOT a dataset).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogStageMediaRequest {
+    pub project_id: String,
+    pub filename: String,
+    pub upload_id: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogStageMediaResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    /// True once the whole file was reassembled and written to staging.
+    pub staged: bool,
+}
+
+/// Builds a COCO `coco_path` dataset from every staged media file of the project
+/// (copy images, decode HEIC, extract video frames at `fps`). Building runs
+/// ASYNCHRONICZNIE w tle (HEIC/ffmpeg per plik trwają minuty); odpowiedź wraca
+/// natychmiast z `build_id`, a UI odpytuje postęp przez
+/// `MlStudioRecogBuildStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogBuildDatasetRequest {
+    pub project_id: String,
+    pub dataset_name: String,
+    pub fps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogBuildDatasetResponse {
+    /// Identyfikator zadania budowy do pollingu statusu. Pusty gdy start odrzucono.
+    pub build_id: String,
+    /// "running" gdy zadanie wystartowało, "failed" gdy odrzucono (np. brak plików,
+    /// inna budowa w toku, zły fps).
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// Polling postępu asynchronicznej budowy datasetu (po `build_id`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogBuildStatusRequest {
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogBuildStatusResponse {
+    pub build_id: String,
+    /// "running" | "succeeded" | "failed".
+    pub status: String,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub frames_extracted: u64,
+    /// Zarejestrowany dataset (tylko gdy `status == "succeeded"`).
+    pub dataset: Option<DatasetSummary>,
+    pub image_count: u64,
+    pub category_count: u32,
+    pub error: Option<String>,
+}
+
 /// Detekcja na obrazie wytrenowanym modelem recognition. `image_b64` to małe
 /// zdjęcie (limit ramki WS ~0.9MB). Odpowiedź niesie detekcje jako JSON
 /// (`detections_json`: [{class_id,class_name,score,bbox_xyxy}]) — bez osobnych
@@ -1879,6 +1945,12 @@ pub enum MlStudioPayload {
     RecogTrainStatusResponse(MlStudioRecogTrainStatusResponse),
     RecogDatasetRegisterRequest(MlStudioRecogDatasetRegisterRequest),
     RecogDatasetRegisterResponse(MlStudioRecogDatasetRegisterResponse),
+    RecogStageMediaRequest(MlStudioRecogStageMediaRequest),
+    RecogStageMediaResponse(MlStudioRecogStageMediaResponse),
+    RecogBuildDatasetRequest(MlStudioRecogBuildDatasetRequest),
+    RecogBuildDatasetResponse(MlStudioRecogBuildDatasetResponse),
+    RecogBuildStatusRequest(MlStudioRecogBuildStatusRequest),
+    RecogBuildStatusResponse(MlStudioRecogBuildStatusResponse),
     RecogDetectRequest(MlStudioRecogDetectRequest),
     RecogDetectResponse(MlStudioRecogDetectResponse),
     RecogImagesListRequest(MlStudioRecogImagesListRequest),
