@@ -884,15 +884,27 @@ impl DeployStrategy for DockerDeploy {
         // tagu (brak niepotrzebnych przebudow).
         let arch_aware =
             !docker_section.arch_variants.is_empty() || !docker_section.default_build_args.is_empty();
+        // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
+        // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
+        // wiec `if !image_exists` ponizej zwraca false i obraz SIE PRZEBUDOWUJE.
+        // Bez tego plaski tag :v1 nigdy sie nie zmienial -> kazda zmiana Dockerfile
+        // byla cicho ignorowana (deploy "0 ms", stary obraz reuzyty), a fix w
+        // Dockerfile (np. TORCH_CUDA_ARCH_LIST) nigdy sie nie kompilowal.
+        let src = self.manifest.docker_source_hash.as_str();
+        let src_suffix = if src.is_empty() {
+            String::new()
+        } else {
+            format!("-{}", &src[..src.len().min(12)])
+        };
         let image_tag = if arch_aware {
             format!(
-                "tentaflow/{}:{}-{}",
-                self.manifest.engine.id, self.manifest.engine.version, arch_tag
+                "tentaflow/{}:{}-{}{}",
+                self.manifest.engine.id, self.manifest.engine.version, arch_tag, src_suffix
             )
         } else {
             format!(
-                "tentaflow/{}:{}",
-                self.manifest.engine.id, self.manifest.engine.version
+                "tentaflow/{}:{}{}",
+                self.manifest.engine.id, self.manifest.engine.version, src_suffix
             )
         };
         let build_args = if build_args.is_empty() {
