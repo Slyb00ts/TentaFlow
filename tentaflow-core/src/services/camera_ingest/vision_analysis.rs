@@ -330,7 +330,7 @@ async fn engine_loop() {
         // Pull the latest frame for each batched camera (async snapshot).
         let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)> = Vec::new();
         for id in &batch_ids {
-            if let Some((rgb, w, h)) =
+            if let Some((rgb, w, h, _captured_ms)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
             {
                 frames.push((id.clone(), rgb, w, h));
