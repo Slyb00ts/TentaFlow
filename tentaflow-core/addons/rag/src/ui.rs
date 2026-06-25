@@ -29,7 +29,7 @@ use tentaflow_sdk_spec::protocol::ui::inline::{
     TableColumn, TableColumnWidth,
 };
 use tentaflow_sdk_spec::protocol::ui::layout::{
-    Card, Cluster, Divider, NavTabs, ScrollContainer, Split, Stack,
+    Box, Card, Cluster, Divider, NavTabs, ScrollContainer, SectionCard, Split, Stack,
 };
 use tentaflow_sdk_spec::protocol::ui::molecules::EmptyState;
 use tentaflow_sdk_spec::protocol::ui::panel::PanelShell;
@@ -596,6 +596,9 @@ fn sidebar_view() -> Component {
             children: cards,
             sticky_header_slot: None,
             virtualize: false,
+            // gap:Sm wymusza display:flex z odstepem miedzy kartami — naprawia
+            // stykajace sie pionowo karty kolekcji (gola lista nie ma zadnego gapu).
+            gap: Some(Spacing::Sm),
         }
         .into_component("sb-scroll")
         .expect("kodowanie ScrollContainer sidebar")
@@ -617,13 +620,14 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
     let active = !id.is_empty() && id == selected;
 
     let info = Stack {
-        gap: Spacing::Xs,
+        gap: Spacing::Xxs,
         align: FlexAlign::Start,
         children: vec![
-            body_text(&format!("cc-name-{index}"), lit(name)),
+            strong_text(&format!("cc-name-{index}"), name),
             muted_caption(&format!("cc-docs-{index}"), lit(&format!("{docs} dok"))),
         ],
         padding: None,
+        justify: None,
     }
     .into_component(format!("cc-info-{index}"))
     .expect("kodowanie Stack card info");
@@ -642,21 +646,42 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
     .into_component(format!("cc-badge-{index}"))
     .expect("kodowanie Badge card");
 
-    let row = cluster_between(&format!("cc-row-{index}"), vec![info, badge]);
+    // Wiersz karty: lewa kolumna info rosnie (box_grow), Badge zostaje staly po prawej
+    // i pionowo wysrodkowany (align:Center). wrap:false (cluster_row_between) gwarantuje,
+    // ze Badge nie spada pod nazwe ani sie nie lamie przy ciasnym sidebarze.
+    let row = cluster_row_between(
+        &format!("cc-row-{index}"),
+        vec![box_grow(&format!("cc-info-grow-{index}"), info), badge],
+    );
 
-    let (variant, accent) = if active {
-        (CardVariant::Filled, Some(Tone::Primary))
+    // Aktywna karta: wypelnienie + akcent + lekki cien (wyrazny stan „selected").
+    // Nieaktywna: subtelna karta z hairline-ramka i tlem powierzchni (rowny rytm,
+    // wyczuwalny hover dzieki interactive).
+    let (variant, accent, shadow, border, background) = if active {
+        (
+            CardVariant::Filled,
+            Some(Tone::Primary),
+            ShadowToken::Subtle,
+            BorderToken::Accent { tone: Tone::Primary },
+            BackgroundToken::Accent,
+        )
     } else {
-        (CardVariant::Ghost, None)
+        (
+            CardVariant::Outlined,
+            None,
+            ShadowToken::None,
+            BorderToken::Hairline,
+            BackgroundToken::Subtle,
+        )
     };
     let mut card = Card {
         variant,
-        padding: Spacing::Sm,
+        padding: Spacing::Md,
         gap: Spacing::Xs,
         radius: RadiusToken::Md,
-        shadow: ShadowToken::None,
-        border: if active { BorderToken::Accent { tone: Tone::Primary } } else { BorderToken::Hairline },
-        background: BackgroundToken::None,
+        shadow,
+        border,
+        background,
         accent,
         children: vec![row],
         interactive: true,
@@ -698,6 +723,7 @@ fn sidebar_create_card() -> Component {
         align: FlexAlign::Center,
         justify: FlexJustify::Start,
         children: vec![create, cancel],
+        wrap: Some(false),
     }
     .into_component("sb-create-actions")
     .expect("kodowanie Cluster create");
@@ -810,6 +836,7 @@ fn workspace_header() -> Component {
         align: FlexAlign::Center,
         justify: FlexJustify::Start,
         children: vec![name, doc_tag],
+        wrap: Some(false),
     }
     .into_component("ws-header-left")
     .expect("kodowanie Cluster header left");
@@ -818,6 +845,7 @@ fn workspace_header() -> Component {
         align: FlexAlign::Center,
         justify: FlexJustify::End,
         children: vec![graph_toggle, delete],
+        wrap: Some(false),
     }
     .into_component("ws-header-right")
     .expect("kodowanie Cluster header right");
@@ -887,6 +915,8 @@ fn chat_view() -> Component {
             children: bubbles,
             sticky_header_slot: None,
             virtualize: false,
+            // Rowny rytm miedzy dymkami rozmowy (md = wyrazne rozdzielenie tur).
+            gap: Some(Spacing::Md),
         }
         .into_component("chat-scroll")
         .expect("kodowanie ScrollContainer chat")
@@ -928,12 +958,25 @@ fn chat_view() -> Component {
         gap: Spacing::Sm,
         align: FlexAlign::End,
         justify: FlexJustify::Start,
-        children: vec![input, send],
+        children: vec![box_grow("chat-input-grow", input), send],
+        // Pole tekstowe rosnie (box_grow), przycisk „Wyslij" zostaje staly po prawej;
+        // bez zawijania, by pasek wejscia byl jednym spojnym rzedem przyklejonym na dole.
+        wrap: Some(false),
     }
     .into_component("chat-input-bar")
     .expect("kodowanie Cluster input bar");
 
-    stack("tab-chat", vec![scroll, input_bar])
+    // Czat: lista dymkow rosnie (box_grow), pasek wejscia przyklejony na dole.
+    // justify:SpaceBetween rozpycha scroll i pasek na pelna wysokosc zakladki.
+    Stack {
+        gap: Spacing::Md,
+        align: FlexAlign::Stretch,
+        children: vec![box_grow("chat-scroll-grow", scroll), input_bar],
+        padding: Some(Spacing::Md),
+        justify: Some(FlexJustify::SpaceBetween),
+    }
+    .into_component("tab-chat")
+    .expect("kodowanie Stack chat")
 }
 
 /// Dymek wiadomosci. user => karta wyrownana do prawej z akcentem; assistant =>
@@ -960,6 +1003,7 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             align: FlexAlign::Start,
             justify: FlexJustify::End,
             children: vec![card],
+            wrap: Some(false),
         }
         .into_component(format!("msg-{index}"))
         .expect("kodowanie Cluster user bubble")
@@ -992,7 +1036,9 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             gap: Spacing::Sm,
             align: FlexAlign::Start,
             justify: FlexJustify::Start,
-            children: vec![avatar, card],
+            // Avatar staly, dymek rosnie — bez zawijania, by avatar nie odskakiwal pod tresc.
+            children: vec![avatar, box_grow(&format!("msg-grow-{index}"), card)],
+            wrap: Some(false),
         }
         .into_component(format!("msg-{index}"))
         .expect("kodowanie Cluster assistant bubble")
@@ -1054,9 +1100,70 @@ fn cluster_between(id: &str, children: Vec<Component>) -> Component {
         align: FlexAlign::Center,
         justify: FlexJustify::SpaceBetween,
         children,
+        // Naglowki sidebara/workspace nie moga sie zawijac — tytul i akcje zostaja
+        // w jednym rzedzie nawet przy ciasnej szerokosci.
+        wrap: Some(false),
     }
     .into_component(id)
     .expect("kodowanie Cluster between")
+}
+
+/// Cluster jednorzedowy (bez zawijania): info rosnie po lewej, element staly po prawej.
+/// Uzywany w karcie kolekcji, zeby Badge nie spadal pod nazwe ani sie nie lamie.
+fn cluster_row_between(id: &str, children: Vec<Component>) -> Component {
+    Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::SpaceBetween,
+        children,
+        wrap: Some(false),
+    }
+    .into_component(id)
+    .expect("kodowanie Cluster row")
+}
+
+/// Box rosnacy (flex-grow) wokol dziecka — w wierszu „info ⟷ badge" pozwala kolumnie
+/// informacji zajac cala wolna szerokosc, a element po prawej zostaje staly.
+fn box_grow(id: &str, child: Component) -> Component {
+    Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![child],
+    }
+    .into_component(id)
+    .expect("kodowanie Box grow")
+}
+
+/// SectionCard grupujacy sekcje workspace: spojny padding/gap, naglowek + opcjonalny
+/// podtytul/akcje, jednolita ramka. Daje sekcjom „oddech" bez recznych Spacerow.
+fn section_card(
+    id: &str,
+    title: &str,
+    subtitle: Option<&str>,
+    header_actions: Vec<Component>,
+    body: Vec<Component>,
+) -> Component {
+    SectionCard {
+        title: lit(title),
+        subtitle: subtitle.map(lit),
+        header_actions,
+        header_divider: true,
+        body,
+        footer: None,
+        padding: Spacing::Md,
+        gap: Spacing::Md,
+        variant: CardVariant::Outlined,
+        radius: RadiusToken::Lg,
+        shadow: ShadowToken::Subtle,
+        border: BorderToken::Hairline,
+        background: BackgroundToken::None,
+        accent: None,
+    }
+    .into_component(id)
+    .expect("kodowanie SectionCard")
 }
 
 /// EmptyState z opcjonalnym przyciskiem akcji glownej. Ikona nazwana (sprite SDK).
@@ -1094,6 +1201,22 @@ fn body_text(id: &str, content: BindRef) -> Component {
     .expect("kodowanie Text")
 }
 
+/// Pogrubiony tekst (np. nazwa kolekcji w karcie) — wyrazna hierarchia wzgledem
+/// sekundarnego podpisu „N dok".
+fn strong_text(id: &str, content: &str) -> Component {
+    Text {
+        content: lit(content),
+        style: TextStyle::BodyStrong,
+        tone: None,
+        align: None,
+        wrap: None,
+        max_lines: Some(1),
+        format: None,
+    }
+    .into_component(id)
+    .expect("kodowanie Text strong")
+}
+
 fn muted_caption(id: &str, content: BindRef) -> Component {
     Text {
         content,
@@ -1114,9 +1237,24 @@ fn stack(id: &str, children: Vec<Component>) -> Component {
         align: FlexAlign::Stretch,
         children,
         padding: Some(Spacing::Md),
+        justify: None,
     }
     .into_component(id)
     .expect("kodowanie Stack")
+}
+
+/// Pionowy stos sekcji workspace bez wlasnego paddingu — sekcje (SectionCard) maja
+/// juz swoj padding, wiec zewnetrzny stos daje tylko rytm `md` miedzy nimi.
+fn section_stack(id: &str, children: Vec<Component>) -> Component {
+    Stack {
+        gap: Spacing::Md,
+        align: FlexAlign::Stretch,
+        children,
+        padding: Some(Spacing::Md),
+        justify: None,
+    }
+    .into_component(id)
+    .expect("kodowanie Stack sekcji")
 }
 
 fn action_button(id: &str, label: &str, action_id: &str, variant: ButtonVariant, tone: Tone) -> Component {
@@ -1246,8 +1384,7 @@ fn row_action(id: &str, label: &str, action_id: &str, tone: Tone) -> Component {
 // =============================================================================
 
 fn documents_tab() -> Component {
-    let selected = body_text("doc-selected", bound(SP_SELECTED_COLLECTION_NAME));
-    let summary = body_text("doc-ingest-summary", bound(SP_INGEST_SUMMARY));
+    let summary = muted_caption("doc-ingest-summary", bound(SP_INGEST_SUMMARY));
 
     // FileInput: upload PDF/obraz/tekst. Po wyborze plikow renderer hosta robi
     // chunked-upload kazdego pliku do document store instancji, a NA KONIEC emituje
@@ -1305,18 +1442,25 @@ fn documents_tab() -> Component {
         vec![row_action("doc-delete", "Usun", "delete-document", Tone::Critical)],
     );
 
-    stack(
-        "tab-documents",
-        vec![
-            heading("doc-heading", "Dokumenty"),
-            selected,
-            muted_caption("doc-status", bound(SP_STATUS_MESSAGE)),
-            summary,
-            upload,
-            refresh,
-            tbl,
-        ],
-    )
+    // Sekcja „Wgraj dokumenty": dropzone + podsumowanie statusu ingestu.
+    let ingest_section = section_card(
+        "doc-ingest-section",
+        "Wgraj dokumenty",
+        Some("Po wgraniu uruchamiany jest pelny ingest: parse -> chunk -> embedding."),
+        vec![],
+        vec![upload, summary, muted_caption("doc-status", bound(SP_STATUS_MESSAGE))],
+    );
+
+    // Sekcja „Dokumenty": akcja odswiezenia w naglowku, tabela z oddechem ponizej.
+    let list_section = section_card(
+        "doc-list-section",
+        "Dokumenty",
+        None,
+        vec![refresh],
+        vec![tbl],
+    );
+
+    section_stack("tab-documents", vec![ingest_section, list_section])
 }
 
 // =============================================================================
@@ -1353,20 +1497,30 @@ fn graph_tab() -> Component {
         vec![],
     );
 
-    stack(
-        "tab-graph",
-        vec![
-            heading("graph-heading", "Graf wiedzy"),
-            muted_caption("graph-status", bound(SP_STATUS_MESSAGE)),
-            query,
-            explore,
-            center,
-            heading("graph-neighbors-heading", "Sasiedztwo"),
-            neighbors,
-            heading("graph-facts-heading", "Fakty"),
-            facts,
-        ],
-    )
+    // Sekcja eksploracji: pole encji + przycisk w jednym rzedzie (pole rosnie),
+    // ponizej nazwa biezacej encji i status.
+    let explore_row = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::End,
+        justify: FlexJustify::Start,
+        children: vec![box_grow("graph-query-grow", query), explore],
+        wrap: Some(false),
+    }
+    .into_component("graph-explore-row")
+    .expect("kodowanie Cluster graph explore");
+
+    let explore_section = section_card(
+        "graph-explore-section",
+        "Graf wiedzy",
+        Some("Eksploruj encje i ich powiazania w bazie."),
+        vec![],
+        vec![explore_row, center, muted_caption("graph-status", bound(SP_STATUS_MESSAGE))],
+    );
+
+    let neighbors_section = section_card("graph-neighbors-section", "Sasiedztwo", None, vec![], vec![neighbors]);
+    let facts_section = section_card("graph-facts-section", "Fakty", None, vec![], vec![facts]);
+
+    section_stack("tab-graph", vec![explore_section, neighbors_section, facts_section])
 }
 
 // =============================================================================
@@ -1399,11 +1553,12 @@ fn conflicts_tab() -> Component {
     let scan = action_button("conf-scan", "A_det: skan", "run-conflict-scan", ButtonVariant::Ghost, Tone::Neutral);
     let resolve = action_button("conf-resolve", "A_res: adjudykuj", "run-conflict-resolve", ButtonVariant::Ghost, Tone::Neutral);
     let merge = action_button("conf-merge", "A_uni: scal encje", "run-entity-merge-scan", ButtonVariant::Ghost, Tone::Neutral);
-    let admin_row = Stack {
+    let admin_row = Cluster {
         gap: Spacing::Sm,
         align: FlexAlign::Center,
+        justify: FlexJustify::Start,
         children: vec![scan, resolve, merge],
-        padding: None,
+        wrap: Some(true),
     }
     .into_component("conf-admin-row")
     .expect("kodowanie Stack admin");
@@ -1428,19 +1583,30 @@ fn conflicts_tab() -> Component {
 
     let detail = body_text("conf-detail", bound(SP_CONFLICT_DETAIL));
 
-    stack(
-        "tab-conflicts",
-        vec![
-            heading("conf-heading", "Konflikty"),
-            muted_caption("conf-status-msg", bound(SP_STATUS_MESSAGE)),
-            status_select,
-            refresh,
-            admin_row,
-            tbl,
-            heading("conf-detail-heading", "Szczegoly konfliktu"),
-            detail,
-        ],
-    )
+    // Pasek filtra: select statusu (rosnie) + przycisk „Filtruj".
+    let filter_row = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::End,
+        justify: FlexJustify::Start,
+        children: vec![box_grow("conf-status-grow", status_select), refresh],
+        wrap: Some(false),
+    }
+    .into_component("conf-filter-row")
+    .expect("kodowanie Cluster conf filter");
+
+    // Sekcja sterowania: filtr + reczne wyzwalacze agentow + biezacy status.
+    let controls_section = section_card(
+        "conf-controls-section",
+        "Konflikty",
+        Some("Filtruj liste i recznie wyzwalaj agentow detekcji/adjudykacji."),
+        vec![],
+        vec![filter_row, admin_row, muted_caption("conf-status-msg", bound(SP_STATUS_MESSAGE))],
+    );
+
+    let list_section = section_card("conf-list-section", "Lista konfliktow", None, vec![], vec![tbl]);
+    let detail_section = section_card("conf-detail-section", "Szczegoly konfliktu", None, vec![], vec![detail]);
+
+    section_stack("tab-conflicts", vec![controls_section, list_section, detail_section])
 }
 
 // =============================================================================

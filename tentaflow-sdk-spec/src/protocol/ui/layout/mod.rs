@@ -1,7 +1,7 @@
 // =============================================================================
 // File: protocol/ui/layout/mod.rs — §3 Layout Primitives (0x0100-0x01FF)
 // Purpose: typed structs for 18 layout components split per-group:
-//   - containers.rs: Flex, Grid, Stack, Cluster, Split, ScrollContainer
+//   - containers.rs: Flex, Grid, Stack, Cluster, Split, ScrollContainer, Box
 //   - cards.rs:      Card, SectionCard, Collapsible, Accordion
 //   - atomic.rs:     Divider, Spacer, Tooltip
 //   - nav.rs:        Sidebar, Tabs, NavTabs, Breadcrumb, Pagination
@@ -14,7 +14,7 @@ pub mod nav;
 
 pub use atomic::{Divider, Spacer, Tooltip};
 pub use cards::{Accordion, Card, Collapsible, SectionCard};
-pub use containers::{Cluster, Flex, Grid, ScrollContainer, Split, Stack};
+pub use containers::{Box, Cluster, Flex, Grid, ScrollContainer, Split, Stack};
 pub use nav::{Breadcrumb, NavTabs, Pagination, Sidebar, Tabs};
 
 #[cfg(test)]

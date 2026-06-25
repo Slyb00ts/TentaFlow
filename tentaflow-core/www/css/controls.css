@@ -4592,6 +4592,24 @@ tf-skeleton {
 .tf-scroll-container--horizontal { overflow-x: auto; overflow-y: hidden; }
 .tf-scroll-container--both       { overflow: auto; }
 .tf-scroll-container__header { position: sticky; top: 0; z-index: 1; }
+/* Gap przełącza kontener w flex-kolumnę z odstępem między dziećmi —
+   inaczej goła lista (np. kolekcji) renderuje się bez żadnego gapu. */
+.tf-scroll-container--gap-zero,
+.tf-scroll-container--gap-xxs,
+.tf-scroll-container--gap-xs,
+.tf-scroll-container--gap-sm,
+.tf-scroll-container--gap-md,
+.tf-scroll-container--gap-lg,
+.tf-scroll-container--gap-xl,
+.tf-scroll-container--gap-xxl { display: flex; flex-direction: column; }
+.tf-scroll-container--gap-zero { gap: var(--tf-space-zero); }
+.tf-scroll-container--gap-xxs  { gap: var(--tf-space-xxs); }
+.tf-scroll-container--gap-xs   { gap: var(--tf-space-xs); }
+.tf-scroll-container--gap-sm   { gap: var(--tf-space-sm); }
+.tf-scroll-container--gap-md   { gap: var(--tf-space-md); }
+.tf-scroll-container--gap-lg   { gap: var(--tf-space-lg); }
+.tf-scroll-container--gap-xl   { gap: var(--tf-space-xl); }
+.tf-scroll-container--gap-xxl  { gap: var(--tf-space-xxl); }
 
 /* ---------- tf-tooltip (0x010F) ---------- */
 .tf-tooltip-wrapper { position: relative; display: inline-block; }
@@ -4735,6 +4753,12 @@ tf-skeleton {
 .tf-stack--padding-lg   { padding: var(--tf-space-lg); }
 .tf-stack--padding-xl   { padding: var(--tf-space-xl); }
 .tf-stack--padding-xxl  { padding: var(--tf-space-xxl); }
+.tf-stack--justify-start         { justify-content: flex-start; }
+.tf-stack--justify-end           { justify-content: flex-end; }
+.tf-stack--justify-center        { justify-content: center; }
+.tf-stack--justify-space_between { justify-content: space-between; }
+.tf-stack--justify-space_around  { justify-content: space-around; }
+.tf-stack--justify-space_evenly  { justify-content: space-evenly; }
 
 /* ---------- tf-cluster (0x0104) ---------- */
 .tf-cluster { display: flex; flex-wrap: wrap; min-width: 0; }
@@ -4757,6 +4781,26 @@ tf-skeleton {
 .tf-cluster--justify-space_between { justify-content: space-between; }
 .tf-cluster--justify-space_around  { justify-content: space-around; }
 .tf-cluster--justify-space_evenly  { justify-content: space-evenly; }
+.tf-cluster--nowrap { flex-wrap: nowrap; }
+
+/* ---------- tf-box (0x0115) ---------- */
+.tf-box { min-width: 0; }
+.tf-box--padding-zero { padding: var(--tf-space-zero); }
+.tf-box--padding-xxs  { padding: var(--tf-space-xxs); }
+.tf-box--padding-xs   { padding: var(--tf-space-xs); }
+.tf-box--padding-sm   { padding: var(--tf-space-sm); }
+.tf-box--padding-md   { padding: var(--tf-space-md); }
+.tf-box--padding-lg   { padding: var(--tf-space-lg); }
+.tf-box--padding-xl   { padding: var(--tf-space-xl); }
+.tf-box--padding-xxl  { padding: var(--tf-space-xxl); }
+.tf-box--margin-zero { margin: var(--tf-space-zero); }
+.tf-box--margin-xxs  { margin: var(--tf-space-xxs); }
+.tf-box--margin-xs   { margin: var(--tf-space-xs); }
+.tf-box--margin-sm   { margin: var(--tf-space-sm); }
+.tf-box--margin-md   { margin: var(--tf-space-md); }
+.tf-box--margin-lg   { margin: var(--tf-space-lg); }
+.tf-box--margin-xl   { margin: var(--tf-space-xl); }
+.tf-box--margin-xxl  { margin: var(--tf-space-xxl); }
 
 /* ---------- Responsive visibility — applied by engine via data attrs ---------- */
 [data-visibility-above="xs"]  { } /* always shown */
