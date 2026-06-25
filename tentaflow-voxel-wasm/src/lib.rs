@@ -1399,10 +1399,29 @@ pub async fn init_voxel_view(
 
     let (width, height) = canvas_backing_size(&canvas);
 
+    // wgpu 29 requires a display handle in the InstanceDescriptor even for a web
+    // canvas: the `SurfaceTarget::Canvas` path supplies only the WINDOW handle
+    // (`raw_display_handle: None`), so `create_surface` reads the display from the
+    // instance. The web has no real display — provide the zero-sized `WebDisplayHandle`.
+    #[derive(Debug)]
+    struct WebDisplay;
+    impl wgpu::rwh::HasDisplayHandle for WebDisplay {
+        fn display_handle(
+            &self,
+        ) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
+            // SAFETY: WebDisplayHandle is a zero-sized handle with no backing resource,
+            // so it is valid for any lifetime.
+            Ok(unsafe {
+                wgpu::rwh::DisplayHandle::borrow_raw(wgpu::rwh::RawDisplayHandle::Web(
+                    wgpu::rwh::WebDisplayHandle::new(),
+                ))
+            })
+        }
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // GL backend = WebGL2 in the browser; works without native WebGPU.
         backends: wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
+        ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(WebDisplay))
     });
 
     let surface = instance
