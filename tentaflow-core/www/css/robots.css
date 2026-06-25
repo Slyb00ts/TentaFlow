@@ -130,10 +130,6 @@
   height: 30px;
 }
 
-.robots-dpad-sp {
-  visibility: hidden;
-}
-
 .robots-card-foot {
   display: flex;
   align-items: center;
