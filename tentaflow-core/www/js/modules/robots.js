@@ -76,7 +76,7 @@ const LIDAR_RESUBSCRIBE_DELAY_MS = 1000;
 // Locomotion magnitude (m/s) for the directional pad / quick-move buttons,
 // matching the go2 driver's own move buttons. The owner re-clamps to its safety
 // cap regardless.
-const MOVE_SPEED = 0.3;
+const MOVE_SPEED = 0.6;
 // Yaw rate (rad/s) for turning. The Go2 has a minimum effective turn rate (~0.5
 // rad/s); below it the robot simply does not rotate. Linear speed (m/s) and yaw
 // rate (rad/s) are DIFFERENT units, so turning uses its own higher magnitude with
@@ -927,24 +927,19 @@ function buildDpad(id, move) {
   const wrap = document.createElement('div');
   wrap.className = 'robots-dpad';
   const cells = [
-    { sp: true },
+    { label: 'Obrót L', text: '↺', vx: 0, vy: 0, vyaw: YAW_SPEED },
     { label: 'Przód', icon: 'arrow', vx: MOVE_SPEED, vy: 0, vyaw: 0 },
-    { sp: true },
+    { label: 'Obrót P', text: '↻', vx: 0, vy: 0, vyaw: -YAW_SPEED },
     { label: 'Lewo', icon: 'arrow', vx: 0, vy: MOVE_SPEED, vyaw: 0 },
     { label: 'Tył', icon: 'arrow', vx: -MOVE_SPEED, vy: 0, vyaw: 0 },
     { label: 'Prawo', icon: 'arrow', vx: 0, vy: -MOVE_SPEED, vyaw: 0 },
   ];
   for (const c of cells) {
-    if (c.sp) {
-      const sp = document.createElement('span');
-      sp.className = 'robots-dpad-sp';
-      wrap.appendChild(sp);
-      continue;
-    }
     const btn = document.createElement('tf-button');
     btn.setAttribute('variant', 'outline');
     btn.setAttribute('size', 'sm');
-    btn.setAttribute('icon', c.icon);
+    if (c.icon) btn.setAttribute('icon', c.icon);
+    else btn.textContent = c.text;
     btn.setAttribute('aria-label', c.label);
     btn.dataset.control = 'move';
     btn.addEventListener('click', () =>
