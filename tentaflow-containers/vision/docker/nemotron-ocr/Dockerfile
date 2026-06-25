@@ -30,6 +30,17 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
       fastapi==0.115.6 uvicorn==0.34.0 python-multipart==0.0.20 \
       "huggingface_hub[cli,hf_transfer]" hatchling setuptools
+# Rozszerzenie CUDA pakietu nemotron-ocr (quad_non_maximal_suppression przez nvcc)
+# kompiluje sie WYLACZNIE pod architektury z TORCH_CUDA_ARCH_LIST. Bez tego nvcc
+# bierze domyslna liste torcha, ktora przy `docker build` (brak widocznego GPU)
+# NIE obejmuje najnowszego Blackwella -> na **B300 (sm_103, DGX)** leci `CUDA error:
+# no kernel image is available for execution on the device` przy /infer, mimo ze
+# B300 to docelowy sprzet. Budujemy FAT-BINARY pod wszystkie karty meshu, zeby ten
+# sam obraz dzialal wszedzie: Ampere 8.6 (RTX 3090), Ada 8.9 (4090/L40), Hopper 9.0
+# (H100), Blackwell 10.0 (B200) i 10.3 (B300) + PTX dla nowszych (forward-compat
+# JIT, np. GB10/Spark). Musi byc USTAWIONE PRZED budowa pakietu nizej.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;10.0;10.3+PTX"
+
 # Klonujemy repo z pominieciem LFS (wagi .pth nie sa potrzebne do builda pakietu;
 # pipeline pobiera je w runtime). `git lfs install --skip-smudge` rejestruje filtr
 # LFS w trybie skip, dzieki czemu checkout dostaje wskazniki zamiast wag i nie
