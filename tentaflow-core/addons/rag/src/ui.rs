@@ -608,7 +608,8 @@ fn sidebar_view() -> Component {
     if create_open() {
         children.push(sidebar_create_card());
     }
-    stack("tab-sidebar", children)
+    // Sidebar zwarty: gap:Sm (nie Md) — naglowek, search i lista trzymaja sie ciasno.
+    sidebar_stack("tab-sidebar", children)
 }
 
 /// Pojedyncza klikalna karta kolekcji w sidebarze: nazwa + licznik dokumentow +
@@ -655,8 +656,8 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
     );
 
     // Aktywna karta: wypelnienie + akcent + lekki cien (wyrazny stan „selected").
-    // Nieaktywna: subtelna karta z hairline-ramka i tlem powierzchni (rowny rytm,
-    // wyczuwalny hover dzieki interactive).
+    // Nieaktywna: tlo `Muted` (8% jasnosci) zamiast `Subtle` (4%, karty znikaly) —
+    // powierzchnia musi byc wyczuwalna jako karta; hairline-ramka domyka ksztalt.
     let (variant, accent, shadow, border, background) = if active {
         (
             CardVariant::Filled,
@@ -671,12 +672,13 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
             None,
             ShadowToken::None,
             BorderToken::Hairline,
-            BackgroundToken::Subtle,
+            BackgroundToken::Muted,
         )
     };
     let mut card = Card {
         variant,
-        padding: Spacing::Md,
+        // padding:Sm zamiast Md — karta ~48-52px (gesta lista) zamiast 75px.
+        padding: Spacing::Sm,
         gap: Spacing::Xs,
         radius: RadiusToken::Md,
         shadow,
@@ -760,12 +762,14 @@ fn workspace_view(tab: &str) -> Component {
             ButtonVariant::Primary,
             Tone::Primary,
         );
+        // Default (nie Illustrated) — mniej pustej przestrzeni, zwarty stos
+        // ikona+tytul+podtytul+CTA wysrodkowany przez sam komponent EmptyState.
         return empty_state(
             "ws-empty",
             IconName::Database,
             "Wybierz baze wiedzy",
             Some("Wybierz baze z listy po lewej albo utworz nowa, aby zaczac rozmowe."),
-            EmptyStateVariant::Illustrated,
+            EmptyStateVariant::Default,
             Some(new_btn),
         );
     }
@@ -1024,7 +1028,9 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             radius: RadiusToken::Lg,
             shadow: ShadowToken::None,
             border: BorderToken::None,
-            background: BackgroundToken::Subtle,
+            // Muted (8%) zamiast Subtle (4%) — dymek asystenta ma byc wyrazna
+            // powierzchnia odrozniona od tla panelu, podobnie jak karty kolekcji.
+            background: BackgroundToken::Muted,
             accent: None,
             children: vec![chat_markdown(&format!("msg-md-{index}"), content)],
             interactive: false,
@@ -1241,6 +1247,20 @@ fn stack(id: &str, children: Vec<Component>) -> Component {
     }
     .into_component(id)
     .expect("kodowanie Stack")
+}
+
+/// Zwarty stos sidebara: gap:Sm i padding:Sm — sidebar ma byc gesty (naglowek,
+/// search, lista kart blisko siebie), inaczej niz luzny workspace (`stack` gap:Md).
+fn sidebar_stack(id: &str, children: Vec<Component>) -> Component {
+    Stack {
+        gap: Spacing::Sm,
+        align: FlexAlign::Stretch,
+        children,
+        padding: Some(Spacing::Sm),
+        justify: None,
+    }
+    .into_component(id)
+    .expect("kodowanie Stack sidebar")
 }
 
 /// Pionowy stos sekcji workspace bez wlasnego paddingu — sekcje (SectionCard) maja
