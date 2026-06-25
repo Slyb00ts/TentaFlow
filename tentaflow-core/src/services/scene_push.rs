@@ -316,7 +316,9 @@ mod tests {
             .expect("live broadcaster")
             .subscribe();
 
-        // A new cell changes the generation → the pump broadcasts the updated map.
+        // A different frame changes the occupied set → the pump broadcasts the new map.
+        // The source mirrors the latest frame (replace, not accumulate), so the map now
+        // holds exactly this frame's single cell.
         mgr.on_lidar_frame(id, &frame(&[[2.0, 0.0, 0.0]], 0.05, 2));
         let got = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
@@ -324,8 +326,8 @@ mod tests {
             .expect("broadcast frame");
         assert_eq!(
             LidarFrameHeader::decode_header(&got).unwrap().point_count,
-            3,
-            "pushed snapshot reflects the 3-cell map"
+            1,
+            "pushed snapshot mirrors the latest frame (1 cell)"
         );
         mgr.remove(id);
     }

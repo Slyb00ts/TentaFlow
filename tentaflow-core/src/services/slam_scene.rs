@@ -207,22 +207,18 @@ impl SlamSceneManager {
         }
     }
 
-    /// Fold one canonical world-frame LiDAR frame into the robot's shared scene map
-    /// (accumulating — each frame dedups into the existing voxel grid). A real LiDAR is
-    /// precise so accumulation builds a clean dense map.
+    /// Mirror one canonical world-frame occupancy frame into the robot's shared scene
+    /// map. Both real LiDAR (Go2 `voxel_map_compressed`) and synthetic camera-depth frames
+    /// are PRE-FUSED sources that re-send their WHOLE current map every frame, so the scene
+    /// map is set to exactly this frame's cells (dedup per cell) — geometry the source
+    /// dropped (a moved/removed object, or noisy depth that spread last frame) disappears
+    /// here too, while a re-sent identical frame leaves the set unchanged so the push pump
+    /// stays quiet on a static scene.
     pub fn on_lidar_frame(&self, robot_id: &str, frame: &[u8]) {
-        self.fold_frame(robot_id, frame, false);
+        self.fold_frame(robot_id, frame);
     }
 
-    /// Fold one camera-DEPTH frame, REPLACING the previous one (the voxel map is cleared
-    /// first). Monocular metric depth is noisy and over-spreads with range, so
-    /// accumulating it (like LiDAR) builds a sprawling garbage cloud and leaves stale
-    /// points lagging the live view; replace-per-frame keeps the map = the current view.
-    pub fn on_depth_frame(&self, robot_id: &str, frame: &[u8]) {
-        self.fold_frame(robot_id, frame, true);
-    }
-
-    fn fold_frame(&self, robot_id: &str, frame: &[u8], replace: bool) {
+    fn fold_frame(&self, robot_id: &str, frame: &[u8]) {
         // Peek the header to learn the grid resolution BEFORE creating the service
         // (so the dedup grid matches the sensor). A bad header → drop the frame.
         let Some(header) = LidarFrameHeader::decode_header(frame) else {
@@ -256,11 +252,6 @@ impl SlamSceneManager {
                 fresh.latest_global = Some(gp);
             }
             *slam = fresh;
-        }
-        // Non-accumulating (depth): drop the previous frame's points so the map holds
-        // only the latest view.
-        if replace {
-            slam.service.clear_voxel_map();
         }
         let pose = slam.last_pose;
         if let Some(gp) = slam.service.ingest_world_frame(frame, pose, None) {
@@ -492,12 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn frames_accumulate_and_dedup_server_side() {
+    fn frame_mirrors_latest_map_and_dedups_server_side() {
         let mgr = SlamSceneManager::new();
         let id = "go2-test-a";
         mgr.on_lidar_frame(id, &frame(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 0.05, 1));
         assert_eq!(mgr.cell_count(id), 2);
-        // Re-send same cells + one new → dedup, total 3.
+        // Pre-fused source re-sends its whole map; this frame keeps both + adds one → 3.
         mgr.on_lidar_frame(
             id,
             &frame(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], 0.05, 2),
@@ -508,6 +499,10 @@ mod tests {
         assert!((snap.resolution - 0.05).abs() < 1e-6);
         // No pose adopted yet → no GlobalPose surfaced.
         assert!(snap.pose.is_none());
+        // A later frame that DROPS cells removes them — the map mirrors the latest frame,
+        // never an accumulation of stale geometry.
+        mgr.on_lidar_frame(id, &frame(&[[2.0, 0.0, 0.0]], 0.05, 3));
+        assert_eq!(mgr.cell_count(id), 1, "dropped cells disappear, no stale buildup");
     }
 
     #[test]

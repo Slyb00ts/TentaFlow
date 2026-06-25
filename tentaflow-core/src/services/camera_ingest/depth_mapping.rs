@@ -248,7 +248,7 @@ async fn central_worker() {
             }
             seq = seq.wrapping_add(1);
             let frame = encode_lidar_frame(&points, MAP_RESOLUTION_M, seq, depth_timestamp_us());
-            SlamSceneManager::global().on_depth_frame(&job.cfg.robot_id, &frame);
+            SlamSceneManager::global().on_lidar_frame(&job.cfg.robot_id, &frame);
             total_pts += points.len() / 3;
         }
         let t_rest_ms = t_rest.elapsed().as_secs_f64() * 1000.0;
