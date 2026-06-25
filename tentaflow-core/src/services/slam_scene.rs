@@ -207,10 +207,22 @@ impl SlamSceneManager {
         }
     }
 
-    /// Fold one canonical world-frame LiDAR frame into the robot's shared scene map.
-    /// Called at frame rate from the `lidar.publish` host-fn. Cheap + non-blocking:
-    /// decodes once, dedups into the voxel grid. A malformed frame is dropped.
+    /// Fold one canonical world-frame LiDAR frame into the robot's shared scene map
+    /// (accumulating — each frame dedups into the existing voxel grid). A real LiDAR is
+    /// precise so accumulation builds a clean dense map.
     pub fn on_lidar_frame(&self, robot_id: &str, frame: &[u8]) {
+        self.fold_frame(robot_id, frame, false);
+    }
+
+    /// Fold one camera-DEPTH frame, REPLACING the previous one (the voxel map is cleared
+    /// first). Monocular metric depth is noisy and over-spreads with range, so
+    /// accumulating it (like LiDAR) builds a sprawling garbage cloud and leaves stale
+    /// points lagging the live view; replace-per-frame keeps the map = the current view.
+    pub fn on_depth_frame(&self, robot_id: &str, frame: &[u8]) {
+        self.fold_frame(robot_id, frame, true);
+    }
+
+    fn fold_frame(&self, robot_id: &str, frame: &[u8], replace: bool) {
         // Peek the header to learn the grid resolution BEFORE creating the service
         // (so the dedup grid matches the sensor). A bad header → drop the frame.
         let Some(header) = LidarFrameHeader::decode_header(frame) else {
@@ -244,6 +256,11 @@ impl SlamSceneManager {
                 fresh.latest_global = Some(gp);
             }
             *slam = fresh;
+        }
+        // Non-accumulating (depth): drop the previous frame's points so the map holds
+        // only the latest view.
+        if replace {
+            slam.service.clear_voxel_map();
         }
         let pose = slam.last_pose;
         if let Some(gp) = slam.service.ingest_world_frame(frame, pose, None) {

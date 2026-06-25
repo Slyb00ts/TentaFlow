@@ -263,7 +263,9 @@ fn extents(pts: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
 
 /// Top-down (x-y plane) overlay: lidar green, depth magenta. A quick visual check
 /// of whether the back-projected depth lands on the lidar geometry.
-fn render_topdown(lidar: &[[f32; 3]], depth: &[[f32; 3]], path: &str) {
+/// Project onto axes (`ah` horizontal, `av` vertical) — `(0,1)`=top-down x-y,
+/// `(0,2)`=side x-z (reveals vertical/height misalignment the top-down hides).
+fn render_view(lidar: &[[f32; 3]], depth: &[[f32; 3]], path: &str, ah: usize, av: usize) {
     let all: Vec<[f32; 3]> = lidar.iter().chain(depth.iter()).copied().collect();
     if all.is_empty() {
         return;
@@ -271,12 +273,12 @@ fn render_topdown(lidar: &[[f32; 3]], depth: &[[f32; 3]], path: &str) {
     let (_, mn, mx) = extents(&all);
     let (w, h) = (760u32, 760u32);
     let pad = 24.0f32;
-    let s = ((w as f32 - 2.0 * pad) / (mx[0] - mn[0]).max(0.1))
-        .min((h as f32 - 2.0 * pad) / (mx[1] - mn[1]).max(0.1));
+    let s = ((w as f32 - 2.0 * pad) / (mx[ah] - mn[ah]).max(0.1))
+        .min((h as f32 - 2.0 * pad) / (mx[av] - mn[av]).max(0.1));
     let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([12, 12, 20]));
     let mut plot = |img: &mut image::RgbImage, p: [f32; 3], c: [u8; 3]| {
-        let px = (pad + (p[0] - mn[0]) * s) as i32;
-        let py = (h as f32 - pad - (p[1] - mn[1]) * s) as i32; // +y up
+        let px = (pad + (p[ah] - mn[ah]) * s) as i32;
+        let py = (h as f32 - pad - (p[av] - mn[av]) * s) as i32; // chosen axis up
         for dx in -1..=1 {
             for dy in -1..=1 {
                 let (x, y) = (px + dx, py + dy);
@@ -407,8 +409,10 @@ fn main() {
         best.fov, best.fov_v, best.scale, best.pitch, best.yaw, best.roll
     );
     println!("  cost: {:.3} m  ->  {:.3} m", best_cost.max(final_cost), final_cost);
-    render_topdown(&cap.lidar, &backproject(&cap, &init, 4), "/tmp/tf_calib/overlay_before.png");
-    render_topdown(&cap.lidar, &backproject(&cap, &best, 4), "/tmp/tf_calib/overlay_after.png");
+    let dp_before = backproject(&cap, &init, 4);
+    render_view(&cap.lidar, &dp_before, "/tmp/tf_calib/overlay_before.png", 0, 1); // top-down x-y
+    render_view(&cap.lidar, &dp_before, "/tmp/tf_calib/side_before.png", 0, 2); // side x-z (height)
+    render_view(&cap.lidar, &backproject(&cap, &best, 4), "/tmp/tf_calib/overlay_after.png", 0, 1);
     println!("  wrote /tmp/tf_calib/overlay_{{before,after}}.png (lidar=green depth=magenta)");
     if best.yaw.abs() < 2.0 && best.roll.abs() < 2.0 {
         println!(
