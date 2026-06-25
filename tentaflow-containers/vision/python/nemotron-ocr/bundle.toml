@@ -35,10 +35,11 @@ backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
 extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow>=12", "shapely", "pandas", "scikit-learn", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "hatchling", "setuptools"]
 extras_no_build_isolation = ["nemotron-ocr @ git+https://huggingface.co/nvidia/nemotron-ocr-v1#subdirectory=nemotron-ocr"]
-# TORCH_CUDA_ARCH_LIST: rozszerzenie CUDA nemotron-ocr (quad_nms przez nvcc) buduje
-# sie tylko pod podane arch. Bez tego polega na auto-detekcji GPU hosta przy
-# instalacji — niedeterministyczne (gdy karta niewidoczna przy buildzie -> "no
-# kernel image" na B300). Fat-binary pod karty meshu: Ampere 8.6, Ada 8.9, Hopper
-# 9.0, Blackwell 10.0 (B200) i 10.3 (B300) + PTX (forward-compat).
-env = { GIT_LFS_SKIP_SMUDGE = "1", TORCH_CUDA_ARCH_LIST = "8.6;8.9;9.0;10.0;10.3+PTX" }
+# GIT_LFS_SKIP_SMUDGE: klon repo HF bez wag .pth (LFS) — wagi pobiera pipeline
+# w runtime. TORCH_CUDA_ARCH_LIST NIE jest tu ustawiany na sztywno: rozszerzenie
+# CUDA nemotron-ocr (quad_nms przez nvcc) buduje sie tylko pod podane arch, a deploy
+# (python_venv.rs) wstrzykuje DOKLADNY arch pod wykryte GPU hosta, wiec kazdy host
+# kompiluje kernel pod swoja realna karte (Ampere 8.6 .. Blackwell 10.3) — bez
+# fat-binary i bez wariantow per-arch.
+env = { GIT_LFS_SKIP_SMUDGE = "1" }
 install_hint = "CUDA_VISIBLE_DEVICES=0; wymaga nvcc (toolkit CUDA) na hoscie"
