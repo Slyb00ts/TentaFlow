@@ -185,6 +185,11 @@ pub struct WebRtcRegisterCameraInput {
     /// square pixels (`fy = fx`).
     #[n(5)]
     pub camera_fov_v_deg: Option<f32>,
+    /// Metric scale correction for the depth model on this camera (the monocular
+    /// depth model has a systematic scale bias; the addon knows the model+camera
+    /// pair). `None` ⇒ core default (1.0 = no correction).
+    #[n(6)]
+    pub camera_depth_scale: Option<f32>,
 }
 
 /// Output of `webrtc_register_camera_v1`.

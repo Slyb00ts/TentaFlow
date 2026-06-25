@@ -193,13 +193,19 @@ async fn central_worker() {
                 active().remove(cam); // mapping turned off / camera gone
                 continue;
             };
-            let Some(pose) = SlamSceneManager::global().latest_scene_pose(&cfg.pose_robot_id) else {
-                continue; // robot not localized yet
-            };
-            let Some((rgb, w, h)) =
+            // Grab the freshest frame WITH its capture timestamp, then place it with the
+            // pose from THAT time — not "latest". The camera (WebRTC decode) lags the
+            // light pose telemetry, so using the latest pose smears the cloud by the
+            // camera latency × angular velocity whenever the robot turns.
+            let Some((rgb, w, h, captured_ms)) =
                 crate::addon::host_functions::camera::latest_frame_global(cam).await
             else {
                 continue; // no frame yet
+            };
+            let Some(pose) = SlamSceneManager::global()
+                .scene_pose_at(&cfg.pose_robot_id, (captured_ms as i64) * 1000)
+            else {
+                continue; // robot not localized yet
             };
             jobs.push(Job { cfg, pose, rgb, w, h });
         }

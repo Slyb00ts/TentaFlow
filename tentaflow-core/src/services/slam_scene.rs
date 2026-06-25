@@ -17,6 +17,7 @@
 // =============================================================================
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
@@ -30,6 +31,44 @@ use tentaflow_slam::{GeoAnchor, LioConfig, Pose, SealPolicy, SlamService};
 /// case at ~7 Hz vs the slower pose cadence) overrides this with the header value.
 const DEFAULT_RESOLUTION_M: f32 = 0.05;
 
+/// Max poses kept in the per-robot history. At ~30–50 Hz telemetry this covers a few
+/// seconds — far longer than any camera-decode delay we look back through.
+const POSE_HIST_MAX: usize = 256;
+
+/// Interpolate between two poses at `alpha ∈ [0,1]`: lerp the translation, normalized-
+/// lerp the (shortest-path) quaternion. nlerp ≈ slerp for the small per-sample
+/// rotations here and avoids any extra deps; the result feeds `scene_pose_at`.
+fn interpolate_pose(p0: &Pose, p1: &Pose, alpha: f64) -> Pose {
+    let a = alpha.clamp(0.0, 1.0);
+    let t0 = p0.translation();
+    let t1 = p1.translation();
+    let trans = [
+        t0[0] + (t1[0] - t0[0]) * a,
+        t0[1] + (t1[1] - t0[1]) * a,
+        t0[2] + (t1[2] - t0[2]) * a,
+    ];
+    let q0 = p0.quat_xyzw();
+    let mut q1 = p1.quat_xyzw();
+    // Shortest-path: flip q1 if the quaternions are in opposite hemispheres.
+    let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+    if dot < 0.0 {
+        q1 = [-q1[0], -q1[1], -q1[2], -q1[3]];
+    }
+    let mut q = [
+        q0[0] + (q1[0] - q0[0]) * a,
+        q0[1] + (q1[1] - q0[1]) * a,
+        q0[2] + (q1[2] - q0[2]) * a,
+        q0[3] + (q1[3] - q0[3]) * a,
+    ];
+    let norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if norm > 1e-9 {
+        q = [q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm];
+    } else {
+        q = q0; // degenerate (antipodal) — fall back to the start orientation
+    }
+    Pose::from_parts(trans, q)
+}
+
 /// Per-robot SLAM state: the accumulating scene map + the latest world pose.
 struct RobotSlam {
     service: SlamService,
@@ -38,6 +77,11 @@ struct RobotSlam {
     /// Last adopted device pose; re-applied per frame so the map-fold path keeps the
     /// pose consistent without waiting for the next (slower) telemetry read.
     last_pose: Pose,
+    /// Short timestamped pose history (`(recv_us, pose)`, host clock, oldest→newest).
+    /// Lets a delayed sensor frame (camera decode lags the light pose telemetry) be
+    /// placed with the pose from ITS capture time instead of "latest" — without it a
+    /// rotating robot smears the depth cloud by the camera latency × angular velocity.
+    pose_hist: VecDeque<(i64, Pose)>,
     /// True once a real `robot_pose` has been adopted — until then the GlobalPose is
     /// at identity and must NOT be published as a confident fix.
     has_pose: bool,
@@ -154,6 +198,7 @@ impl SlamSceneManager {
             service,
             resolution,
             last_pose: Pose::identity(),
+            pose_hist: VecDeque::new(),
             has_pose: false,
             latest_global: None,
             last_frame_us: 0,
@@ -250,6 +295,47 @@ impl SlamSceneManager {
         slam.last_pose = pose;
         slam.has_pose = true;
         slam.latest_global = Some(gp);
+        // Append to the timestamped history (monotonic by recv time); cap to ~the last
+        // few seconds so `scene_pose_at` can look up the pose at a delayed frame's
+        // capture time. Drop out-of-order/duplicate stamps to keep it sorted.
+        if slam.pose_hist.back().map(|&(t, _)| timestamp_us > t).unwrap_or(true) {
+            slam.pose_hist.push_back((timestamp_us, pose));
+            while slam.pose_hist.len() > POSE_HIST_MAX {
+                slam.pose_hist.pop_front();
+            }
+        }
+    }
+
+    /// Pose at (host-clock) `target_us`, interpolated from the history — used to place
+    /// a delayed sensor frame with the pose from its own capture time. Clamps to the
+    /// ends; falls back to the latest pose when no history exists yet.
+    pub fn scene_pose_at(&self, robot_id: &str, target_us: i64) -> Option<Pose> {
+        let entry = self.robots.get(robot_id)?;
+        let slam = entry.lock();
+        if !slam.has_pose {
+            return None;
+        }
+        let h = &slam.pose_hist;
+        if h.is_empty() {
+            return Some(slam.last_pose);
+        }
+        if target_us <= h.front().unwrap().0 {
+            return Some(h.front().unwrap().1);
+        }
+        if target_us >= h.back().unwrap().0 {
+            return Some(h.back().unwrap().1);
+        }
+        // Find the bracketing samples and interpolate.
+        for w in 0..h.len() - 1 {
+            let (t0, p0) = h[w];
+            let (t1, p1) = h[w + 1];
+            if target_us >= t0 && target_us <= t1 {
+                let span = (t1 - t0).max(1) as f64;
+                let alpha = (target_us - t0) as f64 / span;
+                return Some(interpolate_pose(&p0, &p1, alpha));
+            }
+        }
+        Some(slam.last_pose)
     }
 
     /// Snapshot the robot's shared scene map for streaming/rendering. `None` if the

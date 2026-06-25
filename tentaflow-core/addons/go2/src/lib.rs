@@ -2133,6 +2133,9 @@ fn tick() {
                                 // both stops the depth cloud over-spreading off the floor.
                                 camera_fov_deg: Some(100.0),
                                 camera_fov_v_deg: Some(56.0),
+                                // DA-V2 metric depth over-estimates ~15% on this camera
+                                // (verified live against the Go2 lidar); 0.85 corrects it.
+                                camera_depth_scale: Some(0.85),
                             };
                             let cam_id = match call_cbor_in_out::<_, WebRtcRegisterCameraOutput>(&reg, webrtc_register_camera_v1) {
                                 Ok(o) => o.camera_id,

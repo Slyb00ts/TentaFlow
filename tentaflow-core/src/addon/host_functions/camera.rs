@@ -425,6 +425,7 @@ pub fn camera_register_backed_v1(
         depth_pose_robot_id: Some(Some(addon_id.clone())),
         depth_camera_fov_deg: Some(input.camera_fov_deg.unwrap_or(120.0) as f64),
         depth_camera_fov_v_deg: input.camera_fov_v_deg.map(|v| v as f64),
+        depth_scale: input.camera_depth_scale.map(|v| v as f64),
         ..Default::default()
     };
     if let Err(e) = update_camera(&db, &addon_id, &camera_id, &depth_patch, org_id_for_insert.as_deref()) {
@@ -558,10 +559,17 @@ pub fn camera_register_pushed_v1(
 /// yet. Used by the always-on vision analysis loop and the depth-mapping loop to
 /// pull frames without reaching into session internals.
 #[cfg(feature = "camera")]
-pub async fn latest_frame_global(camera_id: &str) -> Option<(std::sync::Arc<[u8]>, u32, u32)> {
+pub async fn latest_frame_global(
+    camera_id: &str,
+) -> Option<(std::sync::Arc<[u8]>, u32, u32, u64)> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
-        Ok(snap) => Some((std::sync::Arc::from(snap.data), snap.width, snap.height)),
+        Ok(snap) => Some((
+            std::sync::Arc::from(snap.data),
+            snap.width,
+            snap.height,
+            snap.timestamp_unix_ms,
+        )),
         Err(_) => None,
     }
 }
