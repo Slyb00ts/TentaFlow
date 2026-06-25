@@ -14,6 +14,7 @@ import {
   registerComponentRenderer,
   lookupComponentRenderer,
 } from './component-renderer.js';
+import { parseDimensionToken } from './data-specialised-renderer.js';
 
 // =============================================================================
 // Token whitelisty (spec §1.5 / §3)
@@ -378,7 +379,7 @@ function flexJustifyToCss(token) {
 
 export const STACK_TAG = 0x0103;
 
-const STACK_FIELD_KEYS = new Set([0, 1, 2, 3]);
+const STACK_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
 
 function renderStack(component, ctx) {
   assertOnlyKnownFields(component.fields, STACK_FIELD_KEYS, 'Stack');
@@ -395,12 +396,19 @@ function renderStack(component, ctx) {
     SPACINGS,
     'Stack.padding'
   );
+  // Klucz 4 (justify) opcjonalny — główna (pionowa) oś rozkładu dzieci.
+  const justify = optionalEnum(
+    ctx.readField(component.fields, 4),
+    FLEX_JUSTIFIES,
+    'Stack.justify'
+  );
 
   const el = document.createElement('div');
   el.classList.add('tf-stack');
   el.classList.add(`tf-stack--gap-${gap}`);
   el.classList.add(`tf-stack--align-${align}`);
   if (padding) el.classList.add(`tf-stack--padding-${padding}`);
+  if (justify) el.classList.add(`tf-stack--justify-${justify}`);
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));
@@ -414,7 +422,7 @@ function renderStack(component, ctx) {
 
 export const CLUSTER_TAG = 0x0104;
 
-const CLUSTER_FIELD_KEYS = new Set([0, 1, 2, 3]);
+const CLUSTER_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
 
 function renderCluster(component, ctx) {
   assertOnlyKnownFields(component.fields, CLUSTER_FIELD_KEYS, 'Cluster');
@@ -435,12 +443,23 @@ function renderCluster(component, ctx) {
   );
   const childrenRaw = ctx.readField(component.fields, 3);
   const children = childrenRaw === undefined ? [] : requireArray(childrenRaw, 'Cluster.children');
+  // Klucz 4 (wrap) opcjonalny — undefined/true zachowuje domyślne zawijanie,
+  // false wymusza jeden rząd (np. badge bez zawijania do nowej linii).
+  const wrapRaw = ctx.readField(component.fields, 4);
+  let wrap = true;
+  if (wrapRaw !== undefined) {
+    if (typeof wrapRaw !== 'boolean') {
+      throw new TypeError(`Cluster.wrap: expected bool, got ${typeof wrapRaw}`);
+    }
+    wrap = wrapRaw;
+  }
 
   const el = document.createElement('div');
   el.classList.add('tf-cluster');
   el.classList.add(`tf-cluster--gap-${gap}`);
   el.classList.add(`tf-cluster--align-${align}`);
   el.classList.add(`tf-cluster--justify-${justify}`);
+  if (!wrap) el.classList.add('tf-cluster--nowrap');
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));
@@ -606,6 +625,70 @@ export function renderSplit(component, ctx) {
 }
 
 // =============================================================================
+// Box (0x0115)
+// =============================================================================
+
+export const BOX_TAG = 0x0115;
+
+const BOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
+
+// DimensionToken → CSS length. parseDimensionToken zwraca string-kind dla
+// wariantów jednostkowych (auto/full/fit_content) i gotowy CSS dla wartości.
+function boxDimensionToCss(raw, ctx) {
+  const t = parseDimensionToken(raw, ctx);
+  if (t === 'full') return '100%';
+  if (t === 'auto') return 'auto';
+  if (t === 'fit_content') return 'fit-content';
+  return t;
+}
+
+function renderBox(component, ctx) {
+  assertOnlyKnownFields(component.fields, BOX_FIELD_KEYS, 'Box');
+  // Wszystkie pola opcjonalne — pusty Box to przezroczysty div.
+  const widthRaw = ctx.readField(component.fields, 0);
+  const widthCss = widthRaw === undefined
+    ? null : boxDimensionToCss(widthRaw, 'Box.width');
+  const growRaw = ctx.readField(component.fields, 1);
+  let grow = false;
+  if (growRaw !== undefined) {
+    if (typeof growRaw !== 'boolean') {
+      throw new TypeError(`Box.grow: expected bool, got ${typeof growRaw}`);
+    }
+    grow = growRaw;
+  }
+  const alignSelf = optionalEnum(
+    ctx.readField(component.fields, 2),
+    FLEX_ALIGNS,
+    'Box.align_self'
+  );
+  const padding = optionalEnum(
+    ctx.readField(component.fields, 3),
+    SPACINGS,
+    'Box.padding'
+  );
+  const margin = optionalEnum(
+    ctx.readField(component.fields, 4),
+    SPACINGS,
+    'Box.margin'
+  );
+  const childrenRaw = ctx.readField(component.fields, 5);
+  const children = childrenRaw === undefined ? [] : requireArray(childrenRaw, 'Box.children');
+
+  const el = document.createElement('div');
+  el.classList.add('tf-box');
+  if (widthCss != null) el.style.width = widthCss;
+  if (grow) el.style.flexGrow = '1';
+  if (alignSelf) el.style.alignSelf = flexAlignToCss(alignSelf);
+  if (padding) el.classList.add(`tf-box--padding-${padding}`);
+  if (margin) el.classList.add(`tf-box--margin-${margin}`);
+
+  for (const childComponent of children) {
+    el.appendChild(ctx.renderChild(childComponent));
+  }
+  return el;
+}
+
+// =============================================================================
 // Rejestracja
 // =============================================================================
 
@@ -615,4 +698,5 @@ export function registerLayoutContainersRenderers() {
   if (!lookupComponentRenderer(STACK_TAG)) registerComponentRenderer(STACK_TAG, renderStack);
   if (!lookupComponentRenderer(CLUSTER_TAG)) registerComponentRenderer(CLUSTER_TAG, renderCluster);
   if (!lookupComponentRenderer(SPLIT_TAG)) registerComponentRenderer(SPLIT_TAG, renderSplit);
+  if (!lookupComponentRenderer(BOX_TAG)) registerComponentRenderer(BOX_TAG, renderBox);
 }
