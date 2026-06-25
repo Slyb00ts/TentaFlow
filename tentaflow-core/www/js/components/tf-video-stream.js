@@ -97,8 +97,8 @@ class TfVideoStream extends HTMLElement {
   _build() {
     const style = document.createElement('style');
     style.textContent = `
-      :host { display: block; position: relative; background: #0a0a14; border-radius: 8px; overflow: hidden; }
-      video { width: 100%; height: var(--tf-video-stream-height, ${DEFAULT_HEIGHT_PX}px); object-fit: contain; background: #000; display: block; }
+      :host { display: block; position: relative; height: var(--tf-video-stream-height, ${DEFAULT_HEIGHT_PX}px); background: #0a0a14; border-radius: 8px; overflow: hidden; }
+      video { width: 100%; height: 100%; object-fit: cover; background: #000; display: block; }
       .label { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #fff; padding: 4px 10px; border-radius: 4px; font: 12px var(--font-mono, monospace); pointer-events: none; }
       .label[hidden] { display: none; }
       .status { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted, #999); font-style: italic; pointer-events: none; padding: 0 12px; text-align: center; }
