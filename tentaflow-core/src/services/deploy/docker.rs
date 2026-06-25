@@ -937,7 +937,8 @@ impl DeployStrategy for DockerDeploy {
         // deklaruje `arch_variants`, tag obrazu dostaje sufiks arch, zeby obrazy
         // pod rozne karty (np. sglang Ampere vs Blackwell) nie kolidowaly w
         // cache "build only when missing".
-        let arch_tag = crate::system_check::collect().gpu.cuda_arch_tag();
+        let gpu = crate::system_check::collect().gpu;
+        let arch_tag = gpu.cuda_arch_tag();
         let mut build_args: std::collections::HashMap<String, String> =
             docker_section.default_build_args.clone();
         if let Some(variant) = docker_section.arch_variants.get(&arch_tag) {
@@ -945,12 +946,27 @@ impl DeployStrategy for DockerDeploy {
                 build_args.insert(k.clone(), v.clone());
             }
         }
+        // Hardware-aware build custom-kerneli CUDA: wstrzykujemy dokladny
+        // TORCH_CUDA_ARCH_LIST pod wykryte GPU jako build-arg, zeby host
+        // kompilowal kernele (OCR quad_nms, yolox FastCOCOEvalOp) pod swoja
+        // realna karte. Manifest WYGRYWA (default_build_args/arch_variants),
+        // np. vllm-spark `12.1a` — nie nadpisujemy. Bez GPU (None) zostawiamy
+        // Dockerfile'owy default (fat-binary ARG).
+        if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
+            if let Some(arch_list) = gpu.torch_cuda_arch_list() {
+                build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+            }
+        }
         // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
         // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
         // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
         // tagu (brak niepotrzebnych przebudow).
-        let arch_aware =
-            !docker_section.arch_variants.is_empty() || !docker_section.default_build_args.is_empty();
+        // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki bez
+        // manifest build-args (nemotron-ocr, yolox) i tak dostaja wstrzykniety
+        // arch-list, wiec ich tag MUSI byc arch-aware — inaczej obraz zbudowany raz
+        // pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty na B300 (ten sam
+        // plaski tag) i odpalil zly kernel.
+        let arch_aware = !build_args.is_empty() || !docker_section.arch_variants.is_empty();
         // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
         // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
         // wiec `if !image_exists` ponizej zwraca false i obraz SIE PRZEBUDOWUJE.
@@ -964,9 +980,28 @@ impl DeployStrategy for DockerDeploy {
             format!("-{}", &src[..src.len().min(12)])
         };
         let image_tag = if arch_aware {
+            // Gruby arch_tag (cuda_arch_tag) NIE rozroznia kart w tej samej rodzinie:
+            // B200 (cc 10.0) i B300 (cc 10.3) mapuja sie oba na "cuda-blackwell", choc
+            // dostaja rozne TORCH_CUDA_ARCH_LIST ("10.0+PTX" vs "10.3+PTX"). Obraz
+            // zbudowany na B300 (SASS 10.3, brak 10.0) reuzyty na B200 by NIE odpalil
+            // (PTX forward-compat tylko w gore). Dlatego doklejamy krotki hash
+            // zdeterminizowanego odcisku build_args: KAZDA roznica (arch list, torch
+            // index, base image, wersja pakietu) -> inny tag -> rebuild; identyczne
+            // build-args (dwa B300) -> ten sam tag -> reuse.
+            use sha2::{Digest, Sha256};
+            let mut keys: Vec<_> = build_args.keys().collect();
+            keys.sort();
+            let mut hasher = Sha256::new();
+            for k in keys {
+                hasher.update(k.as_bytes());
+                hasher.update(b"=");
+                hasher.update(build_args[k].as_bytes());
+                hasher.update(b"\n");
+            }
+            let ba8 = hex::encode(hasher.finalize())[..8].to_string();
             format!(
-                "tentaflow/{}:{}-{}{}",
-                self.manifest.engine.id, self.manifest.engine.version, arch_tag, src_suffix
+                "tentaflow/{}:{}-{}-{}{}",
+                self.manifest.engine.id, self.manifest.engine.version, arch_tag, ba8, src_suffix
             )
         } else {
             format!(
