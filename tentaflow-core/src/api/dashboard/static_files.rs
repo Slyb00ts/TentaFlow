@@ -9,6 +9,36 @@
 // Nazwa pliku pozostala historyczna po usunieciu wwwroot/.
 include!(concat!(env!("OUT_DIR"), "/wwwroot_embed.rs"));
 
+/// Content-type from a file extension, for the disk dev path (the embedded map
+/// carries its own types).
+fn disk_mime(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "wasm" => "application/wasm",
+        "json" | "map" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Reads `<dir>/<rel>` from disk for the TENTAFLOW_WWW_DIR dev path. `None` if the
+/// file is absent (caller falls back to the embedded copy).
+fn serve_from_disk(dir: &str, rel: &str) -> Option<(u16, &'static str, Vec<u8>)> {
+    let full = std::path::Path::new(dir).join(rel);
+    std::fs::read(&full).ok().map(|bytes| (200u16, disk_mime(rel), bytes))
+}
+
 /// Zwraca (status, content_type, body_bytes) dla podanej sciezki HTTP.
 /// Pliki sa wbudowane w binarie — zero zaleznosci od systemu plikow.
 pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
@@ -24,6 +54,17 @@ pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
     // Zabezpiecz przed path traversal (surowy i zdekodowany)
     if clean_path.contains("..") || decoded.contains("..") || decoded.contains('\0') {
         return (403, "text/plain", b"Forbidden".to_vec());
+    }
+
+    // Dev affordance: when TENTAFLOW_WWW_DIR points at a www/ source tree, serve files
+    // from disk per-request so frontend edits show on a browser refresh WITHOUT a
+    // rebuild. The embedded copy stays the production path (env unset → zero overhead).
+    if let Ok(dir) = std::env::var("TENTAFLOW_WWW_DIR") {
+        if !dir.is_empty() {
+            if let Some(resp) = serve_from_disk(&dir, clean_path) {
+                return resp;
+            }
+        }
     }
 
     if let Some((content_type, data)) = wwwroot_lookup(clean_path) {
