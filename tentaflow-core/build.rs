@@ -707,8 +707,14 @@ fn pack_container_contexts(out_dir: &Path) {
         return;
     }
 
-    // Zmiany w kontekstach trigerują rebuild
-    println!("cargo:rerun-if-changed={}", containers_dir.display());
+    // Zmiany w kontekstach trigerują rebuild. KONTENERY (Dockerfile'e, server.py,
+    // entrypointy) embedujemy jako dane — cargo ich NIE śledzi normalnie, a
+    // `rerun-if-changed=<katalog>` łapie tylko add/remove, NIE edycję treści
+    // istniejących plików. Bez per-pliku `git pull` zmieniający server.py/Dockerfile
+    // + `cargo run` NIE re-embeduje bundla → binarka trzyma stare kontenery, brak
+    // "Aktualizacja dostępna", a obraz dalej buduje się ze starego źródła (np. /detect
+    // zamiast /v1/infer, OCR bez TORCH_CUDA_ARCH_LIST).
+    rerun_if_changed_recursive(&containers_dir);
     println!("cargo:rerun-if-changed={}", protocol_dir.display());
     println!("cargo:rerun-if-changed={}", transport_dir.display());
     println!("cargo:rerun-if-changed={}", voice_dir.display());
