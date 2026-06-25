@@ -308,6 +308,73 @@ pub(super) fn compose_project_name(engine_id: &str, port: u16) -> String {
     format!("tentaflow-{safe}-{port}")
 }
 
+/// Tag obrazu, z którego URUCHOMIONY jest kontener danego serwisu (np.
+/// `tentaflow/nemotron-page-elements:v3-30cf3e621865`). ŹRÓDŁO PRAWDY co
+/// faktycznie biegnie na węźle — od fixu tagów deploy zaszywa w nim 12-hex
+/// `docker_source_hash`, więc reconcile może zsynchronizować
+/// `deployed_source_hash` z REALNYM obrazem (stary deploy zapisywał baked hash
+/// nie przebudowując flat-tagowanego obrazu → badge update nigdy nie wracał).
+///
+/// `ContainerSummary.image` niesie napis tagu (a NIE digest jak top-level
+/// `Image` w inspect), dlatego listujemy po nazwie zamiast `inspect_container`.
+/// Zwraca `None` gdy daemon nieosiągalny lub brak running kontenera o tej
+/// nazwie (serwis zatrzymany / single-container nie istnieje). Nazwa kontenera
+/// to `tentaflow-<engine_id>-<host_port>` (jak w `run()` i `stop_checked`).
+#[cfg(feature = "docker")]
+pub(crate) async fn running_container_image_tag(engine_id: &str, host_port: u16) -> Option<String> {
+    let docker = backend::connect().await.ok()?;
+    let expected = format!("tentaflow-{}-{}", engine_id, host_port);
+    let listed = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .ok()?;
+    listed.into_iter().find_map(|c| {
+        // Tylko running — zatrzymany/exited kontener nie reprezentuje tego, co
+        // realnie obsługuje ruch; jego stary tag nie powinien sterować badge.
+        let running = matches!(
+            c.state,
+            Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+        );
+        if !running {
+            return None;
+        }
+        // Nazwy w bollard mają wiodący `/`; normalizujemy przed porównaniem.
+        let matches_name = c
+            .names
+            .as_ref()
+            .map(|ns| {
+                ns.iter()
+                    .any(|n| n.trim_start_matches('/') == expected)
+            })
+            .unwrap_or(false);
+        if matches_name {
+            c.image
+        } else {
+            None
+        }
+    })
+}
+
+/// Wyłuskuje 12-hex `docker_source_hash` z ostatniego segmentu tagu obrazu.
+/// Tag może być `<version>`, `<version>-<arch>` (np. `-sm86`),
+/// `<version>-<hash>` albo `<version>-<arch>-<hash>`. Hash to ZAWSZE ostatni
+/// segment pasujący do `-[0-9a-f]{12}$`; arch-tag (`-sm86`) nie jest 12-hex,
+/// więc nie zostanie złapany (flat-bez-hasha → `None` → stary obraz → badge).
+#[cfg(feature = "docker")]
+pub(crate) fn hash12_from_image_tag(image: &str) -> Option<String> {
+    // Tag to część po OSTATNIM `:` (repo może zawierać port rejestru z `:`).
+    let tag = image.rsplit(':').next()?;
+    let last = tag.rsplit('-').next()?;
+    if last.len() == 12 && last.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        Some(last.to_string())
+    } else {
+        None
+    }
+}
+
 /// Host ports currently published by any running docker container (incl. ones
 /// not managed by TentaFlow). Parsed from `docker ps --format '{{.Ports}}'`,
 /// whose entries look like `0.0.0.0:5001->19530/tcp, [::]:5001->19530/tcp`.

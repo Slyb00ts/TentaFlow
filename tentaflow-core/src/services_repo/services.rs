@@ -535,6 +535,24 @@ pub fn update_progress_message(conn: &Connection, id: i64, msg: Option<&str>) ->
     Ok(())
 }
 
+/// Nadpisuje `deployed_source_hash` na podstawie REALNEGO obrazu running
+/// kontenera (reconcile docker-sync). Pozwala badge „update_available" wrócić
+/// dla istniejących kontenerów na starym flat-tagu, którym poprzedni deploy
+/// błędnie zaksięgował baked hash bez przebudowy obrazu.
+pub fn update_deployed_source_hash(conn: &Connection, id: i64, hash: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE services SET deployed_source_hash = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+        params![id, hash],
+    )?;
+    if n == 0 {
+        return Err(anyhow!(
+            "update_deployed_source_hash: service id={} not found",
+            id
+        ));
+    }
+    Ok(())
+}
+
 /// Increments `restart_count`. Used by supervisor.
 pub fn increment_restart(conn: &Connection, id: i64) -> Result<i64> {
     conn.execute(
