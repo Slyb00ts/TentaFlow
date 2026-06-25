@@ -15,6 +15,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use nalgebra::Point3;
@@ -132,30 +133,54 @@ impl SceneVoxelMap {
         }
     }
 
-    /// Fold a batch of world-frame points (the common single-robot path: the source
-    /// is already in the scene frame, so no placement transform is applied).
-    /// Non-finite points are skipped.
-    pub fn insert_world_points(&mut self, points: &[Point3<f32>]) {
+    /// Set the occupied set to EXACTLY the cells of `points` (already in the scene/world
+    /// frame): cells absent from `points` are removed, new cells added, common cells kept
+    /// (touch-refreshed). `revision` changes only if the occupied SET actually differs —
+    /// a pre-fused sensor re-sending an identical frame stays quiet. This MIRRORS the
+    /// source's current frame instead of accumulating it, so geometry the sensor dropped
+    /// (a moved/removed object) disappears here too. Non-finite points are skipped.
+    pub fn replace_world_points(&mut self, points: &[Point3<f32>]) {
+        let mut next = HashSet::with_capacity(points.len());
         for p in points {
             if let Some(cell) = self.cell_of([p.x, p.y, p.z]) {
-                self.touch(cell);
+                next.insert(cell);
             }
         }
+        self.replace_with_cells(next);
     }
 
-    /// Fold a batch of points expressed in a SOURCE frame, placed into this scene
-    /// frame by `source_to_scene` first (cross-robot fusion). For a single robot
-    /// whose odom frame IS the scene frame, pass identity / use [`insert_world_points`].
-    /// Non-finite points are skipped.
-    pub fn insert_points_via(&mut self, points: &[Point3<f32>], source_to_scene: &Pose) {
+    /// As [`replace_world_points`], but the points are in a SOURCE frame placed into this
+    /// scene frame by `source_to_scene` first (cross-robot fusion). Non-finite points skip.
+    pub fn replace_points_via(&mut self, points: &[Point3<f32>], source_to_scene: &Pose) {
+        let mut next = HashSet::with_capacity(points.len());
         for p in points {
             if !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite()) {
                 continue;
             }
             let w = source_to_scene.transform_point([p.x as f64, p.y as f64, p.z as f64]);
             if let Some(cell) = self.cell_of([w[0] as f32, w[1] as f32, w[2] as f32]) {
-                self.touch(cell);
+                next.insert(cell);
             }
+        }
+        self.replace_with_cells(next);
+    }
+
+    /// Diff the current occupied set against `next`: drop cells no longer present, then
+    /// touch every cell in `next` (adds new ones, refreshes survivors). `revision` ends
+    /// up changed iff the set changed.
+    fn replace_with_cells(&mut self, next: HashSet<Cell>) {
+        let gone: Vec<Cell> = self
+            .cells
+            .keys()
+            .filter(|c| !next.contains(*c))
+            .copied()
+            .collect();
+        for cell in gone {
+            self.cells.remove(&cell);
+            self.revision += 1;
+        }
+        for cell in next {
+            self.touch(cell);
         }
     }
 
@@ -299,15 +324,15 @@ mod tests {
     }
 
     #[test]
-    fn insert_points_via_applies_placement_transform() {
+    fn replace_points_via_applies_placement_transform() {
         let mut scene = SceneVoxelMap::new(0.5, 1000);
         // A source-frame point at origin, placed by a +10 m X shift → scene cell at 10.
-        scene.insert_points_via(&[p(0.0, 0.0, 0.0)], &translation_pose([10.0, 0.0, 0.0]));
+        scene.replace_points_via(&[p(0.0, 0.0, 0.0)], &translation_pose([10.0, 0.0, 0.0]));
         let c = scene.iter_world().next().unwrap();
         assert!((c[0] - 10.0).abs() < 1e-4);
         // Same physical point, identity placement → different cell (origin).
         let mut local = SceneVoxelMap::new(0.5, 1000);
-        local.insert_world_points(&[p(0.0, 0.0, 0.0)]);
+        local.replace_world_points(&[p(0.0, 0.0, 0.0)]);
         let c2 = local.iter_world().next().unwrap();
         assert!((c2[0]).abs() < 1e-4);
     }
@@ -315,7 +340,7 @@ mod tests {
     #[test]
     fn packed_xyz_matches_cell_count() {
         let mut m = SceneVoxelMap::new(0.05, 1000);
-        m.insert_world_points(&[p(0.0, 0.0, 0.0), p(5.0, 5.0, 5.0), p(0.0, 0.0, 0.0)]);
+        m.replace_world_points(&[p(0.0, 0.0, 0.0), p(5.0, 5.0, 5.0), p(0.0, 0.0, 0.0)]);
         assert_eq!(m.len(), 2);
         assert_eq!(m.to_packed_xyz().len(), 2 * 3);
     }
@@ -327,9 +352,12 @@ mod tests {
         m.insert_world([0.0, f32::INFINITY, 0.0]);
         m.insert_world([0.0, 0.0, f32::NEG_INFINITY]);
         assert!(m.is_empty(), "bad coords must not create a cell-0 / saturated cell");
-        m.insert_world_points(&[p(f32::NAN, 1.0, 1.0), p(2.0, 2.0, 2.0)]);
+        m.replace_world_points(&[p(f32::NAN, 1.0, 1.0), p(2.0, 2.0, 2.0)]);
         assert_eq!(m.len(), 1, "only the finite point is kept");
-        m.insert_points_via(&[p(f32::NAN, 0.0, 0.0)], &translation_pose([10.0, 0.0, 0.0]));
+        m.replace_points_via(
+            &[p(f32::NAN, 0.0, 0.0), p(0.0, 0.0, 0.0)],
+            &translation_pose([10.0, 0.0, 0.0]),
+        );
         assert_eq!(m.len(), 1, "non-finite source point skipped before transform");
     }
 
@@ -362,7 +390,7 @@ mod tests {
     #[test]
     fn clear_resets() {
         let mut m = SceneVoxelMap::new(0.05, 1000);
-        m.insert_world_points(&[p(0.0, 0.0, 0.0), p(1.0, 1.0, 1.0)]);
+        m.replace_world_points(&[p(0.0, 0.0, 0.0), p(1.0, 1.0, 1.0)]);
         assert_eq!(m.len(), 2);
         m.clear();
         assert!(m.is_empty());

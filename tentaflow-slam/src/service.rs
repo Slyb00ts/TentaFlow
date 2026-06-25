@@ -128,11 +128,14 @@ impl SlamService {
     }
 
     /// PRE-FUSED ingest (Go2 option B, the shared-map path): adopt the device's own
-    /// trusted world pose (no ICP) AND fold its world-frame occupancy voxels into the
-    /// shared scene map (idempotent dedup per cell). `placement` maps the device's odom
-    /// frame into the shared scene frame — `None` for a single robot whose odom frame
-    /// IS the scene frame; the robot→scene alignment for cross-robot fusion otherwise.
-    /// Returns the device-odometry `GlobalPose` (placed by the same `placement`).
+    /// trusted world pose (no ICP) AND mirror its world-frame occupancy voxels into the
+    /// shared scene map. The device re-sends its WHOLE current map every frame, so the
+    /// scene map is REPLACED with exactly this frame's cells (dedup per cell) rather than
+    /// accumulated — geometry the device dropped (a moved/removed object) disappears here
+    /// too, while a re-sent identical frame leaves the set (and `revision`) untouched.
+    /// `placement` maps the device's odom frame into the shared scene frame — `None` for
+    /// a single robot whose odom frame IS the scene frame; the robot→scene alignment for
+    /// cross-robot fusion otherwise. Returns the device-odometry `GlobalPose`.
     pub fn ingest_world_voxels(
         &mut self,
         pose: Pose,
@@ -143,12 +146,12 @@ impl SlamService {
         self.last_timestamp_us = timestamp_us;
         match placement {
             Some(t) => {
-                self.voxel_map.insert_points_via(world_points, t);
+                self.voxel_map.replace_points_via(world_points, t);
                 let step = self.fe.ingest_posed(t.compose(&pose));
                 self.pose_frame(&step.track, POSE_SRC_ODOM)
             }
             None => {
-                self.voxel_map.insert_world_points(world_points);
+                self.voxel_map.replace_world_points(world_points);
                 let step = self.fe.ingest_posed(pose);
                 self.pose_frame(&step.track, POSE_SRC_ODOM)
             }
@@ -262,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_world_voxels_accumulates_and_dedups_across_frames() {
+    fn ingest_world_voxels_mirrors_latest_frame() {
         let mut s = svc();
         let frame_a = pts(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
         let f = s.ingest_world_voxels(translation_pose([0.5, 0.0, 0.31]), &frame_a, None, 1000);
@@ -271,10 +274,17 @@ mod tests {
         assert_eq!(f.source, POSE_SRC_ODOM);
         assert_eq!(f.position, [0.5, 0.0, 0.31]);
 
-        // Next frame re-sends the SAME world cells (+1 new) — set grows by 1, not 3.
+        // A pre-fused source re-sends its WHOLE map each frame; this one keeps both cells
+        // and adds one → the map mirrors it at 3 (dedup per cell).
         let frame_b = pts(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]);
         s.ingest_world_voxels(translation_pose([0.6, 0.0, 0.31]), &frame_b, None, 2000);
-        assert_eq!(s.scene_voxel_map().len(), 3, "re-sent cells dedup; only the new one adds");
+        assert_eq!(s.scene_voxel_map().len(), 3, "map mirrors the frame's cells");
+
+        // Next frame DROPS the first two cells (object moved away) → they disappear; the
+        // map equals exactly the latest frame, never an accumulation of stale geometry.
+        let frame_c = pts(&[[2.0, 0.0, 0.0]]);
+        s.ingest_world_voxels(translation_pose([0.6, 0.0, 0.31]), &frame_c, None, 3000);
+        assert_eq!(s.scene_voxel_map().len(), 1, "dropped cells disappear, no stale buildup");
     }
 
     #[test]
