@@ -2599,9 +2599,14 @@ function renderRecogAnnotateTab(panel, p) {
       <svg id="annot-svg" viewBox="0 0 ${S.origW} ${S.origH}" preserveAspectRatio="none"
            style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair"></svg>`;
     const svg = byId('annot-svg');
-    svg.addEventListener('pointerdown', onDown);
-    svg.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+    // Property assignment (NOT addEventListener) so re-rendering the stage can never
+    // stack duplicate handlers — stacked pointerdown listeners would create one box
+    // per past render on a single click. Pointer capture routes move/up back to the
+    // svg even when the pointer leaves it, so no leaky global window listener is needed.
+    svg.onpointerdown = (ev) => { try { svg.setPointerCapture(ev.pointerId); } catch (_) {} onDown(ev); };
+    svg.onpointermove = onMove;
+    svg.onpointerup = onUp;
+    svg.onpointercancel = onUp;
     drawBoxes();
   }
 
@@ -2617,8 +2622,12 @@ function renderRecogAnnotateTab(panel, p) {
     let html = '';
     S.boxes.forEach((b, i) => {
       const col = catColor(b.category_id); const seld = i === S.sel;
+      const sw = Math.max(2, S.origW / 400);
+      // Interior stays transparent so the image underneath is always visible, but a
+      // transparent fill (NOT `none`) still captures pointer events, so the whole box
+      // is clickable to re-select/move it. Selection is shown by a thicker outline.
       html += `<rect data-box="${i}" x="${b.x}" y="${b.y}" width="${Math.max(0, b.w)}" height="${Math.max(0, b.h)}"
-        fill="${seld ? col.replace('hsl', 'hsla').replace(')', ',0.15)') : 'none'}" stroke="${col}" stroke-width="${Math.max(2, S.origW / 400)}"/>`;
+        fill="transparent" stroke="${col}" stroke-width="${seld ? sw * 1.9 : sw}" style="pointer-events:all;cursor:move"/>`;
       html += `<text x="${b.x}" y="${Math.max(hs, b.y - 4)}" fill="${col}" font-size="${Math.max(11, S.origW / 55)}" font-weight="700" style="pointer-events:none">${escapeHtml(catName(b.category_id))}</text>`;
       if (seld) {
         const corners = [[b.x, b.y, 'nw'], [b.x + b.w, b.y, 'ne'], [b.x, b.y + b.h, 'sw'], [b.x + b.w, b.y + b.h, 'se']];
