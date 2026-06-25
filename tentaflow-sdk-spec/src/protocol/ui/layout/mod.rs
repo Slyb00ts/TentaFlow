@@ -90,6 +90,7 @@ mod tests {
             align: FlexAlign::Stretch,
             children: vec![],
             padding: None,
+            justify: None,
         };
         let mut c = s.into_component("s").unwrap();
         c.fields.0.retain(|(k, _)| *k != 0 && *k != 1);
@@ -105,6 +106,7 @@ mod tests {
             align: FlexAlign::Center,
             justify: FlexJustify::Start,
             children: vec![dummy(0x0001)],
+            wrap: None,
         };
         let c = cl.clone().into_component("cl").unwrap();
         assert_eq!(Cluster::try_from_component(&c).unwrap(), cl);
@@ -289,6 +291,7 @@ mod tests {
             children: vec![],
             sticky_header_slot: None,
             virtualize: false,
+            gap: None,
         };
         let mut c = s.into_component("sc").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);

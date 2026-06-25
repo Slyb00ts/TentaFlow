@@ -324,6 +324,7 @@ pub const STACK_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 1, name: "align", wire: "Enum<FlexAlign>", required: false, default: Some("FlexAlign::Stretch") },
         FieldMeta { key: 2, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
         FieldMeta { key: 3, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 4, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -337,6 +338,7 @@ pub const CLUSTER_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 1, name: "align", wire: "Enum<FlexAlign>", required: true, default: None },
         FieldMeta { key: 2, name: "justify", wire: "Enum<FlexJustify>", required: true, default: None },
         FieldMeta { key: 3, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
+        FieldMeta { key: 4, name: "wrap", wire: "Option<bool>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -368,6 +370,22 @@ pub const SCROLLCONTAINER_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 3, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
         FieldMeta { key: 4, name: "sticky_header_slot", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 5, name: "virtualize", wire: "bool", required: true, default: None },
+        FieldMeta { key: 6, name: "gap", wire: "Option<Enum<Spacing>>", required: false, default: None },
+    ],
+    handlers: &[],
+};
+
+pub const BOX_SCHEMA: ComponentMeta = ComponentMeta {
+    tag: 0x0115,
+    name: "Box",
+    section: section::LAYOUT,
+    fields: &[
+        FieldMeta { key: 0, name: "width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 1, name: "grow", wire: "Option<bool>", required: false, default: None },
+        FieldMeta { key: 2, name: "align_self", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 3, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 4, name: "margin", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 5, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
     ],
     handlers: &[],
 };
@@ -2142,6 +2160,7 @@ pub const ALL_COMPONENTS: &[&ComponentMeta] = &[
     &CLUSTER_SCHEMA,
     &SPLIT_SCHEMA,
     &SCROLLCONTAINER_SCHEMA,
+    &BOX_SCHEMA,
     &SIDEBAR_SCHEMA,
     &TABS_SCHEMA,
     &NAVTABS_SCHEMA,
