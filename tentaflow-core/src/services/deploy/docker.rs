@@ -952,20 +952,41 @@ impl DeployStrategy for DockerDeploy {
         // realna karte. Manifest WYGRYWA (default_build_args/arch_variants),
         // np. vllm-spark `12.1a` — nie nadpisujemy. Bez GPU (None) zostawiamy
         // Dockerfile'owy default (fat-binary ARG).
+        //
+        // Gate na realnej deklaracji `ARG TORCH_CUDA_ARCH_LIST` w Dockerfile:
+        // tylko nemotron-ocr/yolox kompiluja custom-kernel i deklaruja ten ARG.
+        // Wstrzykniecie build-arga niekonsumowanego przez Dockerfile (rerank-vl,
+        // parse, embed-vl, comfyui) daje docker warning "build-args were not
+        // consumed" ORAZ niepotrzebny arch-aware tag -> zbedny per-arch rebuild
+        // serwisu bez custom-kernela. Czytamy DOKLADNIE ten plik, ktory idzie do
+        // Bollard build (`bundle_root.join(dockerfile_rel)`); IO error = nie
+        // wstrzykujemy (bezpieczny default, brak warningu).
         if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
-            if let Some(arch_list) = gpu.torch_cuda_arch_list() {
-                build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+            let dockerfile_declares_arch_arg = std::fs::read_to_string(
+                bundle_root.join(&dockerfile_rel),
+            )
+            .map(|contents| {
+                contents
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
+            })
+            .unwrap_or(false);
+            if dockerfile_declares_arch_arg {
+                if let Some(arch_list) = gpu.torch_cuda_arch_list() {
+                    build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+                }
             }
         }
         // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
         // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
         // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
         // tagu (brak niepotrzebnych przebudow).
-        // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki bez
-        // manifest build-args (nemotron-ocr, yolox) i tak dostaja wstrzykniety
-        // arch-list, wiec ich tag MUSI byc arch-aware — inaczej obraz zbudowany raz
-        // pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty na B300 (ten sam
-        // plaski tag) i odpalil zly kernel.
+        // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki z
+        // custom-kernelem (nemotron-ocr, yolox; deklaruja `ARG TORCH_CUDA_ARCH_LIST`)
+        // dostaja wstrzykniety arch-list, wiec ich tag staje sie arch-aware — inaczej
+        // obraz zbudowany raz pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty
+        // na B300 (ten sam plaski tag) i odpalil zly kernel. Serwisy bez tego ARG
+        // (rerank-vl, parse, embed-vl, comfyui) nie dostaja wstrzykniecia -> plaski tag.
         let arch_aware = !build_args.is_empty() || !docker_section.arch_variants.is_empty();
         // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
         // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
