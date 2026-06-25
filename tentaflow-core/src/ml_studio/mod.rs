@@ -5,6 +5,7 @@
 // (`owner_user_id`/`org_id`) is referenced at the application level from the
 // request `HandlerContext`, never via SQL foreign keys into `tentaflow.db`.
 
+pub mod build_recog_dataset;
 pub mod coco_annotate;
 pub mod db;
 pub mod export_llm;
