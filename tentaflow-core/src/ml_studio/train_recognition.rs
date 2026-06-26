@@ -89,6 +89,63 @@ async fn run_training(
         anyhow::bail!("dataset COCO bez kategorii (class_names puste)");
     }
 
+    // RF-DETR `/train` wymaga splitów train/ ORAZ valid/. Build dataset + auto-label
+    // dają tylko train/, więc gdy brak valid/ tworzymy EFEMERYCZNĄ kopię ze
+    // wstrzymanym splitem walidacyjnym. Oryginalny dataset (który użytkownik dalej
+    // poprawia w edytorze) NIGDY nie jest modyfikowany.
+    let prepared = prepare_dataset_with_valid(&dataset_dir, run_id)?;
+    // Sprzątanie efemerycznego splitu po zakończeniu joba (sukces/porażka) — to
+    // dane pochodne, nie dataset użytkownika. Wykonujemy ręcznie na każdej ścieżce
+    // wyjścia poniżej (zamiast guarda Drop, by uniknąć blokowania w destruktorze).
+    let result = run_training_against_dir(
+        run_id,
+        project_id,
+        variant,
+        hyperparams,
+        &endpoint,
+        prepared.train_dir(),
+        &class_names,
+    )
+    .await;
+    prepared.cleanup();
+    result
+}
+
+/// Wynik przygotowania katalogu treningowego: albo oryginalny `coco_path` (gdy
+/// miał już valid/), albo efemeryczna kopia ze splitem train/valid do sprzątnięcia.
+enum PreparedDataset {
+    /// Oryginalny katalog datasetu — przekazujemy bez zmian.
+    Original(std::path::PathBuf),
+    /// Efemeryczny katalog ze splitem train/valid (do usunięcia po treningu).
+    Ephemeral(std::path::PathBuf),
+}
+
+impl PreparedDataset {
+    fn train_dir(&self) -> &Path {
+        match self {
+            PreparedDataset::Original(p) | PreparedDataset::Ephemeral(p) => p,
+        }
+    }
+
+    fn cleanup(&self) {
+        if let PreparedDataset::Ephemeral(p) = self {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
+/// Startuje job na serwisie rfdetr-training dla GOTOWEGO `dataset_dir` (zawiera już
+/// train/ + valid/) i odpytuje status do końca. Wydzielone z `run_training`, żeby
+/// efemeryczny split można było sprzątnąć na każdej ścieżce wyjścia (`?` w środku).
+async fn run_training_against_dir(
+    run_id: &str,
+    project_id: &str,
+    variant: &str,
+    hyperparams: &tentaflow_protocol::MlStudioRecogHyperparams,
+    endpoint: &str,
+    dataset_dir: &Path,
+    class_names: &[String],
+) -> anyhow::Result<()> {
     let output_dir = format!("recog/{}/{}", project_id, run_id);
     let train_body = json!({
         "dataset_dir": dataset_dir.to_string_lossy(),
@@ -165,6 +222,171 @@ async fn run_training(
             other => anyhow::bail!("rfdetr-training unknown status '{}'", other),
         }
     }
+}
+
+/// Nazwa wstrzymanego splitu walidacyjnego co N-ty obraz (po posortowaniu po
+/// file_name). 7 → ~15% obrazów trafia do valid/, reszta zostaje w train/.
+const VALID_HOLDOUT_STRIDE: usize = 7;
+/// Minimalna liczba obrazów w train/ wymagana do sensownego treningu.
+const MIN_TRAIN_IMAGES: usize = 4;
+
+/// Przygotowuje katalog treningowy z gwarantowanym splitem valid/.
+///
+/// Gdy `coco_path` ma już `valid/_annotations.coco.json` → zwraca go bez zmian.
+/// Gdy ma TYLKO `train/` → tworzy efemeryczną kopię pod cache (train/ + valid/),
+/// deterministycznie wstrzymując co `VALID_HOLDOUT_STRIDE`-ty obraz do valid/.
+/// Oryginalny `coco_path` pozostaje NIETKNIĘTY (read-only).
+fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<PreparedDataset> {
+    let valid_annot = coco_path.join("valid").join("_annotations.coco.json");
+    if valid_annot.is_file() {
+        return Ok(PreparedDataset::Original(coco_path.to_path_buf()));
+    }
+
+    let train_dir = coco_path.join("train");
+    let train_annot = train_dir.join("_annotations.coco.json");
+    if !train_annot.is_file() {
+        anyhow::bail!(
+            "dataset COCO bez splitu valid/ ani train/ ({})",
+            coco_path.display()
+        );
+    }
+
+    let coco: serde_json::Value = serde_json::from_slice(&std::fs::read(&train_annot)?)
+        .map_err(|e| anyhow::anyhow!("train/_annotations.coco.json niepoprawny: {}", e))?;
+    let categories = coco.get("categories").cloned().unwrap_or(json!([]));
+    let images = coco
+        .get("images")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let annotations = coco
+        .get("annotations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if images.len() < MIN_TRAIN_IMAGES {
+        anyhow::bail!("zbiór za mały do treningu — dodaj więcej obrazów");
+    }
+
+    // Deterministyczny podział: sortujemy obrazy po file_name i co N-ty → valid/.
+    // Brak RNG (Math::random/Date::now niedostępne) — stride daje powtarzalny split.
+    let mut ordered: Vec<&serde_json::Value> = images.iter().collect();
+    ordered.sort_by(|a, b| coco_image_file_name(a).cmp(&coco_image_file_name(b)));
+
+    let mut valid_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (idx, img) in ordered.iter().enumerate() {
+        if idx % VALID_HOLDOUT_STRIDE == VALID_HOLDOUT_STRIDE - 1 {
+            if let Some(id) = img.get("id").and_then(|v| v.as_i64()) {
+                valid_ids.insert(id);
+            }
+        }
+    }
+    // Gwarancja: valid/ ma min. 1 obraz, train/ zachowuje większość. Gdy stride
+    // nie trafił żadnego (mało obrazów), wstrzymujemy ostatni obraz.
+    if valid_ids.is_empty() {
+        if let Some(id) = ordered
+            .last()
+            .and_then(|img| img.get("id").and_then(|v| v.as_i64()))
+        {
+            valid_ids.insert(id);
+        }
+    }
+    let train_count = images.len() - valid_ids.len();
+    if train_count < MIN_TRAIN_IMAGES {
+        anyhow::bail!("zbiór za mały do treningu — dodaj więcej obrazów");
+    }
+
+    let dest = crate::paths::cache_dir()
+        .join("ml-recog-train-split")
+        .join(run_id);
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    let dest_train = dest.join("train");
+    let dest_valid = dest.join("valid");
+    std::fs::create_dir_all(&dest_train)?;
+    std::fs::create_dir_all(&dest_valid)?;
+
+    // Rozdział obrazów i adnotacji wg przynależności do valid_ids. Ids zostają
+    // oryginalne — są spójne w obrębie każdego splitu (image_id ↔ annotation).
+    let (valid_images, train_images): (Vec<_>, Vec<_>) = images.iter().partition(|img| {
+        img.get("id")
+            .and_then(|v| v.as_i64())
+            .map(|id| valid_ids.contains(&id))
+            .unwrap_or(false)
+    });
+    let (valid_annots, train_annots): (Vec<_>, Vec<_>) = annotations.iter().partition(|a| {
+        a.get("image_id")
+            .and_then(|v| v.as_i64())
+            .map(|id| valid_ids.contains(&id))
+            .unwrap_or(false)
+    });
+
+    write_split_coco(&dest_train, &categories, &train_images, &train_annots)?;
+    write_split_coco(&dest_valid, &categories, &valid_images, &valid_annots)?;
+
+    // Kopiujemy (preferując hardlink) pliki obrazów do odpowiednich splitów.
+    // Serwis czyta obrazy po file_name z katalogu danego splitu.
+    copy_split_images(&train_dir, &dest_train, &train_images)?;
+    copy_split_images(&train_dir, &dest_valid, &valid_images)?;
+
+    Ok(PreparedDataset::Ephemeral(dest))
+}
+
+/// file_name obrazu z rekordu COCO (pusty string gdy brak — stabilne sortowanie).
+fn coco_image_file_name(img: &serde_json::Value) -> String {
+    img.get("file_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Zapisuje `_annotations.coco.json` dla jednego splitu: te same `categories`,
+/// przypisane obrazy i tylko ich adnotacje.
+fn write_split_coco(
+    split_dir: &Path,
+    categories: &serde_json::Value,
+    images: &[&serde_json::Value],
+    annotations: &[&serde_json::Value],
+) -> anyhow::Result<()> {
+    let doc = json!({
+        "categories": categories,
+        "images": images,
+        "annotations": annotations,
+    });
+    std::fs::write(
+        split_dir.join("_annotations.coco.json"),
+        serde_json::to_vec(&doc)?,
+    )?;
+    Ok(())
+}
+
+/// Kopiuje pliki obrazów wymienione w `images` z `src_dir` do `dst_dir`. Preferuje
+/// hardlink (zero dodatkowego miejsca); gdy się nie uda (inny FS) — kopiuje bajty.
+fn copy_split_images(
+    src_dir: &Path,
+    dst_dir: &Path,
+    images: &[&serde_json::Value],
+) -> anyhow::Result<()> {
+    for img in images {
+        let Some(name) = img.get("file_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Tylko nazwa pliku — odcięcie ewentualnych komponentów ścieżki (zip slip).
+        let Some(base) = Path::new(name).file_name() else {
+            continue;
+        };
+        let src = src_dir.join(base);
+        if !src.is_file() {
+            anyhow::bail!("obraz datasetu nie istnieje: {}", src.display());
+        }
+        let dst = dst_dir.join(base);
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// Rozpakowuje zip COCO do `dest` (czyści wcześniejszą zawartość) i zwraca
