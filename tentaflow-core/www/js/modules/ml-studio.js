@@ -26,6 +26,9 @@ import '/js/components/tf-tabs.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
 import '/js/components/tf-progress-bar.js';
+import '/js/components/tf-segmented.js';
+import '/js/components/tf-toggle.js';
+import '/js/components/tf-tag-input.js';
 
 let projects = [];
 let projectTypes = [];
@@ -96,7 +99,7 @@ const TYPE_ICON = {
 };
 
 const TYPE_TABS = {
-  recognition: ['Schemat', 'Dane', 'Anotacje', 'Treningi', 'Modele'],
+  recognition: ['Schemat', 'Dane', 'Anotacje', 'Trening', 'Treningi', 'Modele'],
   ft_llm: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   ft_vision_audio: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   tabular_anomaly: ['Dane', 'Trenuj', 'Cechy', 'Anomalie', 'Modele'],
@@ -841,6 +844,33 @@ function renderDetail(host, p) {
   // a "Zasoby" zawsze ostatnią (§11.3 — zasoby mesh przydzielone projektowi).
   // Żaden wpis TYPE_TABS nie zawiera "Przegląd", więc bez duplikatów.
   const tabs = ['Przegląd', ...(TYPE_TABS[slug] || ['Dane', 'Treningi', 'Modele']), 'Zasoby'];
+  const recognition = slug === 'recognition';
+
+  // Per-tab indices used for tab counts (set once recog metrics resolve) and
+  // for the header action buttons that jump straight into a sibling tab.
+  const tabIndex = (label) => tabs.indexOf(label);
+
+  // Header badges: project type, created-at provenance, schema size and mesh
+  // sync state. Synced is signalled by the backend `synced`/`isShared` flag.
+  const createdRel = formatRelative(p.createdAt ?? p.created_at);
+  const synced = p.synced === true || p.is_synced === true;
+  const headerBadges = [
+    `<tf-chip status="accent" icon="${escapeAttr(typeIcon(slug))}" label="typ: ${escapeAttr(typeLabel(slug))}"></tf-chip>`,
+    createdRel !== '—' ? `<tf-chip icon="clock" label="utworzony ${escapeAttr(createdRel)}"></tf-chip>` : '',
+    `<tf-chip status="info" icon="grid-2x2" label="schemat: —"></tf-chip>`,
+    synced ? `<tf-chip status="ok" icon="network" label="zsynchronizowano z mesh"></tf-chip>` : '',
+  ].join('');
+
+  // Recognition gets data-centric header actions (add photos → Dane, annotate →
+  // Anotacje); other types keep the owner-only access action.
+  const headerActions = recognition
+    ? `<span slot="actions">
+         <tf-button variant="outline" icon="plus" id="ml-studio-hdr-data">Dodaj zdjęcia</tf-button>
+         <tf-button variant="primary" icon="edit" id="ml-studio-hdr-annot">Anotuj</tf-button>
+       </span>`
+    : (isOwnerProject(p)
+      ? `<span slot="actions"><tf-button variant="outline" icon="share" id="ml-studio-manage-access">Zarządzaj dostępem</tf-button></span>`
+      : '');
 
   host.innerHTML = `
     <div class="ml-studio-detail-top">
@@ -849,13 +879,14 @@ function renderDetail(host, p) {
 
     <tf-detail-header
       title="${escapeAttr(p.name || '(bez nazwy)')}"
-      subtitle="${escapeAttr(typeLabel(slug))}"
+      subtitle="${escapeAttr(p.description || typeLabel(slug))}"
       icon="${escapeAttr(typeIcon(slug))}">
-      <span slot="badges"><tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(statusLabel(p.status))}"></tf-badge></span>
-      ${isOwnerProject(p) ? `<span slot="actions"><tf-button variant="outline" icon="share" id="ml-studio-manage-access">Zarządzaj dostępem</tf-button></span>` : ''}
+      <span slot="badges" id="ml-studio-hdr-badges">
+        <tf-badge tone="${statusTone(p.status)}" value="${escapeAttr(statusLabel(p.status))}"></tf-badge>
+        ${headerBadges}
+      </span>
+      ${headerActions}
     </tf-detail-header>
-
-    <p class="ml-studio-detail-desc">${escapeHtml(p.description || 'Bez opisu.')}</p>
 
     <tf-tabs id="ml-studio-tabs" value="ml-tab-0">
       ${tabs.map((t, i) => `<tf-tab id="ml-tab-${i}" label="${escapeAttr(t)}"></tf-tab>`).join('')}
@@ -868,6 +899,27 @@ function renderDetail(host, p) {
   byId('ml-studio-manage-access')?.addEventListener('click', () => {
     Router.navigate('ml-studio', { projectId: projectId(p), share: true });
   });
+  byId('ml-studio-hdr-data')?.addEventListener('click', () => selectTab('Dane'));
+  byId('ml-studio-hdr-annot')?.addEventListener('click', () => selectTab('Anotacje'));
+
+  // Recognition tab counts + header schema badge come from the COCO dataset, so
+  // they are resolved once asynchronously and patched into the already-rendered
+  // header/tabs (degrades silently when unavailable).
+  if (recognition) {
+    fetchRecogStats(projectId(p)).then((stats) => {
+      if (!stats) return;
+      const setCount = (label, value) => {
+        const i = tabIndex(label);
+        if (i >= 0 && value != null) byId('ml-tab-' + i)?.setAttribute('count', String(value));
+      };
+      setCount('Dane', stats.images);
+      if (stats.images) setCount('Anotacje', `${stats.annotated}/${stats.images}`);
+      const schemaBadge = byId('ml-studio-hdr-badges')?.querySelector('tf-chip[icon="grid-2x2"]');
+      if (schemaBadge && stats.classes != null) {
+        schemaBadge.setAttribute('label', `schemat: ${stats.classes} ${plural(stats.classes, 'klasa', 'klasy', 'klas')}`);
+      }
+    });
+  }
 
   const tabsEl = byId('ml-studio-tabs');
   // Pozwala skrótom z zakładki "Przegląd" przełączać aktywną zakładkę:
@@ -899,6 +951,10 @@ function renderDetail(host, p) {
       return;
     }
     if (label === 'Schemat' && slug === 'recognition') {
+      renderRecogSchemaTab(panel, p, { selectTab });
+      return;
+    }
+    if (label === 'Trening' && slug === 'recognition') {
       renderRecogTrainTab(panel, p, { selectTab });
       return;
     }
@@ -966,6 +1022,81 @@ function runBadge(status) {
   return { tone: statusTone(s), label: statusLabel(s) };
 }
 
+// Parse a metrics-bearing JSON blob (string or object) into a plain object,
+// tolerating the snake/camel field pair. Returns {} when unparseable.
+function parseMetrics(raw) {
+  if (!raw) return {};
+  let m = raw;
+  if (typeof m === 'string') { try { m = JSON.parse(m); } catch (_) { return {}; } }
+  return (m && typeof m === 'object') ? m : {};
+}
+
+function metricNum(m, ...keys) {
+  for (const k of keys) {
+    const v = m[k];
+    if (v != null && Number.isFinite(Number(v))) return Number(v);
+  }
+  return null;
+}
+
+// Progress + headline result for a training run row. `done` drives the green
+// progress style; `metric` (if present) becomes the success chip text. Falls
+// back to a 0/100 % bar derived only from the run status when no numbers exist.
+function runProgressMeta(r) {
+  const m = parseMetrics(r.metricsJson ?? r.metrics_json);
+  const status = String(r.status ?? '').toLowerCase();
+  const terminal = status === 'succeeded' || status === 'finished' || status === 'completed';
+  let pct = metricNum({ ...r, ...m }, 'progress', 'progressPct', 'progress_pct');
+  if (pct != null && pct <= 1) pct = Math.round(pct * 100);
+  if (pct == null) pct = terminal ? 100 : (status === 'failed' || status === 'error' ? 0 : 0);
+  pct = Math.max(0, Math.min(100, Math.round(pct)));
+  const map50 = metricNum(m, 'map50', 'mAP50', 'map_50', 'mAP@50');
+  let metric = null;
+  if (terminal && map50 != null) metric = `mAP@50 ${map50.toFixed(3)}`;
+  else if (terminal) {
+    const summary = modelMetricsSummary(m);
+    if (summary) metric = summary;
+  }
+  return { pct, done: terminal, metric };
+}
+
+// Metric tiles for a project model card (mAP@50 / mAP@50-95 / klasy). Missing
+// values render as an em-dash so the tile layout stays stable.
+function modelMetricTiles(model) {
+  const m = parseMetrics(model.metricsJson ?? model.metrics_json);
+  const fmt = (v) => (v == null ? '—' : v.toFixed(3));
+  const map50 = metricNum(m, 'map50', 'mAP50', 'map_50', 'mAP@50');
+  const map5095 = metricNum(m, 'map5095', 'map50_95', 'map_50_95', 'mAP50-95', 'mAP@50-95');
+  const classes = metricNum(m, 'num_classes', 'numClasses', 'classes');
+  return [
+    { val: fmt(map50), lbl: 'mAP@50' },
+    { val: fmt(map5095), lbl: 'mAP@50-95' },
+    { val: classes == null ? '—' : String(classes), lbl: 'klasy' },
+  ];
+}
+
+// Recognition project stats from the COCO dataset: image count, class count
+// (background id 0 excluded, mirroring the annotate tab) and annotated-image
+// count (images with at least one annotation). Returns null on any failure so
+// callers degrade to "—" instead of throwing.
+async function fetchRecogStats(pid) {
+  try {
+    const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+    const datasets = (Array.isArray(dsResp.datasets) ? dsResp.datasets : [])
+      .filter((d) => (d.kind ?? '') === 'coco_path');
+    if (!datasets.length) return { images: 0, classes: 0, annotated: 0 };
+    const datasetId = datasets[0].datasetId ?? datasets[0].dataset_id;
+    const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
+    const images = JSON.parse(imgResp.imagesJson ?? imgResp.images_json ?? '[]');
+    const categories = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+    const classes = categories.filter((c) => c.id !== 0).length || categories.length;
+    const annotated = images.filter((im) => Number(im.ann_count ?? 0) > 0).length;
+    return { images: images.length, classes, annotated };
+  } catch (_) {
+    return null;
+  }
+}
+
 async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   const pid = projectId(p);
   panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
@@ -989,20 +1120,33 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   const shareNav = () => Router.navigate('ml-studio', { projectId: pid, share: true });
   const adminNav = () => Router.navigate('ml-studio', { admin: 'resources' });
 
-  const kpi = (icon, label, value, delta) => `
+  const slug = p.projectType ?? p.project_type ?? '';
+  const recognition = slug === 'recognition';
+
+  // value can carry an inline <span class="small"> suffix (e.g. "42%"), so it is
+  // injected as raw HTML — callers must pre-escape any dynamic text.
+  const kpi = (icon, label, valueHtml, deltaText, deltaClass = '') => `
     <div class="ml-studio-kpi">
       <div class="label">${sprite(icon)}${escapeHtml(label)}</div>
-      <div class="value">${escapeHtml(String(value))}</div>
-      <div class="delta">${escapeHtml(delta)}</div>
+      <div class="value">${valueHtml}</div>
+      <div class="delta${deltaClass ? ' ' + deltaClass : ''}">${escapeHtml(deltaText)}</div>
     </div>`;
 
-  const kpiGrid = `
-    <div class="ml-studio-kpi-grid">
-      ${kpi('image', 'Datasety', datasetCount, 'z zakładki Dane')}
-      ${kpi('catalog', 'Modele', modelCount, 'wytrenowane wersje w projekcie')}
-      ${kpi('brain', 'Treningi', trainingCount, 'uruchomione joby treningowe')}
-      ${kpi('users', 'Członkowie', members.length, 'właściciel + osoby z dostępem')}
-    </div>`;
+  // Recognition KPI (Zdjęcia/Klasy/Oznaczone/Modele) need the COCO dataset, so
+  // they start as placeholders and are patched once fetchRecogStats resolves.
+  const kpiGrid = recognition
+    ? `<div class="ml-studio-kpi-grid">
+        ${kpi('image', 'Zdjęcia', '<span id="ml-studio-kpi-images">—</span>', 'z zakładki Dane')}
+        ${kpi('grid-2x2', 'Klasy', '<span id="ml-studio-kpi-classes">—</span>', 'ze schematu projektu')}
+        ${kpi('chart-line', 'Oznaczone', '<span id="ml-studio-kpi-annot">—</span>', 'wczytywanie…', 'up')}
+        ${kpi('catalog', 'Modele', escapeHtml(String(modelCount)), 'wersje wytrenowane w projekcie')}
+      </div>`
+    : `<div class="ml-studio-kpi-grid">
+        ${kpi('image', 'Datasety', escapeHtml(String(datasetCount)), 'z zakładki Dane')}
+        ${kpi('catalog', 'Modele', escapeHtml(String(modelCount)), 'wytrenowane wersje w projekcie')}
+        ${kpi('brain', 'Treningi', escapeHtml(String(trainingCount)), 'uruchomione joby treningowe')}
+        ${kpi('users', 'Członkowie', escapeHtml(String(members.length)), 'właściciel + osoby z dostępem')}
+      </div>`;
 
   // Mini-lista członków: awatar z inicjałów, nazwa = displayName (fallback userId), rola jako tf-chip.
   const memberChips = members.map((m) => {
@@ -1075,6 +1219,25 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   }
   byId('ml-studio-ov-resources-admin')?.addEventListener('click', adminNav);
 
+  // Recognition KPI patch — fill image/class counts and the annotated-% tile
+  // once the COCO dataset stats resolve (placeholders stay "—" on failure).
+  if (recognition) {
+    fetchRecogStats(pid).then((stats) => {
+      if (!stats) return;
+      const imagesEl = byId('ml-studio-kpi-images');
+      const classesEl = byId('ml-studio-kpi-classes');
+      const annotEl = byId('ml-studio-kpi-annot');
+      if (imagesEl) imagesEl.textContent = String(stats.images);
+      if (classesEl) classesEl.textContent = String(stats.classes);
+      if (annotEl) {
+        const pct = stats.images ? Math.round((stats.annotated / stats.images) * 100) : 0;
+        annotEl.innerHTML = `${pct}<span class="small">%</span>`;
+        const deltaEl = annotEl.closest('.ml-studio-kpi')?.querySelector('.delta');
+        if (deltaEl) deltaEl.textContent = `${stats.annotated} / ${stats.images} zdjęć z anotacji`;
+      }
+    });
+  }
+
   // Zasoby przydzielone — istniejący endpoint member-dostępny.
   try {
     const resp = await ApiBinary.one('mlStudioProjectResourcesRequest', { projectId: pid });
@@ -1144,15 +1307,20 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
         table.setAttribute('variant', 'lined');
         table.innerHTML = `
           <tf-column key="job" label="Job" renderer="html"></tf-column>
-          <tf-column key="status" label="Status" renderer="html"></tf-column>
+          <tf-column key="progress" label="Postęp" renderer="html"></tf-column>
+          <tf-column key="result" label="Wynik" renderer="html"></tf-column>
           <tf-column key="time" label="Czas"></tf-column>
         `;
         table.rows = runs.slice(0, 5).map((r) => {
           const runId = String(r.runId ?? r.run_id ?? '');
           const b = runBadge(r.status);
+          const meta = runProgressMeta(r);
           return {
             job: `<span class="ml-studio-mono">${escapeHtml(runId.slice(0, 8) || '—')}</span>`,
-            status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+            progress: `<div class="ml-studio-progress-cell"><div class="ml-studio-progress${meta.done ? ' done' : ''}"><span style="width:${meta.pct}%"></span></div><span class="pct">${meta.pct}%</span></div>`,
+            result: meta.metric != null
+              ? `<tf-chip status="ok" icon="check" label="${escapeAttr(meta.metric)}"></tf-chip>`
+              : `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
             time: formatRelative(r.finishedAt ?? r.finished_at ?? r.startedAt ?? r.started_at),
           };
         });
@@ -1183,24 +1351,32 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
         empty.setAttribute('message', 'Modele pojawią się tutaj po udanym treningu.');
         host.appendChild(empty);
       } else {
-        const table = document.createElement('tf-table');
-        table.setAttribute('variant', 'lined');
-        table.innerHTML = `
-          <tf-column key="model" label="Model"></tf-column>
-          <tf-column key="framework" label="Framework"></tf-column>
-          <tf-column key="status" label="Status" renderer="html"></tf-column>
-          <tf-column key="createdAt" label="Utworzony"></tf-column>
-        `;
-        table.rows = models.map((m) => {
+        // Model cards: icon + name + status chip + framework/base sub + a row of
+        // metric tiles (mAP@50 / mAP@50-95 / klasy) + an origin provenance line.
+        const grid = document.createElement('div');
+        grid.className = 'ml-studio-model-card-grid';
+        grid.innerHTML = models.map((m) => {
           const b = runBadge(m.status);
-          return {
-            model: String(m.name ?? m.modelId ?? m.model_id ?? '—'),
-            framework: String(m.framework ?? '—') || '—',
-            status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
-            createdAt: formatRelative(m.createdAt ?? m.created_at),
-          };
-        });
-        host.appendChild(table);
+          const name = String(m.name ?? m.modelId ?? m.model_id ?? '—');
+          const framework = String(m.framework ?? '') || '—';
+          const base = String(m.baseModel ?? m.base_model ?? '').trim();
+          const sub = base ? `${framework} · ${base}` : framework;
+          const tiles = modelMetricTiles(m).map((t) =>
+            `<div class="mc-metric"><div class="mm-val">${escapeHtml(t.val)}</div><div class="mm-lbl">${escapeHtml(t.lbl)}</div></div>`).join('');
+          return `
+            <div class="ml-studio-model-card">
+              <div class="mc-head">
+                <div class="mc-ico">${sprite('model')}</div>
+                <div>
+                  <div class="mc-name">${escapeHtml(name)} <tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge></div>
+                  <div class="mc-sub">${escapeHtml(sub)}</div>
+                </div>
+              </div>
+              <div class="mc-metrics">${tiles}</div>
+              <div class="ml-studio-origin">${sprite('external-link')} Rejestr modeli · źródło: ten projekt</div>
+            </div>`;
+        }).join('');
+        host.appendChild(grid);
       }
     }
   } catch (_) {
@@ -1214,16 +1390,30 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
     }
   }
 
-  // Szybkie skróty do pozostałych zakładek (bez "Przegląd"). Ikona per skrót.
+  // Szybkie skróty do pozostałych zakładek (bez "Przegląd"). Ikona + opis skrótu.
   const shortcutsHost = byId('ml-studio-ov-shortcuts');
   if (shortcutsHost) {
-    const slug = p.projectType ?? p.project_type ?? '';
     const shortcutIcon = (label) => {
       if (label === 'Dane') return 'image';
+      if (label === 'Schemat') return 'grid-2x2';
+      if (label === 'Anotacje') return 'edit';
       if (label === 'Zasoby') return 'host';
       if (label === 'Treningi' || label === 'Trening' || label === 'Trenuj') return 'brain';
       if (label === 'Modele') return 'catalog';
+      if (label === 'Ewaluacja') return 'check';
       return typeIcon(slug);
+    };
+    const shortcutDesc = (label) => {
+      if (label === 'Dane') return 'import i profil danych';
+      if (label === 'Schemat') return 'klasy i atrybuty';
+      if (label === 'Anotacje') return 'studio anotacji';
+      if (label === 'Zasoby') return 'GPU/nody mesh projektu';
+      if (label === 'Treningi' || label === 'Trening') return 'uruchom i śledź treningi';
+      if (label === 'Trenuj') return 'uruchom nowy trening';
+      if (label === 'Modele') return 'wytrenowane wersje';
+      if (label === 'Ewaluacja') return 'metryki i porównania';
+      if (label === 'Model bazowy') return 'wybór modelu i metody';
+      return 'przejdź do zakładki';
     };
     tabs.filter((t) => t !== 'Przegląd').forEach((label) => {
       // Kafel-skrót jest blokiem nawigacyjnym (jak <a> w mockupie), nie prymitywem
@@ -1235,7 +1425,10 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
       card.setAttribute('tabindex', '0');
       card.innerHTML = `
         <div class="sc-ico">${sprite(shortcutIcon(label))}</div>
-        <div class="sc-title">${escapeHtml(label)}</div>`;
+        <div class="sc-text">
+          <div class="sc-title">${escapeHtml(label)}</div>
+          <div class="sc-desc">${escapeHtml(shortcutDesc(label))}</div>
+        </div>`;
       const go = () => selectTab(label);
       card.addEventListener('click', go);
       card.addEventListener('keydown', (e) => {
@@ -2408,42 +2601,132 @@ function getRecogCfg(pid) {
   return recogCfg[pid];
 }
 
-// Zakładka "Dane" dla recognition: rejestracja datasetu COCO przez ścieżkę.
+// Zakładka "Dane" dla recognition — układ z mockupu a-dane.html:
+// źródło danych (upload/folder/kamera) → dropzone/ścieżka → galeria miniatur →
+// podział train/val/test (liczony jak trener) → tabela zarejestrowanych zbiorów.
+// Wszystkie realne ścieżki ingestu (build-from-files, build-from-folder,
+// rejestracja COCO, lista datasetów, miniatury) są zachowane, tylko przełożone
+// na kształt mockupu.
 function renderRecogDataTab(panel, p) {
   const pid = projectId(p);
   panel.innerHTML = `
     <div class="ml-studio-data">
+
       <section class="ml-studio-data-card">
-        <div class="ml-studio-data-head">${sprite('database')} Dataset COCO (katalog na serwerze)
-          <span class="ml-studio-data-hint">splity train/valid/test z _annotations.coco.json + obrazy</span>
+        <div class="ml-studio-data-head">${sprite('cloud')} Źródło danych
+          <span class="ml-studio-data-hint">upload · folder na serwerze · kamera TentaFlow</span>
         </div>
-        <p class="ml-studio-data-origin-text" style="margin:0 0 10px">Zbiory detekcji to dziesiątki/setki MB obrazów — podajesz ŚCIEŻKĘ do katalogu COCO na węźle (nie wgrywasz bajtów). Klasy i liczba obrazów są czytane z plików COCO.</p>
-        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
-          <tf-input id="ml-studio-recog-path" label="Ścieżka katalogu COCO" placeholder="/home/.../dataset_aug" style="flex:1;min-width:260px"></tf-input>
-          <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. Acme ADR" style="min-width:180px"></tf-input>
-          <tf-button variant="primary" icon="plus" id="ml-studio-recog-register">Zarejestruj dataset</tf-button>
+        <p class="ml-studio-data-origin-text" style="margin:0 0 12px">Wybierz skąd pochodzą zdjęcia. Obrazy są kopiowane, HEIC dekodowane, a z wideo wycinane klatki — powstaje dataset COCO gotowy do anotacji i treningu.</p>
+
+        <div class="ml-studio-source-tiles" id="ml-studio-source-tiles">
+          <button type="button" class="ml-studio-source-tile" data-source="upload">
+            <span class="st-ico">${sprite('cloud')}</span>
+            <span class="st-name">Upload plików</span>
+            <span class="st-desc">Przeciągnij JPG/PNG/HEIC lub wskaż pliki z dysku.</span>
+          </button>
+          <button type="button" class="ml-studio-source-tile" data-source="folder">
+            <span class="st-ico">${sprite('folder')}</span>
+            <span class="st-name">Z folderu (na serwerze)</span>
+            <span class="st-desc">Import całego katalogu obrazów/wideo z węzła.</span>
+          </button>
+          <button type="button" class="ml-studio-source-tile" data-source="camera">
+            <span class="st-ico">${sprite('record')}</span>
+            <span class="st-name">Kamera TentaFlow</span>
+            <span class="st-desc">Klatki z kamery na żywo przez TentaVision.</span>
+          </button>
         </div>
-      </section>
-      <section class="ml-studio-data-card">
-        <div class="ml-studio-data-head">${sprite('cloud')} Zbuduj dataset z plików
-          <span class="ml-studio-data-hint">obrazy + wideo → katalog COCO train/ z pustymi anotacjami</span>
+
+        <div class="ml-studio-source-body" id="ml-studio-source-upload">
+          <div class="ml-studio-dropzone" id="ml-studio-dropzone">
+            <span class="dz-ico">${sprite('cloud')}</span>
+            <span class="dz-title">Upuść zdjęcia tutaj lub kliknij, aby wczytać</span>
+            <span class="dz-sub">Obsługiwane: JPG, PNG, HEIC, MP4, MOV · z wideo wycinane są klatki</span>
+            <span class="dz-formats">
+              <span class="tf-chip">JPG</span><span class="tf-chip">PNG</span><span class="tf-chip">HEIC</span><span class="tf-chip">MP4</span><span class="tf-chip">MOV</span>
+            </span>
+            <tf-file-input id="ml-studio-recog-build-files" class="ml-studio-dropzone-input" accept=".jpg,.jpeg,.png,.heic,.mp4,.mov" multiple label="Wybierz pliki"></tf-file-input>
+          </div>
         </div>
-        <p class="ml-studio-data-origin-text" style="margin:0 0 10px">Wgraj wiele plików (jpg/png/heic, mp4/mov). Obrazy są kopiowane, HEIC dekodowane, a z wideo wycinane klatki. Powstaje dataset COCO gotowy do auto-etykietowania, ręcznej anotacji i treningu.</p>
-        <tf-file-input id="ml-studio-recog-build-files" accept=".jpg,.jpeg,.png,.heic,.mp4,.mov" multiple label="Przeciągnij pliki lub kliknij, aby wgrać"></tf-file-input>
-        <tf-input id="ml-studio-recog-build-srcdir" label="lub folder na serwerze (ścieżka)" placeholder="np. /mnt/dane/adr" style="margin-top:10px"></tf-input>
-        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
+
+        <div class="ml-studio-source-body" id="ml-studio-source-folder" hidden>
+          <tf-input id="ml-studio-recog-build-srcdir" label="Folder na serwerze (ścieżka)" placeholder="np. /mnt/dane/adr"></tf-input>
+          <p class="ml-studio-data-hint" style="margin:6px 0 0">Core czyta media wprost z dysku węzła — nic nie jest wgrywane przez przeglądarkę.</p>
+        </div>
+
+        <div class="ml-studio-source-body" id="ml-studio-source-camera" hidden>
+          <div class="ml-studio-callout">
+            <span class="co-ico">${sprite('info')}</span>
+            <p>Pobieranie klatek z kamer na żywo odbywa się w <strong>TentaVision</strong> — tam wybierzesz kamerę i zapiszesz nagrania jako materiał źródłowy, a następnie wczytasz je tutaj jako folder na serwerze. Bezpośrednie wpięcie kamery w ML Studio nie jest jeszcze podłączone.</p>
+          </div>
+        </div>
+
+        <div class="ml-studio-source-fields" id="ml-studio-source-fields">
           <tf-input id="ml-studio-recog-build-name" label="Nazwa datasetu" placeholder="np. ADR z terenu" style="flex:1;min-width:200px"></tf-input>
           <tf-input id="ml-studio-recog-build-fps" type="number" label="Klatki/s z wideo" value="5" min="1" max="60" style="min-width:140px"></tf-input>
           <tf-button variant="primary" icon="plus" id="ml-studio-recog-build">Zbuduj dataset</tf-button>
         </div>
         <div id="ml-studio-recog-build-progress" class="ml-studio-data-hint" style="margin-top:8px"></div>
+
+        <details class="ml-studio-coco-register">
+          <summary>${sprite('database')} Mam już katalog COCO na serwerze — zarejestruj bez budowania</summary>
+          <p class="ml-studio-data-origin-text" style="margin:10px 0">Zbiory detekcji to dziesiątki/setki MB obrazów — podajesz ŚCIEŻKĘ do katalogu COCO (z <code>_annotations.coco.json</code>), nie wgrywasz bajtów. Klasy i liczba obrazów są czytane z plików COCO.</p>
+          <div class="ml-studio-source-fields">
+            <tf-input id="ml-studio-recog-path" label="Ścieżka katalogu COCO" placeholder="/home/.../dataset_aug" style="flex:1;min-width:260px"></tf-input>
+            <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. Acme ADR" style="min-width:180px"></tf-input>
+            <tf-button variant="secondary" icon="plus" id="ml-studio-recog-register">Zarejestruj dataset</tf-button>
+          </div>
+        </details>
       </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Galeria podglądu
+          <span class="ml-studio-data-hint" id="ml-studio-gallery-meta">—</span>
+        </div>
+        <div class="ml-studio-gallery" id="ml-studio-gallery"></div>
+      </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('grid-2x2')} Podział TRAIN / VAL / TEST
+          <span class="ml-studio-data-hint">liczony przez trener (deterministyczny stride, bez RNG)</span>
+        </div>
+        <p class="ml-studio-data-origin-text" style="margin:0 0 12px">Trener tworzy efemeryczny split: co 7. obraz trafia do <strong>val</strong>, przedostatni z siódemki do <strong>test</strong>, reszta to <strong>train</strong>. Liczby poniżej są wyliczone z liczby wgranych obrazów — nie wpisywane ręcznie.</p>
+        <div class="ml-studio-split-bar" id="ml-studio-split-bar">
+          <span class="seg-train" style="width:0%"></span>
+          <span class="seg-val" style="width:0%"></span>
+          <span class="seg-test" style="width:0%"></span>
+        </div>
+        <div class="ml-studio-split-stats" id="ml-studio-split-stats"></div>
+      </section>
+
       <section class="ml-studio-data-card">
         <div class="ml-studio-data-head">${sprite('database')} Zarejestrowane zbiory</div>
         <div id="ml-studio-datasets"></div>
       </section>
     </div>
   `;
+
+  // ----- Wybór źródła (segmentowane kafelki) -----
+  const sourceBodies = {
+    upload: byId('ml-studio-source-upload'),
+    folder: byId('ml-studio-source-folder'),
+    camera: byId('ml-studio-source-camera'),
+  };
+  const buildFields = byId('ml-studio-source-fields');
+  const buildProgress = byId('ml-studio-recog-build-progress');
+  function selectSource(src) {
+    byId('ml-studio-source-tiles')?.querySelectorAll('.ml-studio-source-tile').forEach((el) => {
+      el.classList.toggle('selected', el.getAttribute('data-source') === src);
+    });
+    for (const [key, el] of Object.entries(sourceBodies)) { if (el) el.hidden = key !== src; }
+    // Kamera nie buduje datasetu w ML Studio — chowamy pola budowy, by nie udawać akcji.
+    const cameraOnly = src === 'camera';
+    if (buildFields) buildFields.hidden = cameraOnly;
+    if (buildProgress) buildProgress.hidden = cameraOnly;
+  }
+  byId('ml-studio-source-tiles')?.querySelectorAll('.ml-studio-source-tile').forEach((el) => {
+    el.addEventListener('click', () => selectSource(el.getAttribute('data-source')));
+  });
+  selectSource('upload');
 
   let recogBuildFiles = [];
   byId('ml-studio-recog-build-files')?.addEventListener('change', (e) => {
@@ -2493,6 +2776,7 @@ function renderRecogDataTab(panel, p) {
       // Budowa biegnie ASYNCHRONICZNIE w tle — odpytuj postęp do zakończenia.
       await pollRecogBuild(pid, buildId, prog);
       recogBuildFiles = [];
+      loadDataPreview(pid);
     } catch (err) {
       toast(`Budowa datasetu: ${err.message}`, 'error');
       if (prog) prog.textContent = '';
@@ -2514,6 +2798,7 @@ function renderRecogDataTab(panel, p) {
       const imgs = d.rowCount ?? d.row_count ?? 0;
       toast(`Dataset zarejestrowany: ${imgs} obrazów, ${classes} klas.`, 'success');
       loadDatasets(pid);
+      loadDataPreview(pid);
     } catch (err) {
       toast(`Rejestracja datasetu: ${err.message}`, 'error');
     } finally {
@@ -2521,123 +2806,380 @@ function renderRecogDataTab(panel, p) {
     }
   });
   loadDatasets(pid);
+  loadDataPreview(pid);
+}
+
+// Liczba obrazów per split, identyczna z trenerem `prepare_dataset_with_valid`
+// (train_recognition.rs): co VALID_HOLDOUT_STRIDE-ty obraz → val, przedostatni
+// z okna → test, reszta → train; każdy split eval ma min. 1 obraz dla małych
+// zbiorów. Liczymy z samej liczby obrazów (kolejność stride jest deterministyczna).
+function recogSplitCounts(total) {
+  const STRIDE = 7;
+  if (total <= 0) return { total: 0, train: 0, val: 0, test: 0 };
+  let val = 0;
+  let test = 0;
+  for (let i = 0; i < total; i += 1) {
+    const m = i % STRIDE;
+    if (m === STRIDE - 1) val += 1;
+    else if (m === STRIDE - 2) test += 1;
+  }
+  if (val === 0 && total >= 1) val = 1;
+  if (test === 0 && total - val >= 1) test = 1;
+  const train = Math.max(0, total - val - test);
+  return { total, train, val, test };
+}
+
+// Ładuje podgląd danych dla zakładki „Dane": galeria miniatur z pierwszego
+// datasetu COCO (mlStudioRecogImagesListRequest + mlStudioRecogImageRequest)
+// oraz podział train/val/test policzony z liczby obrazów. Galeria jest ograniczona
+// do pierwszych 23 miniatur + kafelek „+N" (jak w mockupie).
+async function loadDataPreview(pid) {
+  const gallery = byId('ml-studio-gallery');
+  const galleryMeta = byId('ml-studio-gallery-meta');
+  const splitStats = byId('ml-studio-split-stats');
+  const splitBar = byId('ml-studio-split-bar');
+  if (!gallery && !splitStats) return;
+
+  const renderSplit = (total, datasetName) => {
+    const s = recogSplitCounts(total);
+    if (splitBar) {
+      const pct = (n) => (s.total ? (n / s.total) * 100 : 0);
+      const segs = splitBar.querySelectorAll('span');
+      if (segs[0]) segs[0].style.width = `${pct(s.train)}%`;
+      if (segs[1]) segs[1].style.width = `${pct(s.val)}%`;
+      if (segs[2]) segs[2].style.width = `${pct(s.test)}%`;
+    }
+    if (splitStats) {
+      const card = (lbl, val, foot, cls) => `
+        <div class="ml-studio-split-stat${cls ? ' ' + cls : ''}">
+          <div class="ss-lbl">${lbl}</div>
+          <div class="ss-val">${formatNumber(val)}</div>
+          <div class="ss-foot">${foot}</div>
+        </div>`;
+      splitStats.innerHTML = total > 0
+        ? card('Wgrane', s.total, datasetName ? escapeHtml(datasetName) : 'wszystkie obrazy')
+          + card('Train', s.train, 'do treningu RF-DETR', 'train')
+          + card('Val', s.val, 'metryki w czasie treningu', 'val')
+          + card('Test', s.test, 'końcowa ewaluacja', 'test')
+        : `<div class="ml-studio-data-hint">Podział pojawi się po wczytaniu pierwszego datasetu.</div>`;
+    }
+  };
+
+  try {
+    const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+    const datasets = (Array.isArray(resp.datasets) ? resp.datasets : [])
+      .filter((d) => (d.kind ?? '') === 'coco_path');
+    if (!datasets.length) {
+      if (gallery) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'image');
+        empty.setAttribute('title', 'Brak obrazów');
+        empty.setAttribute('message', 'Wgraj pliki, wskaż folder na serwerze lub zarejestruj katalog COCO — miniatury pojawią się tutaj.');
+        gallery.innerHTML = '';
+        gallery.appendChild(empty);
+      }
+      if (galleryMeta) galleryMeta.textContent = '0 obrazów';
+      renderSplit(0, '');
+      return;
+    }
+    const ds = datasets[0];
+    const datasetId = ds.datasetId ?? ds.dataset_id;
+    const datasetName = ds.name || '';
+    if (gallery) gallery.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
+
+    const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
+    const images = JSON.parse(imgResp.imagesJson ?? imgResp.images_json ?? '[]');
+    const total = images.length;
+    if (galleryMeta) galleryMeta.textContent = `${formatNumber(total)} obrazów${datasetName ? ' · ' + escapeHtml(datasetName) : ''}`;
+    renderSplit(total, datasetName);
+
+    if (gallery) {
+      const MAX_THUMBS = 23;
+      const shown = images.slice(0, MAX_THUMBS);
+      const overflow = total - shown.length;
+      gallery.innerHTML = shown.map((im) => `
+        <div class="ml-studio-thumb" data-image-id="${escapeAttr(String(im.image_id))}" title="${escapeAttr(im.file_name || '')}">
+          ${sprite('image')}
+          <span class="it-name">${escapeHtml(im.file_name || '')}</span>
+        </div>`).join('')
+        + (overflow > 0 ? `<div class="ml-studio-thumb more">+${overflow}</div>` : '');
+
+      // Lazy-load miniatur (base64) — pojedyncze żądania per obraz, bez blokowania.
+      for (const im of shown) {
+        const cell = gallery.querySelector(`.ml-studio-thumb[data-image-id="${CSS.escape(String(im.image_id))}"]`);
+        if (!cell) continue;
+        ApiBinary.one('mlStudioRecogImageRequest', { datasetId, imageId: im.image_id }).then((r) => {
+          const b64 = r.imageB64 ?? r.image_b64;
+          if (!b64 || !cell.isConnected) return;
+          cell.style.backgroundImage = `url(data:${r.mime || 'image/jpeg'};base64,${b64})`;
+          cell.classList.add('has-img');
+        }).catch(() => {});
+      }
+    }
+  } catch (err) {
+    if (gallery) gallery.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`;
+    renderSplit(0, '');
+  }
 }
 
 // Zakładka "Anotacje" — edytor bboxów COCO: galeria obrazów + płótno z rysowaniem,
 // przesuwaniem, resize (uchwyty), zmianą klasy, usuwaniem; zapis do COCO.
+// Zakładka "Anotacje" rozpoznawania — układ 3-kolumnowy (port z mockupu
+// r02-anotacja.html, namespaced prefiksami ml-studio-annotate-):
+//   LEWA   — postęp datasetu + lista obrazów ze statusem ramek,
+//   CENTRUM— płótno z edytowalnymi ramkami (rysowanie/przesuwanie/skala),
+//   PRAWA  — pre-label modelem (RF-DETR działa, OWLv2/Qwen3-VL „wkrótce"),
+//            klasy ze schematu (kolor + skrót cyfrowy) oraz panel atrybutów
+//            zaznaczonej ramki generowany z atrybutów klasy w schemacie.
+// Klasy i atrybuty pochodzą ze schematu projektu (mlStudioSchemaGetRequest);
+// gdy schemat jest pusty, klasy spadają do kategorii COCO datasetu.
 function renderRecogAnnotateTab(panel, p) {
   const pid = projectId(p);
-  // Stan edytora.
+  // Stan edytora. `boxes[i]` niesie też `score`/`predicted` (ramki z pre-labelu)
+  // oraz `attributes` (wartości atrybutów ze schematu) — round-trip przez COCO.
   const S = {
     datasetId: '', images: [], categories: [], curIdx: -1,
     origW: 0, origH: 0, boxes: [], sel: -1, dirty: false,
     drag: null, // {mode:'new'|'move'|'resize', handle, startX, startY, orig}
+    schemaClasses: [], dicts: [], prelabelModel: 'rf-detr', threshold: 0.5,
   };
 
+  // Modele pre-label: tylko RF-DETR jest podpięty pod wbudowany autolabel.
+  // OWLv2 i Qwen3-VL pojawiają się w pickerze (zgodnie z mockupem), ale są
+  // oznaczone „wkrótce" i wyłączone — żaden klik nie udaje działania.
+  const PRELABEL_MODELS = [
+    { id: 'rf-detr', name: 'RF-DETR', meta: 'detekcja boxów · ramki + klasa', ready: true },
+    { id: 'owlv2', name: 'OWLv2', meta: 'open-vocab · po opisie tekstowym', ready: false },
+    { id: 'qwen3-vl', name: 'Qwen3-VL', meta: 'multimodal · ramki + atrybuty (OCR)', ready: false },
+  ];
+
   panel.innerHTML = `
-    <div class="ml-studio-annot">
-      <section class="ml-studio-data-card">
-        <div class="ml-studio-data-head">${sprite('image')} Edytor anotacji (COCO)
-          <span class="ml-studio-data-hint">rysuj/przesuwaj/zmieniaj rozmiar ramek, ustaw klasę, zapisz</span>
-        </div>
-        <tf-select id="ml-studio-annot-dataset" label="Dataset COCO"></tf-select>
-        <div class="ml-studio-annot-autolabel" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
-          <tf-input id="ml-studio-annot-threshold" type="number" label="Próg" value="0.5" min="0.5" max="1" step="0.05" style="width:110px"></tf-input>
-          <tf-select id="ml-studio-annot-mode" label="Tryb">
-            <option value="only_empty">Tylko puste</option>
-            <option value="overwrite">Nadpisz</option>
-          </tf-select>
-          <tf-button id="ml-studio-annot-autolabel-btn" variant="secondary">Auto-etykietuj dataset (RF-DETR)</tf-button>
-          <span id="ml-studio-annot-autolabel-prog" class="ml-studio-data-hint"></span>
-        </div>
-      </section>
-      <div class="ml-studio-annot-body">
-        <section class="ml-studio-data-card" style="max-height:70vh;overflow:auto">
-          <div class="ml-studio-data-head">Obrazy <span id="ml-studio-annot-count" class="ml-studio-data-hint"></span></div>
-          <div id="ml-studio-annot-gallery"></div>
+    <div class="ml-studio-annotate">
+      <div class="ml-studio-annotate-layout">
+
+        <aside class="ml-studio-annotate-tasks">
+          <div class="ml-studio-annotate-progress-row">
+            <tf-progress-bar id="ml-studio-annotate-progress" value="0"></tf-progress-bar>
+            <span class="ml-studio-annotate-pct" id="ml-studio-annotate-pct">0%</span>
+          </div>
+          <div class="ml-studio-annotate-progress-meta" id="ml-studio-annotate-progress-meta">0 z 0 oznaczonych</div>
+          <tf-select id="ml-studio-annotate-dataset" label="Dataset COCO"></tf-select>
+          <div class="ml-studio-annotate-task-list" id="ml-studio-annotate-task-list"></div>
+        </aside>
+
+        <section class="ml-studio-annotate-canvas">
+          <div class="ml-studio-annotate-toolbar" id="ml-studio-annotate-toolbar"></div>
+          <div class="ml-studio-annotate-stage" id="ml-studio-annotate-stage"></div>
         </section>
-        <section class="ml-studio-data-card">
-          <div id="ml-studio-annot-toolbar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"></div>
-          <div id="ml-studio-annot-stage" style="position:relative;max-width:100%;background:var(--bg-3);border:1px solid var(--border);border-radius:var(--radius-sm);min-height:240px"></div>
-          <div id="ml-studio-annot-hint" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
-        </section>
+
+        <aside class="ml-studio-annotate-side" id="ml-studio-annotate-side">
+          <tf-button class="ml-studio-prelabel-btn" id="ml-studio-annotate-prelabel" variant="primary" icon="zap">Pre-oznacz modelem</tf-button>
+          <span class="ml-studio-data-hint" id="ml-studio-annotate-prelabel-prog"></span>
+
+          <div class="ml-studio-annotate-card">
+            <div class="ml-studio-annotate-card-title">Model wstępnie oznaczający (z serwisu)</div>
+            <div class="ml-studio-annotate-models" id="ml-studio-annotate-models"></div>
+            <tf-input id="ml-studio-annotate-threshold" type="number" label="Próg detekcji" value="0.5" min="0.5" max="1" step="0.05"></tf-input>
+            <p class="ml-studio-annotate-card-note">Predykcje pojawią się jako kropkowane ramki — akceptuj (klik) lub popraw.</p>
+          </div>
+
+          <div class="ml-studio-annotate-card">
+            <div class="ml-studio-annotate-card-title">${sprite('grid-2x2')} Klasy (ze schematu)</div>
+            <div class="ml-studio-annotate-classes" id="ml-studio-annotate-classes"></div>
+          </div>
+
+          <div class="ml-studio-annotate-card" id="ml-studio-annotate-attrs">
+            <div class="ml-studio-annotate-card-title">Atrybuty zaznaczonej ramki</div>
+            <div id="ml-studio-annotate-attrs-body"></div>
+          </div>
+        </aside>
+
       </div>
     </div>
   `;
 
-  // Lista datasetów coco_path do selecta.
+  renderModelPicker();
+  byId('ml-studio-annotate-threshold')?.addEventListener('change', (e) => {
+    const v = Number(e.detail?.value ?? 0.5);
+    S.threshold = v >= 0.5 && v <= 1 ? v : 0.5;
+  });
+
+  // Lista datasetów coco_path do selecta + ładowanie schematu/słowników raz.
   (async () => {
-    const sel = byId('ml-studio-annot-dataset');
+    await Promise.all([loadSchema(), loadDicts()]);
+    const sel = byId('ml-studio-annotate-dataset');
     try {
       const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path');
       const opts = list.map((d) => ({ value: d.datasetId ?? d.dataset_id, label: `${d.name} (${d.rowCount ?? d.row_count ?? 0} obr.)` }));
       if (sel?.setOptions) sel.setOptions(opts, opts.length ? opts[0].value : null);
-      else if (sel) sel.innerHTML = opts.map((o) => `<option value="${escapeAttr(o.value)}">${escapeHtml(o.label)}</option>`).join('');
       if (opts.length) { S.datasetId = opts[0].value; await loadImages(); }
       sel?.addEventListener('change', async (e) => { S.datasetId = e.detail?.value || sel.value; await loadImages(); });
-    } catch (err) { byId('ml-studio-annot-gallery').innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+    } catch (err) { byId('ml-studio-annotate-task-list').innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
   })();
 
-  // Auto-etykietowanie całego datasetu wbudowanym detektorem RF-DETR (ADR). Po
-  // sukcesie odświeża listę obrazów i bieżący obraz, by ramki były widoczne od razu.
-  (() => {
-    const btn = byId('ml-studio-annot-autolabel-btn');
-    if (!btn) return;
-    btn.addEventListener('click', async () => {
-      if (!S.datasetId) { toast('Wybierz dataset COCO.', 'error'); return; }
-      const thrEl = byId('ml-studio-annot-threshold');
-      const modeEl = byId('ml-studio-annot-mode');
-      const threshold = Number(thrEl?.value ?? 0.5);
-      const mode = String(modeEl?.value ?? 'only_empty');
-      // Floor of 0.5: the RF-DETR detector hard-drops anything below it, so a lower
-      // threshold cannot surface extra boxes (server enforces the same range).
-      if (!(threshold >= 0.5 && threshold <= 1)) { toast('Próg musi być w zakresie 0,5–1.', 'error'); return; }
-      const prog = byId('ml-studio-annot-autolabel-prog');
-      btn.setAttribute('disabled', '');
-      try {
-        const resp = await ApiBinary.one('mlStudioRecogAutolabelRequest', { datasetId: S.datasetId, threshold, mode });
-        if (resp.status === 'failed' || resp.error) throw new Error(resp.error || 'start nieudany');
-        const jobId = resp.jobId ?? resp.job_id;
-        if (prog) prog.textContent = 'Auto-etykietowanie…';
-        await pollRecogAutolabel(jobId, prog, async () => {
-          await loadImages();
-          if (S.curIdx >= 0) await selectImage(S.curIdx);
-        });
-      } catch (err) {
-        if (prog) prog.textContent = '';
-        toast(`Auto-etykietowanie: ${err.message}`, 'error');
-      } finally {
-        btn.removeAttribute('disabled');
-      }
+  async function loadSchema() {
+    try {
+      const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
+      const schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+      S.schemaClasses = Array.isArray(schema.classes) ? schema.classes : [];
+    } catch { S.schemaClasses = []; }
+  }
+
+  async function loadDicts() {
+    try {
+      const resp = await ApiBinary.one('mlStudioLookupDictsListRequest', { projectId: pid });
+      S.dicts = JSON.parse(resp.dictsJson ?? resp.dicts_json ?? '[]');
+    } catch { S.dicts = []; }
+  }
+
+  // Klasy do panelu prawego + mapy nazwa↔kolor: ze schematu, a gdy pusty —
+  // z kategorii COCO datasetu (zgodnie z zasiewem zakładki Schemat).
+  function effectiveClasses() {
+    if (S.schemaClasses.length) {
+      return S.schemaClasses.map((c, i) => ({
+        name: c.name, color: c.color || RECOG_SCHEMA_PALETTE[i % RECOG_SCHEMA_PALETTE.length],
+        attributes: Array.isArray(c.attributes) ? c.attributes : [],
+      }));
+    }
+    const cats = S.categories.length > 1 ? S.categories.filter((c) => c.id !== 0) : S.categories;
+    return cats.map((c, i) => ({ name: c.name, color: RECOG_SCHEMA_PALETTE[i % RECOG_SCHEMA_PALETTE.length], attributes: [] }));
+  }
+
+  function schemaClassFor(box) {
+    const name = catName(box.category_id);
+    return effectiveClasses().find((c) => c.name === name) || null;
+  }
+
+  function classColor(name) {
+    const c = effectiveClasses().find((x) => x.name === name);
+    return c ? c.color : null;
+  }
+
+  // ----- Picker modeli pre-label -----
+  function renderModelPicker() {
+    const host = byId('ml-studio-annotate-models');
+    if (!host) return;
+    host.innerHTML = PRELABEL_MODELS.map((m) => `
+      <div class="ml-studio-model-pick${m.id === S.prelabelModel ? ' selected' : ''}${m.ready ? '' : ' disabled'}" data-model="${escapeAttr(m.id)}">
+        <div>
+          <div class="m-name">${escapeHtml(m.name)}</div>
+          <div class="m-meta">${escapeHtml(m.meta)}</div>
+        </div>
+        ${m.ready
+          ? (m.id === S.prelabelModel ? `<span class="m-check">${sprite('check')}</span>` : '')
+          : '<tf-chip status="warning" label="wkrótce"></tf-chip>'}
+      </div>`).join('');
+    host.querySelectorAll('.ml-studio-model-pick').forEach((el) => {
+      const id = el.getAttribute('data-model');
+      const model = PRELABEL_MODELS.find((m) => m.id === id);
+      if (!model?.ready) return;
+      el.addEventListener('click', () => { S.prelabelModel = id; renderModelPicker(); });
     });
-  })();
+  }
+
+  // ----- Pre-label (RF-DETR) -----
+  byId('ml-studio-annotate-prelabel')?.addEventListener('click', async () => {
+    if (S.prelabelModel !== 'rf-detr') { toast('Wybrany model nie jest jeszcze podpięty.', 'error'); return; }
+    if (!S.datasetId) { toast('Wybierz dataset COCO.', 'error'); return; }
+    const btn = byId('ml-studio-annotate-prelabel');
+    const prog = byId('ml-studio-annotate-prelabel-prog');
+    btn.setAttribute('disabled', '');
+    try {
+      const resp = await ApiBinary.one('mlStudioRecogAutolabelRequest', { datasetId: S.datasetId, threshold: S.threshold, mode: 'only_empty' });
+      if (resp.status === 'failed' || resp.error) throw new Error(resp.error || 'start nieudany');
+      const jobId = resp.jobId ?? resp.job_id;
+      if (prog) prog.textContent = 'Pre-oznaczanie…';
+      await pollRecogAutolabel(jobId, prog, async () => {
+        await loadImages();
+        if (S.curIdx >= 0) await selectImage(S.curIdx);
+      });
+    } catch (err) {
+      if (prog) prog.textContent = '';
+      toast(`Pre-oznaczanie: ${err.message}`, 'error');
+    } finally {
+      btn.removeAttribute('disabled');
+    }
+  });
 
   async function loadImages() {
-    const gal = byId('ml-studio-annot-gallery');
-    gal.innerHTML = '<tf-spinner></tf-spinner>';
+    const host = byId('ml-studio-annotate-task-list');
+    host.innerHTML = '<tf-spinner></tf-spinner>';
     try {
       const resp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: S.datasetId });
       S.images = JSON.parse(resp.imagesJson ?? resp.images_json ?? '[]');
       S.categories = JSON.parse(resp.categoriesJson ?? resp.categories_json ?? '[]');
-      byId('ml-studio-annot-count').textContent = `(${S.images.length})`;
-      renderGallery();
+      renderProgress();
+      renderTaskList();
+      renderClassPanel();
       if (S.images.length) selectImage(0);
-      else { byId('ml-studio-annot-stage').innerHTML = '<div class="ml-studio-ft-chart-empty">Brak obrazów w datasecie.</div>'; }
-    } catch (err) { gal.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+      else { byId('ml-studio-annotate-stage').innerHTML = '<div class="ml-studio-ft-chart-empty">Brak obrazów w datasecie.</div>'; }
+    } catch (err) { host.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
   }
 
-  function renderGallery() {
-    const gal = byId('ml-studio-annot-gallery');
-    gal.innerHTML = S.images.map((im, i) => `
-      <div class="ml-studio-annot-thumb${i === S.curIdx ? ' active' : ''}" data-idx="${i}"
-           style="padding:6px 8px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between;gap:6px;${i === S.curIdx ? 'background:var(--accent-glow)' : ''}">
-        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(im.file_name)}</span>
-        <span class="ml-studio-data-hint">${im.ann_count}</span>
-      </div>`).join('');
-    gal.querySelectorAll('.ml-studio-annot-thumb').forEach((el) => {
+  function renderProgress() {
+    const total = S.images.length;
+    const labeled = S.images.filter((im) => (im.ann_count || 0) > 0).length;
+    const pct = total ? Math.round((labeled / total) * 100) : 0;
+    byId('ml-studio-annotate-progress')?.setAttribute('value', String(pct));
+    byId('ml-studio-annotate-pct').textContent = `${pct}%`;
+    byId('ml-studio-annotate-progress-meta').textContent = `${labeled} z ${total} oznaczonych`;
+  }
+
+  function imageStatus(im, i) {
+    if (i === S.curIdx) {
+      const n = S.curIdx === i && S.boxes.length ? S.boxes.length : (im.ann_count || 0);
+      return `edytowane teraz${n ? ` · ${n} ${plRamki(n)}` : ''}`;
+    }
+    const n = im.ann_count || 0;
+    return n > 0 ? `${n} ${plRamki(n)}` : 'nieoznaczone';
+  }
+
+  function plRamki(n) { return n === 1 ? 'ramka' : (n >= 2 && n <= 4 ? 'ramki' : 'ramek'); }
+
+  function renderTaskList() {
+    const host = byId('ml-studio-annotate-task-list');
+    host.innerHTML = S.images.map((im, i) => {
+      const labeled = (im.ann_count || 0) > 0;
+      const active = i === S.curIdx;
+      return `
+        <div class="ml-studio-task-item${active ? ' active' : ''}" data-idx="${i}">
+          <div class="t-thumb">${sprite('image')}</div>
+          <div class="t-body">
+            <div class="t-name">${escapeHtml(im.file_name)}</div>
+            <div class="t-meta${labeled && !active ? ' ok' : ''}">${active ? '' : (labeled ? sprite('check') : '')}${escapeHtml(imageStatus(im, i))}</div>
+          </div>
+        </div>`;
+    }).join('');
+    host.querySelectorAll('.ml-studio-task-item').forEach((el) => {
       el.addEventListener('click', () => maybeLeave(() => selectImage(Number(el.getAttribute('data-idx')))));
     });
+  }
+
+  // ----- Panel klas (prawa kolumna) ze skrótami 1-9 -----
+  function renderClassPanel() {
+    const host = byId('ml-studio-annotate-classes');
+    if (!host) return;
+    const classes = effectiveClasses();
+    host.innerHTML = classes.map((c, i) => `
+      <div class="ml-studio-class-row" data-class="${escapeAttr(c.name)}">
+        <span class="c-swatch" style="background:${escapeAttr(c.color)}"></span>
+        <span class="c-name">${escapeHtml(c.name)}</span>
+        ${i < 9 ? `<span class="c-key">${i + 1}</span>` : ''}
+      </div>`).join('')
+      + `<a class="ml-studio-class-add" href="#/ml-studio/${escapeAttr(pid)}?tab=schemat">${sprite('plus')} Dodaj klasę w schemacie</a>`;
+    host.querySelectorAll('.ml-studio-class-row').forEach((el) => {
+      el.addEventListener('click', () => assignClass(el.getAttribute('data-class')));
+    });
+  }
+
+  // Przypisuje klasę o danej nazwie zaznaczonej ramce (po cat_id z kategorii COCO).
+  function assignClass(name) {
+    if (S.sel < 0) { toast('Najpierw zaznacz ramkę.', 'error'); return; }
+    const cat = S.categories.find((c) => c.name === name);
+    if (!cat) { toast('Klasa nie ma odpowiednika w kategoriach datasetu.', 'error'); return; }
+    S.boxes[S.sel].category_id = cat.id; S.dirty = true;
+    drawBoxes(); renderAttrPanel();
   }
 
   function maybeLeave(fn) {
@@ -2648,8 +3190,8 @@ function renderRecogAnnotateTab(panel, p) {
   async function selectImage(idx) {
     if (idx < 0 || idx >= S.images.length) return;
     S.curIdx = idx; S.sel = -1; S.dirty = false;
-    renderGallery();
-    const stage = byId('ml-studio-annot-stage');
+    renderTaskList();
+    const stage = byId('ml-studio-annotate-stage');
     stage.innerHTML = '<tf-spinner></tf-spinner>';
     try {
       const im = S.images[idx];
@@ -2658,41 +3200,50 @@ function renderRecogAnnotateTab(panel, p) {
       S.origW = resp.origWidth ?? resp.orig_width ?? im.width;
       S.origH = resp.origHeight ?? resp.orig_height ?? im.height;
       const anns = JSON.parse(resp.annotationsJson ?? resp.annotations_json ?? '[]');
-      S.boxes = anns.map((a) => ({ category_id: a.category_id, x: a.bbox[0], y: a.bbox[1], w: a.bbox[2], h: a.bbox[3] }));
+      S.boxes = anns.map((a) => ({
+        category_id: a.category_id, x: a.bbox[0], y: a.bbox[1], w: a.bbox[2], h: a.bbox[3],
+        score: typeof a.score === 'number' ? a.score : null,
+        predicted: a.predicted === true,
+        attributes: a.attributes && typeof a.attributes === 'object' ? a.attributes : {},
+      }));
       renderStage(`data:${resp.mime || 'image/jpeg'};base64,${resp.imageB64 ?? resp.image_b64}`);
       renderToolbar();
+      renderAttrPanel();
     } catch (err) { stage.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
   }
 
   function catName(id) { const c = S.categories.find((c) => c.id === id); return c ? c.name : String(id); }
-  function catColor(id) { return `hsl(${(id * 67) % 360} 85% 55%)`; }
+  function catColor(id) {
+    const col = classColor(catName(id));
+    return col || `hsl(${(id * 67) % 360} 85% 55%)`;
+  }
   function defaultCat() { return S.categories.length ? S.categories[S.categories.length > 1 && S.categories[0].id === 0 ? 1 : 0].id : 0; }
 
   function renderToolbar() {
-    const tb = byId('ml-studio-annot-toolbar');
-    const catOpts = S.categories.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+    const tb = byId('ml-studio-annotate-toolbar');
+    const im = S.images[S.curIdx];
     tb.innerHTML = `
-      <button class="btn btn-secondary" id="annot-prev">◀</button>
-      <span class="ml-studio-data-hint" id="annot-pos">${S.curIdx + 1}/${S.images.length}</span>
-      <button class="btn btn-secondary" id="annot-next">▶</button>
-      <span style="margin-left:8px">Klasa zazn.:</span>
-      <select id="annot-cat" class="ml-studio-annot-cat">${catOpts}</select>
-      <button class="btn btn-secondary" id="annot-del">Usuń ramkę</button>
-      <button class="btn btn-primary" id="annot-save" style="margin-left:auto">Zapisz anotacje</button>`;
-    byId('annot-prev').onclick = () => maybeLeave(() => selectImage(S.curIdx - 1));
-    byId('annot-next').onclick = () => maybeLeave(() => selectImage(S.curIdx + 1));
-    byId('annot-del').onclick = () => { if (S.sel >= 0) { S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); } };
-    byId('annot-save').onclick = saveAnns;
-    byId('annot-cat').onchange = (e) => { if (S.sel >= 0) { S.boxes[S.sel].category_id = Number(e.target.value); S.dirty = true; drawBoxes(); } };
-    byId('ml-studio-annot-hint').textContent = 'Rysuj ramkę: przeciągnij na pustym. Zaznacz: klik. Przesuń: przeciągnij wnętrze. Skaluj: narożniki. Usuń: klawisz Delete.';
+      <tf-button id="ml-studio-annotate-prev" variant="ghost" icon="chevron-left"></tf-button>
+      <span class="ml-studio-annotate-pos">${S.curIdx + 1}/${S.images.length}</span>
+      <tf-button id="ml-studio-annotate-next" variant="ghost" icon="chevron-right"></tf-button>
+      <span class="ml-studio-annotate-filemeta">${escapeHtml(im?.file_name || '')} · ${S.origW}×${S.origH}</span>
+      <tf-button id="ml-studio-annotate-save" variant="primary" icon="download">Zapisz anotacje</tf-button>`;
+    byId('ml-studio-annotate-prev').addEventListener('click', () => maybeLeave(() => selectImage(S.curIdx - 1)));
+    byId('ml-studio-annotate-next').addEventListener('click', () => maybeLeave(() => selectImage(S.curIdx + 1)));
+    byId('ml-studio-annotate-save').addEventListener('click', saveAnns);
   }
 
   function renderStage(src) {
-    const stage = byId('ml-studio-annot-stage');
+    const stage = byId('ml-studio-annotate-stage');
+    // The SVG overlay must cover the image's RENDERED rectangle exactly, not the
+    // whole stage — otherwise letterboxing (which changes on window resize) shifts
+    // and scales the boxes off the picture. A shrink-to-image wrapper makes the SVG
+    // share the image's box, so boxes stay pinned to the picture at any size.
     stage.innerHTML = `
-      <img id="annot-img" src="${src}" style="display:block;width:100%;height:auto;user-select:none;-webkit-user-drag:none"/>
-      <svg id="annot-svg" viewBox="0 0 ${S.origW} ${S.origH}" preserveAspectRatio="none"
-           style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair"></svg>`;
+      <div class="ml-studio-annotate-imgwrap">
+        <img id="annot-img" src="${src}" class="ml-studio-annotate-img"/>
+        <svg id="annot-svg" viewBox="0 0 ${S.origW} ${S.origH}" preserveAspectRatio="none" class="ml-studio-annotate-svg"></svg>
+      </div>`;
     const svg = byId('annot-svg');
     // Property assignment (NOT addEventListener) so re-rendering the stage can never
     // stack duplicate handlers — stacked pointerdown listeners would create one box
@@ -2717,17 +3268,20 @@ function renderRecogAnnotateTab(panel, p) {
     let html = '';
     S.boxes.forEach((b, i) => {
       const col = catColor(b.category_id); const seld = i === S.sel;
-      const sw = Math.max(2, S.origW / 400);
-      // Interior stays transparent so the image underneath is always visible, but a
-      // transparent fill (NOT `none`) still captures pointer events, so the whole box
-      // is clickable to re-select/move it. Selection is shown by a thicker outline.
+      // Stroke widths are in SCREEN pixels (vector-effect: non-scaling-stroke) so a thin
+      // 2px outline stays 2px on any image resolution. Predicted (autolabeled) boxes are
+      // dashed with a confidence label until accepted; confirmed boxes are solid.
+      const dash = b.predicted ? ' stroke-dasharray="6 4"' : '';
       html += `<rect data-box="${i}" x="${b.x}" y="${b.y}" width="${Math.max(0, b.w)}" height="${Math.max(0, b.h)}"
-        fill="transparent" stroke="${col}" stroke-width="${seld ? sw * 1.9 : sw}" style="pointer-events:all;cursor:move"/>`;
-      html += `<text x="${b.x}" y="${Math.max(hs, b.y - 4)}" fill="${col}" font-size="${Math.max(11, S.origW / 55)}" font-weight="700" style="pointer-events:none">${escapeHtml(catName(b.category_id))}</text>`;
+        fill="transparent" stroke="${col}" stroke-width="2"${dash} vector-effect="non-scaling-stroke" style="pointer-events:all;cursor:move"/>`;
+      const label = b.predicted && typeof b.score === 'number'
+        ? `${catName(b.category_id)} ${b.score.toFixed(2)}`
+        : catName(b.category_id);
+      html += `<text x="${b.x}" y="${Math.max(hs, b.y - 4)}" fill="${col}" font-size="${Math.max(11, S.origW / 55)}" font-weight="700" style="pointer-events:none">${escapeHtml(label)}</text>`;
       if (seld) {
         const corners = [[b.x, b.y, 'nw'], [b.x + b.w, b.y, 'ne'], [b.x, b.y + b.h, 'sw'], [b.x + b.w, b.y + b.h, 'se']];
         for (const [cx, cy, h] of corners) {
-          html += `<rect class="annot-handle" data-box="${i}" data-handle="${h}" x="${cx - hs / 2}" y="${cy - hs / 2}" width="${hs}" height="${hs}" fill="#fff" stroke="${col}" stroke-width="1" style="cursor:nwse-resize"/>`;
+          html += `<rect class="annot-handle" data-box="${i}" data-handle="${h}" x="${cx - hs / 2}" y="${cy - hs / 2}" width="${hs}" height="${hs}" fill="#fff" stroke="${col}" stroke-width="2" vector-effect="non-scaling-stroke" style="cursor:nwse-resize"/>`;
         }
       }
     });
@@ -2742,11 +3296,13 @@ function renderRecogAnnotateTab(panel, p) {
       S.drag = { mode: 'resize', handle: t.getAttribute('data-handle'), orig: { ...S.boxes[S.sel] } };
     } else if (t.hasAttribute && t.hasAttribute('data-box')) {
       S.sel = Number(t.getAttribute('data-box'));
-      S.drag = { mode: 'move', startX: p0.x, startY: p0.y, orig: { ...S.boxes[S.sel] } };
-      syncCatSelect();
+      // Klik w predykcję akceptuje ją (solid) — pierwszy klik zaznacza, akceptacja
+      // dzieje się przy zwolnieniu bez przeciągnięcia (onUp).
+      S.drag = { mode: 'move', startX: p0.x, startY: p0.y, orig: { ...S.boxes[S.sel] }, wasPredicted: S.boxes[S.sel].predicted };
+      renderAttrPanel();
     } else {
       // Nowa ramka.
-      const b = { category_id: Number(byId('annot-cat')?.value ?? defaultCat()), x: p0.x, y: p0.y, w: 0, h: 0 };
+      const b = { category_id: Number(byId('annot-cat')?.value ?? defaultCat()), x: p0.x, y: p0.y, w: 0, h: 0, score: null, predicted: false, attributes: {} };
       S.boxes.push(b); S.sel = S.boxes.length - 1;
       S.drag = { mode: 'new', startX: p0.x, startY: p0.y };
     }
@@ -2772,43 +3328,821 @@ function renderRecogAnnotateTab(panel, p) {
     S.dirty = true; drawBoxes();
   }
 
-  function onUp() {
+  function onUp(ev) {
     if (!S.drag) return;
     const b = S.boxes[S.sel];
     if (S.drag.mode === 'new' && b && (b.w < 3 || b.h < 3)) { S.boxes.splice(S.sel, 1); S.sel = -1; } // za mała = anuluj
-    S.drag = null; syncCatSelect(); drawBoxes();
+    else if (S.drag.mode === 'move' && b && S.drag.wasPredicted) {
+      // Klik bez przeciągnięcia w ramkę-predykcję = akceptacja (staje się solid).
+      const moved = ev && (Math.abs((toOrig(ev).x) - S.drag.startX) > 2 || Math.abs((toOrig(ev).y) - S.drag.startY) > 2);
+      if (!moved) { b.predicted = false; b.score = null; S.dirty = true; toast('Ramka zaakceptowana.', 'success'); }
+    }
+    S.drag = null; drawBoxes(); renderAttrPanel();
   }
 
-  function syncCatSelect() { const s = byId('annot-cat'); if (s && S.sel >= 0) s.value = String(S.boxes[S.sel].category_id); }
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+  // ----- Panel atrybutów zaznaczonej ramki (z atrybutów klasy ze schematu) -----
+  function renderAttrPanel() {
+    const host = byId('ml-studio-annotate-attrs-body');
+    if (!host) return;
+    if (S.sel < 0 || !S.boxes[S.sel]) {
+      host.innerHTML = '<p class="ml-studio-annotate-card-note">Zaznacz ramkę, aby ustawić jej klasę i atrybuty.</p>';
+      return;
+    }
+    const box = S.boxes[S.sel];
+    const cls = schemaClassFor(box);
+    const swatch = catColor(box.category_id);
+    const catOpts = S.categories.map((c) => `<option value="${c.id}"${c.id === box.category_id ? ' selected' : ''}>${escapeHtml(c.name)}</option>`).join('');
+    const attrs = cls?.attributes || [];
+    const fieldsHtml = attrs.map((a, ai) => recogAttrFieldHtml(a, ai, box)).join('')
+      || '<p class="ml-studio-annotate-card-note">Ta klasa nie ma atrybutów w schemacie.</p>';
+    host.innerHTML = `
+      <div class="ml-studio-annotate-attr-head">
+        <span class="c-swatch" style="background:${escapeAttr(swatch)}"></span>
+        <span>Ramka: <strong>${escapeHtml(catName(box.category_id))}</strong>${box.predicted ? ' <tf-chip status="warning" label="predykcja"></tf-chip>' : ''}</span>
+        <tf-button id="ml-studio-annotate-del" variant="ghost" icon="trash" class="ml-studio-annotate-attr-del"></tf-button>
+      </div>
+      <tf-select id="ml-studio-annot-cat" label="Klasa ramki">${catOpts}</tf-select>
+      <div class="ml-studio-annotate-attr-fields">${fieldsHtml}</div>
+      <tf-button id="ml-studio-annotate-confirm" variant="primary" icon="check" class="ml-studio-annotate-confirm">Zatwierdź ramkę</tf-button>`;
+    byId('ml-studio-annot-cat')?.addEventListener('change', (e) => {
+      const v = Number(e.detail?.value ?? box.category_id);
+      box.category_id = v; box.attributes = {}; S.dirty = true; drawBoxes(); renderAttrPanel();
+    });
+    byId('ml-studio-annotate-del')?.addEventListener('click', () => {
+      S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); renderAttrPanel();
+    });
+    byId('ml-studio-annotate-confirm')?.addEventListener('click', () => {
+      box.predicted = false; box.score = null; S.dirty = true; drawBoxes(); renderAttrPanel();
+      toast('Ramka zatwierdzona.', 'success');
+    });
+    bindAttrFields(attrs, box);
+  }
+
+  // Pole atrybutu wg typu (list/text/number/classifier/ocr). Atrybut OCR ma
+  // dodatkowo żywy lookup ze słownika (gdy attr.ocr.lookup_dict_id wskazuje słownik).
+  function recogAttrFieldHtml(a, ai, box) {
+    const v = box.attributes?.[a.name] ?? '';
+    const typeBadge = `<span class="ml-studio-annotate-attr-type ${escapeAttr(a.type)}">${escapeHtml(recogAttrTypeLabel(a.type))}</span>`;
+    let field = '';
+    if (a.type === 'list') {
+      const opts = (a.list?.values || []).map((o) => `<option value="${escapeAttr(o)}"${o === v ? ' selected' : ''}>${escapeHtml(o)}</option>`).join('');
+      field = `<tf-select data-attr="${escapeAttr(a.name)}"><option value="">—</option>${opts}</tf-select>`;
+    } else if (a.type === 'classifier') {
+      const opts = (a.classifier?.values || []).map((o) => `<option value="${escapeAttr(o)}"${o === v ? ' selected' : ''}>${escapeHtml(o)}</option>`).join('');
+      field = `<tf-select data-attr="${escapeAttr(a.name)}"><option value="">—</option>${opts}</tf-select>`;
+    } else if (a.type === 'number') {
+      const n = a.number || {};
+      const minA = n.min != null && n.min !== '' ? ` min="${escapeAttr(n.min)}"` : '';
+      const maxA = n.max != null && n.max !== '' ? ` max="${escapeAttr(n.max)}"` : '';
+      const unit = n.unit ? ` <span class="ml-studio-annotate-attr-unit">${escapeHtml(n.unit)}</span>` : '';
+      field = `<tf-input type="number" data-attr="${escapeAttr(a.name)}" value="${escapeAttr(v)}"${minA}${maxA}></tf-input>${unit}`;
+    } else { // text + ocr
+      field = `<tf-input data-attr="${escapeAttr(a.name)}" value="${escapeAttr(v)}"></tf-input>`;
+    }
+    const lookup = a.type === 'ocr' ? `<div class="ml-studio-annotate-attr-lookup" data-lookup="${escapeAttr(a.name)}"></div>` : '';
+    return `
+      <div class="ml-studio-annotate-attr-field">
+        <div class="ml-studio-annotate-attr-label">${escapeHtml(a.name)} ${typeBadge}</div>
+        ${field}
+        ${lookup}
+      </div>`;
+  }
+
+  function bindAttrFields(attrs, box) {
+    byId('ml-studio-annotate-attrs-body')?.querySelectorAll('[data-attr]').forEach((el) => {
+      const name = el.getAttribute('data-attr');
+      const attr = attrs.find((a) => a.name === name);
+      // Capture on both input and change so live typing is persisted even if the
+      // user never blurs the field (tf-input emits detail.value; native bubbling
+      // events without detail fall back to the element's value getter).
+      const capture = (e) => {
+        box.attributes = box.attributes || {};
+        box.attributes[name] = e.detail?.value ?? el.value ?? '';
+        S.dirty = true;
+        if (attr?.type === 'ocr') renderOcrLookup(attr, box.attributes[name]);
+      };
+      el.addEventListener('change', capture);
+      el.addEventListener('input', capture);
+    });
+    // Wyrenderuj istniejący wynik lookup dla wartości wczytanych z zapisu.
+    attrs.filter((a) => a.type === 'ocr').forEach((a) => renderOcrLookup(a, box.attributes?.[a.name] ?? ''));
+  }
+
+  // Żywy lookup OCR: gdy wpisana wartość pasuje do klucza wiersza słownika,
+  // pokaż zmapowane pola (np. 33 → UN1203 · Benzyna).
+  function renderOcrLookup(attr, value) {
+    const host = byId('ml-studio-annotate-attrs-body')?.querySelector(`[data-lookup="${CSS.escape(attr.name)}"]`);
+    if (!host) return;
+    const dictId = attr.ocr?.lookup_dict_id;
+    if (!dictId || !value) { host.innerHTML = ''; return; }
+    const dict = S.dicts.find((d) => d.dictId === dictId || d.dict_id === dictId);
+    if (!dict) { host.innerHTML = ''; return; }
+    let body; try { body = JSON.parse(dict.rowsJson || dict.rows_json || '{}'); } catch { body = {}; }
+    const cols = body.columns || []; const rows = body.rows || [];
+    if (!cols.length) { host.innerHTML = ''; return; }
+    const keyCol = cols[0].key;
+    const row = rows.find((r) => String(r[keyCol] ?? '').trim() === String(value).trim());
+    if (!row) { host.innerHTML = `<span class="ml-studio-annotate-attr-lookup-miss">brak w słowniku „${escapeHtml(dict.name)}"</span>`; return; }
+    const mapped = cols.slice(1).map((c) => escapeHtml(String(row[c.key] ?? ''))).filter(Boolean).join(' · ');
+    host.innerHTML = `<span class="ml-studio-annotate-attr-lookup-hit">${sprite('check')} ${escapeHtml(String(value))} → ${mapped}</span>`;
+  }
+
   async function saveAnns() {
-    const btn = byId('annot-save'); btn?.setAttribute('disabled', '');
+    const btn = byId('ml-studio-annotate-save'); btn?.setAttribute('disabled', '');
     try {
-      const anns = S.boxes.filter((b) => b.w >= 3 && b.h >= 3).map((b) => ({
-        category_id: b.category_id, bbox: [Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)],
-      }));
+      const anns = S.boxes.filter((b) => b.w >= 3 && b.h >= 3).map((b) => {
+        const out = {
+          category_id: b.category_id, bbox: [Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)],
+        };
+        if (b.predicted) { out.predicted = true; if (typeof b.score === 'number') out.score = b.score; }
+        if (b.attributes && Object.keys(b.attributes).length) out.attributes = b.attributes;
+        return out;
+      });
       const resp = await ApiBinary.one('mlStudioRecogSaveAnnotationsRequest', {
         datasetId: S.datasetId, imageId: S.images[S.curIdx].image_id, annotationsJson: JSON.stringify(anns),
       });
       if (!resp.ok) throw new Error(resp.error || 'zapis nieudany');
       S.dirty = false;
-      S.images[S.curIdx].ann_count = anns.length; renderGallery();
+      S.images[S.curIdx].ann_count = anns.length; renderProgress(); renderTaskList();
       toast('Anotacje zapisane.', 'success');
     } catch (err) { toast(`Zapis anotacji: ${err.message}`, 'error'); }
     finally { btn?.removeAttribute('disabled'); }
   }
 
-  // Klawisz Delete usuwa zaznaczoną ramkę (gdy zakładka aktywna).
+  // Skróty klawiszowe: Delete usuwa zaznaczoną ramkę, 1-9 przypisuje klasę.
+  // Ignorowane gdy fokus jest w polu formularza (wpisywanie wartości atrybutu).
   const keyHandler = (e) => {
-    if ((e.key === 'Delete' || e.key === 'Backspace') && S.sel >= 0 && byId('annot-svg')) {
-      S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); e.preventDefault();
+    if (!byId('annot-svg')) return;
+    const tag = (e.target?.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target?.isContentEditable) return;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && S.sel >= 0) {
+      S.boxes.splice(S.sel, 1); S.sel = -1; S.dirty = true; drawBoxes(); renderAttrPanel(); e.preventDefault();
+    } else if (/^[1-9]$/.test(e.key) && S.sel >= 0) {
+      const classes = effectiveClasses(); const idx = Number(e.key) - 1;
+      if (idx < classes.length) { assignClass(classes[idx].name); e.preventDefault(); }
     }
   };
   document.addEventListener('keydown', keyHandler);
 }
 
-// Zakładka "Schemat" dla recognition: wybór datasetu + wariantu + hiperparametry
+// Zakładka "Schemat" dla recognition: edytor klas i atrybutów rozpoznawania.
+// Lewa kolumna to lista klas (kolor/kształt/liczba atrybutów), prawa to edytor
+// wybranej klasy + jej atrybuty (lista/tekst/OCR/liczba/klasyfikator). Schemat
+// jest opakiem w backendzie (CBOR string) — frontend jest jego właścicielem i
+// serializuje go do `schemaJson`. Gdy schemat jest pusty, klasy są zasiewane z
+// istniejących kategorii COCO projektu, żeby użytkownik od razu widział swoje
+// realne klasy (zasiew żyje w pamięci do kliknięcia "Zapisz schemat").
+//
+// Słowniki lookup (OCR) są osobnym zasobem backendu i edytowane przez modal:
+// nazwa + tabela kolumn/wierszy zapisywana jako `rowsJson`.
+
+// Stała paleta kolorów klas — zgodna z mockupem r01-schemat. Cyklowana przy
+// zasiewie z kategorii COCO, oferowana jako szybki wybór w edytorze klasy.
+const RECOG_SCHEMA_PALETTE = ['#a78bfa', '#60a5fa', '#22c55e', '#f59e0b', '#ef4444'];
+
+// Typy atrybutów: id + etykieta + ikona + krótki opis (dla pickera) oraz ton
+// badge'a (klasa CSS .ml-studio-attr-type-badge.<id>) używanego w wierszu atrybutu.
+const RECOG_ATTR_TYPES = [
+  { id: 'list', label: 'Lista wyboru', icon: 'list', desc: 'jedna z wartości' },
+  { id: 'text', label: 'Tekst', icon: 'file-text', desc: 'dowolny ciąg' },
+  { id: 'ocr', label: 'OCR', icon: 'search', desc: 'odczyt z ramki' },
+  { id: 'number', label: 'Liczba', icon: 'pi', desc: 'wartość num.' },
+  { id: 'classifier', label: 'Klasyfikator', icon: 'model', desc: 'osobny model' },
+];
+
+// Kształt ramki klasy → ikona (segmented control + ikona przy wierszu klasy).
+const RECOG_SHAPES = [
+  { id: 'box', label: 'Box', icon: 'grid-2x2' },
+  { id: 'polygon', label: 'Poligon', icon: 'branch' },
+  { id: 'point', label: 'Punkt', icon: 'record-dot' },
+];
+
+function recogShapeIcon(shape) {
+  const s = RECOG_SHAPES.find((x) => x.id === shape);
+  return s ? s.icon : 'grid-2x2';
+}
+
+function recogAttrTypeLabel(type) {
+  const t = RECOG_ATTR_TYPES.find((x) => x.id === type);
+  return t ? t.label : type;
+}
+
+// Krótki opis atrybutu dla wiersza (preview) — zależny od typu, bez OCR słownika
+// (ten dostaje osobny blok detail + podgląd tabeli).
+function recogAttrSummary(attr) {
+  switch (attr.type) {
+    case 'list':
+      return (attr.list?.values || []).join(' / ') || '—';
+    case 'classifier': {
+      const vals = (attr.classifier?.values || []).join(' / ');
+      const m = attr.classifier?.model || '';
+      return [m && `model: ${m}`, vals].filter(Boolean).join(' · ') || '—';
+    }
+    case 'number': {
+      const n = attr.number || {};
+      const range = [n.min, n.max].every((v) => v != null && v !== '') ? `${n.min}…${n.max}` : '';
+      return [range, n.unit].filter(Boolean).join(' ') || '—';
+    }
+    case 'text':
+      return 'dowolny tekst';
+    default:
+      return '';
+  }
+}
+
+function renderRecogSchemaTab(panel, p, { selectTab }) {
+  const pid = projectId(p);
+  // Stan edytora schematu — żyje w domknięciu zakładki. `classes` jest in-memory
+  // do zapisu; `selected` to indeks wybranej klasy; `dicts`/`models` to cache
+  // zasobów backendu; `adding` przechowuje roboczy stan formularza atrybutu.
+  const S = {
+    classes: [], selected: 0, dirty: false,
+    dicts: [], ocrModels: [], classifierModels: [],
+    adding: null, // {name, type, ocr:{...}, list:{values}, classifier:{...}, number:{...}}
+  };
+
+  panel.innerHTML = `
+    <div class="ml-studio-schema">
+      <div class="ml-studio-schema-toolbar">
+        <span class="ml-studio-schema-toolbar-hint" id="ml-studio-schema-dirty"></span>
+        <tf-button variant="primary" icon="download" id="ml-studio-schema-save">Zapisz schemat</tf-button>
+      </div>
+      <div class="ml-studio-schema-layout">
+        <aside class="ml-studio-schema-classes">
+          <div class="ml-studio-schema-classes-head" id="ml-studio-schema-classes-head">Klasy (0)</div>
+          <div id="ml-studio-schema-class-list"></div>
+          <button type="button" class="ml-studio-schema-add-class" id="ml-studio-schema-add-class">
+            ${sprite('plus')} Dodaj klasę
+          </button>
+          <p class="ml-studio-schema-classes-note">Nowa klasa: nazwa (snake_case), kolor i kształt ramki. Atrybuty dodasz po jej wybraniu.</p>
+        </aside>
+        <div class="ml-studio-schema-editor" id="ml-studio-schema-editor"></div>
+      </div>
+    </div>
+  `;
+
+  const markDirty = () => {
+    S.dirty = true;
+    const el = byId('ml-studio-schema-dirty');
+    if (el) el.textContent = 'Niezapisane zmiany';
+  };
+
+  function renderClassList() {
+    const head = byId('ml-studio-schema-classes-head');
+    if (head) head.textContent = `Klasy (${S.classes.length})`;
+    const host = byId('ml-studio-schema-class-list');
+    if (!host) return;
+    host.innerHTML = S.classes.map((c, i) => `
+      <button type="button" class="ml-studio-schema-class${i === S.selected ? ' active' : ''}" data-idx="${i}">
+        <span class="ml-studio-schema-class-swatch" style="background:${escapeAttr(c.color)}"></span>
+        <span class="ml-studio-schema-class-name">${escapeHtml(c.name)}</span>
+        <span class="ml-studio-schema-class-shape">${sprite(recogShapeIcon(c.shape))}</span>
+        <span class="ml-studio-schema-class-attrs">${(c.attributes || []).length} atr.</span>
+      </button>`).join('');
+    host.querySelectorAll('.ml-studio-schema-class').forEach((el) => {
+      el.addEventListener('click', () => {
+        S.selected = Number(el.getAttribute('data-idx'));
+        S.adding = null;
+        renderClassList();
+        renderEditor();
+      });
+    });
+  }
+
+  function renderEditor() {
+    const host = byId('ml-studio-schema-editor');
+    if (!host) return;
+    const c = S.classes[S.selected];
+    if (!c) {
+      host.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'grid-2x2');
+      empty.setAttribute('title', 'Brak klas w schemacie');
+      empty.setAttribute('message', 'Dodaj pierwszą klasę po lewej, aby zdefiniować co model wykrywa i jakie ma atrybuty.');
+      host.appendChild(empty);
+      return;
+    }
+
+    const colorPicks = RECOG_SCHEMA_PALETTE.map((col) => `
+      <button type="button" class="ml-studio-color-pick${c.color === col ? ' active' : ''}"
+              data-color="${escapeAttr(col)}" style="background:${escapeAttr(col)}" aria-label="${escapeAttr(col)}"></button>`).join('');
+
+    const attrRows = (c.attributes || []).map((a, ai) => recogAttrRowHtml(a, ai)).join('')
+      || '<p class="ml-studio-schema-classes-note" style="padding:4px 2px">Brak atrybutów. Dodaj pierwszy poniżej.</p>';
+
+    host.innerHTML = `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-schema-editor-head">
+          <div class="ml-studio-schema-editor-title">
+            <span class="ml-studio-schema-class-swatch" style="background:${escapeAttr(c.color)}"></span>
+            Klasa: <span class="mono" style="color:var(--accent-2)">${escapeHtml(c.name)}</span>
+          </div>
+          <tf-button variant="danger" icon="trash" id="ml-studio-schema-del-class">Usuń klasę</tf-button>
+        </div>
+        <div class="ml-studio-schema-class-props">
+          <tf-input id="ml-studio-schema-class-name" class="mono" label="Nazwa klasy" value="${escapeAttr(c.name)}"
+                    hint="Identyfikator techniczny (snake_case). Trafi do eksportu COCO/JSONL."></tf-input>
+          <div class="ml-studio-schema-field">
+            <label class="ml-studio-schema-label">Kolor ramki</label>
+            <div class="ml-studio-color-swatches">${colorPicks}</div>
+          </div>
+          <div class="ml-studio-schema-field">
+            <label class="ml-studio-schema-label">Kształt</label>
+            <tf-segmented id="ml-studio-schema-shape" value="${escapeAttr(c.shape)}">
+              ${RECOG_SHAPES.map((s) => `<option value="${escapeAttr(s.id)}">${escapeHtml(s.label)}</option>`).join('')}
+            </tf-segmented>
+          </div>
+        </div>
+      </section>
+
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-schema-editor-head">
+          <div class="ml-studio-schema-editor-title">${sprite('list')} Atrybuty klasy
+            <span class="text-3" style="font-weight:400">— odczytywane dla każdej ramki</span>
+          </div>
+          <tf-button variant="outline" icon="plus" id="ml-studio-schema-add-attr">Dodaj atrybut</tf-button>
+        </div>
+        <div id="ml-studio-schema-attr-list">${attrRows}</div>
+        <div id="ml-studio-schema-attr-form"></div>
+      </section>
+    `;
+
+    byId('ml-studio-schema-del-class')?.addEventListener('click', () => {
+      if (!confirm(`Usunąć klasę „${c.name}" wraz z atrybutami?`)) return;
+      S.classes.splice(S.selected, 1);
+      S.selected = Math.max(0, S.selected - 1);
+      S.adding = null;
+      markDirty();
+      renderClassList();
+      renderEditor();
+    });
+
+    const nameInput = byId('ml-studio-schema-class-name');
+    nameInput?.addEventListener('change', () => {
+      const v = String(nameInput.value || '').trim();
+      if (v) { c.name = v; markDirty(); renderClassList(); }
+    });
+
+    host.querySelectorAll('.ml-studio-color-pick').forEach((el) => {
+      el.addEventListener('click', () => {
+        c.color = el.getAttribute('data-color');
+        markDirty();
+        renderClassList();
+        renderEditor();
+      });
+    });
+
+    byId('ml-studio-schema-shape')?.addEventListener('change', (e) => {
+      c.shape = e.detail?.value || 'box';
+      markDirty();
+      renderClassList();
+      renderEditor();
+    });
+
+    bindAttrRowActions(c);
+
+    byId('ml-studio-schema-add-attr')?.addEventListener('click', () => {
+      S.adding = { name: '', type: 'list', ocr: { model: '', format_regex: '', lookup_dict_id: '', on_missing: 'keep_raw', lookup_enabled: false }, list: { values: [] }, classifier: { model: '', values: [] }, number: { min: '', max: '', unit: '' } };
+      renderAttrForm(c);
+    });
+  }
+
+  // Wiersz istniejącego atrybutu: nazwa + badge typu + (dla OCR) detale modelu/
+  // regexu/słownika i podgląd tabeli lookup. Edytuj/usuń obsługiwane delegacją.
+  function recogAttrRowHtml(a, ai) {
+    const typeMeta = RECOG_ATTR_TYPES.find((t) => t.id === a.type) || RECOG_ATTR_TYPES[0];
+    let detail = '';
+    if (a.type === 'ocr') {
+      const o = a.ocr || {};
+      const dict = o.lookup_dict_id ? S.dicts.find((d) => d.dictId === o.lookup_dict_id) : null;
+      detail = `
+        <div class="ml-studio-attr-detail">
+          <span class="dk">Model OCR</span><span class="dv mono">${escapeHtml(o.model || '—')}</span>
+          <span class="dk">Walidacja formatu</span><span class="dv mono">${escapeHtml(o.format_regex || '—')}</span>
+          <span class="dk">Lookup / słownik</span><span class="dv">${dict ? escapeHtml(dict.name) : 'brak'}${dict ? ` · braki: ${o.on_missing === 'reject' ? 'odrzuć ramkę' : 'zapisz surowy kod'}` : ''}</span>
+        </div>
+        ${dict ? recogLookupPreviewHtml(dict) : ''}`;
+    } else {
+      const summary = recogAttrSummary(a);
+      if (summary) {
+        detail = `<div class="ml-studio-attr-detail"><span class="dk">${escapeHtml(a.type === 'number' ? 'zakres' : a.type === 'classifier' ? 'klasyfikator' : a.type === 'list' ? 'wartości' : 'wartość')}</span><span class="dv">${escapeHtml(summary)}</span></div>`;
+      }
+    }
+    return `
+      <div class="ml-studio-attr-row" data-attr-idx="${ai}">
+        <div class="ml-studio-attr-head">
+          <span class="ml-studio-attr-name">${escapeHtml(a.name)}</span>
+          <span class="ml-studio-attr-type-badge ${escapeAttr(a.type)}">${sprite(typeMeta.icon)}${escapeHtml(typeMeta.label)}</span>
+          <span class="ml-studio-attr-actions">
+            <tf-button variant="ghost" icon="trash" data-attr-del="${ai}" aria-label="Usuń atrybut"></tf-button>
+          </span>
+        </div>
+        ${detail}
+      </div>`;
+  }
+
+  function recogLookupPreviewHtml(dict) {
+    let body;
+    try { body = JSON.parse(dict.rowsJson || '{}'); } catch { body = {}; }
+    const cols = body.columns || [];
+    const rows = body.rows || [];
+    if (!cols.length) return '';
+    const head = cols.map((col) => `<th>${escapeHtml(col.label || col.key)}</th>`).join('');
+    const preview = rows.slice(0, 4).map((r) =>
+      `<tr>${cols.map((col) => `<td>${escapeHtml(String(r[col.key] ?? ''))}</td>`).join('')}</tr>`).join('');
+    return `
+      <div class="ml-studio-lookup-wrap">
+        <div class="ml-studio-lookup-head">${sprite('catalog')} Słownik lookup: ${escapeHtml(dict.name)} (${Math.min(4, rows.length)} z ${rows.length})</div>
+        <table class="ml-studio-lookup-table"><thead><tr>${head}</tr></thead><tbody>${preview}</tbody></table>
+      </div>`;
+  }
+
+  function bindAttrRowActions(c) {
+    byId('ml-studio-schema-attr-list')?.querySelectorAll('[data-attr-del]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const ai = Number(btn.getAttribute('data-attr-del'));
+        c.attributes.splice(ai, 1);
+        markDirty();
+        renderClassList();
+        renderEditor();
+      });
+    });
+  }
+
+  // Formularz dodawania atrybutu — nazwa + picker typu + pola zależne od typu.
+  function renderAttrForm(c) {
+    const host = byId('ml-studio-schema-attr-form');
+    if (!host || !S.adding) { if (host) host.innerHTML = ''; return; }
+    const a = S.adding;
+
+    const typeOpts = RECOG_ATTR_TYPES.map((t) => `
+      <button type="button" class="ml-studio-attr-type-opt${a.type === t.id ? ' selected' : ''}" data-type="${escapeAttr(t.id)}">
+        <span class="ato-ico">${sprite(t.icon)}</span>
+        <span class="ato-name">${escapeHtml(t.label)}</span>
+        <span class="ato-desc">${escapeHtml(t.desc)}</span>
+      </button>`).join('');
+
+    host.innerHTML = `
+      <div class="ml-studio-attr-add">
+        <h4 class="ml-studio-attr-add-title">${sprite('plus')} Nowy atrybut</h4>
+        <p class="ml-studio-schema-classes-note" style="margin:0 0 12px">Krok 1: nadaj nazwę. Krok 2: wybierz typ — od typu zależą dodatkowe pola.</p>
+        <tf-input id="ml-studio-schema-attr-name" class="mono" label="Nazwa atrybutu" value="${escapeAttr(a.name)}"
+                  placeholder="np. numer, klasa, stan…" hint="snake_case. Pojawi się w panelu anotacji dla każdej ramki tej klasy."></tf-input>
+        <div class="ml-studio-schema-field">
+          <label class="ml-studio-schema-label">Typ atrybutu</label>
+          <div class="ml-studio-attr-type-pick">${typeOpts}</div>
+        </div>
+        <div id="ml-studio-schema-attr-config"></div>
+        <div class="ml-studio-attr-add-foot">
+          <tf-button variant="ghost" id="ml-studio-schema-attr-cancel">Anuluj</tf-button>
+          <tf-button variant="primary" icon="check" id="ml-studio-schema-attr-confirm">Dodaj atrybut do klasy</tf-button>
+        </div>
+      </div>
+    `;
+
+    const nameEl = byId('ml-studio-schema-attr-name');
+    nameEl?.addEventListener('input', () => { a.name = String(nameEl.value || '').trim(); });
+
+    host.querySelectorAll('.ml-studio-attr-type-opt').forEach((el) => {
+      el.addEventListener('click', () => {
+        a.type = el.getAttribute('data-type');
+        renderAttrForm(c);
+      });
+    });
+
+    byId('ml-studio-schema-attr-cancel')?.addEventListener('click', () => {
+      S.adding = null;
+      renderEditor();
+    });
+
+    byId('ml-studio-schema-attr-confirm')?.addEventListener('click', () => {
+      if (!a.name) { toast('Podaj nazwę atrybutu.', 'error'); return; }
+      if ((c.attributes || []).some((x) => x.name === a.name)) { toast('Atrybut o tej nazwie już istnieje.', 'error'); return; }
+      c.attributes = c.attributes || [];
+      c.attributes.push(buildAttrFromForm(a));
+      S.adding = null;
+      markDirty();
+      renderClassList();
+      renderEditor();
+    });
+
+    renderAttrConfig(c);
+  }
+
+  function buildAttrFromForm(a) {
+    const out = { name: a.name, type: a.type };
+    if (a.type === 'ocr') {
+      out.ocr = {
+        model: a.ocr.model || '',
+        format_regex: a.ocr.format_regex || '',
+        lookup_dict_id: a.ocr.lookup_enabled ? (a.ocr.lookup_dict_id || '') : '',
+        on_missing: a.ocr.on_missing || 'keep_raw',
+      };
+    } else if (a.type === 'classifier') {
+      out.classifier = { model: a.classifier.model || '', values: a.classifier.values.slice() };
+    } else if (a.type === 'list') {
+      out.list = { values: a.list.values.slice() };
+    } else if (a.type === 'number') {
+      const n = a.number;
+      out.number = {
+        min: n.min === '' ? null : Number(n.min),
+        max: n.max === '' ? null : Number(n.max),
+        unit: n.unit || '',
+      };
+    } else {
+      out.text = {};
+    }
+    return out;
+  }
+
+  // Pola zależne od typu w formularzu dodawania. Renderowane do osobnego kontenera,
+  // żeby zmiana typu nie gubiła już wpisanej nazwy atrybutu.
+  function renderAttrConfig(c) {
+    const host = byId('ml-studio-schema-attr-config');
+    if (!host || !S.adding) return;
+    const a = S.adding;
+
+    if (a.type === 'text') { host.innerHTML = '<p class="ml-studio-schema-classes-note" style="margin:0">Tekst nie wymaga dodatkowych pól.</p>'; return; }
+
+    if (a.type === 'list') {
+      host.innerHTML = `
+        <div class="ml-studio-schema-field">
+          <label class="ml-studio-schema-label">Wartości listy</label>
+          <tf-tag-input id="ml-studio-schema-list-values" placeholder="dopisz wartość i Enter"></tf-tag-input>
+        </div>`;
+      const ti = byId('ml-studio-schema-list-values');
+      if (ti) { ti.tags = a.list.values; ti.addEventListener('change', (e) => { a.list.values = e.detail?.tags || []; }); }
+      return;
+    }
+
+    if (a.type === 'number') {
+      const n = a.number;
+      host.innerHTML = `
+        <div class="ml-studio-schema-config-grid">
+          <tf-input id="ml-studio-schema-num-min" type="number" label="Min" value="${escapeAttr(String(n.min))}"></tf-input>
+          <tf-input id="ml-studio-schema-num-max" type="number" label="Max" value="${escapeAttr(String(n.max))}"></tf-input>
+          <tf-input id="ml-studio-schema-num-unit" label="Jednostka" value="${escapeAttr(n.unit)}" placeholder="np. °C"></tf-input>
+        </div>`;
+      byId('ml-studio-schema-num-min')?.addEventListener('input', (e) => { n.min = e.target?.value ?? e.detail?.value ?? ''; });
+      byId('ml-studio-schema-num-max')?.addEventListener('input', (e) => { n.max = e.target?.value ?? e.detail?.value ?? ''; });
+      byId('ml-studio-schema-num-unit')?.addEventListener('input', (e) => { n.unit = e.target?.value ?? e.detail?.value ?? ''; });
+      return;
+    }
+
+    if (a.type === 'classifier') {
+      host.innerHTML = `
+        <div class="ml-studio-schema-config-card">
+          <div class="ml-studio-schema-config-grid two">
+            <tf-select id="ml-studio-schema-cls-model" label="Model klasyfikatora"></tf-select>
+            <div class="ml-studio-schema-field">
+              <label class="ml-studio-schema-label">Wartości (klasy)</label>
+              <tf-tag-input id="ml-studio-schema-cls-values" placeholder="dopisz wartość i Enter"></tf-tag-input>
+            </div>
+          </div>
+        </div>`;
+      const sel = byId('ml-studio-schema-cls-model');
+      const opts = [{ value: '', label: '— wybierz model —' }].concat(S.classifierModels.map((m) => ({ value: m.id, label: `${m.name} (${m.source || 'serwis'})` })));
+      sel?.setOptions(opts, a.classifier.model || '');
+      sel?.addEventListener('change', (e) => { a.classifier.model = e.detail?.value || ''; });
+      const ti = byId('ml-studio-schema-cls-values');
+      if (ti) { ti.tags = a.classifier.values; ti.addEventListener('change', (e) => { a.classifier.values = e.detail?.tags || []; }); }
+      return;
+    }
+
+    // OCR
+    const o = a.ocr;
+    const dictOpts = [{ value: '', label: '— wybierz słownik —' }]
+      .concat(S.dicts.map((d) => ({ value: d.dictId, label: d.name })))
+      .concat([{ value: '__new__', label: '+ Utwórz nowy słownik…' }]);
+    host.innerHTML = `
+      <div class="ml-studio-schema-config-card">
+        <div class="ml-studio-schema-config-badge"><span class="ml-studio-attr-type-badge ocr">${sprite('search')}Konfiguracja OCR</span></div>
+        <div class="ml-studio-schema-config-grid two">
+          <tf-select id="ml-studio-schema-ocr-model" label="Model OCR"></tf-select>
+          <tf-input id="ml-studio-schema-ocr-regex" class="mono" label="Walidacja formatu (regex, opcjonalnie)" value="${escapeAttr(o.format_regex)}" placeholder="^\\d{2,3}$"></tf-input>
+        </div>
+        <div class="ml-studio-schema-toggle-row">
+          <tf-toggle id="ml-studio-schema-ocr-lookup"${o.lookup_enabled ? ' checked' : ''}></tf-toggle>
+          <span><strong>Dołącz słownik (lookup)</strong> — mapuje odczytany kod na dodatkowe pola</span>
+        </div>
+        <div id="ml-studio-schema-ocr-lookup-fields"></div>
+      </div>`;
+
+    const modelSel = byId('ml-studio-schema-ocr-model');
+    const modelOpts = [{ value: '', label: '— wybierz model —' }].concat(S.ocrModels.map((m) => ({ value: m.id, label: `${m.name} (${m.source || 'serwis'})` })));
+    modelSel?.setOptions(modelOpts, o.model || '');
+    modelSel?.addEventListener('change', (e) => { o.model = e.detail?.value || ''; });
+    byId('ml-studio-schema-ocr-regex')?.addEventListener('input', (e) => { o.format_regex = e.target?.value ?? e.detail?.value ?? ''; });
+    byId('ml-studio-schema-ocr-lookup')?.addEventListener('change', (e) => {
+      o.lookup_enabled = !!e.detail?.checked;
+      renderOcrLookupFields(o);
+    });
+    renderOcrLookupFields(o);
+
+    function renderOcrLookupFields(ocr) {
+      const lh = byId('ml-studio-schema-ocr-lookup-fields');
+      if (!lh) return;
+      if (!ocr.lookup_enabled) { lh.innerHTML = ''; return; }
+      lh.innerHTML = `
+        <div class="ml-studio-schema-config-grid two" style="margin-top:10px">
+          <tf-select id="ml-studio-schema-ocr-dict" label="Tabela słownika"></tf-select>
+          <tf-select id="ml-studio-schema-ocr-onmissing" label="Zachowanie przy braku w słowniku">
+            <option value="keep_raw">Zapisz surowy kod, oznacz „nieznany"</option>
+            <option value="reject">Odrzuć ramkę do ręcznej weryfikacji</option>
+          </tf-select>
+        </div>`;
+      const dictSel = byId('ml-studio-schema-ocr-dict');
+      dictSel?.setOptions(dictOpts, ocr.lookup_dict_id || '');
+      dictSel?.addEventListener('change', (e) => {
+        const v = e.detail?.value || '';
+        if (v === '__new__') { openDictEditor(null, (newId) => { ocr.lookup_dict_id = newId; renderAttrConfig(c); }); return; }
+        ocr.lookup_dict_id = v;
+      });
+      const omSel = byId('ml-studio-schema-ocr-onmissing');
+      if (omSel) { omSel.value = ocr.on_missing || 'keep_raw'; omSel.addEventListener('change', (e) => { ocr.on_missing = e.detail?.value || 'keep_raw'; }); }
+    }
+  }
+
+  // Modal edytora słownika lookup: nazwa + edytowalna tabela kolumn/wierszy.
+  // Po zapisie woła mlStudioLookupDictSave, odświeża cache i wraca dictId.
+  function openDictEditor(existing, onSaved) {
+    const dict = existing
+      ? { dictId: existing.dictId, name: existing.name, body: safeParse(existing.rowsJson) }
+      : { dictId: '', name: '', body: { columns: [{ key: 'code', label: 'kod' }, { key: 'un', label: 'numer UN' }, { key: 'material', label: 'nazwa materiału' }], rows: [] } };
+
+    const modal = document.createElement('tf-modal');
+    modal.setAttribute('open', '');
+    modal.setAttribute('title', existing ? 'Edytuj słownik lookup' : 'Nowy słownik lookup');
+    modal.innerHTML = `
+      <div slot="body" class="ml-studio-dict-editor">
+        <tf-input id="ml-studio-dict-name" label="Nazwa słownika" value="${escapeAttr(dict.name)}" placeholder="np. un_kody"></tf-input>
+        <div class="ml-studio-schema-field">
+          <label class="ml-studio-schema-label">Kolumny (klucz : etykieta)</label>
+          <div id="ml-studio-dict-cols"></div>
+          <tf-button variant="ghost" icon="plus" id="ml-studio-dict-add-col">Dodaj kolumnę</tf-button>
+        </div>
+        <div class="ml-studio-schema-field">
+          <label class="ml-studio-schema-label">Wiersze</label>
+          <div id="ml-studio-dict-rows"></div>
+          <tf-button variant="ghost" icon="plus" id="ml-studio-dict-add-row">Dodaj wiersz</tf-button>
+        </div>
+      </div>
+      <div slot="footer">
+        <tf-button variant="ghost" id="ml-studio-dict-cancel">Anuluj</tf-button>
+        <tf-button variant="primary" icon="download" id="ml-studio-dict-save">Zapisz słownik</tf-button>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const renderCols = () => {
+      const h = modal.querySelector('#ml-studio-dict-cols');
+      h.innerHTML = dict.body.columns.map((col, i) => `
+        <div class="ml-studio-dict-col-row" data-col="${i}">
+          <tf-input class="mono ml-studio-dict-col-key" value="${escapeAttr(col.key)}" placeholder="klucz"></tf-input>
+          <tf-input class="ml-studio-dict-col-label" value="${escapeAttr(col.label)}" placeholder="etykieta"></tf-input>
+          <tf-button variant="ghost" icon="trash" data-del-col="${i}" aria-label="Usuń kolumnę"></tf-button>
+        </div>`).join('');
+      h.querySelectorAll('[data-del-col]').forEach((b) => b.addEventListener('click', () => {
+        dict.body.columns.splice(Number(b.getAttribute('data-del-col')), 1); renderCols(); renderRows();
+      }));
+      h.querySelectorAll('.ml-studio-dict-col-row').forEach((row) => {
+        const i = Number(row.getAttribute('data-col'));
+        row.querySelector('.ml-studio-dict-col-key')?.addEventListener('input', (e) => { dict.body.columns[i].key = (e.target?.value ?? '').trim(); });
+        row.querySelector('.ml-studio-dict-col-label')?.addEventListener('input', (e) => { dict.body.columns[i].label = e.target?.value ?? ''; });
+      });
+    };
+    const renderRows = () => {
+      const h = modal.querySelector('#ml-studio-dict-rows');
+      h.innerHTML = dict.body.rows.map((r, ri) => `
+        <div class="ml-studio-dict-data-row" data-row="${ri}" style="grid-template-columns:repeat(${dict.body.columns.length}, 1fr) auto">
+          ${dict.body.columns.map((col) => `<tf-input class="mono" data-key="${escapeAttr(col.key)}" value="${escapeAttr(String(r[col.key] ?? ''))}" placeholder="${escapeAttr(col.label || col.key)}"></tf-input>`).join('')}
+          <tf-button variant="ghost" icon="trash" data-del-row="${ri}" aria-label="Usuń wiersz"></tf-button>
+        </div>`).join('');
+      h.querySelectorAll('[data-del-row]').forEach((b) => b.addEventListener('click', () => {
+        dict.body.rows.splice(Number(b.getAttribute('data-del-row')), 1); renderRows();
+      }));
+      h.querySelectorAll('.ml-studio-dict-data-row').forEach((row) => {
+        const ri = Number(row.getAttribute('data-row'));
+        row.querySelectorAll('tf-input[data-key]').forEach((inp) => {
+          inp.addEventListener('input', (e) => { dict.body.rows[ri][inp.getAttribute('data-key')] = e.target?.value ?? ''; });
+        });
+      });
+    };
+    renderCols();
+    renderRows();
+
+    modal.querySelector('#ml-studio-dict-add-col')?.addEventListener('click', () => { dict.body.columns.push({ key: '', label: '' }); renderCols(); renderRows(); });
+    modal.querySelector('#ml-studio-dict-add-row')?.addEventListener('click', () => {
+      const row = {}; dict.body.columns.forEach((c) => { row[c.key] = ''; }); dict.body.rows.push(row); renderRows();
+    });
+    const close = () => modal.remove();
+    modal.querySelector('#ml-studio-dict-cancel')?.addEventListener('click', close);
+    modal.addEventListener('close', close);
+    modal.querySelector('#ml-studio-dict-save')?.addEventListener('click', async () => {
+      const name = String(modal.querySelector('#ml-studio-dict-name')?.value || '').trim();
+      if (!name) { toast('Podaj nazwę słownika.', 'error'); return; }
+      try {
+        const resp = await ApiBinary.one('mlStudioLookupDictSaveRequest', {
+          projectId: pid, dictId: dict.dictId || '', name, rowsJson: JSON.stringify(dict.body),
+        });
+        const newId = resp.dictId ?? resp.dict_id ?? dict.dictId;
+        await loadDicts();
+        toast('Słownik zapisany.', 'success');
+        close();
+        if (onSaved) onSaved(newId);
+      } catch (err) { toast(`Słownik: ${err.message}`, 'error'); }
+    });
+  }
+
+  function safeParse(s) {
+    try { const v = JSON.parse(s || '{}'); return (v && v.columns) ? v : { columns: [], rows: [] }; }
+    catch { return { columns: [], rows: [] }; }
+  }
+
+  async function loadDicts() {
+    try {
+      const resp = await ApiBinary.one('mlStudioLookupDictsListRequest', { projectId: pid });
+      S.dicts = JSON.parse(resp.dictsJson ?? resp.dicts_json ?? '[]');
+    } catch { S.dicts = []; }
+  }
+
+  async function loadModels() {
+    try {
+      const ocr = await ApiBinary.one('mlStudioServiceModelsListRequest', { capability: 'ocr' });
+      S.ocrModels = JSON.parse(ocr.modelsJson ?? ocr.models_json ?? '[]');
+    } catch { S.ocrModels = []; }
+    try {
+      const cls = await ApiBinary.one('mlStudioServiceModelsListRequest', { capability: 'classifier' });
+      S.classifierModels = JSON.parse(cls.modelsJson ?? cls.models_json ?? '[]');
+    } catch { S.classifierModels = []; }
+  }
+
+  // Zasiew klas z istniejących kategorii COCO projektu, gdy schemat jest pusty.
+  // Pomija kategorię id 0 jeśli istnieje więcej niż jedna (placeholder/tło) —
+  // zgodnie z logiką defaultCat w zakładce Anotacje.
+  async function seedClassesFromCoco() {
+    try {
+      const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+      const list = (dsResp.datasets || []).filter((d) => (d.kind || '') === 'coco_path');
+      if (!list.length) return [];
+      const datasetId = list[0].datasetId ?? list[0].dataset_id;
+      const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
+      const cats = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+      const usable = cats.length > 1 ? cats.filter((c) => c.id !== 0) : cats;
+      return usable.map((cat, i) => ({
+        name: cat.name, color: RECOG_SCHEMA_PALETTE[i % RECOG_SCHEMA_PALETTE.length],
+        shape: 'box', attributes: [],
+      }));
+    } catch { return []; }
+  }
+
+  byId('ml-studio-schema-add-class')?.addEventListener('click', () => {
+    const idx = S.classes.length;
+    S.classes.push({ name: `klasa_${idx + 1}`, color: RECOG_SCHEMA_PALETTE[idx % RECOG_SCHEMA_PALETTE.length], shape: 'box', attributes: [] });
+    S.selected = idx;
+    S.adding = null;
+    markDirty();
+    renderClassList();
+    renderEditor();
+  });
+
+  byId('ml-studio-schema-save')?.addEventListener('click', async () => {
+    const btn = byId('ml-studio-schema-save');
+    btn?.setAttribute('disabled', '');
+    try {
+      await ApiBinary.one('mlStudioSchemaSaveRequest', { projectId: pid, schemaJson: JSON.stringify({ classes: S.classes }) });
+      S.dirty = false;
+      const el = byId('ml-studio-schema-dirty');
+      if (el) el.textContent = 'Zapisano';
+      toast('Schemat zapisany.', 'success');
+    } catch (err) { toast(`Zapis schematu: ${err.message}`, 'error'); }
+    finally { btn?.removeAttribute('disabled'); }
+  });
+
+  (async () => {
+    await Promise.all([loadDicts(), loadModels()]);
+    let schema = {};
+    try {
+      const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
+      schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+    } catch { schema = {}; }
+    if (Array.isArray(schema.classes) && schema.classes.length) {
+      S.classes = schema.classes.map((c) => ({
+        name: c.name || 'klasa', color: c.color || RECOG_SCHEMA_PALETTE[0], shape: c.shape || 'box',
+        attributes: Array.isArray(c.attributes) ? c.attributes : [],
+      }));
+    } else {
+      S.classes = await seedClassesFromCoco();
+    }
+    S.selected = 0;
+    renderClassList();
+    renderEditor();
+  })();
+}
+
+// Zakładka "Trening" dla recognition: wybór datasetu + wariantu + hiperparametry
 // + start treningu. Po starcie przechodzi w widok LIVE (startRecogLive).
 function renderRecogTrainTab(panel, p, { selectTab }) {
   const pid = projectId(p);
