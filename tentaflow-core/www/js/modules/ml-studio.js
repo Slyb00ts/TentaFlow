@@ -1463,9 +1463,17 @@ function pollRecogAutolabel(jobId, prog, onDone) {
       const total = st.imagesTotal ?? st.images_total ?? 0;
       const doneN = st.imagesDone ?? st.images_done ?? 0;
       const dets = st.detections ?? 0;
+      const skippedUnknown = st.skippedUnknown ?? st.skipped_unknown ?? 0;
       if (status === 'succeeded') {
         if (prog) prog.textContent = '';
-        toast(`Auto-etykietowanie zakończone: ${dets} wykryć na ${total} obrazach.`, 'success');
+        if (dets === 0) {
+          const hint = skippedUnknown > 0
+            ? `0 wykryć — ${skippedUnknown} pominięto (klasy spoza datasetu), sprawdź model`
+            : '0 wykryć — sprawdź próg/model';
+          toast(`Auto-etykietowanie zakończone: ${hint}.`, 'warning');
+        } else {
+          toast(`Auto-etykietowanie zakończone: ${dets} wykryć na ${total} obrazach.`, 'success');
+        }
         if (onDone) { try { await onDone(); } catch (_) {} }
         resolve();
         return;
@@ -2528,7 +2536,7 @@ function renderRecogAnnotateTab(panel, p) {
         </div>
         <tf-select id="ml-studio-annot-dataset" label="Dataset COCO"></tf-select>
         <div class="ml-studio-annot-autolabel" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
-          <tf-input id="ml-studio-annot-threshold" type="number" label="Próg" value="0.5" min="0" max="1" step="0.05" style="width:110px"></tf-input>
+          <tf-input id="ml-studio-annot-threshold" type="number" label="Próg" value="0.5" min="0.5" max="1" step="0.05" style="width:110px"></tf-input>
           <tf-select id="ml-studio-annot-mode" label="Tryb">
             <option value="only_empty">Tylko puste</option>
             <option value="overwrite">Nadpisz</option>
@@ -2576,7 +2584,9 @@ function renderRecogAnnotateTab(panel, p) {
       const modeEl = byId('ml-studio-annot-mode');
       const threshold = Number(thrEl?.value ?? 0.5);
       const mode = String(modeEl?.value ?? 'only_empty');
-      if (!(threshold >= 0 && threshold <= 1)) { toast('Próg musi być w zakresie 0–1.', 'error'); return; }
+      // Floor of 0.5: the RF-DETR detector hard-drops anything below it, so a lower
+      // threshold cannot surface extra boxes (server enforces the same range).
+      if (!(threshold >= 0.5 && threshold <= 1)) { toast('Próg musi być w zakresie 0,5–1.', 'error'); return; }
       const prog = byId('ml-studio-annot-autolabel-prog');
       btn.setAttribute('disabled', '');
       try {
