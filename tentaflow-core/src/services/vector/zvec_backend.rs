@@ -19,8 +19,7 @@ use tentaflow_zvec::{
 };
 
 use super::backend::{
-    Field, FieldSpec, FieldValue, Filter, Fusion, Metric, SearchHit, SparseVector, UpsertItem,
-    VectorBackend,
+    Field, FieldSpec, FieldValue, Filter, Fusion, Metric, SearchHit, SparseVector, VectorBackend,
 };
 use super::error::{Result, VectorError};
 use super::filter;
@@ -145,13 +144,9 @@ impl ZvecBackend {
     }
 }
 
-impl ZvecBackend {
-    /// Validate one item and run the in-memory upsert WITHOUT flushing. The
-    /// caller holds the collection lock and is responsible for flushing once
-    /// (so a batch does a single fsync instead of one per element).
-    fn upsert_locked_no_flush(
+impl VectorBackend for ZvecBackend {
+    fn upsert(
         &self,
-        coll: &Collection,
         ref_id: u64,
         vector: &[f32],
         fields: &[Field],
@@ -182,38 +177,10 @@ impl ZvecBackend {
             })
             .collect();
         let sparse_ref = sparse.map(|s| (s.indices.as_slice(), s.values.as_slice()));
-        coll.upsert_no_flush(ref_id, vector, &zfields, sparse_ref)
+        self.inner
+            .lock()
+            .upsert(ref_id, vector, &zfields, sparse_ref)
             .map_err(map_err)
-    }
-}
-
-impl VectorBackend for ZvecBackend {
-    fn upsert(
-        &self,
-        ref_id: u64,
-        vector: &[f32],
-        fields: &[Field],
-        sparse: Option<&SparseVector>,
-    ) -> Result<()> {
-        let coll = self.inner.lock();
-        self.upsert_locked_no_flush(&coll, ref_id, vector, fields, sparse)?;
-        coll.flush().map_err(map_err)
-    }
-
-    fn upsert_batch(&self, items: &[UpsertItem<'_>]) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        let coll = self.inner.lock();
-        // Upsert wszystkie wektory do indeksu w pamięci, flush RAZ na końcu:
-        // flush per-element fsyncuje cały rosnący indeks (O(n) zapisów dysku dla
-        // dokumentu z n chunkami). Błąd któregokolwiek elementu zwraca się od razu
-        // — częściowo wstawione (jeszcze nieflushowane) wektory sprząta caller
-        // (cleanup-on-failure w store), a brak flusha = nie utrwalone na dysku.
-        for it in items {
-            self.upsert_locked_no_flush(&coll, it.ref_id, it.vector, it.fields, it.sparse)?;
-        }
-        coll.flush().map_err(map_err)
     }
 
     fn hybrid_search(
@@ -420,46 +387,6 @@ mod tests {
         assert!(matches!(
             be.upsert(0, &[1.0, 0.0], &[], None).unwrap_err(),
             VectorError::InvalidRefId
-        ));
-    }
-
-    #[test]
-    fn test_upsert_batch_persists_and_searchable() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("batch.usearch");
-        {
-            let be =
-                ZvecBackend::open_or_create(path.clone(), 4, Metric::Cosine, &[], false).unwrap();
-            let v0 = [1.0f32, 0.0, 0.0, 0.0];
-            let v1 = [0.0f32, 1.0, 0.0, 0.0];
-            let v2 = [0.0f32, 0.0, 1.0, 0.0];
-            let items = vec![
-                UpsertItem { ref_id: 1, vector: &v0, fields: &[], sparse: None },
-                UpsertItem { ref_id: 2, vector: &v1, fields: &[], sparse: None },
-                UpsertItem { ref_id: 3, vector: &v2, fields: &[], sparse: None },
-            ];
-            be.upsert_batch(&items).unwrap();
-            assert_eq!(be.count(), 3);
-        }
-        // Reopen proves the single end-of-batch flush actually persisted.
-        let be2 = ZvecBackend::open_or_create(path, 4, Metric::Cosine, &[], false).unwrap();
-        assert_eq!(be2.count(), 3);
-        let hits = be2.search(&[0.99, 0.01, 0.0, 0.0], 1, None, &[]).unwrap();
-        assert_eq!(hits[0].ref_id, 1);
-    }
-
-    #[test]
-    fn test_upsert_batch_rejects_dim_mismatch() {
-        let (_dir, be) = tmp_backend(4, Metric::Cosine);
-        let good = [1.0f32, 0.0, 0.0, 0.0];
-        let bad = [1.0f32, 0.0];
-        let items = vec![
-            UpsertItem { ref_id: 1, vector: &good, fields: &[], sparse: None },
-            UpsertItem { ref_id: 2, vector: &bad, fields: &[], sparse: None },
-        ];
-        assert!(matches!(
-            be.upsert_batch(&items).unwrap_err(),
-            VectorError::DimMismatch { .. }
         ));
     }
 
