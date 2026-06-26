@@ -14,7 +14,7 @@ use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::services::org::DEFAULT_ORG_ID;
-use crate::services::vector::backend::{Field, FieldSpec, Metric};
+use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
 use tentaflow_sdk_spec::{FieldType, FieldValue, Filter};
 
 const NODE_TYPE: &str = "store";
@@ -305,10 +305,12 @@ impl NodeAdapter for StoreNodeAdapter {
             Err(e) => return Err(anyhow!("store: cleanup-then-reingest: {e}")),
         }
 
-        // Faza 2: zapis. Trackujemy zapisane ref_id, by przy błędzie któregokolwiek
-        // chunka skasować WSZYSTKIE już zapisane (cleanup-on-failure) — zero
-        // częściowego ingestu (lustro run_ingest_pipeline z addona).
-        let mut written_refs: Vec<u64> = Vec::with_capacity(prepared.len());
+        // Faza 2: zapis. Cały dokument idzie JEDNYM batched upsertem — zvec buduje
+        // graf HNSW znacznie taniej z N doków naraz niż z N pojedynczych insertów
+        // (pojedyncze insert+flush per chunk to anty-wzorzec: ~100-150 s na
+        // dokument). Metadane chunków budujemy z wyprzedzeniem (muszą przeżyć
+        // pożyczające je `UpsertItem`), wektory pożyczamy wprost z `prepared`.
+        let mut fields_per_chunk: Vec<Vec<Field>> = Vec::with_capacity(prepared.len());
         for chunk in &prepared {
             let mut field_values = vec![
                 Field {
@@ -330,39 +332,42 @@ impl NodeAdapter for StoreNodeAdapter {
                     value: FieldValue::Str(cid.clone()),
                 });
             }
+            fields_per_chunk.push(field_values);
+        }
 
-            let upsert = ctx.vectors.upsert_with_quota(
-                &org,
-                addon,
-                &namespace,
-                chunk.ref_id,
-                &chunk.vector,
-                dim,
-                metric,
-                &field_specs,
-                &field_values,
-                false,
-                None,
-            );
-            match upsert {
-                Ok(_) => written_refs.push(chunk.ref_id),
-                Err(e) => {
-                    // Cleanup-on-failure: skasuj wszystkie zapisane do tej pory
-                    // wektory tego dokumentu. Błąd cleanupu doklejamy do
-                    // komunikatu — ingest i tak kończy się Err.
-                    let cleanup_err = Self::rollback(ctx, &org, addon, &namespace, &written_refs);
-                    return match cleanup_err {
-                        Some(ce) => Err(anyhow!(
-                            "store: zapis chunka {} nieudany: {e}; dodatkowo cleanup nieudany: {ce}",
-                            chunk.chunk_index
-                        )),
-                        None => Err(anyhow!(
-                            "store: zapis chunka {} nieudany: {e}",
-                            chunk.chunk_index
-                        )),
-                    };
-                }
-            }
+        let items: Vec<UpsertItem<'_>> = prepared
+            .iter()
+            .zip(fields_per_chunk.iter())
+            .map(|(chunk, fields)| UpsertItem {
+                ref_id: chunk.ref_id,
+                vector: &chunk.vector,
+                fields: fields.as_slice(),
+                sparse: None,
+            })
+            .collect();
+
+        if let Err(e) = ctx.vectors.upsert_batch_with_quota(
+            &org,
+            addon,
+            &namespace,
+            dim,
+            metric,
+            &field_specs,
+            false,
+            &items,
+        ) {
+            // Cleanup-on-failure: batch jest transakcyjny po stronie quoty i
+            // robi jeden insert, ale gdyby częściowo zapisał (błąd backendu po
+            // wstawieniu części doków), kasujemy wszystkie ref_id dokumentu —
+            // zero częściowego ingestu (lustro run_ingest_pipeline z addona).
+            let all_refs: Vec<u64> = prepared.iter().map(|c| c.ref_id).collect();
+            let cleanup_err = Self::rollback(ctx, &org, addon, &namespace, &all_refs);
+            return match cleanup_err {
+                Some(ce) => Err(anyhow!(
+                    "store: batch upsert dokumentu nieudany: {e}; dodatkowo cleanup nieudany: {ce}"
+                )),
+                None => Err(anyhow!("store: batch upsert dokumentu nieudany: {e}")),
+            };
         }
 
         // Markdown rekonstrukcji do raportu. Tekstów chunków NIE przepychamy przez
@@ -391,9 +396,9 @@ impl NodeAdapter for StoreNodeAdapter {
             "op": "store",
             "namespace": namespace,
             "doc_id": doc_id,
-            "written": written_refs.len(),
+            "written": prepared.len(),
             "markdown": markdown,
-            "chunks": written_refs.len(),
+            "chunks": prepared.len(),
         });
         if let Some(pc) = page_count {
             payload["page_count"] = serde_json::json!(pc);
@@ -403,7 +408,7 @@ impl NodeAdapter for StoreNodeAdapter {
         out.payload = FlowValue::Json(payload);
         out.meta.insert(
             "stored_chunks".to_string(),
-            serde_json::json!(written_refs.len()),
+            serde_json::json!(prepared.len()),
         );
         Ok(out)
     }

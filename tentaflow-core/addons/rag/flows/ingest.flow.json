@@ -109,10 +109,7 @@
     {
       "id": "chunk",
       "type": "chunk",
-      "config": {
-        "size": 6144,
-        "overlap": 400
-      },
+      "config": {},
       "position": {
         "x": 1320,
         "y": 60
