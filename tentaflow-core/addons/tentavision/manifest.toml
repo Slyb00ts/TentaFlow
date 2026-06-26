@@ -1,0 +1,212 @@
+[addon]
+id = "tentavision"
+name = "TentaVision"
+version = "0.0.1"
+description = "Analiza obrazu z kamer — podstawowy podgląd i zarządzanie kamerami (MVP bez AI)"
+category = "surveillance"
+keywords = ["video", "camera", "cctv", "surveillance"]
+author = "TentaFlow"
+license = "Apache-2.0"
+icon = "video"
+runtime = "wasmtime"
+platforms = ["linux"]
+wasm_file = "addon.wasm"
+
+[application]
+entry_panel = "overview"
+title = "TentaVision"
+icon = "video"
+description = "Analiza obrazu z kamer"
+sort_order = 50
+
+[[permission]]
+id = "cameras.read"
+display_name = "Lista i odczyt kamer"
+description = "Listowanie i pobieranie szczegółów kamer w organizacji."
+risk = "low"
+
+[[permission]]
+id = "cameras.write"
+display_name = "Dodawanie i usuwanie kamer"
+description = "Dodawanie nowych kamer RTSP/ONVIF, edycja, usuwanie."
+risk = "medium"
+
+[[permission]]
+id = "cameras.snapshot"
+display_name = "Pobieranie klatek z kamer"
+description = "Pojedyncze migawki RGB24 dla podglądu."
+risk = "medium"
+
+[[permission]]
+id = "streams.subscribe"
+display_name = "Subskrypcja strumieni"
+description = "Strumień klatek na żywo z subscribed kamer."
+risk = "medium"
+
+[[permission]]
+id = "recording.read"
+display_name = "Dostęp do nagrań"
+description = "Pobieranie URL-i do nagrań i klatek przez signed URL."
+risk = "low"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt SQL"
+description = "SELECT/WITH/EXPLAIN na per-addon bazie SQLite (kamery, profile, alarmy, strefy, modele, audyt)."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis SQL"
+description = "INSERT/UPDATE/DELETE na per-addon bazie SQLite."
+risk = "medium"
+
+[[permission]]
+id = "vector.read"
+display_name = "Wyszukiwanie wektorowe"
+description = "k-NN nad wektorowymi przestrzeniami nazw addona (semantyczne wyszukiwanie zdarzeń)."
+risk = "low"
+
+[[permission]]
+id = "vector.write"
+display_name = "Zapis wektorów"
+description = "Upsert/usuwanie wektorów w przestrzeniach nazw addona (indeksowanie zdarzeń)."
+risk = "medium"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generowanie przez model"
+description = "Wywołania modelu embeddingów do indeksowania i wyszukiwania semantycznego zdarzeń."
+risk = "medium"
+
+[[permission]]
+id = "ui"
+display_name = "Renderowanie UI"
+description = "Renderowanie deklaratywnego UI panelu aplikacji."
+risk = "low"
+
+[[permission]]
+id = "alias.read"
+display_name = "Odczyt aliasów modeli"
+description = "Listowanie aliasów/modeli przyznanych addonowi przez system grantów (Bindings)."
+risk = "low"
+
+[[permission]]
+id = "events"
+display_name = "Subskrypcja zdarzeń"
+description = "Nasłuch zdarzeń systemowych (camera.alarm) i zapis alarmów z flow analizy."
+risk = "low"
+
+# AI aliases owned by TentaVision. Each is registered in the global model alias
+# registry at install with its capability methods; the operator picks the
+# concrete backing model per slot in the Bindings tab. Visibility=private — only
+# TentaVision consumes them (it is both owner and consumer below).
+[[alias]]
+id = "tentavision-yolo"
+display_name = "Detekcja obiektów (YOLO)"
+methods = ["detect", "track"]
+suggested_default = "yolo11m-detector"
+visibility = "private"
+
+[[alias]]
+id = "tentavision-ocr"
+display_name = "Rozpoznawanie tekstu (OCR)"
+methods = ["recognize", "recognize_cropped"]
+suggested_default = "ppocrv5-ocr"
+visibility = "private"
+
+[[alias]]
+id = "tentavision-action"
+display_name = "Klasyfikacja akcji"
+methods = ["classify_window"]
+suggested_default = "videomae-v2-rwf2k"
+visibility = "private"
+
+[[alias]]
+id = "tentavision-vlm"
+display_name = "Model wizyjno-językowy (VLM)"
+methods = ["embed", "caption"]
+suggested_default = "siglip2-vit-l14"
+visibility = "private"
+
+[[alias]]
+id = "tentavision-face-embed"
+display_name = "Embedding twarzy"
+methods = ["embed"]
+suggested_default = "adaface-r100"
+gate = "d4-historical"
+visibility = "private"
+
+[[alias]]
+id = "tentavision-reid"
+display_name = "Re-identyfikacja osób (ReID)"
+methods = ["embed", "match"]
+suggested_default = ""
+gate = "d4-historical"
+visibility = "private"
+
+# Consumer-side declarations — TentaVision uses the aliases it owns. Because the
+# addon owns these aliases, install reconciles each row to `auto_granted` (the
+# owner-match short-circuit in compute_uses_alias_status_within_tx), so the
+# Bindings discovery list is populated immediately without admin action.
+[[uses_alias]]
+id = "tentavision-yolo"
+required = false
+reason = "Detekcja obiektów na klatkach kamer."
+
+[[uses_alias]]
+id = "tentavision-ocr"
+required = false
+reason = "Rozpoznawanie tablic/tekstu na klatkach."
+
+[[uses_alias]]
+id = "tentavision-action"
+required = false
+reason = "Klasyfikacja akcji w oknie czasowym."
+
+[[uses_alias]]
+id = "tentavision-vlm"
+required = false
+reason = "Embedding i opis sceny do wyszukiwania semantycznego."
+
+[[uses_alias]]
+id = "tentavision-face-embed"
+required = false
+reason = "Embedding twarzy (gated d4-historical)."
+
+[[uses_alias]]
+id = "tentavision-reid"
+required = false
+reason = "Re-identyfikacja osób między kamerami (gated d4-historical)."
+
+[visibility]
+admin_only = false
+show_in_catalog = true
+
+# Per-addon SQL storage with migrations — the source of truth for all
+# TentaVision domain data (cameras, profiles, alarms, zones, models, audit,
+# settings, evidence). Schema lives in migrations/ and is applied per-instance.
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+# Vector namespace for semantic event search. Holds one embedding per alarm,
+# built from the alarm text doc via the jina-embeddings-v5-text-small model
+# (1024 dims, cosine). ref_id is a stable u64 hash of the alarm string id; the
+# alarm_id ↔ ref_id mapping lives in the `vector_refs` SQL table.
+[[vector_namespace]]
+name = "events"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[resources]
+memory_mb = 128
+fuel_limit = 200000000
+# storage limit MUST be explicit > 0 — lifecycle.rs writes
+# storage_total_mb.unwrap_or(0) to the DB and the storage host function
+# rejects every store_set when the limit is 0 (no unlimited semantics).
+storage_total_mb = 50
