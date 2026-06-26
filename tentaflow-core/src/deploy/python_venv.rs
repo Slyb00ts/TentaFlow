@@ -720,7 +720,16 @@ fn prepare_template_env(
     } else {
         create_venv(python, &template_dir, log)?;
     }
-    install_deps(&template_dir, uv, spec, variant, bundle_src, extra_env, log)?;
+    install_deps(
+        &template_dir,
+        python,
+        uv,
+        spec,
+        variant,
+        bundle_src,
+        extra_env,
+        log,
+    )?;
     copy_bundle_files(bundle_src, &template_dir)?;
     std::fs::write(&install_complete_marker, template_id.as_bytes())
         .context("zapis markera template install complete")?;
@@ -991,8 +1000,62 @@ fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 /// `variant` niesie konfiguracje specyficzna dla backendu GPU
 /// (extra_index -> PyTorch wheels per CUDA/ROCm/Metal, extras -> dodatkowe
 /// pakiety typu vllm-metal/flash-attn).
+/// Czy katalog bundla jest uv-native — tzn. ma zarowno `pyproject.toml` jak i
+/// `uv.lock`. Takie bundle definiuja CALY graf zaleznosci (z pinami indeksu, np.
+/// torch cu121) w pyproject + lockfile i MUSZA byc instalowane przez `uv sync`,
+/// a nie przez pip/requirements — inaczej resolver bierze generyczny torch z
+/// domyslnego PyPI i pomija deps deklarowane wylacznie w pyproject (uvicorn,
+/// fastapi). Pip-/requirements-/git-based bundle (ComfyUI, parakeet) nie maja
+/// uv.lock i ida swoja dotychczasowa sciezka.
+fn is_uv_native_bundle(bundle_src: &Path) -> bool {
+    bundle_src.join("pyproject.toml").exists() && bundle_src.join("uv.lock").exists()
+}
+
+/// Instaluje uv-native bundle przez `uv sync`: tworzy w docelowym venv DOKLADNIE
+/// zablokowany graf z `uv.lock` (lacznie z torchem z indeksu zadeklarowanego w
+/// `[tool.uv.sources]`/`[[tool.uv.index]]`) oraz console scripts (`bin/uvicorn`,
+/// `bin/fastapi`). `UV_PROJECT_ENVIRONMENT` celuje w istniejacy venv deployu, a
+/// `--python` w prowizjonowany interpreter python-build-standalone — dzieki temu
+/// uv nie tworzy wlasnego `.venv` ani nie pobiera wlasnego Pythona. `--frozen`
+/// wymusza zgodnosc z lockfile (failuje glosno przy driftcie).
+fn uv_sync_project(
+    venv: &Path,
+    python: &Path,
+    uv: &Path,
+    bundle_src: &Path,
+    extra_env: &HashMap<String, String>,
+    log: &LogSink,
+) -> Result<()> {
+    log(&format!(
+        "uv sync (uv-native bundle) project={} env={}",
+        bundle_src.display(),
+        venv.display()
+    ));
+    let mut c = Command::new(uv);
+    c.arg("sync")
+        .arg("--frozen")
+        .arg("--no-dev")
+        .arg("--project")
+        .arg(bundle_src)
+        .arg("--python")
+        .arg(python);
+    // Docelowy venv to ten utworzony wczesniej przez `python -m venv`; uv ma
+    // synchronizowac do niego, nie tworzyc `<bundle_src>/.venv`.
+    c.env("UV_PROJECT_ENVIRONMENT", venv);
+    // Duze wheels NVIDIA (cu121 torch ~2.5GB) — ten sam dlugi timeout co reszta
+    // instalacji, zeby slabsza siec nie ucinala pobierania broken-pipe'em.
+    c.env("UV_HTTP_TIMEOUT", "600");
+    // Propaguj HF_TOKEN/HF_HOME/TORCH_HOME itp. z deploy requestu (np. gated
+    // repo, wspolny katalog cache).
+    for (k, v) in extra_env {
+        c.env(k, v);
+    }
+    run_with_logs(&mut c, log).context("uv sync uv-native bundle")
+}
+
 fn install_deps(
     venv: &Path,
+    python: &Path,
     uv: &Option<PathBuf>,
     spec: &BundleSpec,
     variant: Option<&InstallVariant>,
@@ -1000,6 +1063,20 @@ fn install_deps(
     extra_env: &HashMap<String, String>,
     log: &LogSink,
 ) -> Result<()> {
+    // uv-native bundle (pyproject.toml + uv.lock): instaluj zablokowany graf
+    // przez `uv sync` i pomin caly pip/requirements flow. `uv` jest tu twardo
+    // wymagany — bez niego nie da sie odtworzyc lockfile (pip nie czyta uv.lock).
+    if is_uv_native_bundle(bundle_src) {
+        let uv = uv.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "bundle '{}' jest uv-native (pyproject.toml + uv.lock), ale uv \
+                 nie jest dostepny — uv sync jest jedyna sciezka instalacji",
+                spec.bundle.engine
+            )
+        })?;
+        return uv_sync_project(venv, python, uv, bundle_src, extra_env, log);
+    }
+
     let extra_index = variant.and_then(|v| v.extra_index.clone());
     let mut merged_env = extra_env.clone();
     if let Some(v) = variant {
