@@ -2394,7 +2394,7 @@ const RECOG_HP = [
   { key: 'batchSize', label: 'batch size', def: 4, step: '1', min: 1 },
   { key: 'gradAccum', label: 'grad accum', def: 4, step: '1', min: 1 },
   { key: 'learningRate', label: 'learning rate', def: 1e-4, step: '0.00001', min: 0 },
-  { key: 'resolution', label: 'rozdzielczość', def: 560, step: '28', min: 196 },
+  { key: 'resolution', label: 'rozdzielczość', def: 576, step: '32', min: 224 },
 ];
 
 const recogCfg = {};
