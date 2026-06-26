@@ -2448,6 +2448,8 @@ pub fn ml_studio_recog_autolabel_dataset(
     // is not compiled in.
     match crate::ml_studio::autolabel_recog_dataset::spawn_autolabel(
         payload.dataset_id.clone(),
+        dataset.project_id.clone(),
+        org.user_id.clone(),
         dir,
         payload.threshold,
         payload.mode.clone(),
@@ -2480,10 +2482,18 @@ pub fn ml_studio_recog_autolabel_status(
         MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusRequest(p)) => p,
         _ => return Err(ProtocolError::bad_request("expected MlStudioRecogAutolabelStatusRequest")),
     };
-    let _org = require_org(ctx)?;
+    let org = require_org(ctx)?;
 
     let prog = crate::ml_studio::autolabel_recog_dataset::autolabel_progress(&payload.job_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "job not found"))?;
+
+    // A job id alone must not expose progress: verify the caller is a member of the
+    // project the job belongs to (mirrors how the start handler authorizes via the
+    // dataset's project). Unknown project => NotFound, so job existence is not leaked.
+    if prog.project_id.is_empty() {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotFound, "job not found"));
+    }
+    require_project_member(&org.user_id, &prog.project_id)?;
 
     Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusResponse(
         tentaflow_protocol::MlStudioRecogAutolabelStatusResponse {
@@ -2491,6 +2501,7 @@ pub fn ml_studio_recog_autolabel_status(
             images_total: prog.images_total,
             images_done: prog.images_done,
             detections: prog.detections,
+            skipped_unknown: prog.skipped_unknown,
             error: prog.error,
         },
     )))

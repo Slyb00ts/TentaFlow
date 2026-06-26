@@ -23,13 +23,21 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 /// Live progress of an async auto-label job, polled by the UI. `status` is
-/// "running" | "succeeded" | "failed".
+/// "running" | "succeeded" | "failed". `project_id`/`owner_user_id` are stored so
+/// the status handler can authorize the caller against the job's project (a job id
+/// alone must not expose progress to an unrelated user).
 #[derive(Clone, Debug)]
 pub struct AutolabelProgress {
     pub status: String,
     pub images_total: u64,
     pub images_done: u64,
     pub detections: u64,
+    /// Detections dropped because their class name is not among the dataset's COCO
+    /// categories. A fully-mismatched category set finishes with 0 written and a
+    /// non-zero count here, so the UI can hint at the cause instead of "0 detections".
+    pub skipped_unknown: u64,
+    pub project_id: String,
+    pub owner_user_id: String,
     pub error: Option<String>,
 }
 
@@ -40,6 +48,9 @@ impl Default for AutolabelProgress {
             images_total: 0,
             images_done: 0,
             detections: 0,
+            skipped_unknown: 0,
+            project_id: String::new(),
+            owner_user_id: String::new(),
             error: None,
         }
     }
@@ -100,12 +111,17 @@ fn release_dataset(dataset_id: &str) {
 /// is not compiled in.
 pub fn spawn_autolabel(
     dataset_id: String,
+    project_id: String,
+    owner_user_id: String,
     dataset_dir: PathBuf,
     threshold: f64,
     mode: String,
 ) -> Result<String> {
-    if !(0.0..=1.0).contains(&threshold) {
-        anyhow::bail!("próg musi być w zakresie 0.0..=1.0");
+    // The RF-DETR detector hard-drops detections with score <= 0.5 internally
+    // (vision::detector_rfdetr::SCORE_THRESHOLD), so a threshold below 0.5 can never
+    // yield anything extra. Clamp to that floor to keep the knob honest.
+    if !(0.5..=1.0).contains(&threshold) {
+        anyhow::bail!("próg musi być w zakresie 0.5..=1.0");
     }
     let mode = match mode.as_str() {
         "only_empty" | "overwrite" => mode,
@@ -114,7 +130,7 @@ pub fn spawn_autolabel(
 
     #[cfg(not(feature = "inference-vision-gpu"))]
     {
-        let _ = (dataset_id, dataset_dir, threshold, mode);
+        let _ = (dataset_id, project_id, owner_user_id, dataset_dir, threshold, mode);
         anyhow::bail!(
             "auto-etykietowanie wymaga wbudowanego detektora wizyjnego (feature inference-vision-gpu) — niedostępne w tej kompilacji"
         );
@@ -134,7 +150,14 @@ pub fn spawn_autolabel(
         }
 
         let job_id = uuid::Uuid::new_v4().to_string();
-        set_progress(&job_id, AutolabelProgress::default());
+        set_progress(
+            &job_id,
+            AutolabelProgress {
+                project_id: project_id.clone(),
+                owner_user_id: owner_user_id.clone(),
+                ..AutolabelProgress::default()
+            },
+        );
 
         let job_id_task = job_id.clone();
         tokio::spawn(async move {
@@ -182,7 +205,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
     let annot_path = train_dir.join("_annotations.coco.json");
     let buf = std::fs::read(&annot_path)
         .with_context(|| format!("odczyt {}", annot_path.display()))?;
-    let mut coco: Value = serde_json::from_slice(&buf)
+    let coco: Value = serde_json::from_slice(&buf)
         .with_context(|| format!("parsowanie {}", annot_path.display()))?;
 
     // Map RF-DETR class name → COCO category_id via the dataset's own categories.
@@ -241,31 +264,19 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
 
     let mut detector = RfDetrDetector::load().context("ładowanie detektora RF-DETR")?;
 
-    // New annotation ids start above the current maximum so overwrite-mode removals
-    // and only_empty additions never collide with kept ids.
-    let mut next_ann_id: i64 = coco
-        .get("annotations")
-        .and_then(|a| a.as_array())
-        .and_then(|arr| arr.iter().filter_map(|a| a.get("id").and_then(|v| v.as_i64())).max())
-        .unwrap_or(0)
-        + 1;
-
-    // Build the new annotation set. In overwrite mode we start from scratch; in
-    // only_empty mode we keep every existing annotation and only add for images that
-    // had none.
-    let mut new_anns: Vec<Value> = if mode == "overwrite" {
-        Vec::new()
-    } else {
-        coco.get("annotations")
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_default()
-    };
+    // Detections produced per image id during inference. Published only after a FRESH
+    // re-read of the COCO file below, so a manual save made DURING this (minutes-long)
+    // job is never clobbered by the stale start-of-job snapshot.
+    let mut produced: std::collections::HashMap<i64, Vec<Value>> = std::collections::HashMap::new();
 
     let mut total_dets: u64 = 0;
+    let mut skipped_unknown: u64 = 0;
     let mut done: u64 = 0;
     for (image_id, file_name) in &images {
         done += 1;
+        // In only_empty mode skip images that already had annotations at job start —
+        // running the detector on them would be wasted work (they are kept regardless
+        // on the fresh re-read below).
         let skip = mode != "overwrite" && existing_counts.get(image_id).copied().unwrap_or(0) > 0;
         if !skip {
             let img_path = train_dir.join(file_name);
@@ -279,6 +290,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
                                 continue;
                             }
                             let Some(&cat_id) = name_to_cat.get(&d.klasa) else {
+                                skipped_unknown += 1;
                                 continue;
                             };
                             // The detector returns a NORMALIZED bbox [x, y, w, h] in
@@ -287,15 +299,13 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
                             let by = (d.bbox[1] * h as f32).round().max(0.0) as i64;
                             let bw = (d.bbox[2] * w as f32).round().max(0.0) as i64;
                             let bh = (d.bbox[3] * h as f32).round().max(0.0) as i64;
-                            new_anns.push(json!({
-                                "id": next_ann_id,
+                            produced.entry(*image_id).or_default().push(json!({
                                 "image_id": image_id,
                                 "category_id": cat_id,
                                 "bbox": [bx, by, bw, bh],
                                 "area": bw * bh,
                                 "iscrowd": 0,
                             }));
-                            next_ann_id += 1;
                             total_dets += 1;
                         }
                     }
@@ -305,23 +315,87 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
             }
         }
         let dets_snapshot = total_dets;
+        let skipped_snapshot = skipped_unknown;
         update_progress(job_id, |p| {
             p.images_done = done;
             p.detections = dets_snapshot;
+            p.skipped_unknown = skipped_snapshot;
         });
     }
 
-    if let Some(arr) = coco.get_mut("annotations").and_then(|a| a.as_array_mut()) {
+    // Re-read the CURRENT file just before publishing so any manual annotation saved
+    // during this job is preserved (we merge against the fresh state, not the stale
+    // start-of-job snapshot). categories/images come from the fresh read too.
+    let fresh_buf = std::fs::read(&annot_path)
+        .with_context(|| format!("ponowny odczyt {}", annot_path.display()))?;
+    let mut fresh: Value = serde_json::from_slice(&fresh_buf)
+        .with_context(|| format!("ponowne parsowanie {}", annot_path.display()))?;
+
+    // Images that currently (FRESH) have at least one annotation. In only_empty mode
+    // we keep ALL current annotations and only add detector boxes for images that have
+    // zero annotations in the fresh file.
+    let mut fresh_counts: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    if let Some(anns) = fresh.get("annotations").and_then(|a| a.as_array()) {
+        for a in anns {
+            if let Some(iid) = a.get("image_id").and_then(|v| v.as_i64()) {
+                *fresh_counts.entry(iid).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // New annotation ids start above the current maximum in the FRESH file so kept ids
+    // (including any saved mid-job) never collide with the boxes we add.
+    let mut next_ann_id: i64 = fresh
+        .get("annotations")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| arr.iter().filter_map(|a| a.get("id").and_then(|v| v.as_i64())).max())
+        .unwrap_or(0)
+        + 1;
+
+    // Build the published annotation set. overwrite: start empty (replace is the
+    // intended behavior). only_empty: keep every current annotation untouched.
+    let mut new_anns: Vec<Value> = if mode == "overwrite" {
+        Vec::new()
+    } else {
+        fresh
+            .get("annotations")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Stable image order so assigned ids are deterministic across runs.
+    let mut produced_ids: Vec<i64> = produced.keys().copied().collect();
+    produced_ids.sort_unstable();
+    for image_id in produced_ids {
+        // only_empty: only fill images that are empty in the fresh file. overwrite:
+        // every image's detector boxes are added (the array started empty).
+        if mode != "overwrite" && fresh_counts.get(&image_id).copied().unwrap_or(0) > 0 {
+            continue;
+        }
+        if let Some(boxes) = produced.remove(&image_id) {
+            for mut b in boxes {
+                if let Some(obj) = b.as_object_mut() {
+                    obj.insert("id".to_string(), json!(next_ann_id));
+                }
+                new_anns.push(b);
+                next_ann_id += 1;
+            }
+        }
+    }
+
+    if let Some(arr) = fresh.get_mut("annotations").and_then(|a| a.as_array_mut()) {
         *arr = new_anns;
     } else {
-        coco.as_object_mut()
+        fresh
+            .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("COCO nie jest obiektem"))?
             .insert("annotations".to_string(), Value::Array(new_anns));
     }
 
     // Atomic publish: temp + rename so a crash never leaves a half-written COCO file.
     let tmp = annot_path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&coco)?)
+    std::fs::write(&tmp, serde_json::to_vec(&fresh)?)
         .with_context(|| format!("zapis {}", tmp.display()))?;
     std::fs::rename(&tmp, &annot_path)
         .with_context(|| format!("publikacja {}", annot_path.display()))?;
@@ -330,6 +404,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
         p.status = "succeeded".to_string();
         p.images_done = images_total;
         p.detections = total_dets;
+        p.skipped_unknown = skipped_unknown;
     });
     Ok(())
 }

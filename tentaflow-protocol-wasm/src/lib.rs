@@ -9429,6 +9429,8 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "imagesDone", (resp.images_done as f64).into());
             set(obj, "images_done", (resp.images_done as f64).into());
             set(obj, "detections", (resp.detections as f64).into());
+            set(obj, "skippedUnknown", (resp.skipped_unknown as f64).into());
+            set(obj, "skipped_unknown", (resp.skipped_unknown as f64).into());
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),

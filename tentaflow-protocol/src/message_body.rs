@@ -1723,6 +1723,9 @@ pub struct MlStudioRecogAutolabelStatusResponse {
     pub images_done: u64,
     /// Łączna liczba zapisanych detekcji.
     pub detections: u64,
+    /// Detekcje pominięte, bo ich klasa nie występuje w kategoriach datasetu.
+    /// Niezerowa wartość przy `detections == 0` sygnalizuje niedopasowany model.
+    pub skipped_unknown: u64,
     pub error: Option<String>,
 }
 
