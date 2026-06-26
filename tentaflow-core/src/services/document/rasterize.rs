@@ -283,6 +283,81 @@ pub fn rasterize_pdf_streaming(
     Ok(emitted)
 }
 
+/// Wynik szybkiej ekstrakcji warstwy tekstowej PDF (FPDFText). `markdown` to
+/// treść wszystkich stron złączona separatorem stron; `total_chars` służy do
+/// heurystyki "czy ten PDF ma użyteczną warstwę tekstową" (skan → ~0).
+#[derive(Debug, Clone)]
+pub struct PdfTextResult {
+    /// Tekst wszystkich (do `max_pages`) stron złączony separatorem stron.
+    pub markdown: String,
+    /// Liczba stron, z których faktycznie wyciągnięto tekst (≤ `max_pages`).
+    pub page_count: usize,
+    /// Łączna liczba znaków wyekstrahowanego tekstu (bez separatorów). Wejście
+    /// heurystyki text-vs-vision: `total_chars / page_count`.
+    pub total_chars: usize,
+}
+
+/// Separator wstawiany między tekstem kolejnych stron w `PdfTextResult.markdown`.
+/// Pusta linia (jak akapit w markdown) — chunker dalej dzieli po treści.
+const PDF_TEXT_PAGE_SEPARATOR: &str = "\n\n";
+
+/// Szybka ścieżka ingestu PDF: wyciąga GOTOWĄ warstwę tekstową (FPDFText) bez
+/// rasteryzacji i bez modelu vision. Dla PDF z osadzonym tekstem (np. oficjalne
+/// publikacje `*_TXT.pdf`) zwraca treść w sekundy, podczas gdy render+vision
+/// strona-po-stronie zajmuje minuty. Skany/obrazy nie mają warstwy tekstowej —
+/// zwrócą `total_chars` ≈ 0, co woła decyzję o przejściu na ścieżkę vision
+/// (patrz `MIN_TEXT_LAYER_CHARS_PER_PAGE`).
+///
+/// Reużywa współdzielonego uchwytu `pdfium()` i tego samego procesowego mutexu
+/// co rasteryzacja (cała praca pdfium serializowana — inwariant z
+/// `rasterize_pdf_streaming`). Respektuje te same cap-y co render: rozmiar
+/// wejścia (`MAX_PDF_INPUT_BYTES`) i `max_pages`.
+pub fn extract_pdf_text(bytes: &[u8], max_pages: usize) -> Result<PdfTextResult, RasterizeError> {
+    if bytes.len() > MAX_PDF_INPUT_BYTES {
+        return Err(RasterizeError::InputTooLarge(
+            bytes.len(),
+            MAX_PDF_INPUT_BYTES,
+        ));
+    }
+
+    // Ten sam mutex co render: feature `thread_safe` chroni pojedyncze wywołania
+    // FFI, ale równoległy load dwóch dokumentów rozjeżdża globalny stan libpdfium.
+    let _guard = render_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pdfium = pdfium()?;
+    let document = pdfium.load_pdf_from_byte_slice(bytes, None)?;
+
+    let total: i32 = document.pages().len();
+    if total <= 0 {
+        return Err(RasterizeError::EmptyDocument);
+    }
+
+    let limit: i32 = max_pages.min(i32::MAX as usize) as i32;
+    let limit = limit.min(total);
+
+    let mut markdown = String::new();
+    let mut total_chars: usize = 0;
+    let mut page_count: usize = 0;
+    for index in 0..limit {
+        let page = document.pages().get(index)?;
+        // FPDFText: treść warstwy tekstowej tej strony (pusta dla skanu/obrazu).
+        let page_text = page.text()?.all();
+        total_chars += page_text.chars().count();
+        if page_count > 0 {
+            markdown.push_str(PDF_TEXT_PAGE_SEPARATOR);
+        }
+        markdown.push_str(&page_text);
+        page_count += 1;
+    }
+
+    Ok(PdfTextResult {
+        markdown,
+        page_count,
+        total_chars,
+    })
+}
+
 /// Koduje surowy bufor RGB8 (`w*h*3` bajtów) do PNG. Współdzielone przez
 /// streaming-producer; trzymane tu, bo to część ścieżki rasteryzacji (RGB nie
 /// opuszcza tej warstwy — executor dostaje od razu PNG).
@@ -316,12 +391,34 @@ fn target_dimensions(width_pt: f32, height_pt: f32, dpi: f32) -> (i32, i32) {
     (w as i32, h as i32)
 }
 
-/// Generuje minimalny, poprawny PDF (`pages` stron A4) bez zewnętrznego crate'a
-/// — czysta ścieżka rasteryzacji. Wzór ze spike'a `_scratch/pdf-spike`.
-/// `pub(crate)` + test-only: współdzielony przez testy rasteryzera i pipeline'u
-/// PDF→merge w `document::mod`.
+/// Generuje minimalny, poprawny PDF (`pages` stron A4) z krótkim tekstem
+/// "Strona {i}" — za mało znaków, by przejść próg warstwy tekstowej, więc testy
+/// rasteryzacji/vision dostają „skanopodobny" PDF (ścieżka render). Wzór ze
+/// spike'a `_scratch/pdf-spike`. `pub(crate)` + test-only.
 #[cfg(test)]
 pub(crate) fn minimal_pdf(pages: usize) -> Vec<u8> {
+    build_pdf(pages, |i| format!("Strona {i}"))
+}
+
+/// Generuje PDF z BOGATĄ warstwą tekstową (wiele linii na stronę) — powyżej
+/// progu `MIN_TEXT_LAYER_CHARS_PER_PAGE`, więc `extract_pdf_text` rozpozna go
+/// jako PDF z gotowym tekstem (szybka ścieżka, pomija vision). Test-only.
+#[cfg(test)]
+pub(crate) fn text_layer_pdf(pages: usize) -> Vec<u8> {
+    // Każda strona: dużo tekstu (kilkaset znaków >> próg 100). Powtarzamy długą
+    // frazę wielokrotnie, by pdfium widział bogatą warstwę tekstową w `Tj`.
+    build_pdf(pages, |i| {
+        let line = "Tresc dokumentu z osadzona warstwa tekstowa do indeksu RAG ";
+        let body = line.repeat(8);
+        format!("{body} strona {i}")
+    })
+}
+
+/// Wspólny builder PDF: `page_text(i)` zwraca treść tekstową strony `i`. Tekst
+/// trafia do strumienia treści jako pojedynczy `Tj`, dzięki czemu pdfium widzi
+/// go w warstwie tekstowej (FPDFText).
+#[cfg(test)]
+fn build_pdf(pages: usize, page_text: impl Fn(usize) -> String) -> Vec<u8> {
         let mut objs: Vec<String> = Vec::new();
         objs.push("<< /Type /Catalog /Pages 2 0 R >>".to_string());
         let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i * 2)).collect();
@@ -338,11 +435,22 @@ pub(crate) fn minimal_pdf(pages: usize) -> Vec<u8> {
                 2 + pages * 2 + 1,
                 content_obj
             ));
-            let text = format!("BT /F1 24 Tf 72 720 Td (Strona {i}) Tj ET");
+            // Tekst łamiemy na linie (~60 znaków) i każdą emitujemy osobnym `Tj`
+            // z przesunięciem `Td` w dół. Inaczej jedna długa linia wybiega poza
+            // MediaBox i pdfium ekstrahuje tylko widoczne glify — testowy PDF z
+            // bogatą warstwą tekstową musi faktycznie zmieścić tekst na stronie.
+            let full = page_text(i);
+            let chars: Vec<char> = full.chars().collect();
+            let mut content = String::from("BT /F1 10 Tf 72 760 Td 12 TL\n");
+            for chunk in chars.chunks(60) {
+                let line: String = chunk.iter().collect();
+                content.push_str(&format!("({line}) Tj T*\n"));
+            }
+            content.push_str("ET");
             objs.push(format!(
                 "<< /Length {} >>\nstream\n{}\nendstream",
-                text.len(),
-                text
+                content.len(),
+                content
             ));
         }
         objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
@@ -441,6 +549,35 @@ mod tests {
         // Po 3. stronie sink zwrócił Closed → break PRZED inkrementacją emitted.
         assert_eq!(emitted, 2, "render przerwany po zamknięciu kanału");
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn extract_pdf_text_reads_embedded_layer() {
+        let pdf = text_layer_pdf(3);
+        let res = extract_pdf_text(&pdf, 200).expect("ekstrakcja warstwy tekstowej");
+        assert_eq!(res.page_count, 3, "trzy strony");
+        assert!(res.total_chars > 0, "warstwa tekstowa niepusta");
+        assert!(
+            res.total_chars / res.page_count >= 100,
+            "bogaty tekst > próg 100 znaków/stronę (avg={})",
+            res.total_chars / res.page_count
+        );
+        // Treść warstwy tekstowej obecna (marker łamany na granicy linii, więc
+        // sprawdzamy stabilny fragment frazy, nie numer strony).
+        assert!(res.markdown.contains("Tresc"), "treść warstwy tekstowej");
+        // Separator stron rozdziela trzy strony.
+        assert_eq!(
+            res.markdown.matches(PDF_TEXT_PAGE_SEPARATOR).count(),
+            2,
+            "dwa separatory między trzema stronami"
+        );
+    }
+
+    #[test]
+    fn extract_pdf_text_respects_max_pages() {
+        let pdf = text_layer_pdf(5);
+        let res = extract_pdf_text(&pdf, 2).expect("ekstrakcja z cap-em stron");
+        assert_eq!(res.page_count, 2, "cap stron egzekwowany w ekstrakcji tekstu");
     }
 
     #[test]
