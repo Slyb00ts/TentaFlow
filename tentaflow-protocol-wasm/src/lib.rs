@@ -2218,6 +2218,86 @@ pub fn encode_ml_studio_recog_save_annotations_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioSchemaGetRequest)]
+pub fn encode_ml_studio_schema_get_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::SchemaGetRequest(
+            tentaflow_protocol::MlStudioSchemaGetRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioSchemaSaveRequest)]
+pub fn encode_ml_studio_schema_save_request(
+    project_id: String,
+    schema_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::SchemaSaveRequest(
+            tentaflow_protocol::MlStudioSchemaSaveRequest {
+                project_id,
+                schema_json,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioLookupDictsListRequest)]
+pub fn encode_ml_studio_lookup_dicts_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::LookupDictsListRequest(
+            tentaflow_protocol::MlStudioLookupDictsListRequest { project_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioLookupDictSaveRequest)]
+pub fn encode_ml_studio_lookup_dict_save_request(
+    project_id: String,
+    dict_id: String,
+    name: String,
+    rows_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::LookupDictSaveRequest(
+            tentaflow_protocol::MlStudioLookupDictSaveRequest {
+                project_id,
+                dict_id,
+                name,
+                rows_json,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioLookupDictDeleteRequest)]
+pub fn encode_ml_studio_lookup_dict_delete_request(dict_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::LookupDictDeleteRequest(
+            tentaflow_protocol::MlStudioLookupDictDeleteRequest { dict_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioServiceModelsListRequest)]
+pub fn encode_ml_studio_service_models_list_request(
+    capability: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ServiceModelsListRequest(
+            tentaflow_protocol::MlStudioServiceModelsListRequest { capability },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioRecogDatasetRegisterRequest)]
 pub fn encode_ml_studio_recog_dataset_register_request(
     project_id: String,
@@ -9515,6 +9595,70 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
             }
+        }
+        tentaflow_protocol::MlStudioPayload::SchemaGetRequest(req) => {
+            set(obj, "variant", "MlStudioSchemaGetRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::SchemaGetResponse(resp) => {
+            set(obj, "variant", "MlStudioSchemaGetResponse".into());
+            set(obj, "schemaJson", resp.schema_json.clone().into());
+            set(obj, "schema_json", resp.schema_json.into());
+        }
+        tentaflow_protocol::MlStudioPayload::SchemaSaveRequest(req) => {
+            set(obj, "variant", "MlStudioSchemaSaveRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "schemaJson", req.schema_json.clone().into());
+            set(obj, "schema_json", req.schema_json.into());
+        }
+        tentaflow_protocol::MlStudioPayload::SchemaSaveResponse(resp) => {
+            set(obj, "variant", "MlStudioSchemaSaveResponse".into());
+            set(obj, "ok", resp.ok.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictsListRequest(req) => {
+            set(obj, "variant", "MlStudioLookupDictsListRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictsListResponse(resp) => {
+            set(obj, "variant", "MlStudioLookupDictsListResponse".into());
+            set(obj, "dictsJson", resp.dicts_json.clone().into());
+            set(obj, "dicts_json", resp.dicts_json.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictSaveRequest(req) => {
+            set(obj, "variant", "MlStudioLookupDictSaveRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "dictId", req.dict_id.clone().into());
+            set(obj, "dict_id", req.dict_id.into());
+            set(obj, "name", req.name.into());
+            set(obj, "rowsJson", req.rows_json.clone().into());
+            set(obj, "rows_json", req.rows_json.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictSaveResponse(resp) => {
+            set(obj, "variant", "MlStudioLookupDictSaveResponse".into());
+            set(obj, "dictId", resp.dict_id.clone().into());
+            set(obj, "dict_id", resp.dict_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictDeleteRequest(req) => {
+            set(obj, "variant", "MlStudioLookupDictDeleteRequest".into());
+            set(obj, "dictId", req.dict_id.clone().into());
+            set(obj, "dict_id", req.dict_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::LookupDictDeleteResponse(resp) => {
+            set(obj, "variant", "MlStudioLookupDictDeleteResponse".into());
+            set(obj, "ok", resp.ok.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ServiceModelsListRequest(req) => {
+            set(obj, "variant", "MlStudioServiceModelsListRequest".into());
+            set(obj, "capability", req.capability.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ServiceModelsListResponse(resp) => {
+            set(obj, "variant", "MlStudioServiceModelsListResponse".into());
+            set(obj, "modelsJson", resp.models_json.clone().into());
+            set(obj, "models_json", resp.models_json.into());
         }
     }
 }

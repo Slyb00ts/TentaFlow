@@ -617,6 +617,178 @@ pub fn ml_studio_recog_dataset_register(
     )))
 }
 
+#[handler(variant = "MlStudioSchemaGetRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_schema_get(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::SchemaGetRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioSchemaGetRequest")),
+    };
+    let org = require_org(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
+    let schema_json = repository::schema_get(&payload.project_id).map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::SchemaGetResponse(
+        tentaflow_protocol::MlStudioSchemaGetResponse { schema_json },
+    )))
+}
+
+#[handler(variant = "MlStudioSchemaSaveRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_schema_save(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::SchemaSaveRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioSchemaSaveRequest")),
+    };
+    let org = require_org(ctx)?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+    repository::schema_upsert(&payload.project_id, &payload.schema_json).map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::SchemaSaveResponse(
+        tentaflow_protocol::MlStudioSchemaSaveResponse { ok: true },
+    )))
+}
+
+#[handler(variant = "MlStudioLookupDictsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_lookup_dicts_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::LookupDictsListRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictsListRequest")),
+    };
+    let org = require_org(ctx)?;
+    require_project_member(&org.user_id, &payload.project_id)?;
+    let dicts = repository::lookup_dicts_list(&payload.project_id).map_err(db_err)?;
+    let arr: Vec<serde_json::Value> = dicts
+        .into_iter()
+        .map(|(dict_id, name, rows_json)| {
+            serde_json::json!({
+                "dictId": dict_id,
+                "name": name,
+                "rowsJson": rows_json,
+            })
+        })
+        .collect();
+    let dicts_json =
+        serde_json::to_string(&arr).map_err(|e| ProtocolError::internal(e.to_string()))?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictsListResponse(
+        tentaflow_protocol::MlStudioLookupDictsListResponse { dicts_json },
+    )))
+}
+
+#[handler(variant = "MlStudioLookupDictSaveRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_lookup_dict_save(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::LookupDictSaveRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictSaveRequest")),
+    };
+    let org = require_org(ctx)?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+    let dict_id = repository::lookup_dict_upsert(
+        &payload.project_id,
+        &payload.dict_id,
+        &payload.name,
+        &payload.rows_json,
+    )
+    .map_err(|e| ProtocolError::bad_request(format!("save lookup dict failed: {}", e)))?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictSaveResponse(
+        tentaflow_protocol::MlStudioLookupDictSaveResponse { dict_id },
+    )))
+}
+
+#[handler(variant = "MlStudioLookupDictDeleteRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_lookup_dict_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::LookupDictDeleteRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictDeleteRequest")),
+    };
+    let org = require_org(ctx)?;
+    let project_id = repository::lookup_dict_project(&payload.dict_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "lookup dict not found"))?;
+    require_project_editor(&org.user_id, &project_id)?;
+    repository::lookup_dict_delete(&payload.dict_id).map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictDeleteResponse(
+        tentaflow_protocol::MlStudioLookupDictDeleteResponse { ok: true },
+    )))
+}
+
+/// Built-in CV models that ship in-core (not registered in `service_models`).
+/// Verified present: `vision/detector_rfdetr.rs`, `vision/ocr_plate.rs`,
+/// `vision/classifier_stan.rs`. A schema field may bind to these without any
+/// service deployment.
+const IN_CORE_MODELS: &[(&str, &str, &str)] = &[
+    ("rfdetr-incore", "RF-DETR (wbudowany)", "detector"),
+    ("ocr-plate-incore", "OCR tablic (wbudowany)", "ocr"),
+    ("classifier-stan-incore", "Klasyfikator stanu (wbudowany)", "classifier"),
+];
+
+#[handler(variant = "MlStudioServiceModelsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_service_models_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ServiceModelsListRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioServiceModelsListRequest")),
+    };
+    // Not project-scoped: any authenticated user (PowerUser policy) may list the
+    // models a schema field can bind to.
+    let _ = require_org(ctx)?;
+    let filter = payload.capability.trim();
+
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    for m in repository::service_models_list().map_err(db_err)? {
+        if !filter.is_empty() && m.capability != filter {
+            continue;
+        }
+        arr.push(serde_json::json!({
+            "id": m.id,
+            "name": m.name,
+            "capability": m.capability,
+            "source": m.source,
+        }));
+    }
+    for (id, name, capability) in IN_CORE_MODELS {
+        if !filter.is_empty() && *capability != filter {
+            continue;
+        }
+        arr.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "capability": capability,
+            "source": "in-core",
+        }));
+    }
+    let models_json =
+        serde_json::to_string(&arr).map_err(|e| ProtocolError::internal(e.to_string()))?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ServiceModelsListResponse(
+        tentaflow_protocol::MlStudioServiceModelsListResponse { models_json },
+    )))
+}
+
 #[handler(variant = "MlStudioDatasetUploadRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]

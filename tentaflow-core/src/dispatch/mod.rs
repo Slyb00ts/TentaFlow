@@ -753,6 +753,36 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsResponse(_) => {
                 "MlStudioRecogSaveAnnotationsResponse"
             }
+            tentaflow_protocol::MlStudioPayload::SchemaGetRequest(_) => "MlStudioSchemaGetRequest",
+            tentaflow_protocol::MlStudioPayload::SchemaGetResponse(_) => "MlStudioSchemaGetResponse",
+            tentaflow_protocol::MlStudioPayload::SchemaSaveRequest(_) => "MlStudioSchemaSaveRequest",
+            tentaflow_protocol::MlStudioPayload::SchemaSaveResponse(_) => {
+                "MlStudioSchemaSaveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictsListRequest(_) => {
+                "MlStudioLookupDictsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictsListResponse(_) => {
+                "MlStudioLookupDictsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictSaveRequest(_) => {
+                "MlStudioLookupDictSaveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictSaveResponse(_) => {
+                "MlStudioLookupDictSaveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictDeleteRequest(_) => {
+                "MlStudioLookupDictDeleteRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::LookupDictDeleteResponse(_) => {
+                "MlStudioLookupDictDeleteResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ServiceModelsListRequest(_) => {
+                "MlStudioServiceModelsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ServiceModelsListResponse(_) => {
+                "MlStudioServiceModelsListResponse"
+            }
         },
         MessageBody::RobotsBody(p) => match p {
             tentaflow_protocol::RobotsPayload::ListRequest(_) => "RobotsListRequest",

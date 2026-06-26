@@ -1055,3 +1055,187 @@ fn read_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectMember> {
         created_at: row.get(5)?,
     })
 }
+
+/// Returns the project's recognition schema JSON verbatim, or `"{}"` when no
+/// schema row exists yet. The JSON is stored opaquely — Core never parses its
+/// internal shape. Authorization is the caller's responsibility (handler gate).
+pub fn schema_get(project_id: &str) -> Result<String> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT json FROM schemas WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(json.unwrap_or_else(|| "{}".to_string()))
+}
+
+/// Upserts the project's recognition schema (one row per project). Updates the
+/// existing row's `json` + `updated_at` in place, or inserts a fresh
+/// `schema_id` when none exists. `schema_json` is stored verbatim.
+pub fn schema_upsert(project_id: &str, schema_json: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    let updated = conn.execute(
+        "UPDATE schemas SET json = ?2, updated_at = datetime('now') WHERE project_id = ?1",
+        params![project_id, schema_json],
+    )?;
+    if updated == 0 {
+        let schema_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO schemas (schema_id, project_id, json) VALUES (?1, ?2, ?3)",
+            params![schema_id, project_id, schema_json],
+        )?;
+    }
+    Ok(())
+}
+
+/// Lists the project's lookup dictionaries as `(dict_id, name, rows_json)`,
+/// newest stable order by name then id. `rows_json` is stored opaquely.
+pub fn lookup_dicts_list(project_id: &str) -> Result<Vec<(String, String, String)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT dict_id, name, rows_json FROM lookup_dicts \
+         WHERE project_id = ?1 ORDER BY name, dict_id",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Upserts one lookup dictionary. Empty `dict_id` inserts with a fresh uuid
+/// (returned); a non-empty id updates that dict's `name` + `rows_json` (scoped to
+/// the project) and returns the same id. `rows_json` is stored opaquely.
+pub fn lookup_dict_upsert(
+    project_id: &str,
+    dict_id: &str,
+    name: &str,
+    rows_json: &str,
+) -> Result<String> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    if dict_id.is_empty() {
+        let new_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO lookup_dicts (dict_id, project_id, name, rows_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![new_id, project_id, name, rows_json],
+        )?;
+        Ok(new_id)
+    } else {
+        let updated = conn.execute(
+            "UPDATE lookup_dicts SET name = ?3, rows_json = ?4 \
+             WHERE dict_id = ?1 AND project_id = ?2",
+            params![dict_id, project_id, name, rows_json],
+        )?;
+        if updated == 0 {
+            bail!("lookup dict not found in project");
+        }
+        Ok(dict_id.to_string())
+    }
+}
+
+/// Deletes a lookup dictionary by id. Returns the project id it belonged to so
+/// the handler can authorize the delete against project membership; errors when
+/// no such dict exists.
+pub fn lookup_dict_delete(dict_id: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    let deleted = conn.execute(
+        "DELETE FROM lookup_dicts WHERE dict_id = ?1",
+        params![dict_id],
+    )?;
+    if deleted == 0 {
+        bail!("lookup dict not found");
+    }
+    Ok(())
+}
+
+/// Resolves the project id that owns a lookup dictionary, or `None` when the
+/// dict does not exist. The delete handler uses this to gate on project access
+/// before removing the row.
+pub fn lookup_dict_project(dict_id: &str) -> Result<Option<String>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    conn.query_row(
+        "SELECT project_id FROM lookup_dicts WHERE dict_id = ?1",
+        params![dict_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// One model a schema field can bind to: id, display name, capability and source.
+/// `capability` is the primary capability (detector/ocr/classifier/...), `source`
+/// distinguishes stored `service_models` rows from built-in in-core models.
+pub struct ServiceModelEntry {
+    pub id: String,
+    pub name: String,
+    pub capability: String,
+    pub source: String,
+}
+
+/// Lists the stored `service_models` rows, one entry per declared capability
+/// (a model advertising several capabilities yields several entries so the
+/// `capability` filter in the handler can match any of them). `capabilities_json`
+/// is parsed as either a JSON array of strings or a JSON object whose keys are
+/// capabilities; an unparseable/empty blob yields a single entry with an empty
+/// capability.
+pub fn service_models_list() -> Result<Vec<ServiceModelEntry>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, capabilities_json, source FROM service_models")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, caps_json, source) = row?;
+        let caps = parse_capabilities(&caps_json);
+        if caps.is_empty() {
+            out.push(ServiceModelEntry {
+                id: id.clone(),
+                name: name.clone(),
+                capability: String::new(),
+                source: source.clone(),
+            });
+        } else {
+            for cap in caps {
+                out.push(ServiceModelEntry {
+                    id: id.clone(),
+                    name: name.clone(),
+                    capability: cap,
+                    source: source.clone(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extracts capability names from a `capabilities_json` blob, accepting either a
+/// JSON array of strings (`["detector","ocr"]`) or a JSON object keyed by
+/// capability (`{"detector":...}`). Returns an empty vec for anything else.
+fn parse_capabilities(caps_json: &str) -> Vec<String> {
+    match serde_json::from_str::<serde_json::Value>(caps_json) {
+        Ok(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        Ok(serde_json::Value::Object(map)) => map.into_iter().map(|(k, _)| k).collect(),
+        _ => Vec::new(),
+    }
+}
