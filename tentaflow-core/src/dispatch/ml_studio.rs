@@ -1045,6 +1045,7 @@ pub fn ml_studio_recog_build_dataset(
         org.user_id.clone(),
         dataset_name,
         payload.fps,
+        payload.source_dir.clone(),
     ) {
         Ok(build_id) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetResponse(
             tentaflow_protocol::MlStudioRecogBuildDatasetResponse {

@@ -2430,6 +2430,7 @@ function renderRecogDataTab(panel, p) {
         </div>
         <p class="ml-studio-data-origin-text" style="margin:0 0 10px">Wgraj wiele plików (jpg/png/heic, mp4/mov). Obrazy są kopiowane, HEIC dekodowane, a z wideo wycinane klatki. Powstaje dataset COCO gotowy do auto-etykietowania, ręcznej anotacji i treningu.</p>
         <tf-file-input id="ml-studio-recog-build-files" accept=".jpg,.jpeg,.png,.heic,.mp4,.mov" multiple label="Przeciągnij pliki lub kliknij, aby wgrać"></tf-file-input>
+        <tf-input id="ml-studio-recog-build-srcdir" label="lub folder na serwerze (ścieżka)" placeholder="np. /mnt/dane/adr" style="margin-top:10px"></tf-input>
         <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
           <tf-input id="ml-studio-recog-build-name" label="Nazwa datasetu" placeholder="np. ADR z terenu" style="flex:1;min-width:200px"></tf-input>
           <tf-input id="ml-studio-recog-build-fps" type="number" label="Klatki/s z wideo" value="5" min="1" max="60" style="min-width:140px"></tf-input>
@@ -2463,20 +2464,25 @@ function renderRecogDataTab(panel, p) {
     const files = liveInput && liveInput.files && liveInput.files.length
       ? Array.from(liveInput.files)
       : recogBuildFiles;
-    if (!files.length) { toast('Wybierz pliki do zbudowania datasetu.', 'error'); return; }
+    // A server folder path makes the file picker optional: when given, Core reads
+    // media straight from disk and no upload happens.
+    const sourceDir = (byId('ml-studio-recog-build-srcdir')?.value || '').trim();
+    if (!sourceDir && !files.length) { toast('Wybierz pliki lub podaj folder na serwerze.', 'error'); return; }
     if (!name) { toast('Podaj nazwę datasetu.', 'error'); return; }
     const btn = byId('ml-studio-recog-build');
     const prog = byId('ml-studio-recog-build-progress');
     btn?.setAttribute('disabled', '');
     try {
-      const total = files.length;
-      for (let i = 0; i < total; i += 1) {
-        if (prog) prog.textContent = `Wysyłanie ${i + 1} / ${total}: ${files[i].name}`;
-        await stageRecogMedia(pid, files[i]);
+      if (!sourceDir) {
+        const total = files.length;
+        for (let i = 0; i < total; i += 1) {
+          if (prog) prog.textContent = `Wysyłanie ${i + 1} / ${total}: ${files[i].name}`;
+          await stageRecogMedia(pid, files[i]);
+        }
       }
       if (prog) prog.textContent = 'Uruchamianie budowy datasetu…';
       const resp = await ApiBinary.one('mlStudioRecogBuildDatasetRequest', {
-        projectId: pid, datasetName: name, fps,
+        projectId: pid, datasetName: name, fps, sourceDir: sourceDir || undefined,
       });
       const buildId = resp.buildId ?? resp.build_id ?? '';
       if (resp.error || !buildId) {
