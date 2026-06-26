@@ -663,6 +663,13 @@ impl Supervisor {
                     .await;
             }
 
+            // Zsynchronizuj `deployed_source_hash` z REALNYM obrazem running
+            // docker-kontenerów. Bez tego badge „update_available" nie wraca
+            // dla kontenerów na starym flat-tagu (poprzedni deploy zaksięgował
+            // baked hash, ale nie przebudował obrazu — running obraz jest stary,
+            // a DB twierdzi że aktualny). ŹRÓDŁEM PRAWDY jest tag obrazu.
+            self.sync_docker_deployed_hashes(&services).await;
+
             // pinned-respawn handled by Krok N4 — list_pinned() is already
             // available in services_repo for the consumer there.
             self.reconcile_handles().await;
@@ -689,6 +696,80 @@ impl Supervisor {
         .await
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
+
+    /// Reconcile `deployed_source_hash` w DB z REALNYM obrazem running
+    /// docker-kontenerów. Dla każdego LOKALNEGO serwisu docker w stanie
+    /// Running/Degraded:
+    ///   1. odczytaj tag obrazu running kontenera (źródło prawdy co biegnie),
+    ///   2. wyłuskaj 12-hex hash z tagu (`...-<12hex>$`), albo "" dla flat/arch,
+    ///   3. porównaj z baked `manifest.docker_source_hash[..12]`,
+    ///   4. nowy deployed = pełny baked gdy hash się zgadza (badge znika),
+    ///      inaczej running12 (pusty/inny → != pełny baked → badge wraca),
+    ///   5. UPDATE tylko gdy `deployed_source_hash` się zmienia (zero churn).
+    /// Nie dotyka serwisów nie-docker ani niebiegnących (brak docker-inspect).
+    #[cfg(feature = "docker")]
+    async fn sync_docker_deployed_hashes(&self, services: &[ServiceRow]) {
+        use crate::services_repo::services::DeployMethod;
+        for svc in services {
+            if svc.deploy_method != DeployMethod::Docker {
+                continue;
+            }
+            if !matches!(
+                svc.status,
+                ServiceStatus::Running | ServiceStatus::Degraded
+            ) {
+                continue;
+            }
+            let Some(port) = svc.runtime_port else {
+                continue;
+            };
+            // Pełny baked hash z manifestu; brak manifestu/hasha → nie ma z czym
+            // porównywać, pomijamy (badge i tak liczy się tylko gdy oba != "").
+            let baked_full = match crate::services::manifest::registry().by_id(&svc.engine_id) {
+                Some(m) if !m.docker_source_hash.is_empty() => m.docker_source_hash.clone(),
+                _ => continue,
+            };
+            // Tag obrazu running kontenera — JEDYNE wiarygodne źródło tego, co
+            // realnie biegnie (DB deployed_source_hash bywa błędnie zaksięgowany).
+            let Some(image) =
+                deploy::docker::running_container_image_tag(&svc.engine_id, port).await
+            else {
+                continue;
+            };
+            let running_hash12 = deploy::docker::hash12_from_image_tag(&image).unwrap_or_default();
+            let baked12 = &baked_full[..baked_full.len().min(12)];
+            let new_deployed = if running_hash12 == baked12 {
+                // Running obraz = aktualne źródło → deployed=pełny baked → bez badge.
+                baked_full.clone()
+            } else if running_hash12.is_empty() {
+                // Flat/arch tag bez hasha = obraz SPRZED schematu hash-tag → nie znamy
+                // jego source-hash, ale na pewno jest przestarzały. Sentinel "legacy"
+                // jest NIEPUSTY i != baked, więc badge "Aktualizacja dostępna" się
+                // pokaże (snapshot_builder wymaga `!deployed.is_empty() && deployed
+                // != baked`). Pusty string by badge ZABLOKOWAŁ — stąd sentinel.
+                "legacy".to_string()
+            } else {
+                // Inny 12-hex = starszy/inny build → niepusty i != pełny baked → badge.
+                running_hash12
+            };
+            if svc.deployed_source_hash == new_deployed {
+                continue;
+            }
+            let db = self.db.clone();
+            let id = svc.id;
+            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = db
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+                services_repo::update_deployed_source_hash(&conn, id, &new_deployed)?;
+                Ok(())
+            })
+            .await;
+        }
+    }
+
+    #[cfg(not(feature = "docker"))]
+    async fn sync_docker_deployed_hashes(&self, _services: &[ServiceRow]) {}
 
     async fn mark_status(&self, id: i64, status: ServiceStatus, err: Option<&str>) {
         let db = self.db.clone();

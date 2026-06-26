@@ -323,6 +323,11 @@ function renderSectionCard(component, ctx) {
   // the component creates its own styled inner div.
   const el = document.createElement('tf-section-card');
 
+  // Parytet z Card: pola padding(6)/gap(7) z buildera muszą realnie działać —
+  // bez tych klas host ignorował wartości i odstępy nigdy nie były stosowane.
+  el.classList.add(`tf-card--padding-${padding}`);
+  el.classList.add(`tf-card--gap-${gap}`);
+
   // Reactive title attribute binding
   const applyTitle = () => {
     const v = resolveBindRef(titleBind, ctx.store);

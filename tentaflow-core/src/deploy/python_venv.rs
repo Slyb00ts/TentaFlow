@@ -302,7 +302,9 @@ pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEn
 
     let detected = crate::system_check::collect();
     let backend_name = install_variant_tag(&detected.gpu);
-    let variant = pick_install_variant(&spec.install_variants, &backend_name)?;
+    let picked = pick_install_variant(&spec.install_variants, &backend_name)?;
+    let variant_owned = inject_torch_cuda_arch(picked, &detected.gpu, log);
+    let variant = variant_owned.as_ref();
     log(&format!(
         "bootstrap: engine={} backend={}",
         engine, backend_name
@@ -356,7 +358,9 @@ pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<Runn
     // Wykryj backend (CUDA/ROCm/Metal/XPU) i wybierz odpowiedni variant.
     let detected = crate::system_check::collect();
     let backend_name = install_variant_tag(&detected.gpu);
-    let variant = pick_install_variant(&spec.install_variants, &backend_name)?;
+    let picked = pick_install_variant(&spec.install_variants, &backend_name)?;
+    let variant_owned = inject_torch_cuda_arch(picked, &detected.gpu, log);
+    let variant = variant_owned.as_ref();
     log(&format!(
         "wariant instalacji: engine={} backend={}",
         req.engine, backend_name
@@ -1476,8 +1480,13 @@ fn pick_install_variant<'a>(
     // Tagi CUDA degraduja do ogolnego 'cuda', potem do dowolnego wariantu CUDA.
     if backend.starts_with("cuda") {
         if let Some(v) = variants.iter().find(|v| v.backend == "cuda") {
-            tracing::warn!(
-                "bundle nie ma wariantu '{}' — fallback na ogolny 'cuda'",
+            // Brak arch-specyficznego wariantu NIE jest problemem: deploy
+            // wstrzykuje dokladny TORCH_CUDA_ARCH_LIST pod wykryte GPU do
+            // ogolnego wariantu 'cuda' (inject_torch_cuda_arch), wiec kernele
+            // i tak kompiluja sie pod realna karte. Stad info!, nie warn!.
+            tracing::info!(
+                "brak arch-specyficznego wariantu '{}', uzywam ogolnego 'cuda' \
+                 (+ wstrzyniety TORCH_CUDA_ARCH_LIST pod wykryte GPU)",
                 backend
             );
             return Ok(Some(v));
@@ -1498,6 +1507,46 @@ fn pick_install_variant<'a>(
         variants[0].backend
     );
     Ok(Some(&variants[0]))
+}
+
+/// Wstrzykuje dokladny `TORCH_CUDA_ARCH_LIST` do wybranego wariantu cuda, jesli
+/// host ma karty NVIDIA, a wariant SAM go nie deklaruje. Custom-kernele CUDA
+/// (np. OCR quad_nms, yolox FastCOCOEvalOp) kompiluja sie tylko pod architektury
+/// z tej listy — bez niej build polega na niedeterministycznej auto-detekcji
+/// hosta i potrafi dac binarke bez kernela dla realnej karty ("no kernel image",
+/// np. na B300). Liczymy liste z compute capability WSZYSTKICH wykrytych GPU, wiec
+/// kazdy host kompiluje dokladnie pod swoja karte — jeden ogolny wariant `cuda`
+/// w bundlu dziala na kazdej architekturze (B300/3090/H100/Ada/B200).
+///
+/// Bundle env WYGRYWA: jesli wariant juz ma `TORCH_CUDA_ARCH_LIST` (np.
+/// vllm-spark `12.1a`), NIE nadpisujemy. Zwraca owned variant z wstrzyknietym env
+/// (uczestniczy w `template_identity`, wiec zmiana arch wymusza rekompilacje).
+fn inject_torch_cuda_arch(
+    variant: Option<&InstallVariant>,
+    gpu: &crate::system_check::GpuSnapshot,
+    log: &LogSink,
+) -> Option<InstallVariant> {
+    let v = variant?;
+    if !v.backend.starts_with("cuda") {
+        return Some(v.clone());
+    }
+    if v.env.contains_key("TORCH_CUDA_ARCH_LIST") {
+        return Some(v.clone());
+    }
+    // Brak nvidia-smi / brak compute capability -> None: nie ustawiamy nic,
+    // fallback na zachowanie torcha (native cuda deploy i tak powinien miec GPU).
+    let Some(arch_list) = gpu.torch_cuda_arch_list() else {
+        return Some(v.clone());
+    };
+    log(&format!(
+        "wstrzykuje TORCH_CUDA_ARCH_LIST={} (custom-kernele CUDA pod wykryte GPU)",
+        arch_list
+    ));
+    let mut owned = v.clone();
+    owned
+        .env
+        .insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+    Some(owned)
 }
 
 /// Abstrakcja ponad `uv` i `pip` — ten sam interfejs instalacji.

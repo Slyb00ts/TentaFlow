@@ -34,6 +34,15 @@ pub const MAX_PDF_INPUT_BYTES: usize = 50 * 1024 * 1024;
 /// skalowane w dół tak, by zmieścić się w limicie (≈ format A0 @ 150 DPI).
 pub const MAX_PAGE_PIXELS: u64 = 40_000_000;
 
+/// Próg warstwy tekstowej: minimalna ŚREDNIA liczba znaków na stronę, przy
+/// której PDF traktujemy jako PDF z gotową warstwą tekstową (ekstrakcja przez
+/// FPDFText) zamiast skanu/obrazu (rasteryzacja + vision-parse). Skany dają ~0
+/// znaków na stronę (cała treść to obraz), publikacje z warstwą tekstową —
+/// setki/tysiące. 100 znaków/stronę bezpiecznie oddziela te dwa przypadki:
+/// poniżej progu render+vision (jakość), powyżej — ekstrakcja tekstu (sekundy
+/// zamiast minut, bo pomijamy model strona-po-stronie).
+pub const MIN_TEXT_LAYER_CHARS_PER_PAGE: usize = 100;
+
 /// Czy `mime` oznacza PDF (case-insensitive, ignoruje parametry typu `; q=…`).
 pub fn is_pdf_mime(mime: &str) -> bool {
     mime.split(';')

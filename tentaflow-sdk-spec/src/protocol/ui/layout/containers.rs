@@ -176,17 +176,21 @@ pub struct Stack {
     pub align: FlexAlign,
     pub children: Vec<Component>,
     pub padding: Option<super::super::tokens::Spacing>,
+    /// Główna oś (pionowa) — pozwala rozłożyć dzieci (np. `space_between`)
+    /// w Stacku o ustalonej wysokości; brak = domyślne pakowanie od startu.
+    pub justify: Option<FlexJustify>,
 }
 
 impl Stack {
     pub const TAG: u16 = 0x0103;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         entries.push((0, encode_to_value(&self.gap)?));
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.children)?));
         if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
+        if let Some(j) = &self.justify { entries.push((4, encode_to_value(j)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -197,12 +201,14 @@ impl Stack {
         let mut align = None;
         let mut children = None;
         let mut padding = None;
+        let mut justify = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => gap = Some(decode_from_value(v)?),
                 1 => align = Some(decode_from_value(v)?),
                 2 => children = Some(decode_from_value(v)?),
                 3 => padding = Some(decode_from_value(v)?),
+                4 => justify = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Stack", *other)),
             }
         }
@@ -212,6 +218,7 @@ impl Stack {
             align: align.unwrap_or(FlexAlign::Stretch),
             children: children.unwrap_or_default(),
             padding,
+            justify,
         })
     }
 }
@@ -226,17 +233,21 @@ pub struct Cluster {
     pub align: FlexAlign,
     pub justify: FlexJustify,
     pub children: Vec<Component>,
+    /// Zawijanie do nowej linii. `None`/`Some(true)` = domyślne `flex-wrap:wrap`
+    /// (zgodność wsteczna); `Some(false)` wymusza jeden rząd (badge bez zawijania).
+    pub wrap: Option<bool>,
 }
 
 impl Cluster {
     pub const TAG: u16 = 0x0104;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         entries.push((0, encode_to_value(&self.gap)?));
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.justify)?));
         entries.push((3, encode_to_value(&self.children)?));
+        if let Some(w) = &self.wrap { entries.push((4, encode_to_value(w)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -247,12 +258,14 @@ impl Cluster {
         let mut align = None;
         let mut justify = None;
         let mut children = None;
+        let mut wrap = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => gap = Some(decode_from_value(v)?),
                 1 => align = Some(decode_from_value(v)?),
                 2 => justify = Some(decode_from_value(v)?),
                 3 => children = Some(decode_from_value(v)?),
+                4 => wrap = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Cluster", *other)),
             }
         }
@@ -261,6 +274,7 @@ impl Cluster {
             align: align.ok_or_else(|| missing_field("Cluster", "align"))?,
             justify: justify.ok_or_else(|| missing_field("Cluster", "justify"))?,
             children: children.unwrap_or_default(),
+            wrap,
         })
     }
 }
@@ -342,19 +356,23 @@ pub struct ScrollContainer {
     pub children: Vec<Component>,
     pub sticky_header_slot: Option<String>,
     pub virtualize: bool,
+    /// Gdy ustawiony, kontener przełącza się w tryb `display:flex` z odstępem
+    /// między dziećmi — bez tego goła lista (np. kolekcji) nie ma żadnego gapu.
+    pub gap: Option<super::super::tokens::Spacing>,
 }
 
 impl ScrollContainer {
     pub const TAG: u16 = 0x0112;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.orientation)?));
         entries.push((1, encode_to_value(&self.height)?));
         if let Some(m) = &self.max_height { entries.push((2, encode_to_value(m)?)); }
         entries.push((3, encode_to_value(&self.children)?));
         if let Some(s) = &self.sticky_header_slot { entries.push((4, encode_to_value(s)?)); }
         entries.push((5, encode_to_value(&self.virtualize)?));
+        if let Some(g) = &self.gap { entries.push((6, encode_to_value(g)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -367,6 +385,7 @@ impl ScrollContainer {
         let mut children = None;
         let mut sticky_header_slot = None;
         let mut virtualize = None;
+        let mut gap = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => orientation = Some(decode_from_value(v)?),
@@ -375,6 +394,7 @@ impl ScrollContainer {
                 3 => children = Some(decode_from_value(v)?),
                 4 => sticky_header_slot = Some(decode_from_value(v)?),
                 5 => virtualize = Some(decode_from_value(v)?),
+                6 => gap = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("ScrollContainer", *other)),
             }
         }
@@ -386,6 +406,71 @@ impl ScrollContainer {
             children: children.unwrap_or_default(),
             sticky_header_slot,
             virtualize: virtualize.ok_or_else(|| missing_field("ScrollContainer", "virtualize"))?,
+            gap,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Box
+// -----------------------------------------------------------------------------
+/// Lekki wrapper kontroli pojedynczego/zbiorczego dziecka (catalog §3 0x0115).
+///
+/// Rozwiązuje brak sterowania marginesem i rozmiarem dziecka wewnątrz
+/// Flex/Cluster: `grow` pozwala jednemu elementowi rosnąć (np. „info rośnie,
+/// badge stały"), `width` ustala wymiar, `margin` dokłada zewnętrzny odstęp.
+/// Wszystkie pola opcjonalne — pusty Box jest przezroczystym `div`em.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Box {
+    pub width: Option<super::super::inline::DimensionToken>,
+    pub grow: Option<bool>,
+    pub align_self: Option<FlexAlign>,
+    pub padding: Option<super::super::tokens::Spacing>,
+    pub margin: Option<super::super::tokens::Spacing>,
+    pub children: Vec<Component>,
+}
+
+impl Box {
+    pub const TAG: u16 = 0x0115;
+
+    pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
+        if let Some(w) = &self.width { entries.push((0, encode_to_value(w)?)); }
+        if let Some(g) = &self.grow { entries.push((1, encode_to_value(g)?)); }
+        if let Some(a) = &self.align_self { entries.push((2, encode_to_value(a)?)); }
+        if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
+        if let Some(m) = &self.margin { entries.push((4, encode_to_value(m)?)); }
+        entries.push((5, encode_to_value(&self.children)?));
+        Ok(component(Self::TAG, id, entries))
+    }
+
+    pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
+        ensure_tag(c.tag, Self::TAG, "Box")?;
+        ensure_no_duplicate_keys("Box", &c.fields.0)?;
+        let mut width = None;
+        let mut grow = None;
+        let mut align_self = None;
+        let mut padding = None;
+        let mut margin = None;
+        let mut children = None;
+        for (k, v) in &c.fields.0 {
+            match k {
+                0 => width = Some(decode_from_value(v)?),
+                1 => grow = Some(decode_from_value(v)?),
+                2 => align_self = Some(decode_from_value(v)?),
+                3 => padding = Some(decode_from_value(v)?),
+                4 => margin = Some(decode_from_value(v)?),
+                5 => children = Some(decode_from_value(v)?),
+                other => return Err(unknown_field("Box", *other)),
+            }
+        }
+        Ok(Box {
+            width,
+            grow,
+            align_self,
+            padding,
+            margin,
+            children: children.unwrap_or_default(),
         })
     }
 }

@@ -543,11 +543,14 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             "image_gen" | "image_generation" => {
                 outputs.insert(OutputModality::Image);
             }
-            // PARTIA 1 (flow-ingest RAG): rasteryzacja PDF bierze plik PDF i emituje
-            // obrazy stron — wejście to plik (Other ≈ brak deklarowanej modalności
-            // medialnej), wyjście to obrazy.
+            // PARTIA 1 (flow-ingest RAG): pdf_rasterize bierze plik PDF i emituje
+            // ALBO obrazy stron (skan/obraz → vision), ALBO gotową warstwę
+            // tekstową (PDF z osadzonym tekstem → szybka ścieżka, pomija vision).
+            // Wejście to plik (Other ≈ brak deklarowanej modalności medialnej),
+            // wyjście to obraz lub tekst (zależnie od wybranej ścieżki).
             "pdf_rasterize" => {
                 outputs.insert(OutputModality::Image);
+                has_text_output = true;
             }
             // PARTIA 2 (flow-ingest RAG): biorą obraz strony. vision_parse /
             // table_structure / ocr emitują tekst; page_detect / graphic_elements

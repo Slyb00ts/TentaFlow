@@ -1,7 +1,7 @@
 // =============================================================================
 // File: protocol/ui/layout/mod.rs — §3 Layout Primitives (0x0100-0x01FF)
 // Purpose: typed structs for 18 layout components split per-group:
-//   - containers.rs: Flex, Grid, Stack, Cluster, Split, ScrollContainer
+//   - containers.rs: Flex, Grid, Stack, Cluster, Split, ScrollContainer, Box
 //   - cards.rs:      Card, SectionCard, Collapsible, Accordion
 //   - atomic.rs:     Divider, Spacer, Tooltip
 //   - nav.rs:        Sidebar, Tabs, NavTabs, Breadcrumb, Pagination
@@ -14,7 +14,7 @@ pub mod nav;
 
 pub use atomic::{Divider, Spacer, Tooltip};
 pub use cards::{Accordion, Card, Collapsible, SectionCard};
-pub use containers::{Cluster, Flex, Grid, ScrollContainer, Split, Stack};
+pub use containers::{Box, Cluster, Flex, Grid, ScrollContainer, Split, Stack};
 pub use nav::{Breadcrumb, NavTabs, Pagination, Sidebar, Tabs};
 
 #[cfg(test)]
@@ -90,6 +90,7 @@ mod tests {
             align: FlexAlign::Stretch,
             children: vec![],
             padding: None,
+            justify: None,
         };
         let mut c = s.into_component("s").unwrap();
         c.fields.0.retain(|(k, _)| *k != 0 && *k != 1);
@@ -105,6 +106,7 @@ mod tests {
             align: FlexAlign::Center,
             justify: FlexJustify::Start,
             children: vec![dummy(0x0001)],
+            wrap: None,
         };
         let c = cl.clone().into_component("cl").unwrap();
         assert_eq!(Cluster::try_from_component(&c).unwrap(), cl);
@@ -289,6 +291,7 @@ mod tests {
             children: vec![],
             sticky_header_slot: None,
             virtualize: false,
+            gap: None,
         };
         let mut c = s.into_component("sc").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);

@@ -141,8 +141,11 @@ export function renderSearchBox(component, ctx) {
 // =============================================================================
 
 export const SCROLLCONTAINER_TAG = 0x0112;
-const SCROLLCONTAINER_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
+const SCROLLCONTAINER_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
 const SCROLL_ORIENTATIONS = new Set(['vertical', 'horizontal', 'both']);
+const SCROLL_SPACINGS = new Set([
+  'zero', 'xxs', 'xs', 'sm', 'md', 'lg', 'xl', 'xxl',
+]);
 
 // DimensionToken → CSS length. parseDimensionToken returns the kind string
 // for unit variants and a ready CSS string for value variants.
@@ -178,6 +181,11 @@ export function renderScrollContainer(component, ctx) {
   const virtualize = requireBool(
     ctx.readField(component.fields, 5), 'ScrollContainer.virtualize'
   );
+  // Klucz 6 (gap) opcjonalny — gdy ustawiony, kontener staje się flex-kolumną
+  // z odstępem między dziećmi (goła lista bez gapu to główny defekt).
+  const gapRaw = ctx.readField(component.fields, 6);
+  const gap = gapRaw === undefined
+    ? null : requireEnum(gapRaw, SCROLL_SPACINGS, 'ScrollContainer.gap');
 
   const el = document.createElement('div');
   el.classList.add(
@@ -186,6 +194,7 @@ export function renderScrollContainer(component, ctx) {
     'tf-scroll'
   );
   if (virtualize) el.classList.add('tf-scroll-container--virtualize');
+  if (gap != null) el.classList.add(`tf-scroll-container--gap-${gap}`);
   el.style.height = heightCss;
   if (maxHeightCss != null) el.style.maxHeight = maxHeightCss;
   if (orientation === 'vertical') {

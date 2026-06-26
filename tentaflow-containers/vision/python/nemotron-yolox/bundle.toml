@@ -33,6 +33,10 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
+# TORCH_CUDA_ARCH_LIST: yolox kompiluje FastCOCOEvalOp (nvcc) przy --no-build-isolation.
+# NIE ustawiamy go tu na sztywno — deploy (python_venv.rs) wstrzykuje DOKLADNY arch
+# pod wykryte GPU hosta, wiec kazdy host kompiluje kernel pod swoja realna karte
+# (Ampere 8.6 .. Blackwell 10.3), bez fat-binary i bez wariantow per-arch.
 # Realne deps runtime yolox.exp (loguru/psutil/packaging/tabulate) dostarczamy
 # jawnie, bo yolox instalujemy z --no-deps (jego graf ciagnie onnx-simplifier/
 # pycocotools, ktore sie nie buduja i sa nieuzywane w inferencji).
