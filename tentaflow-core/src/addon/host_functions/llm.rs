@@ -24,6 +24,13 @@ use crate::api::openai::types::{
 /// nie moze wstrzyknac nieograniczonej listy do meta flow. Reszta degraduje do braku rewrite.
 const ENTITY_ALIASES_META_CAP: usize = 256;
 
+/// MemGraphRAG eq. 19 (Information Density) — twardy cap liczby wpisow rzadkosci encji
+/// (`entity_density = [{id, density}]`) przepuszczanych z opcji wywolania do flow.meta.
+/// Mapa to retrieval-side ulatwienie (skalowanie P_init relevance); addon nie moze
+/// wstrzyknac nieograniczonej listy do meta flow. Lustro capu addon-side, ale GRANICA
+/// bezpieczenstwa jest TU (options pochodza z addona). Reszta degraduje do density=0.
+const ENTITY_DENSITY_META_CAP: usize = 512;
+
 // =============================================================================
 // llm_generate — synchroniczne generowanie tekstu
 // =============================================================================
@@ -329,9 +336,9 @@ pub fn llm_generate(
     // Most async→sync: host function jest synchroniczna, router jest async.
     // Uzywamy tokio::task::block_in_place aby uniknac deadlocka w wielowatkowym runtime.
     // RAG E2.0 — wąska allowlista opcji wywołania przepuszczana do flow.meta:
-    // tylko `collection_id` (str) i `top_k` (dodatnia liczba całkowita). Reszta
-    // opcji NIE jest przepuszczana, żeby addon nie wstrzyknął dowolnych pól w
-    // meta flow. Węzeł `vector` flow czyta z tego filtr po kolekcji i top_k.
+    // `collection_id` (str), `top_k` (dodatnia liczba całkowita), `graph_enabled`
+    // (bool), `entity_aliases` i `entity_density` (listy z capem). Reszta opcji NIE
+    // jest przepuszczana, żeby addon nie wstrzyknął dowolnych pól w meta flow.
     let mut flow_meta: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
     if let Some(opts) = _options_json.as_ref() {
@@ -377,6 +384,25 @@ pub fn llm_generate(
                 .collect();
             if !pairs.is_empty() {
                 flow_meta.insert("entity_aliases".to_string(), serde_json::Value::Array(pairs));
+            }
+        }
+        // MemGraphRAG eq. 19 — Information Density seedow grafu (retrieval-side). Addon RAG
+        // przekazuje znormalizowane IDF encji `[{id, density∈[0,1]}]`; `rag_graph_facts` skaluje
+        // nim P_init relevance. Twardy cap (ENTITY_DENSITY_META_CAP) + walidacja ksztaltu chronia
+        // meta przed wstrzyknieciem ogromnej/zlej listy. Tylko poprawne `id` (str) + skonczone
+        // `density` (liczba) przechodza; density jest clampowane do [0,1] (powtorne, defense-in-depth).
+        if let Some(arr) = opts.get("entity_density").and_then(|v| v.as_array()) {
+            let entries: Vec<serde_json::Value> = arr
+                .iter()
+                .filter_map(|e| {
+                    let id = e.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+                    let d = e.get("density").and_then(|v| v.as_f64()).filter(|x| x.is_finite())?;
+                    Some(serde_json::json!({ "id": id, "density": d.clamp(0.0, 1.0) }))
+                })
+                .take(ENTITY_DENSITY_META_CAP)
+                .collect();
+            if !entries.is_empty() {
+                flow_meta.insert("entity_density".to_string(), serde_json::Value::Array(entries));
             }
         }
     }
