@@ -55,6 +55,13 @@ fn graph_enabled_in_meta(envelope: &FlowEnvelope) -> bool {
 /// przez addon RAG do flow.meta (host-fn allowlist). `rag_graph_seed` uzywa jej do alias-rewrite
 /// seedow PPR (alias->canonical). Brak klucza => brak rewrite (degradacja).
 pub const META_ENTITY_ALIASES: &str = "entity_aliases";
+/// Meta-klucz (MemGraphRAG §4.3.2, eq. 19 — Information Density): mapa rzadkosci encji
+/// `[{id, density}]`, gdzie `density` ∈ [0,1] to znormalizowane IDF encji w korpusie
+/// (0 = encja pospolita, 1 = unikalna/rzadka). Wstrzykiwana przez addon RAG (df liczone
+/// z `graph_artifacts`). `rag_graph_facts` skaluje nia P_init relevance: seed potwierdzony
+/// w pasazu, ale RZADKI, jest mocniejsza kotwica niz seed pospolity. Brak klucza => czysty
+/// `RELEVANCE_BOOST` (degradacja jak dotychczas).
+pub const META_ENTITY_DENSITY: &str = "entity_density";
 /// Meta-klucz: sformatowany tekst faktow grafowych (fuzowany do kontekstu LLM).
 /// Po E3.2 niesie fakty ZAKUMULOWANE przez wszystkie hopy (lustro pasazy w
 /// `rag_accumulated`), nie tylko ostatni hop — `rag_finalize` go fuzuje.
@@ -437,9 +444,22 @@ fn seeds_from_meta(envelope: &FlowEnvelope) -> Vec<(String, f64)> {
 /// juz znormalizowany (lowercase, collapse) jak ingest, wiec szukamy go wprost w
 /// zlowercase'owanym tekscie. Pusty tekst => brak boostu (degradacja).
 ///
+/// Information Density (MemGraphRAG eq. 19): boost potwierdzonej kotwicy jest
+/// dodatkowo skalowany rzadkoscia encji `density(id)` ∈ [0,1] (znormalizowane IDF
+/// z `meta.entity_density`). Mnoznik = `RELEVANCE_BOOST × (1 + density)`: encja
+/// pospolita (density≈0) -> czysty `RELEVANCE_BOOST`, encja unikalna (density≈1)
+/// -> do `2 × RELEVANCE_BOOST`. Tak jak w papierze, rzadkie/informacyjne encje w
+/// pasazu sa silniejszym dowodem niz generyczne. Brak wpisu w mapie => density 0
+/// (degradacja do dawnego, plaskiego boostu). Mnoznik pozostaje OGRANICZONY (max
+/// 2×), zeby nie zdominowac kary log-degree ani struktury grafu.
+///
 /// Wagi <= 0 nie powstaja (mnoznik dodatni). Kolejnosc i liczba kandydatow bez
 /// zmian — to tylko PRZEWAZENIE istniejacych kotwic.
-fn apply_relevance_boost(seeds: Vec<(String, f64)>, passage_text: &str) -> Vec<(String, f64)> {
+fn apply_relevance_boost(
+    seeds: Vec<(String, f64)>,
+    passage_text: &str,
+    density: &std::collections::HashMap<String, f64>,
+) -> Vec<(String, f64)> {
     let haystack = passage_text.to_lowercase();
     if haystack.is_empty() {
         return seeds;
@@ -448,11 +468,40 @@ fn apply_relevance_boost(seeds: Vec<(String, f64)>, passage_text: &str) -> Vec<(
         .into_iter()
         .map(|(id, mut w)| {
             if id.len() >= MIN_TOKEN_CHARS && haystack.contains(&id) {
-                w *= RELEVANCE_BOOST;
+                let d = density.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                w *= RELEVANCE_BOOST * (1.0 + d);
             }
             (id, w)
         })
         .collect()
+}
+
+/// Odczytuje mape rzadkosci encji `meta.entity_density = [{id, density}]` do
+/// `HashMap<id, density∈[0,1]>` (Information Density, eq. 19). Wpisy bez `id`/
+/// `density`, puste id lub niefinite/poza-zakresem density sa pomijane. Brak
+/// klucza / zly ksztalt => pusta mapa (apply_relevance_boost degraduje do plaskiego
+/// boostu). Czysta funkcja — testowalna bez hosta.
+fn density_from_meta(envelope: &FlowEnvelope) -> std::collections::HashMap<String, f64> {
+    envelope
+        .meta
+        .get(META_ENTITY_DENSITY)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let id = e
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|x| !x.is_empty())?;
+                    let d = e.get("density").and_then(|v| v.as_f64())?;
+                    if !d.is_finite() {
+                        return None;
+                    }
+                    Some((id.to_string(), d.clamp(0.0, 1.0)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // =============================================================================
@@ -577,10 +626,14 @@ impl RagGraphFactsNodeAdapter {
         // inaczej stopnie i ranking mogłyby byc z roznych snapshotow, a kandydat
         // capniety przed przewazeniem nigdy nie zostalby rozwazony.
         let passage_text = envelope.payload.as_text().unwrap_or_default();
-        let seeds = apply_relevance_boost(seeds, passage_text);
+        let density = density_from_meta(envelope);
+        let seeds = apply_relevance_boost(seeds, passage_text, &density);
 
         // Krok 1: PPR z P_init na seedach -> top encje powiazane w grafie. Cap do
         // MAX_GRAPH_SEEDS zapada wewnatrz, PO przewazeniu base × relevance × log-degree.
+        // damping=0.5 (MemGraphRAG eq. 20, λ=0.5): wysoki restart trzyma propagacje w
+        // lokalnym sasiedztwie seedow i ogranicza semantic drift na multi-hop (papier
+        // celowo wybiera 0.5, nie klasyczne 0.85 PageRanku).
         let ranked = match ctx.graph.ppr_with_p_init(
             &org,
             addon,
@@ -588,7 +641,7 @@ impl RagGraphFactsNodeAdapter {
             &seeds,
             MAX_GRAPH_SEEDS,
             MAX_GRAPH_ENTITIES,
-            0.85,
+            0.5,
             20,
         ) {
             Ok(r) => r,
@@ -1212,6 +1265,7 @@ mod tests {
         let out = apply_relevance_boost(
             vec![("albert einstein".into(), 1.0), ("isaac newton".into(), 1.0)],
             passages,
+            &std::collections::HashMap::new(),
         );
         let w = |id: &str| out.iter().find(|(x, _)| x == id).map(|(_, w)| *w).unwrap();
         assert!(
@@ -1220,7 +1274,59 @@ mod tests {
             w("albert einstein"),
             w("isaac newton")
         );
+        // Brak mapy density => plaski RELEVANCE_BOOST (degradacja jak dawniej).
         assert_eq!(w("albert einstein"), RELEVANCE_BOOST);
+    }
+
+    #[test]
+    fn p_init_information_density_scales_boost_by_rarity() {
+        // Dwie encje w pasazu: rzadka (density=1.0) dostaje 2× RELEVANCE_BOOST,
+        // pospolita (density=0.0) tylko 1× — eq. 19 information density.
+        let passages = "Osimertinib leczy raka pluc. Pacjent woli herbate.";
+        let mut density = std::collections::HashMap::new();
+        density.insert("osimertinib".to_string(), 1.0); // unikalna nazwa leku
+        density.insert("pacjent".to_string(), 0.0); // generyczne slowo
+        let out = apply_relevance_boost(
+            vec![("osimertinib".into(), 1.0), ("pacjent".into(), 1.0)],
+            passages,
+            &density,
+        );
+        let w = |id: &str| out.iter().find(|(x, _)| x == id).map(|(_, w)| *w).unwrap();
+        assert_eq!(w("osimertinib"), RELEVANCE_BOOST * 2.0, "rzadka encja: 2× boost");
+        assert_eq!(w("pacjent"), RELEVANCE_BOOST, "pospolita encja: 1× boost");
+        assert!(
+            w("osimertinib") > w("pacjent"),
+            "rzadka kotwica mocniejsza niz pospolita"
+        );
+    }
+
+    #[test]
+    fn density_from_meta_parses_and_clamps() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert(
+            META_ENTITY_DENSITY.into(),
+            json!([
+                { "id": "osimertinib", "density": 0.9 },
+                { "id": "pacjent", "density": 0.0 },
+                { "id": "przepelnione", "density": 5.0 },   // clamp do 1.0
+                { "id": "", "density": 0.5 },                 // puste id -> pominiete
+                { "id": "brak_density" },                     // brak density -> pominiete
+                { "id": "nan", "density": null }              // null -> pominiete
+            ]),
+        );
+        let map = density_from_meta(&env);
+        assert_eq!(map.get("osimertinib"), Some(&0.9));
+        assert_eq!(map.get("pacjent"), Some(&0.0));
+        assert_eq!(map.get("przepelnione"), Some(&1.0), "density > 1 clamp do 1");
+        assert!(!map.contains_key(""), "puste id pominiete");
+        assert!(!map.contains_key("brak_density"));
+        assert!(!map.contains_key("nan"));
+    }
+
+    #[test]
+    fn density_from_meta_absent_is_empty() {
+        let env = FlowEnvelope::empty();
+        assert!(density_from_meta(&env).is_empty(), "brak klucza => pusta mapa");
     }
 
     // --- merge_accumulated_facts (bug 3: dedup + cap przez hopy) -----------
