@@ -1653,6 +1653,9 @@ pub struct MlStudioRecogBuildDatasetRequest {
     pub project_id: String,
     pub dataset_name: String,
     pub fps: u32,
+    /// Opcjonalna ścieżka katalogu na serwerze przeszukiwana REKURENCYJNIE jako
+    /// źródło mediów (zamiast wgranych plików staging). Pusta/None → staging.
+    pub source_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

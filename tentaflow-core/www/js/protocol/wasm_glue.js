@@ -3896,20 +3896,23 @@ export function encodeMlStudioRecogAutolabelStatusRequest(job_id) {
  * @param {string} project_id
  * @param {string} dataset_name
  * @param {number} fps
+ * @param {string | null} [source_dir]
  * @returns {Uint8Array}
  */
-export function encodeMlStudioRecogBuildDatasetRequest(project_id, dataset_name, fps) {
+export function encodeMlStudioRecogBuildDatasetRequest(project_id, dataset_name, fps, source_dir) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(dataset_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioRecogBuildDatasetRequest(ptr0, len0, ptr1, len1, fps);
+    var ptr2 = isLikeNone(source_dir) ? 0 : passStringToWasm0(source_dir, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMlStudioRecogBuildDatasetRequest(ptr0, len0, ptr1, len1, fps, ptr2, len2);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v3;
+    return v4;
 }
 
 /**

@@ -3125,14 +3125,18 @@ export const encode = {
   /**
    * MessageBody::MlStudioBody(RecogBuildDatasetRequest) — buduje dataset COCO z
    * wcześniej wgranych plików staging (kopia obrazów, dekodowanie HEIC, ekstrakcja
-   * klatek wideo). payload: { projectId, datasetName, fps }.
+   * klatek wideo). payload: { projectId, datasetName, fps, sourceDir? }. Gdy
+   * sourceDir jest podane, Core skanuje ten katalog na serwerze rekurencyjnie
+   * zamiast staging.
    */
   mlStudioRecogBuildDatasetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
+    const sourceDir = payload.sourceDir ?? payload.source_dir ?? '';
     const body = _wasm.encodeMlStudioRecogBuildDatasetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetName ?? payload.dataset_name ?? ''),
       Number(payload.fps ?? 5) >>> 0,
+      sourceDir ? String(sourceDir) : undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

@@ -2265,6 +2265,7 @@ pub fn encode_ml_studio_recog_build_dataset_request(
     project_id: String,
     dataset_name: String,
     fps: u32,
+    source_dir: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogBuildDatasetRequest(
@@ -2272,6 +2273,8 @@ pub fn encode_ml_studio_recog_build_dataset_request(
                 project_id,
                 dataset_name,
                 fps,
+                // Pusta ścieżka traktowana jak brak — Core użyje staging.
+                source_dir: source_dir.filter(|s| !s.is_empty()),
             },
         ),
     ))
@@ -9360,6 +9363,16 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "datasetName", req.dataset_name.clone().into());
             set(obj, "dataset_name", req.dataset_name.into());
             set(obj, "fps", req.fps.into());
+            match req.source_dir {
+                Some(s) => {
+                    set(obj, "sourceDir", s.clone().into());
+                    set(obj, "source_dir", s.into());
+                }
+                None => {
+                    set(obj, "sourceDir", JsValue::NULL);
+                    set(obj, "source_dir", JsValue::NULL);
+                }
+            }
         }
         tentaflow_protocol::MlStudioPayload::RecogBuildDatasetResponse(resp) => {
             set(obj, "variant", "MlStudioRecogBuildDatasetResponse".into());

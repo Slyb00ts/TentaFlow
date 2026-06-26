@@ -331,13 +331,27 @@ pub fn spawn_build(
     owner_user_id: String,
     dataset_name: String,
     fps: u32,
+    source_dir: Option<String>,
 ) -> Result<String> {
     if fps < FPS_MIN || fps > FPS_MAX {
         anyhow::bail!("fps musi być w zakresie {}..={}", FPS_MIN, FPS_MAX);
     }
-    let staging = staging_dir(&project_id);
-    if !staging.is_dir() || staging_usage(&staging).1 == 0 {
-        anyhow::bail!("brak wgranych plików do zbudowania datasetu");
+    // A non-empty server folder path replaces staging as the media source; the
+    // folder must exist before a build is queued so the user gets an immediate error.
+    let source_dir = source_dir.filter(|s| !s.trim().is_empty());
+    match &source_dir {
+        Some(dir) => {
+            let path = Path::new(dir.trim());
+            if !path.is_dir() {
+                anyhow::bail!("folder źródłowy nie istnieje lub nie jest katalogiem: {}", dir.trim());
+            }
+        }
+        None => {
+            let staging = staging_dir(&project_id);
+            if !staging.is_dir() || staging_usage(&staging).1 == 0 {
+                anyhow::bail!("brak wgranych plików do zbudowania datasetu");
+            }
+        }
     }
     if !try_claim_project(&project_id) {
         anyhow::bail!("budowa datasetu dla tego projektu już trwa — poczekaj na jej zakończenie");
@@ -352,7 +366,14 @@ pub fn spawn_build(
         let pid = project_id.clone();
         // Heavy fs/tool work is blocking — keep it off the async worker.
         let result = tokio::task::spawn_blocking(move || {
-            run_build(&build_id_task, &project_id, &owner_user_id, &dataset_name, fps)
+            run_build(
+                &build_id_task,
+                &project_id,
+                &owner_user_id,
+                &dataset_name,
+                fps,
+                source_dir.as_deref(),
+            )
         })
         .await;
         match result {
@@ -388,25 +409,40 @@ fn run_build(
     owner_user_id: &str,
     dataset_name: &str,
     fps: u32,
+    source_dir: Option<&str>,
 ) -> Result<()> {
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let staging = staging_dir(project_id);
-    if !staging.is_dir() {
-        anyhow::bail!("brak wgranych plików do zbudowania datasetu");
-    }
+    // When a server folder is given it is the media source (scanned recursively);
+    // otherwise the per-project staging dir is used (and cleared on success).
+    let use_staging = source_dir.is_none();
 
     let mut sources: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(&staging)? {
-        let path = entry?.path();
-        if !path.is_file() {
-            continue;
+    match source_dir {
+        Some(dir) => {
+            let root = Path::new(dir.trim());
+            if !root.is_dir() {
+                anyhow::bail!("folder źródłowy nie istnieje lub nie jest katalogiem: {}", dir.trim());
+            }
+            gather_media_recursive(root, &mut sources)?;
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        // Android/photo apps leave soft-deleted shadows; never ingest them.
-        if name.starts_with(".trashed-") {
-            continue;
+        None => {
+            if !staging.is_dir() {
+                anyhow::bail!("brak wgranych plików do zbudowania datasetu");
+            }
+            for entry in std::fs::read_dir(&staging)? {
+                let path = entry?.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Android/photo apps leave soft-deleted shadows; never ingest them.
+                if name.starts_with(".trashed-") {
+                    continue;
+                }
+                sources.push(path);
+            }
         }
-        sources.push(path);
     }
     sources.sort();
     if sources.len() > MAX_SOURCE_FILES {
@@ -495,8 +531,11 @@ fn run_build(
         }
     };
 
-    // Staging consumed only after the dataset is durably registered.
-    let _ = std::fs::remove_dir_all(&staging);
+    // Staging consumed only after the dataset is durably registered — and never
+    // for a server-folder build, where the source is the user's own data.
+    if use_staging {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
 
     update_progress(build_id, |p| {
         p.status = "succeeded".to_string();
@@ -505,6 +544,49 @@ fn run_build(
         p.dataset_id = Some(dataset.dataset_id.clone());
         p.files_done = files_total;
     });
+    Ok(())
+}
+
+/// Media extensions accepted from a server source folder (lowercased match).
+const SOURCE_DIR_EXTS: &[&str] = &["jpg", "jpeg", "png", "heic", "mp4", "mov"];
+
+/// Recursively collects media files from a server source folder into `out`.
+/// Skips any file whose name starts with `.trashed-` (photo-app soft-delete
+/// shadows) and prunes any directory component named exactly `Archiwum`
+/// (case-sensitive) so archived material is never ingested. Symlinks are not
+/// followed: `read_dir` + `is_dir`/`is_file` traverse only real entries.
+fn gather_media_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("read dir {}", dir.display()))?;
+        for entry in entries {
+            let path = entry?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                // Skip whole subtrees named exactly `Archiwum`.
+                if name == "Archiwum" {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if name.starts_with(".trashed-") {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if SOURCE_DIR_EXTS.contains(&ext.as_str()) {
+                out.push(path);
+            }
+        }
+    }
     Ok(())
 }
 
