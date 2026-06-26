@@ -7,85 +7,138 @@
       "id": "trigger",
       "type": "trigger",
       "config": {},
-      "position": { "x": 0, "y": 0 }
+      "position": {
+        "x": 0,
+        "y": 0
+      }
     },
     {
       "id": "router",
       "type": "document_router",
       "config": {},
-      "position": { "x": 220, "y": 120 }
+      "position": {
+        "x": 220,
+        "y": 120
+      }
     },
     {
       "id": "vision_image",
       "type": "vision_parse",
-      "config": { "model": "rag-parse" },
-      "position": { "x": 220, "y": -120 }
+      "config": {
+        "model": "rag-parse"
+      },
+      "position": {
+        "x": 220,
+        "y": -120
+      }
     },
     {
       "id": "pdf_pages",
       "type": "pdf_rasterize",
       "config": {},
-      "position": { "x": 440, "y": -40 }
+      "position": {
+        "x": 440,
+        "y": -40
+      }
     },
     {
       "id": "vision_pages",
       "type": "vision_parse_pages",
-      "config": { "model": "rag-parse" },
-      "position": { "x": 660, "y": -40 }
+      "config": {
+        "model": "rag-parse"
+      },
+      "position": {
+        "x": 660,
+        "y": -40
+      }
     },
     {
       "id": "pdf_merge",
       "type": "document_merge",
       "config": {},
-      "position": { "x": 880, "y": -40 }
+      "position": {
+        "x": 880,
+        "y": -40
+      }
     },
     {
       "id": "xlsx",
       "type": "excel_extract",
       "config": {},
-      "position": { "x": 440, "y": 60 }
+      "position": {
+        "x": 440,
+        "y": 60
+      }
     },
     {
       "id": "docx",
       "type": "word_extract",
       "config": {},
-      "position": { "x": 440, "y": 160 }
+      "position": {
+        "x": 440,
+        "y": 160
+      }
     },
     {
       "id": "pptx",
       "type": "pptx_extract",
       "config": {},
-      "position": { "x": 440, "y": 260 }
+      "position": {
+        "x": 440,
+        "y": 260
+      }
     },
     {
       "id": "text_extract",
       "type": "text_extract",
       "config": {},
-      "position": { "x": 660, "y": 360 }
+      "position": {
+        "x": 660,
+        "y": 360
+      }
     },
     {
       "id": "combine",
       "type": "combine",
       "config": {},
-      "position": { "x": 1100, "y": 60 }
+      "position": {
+        "x": 1100,
+        "y": 60
+      }
     },
     {
       "id": "chunk",
       "type": "chunk",
-      "config": {},
-      "position": { "x": 1320, "y": 60 }
+      "config": {
+        "size": 6144,
+        "overlap": 400
+      },
+      "position": {
+        "x": 1320,
+        "y": 60
+      }
     },
     {
       "id": "embed",
       "type": "embed_chunks",
-      "config": { "model": "rag-embeddings" },
-      "position": { "x": 1540, "y": 60 }
+      "config": {
+        "model": "rag-embeddings"
+      },
+      "position": {
+        "x": 1540,
+        "y": 60
+      }
     },
     {
       "id": "store",
       "type": "store",
-      "config": { "namespace": "passages" },
-      "position": { "x": 1760, "y": 60 }
+      "config": {
+        "namespace": "passages"
+      },
+      "position": {
+        "x": 1760,
+        "y": 60
+      }
     }
   ],
   "edges": [
