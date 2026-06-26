@@ -299,12 +299,17 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
                             let by = (d.bbox[1] * h as f32).round().max(0.0) as i64;
                             let bw = (d.bbox[2] * w as f32).round().max(0.0) as i64;
                             let bh = (d.bbox[3] * h as f32).round().max(0.0) as i64;
+                            // `score` + `predicted` mark the box as a model prediction so
+                            // the annotation editor renders it dashed with a confidence
+                            // label until a human accepts it.
                             produced.entry(*image_id).or_default().push(json!({
                                 "image_id": image_id,
                                 "category_id": cat_id,
                                 "bbox": [bx, by, bw, bh],
                                 "area": bw * bh,
                                 "iscrowd": 0,
+                                "score": d.score,
+                                "predicted": true,
                             }));
                             total_dets += 1;
                         }
