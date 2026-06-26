@@ -633,6 +633,11 @@
 
 .ml-studio-tab-panel {
   margin-top: 16px;
+  /* The shell's main column is `1fr` (min-width:auto); without this, a wide grid
+     child (annotation canvas, tables) forces horizontal overflow and layers panels
+     over the header/sidebar. min-width:0 lets the panel shrink to its track. */
+  min-width: 0;
+  overflow-x: hidden;
 }
 
 /* ---------- Podział listy: Moje / Udostępnione mi ---------- */
@@ -873,6 +878,265 @@
   color: var(--text-2);
   line-height: 1.6;
 }
+
+/* =============================================================================
+   Zakładka „Dane" rozpoznawania — port mockupu a-dane.html (źródło danych,
+   dropzone, galeria miniatur, podział train/val/test). Tokeny TentaFlow.
+   ============================================================================= */
+
+/* ----- Kafelki źródła danych ----- */
+.ml-studio-source-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.ml-studio-source-tile {
+  background: var(--bg-input, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  font-family: inherit;
+  color: var(--text-1);
+}
+
+.ml-studio-source-tile:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-card, var(--bg-2));
+}
+
+.ml-studio-source-tile.selected {
+  border-color: var(--accent-1);
+  background: var(--accent-glow, rgba(99, 102, 241, 0.18));
+  box-shadow: 0 0 0 1px var(--accent-1);
+}
+
+.ml-studio-source-tile .st-ico {
+  width: 38px;
+  height: 38px;
+  margin-bottom: 6px;
+  border-radius: 10px;
+  background: var(--accent-glow, rgba(99, 102, 241, 0.18));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-2);
+}
+
+.ml-studio-source-tile .st-ico .icon {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  fill: none;
+}
+
+.ml-studio-source-tile .st-name { font-size: 12.5px; font-weight: 800; }
+.ml-studio-source-tile .st-desc { font-size: 10.5px; color: var(--text-3); line-height: 1.4; }
+
+.ml-studio-source-body { margin-bottom: 12px; }
+
+.ml-studio-source-fields {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+/* ----- Dropzone (wizualnie owija tf-file-input) ----- */
+.ml-studio-dropzone {
+  border: 2px dashed var(--border-hover);
+  border-radius: var(--radius-lg, 14px);
+  background: linear-gradient(135deg, var(--bg-2), var(--bg-input, var(--bg-2)));
+  padding: 28px 24px;
+  text-align: center;
+  transition: all 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.ml-studio-dropzone:hover { border-color: var(--accent-1); }
+
+.ml-studio-dropzone .dz-ico {
+  width: 54px;
+  height: 54px;
+  margin-bottom: 6px;
+  border-radius: 50%;
+  background: var(--accent-glow, rgba(99, 102, 241, 0.18));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-2);
+}
+
+.ml-studio-dropzone .dz-ico .icon { width: 26px; height: 26px; stroke: currentColor; fill: none; }
+.ml-studio-dropzone .dz-title { font-size: 15px; font-weight: 800; color: var(--text-1); }
+.ml-studio-dropzone .dz-sub { font-size: 12px; color: var(--text-3); }
+
+.ml-studio-dropzone .dz-formats {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.ml-studio-dropzone .dz-formats .tf-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--bg-3, var(--bg-2));
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+
+.ml-studio-dropzone-input { margin-top: 6px; }
+
+/* ----- Callout (kamera: honest placeholder) ----- */
+.ml-studio-callout {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: var(--bg-input, var(--bg-2));
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-1);
+  border-radius: var(--radius);
+  padding: 13px 15px;
+}
+
+.ml-studio-callout .co-ico { color: var(--accent-2); flex-shrink: 0; margin-top: 1px; }
+.ml-studio-callout .co-ico .icon { width: 18px; height: 18px; stroke: currentColor; fill: none; }
+.ml-studio-callout p { font-size: 12px; color: var(--text-2); line-height: 1.6; margin: 0; }
+
+/* ----- Rejestracja COCO (zwijana, ścieżka serwerowa) ----- */
+.ml-studio-coco-register {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.ml-studio-coco-register > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+}
+
+.ml-studio-coco-register > summary::-webkit-details-marker { display: none; }
+.ml-studio-coco-register > summary:hover { color: var(--text-1); }
+.ml-studio-coco-register > summary .icon { width: 14px; height: 14px; color: var(--accent-2); }
+
+/* ----- Galeria miniatur ----- */
+.ml-studio-gallery {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+}
+
+.ml-studio-thumb {
+  aspect-ratio: 4 / 3;
+  border-radius: var(--radius-sm, 6px);
+  overflow: hidden;
+  position: relative;
+  background: linear-gradient(135deg, #2f3668, #050818);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  background-size: cover;
+  background-position: center;
+}
+
+.ml-studio-thumb .icon { width: 26px; height: 26px; stroke: currentColor; fill: none; opacity: 0.6; }
+.ml-studio-thumb.has-img .icon { display: none; }
+
+.ml-studio-thumb .it-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  font-size: 8.5px;
+  color: var(--text-2);
+  background: linear-gradient(0deg, rgba(5, 8, 24, 0.85), transparent);
+  padding: 8px 4px 2px;
+  text-align: center;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ml-studio-thumb.more {
+  background: var(--bg-input, var(--bg-2));
+  color: var(--text-2);
+  font-weight: 800;
+  font-size: 14px;
+}
+
+/* ----- Podział train/val/test ----- */
+.ml-studio-split-bar {
+  display: flex;
+  height: 16px;
+  border-radius: var(--radius-sm, 6px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+
+.ml-studio-split-bar .seg-train { background: var(--accent-1); transition: width 0.3s; }
+.ml-studio-split-bar .seg-val { background: var(--info, #60a5fa); transition: width 0.3s; }
+.ml-studio-split-bar .seg-test { background: var(--success, #22c55e); transition: width 0.3s; }
+
+.ml-studio-split-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.ml-studio-split-stat {
+  background: var(--bg-input, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.ml-studio-split-stat.train { border-top: 2px solid var(--accent-1); }
+.ml-studio-split-stat.val { border-top: 2px solid var(--info, #60a5fa); }
+.ml-studio-split-stat.test { border-top: 2px solid var(--success, #22c55e); }
+
+.ml-studio-split-stat .ss-lbl {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-3);
+  font-weight: 700;
+}
+
+.ml-studio-split-stat .ss-val {
+  font-size: 26px;
+  font-weight: 800;
+  margin-top: 4px;
+  color: var(--text-1);
+}
+
+.ml-studio-split-stat .ss-foot { font-size: 11px; color: var(--text-2); margin-top: 3px; }
 
 .ml-studio-col-name {
   font-family: var(--font-mono, monospace);
@@ -1310,9 +1574,18 @@
   .ml-studio-role-pick {
     max-width: none;
   }
+
+  /* Zakładka „Dane": kafelki źródła i statystyki splitu w jednej kolumnie,
+     galeria z 8 do 4 kolumn — bez poziomego scrolla. */
+  .ml-studio-source-tiles { grid-template-columns: 1fr; }
+  .ml-studio-split-stats { grid-template-columns: repeat(2, 1fr); }
+  .ml-studio-gallery { grid-template-columns: repeat(4, 1fr); }
 }
 
 @media (max-width: 480px) {
+  .ml-studio-split-stats { grid-template-columns: 1fr; }
+  .ml-studio-gallery { grid-template-columns: repeat(3, 1fr); }
+
   /* Na bardzo wąskim ekranie przyciski nagłówka idą jeden pod drugim, żeby
      długa etykieta „Administracja › Zasoby" nie wymuszała poziomego scrolla. */
   .page-header .actions#ml-studio-actions {
@@ -1377,10 +1650,20 @@
   line-height: 1.1;
 }
 
+.ml-studio-kpi .value .small {
+  font-size: 13px;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
 .ml-studio-kpi .delta {
   font-size: 11px;
   color: var(--text-3);
 }
+
+.ml-studio-kpi .delta.up { color: var(--success); }
+.ml-studio-kpi .delta.down { color: var(--danger); }
+.ml-studio-kpi .delta.warn { color: var(--warning); }
 
 /* Karta sekcji (członkowie, zasoby, joby, modele, skróty). */
 .ml-studio-section-card {
@@ -1492,22 +1775,163 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--gradient-accent);
+  color: #fff;
+  flex: 0 0 auto;
+  box-shadow: var(--glow-indigo);
+}
+
+.ml-studio-shortcut-card .sc-ico .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.ml-studio-shortcut-card .sc-title {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.ml-studio-shortcut-card .sc-desc {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+/* Karty modeli projektu (przegląd): ikona + nazwa + status + kafle metryk. */
+.ml-studio-model-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.ml-studio-model-card {
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-input);
+  transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+}
+
+.ml-studio-model-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--accent-1, var(--accent-2));
+  box-shadow: var(--shadow), var(--glow-indigo);
+}
+
+.ml-studio-model-card .mc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.ml-studio-model-card .mc-ico {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
   background: var(--accent-glow);
   color: var(--accent-2, var(--accent));
   flex: 0 0 auto;
 }
 
-.ml-studio-shortcut-card .sc-ico .icon {
+.ml-studio-model-card .mc-ico .icon {
   width: 18px;
   height: 18px;
 }
 
-.ml-studio-shortcut-card .sc-title {
-  font-size: 13px;
+.ml-studio-model-card .mc-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 800;
+}
+
+.ml-studio-model-card .mc-sub {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.ml-studio-model-card .mc-metrics {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+}
+
+.ml-studio-model-card .mc-metric .mm-val {
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.ml-studio-model-card .mc-metric .mm-lbl {
+  font-size: 10px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Wiersz pochodzenia (przegląd: karty modeli, joby). */
+.ml-studio-origin {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.ml-studio-origin .icon {
+  width: 11px;
+  height: 11px;
+}
+
+/* Komórka postępu w tabeli ostatnich jobów (pasek + procent). */
+.ml-studio-progress-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 140px;
+}
+
+.ml-studio-progress {
+  flex: 1;
+  height: 8px;
+  border-radius: 5px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.ml-studio-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 5px;
+  background: var(--gradient-accent);
+  transition: width 0.4s ease;
+}
+
+.ml-studio-progress.done > span {
+  background: var(--success);
+}
+
+.ml-studio-progress-cell .pct {
+  font-size: 11px;
   font-weight: 700;
+  color: var(--text-2);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* Odstęp między badge'ami w nagłówku szczegółu projektu. */
+.ml-studio-detail .tf-detail-badges {
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 @media (max-width: 767px) {
@@ -1516,6 +1940,10 @@
   }
 
   .ml-studio-shortcut-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ml-studio-model-card-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2088,13 +2516,330 @@
   }
 }
 
-/* Edytor anotacji: galeria + płótno obok siebie; na wąskim ekranie 1 kolumna. */
-.ml-studio-annot-body {
+/* =============================================================================
+   Studio anotacji (zakładka "Anotacje") — układ 3-kolumnowy, port z mockupu
+   r02-anotacja.html. LEWA: postęp + lista obrazów; CENTRUM: płótno z ramkami;
+   PRAWA (scroll): pre-label modelem + klasy ze schematu + atrybuty ramki.
+   ============================================================================= */
+.ml-studio-annotate-layout {
   display: grid;
-  grid-template-columns: 240px 1fr;
-  gap: 12px;
+  grid-template-columns: 220px minmax(0, 1fr) 280px;
+  gap: 14px;
+  min-height: 540px;
   align-items: start;
 }
+/* Center column must be allowed to shrink below its content's intrinsic width,
+   otherwise the image/canvas forces the whole grid wider than the viewport. */
+.ml-studio-annotate-canvas { min-width: 0; }
+
+/* ----- LEWA: postęp + zadania ----- */
+.ml-studio-annotate-tasks {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px; display: flex; flex-direction: column; gap: 8px;
+  max-height: 78vh; overflow-y: auto;
+}
+.ml-studio-annotate-progress-row { display: flex; align-items: center; gap: 10px; }
+.ml-studio-annotate-progress-row tf-progress-bar { flex: 1; }
+.ml-studio-annotate-pct { font-size: 11px; font-weight: 700; color: var(--text-2); min-width: 36px; text-align: right; }
+.ml-studio-annotate-progress-meta { font-size: 11px; color: var(--text-3); }
+.ml-studio-annotate-task-list { display: flex; flex-direction: column; gap: 4px; }
+
+.ml-studio-task-item {
+  display: flex; gap: 10px; align-items: center; padding: 8px; border-radius: var(--radius-sm);
+  cursor: pointer; transition: all 0.15s; border: 1px solid transparent;
+}
+.ml-studio-task-item:hover { background: var(--bg-3); }
+.ml-studio-task-item.active { background: var(--accent-glow); border-color: var(--accent-1); }
+.ml-studio-task-item .t-thumb {
+  width: 42px; height: 32px; border-radius: 5px; flex-shrink: 0;
+  background: linear-gradient(135deg, #2f3668, #050818); display: flex; align-items: center;
+  justify-content: center; color: var(--text-3);
+}
+.ml-studio-task-item .t-thumb .icon { width: 14px; height: 14px; }
+.ml-studio-task-item .t-body { min-width: 0; }
+.ml-studio-task-item .t-name {
+  font-size: 11.5px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ml-studio-task-item .t-meta {
+  font-size: 10px; color: var(--text-3); display: flex; align-items: center; gap: 4px;
+}
+.ml-studio-task-item .t-meta.ok { color: var(--success); }
+.ml-studio-task-item .t-meta .icon { width: 11px; height: 11px; }
+
+/* ----- CENTRUM: płótno ----- */
+.ml-studio-annotate-canvas {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  position: relative; overflow: hidden; display: flex; flex-direction: column; min-height: 540px;
+}
+.ml-studio-annotate-toolbar {
+  display: flex; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  background: var(--bg-2); align-items: center; flex-wrap: wrap;
+}
+.ml-studio-annotate-pos { font-size: 11px; color: var(--text-2); font-weight: 700; }
+.ml-studio-annotate-filemeta { font-size: 11px; color: var(--text-3); }
+.ml-studio-annotate-toolbar #ml-studio-annotate-save { margin-left: auto; }
+.ml-studio-annotate-stage {
+  flex: 1; position: relative; min-height: 240px;
+  background: linear-gradient(135deg, #14213a 0%, #0a1428 60%, #07101f 100%);
+  display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+/* Wrapper shrink-wraps to the image's rendered size (inline-block + line-height:0),
+   so the absolutely-positioned SVG overlay shares the image's exact box. This keeps
+   annotation boxes locked to the picture regardless of window/container size. */
+.ml-studio-annotate-imgwrap {
+  position: relative; display: inline-block; line-height: 0;
+  max-width: 100%; max-height: 72vh;
+}
+.ml-studio-annotate-img { display: block; max-width: 100%; max-height: 72vh; width: auto; height: auto; user-select: none; -webkit-user-drag: none; }
+.ml-studio-annotate-svg { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+
+/* ----- PRAWA: panel boczny (scroll) ----- */
+.ml-studio-annotate-side {
+  display: flex; flex-direction: column; gap: 12px; max-height: 78vh; overflow-y: auto; padding-right: 2px;
+}
+.ml-studio-prelabel-btn { width: 100%; }
+.ml-studio-prelabel-btn .tf-btn {
+  width: 100%; justify-content: center; padding: 11px; font-size: 13px;
+  background: var(--gradient-accent); border: 0;
+}
+.ml-studio-annotate-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.ml-studio-annotate-card-title {
+  font-size: 12px; font-weight: 700; display: flex; align-items: center; gap: 6px; color: var(--text);
+}
+.ml-studio-annotate-card-title .icon { width: 14px; height: 14px; color: var(--accent-2); }
+.ml-studio-annotate-card-note { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+
+.ml-studio-annotate-models { display: flex; flex-direction: column; gap: 5px; }
+.ml-studio-model-pick {
+  display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-input); border: 1px solid var(--border); cursor: pointer; transition: all 0.15s;
+}
+.ml-studio-model-pick:hover { border-color: var(--border-hover); background: var(--bg-card); }
+.ml-studio-model-pick.selected { border-color: var(--accent-1); background: var(--accent-glow); }
+.ml-studio-model-pick.disabled { cursor: not-allowed; opacity: 0.7; }
+.ml-studio-model-pick.disabled:hover { background: var(--bg-input); border-color: var(--border); }
+.ml-studio-model-pick .m-name { font-size: 12px; font-weight: 700; }
+.ml-studio-model-pick .m-meta { font-size: 10px; color: var(--text-3); }
+.ml-studio-model-pick .m-check { margin-left: auto; color: var(--accent-1); display: inline-flex; }
+.ml-studio-model-pick .m-check .icon { width: 16px; height: 16px; }
+.ml-studio-model-pick tf-chip { margin-left: auto; }
+
+.ml-studio-annotate-classes { display: flex; flex-direction: column; gap: 5px; }
+.ml-studio-class-row {
+  display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-input); border: 1px solid var(--border); transition: all 0.15s; cursor: pointer;
+}
+.ml-studio-class-row:hover { border-color: var(--border-hover); }
+.ml-studio-class-row .c-swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+.ml-studio-class-row .c-name { font-size: 12px; font-weight: 700; }
+.ml-studio-class-row .c-key {
+  margin-left: auto; font-size: 10px; font-family: ui-monospace, monospace;
+  color: var(--text-3); background: var(--bg-3); padding: 1px 6px; border-radius: 4px;
+}
+.ml-studio-class-add {
+  display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 3px;
+  font-size: 11.5px; color: var(--text-2); padding: 8px; border: 1px dashed var(--border-hover);
+  border-radius: var(--radius-sm); cursor: pointer;
+}
+.ml-studio-class-add:hover { color: var(--accent-2); border-color: var(--accent-1); }
+.ml-studio-class-add .icon { width: 13px; height: 13px; }
+
+/* Panel atrybutów zaznaczonej ramki — wyróżniony obwódką akcentu. */
+#ml-studio-annotate-attrs { border-color: var(--accent-1); box-shadow: 0 0 0 1px var(--accent-1); }
+.ml-studio-annotate-attr-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.ml-studio-annotate-attr-head .c-swatch { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+.ml-studio-annotate-attr-del { margin-left: auto; }
+.ml-studio-annotate-attr-fields { display: flex; flex-direction: column; gap: 8px; }
+.ml-studio-annotate-attr-field {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.ml-studio-annotate-attr-label {
+  font-size: 11px; font-weight: 700; color: var(--text-2); display: flex; align-items: center; gap: 6px;
+}
+.ml-studio-annotate-attr-type {
+  font-size: 8.5px; font-weight: 800; text-transform: uppercase; padding: 1px 5px; border-radius: 4px;
+  background: rgba(167,139,250,0.15); color: var(--accent-2); letter-spacing: 0.04em;
+}
+.ml-studio-annotate-attr-type.list { background: rgba(96,165,250,0.15); color: var(--info); }
+.ml-studio-annotate-attr-type.classifier { background: rgba(245,158,11,0.14); color: var(--warning); }
+.ml-studio-annotate-attr-type.ocr { background: rgba(167,139,250,0.15); color: var(--accent-2); }
+.ml-studio-annotate-attr-unit { font-size: 10px; color: var(--text-3); }
+.ml-studio-annotate-attr-lookup-hit { font-size: 10px; color: var(--success); display: flex; align-items: center; gap: 5px; }
+.ml-studio-annotate-attr-lookup-hit .icon { width: 11px; height: 11px; }
+.ml-studio-annotate-attr-lookup-miss { font-size: 10px; color: var(--text-3); }
+.ml-studio-annotate-confirm { width: 100%; }
+.ml-studio-annotate-confirm .tf-btn { width: 100%; justify-content: center; }
+
+@media (max-width: 900px) {
+  .ml-studio-annotate-layout { grid-template-columns: 180px minmax(0, 1fr) 240px; }
+}
 @media (max-width: 640px) {
-  .ml-studio-annot-body { grid-template-columns: 1fr; }
+  .ml-studio-annotate-layout { grid-template-columns: 1fr; }
+}
+
+/* =============================================================================
+   Edytor schematu rozpoznawania (zakładka "Schemat") — port z mockupu
+   r01-schemat.html, namespaced prefiksami ml-studio-. Lista klas | edytor klasy
+   + atrybuty (lista/tekst/OCR/liczba/klasyfikator) + podgląd słownika lookup.
+   ============================================================================= */
+
+.ml-studio-schema-toolbar {
+  display: flex; align-items: center; justify-content: flex-end; gap: 12px;
+  margin-bottom: 14px;
+}
+.ml-studio-schema-toolbar-hint { font-size: 11.5px; color: var(--warning); font-weight: 600; margin-right: auto; }
+
+.ml-studio-schema-layout {
+  display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; min-height: 520px;
+}
+
+.ml-studio-schema-classes {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px; display: flex; flex-direction: column; gap: 6px; align-self: start;
+}
+.ml-studio-schema-classes-head { font-size: 13px; font-weight: 700; padding: 2px 2px 6px; display: flex; align-items: center; gap: 8px; }
+.ml-studio-schema-classes-note { font-size: 11px; color: var(--text-3); padding: 6px 4px; line-height: 1.5; margin: 0; }
+
+.ml-studio-schema-class {
+  display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-radius: var(--radius-sm);
+  background: var(--bg-input); border: 1px solid var(--border); cursor: pointer; transition: all 0.15s;
+  width: 100%; text-align: left; font: inherit; color: var(--text); margin-bottom: 4px;
+}
+.ml-studio-schema-class:hover { border-color: var(--border-hover); }
+.ml-studio-schema-class.active { border-color: var(--accent-1); background: var(--accent-glow); }
+.ml-studio-schema-class-swatch { width: 14px; height: 14px; border-radius: 4px; flex-shrink: 0; display: inline-block; }
+.ml-studio-schema-class-name { font-size: 12.5px; font-weight: 700; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ml-studio-schema-class-shape { color: var(--text-3); display: flex; margin-left: auto; }
+.ml-studio-schema-class-shape svg { width: 13px; height: 13px; }
+.ml-studio-schema-class-attrs { font-size: 10px; color: var(--text-3); flex-shrink: 0; }
+
+.ml-studio-schema-add-class {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 8px 13px; border-radius: var(--radius-sm); font-weight: 600; font-size: 12.5px;
+  cursor: pointer; border: 1px dashed var(--border); background: var(--bg-3); color: var(--text-2);
+  font-family: inherit; transition: all 0.12s; margin-top: 4px;
+}
+.ml-studio-schema-add-class:hover { color: var(--text); border-color: var(--border-hover); background: var(--bg-card); }
+.ml-studio-schema-add-class svg { width: 14px; height: 14px; }
+
+.ml-studio-schema-editor { display: flex; flex-direction: column; gap: 16px; }
+.ml-studio-schema-editor-head {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 12px;
+}
+.ml-studio-schema-editor-title { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.ml-studio-schema-editor-title svg { width: 14px; height: 14px; }
+
+.ml-studio-schema-class-props { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; align-items: start; }
+.ml-studio-schema-field { display: flex; flex-direction: column; gap: 6px; }
+.ml-studio-schema-label { font-size: 12px; color: var(--text-2); font-weight: 600; }
+
+.ml-studio-color-swatches { display: flex; gap: 7px; padding-top: 2px; }
+.ml-studio-color-pick {
+  width: 26px; height: 26px; border-radius: 6px; cursor: pointer; border: 2px solid transparent;
+  transition: all 0.15s; padding: 0;
+}
+.ml-studio-color-pick.active { border-color: white; box-shadow: 0 0 0 1px var(--accent-1); transform: scale(1.08); }
+
+/* ----- Wiersz atrybutu ----- */
+.ml-studio-attr-row {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 14px; margin-bottom: 10px; transition: all 0.15s;
+}
+.ml-studio-attr-row:hover { border-color: var(--border-hover); }
+.ml-studio-attr-head { display: flex; align-items: center; gap: 10px; }
+.ml-studio-attr-name { font-size: 13px; font-weight: 800; font-family: ui-monospace, monospace; }
+.ml-studio-attr-actions { margin-left: auto; display: flex; gap: 4px; }
+
+.ml-studio-attr-type-badge {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 800;
+  text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 8px; border-radius: 6px;
+}
+.ml-studio-attr-type-badge svg { width: 11px; height: 11px; }
+.ml-studio-attr-type-badge.ocr { background: rgba(167,139,250,0.15); color: var(--accent-2); }
+.ml-studio-attr-type-badge.list { background: rgba(96,165,250,0.15); color: var(--info); }
+.ml-studio-attr-type-badge.text { background: var(--bg-3); color: var(--text-2); }
+.ml-studio-attr-type-badge.number { background: rgba(34,197,94,0.13); color: var(--success); }
+.ml-studio-attr-type-badge.classifier { background: rgba(245,158,11,0.14); color: var(--warning); }
+
+.ml-studio-attr-detail {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; font-size: 11.5px;
+}
+.ml-studio-attr-detail .dk { color: var(--text-3); font-weight: 600; }
+.ml-studio-attr-detail .dv { color: var(--text); }
+.ml-studio-attr-detail .dv.mono { font-family: ui-monospace, monospace; }
+
+/* ----- Podgląd słownika lookup ----- */
+.ml-studio-lookup-wrap {
+  margin-top: 10px; background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); overflow: hidden;
+}
+.ml-studio-lookup-head {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+  border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 700;
+}
+.ml-studio-lookup-head svg { width: 13px; height: 13px; color: var(--accent-2); }
+.ml-studio-lookup-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.ml-studio-lookup-table th {
+  text-align: left; padding: 6px 10px; font-size: 9.5px; text-transform: uppercase;
+  color: var(--text-3); border-bottom: 1px solid var(--border);
+}
+.ml-studio-lookup-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; }
+.ml-studio-lookup-table td:last-child { font-family: 'Manrope', sans-serif; color: var(--text-2); }
+
+/* ----- Formularz dodawania atrybutu ----- */
+.ml-studio-attr-add {
+  background: var(--bg-input); border: 1px solid var(--accent-1); border-radius: var(--radius);
+  padding: 16px 18px; margin-top: 6px;
+}
+.ml-studio-attr-add-title {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2);
+  margin: 0 0 8px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+}
+.ml-studio-attr-add-title svg { width: 14px; height: 14px; }
+.ml-studio-attr-add-foot { display: flex; justify-content: space-between; margin-top: 16px; }
+
+.ml-studio-attr-type-pick { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.ml-studio-attr-type-opt {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 11px 8px; text-align: center; cursor: pointer; transition: all 0.15s;
+  display: flex; flex-direction: column; align-items: center; font: inherit; color: var(--text);
+}
+.ml-studio-attr-type-opt:hover { border-color: var(--border-hover); background: var(--bg-card); }
+.ml-studio-attr-type-opt.selected { border-color: var(--accent-1); background: var(--accent-glow); box-shadow: 0 0 0 1px var(--accent-1); }
+.ml-studio-attr-type-opt .ato-ico { color: var(--accent-2); margin-bottom: 6px; }
+.ml-studio-attr-type-opt .ato-ico svg { width: 18px; height: 18px; }
+.ml-studio-attr-type-opt .ato-name { font-size: 11.5px; font-weight: 700; }
+.ml-studio-attr-type-opt .ato-desc { font-size: 9.5px; color: var(--text-3); margin-top: 2px; line-height: 1.3; }
+
+/* ----- Pola konfiguracji zależne od typu ----- */
+.ml-studio-schema-config-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px; margin-top: 12px;
+}
+.ml-studio-schema-config-badge { margin-bottom: 10px; }
+.ml-studio-schema-config-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.ml-studio-schema-config-grid.two { grid-template-columns: 1fr 1fr; }
+.ml-studio-schema-toggle-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); margin-top: 12px; }
+
+/* ----- Edytor słownika (modal) ----- */
+.ml-studio-dict-editor { display: flex; flex-direction: column; gap: 14px; }
+.ml-studio-dict-col-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; margin-bottom: 6px; }
+.ml-studio-dict-data-row { display: grid; gap: 8px; align-items: center; margin-bottom: 6px; }
+
+@media (max-width: 900px) {
+  .ml-studio-schema-layout { grid-template-columns: 220px minmax(0, 1fr); }
+  .ml-studio-schema-class-props { grid-template-columns: 1fr; }
+  .ml-studio-attr-type-pick { grid-template-columns: repeat(3, 1fr); }
+  .ml-studio-schema-config-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .ml-studio-schema-layout { grid-template-columns: 1fr; }
+  .ml-studio-attr-type-pick { grid-template-columns: repeat(2, 1fr); }
+  .ml-studio-schema-config-grid, .ml-studio-schema-config-grid.two { grid-template-columns: 1fr; }
+  .ml-studio-attr-detail { grid-template-columns: 1fr; }
 }
