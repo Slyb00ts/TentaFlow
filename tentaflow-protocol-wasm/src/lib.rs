@@ -2288,6 +2288,34 @@ pub fn encode_ml_studio_recog_build_status_request(build_id: String) -> Result<V
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioRecogAutolabelRequest)]
+pub fn encode_ml_studio_recog_autolabel_request(
+    dataset_id: String,
+    threshold: f64,
+    mode: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelRequest(
+            tentaflow_protocol::MlStudioRecogAutolabelRequest {
+                dataset_id,
+                threshold,
+                mode,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogAutolabelStatusRequest)]
+pub fn encode_ml_studio_recog_autolabel_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusRequest(
+            tentaflow_protocol::MlStudioRecogAutolabelStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeSkillsListRequest)]
 pub fn encode_skills_list_request(
     tag: Option<String>,
@@ -9366,6 +9394,41 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "image_count", (resp.image_count as f64).into());
             set(obj, "categoryCount", resp.category_count.into());
             set(obj, "category_count", resp.category_count.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelRequest(req) => {
+            set(obj, "variant", "MlStudioRecogAutolabelRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "threshold", req.threshold.into());
+            set(obj, "mode", req.mode.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogAutolabelResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+            set(obj, "status", resp.status.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusRequest(req) => {
+            set(obj, "variant", "MlStudioRecogAutolabelStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioRecogAutolabelStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "imagesTotal", (resp.images_total as f64).into());
+            set(obj, "images_total", (resp.images_total as f64).into());
+            set(obj, "imagesDone", (resp.images_done as f64).into());
+            set(obj, "images_done", (resp.images_done as f64).into());
+            set(obj, "detections", (resp.detections as f64).into());
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),

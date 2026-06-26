@@ -717,6 +717,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::RecogBuildStatusResponse(_) => {
                 "MlStudioRecogBuildStatusResponse"
             }
+            tentaflow_protocol::MlStudioPayload::RecogAutolabelRequest(_) => {
+                "MlStudioRecogAutolabelRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogAutolabelResponse(_) => {
+                "MlStudioRecogAutolabelResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusRequest(_) => {
+                "MlStudioRecogAutolabelStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusResponse(_) => {
+                "MlStudioRecogAutolabelStatusResponse"
+            }
             tentaflow_protocol::MlStudioPayload::RecogDetectRequest(_) => {
                 "MlStudioRecogDetectRequest"
             }

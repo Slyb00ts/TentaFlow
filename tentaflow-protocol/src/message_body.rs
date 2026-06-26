@@ -1686,6 +1686,46 @@ pub struct MlStudioRecogBuildStatusResponse {
     pub error: Option<String>,
 }
 
+/// Auto-etykietowanie całego datasetu COCO wbudowanym detektorem RF-DETR (ADR):
+/// dla każdego obrazu uruchamia detektor i zapisuje detekcje jako adnotacje COCO
+/// (edytowalny punkt startowy). Praca jest CIĘŻKA (dekodowanie + inferencja per
+/// obraz), więc job leci ASYNCHRONICZNIE: odpowiedź wraca natychmiast z `job_id`,
+/// a UI odpytuje postęp przez `MlStudioRecogAutolabelStatusRequest`. `mode`:
+/// "only_empty" (tylko obrazy bez adnotacji — ręczne poprawki nietknięte) lub
+/// "overwrite" (zastąp wszystkie adnotacje).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogAutolabelRequest {
+    pub dataset_id: String,
+    pub threshold: f64,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogAutolabelResponse {
+    /// Identyfikator zadania do pollingu statusu. Pusty gdy start odrzucono.
+    pub job_id: String,
+    /// "running" gdy zadanie wystartowało, "failed" gdy odrzucono.
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// Polling postępu asynchronicznego auto-etykietowania (po `job_id`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogAutolabelStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogAutolabelStatusResponse {
+    /// "running" | "succeeded" | "failed".
+    pub status: String,
+    pub images_total: u64,
+    pub images_done: u64,
+    /// Łączna liczba zapisanych detekcji.
+    pub detections: u64,
+    pub error: Option<String>,
+}
+
 /// Detekcja na obrazie wytrenowanym modelem recognition. `image_b64` to małe
 /// zdjęcie (limit ramki WS ~0.9MB). Odpowiedź niesie detekcje jako JSON
 /// (`detections_json`: [{class_id,class_name,score,bbox_xyxy}]) — bez osobnych
@@ -1951,6 +1991,10 @@ pub enum MlStudioPayload {
     RecogBuildDatasetResponse(MlStudioRecogBuildDatasetResponse),
     RecogBuildStatusRequest(MlStudioRecogBuildStatusRequest),
     RecogBuildStatusResponse(MlStudioRecogBuildStatusResponse),
+    RecogAutolabelRequest(MlStudioRecogAutolabelRequest),
+    RecogAutolabelResponse(MlStudioRecogAutolabelResponse),
+    RecogAutolabelStatusRequest(MlStudioRecogAutolabelStatusRequest),
+    RecogAutolabelStatusResponse(MlStudioRecogAutolabelStatusResponse),
     RecogDetectRequest(MlStudioRecogDetectRequest),
     RecogDetectResponse(MlStudioRecogDetectResponse),
     RecogImagesListRequest(MlStudioRecogImagesListRequest),

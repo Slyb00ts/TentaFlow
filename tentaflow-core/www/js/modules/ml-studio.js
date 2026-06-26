@@ -1445,6 +1445,44 @@ function pollRecogBuild(pid, buildId, prog) {
   });
 }
 
+// Polling postępu auto-etykietowania datasetu (po jobId). `prog` to element na
+// tekst statusu; `onDone` wywoływane po sukcesie (odświeżenie obrazów).
+function pollRecogAutolabel(jobId, prog, onDone) {
+  return new Promise((resolve) => {
+    const tick = async () => {
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioRecogAutolabelStatusRequest', { jobId });
+      } catch (err) {
+        if (prog) prog.textContent = '';
+        toast(`Auto-etykietowanie: ${err.message}`, 'error');
+        resolve();
+        return;
+      }
+      const status = st.status || 'running';
+      const total = st.imagesTotal ?? st.images_total ?? 0;
+      const doneN = st.imagesDone ?? st.images_done ?? 0;
+      const dets = st.detections ?? 0;
+      if (status === 'succeeded') {
+        if (prog) prog.textContent = '';
+        toast(`Auto-etykietowanie zakończone: ${dets} wykryć na ${total} obrazach.`, 'success');
+        if (onDone) { try { await onDone(); } catch (_) {} }
+        resolve();
+        return;
+      }
+      if (status === 'failed') {
+        if (prog) prog.textContent = '';
+        toast(`Auto-etykietowanie: ${st.error || 'nieznany błąd'}`, 'error');
+        resolve();
+        return;
+      }
+      if (prog) prog.textContent = `Auto-etykietowanie ${doneN} / ${total} (wykryć: ${dets})…`;
+      setTimeout(tick, 2000);
+    };
+    tick();
+  });
+}
+
 async function onDatasetUploaded(pid, filename, resp) {
   toast(`Wgrano „${filename}" — sprofilowano`, 'success');
   await loadDatasets(pid);
@@ -2489,6 +2527,15 @@ function renderRecogAnnotateTab(panel, p) {
           <span class="ml-studio-data-hint">rysuj/przesuwaj/zmieniaj rozmiar ramek, ustaw klasę, zapisz</span>
         </div>
         <tf-select id="ml-studio-annot-dataset" label="Dataset COCO"></tf-select>
+        <div class="ml-studio-annot-autolabel" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
+          <tf-input id="ml-studio-annot-threshold" type="number" label="Próg" value="0.5" min="0" max="1" step="0.05" style="width:110px"></tf-input>
+          <tf-select id="ml-studio-annot-mode" label="Tryb">
+            <option value="only_empty">Tylko puste</option>
+            <option value="overwrite">Nadpisz</option>
+          </tf-select>
+          <tf-button id="ml-studio-annot-autolabel-btn" variant="secondary">Auto-etykietuj dataset (RF-DETR)</tf-button>
+          <span id="ml-studio-annot-autolabel-prog" class="ml-studio-data-hint"></span>
+        </div>
       </section>
       <div class="ml-studio-annot-body">
         <section class="ml-studio-data-card" style="max-height:70vh;overflow:auto">
@@ -2516,6 +2563,38 @@ function renderRecogAnnotateTab(panel, p) {
       if (opts.length) { S.datasetId = opts[0].value; await loadImages(); }
       sel?.addEventListener('change', async (e) => { S.datasetId = e.detail?.value || sel.value; await loadImages(); });
     } catch (err) { byId('ml-studio-annot-gallery').innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
+  })();
+
+  // Auto-etykietowanie całego datasetu wbudowanym detektorem RF-DETR (ADR). Po
+  // sukcesie odświeża listę obrazów i bieżący obraz, by ramki były widoczne od razu.
+  (() => {
+    const btn = byId('ml-studio-annot-autolabel-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (!S.datasetId) { toast('Wybierz dataset COCO.', 'error'); return; }
+      const thrEl = byId('ml-studio-annot-threshold');
+      const modeEl = byId('ml-studio-annot-mode');
+      const threshold = Number(thrEl?.value ?? 0.5);
+      const mode = String(modeEl?.value ?? 'only_empty');
+      if (!(threshold >= 0 && threshold <= 1)) { toast('Próg musi być w zakresie 0–1.', 'error'); return; }
+      const prog = byId('ml-studio-annot-autolabel-prog');
+      btn.setAttribute('disabled', '');
+      try {
+        const resp = await ApiBinary.one('mlStudioRecogAutolabelRequest', { datasetId: S.datasetId, threshold, mode });
+        if (resp.status === 'failed' || resp.error) throw new Error(resp.error || 'start nieudany');
+        const jobId = resp.jobId ?? resp.job_id;
+        if (prog) prog.textContent = 'Auto-etykietowanie…';
+        await pollRecogAutolabel(jobId, prog, async () => {
+          await loadImages();
+          if (S.curIdx >= 0) await selectImage(S.curIdx);
+        });
+      } catch (err) {
+        if (prog) prog.textContent = '';
+        toast(`Auto-etykietowanie: ${err.message}`, 'error');
+      } finally {
+        btn.removeAttribute('disabled');
+      }
+    });
   })();
 
   async function loadImages() {
