@@ -750,7 +750,7 @@ impl BackendClient {
                 .clone()
                 .unwrap_or_else(|| "text-embedding-3-small".to_string()),
             input: EmbeddingInput::Multiple(input),
-            encoding_format: Some("float".to_string()),
+            encoding_format: Some("base64".to_string()),
             dimensions: None,
             user: None,
         };
@@ -822,6 +822,15 @@ impl BackendClient {
     ) -> Result<EmbeddingResponse> {
         self.check_circuit_breaker()?;
         self.apply_model_override(&mut request.model);
+
+        // Wymuszamy base64 jako format TRANSPORTU do backendu: vLLM/OpenAI-compatible
+        // zwracają wtedy każdy wektor jako base64 spakowanych f32 LE (jeden decode
+        // na wektor) zamiast tablicy tysięcy liczb JSON. `EmbeddingData` deserializuje
+        // oba formaty, więc backend bez wsparcia base64 (zwraca tablicę) też działa.
+        // Wektory pozostają bit-identyczne. To wyłącznie format na drucie — API-level
+        // `encoding_format` żądany przez zewnętrznego klienta jest materializowany przy
+        // re-serializacji odpowiedzi w warstwie API, nie tutaj.
+        request.encoding_format = Some("base64".to_string());
 
         let url = &self.embeddings_url;
 
