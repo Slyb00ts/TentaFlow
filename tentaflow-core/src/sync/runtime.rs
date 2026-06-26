@@ -83,6 +83,55 @@ pub struct SyncRuntime {
     /// slice), but the state still deserves ONE warn per target — repair pulls
     /// retry on a timer, so an unconditional warn would flood the log.
     floor_anchor_warned: parking_lot::Mutex<HashSet<String>>,
+    /// In-memory-only scheduling state for the periodic push: per-target retry
+    /// backoff and a short-lived sync-target cache. Never persisted — rebuilt on
+    /// restart from the durable outbox/SQLite state, so it cannot corrupt the
+    /// ledger. Decouples per-tick push cost from the ledger size: a target that
+    /// is offline / not ACK-ing is retried on an exponential backoff instead of
+    /// having its whole un-acked backlog re-scanned, re-encoded and re-shipped
+    /// every 5 s tick.
+    push_state: PushState,
+}
+
+/// Per-target push retry backoff plus a permission-epoch-scoped sync-target
+/// cache. All state is ephemeral: losing it on restart only means the next tick
+/// re-evaluates from the durable outbox, never a data loss.
+#[derive(Default)]
+struct PushState {
+    /// `target_node_id -> earliest wall-clock ms at which the periodic push may
+    /// re-ship that target's already-delivered-but-unacknowledged backlog`. A
+    /// freshly queued op (`put_in_outbox`) clears the target's entry so new data
+    /// ships on the very next tick; a push that left un-acked work behind sets an
+    /// exponentially growing deadline so an offline / non-ACK peer is no longer
+    /// re-processed every tick.
+    retry_after_ms: parking_lot::Mutex<std::collections::HashMap<String, RetrySchedule>>,
+    /// `(org, addon, resource_type, resource_id) -> resolved target node ids`,
+    /// valid only while `epoch` matches the org's current `sync_permission_epoch`.
+    /// Every grant/revoke bumps that epoch (`bump_sync_permission_epoch`), so a
+    /// stale entry can never authorize a target that lost access. Collapses the
+    /// per-op-per-tick `list_sync_targets_for_resource` SQLite fan-out (the
+    /// `can_node_receive_sync_resource` / `load_sync_node_identity` perf hotspots)
+    /// to one query per distinct resource per epoch.
+    target_cache: parking_lot::Mutex<std::collections::HashMap<TargetCacheKey, TargetCacheEntry>>,
+}
+
+#[derive(Clone)]
+struct RetrySchedule {
+    next_attempt_ms: i64,
+    retry_count: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TargetCacheKey {
+    org_id: String,
+    addon_id: String,
+    resource_type: String,
+    resource_id: String,
+}
+
+struct TargetCacheEntry {
+    epoch: u64,
+    target_node_ids: Vec<String>,
 }
 
 struct RuntimeSigner {
@@ -208,6 +257,7 @@ pub fn init(
         adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
         pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
         floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+        push_state: PushState::default(),
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
     let runtime = SYNC_RUNTIME
@@ -908,6 +958,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
+                    self.reset_push_backoff(sync_target.as_str());
                     self.ledger.put_in_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
@@ -937,6 +988,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
+                    self.reset_push_backoff(sync_target.as_str());
                     self.ledger.put_in_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
@@ -977,6 +1029,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(node_id.clone()) {
                 Ok(sync_target) => {
+                    self.reset_push_backoff(sync_target.as_str());
                     self.ledger.put_in_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
@@ -1042,8 +1095,30 @@ impl SyncRuntime {
         limit: usize,
     ) -> LedgerResult<Option<MeshSyncPushPayload>> {
         let target = SyncTarget::new(target_node_id.to_string())?;
+
+        // Idle fast-path: a future retry deadline means this target's backlog was
+        // already shipped and is only awaiting ACK. A newly queued op always clears
+        // the deadline (`reset_push_backoff`), so a deadline still in the future
+        // proves there is nothing new to send — skip the whole outbox scan, making
+        // the per-tick cost a single in-memory lookup regardless of ledger size.
+        // The scan/encode/ship below runs only when the deadline is absent (new
+        // data queued) or has elapsed (time to retry a non-ACK peer).
+        let now = now_ms();
+        let prior_retry = {
+            let schedule = self.push_state.retry_after_ms.lock();
+            schedule.get(target.as_str()).cloned()
+        };
+        if let Some(prior) = &prior_retry {
+            if prior.next_attempt_ms > now {
+                return Ok(None);
+            }
+        }
+
         let entries = self.ledger.list_pending_outbox(target.clone(), limit)?;
         if entries.is_empty() {
+            // Backlog fully acknowledged/drained: drop any stale retry deadline so
+            // the next freshly queued op is not gated behind it.
+            self.push_state.retry_after_ms.lock().remove(target.as_str());
             return Ok(None);
         }
         let mut pending = Vec::with_capacity(entries.len());
@@ -1085,8 +1160,28 @@ impl SyncRuntime {
             self.ledger.mark_delivered(target.clone(), op_id)?;
         }
         if operations.is_empty() {
+            // Everything in-scope was revoked (acked-as-skip) or reaped; no payload
+            // and no obligation left, so clear the deadline.
+            self.push_state.retry_after_ms.lock().remove(target.as_str());
             return Ok(None);
         }
+
+        // We just (re)shipped a batch that is still awaiting ACK. Arm an
+        // exponential backoff so an offline / non-ACK peer is retried on a growing
+        // interval instead of having its whole backlog re-shipped every tick. A
+        // freshly queued op resets this (`reset_push_backoff`), so live data is not
+        // delayed. A successful ACK drains the outbox, and the empty-outbox branch
+        // above then clears the deadline.
+        let retry_count = prior_retry.map_or(0, |prior| prior.retry_count.saturating_add(1));
+        let next_attempt_ms = now.saturating_add(repair_backoff_ms(retry_count));
+        self.push_state.retry_after_ms.lock().insert(
+            target.as_str().to_string(),
+            RetrySchedule {
+                next_attempt_ms,
+                retry_count,
+            },
+        );
+
         Ok(Some(MeshSyncPushPayload {
             from_node_id: self.local_node_id.clone(),
             operations,
@@ -1098,17 +1193,75 @@ impl SyncRuntime {
         target_node_id: &str,
         operation: &SyncOperation,
     ) -> LedgerResult<bool> {
-        let targets = repository::list_sync_targets_for_resource(
-            &self.db,
+        let targets = self.cached_sync_targets_for_resource(
             &operation.body.org_id,
             &operation.body.addon_id,
             &operation.body.resource_type,
             &operation.body.resource_id,
+        )?;
+        Ok(targets.iter().any(|node_id| node_id == target_node_id))
+    }
+
+    /// Permission-epoch-scoped wrapper over `list_sync_targets_for_resource`.
+    /// Sync policy + node identity are stable between grant/revoke writes, and
+    /// every such write bumps the org's `sync_permission_epoch`; an entry is only
+    /// trusted while its recorded epoch matches the live one, so a revoked target
+    /// can never be served from a stale entry. Without the cache the periodic push
+    /// runs the full `can_node_receive_sync_resource` / `load_sync_node_identity`
+    /// SQLite fan-out once PER outbox entry PER tick, the dominant idle cost.
+    fn cached_sync_targets_for_resource(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> LedgerResult<Vec<String>> {
+        let epoch = repository::get_sync_permission_epoch(&self.db, org_id)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let key = TargetCacheKey {
+            org_id: org_id.to_string(),
+            addon_id: addon_id.to_string(),
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+        };
+        {
+            let cache = self.push_state.target_cache.lock();
+            if let Some(entry) = cache.get(&key) {
+                if entry.epoch == epoch {
+                    return Ok(entry.target_node_ids.clone());
+                }
+            }
+        }
+        let target_node_ids = repository::list_sync_targets_for_resource(
+            &self.db,
+            org_id,
+            addon_id,
+            resource_type,
+            resource_id,
         )
-        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
-        Ok(targets
-            .iter()
-            .any(|target| target.node_id == target_node_id))
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?
+        .into_iter()
+        .map(|target| target.node_id)
+        .collect::<Vec<_>>();
+        let mut cache = self.push_state.target_cache.lock();
+        cache.insert(
+            key,
+            TargetCacheEntry {
+                epoch,
+                target_node_ids: target_node_ids.clone(),
+            },
+        );
+        Ok(target_node_ids)
+    }
+
+    /// Clears a target's push backoff so a freshly queued op ships on the next
+    /// tick instead of waiting out a previously-set retry deadline. Called from
+    /// the outbox enqueue paths.
+    fn reset_push_backoff(&self, target_node_id: &str) {
+        self.push_state
+            .retry_after_ms
+            .lock()
+            .remove(target_node_id);
     }
 
     /// Re-enqueues already-minted operations to receivers that gained access AFTER
@@ -1194,6 +1347,7 @@ impl SyncRuntime {
                 }
                 match SyncTarget::new(target.node_id) {
                     Ok(sync_target) => {
+                        self.reset_push_backoff(sync_target.as_str());
                         self.ledger.put_in_outbox(sync_target, operation.op_id)?;
                         enqueued += 1;
                     }
@@ -3596,6 +3750,7 @@ mod tests {
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                 floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                push_state: PushState::default(),
             },
             _ledger_dir: ledger_dir,
         }
@@ -3622,6 +3777,7 @@ mod tests {
             adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
             pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
             floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+            push_state: PushState::default(),
         }
     }
 
@@ -5722,6 +5878,97 @@ mod tests {
                 .get_outbox_entry(target, result.op_id)
                 .expect("outbox entry");
             assert!(entry.acknowledged);
+        });
+    }
+
+    #[test]
+    fn push_backoff_skips_unacked_backlog_until_new_op_or_deadline() {
+        // A non-ACK peer must NOT have its whole un-acked backlog re-scanned and
+        // re-shipped on every scheduler tick (the idle-CPU regression). After one
+        // push the per-target backoff suppresses the next push (returns None) while
+        // the deadline is in the future, so per-tick cost is a single in-memory
+        // lookup independent of ledger size. A freshly queued op resets the backoff
+        // so live data still ships immediately, and an ACK drains the backlog.
+        with_tmp_home(|| {
+            let source = make_runtime(131);
+            let receiver = make_runtime(132);
+            let addon_id = "sync-runtime-backoff";
+            seed_authority_target(&source.runtime.db, addon_id, &receiver.runtime.local_node_id);
+            open_contacts_table(addon_id);
+            let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
+
+            let first = source
+                .runtime
+                .record_sql_capture(capture(addon_id, "person-1", "Ewa"))
+                .expect("record first");
+
+            // First push ships the op and arms the backoff (peer has not ACKed).
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push")
+                .expect("first push ships");
+            assert_eq!(push.operations.len(), 1);
+
+            // Second push within the backoff window: nothing new queued, peer still
+            // un-acked, so the whole un-acked backlog is NOT re-shipped.
+            assert!(
+                source
+                    .runtime
+                    .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                    .expect("second push")
+                    .is_none(),
+                "un-acked backlog must not be re-shipped while backoff holds"
+            );
+
+            // A freshly queued op clears the backoff: the next push ships and now
+            // carries BOTH the new op and the still-un-acked first op (the peer
+            // never confirmed it, so it must keep being delivered).
+            source
+                .runtime
+                .record_sql_capture(capture(addon_id, "person-2", "Ola"))
+                .expect("record second");
+            let push = source
+                .runtime
+                .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                .expect("push after new op")
+                .expect("new op resets backoff and ships");
+            assert_eq!(
+                push.operations.len(),
+                2,
+                "a new op resets backoff and re-ships the un-acked tail too"
+            );
+
+            // The receiver applies and ACKs; the source marks both delivered ops
+            // acknowledged, draining the outbox.
+            let ack = receiver
+                .runtime
+                .handle_push_payload(&source.runtime.local_node_id, push)
+                .expect("handle push");
+            source
+                .runtime
+                .handle_ack_payload(&receiver.runtime.local_node_id, ack)
+                .expect("ack");
+            assert!(
+                source
+                    .runtime
+                    .ledger
+                    .get_outbox_entry(target, first.op_id)
+                    .expect("outbox entry")
+                    .acknowledged,
+                "ACK must drain the backlog"
+            );
+
+            // With the backlog acked there is nothing pending: the push is a no-op
+            // and the stale deadline is cleared by the empty-outbox branch.
+            assert!(
+                source
+                    .runtime
+                    .build_push_payload_for_target(&receiver.runtime.local_node_id, 16)
+                    .expect("post-ack push")
+                    .is_none(),
+                "fully acked target yields no payload"
+            );
         });
     }
 
@@ -10680,6 +10927,7 @@ mod tests {
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                 floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                push_state: PushState::default(),
             },
             _ledger_dir: ledger_dir,
         }
@@ -11486,6 +11734,7 @@ mod tests {
                     adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                     pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                     floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                    push_state: PushState::default(),
                 },
                 _ledger_dir: tempfile::tempdir().expect("forge tempdir"),
             };
