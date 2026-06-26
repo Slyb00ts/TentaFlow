@@ -15,11 +15,12 @@ use std::path::PathBuf;
 use parking_lot::Mutex;
 use tentaflow_zvec::{
     Collection, Field as ZField, FieldDef as ZFieldDef, FieldType as ZFieldType,
-    FieldValue as ZFieldValue, Fusion as ZFusion, Metric as ZMetric, ZvecError,
+    FieldValue as ZFieldValue, Fusion as ZFusion, Metric as ZMetric, UpsertDoc, ZvecError,
 };
 
 use super::backend::{
-    Field, FieldSpec, FieldValue, Filter, Fusion, Metric, SearchHit, SparseVector, VectorBackend,
+    Field, FieldSpec, FieldValue, Filter, Fusion, Metric, SearchHit, SparseVector, UpsertItem,
+    VectorBackend,
 };
 use super::error::{Result, VectorError};
 use super::filter;
@@ -181,6 +182,58 @@ impl VectorBackend for ZvecBackend {
             .lock()
             .upsert(ref_id, vector, &zfields, sparse_ref)
             .map_err(map_err)
+    }
+
+    fn upsert_batch(&self, items: &[UpsertItem<'_>]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Validate every item up front and materialize owned zvec field vectors
+        // that outlive the borrowing `UpsertDoc` slice handed to the wrapper.
+        let mut zfields_all: Vec<Vec<ZField>> = Vec::with_capacity(items.len());
+        for item in items {
+            if item.ref_id == 0 {
+                return Err(VectorError::InvalidRefId);
+            }
+            if item.vector.is_empty() {
+                return Err(VectorError::EmptyVector);
+            }
+            if item.vector.len() as u32 != self.dim {
+                return Err(VectorError::DimMismatch {
+                    expected: self.dim,
+                    actual: item.vector.len() as u32,
+                });
+            }
+            if item.sparse.is_some() && !self.sparse {
+                return Err(VectorError::Backend(
+                    "namespace does not support sparse vectors (declare sparse = true)".into(),
+                ));
+            }
+            zfields_all.push(
+                item.fields
+                    .iter()
+                    .map(|f| ZField {
+                        name: f.name.clone(),
+                        value: to_zvalue(&f.value),
+                    })
+                    .collect(),
+            );
+        }
+
+        let docs: Vec<UpsertDoc<'_>> = items
+            .iter()
+            .zip(zfields_all.iter())
+            .map(|(item, zfields)| UpsertDoc {
+                ref_id: item.ref_id,
+                vector: item.vector,
+                fields: zfields.as_slice(),
+                sparse: item
+                    .sparse
+                    .map(|s| (s.indices.as_slice(), s.values.as_slice())),
+            })
+            .collect();
+
+        self.inner.lock().upsert_batch(&docs).map_err(map_err)
     }
 
     fn hybrid_search(

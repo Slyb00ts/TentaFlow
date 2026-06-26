@@ -15,12 +15,13 @@
 // id's namespace in org Y; the org_id filters land on every SELECT / INSERT
 // / UPDATE / DELETE and on every file-path resolution.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use super::backend::{Field, FieldSpec, Metric, SparseVector, VectorBackend};
+use super::backend::{Field, FieldSpec, Metric, SparseVector, UpsertItem, VectorBackend};
 use super::error::{Result, VectorError};
 use super::zvec_backend::ZvecBackend;
 use crate::db::DbPool;
@@ -831,6 +832,103 @@ impl NamespaceManager {
         Ok(new_count)
     }
 
+    /// Transactional BATCH upsert scoped to `(org_id, addon_id, namespace)`.
+    /// Counts only realistically-new `ref_id`s (those not already stored) toward
+    /// the per-tenant quota, in a SINGLE `IMMEDIATE` transaction, then runs ONE
+    /// batched backend insert (zvec builds its HNSW graph from all docs at once).
+    /// A backend failure rolls the transaction back so the cached count and the
+    /// index stay consistent. Returns the new namespace count.
+    ///
+    /// All items target the same namespace/dim/metric/schema; per-item `ref_id`,
+    /// `vector`, `fields` and `sparse` come from `items`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_batch_with_quota(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        field_specs: &[FieldSpec],
+        sparse_flag: bool,
+        items: &[UpsertItem<'_>],
+    ) -> Result<u64> {
+        if items.is_empty() {
+            return Ok(self
+                .get_or_create(
+                    org_id, addon_id, namespace, dim, metric, field_specs, sparse_flag,
+                )?
+                .count());
+        }
+
+        let backend = self.get_or_create(
+            org_id,
+            addon_id,
+            namespace,
+            dim,
+            metric,
+            field_specs,
+            sparse_flag,
+        )?;
+
+        // Count genuinely new ref_ids (replaces consume no quota). A duplicate
+        // ref_id within the same batch counts once.
+        let mut new_refs: HashSet<u64> = HashSet::with_capacity(items.len());
+        for item in items {
+            if !backend.has_ref(item.ref_id) {
+                new_refs.insert(item.ref_id);
+            }
+        }
+        let new_inserts = new_refs.len() as u64;
+
+        let conn = self
+            .pool
+            .write()
+            .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM addon_vector_namespaces \
+                 WHERE addon_id = ?1 AND org_id = ?2",
+                rusqlite::params![addon_id, org_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                VectorError::Db(e.to_string())
+            })?;
+
+        if total as u64 + new_inserts > MAX_VECTORS_PER_ADDON {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(VectorError::VectorQuotaExceeded {
+                addon_id: addon_id.to_string(),
+                current: total as u64,
+                max: MAX_VECTORS_PER_ADDON,
+            });
+        }
+
+        if let Err(e) = backend.upsert_batch(items) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
+
+        let new_count = backend.count();
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE addon_vector_namespaces SET count = ?1, updated_at = ?2 \
+             WHERE addon_id = ?3 AND namespace = ?4 AND org_id = ?5",
+            rusqlite::params![new_count as i64, now, addon_id, namespace, org_id],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(VectorError::Db(e.to_string()));
+        }
+        conn.execute("COMMIT", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+        Ok(new_count)
+    }
+
     fn check_namespace_quota(&self, org_id: &str, addon_id: &str) -> Result<()> {
         let conn = self
             .pool
@@ -1317,6 +1415,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(c2, 1);
+    }
+
+    #[test]
+    fn test_upsert_batch_with_quota_counts_only_new_refs() {
+        let (_dir, mgr) = mgr();
+        let v1 = [1.0, 0.0, 0.0];
+        let v2 = [0.0, 1.0, 0.0];
+        let v3 = [0.0, 0.0, 1.0];
+
+        // Three distinct refs in one batch -> count 3.
+        let items = vec![
+            UpsertItem { ref_id: 1, vector: &v1, fields: &[], sparse: None },
+            UpsertItem { ref_id: 2, vector: &v2, fields: &[], sparse: None },
+            UpsertItem { ref_id: 3, vector: &v3, fields: &[], sparse: None },
+        ];
+        let c1 = mgr
+            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &items)
+            .unwrap();
+        assert_eq!(c1, 3);
+
+        // Re-batch the same refs (all replaces) -> count stays 3 (no quota delta).
+        let c2 = mgr
+            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &items)
+            .unwrap();
+        assert_eq!(c2, 3);
+
+        // One new ref + two replaces -> count 4.
+        let v4 = [0.5, 0.5, 0.0];
+        let mixed = vec![
+            UpsertItem { ref_id: 1, vector: &v1, fields: &[], sparse: None },
+            UpsertItem { ref_id: 4, vector: &v4, fields: &[], sparse: None },
+        ];
+        let c3 = mgr
+            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &mixed)
+            .unwrap();
+        assert_eq!(c3, 4);
     }
 
     #[test]

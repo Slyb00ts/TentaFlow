@@ -52,6 +52,16 @@ pub struct SearchHit {
     pub fields: Vec<Field>,
 }
 
+/// One document for a batched [`VectorBackend::upsert_batch`]: the same inputs
+/// as a single `upsert`, borrowed so a chunk batch can be assembled without
+/// cloning vector/field data.
+pub struct UpsertItem<'a> {
+    pub ref_id: u64,
+    pub vector: &'a [f32],
+    pub fields: &'a [Field],
+    pub sparse: Option<&'a SparseVector>,
+}
+
 /// Per-namespace backend. Implementations must be cheap to clone (typically
 /// `Arc<Self>` wrapping an internal lock around the native handle). All
 /// operations are synchronous because usearch's native methods are not async
@@ -69,6 +79,18 @@ pub trait VectorBackend: Send + Sync {
         fields: &[Field],
         sparse: Option<&SparseVector>,
     ) -> Result<()>;
+
+    /// Insert-or-replace a whole batch in one backend round-trip. Embedded zvec
+    /// overrides this to issue a single batched native insert (its HNSW build is
+    /// far cheaper from N docs at once than from N single inserts). Remote
+    /// backends keep the default per-item loop. On error nothing is guaranteed
+    /// to have been written; callers handle rollback.
+    fn upsert_batch(&self, items: &[UpsertItem<'_>]) -> Result<()> {
+        for item in items {
+            self.upsert(item.ref_id, item.vector, item.fields, item.sparse)?;
+        }
+        Ok(())
+    }
 
     /// Top-k k-NN search; returns at most `k` hits ordered by ascending distance
     /// (closest first). `filter` restricts results by metadata (the backend

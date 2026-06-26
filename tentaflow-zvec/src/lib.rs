@@ -75,6 +75,17 @@ pub struct Field {
     pub value: FieldValue,
 }
 
+/// One document for a batched upsert: its primary key (`ref_id`), dense vector,
+/// typed metadata fields and an optional sparse vector `(indices, values)`.
+/// Borrows so the caller can build a slice without cloning chunk data.
+#[derive(Debug, Clone, Copy)]
+pub struct UpsertDoc<'a> {
+    pub ref_id: u64,
+    pub vector: &'a [f32],
+    pub fields: &'a [Field],
+    pub sparse: Option<(&'a [u32], &'a [f32])>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ZvecError {
     #[error("zvec error {code}: {message}")]
@@ -474,6 +485,132 @@ impl Collection {
         self.metric
     }
 
+    /// Validate one document's vector/sparse against the collection schema.
+    /// Returns the pk `CString` to reuse for replace + doc build.
+    fn validate_upsert(
+        &self,
+        ref_id: u64,
+        vector: &[f32],
+        sparse: Option<(&[u32], &[f32])>,
+    ) -> Result<CString> {
+        if vector.len() != self.dim as usize {
+            return Err(ZvecError::InvalidArgument(format!(
+                "vector len {} != dim {}",
+                vector.len(),
+                self.dim
+            )));
+        }
+        if let Some((indices, values)) = sparse {
+            if !self.has_sparse {
+                return Err(ZvecError::InvalidArgument(
+                    "sparse vector supplied but collection has no sparse field".into(),
+                ));
+            }
+            if indices.len() != values.len() {
+                return Err(ZvecError::InvalidArgument(
+                    "sparse indices and values length mismatch".into(),
+                ));
+            }
+        }
+        CString::new(ref_id.to_string())
+            .map_err(|_| ZvecError::InvalidArgument("ref_id produced NUL".into()))
+    }
+
+    /// Build a fully populated `zvec_doc_t` (pk + dense vector + metadata +
+    /// optional sparse). On any failure destroys the partial doc and returns
+    /// Err, so the caller never leaks. Assumes [`validate_upsert`] already ran.
+    ///
+    /// # Safety
+    /// Unsafe FFI; the returned pointer must be passed to `zvec_doc_destroy`.
+    unsafe fn build_doc(
+        &self,
+        pk: &CString,
+        vector: &[f32],
+        fields: &[Field],
+        sparse: Option<(&[u32], &[f32])>,
+    ) -> Result<*mut sys::zvec_doc_t> {
+        let doc = sys::zvec_doc_create();
+        if doc.is_null() {
+            return Err(ZvecError::NullHandle("doc_create"));
+        }
+        sys::zvec_doc_set_pk(doc, pk.as_ptr());
+        let r = sys::zvec_doc_add_field_by_value(
+            doc,
+            VEC_FIELD.as_ptr() as *const std::os::raw::c_char,
+            sys::ZVEC_DATA_TYPE_VECTOR_FP32 as sys::zvec_data_type_t,
+            vector.as_ptr() as *const c_void,
+            std::mem::size_of_val(vector),
+        );
+        if let Err(err) = check(r) {
+            sys::zvec_doc_destroy(doc);
+            return Err(err);
+        }
+
+        // Metadata fields.
+        for f in fields {
+            let fname = match CString::new(f.name.as_str()) {
+                Ok(c) => c,
+                Err(_) => {
+                    sys::zvec_doc_destroy(doc);
+                    return Err(ZvecError::InvalidArgument("field name contains NUL".into()));
+                }
+            };
+            let rc = match &f.value {
+                FieldValue::Str(s) => sys::zvec_doc_add_field_by_value(
+                    doc, fname.as_ptr(), FieldType::Str.to_zvec(),
+                    s.as_ptr() as *const c_void, s.len(),
+                ),
+                FieldValue::Int(i) => sys::zvec_doc_add_field_by_value(
+                    doc, fname.as_ptr(), FieldType::Int.to_zvec(),
+                    i as *const i64 as *const c_void, std::mem::size_of::<i64>(),
+                ),
+                FieldValue::Float(d) => sys::zvec_doc_add_field_by_value(
+                    doc, fname.as_ptr(), FieldType::Float.to_zvec(),
+                    d as *const f64 as *const c_void, std::mem::size_of::<f64>(),
+                ),
+                FieldValue::Bool(b) => {
+                    let bb: u8 = *b as u8;
+                    sys::zvec_doc_add_field_by_value(
+                        doc, fname.as_ptr(), FieldType::Bool.to_zvec(),
+                        &bb as *const u8 as *const c_void, std::mem::size_of::<u8>(),
+                    )
+                }
+            };
+            if let Err(err) = check(rc) {
+                sys::zvec_doc_destroy(doc);
+                return Err(err);
+            }
+        }
+
+        // Sparse vector: serialized as [nnz: u32][indices: u32*nnz][values: f32*nnz]
+        // (native LE), the layout zvec's add_field_by_value expects for
+        // SPARSE_VECTOR_FP32.
+        if let Some((indices, values)) = sparse {
+            let nnz = indices.len() as u32;
+            let mut buf = Vec::with_capacity(4 + indices.len() * 4 + values.len() * 4);
+            buf.extend_from_slice(&nnz.to_le_bytes());
+            for &i in indices {
+                buf.extend_from_slice(&i.to_le_bytes());
+            }
+            for &v in values {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let rc = sys::zvec_doc_add_field_by_value(
+                doc,
+                SPARSE_FIELD.as_ptr() as *const std::os::raw::c_char,
+                sys::ZVEC_DATA_TYPE_SPARSE_VECTOR_FP32 as sys::zvec_data_type_t,
+                buf.as_ptr() as *const c_void,
+                buf.len(),
+            );
+            if let Err(err) = check(rc) {
+                sys::zvec_doc_destroy(doc);
+                return Err(err);
+            }
+        }
+
+        Ok(doc)
+    }
+
     /// Insert or replace the vector stored under `ref_id`, with optional typed
     /// metadata `fields`. Flushes so a successful return implies durability.
     pub fn upsert(
@@ -483,14 +620,7 @@ impl Collection {
         fields: &[Field],
         sparse: Option<(&[u32], &[f32])>,
     ) -> Result<()> {
-        if vector.len() != self.dim as usize {
-            return Err(ZvecError::InvalidArgument(format!(
-                "vector len {} != dim {}",
-                vector.len(),
-                self.dim
-            )));
-        }
-        let pk = CString::new(ref_id.to_string()).unwrap();
+        let pk = self.validate_upsert(ref_id, vector, sparse)?;
         unsafe {
             // Replace semantics: drop any existing row with this pk first.
             let pks = [pk.as_ptr()];
@@ -498,92 +628,7 @@ impl Collection {
             let mut e = 0usize;
             let _ = sys::zvec_collection_delete(self.handle, pks.as_ptr(), 1, &mut s, &mut e);
 
-            let doc = sys::zvec_doc_create();
-            if doc.is_null() {
-                return Err(ZvecError::NullHandle("doc_create"));
-            }
-            sys::zvec_doc_set_pk(doc, pk.as_ptr());
-            let r = sys::zvec_doc_add_field_by_value(
-                doc,
-                VEC_FIELD.as_ptr() as *const std::os::raw::c_char,
-                sys::ZVEC_DATA_TYPE_VECTOR_FP32 as sys::zvec_data_type_t,
-                vector.as_ptr() as *const c_void,
-                std::mem::size_of_val(vector),
-            );
-            if let Err(err) = check(r) {
-                sys::zvec_doc_destroy(doc);
-                return Err(err);
-            }
-
-            // Metadata fields.
-            for f in fields {
-                let fname = match CString::new(f.name.as_str()) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        sys::zvec_doc_destroy(doc);
-                        return Err(ZvecError::InvalidArgument("field name contains NUL".into()));
-                    }
-                };
-                let rc = match &f.value {
-                    FieldValue::Str(s) => sys::zvec_doc_add_field_by_value(
-                        doc, fname.as_ptr(), FieldType::Str.to_zvec(),
-                        s.as_ptr() as *const c_void, s.len(),
-                    ),
-                    FieldValue::Int(i) => sys::zvec_doc_add_field_by_value(
-                        doc, fname.as_ptr(), FieldType::Int.to_zvec(),
-                        i as *const i64 as *const c_void, std::mem::size_of::<i64>(),
-                    ),
-                    FieldValue::Float(d) => sys::zvec_doc_add_field_by_value(
-                        doc, fname.as_ptr(), FieldType::Float.to_zvec(),
-                        d as *const f64 as *const c_void, std::mem::size_of::<f64>(),
-                    ),
-                    FieldValue::Bool(b) => {
-                        let bb: u8 = *b as u8;
-                        sys::zvec_doc_add_field_by_value(
-                            doc, fname.as_ptr(), FieldType::Bool.to_zvec(),
-                            &bb as *const u8 as *const c_void, std::mem::size_of::<u8>(),
-                        )
-                    }
-                };
-                if let Err(err) = check(rc) {
-                    sys::zvec_doc_destroy(doc);
-                    return Err(err);
-                }
-            }
-
-            // Sparse vector: serialized as [nnz: u32][indices: u32*nnz][values: f32*nnz]
-            // (native LE), the layout zvec's add_field_by_value expects for
-            // SPARSE_VECTOR_FP32.
-            if let Some((indices, values)) = sparse {
-                if indices.len() != values.len() {
-                    sys::zvec_doc_destroy(doc);
-                    return Err(ZvecError::InvalidArgument(
-                        "sparse indices and values length mismatch".into(),
-                    ));
-                }
-                let nnz = indices.len() as u32;
-                let mut buf =
-                    Vec::with_capacity(4 + indices.len() * 4 + values.len() * 4);
-                buf.extend_from_slice(&nnz.to_le_bytes());
-                for &i in indices {
-                    buf.extend_from_slice(&i.to_le_bytes());
-                }
-                for &v in values {
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-                let rc = sys::zvec_doc_add_field_by_value(
-                    doc,
-                    SPARSE_FIELD.as_ptr() as *const std::os::raw::c_char,
-                    sys::ZVEC_DATA_TYPE_SPARSE_VECTOR_FP32 as sys::zvec_data_type_t,
-                    buf.as_ptr() as *const c_void,
-                    buf.len(),
-                );
-                if let Err(err) = check(rc) {
-                    sys::zvec_doc_destroy(doc);
-                    return Err(err);
-                }
-            }
-
+            let doc = self.build_doc(&pk, vector, fields, sparse)?;
             let mut docs = [doc as *const sys::zvec_doc_t];
             let mut success = 0usize;
             let mut errors = 0usize;
@@ -595,6 +640,85 @@ impl Collection {
                 return Err(ZvecError::Api {
                     code: -1,
                     message: format!("insert reported {success} ok / {errors} failed"),
+                });
+            }
+            check(sys::zvec_collection_flush(self.handle))
+        }
+    }
+
+    /// Insert-or-replace a whole batch of documents in ONE `zvec_collection_*`
+    /// round-trip: one `zvec_collection_delete(count = N)` for replace semantics,
+    /// one `zvec_collection_insert(count = N)` for the whole array, then a single
+    /// `flush`. zvec builds its HNSW graph far more efficiently from N docs at
+    /// once than from N single-doc inserts, so document ingest uses this path.
+    ///
+    /// Every element is validated BEFORE any doc is built or inserted; a bad
+    /// element returns Err and nothing is written. Already-built docs are
+    /// destroyed on every exit path (success or error) — no leak.
+    pub fn upsert_batch(&self, items: &[UpsertDoc<'_>]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        // Validate everything first; collect pks so we can build the doc array
+        // and the delete-pk array without re-allocating the strings.
+        let mut pks: Vec<CString> = Vec::with_capacity(items.len());
+        for item in items {
+            pks.push(self.validate_upsert(item.ref_id, item.vector, item.sparse)?);
+        }
+
+        unsafe {
+            // Replace semantics for the whole batch in a single delete call.
+            let pk_ptrs: Vec<*const std::os::raw::c_char> =
+                pks.iter().map(|c| c.as_ptr()).collect();
+            let mut del_ok = 0usize;
+            let mut del_err = 0usize;
+            let _ = sys::zvec_collection_delete(
+                self.handle,
+                pk_ptrs.as_ptr(),
+                pk_ptrs.len(),
+                &mut del_ok,
+                &mut del_err,
+            );
+
+            // Build every doc; on failure destroy the ones already built.
+            let mut docs: Vec<*mut sys::zvec_doc_t> = Vec::with_capacity(items.len());
+            for (item, pk) in items.iter().zip(pks.iter()) {
+                match self.build_doc(pk, item.vector, item.fields, item.sparse) {
+                    Ok(doc) => docs.push(doc),
+                    Err(err) => {
+                        for d in &docs {
+                            sys::zvec_doc_destroy(*d);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+
+            let mut doc_ptrs: Vec<*const sys::zvec_doc_t> =
+                docs.iter().map(|d| *d as *const sys::zvec_doc_t).collect();
+            let mut success = 0usize;
+            let mut errors = 0usize;
+            let r = sys::zvec_collection_insert(
+                self.handle,
+                doc_ptrs.as_mut_ptr(),
+                doc_ptrs.len(),
+                &mut success,
+                &mut errors,
+            );
+
+            for d in &docs {
+                sys::zvec_doc_destroy(*d);
+            }
+
+            check(r)?;
+            if success != items.len() {
+                return Err(ZvecError::Api {
+                    code: -1,
+                    message: format!(
+                        "batch insert reported {success} ok / {errors} failed (expected {})",
+                        items.len()
+                    ),
                 });
             }
             check(sys::zvec_collection_flush(self.handle))
@@ -1146,6 +1270,89 @@ mod tests {
         assert_eq!(coll.count().unwrap(), 1);
         let hits = coll.search(&[1.0, 2.0, 3.0], 1, None, &[]).unwrap();
         assert_eq!(hits[0].ref_id, 1);
+    }
+
+    #[test]
+    fn upsert_batch_inserts_all_in_one_call_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns_batch");
+        let fields = vec![FieldDef { name: "chunk".into(), field_type: FieldType::Int }];
+
+        // Three distinct docs in a SINGLE batched insert (count = N).
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let chunk_fields: Vec<Vec<Field>> = (0..3)
+            .map(|i| vec![Field { name: "chunk".into(), value: FieldValue::Int(i) }])
+            .collect();
+        {
+            let coll = Collection::create_or_open(&path, 3, Metric::Cosine, &fields, false).unwrap();
+            let items: Vec<UpsertDoc<'_>> = vectors
+                .iter()
+                .zip(chunk_fields.iter())
+                .enumerate()
+                .map(|(i, (v, f))| UpsertDoc {
+                    ref_id: (i as u64) + 1,
+                    vector: v.as_slice(),
+                    fields: f.as_slice(),
+                    sparse: None,
+                })
+                .collect();
+            coll.upsert_batch(&items).unwrap();
+            assert_eq!(coll.count().unwrap(), 3);
+        }
+
+        // Reopen proves the single batched insert + one flush was durable.
+        let coll = Collection::create_or_open(&path, 3, Metric::Cosine, &fields, false).unwrap();
+        assert_eq!(coll.count().unwrap(), 3);
+        let hit = coll.search(&[0.0, 1.0, 0.0], 1, None, &["chunk".to_string()]).unwrap();
+        assert_eq!(hit[0].ref_id, 2);
+
+        // Re-batching the same ref_ids replaces (no duplicates).
+        let v2 = [vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let f2: Vec<Vec<Field>> = (0..3)
+            .map(|i| vec![Field { name: "chunk".into(), value: FieldValue::Int(i + 100) }])
+            .collect();
+        let items2: Vec<UpsertDoc<'_>> = v2
+            .iter()
+            .zip(f2.iter())
+            .enumerate()
+            .map(|(i, (v, f))| UpsertDoc {
+                ref_id: (i as u64) + 1,
+                vector: v.as_slice(),
+                fields: f.as_slice(),
+                sparse: None,
+            })
+            .collect();
+        coll.upsert_batch(&items2).unwrap();
+        assert_eq!(coll.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn upsert_batch_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns_batch_empty");
+        let coll = Collection::create_or_open(&path, 3, Metric::Cosine, &[], false).unwrap();
+        coll.upsert_batch(&[]).unwrap();
+        assert_eq!(coll.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn upsert_batch_rejects_bad_dim_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns_batch_dim");
+        let coll = Collection::create_or_open(&path, 3, Metric::Cosine, &[], false).unwrap();
+        let good = vec![1.0, 0.0, 0.0];
+        let bad = vec![1.0, 0.0]; // wrong dim
+        let items = vec![
+            UpsertDoc { ref_id: 1, vector: good.as_slice(), fields: &[], sparse: None },
+            UpsertDoc { ref_id: 2, vector: bad.as_slice(), fields: &[], sparse: None },
+        ];
+        assert!(coll.upsert_batch(&items).is_err());
+        // Validation runs before any insert: nothing written.
+        assert_eq!(coll.count().unwrap(), 0);
     }
 
     #[test]
