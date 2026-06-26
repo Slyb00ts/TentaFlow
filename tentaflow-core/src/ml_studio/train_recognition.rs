@@ -147,6 +147,13 @@ async fn run_training_against_dir(
     class_names: &[String],
 ) -> anyhow::Result<()> {
     let output_dir = format!("recog/{}/{}", project_id, run_id);
+    // RF-DETR's windowed attention requires the training resolution to be a multiple
+    // of 32 (patch_size 16 * num_windows 2). Snap any incoming value (e.g. the 560px
+    // inference default) to the nearest valid multiple so a clean train never fails.
+    let resolution = {
+        let r = (hyperparams.resolution as i64).max(224);
+        (((r + 16) / 32) * 32) as u32
+    };
     let train_body = json!({
         "dataset_dir": dataset_dir.to_string_lossy(),
         "class_names": class_names,
@@ -157,7 +164,7 @@ async fn run_training_against_dir(
             "batch_size": hyperparams.batch_size,
             "grad_accum": hyperparams.grad_accum,
             "lr": hyperparams.learning_rate,
-            "resolution": hyperparams.resolution,
+            "resolution": resolution,
             "early_stopping": hyperparams.early_stopping,
         },
     });
@@ -274,25 +281,43 @@ fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<
     let mut ordered: Vec<&serde_json::Value> = images.iter().collect();
     ordered.sort_by(|a, b| coco_image_file_name(a).cmp(&coco_image_file_name(b)));
 
+    // RF-DETR trains with run_test=True, so it needs train/ valid/ AND test/. We do a
+    // deterministic 3-way split by position mod stride: last slot → valid, second-last
+    // → test, rest → train. No RNG (reproducible).
     let mut valid_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut test_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (idx, img) in ordered.iter().enumerate() {
-        if idx % VALID_HOLDOUT_STRIDE == VALID_HOLDOUT_STRIDE - 1 {
-            if let Some(id) = img.get("id").and_then(|v| v.as_i64()) {
+        let Some(id) = img.get("id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        match idx % VALID_HOLDOUT_STRIDE {
+            n if n == VALID_HOLDOUT_STRIDE - 1 => {
                 valid_ids.insert(id);
             }
+            n if n == VALID_HOLDOUT_STRIDE - 2 => {
+                test_ids.insert(id);
+            }
+            _ => {}
         }
     }
-    // Gwarancja: valid/ ma min. 1 obraz, train/ zachowuje większość. Gdy stride
-    // nie trafił żadnego (mało obrazów), wstrzymujemy ostatni obraz.
+    // Each eval split must hold >=1 image (small datasets); pull distinct images from
+    // the end so valid/ and test/ never steal the same one.
+    let rev_ids: Vec<i64> = ordered
+        .iter()
+        .rev()
+        .filter_map(|img| img.get("id").and_then(|v| v.as_i64()))
+        .collect();
     if valid_ids.is_empty() {
-        if let Some(id) = ordered
-            .last()
-            .and_then(|img| img.get("id").and_then(|v| v.as_i64()))
-        {
+        if let Some(&id) = rev_ids.iter().find(|id| !test_ids.contains(id)) {
             valid_ids.insert(id);
         }
     }
-    let train_count = images.len() - valid_ids.len();
+    if test_ids.is_empty() {
+        if let Some(&id) = rev_ids.iter().find(|id| !valid_ids.contains(id)) {
+            test_ids.insert(id);
+        }
+    }
+    let train_count = images.len().saturating_sub(valid_ids.len() + test_ids.len());
     if train_count < MIN_TRAIN_IMAGES {
         anyhow::bail!("zbiór za mały do treningu — dodaj więcej obrazów");
     }
@@ -305,31 +330,47 @@ fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<
     }
     let dest_train = dest.join("train");
     let dest_valid = dest.join("valid");
+    let dest_test = dest.join("test");
     std::fs::create_dir_all(&dest_train)?;
     std::fs::create_dir_all(&dest_valid)?;
+    std::fs::create_dir_all(&dest_test)?;
 
-    // Rozdział obrazów i adnotacji wg przynależności do valid_ids. Ids zostają
-    // oryginalne — są spójne w obrębie każdego splitu (image_id ↔ annotation).
-    let (valid_images, train_images): (Vec<_>, Vec<_>) = images.iter().partition(|img| {
-        img.get("id")
-            .and_then(|v| v.as_i64())
-            .map(|id| valid_ids.contains(&id))
-            .unwrap_or(false)
-    });
-    let (valid_annots, train_annots): (Vec<_>, Vec<_>) = annotations.iter().partition(|a| {
-        a.get("image_id")
-            .and_then(|v| v.as_i64())
-            .map(|id| valid_ids.contains(&id))
-            .unwrap_or(false)
-    });
+    // Split images + annotations by image id (ids stay original — consistent within
+    // each split). 0 = train, 1 = valid, 2 = test.
+    let img_split = |id: i64| -> u8 {
+        if valid_ids.contains(&id) {
+            1
+        } else if test_ids.contains(&id) {
+            2
+        } else {
+            0
+        }
+    };
+    let pick_imgs = |sel: u8| -> Vec<&serde_json::Value> {
+        images
+            .iter()
+            .filter(|img| img.get("id").and_then(|v| v.as_i64()).map(img_split) == Some(sel))
+            .collect()
+    };
+    let pick_annots = |sel: u8| -> Vec<&serde_json::Value> {
+        annotations
+            .iter()
+            .filter(|a| a.get("image_id").and_then(|v| v.as_i64()).map(img_split) == Some(sel))
+            .collect()
+    };
+    let (train_images, valid_images, test_images) = (pick_imgs(0), pick_imgs(1), pick_imgs(2));
+    let (train_annots, valid_annots, test_annots) =
+        (pick_annots(0), pick_annots(1), pick_annots(2));
 
     write_split_coco(&dest_train, &categories, &train_images, &train_annots)?;
     write_split_coco(&dest_valid, &categories, &valid_images, &valid_annots)?;
+    write_split_coco(&dest_test, &categories, &test_images, &test_annots)?;
 
     // Kopiujemy (preferując hardlink) pliki obrazów do odpowiednich splitów.
     // Serwis czyta obrazy po file_name z katalogu danego splitu.
     copy_split_images(&train_dir, &dest_train, &train_images)?;
     copy_split_images(&train_dir, &dest_valid, &valid_images)?;
+    copy_split_images(&train_dir, &dest_test, &test_images)?;
 
     Ok(PreparedDataset::Ephemeral(dest))
 }
