@@ -3079,6 +3079,71 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MlStudioBody(SchemaGetRequest) — odczyt schematu rozpoznawania projektu
+   * (JSON nieprzezroczysty dla Core). payload: { projectId }. Zwraca schemaJson. */
+  mlStudioSchemaGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioSchemaGetRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(SchemaSaveRequest) — upsert schematu rozpoznawania projektu.
+   * Core zapisuje schemaJson dosłownie. payload: { projectId, schemaJson }. */
+  mlStudioSchemaSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioSchemaSaveRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.schemaJson ?? payload.schema_json ?? '{}'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(LookupDictsListRequest) — lista słowników lookup projektu.
+   * payload: { projectId }. Zwraca dictsJson (tablica {dictId,name,rowsJson}). */
+  mlStudioLookupDictsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioLookupDictsListRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(LookupDictSaveRequest) — upsert słownika lookup. Pusty dictId
+   * = INSERT (zwraca nowe id). payload: { projectId, dictId, name, rowsJson }. */
+  mlStudioLookupDictSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioLookupDictSaveRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.dictId ?? payload.dict_id ?? ''),
+      String(payload.name ?? ''),
+      String(payload.rowsJson ?? payload.rows_json ?? '[]'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(LookupDictDeleteRequest) — usuwa słownik lookup po id.
+   * payload: { dictId }. */
+  mlStudioLookupDictDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioLookupDictDeleteRequest(
+      String(payload.dictId ?? payload.dict_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(ServiceModelsListRequest) — modele, do których pole schematu
+   * może się przypiąć (service_models + wbudowane in-core). Pusta capability =
+   * wszystkie. payload: { capability }. Zwraca modelsJson. */
+  mlStudioServiceModelsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioServiceModelsListRequest(
+      String(payload.capability ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /**
    * MessageBody::MlStudioBody(RecogDatasetRegisterRequest) — rejestruje dataset
    * COCO przez ŚCIEŻKĘ do katalogu na serwerze (duże zbiory obrazów ponad limit

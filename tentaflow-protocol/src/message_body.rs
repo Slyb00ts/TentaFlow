@@ -1935,6 +1935,86 @@ pub struct MlStudioFtChatResponse {
     pub error: Option<String>,
 }
 
+// ----- Recognition: schema editor (opaque JSON owned by the frontend) -----
+
+/// Reads the project's recognition schema as an OPAQUE JSON string. Core never
+/// parses the internal shape — it persists and returns whatever the frontend
+/// stored. Empty/none-stored projects get `"{}"`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioSchemaGetRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioSchemaGetResponse {
+    pub schema_json: String,
+}
+
+/// Upserts the project's recognition schema (one schema row per project). Core
+/// stores `schema_json` verbatim without validating its internal shape.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioSchemaSaveRequest {
+    pub project_id: String,
+    pub schema_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioSchemaSaveResponse {
+    pub ok: bool,
+}
+
+/// Lists the project's lookup dictionaries. `dicts_json` is a JSON array string
+/// of `{dictId,name,rowsJson}`; `rowsJson` is the opaque per-dict rows blob the
+/// frontend stored. Mirrors the JSON-as-string convention used by recog images.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictsListRequest {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictsListResponse {
+    pub dicts_json: String,
+}
+
+/// Upserts one lookup dictionary. Empty `dict_id` → INSERT with a fresh uuid
+/// (returned); non-empty → UPDATE that dict's name + rows. `rows_json` is stored
+/// opaquely.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictSaveRequest {
+    pub project_id: String,
+    pub dict_id: String,
+    pub name: String,
+    pub rows_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictSaveResponse {
+    pub dict_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictDeleteRequest {
+    pub dict_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioLookupDictDeleteResponse {
+    pub ok: bool,
+}
+
+/// Lists models a recognition schema field can bind to. `models_json` is a JSON
+/// array string of `{id,name,capability,source}` merged from the `service_models`
+/// table plus the in-core built-in CV models. Empty `capability` = all.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioServiceModelsListRequest {
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioServiceModelsListResponse {
+    pub models_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2013,6 +2093,18 @@ pub enum MlStudioPayload {
     DatasetUploadChunkResponse(MlStudioDatasetUploadChunkResponse),
     FtChatRequest(MlStudioFtChatRequest),
     FtChatResponse(MlStudioFtChatResponse),
+    SchemaGetRequest(MlStudioSchemaGetRequest),
+    SchemaGetResponse(MlStudioSchemaGetResponse),
+    SchemaSaveRequest(MlStudioSchemaSaveRequest),
+    SchemaSaveResponse(MlStudioSchemaSaveResponse),
+    LookupDictsListRequest(MlStudioLookupDictsListRequest),
+    LookupDictsListResponse(MlStudioLookupDictsListResponse),
+    LookupDictSaveRequest(MlStudioLookupDictSaveRequest),
+    LookupDictSaveResponse(MlStudioLookupDictSaveResponse),
+    LookupDictDeleteRequest(MlStudioLookupDictDeleteRequest),
+    LookupDictDeleteResponse(MlStudioLookupDictDeleteResponse),
+    ServiceModelsListRequest(MlStudioServiceModelsListRequest),
+    ServiceModelsListResponse(MlStudioServiceModelsListResponse),
 }
 
 // ----- Robots screen (UserSession) -----
