@@ -12,7 +12,7 @@ python_version = "3.12"
 # Zależności pinowane w pyproject. `pypi_package` to identity-package bundla
 # (rfdetr); torch z wariantu CUDA przez install_variants.extra_index.
 source = "pypi"
-pypi_package = "rfdetr==1.7.1"
+pypi_package = "rfdetr==1.8.1"
 
 [launch]
 command = "uvicorn"
@@ -29,11 +29,12 @@ gpu_memory_gb = 10
 disk_gb = 30
 platforms = ["linux-x86_64"]
 
-# torch z kołami CUDA 12.1 (PyPI domyślnie serwuje wariant CPU). Brak GPU →
-# wariant `cpu`. RF-DETR wymaga GPU realnie do treningu (CPU tylko smoke).
+# torch z kołami CUDA 13.0 (wsparcie Blackwell/B300; PyPI domyślnie serwuje
+# wariant CPU). Brak GPU → wariant `cpu`. RF-DETR wymaga GPU realnie do treningu
+# (CPU tylko smoke).
 [[install_variants]]
 backend = "cuda"
-extra_index = "https://download.pytorch.org/whl/cu121"
+extra_index = "https://download.pytorch.org/whl/cu130"
 extras = []
 
 [[install_variants]]

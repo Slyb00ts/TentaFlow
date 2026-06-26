@@ -2,7 +2,7 @@
 # =============================================================================
 # Plik: run.sh
 # Opis: Uruchamia natywny serwer treningowy RF-DETR przez `uv` (izolowany
-#       Python 3.12 + torch CUDA 12.1). Port nadpisywalny przez PORT (8202).
+#       Python 3.12 + torch CUDA 13.0). Port nadpisywalny przez PORT (8202).
 # =============================================================================
 
 set -euo pipefail

@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: pyproject.toml
 # Opis: Definicja środowiska `uv` dla natywnego serwera treningowego RF-DETR.
-#       torch z CUDA 12.1 z indeksu PyTorch; rfdetr z extras [train].
+#       torch z CUDA 13.0 z indeksu PyTorch (wsparcie Blackwell/B300); rfdetr z extras [train].
 # =============================================================================
 
 [project]
@@ -10,21 +10,21 @@ version = "1.0.0"
 description = "TentaFlow RF-DETR object detection training server"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "torch==2.4.1",
-    "torchvision==0.19.1",
-    "rfdetr[train]==1.7.1",
+    "torch==2.12.1",
+    "torchvision==0.27.1",
+    "rfdetr[train]==1.8.1",
     "pycocotools==2.0.8",
-    "onnx==1.17.0",
-    "onnxruntime==1.19.2",
+    "onnx>=1.20.0,<2.0",
+    "onnxruntime>=1.20.0",
     "fastapi==0.115.5",
     "uvicorn[standard]==0.32.1",
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
-torchvision = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
