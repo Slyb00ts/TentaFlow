@@ -403,7 +403,7 @@ mod tests {
             ALL_COMPONENTS.iter().filter(|c| c.section == s).count()
         };
         assert_eq!(by_section(section::MOLECULES), 12, "§2 Molecules");
-        assert_eq!(by_section(section::LAYOUT), 18, "§3 Layout");
+        assert_eq!(by_section(section::LAYOUT), 19, "§3 Layout");
         assert_eq!(by_section(section::DATA), 38, "§4 Data Display");
         assert_eq!(by_section(section::FORM), 29, "§5 Form");
         assert_eq!(by_section(section::ACTION), 12, "§6 Action");

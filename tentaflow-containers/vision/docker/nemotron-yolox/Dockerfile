@@ -29,6 +29,16 @@ ENV PATH="/opt/venv/bin:$PATH"
 # FastCOCOEvalOp (CppExtension) i `assert TORCH_AVAILABLE` — w izolacji PEP 517
 # torch jest niewidoczny i build pada; tu uzywamy torcha juz w /opt/venv, a
 # build-essential + ninja dostarczaja g++ do kompilacji op. Bez onnxruntime.
+# YOLOX kompiluje custom-op CUDA FastCOCOEvalOp (CppExtension) i bierze pod uwage
+# WYLACZNIE architektury z TORCH_CUDA_ARCH_LIST. Przy `docker build` GPU nie jest
+# widoczne, wiec bez tej listy nvcc moze pominac najnowszego Blackwella -> na B300
+# (sm_103) `no kernel image is available`. Deploy (docker.rs) wstrzykuje DOKLADNY
+# arch pod wykryte GPU przez --build-arg TORCH_CUDA_ARCH_LIST=...; gdy argu brak
+# (manualny build) zostaje DEFAULT fat-binary pod wszystkie karty meshu (Ampere
+# 8.6 .. Blackwell 10.3) + PTX (forward-compat JIT). ARG zadeklarowany ZANIM
+# uzyjemy go w ENV, ENV USTAWIONE PRZED budowa pakietu yolox nizej.
+ARG TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0;10.0;10.3+PTX"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
  && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
       torch torchvision \

@@ -115,6 +115,58 @@ fn cuda_arch_tag_from_cc(cc: &str) -> &'static str {
 }
 
 impl GpuSnapshot {
+    /// Buduje dokladny `TORCH_CUDA_ARCH_LIST` dla custom-kerneli CUDA z compute
+    /// capability WSZYSTKICH wykrytych kart NVIDIA. Format torcha (np. "8.6",
+    /// "10.3" — compute_capability jest juz w tej postaci, NIE konwertujemy na
+    /// sm_103). Lista jest unikalna i posortowana rosnaco, a `+PTX` dolepiamy do
+    /// NAJWYZSZEGO arch (forward-compat: JIT-owalny PTX dla nowszych kart).
+    /// Przyklady: same B300 -> "10.3+PTX"; same 3090 -> "8.6+PTX";
+    /// mix 3090+B300 -> "8.6;10.3+PTX". Brak CUDA GPU -> None.
+    ///
+    /// Po co: bez jawnej listy build polega na auto-detekcji hosta i potrafi
+    /// wyprodukowac binarke bez kernela dla realnej karty ("no kernel image").
+    /// Deploy wstrzykuje to do builda (native env / docker build-arg), wiec
+    /// kazdy host kompiluje kernel dokladnie pod swoja karte — bez duplikowania
+    /// wariantow per-arch.
+    pub fn torch_cuda_arch_list(&self) -> Option<String> {
+        if self.preferred_backend != GpuBackend::Cuda || self.nvidia.is_empty() {
+            return None;
+        }
+        // Sortujemy compute capability numerycznie (major, minor), zeby "10.3"
+        // bylo wyzej niz "8.6" (porownanie stringowe daloby zla kolejnosc).
+        let mut caps: Vec<(u32, u32, String)> = self
+            .nvidia
+            .iter()
+            .filter_map(|g| g.compute_capability.as_deref())
+            .filter_map(|cc| {
+                let mut parts = cc.split('.');
+                let major = parts.next()?.parse::<u32>().ok()?;
+                let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+                Some((major, minor, cc.to_string()))
+            })
+            .collect();
+        if caps.is_empty() {
+            return None;
+        }
+        caps.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        caps.dedup_by(|a, b| a.2 == b.2);
+
+        let last = caps.len() - 1;
+        let list = caps
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, cc))| {
+                if i == last {
+                    format!("{cc}+PTX")
+                } else {
+                    cc.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        Some(list)
+    }
+
     /// Tag architektury GPU do wyboru wariantu builda silnika. Dla CUDA zwraca
     /// arch-specyficzny tag (`cuda-ampere`/`-ada`/`-hopper`/`-blackwell`/`-spark`)
     /// liczony z compute capability karty o najwiekszym VRAM; dla pozostalych

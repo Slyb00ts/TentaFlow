@@ -308,6 +308,73 @@ pub(super) fn compose_project_name(engine_id: &str, port: u16) -> String {
     format!("tentaflow-{safe}-{port}")
 }
 
+/// Tag obrazu, z którego URUCHOMIONY jest kontener danego serwisu (np.
+/// `tentaflow/nemotron-page-elements:v3-30cf3e621865`). ŹRÓDŁO PRAWDY co
+/// faktycznie biegnie na węźle — od fixu tagów deploy zaszywa w nim 12-hex
+/// `docker_source_hash`, więc reconcile może zsynchronizować
+/// `deployed_source_hash` z REALNYM obrazem (stary deploy zapisywał baked hash
+/// nie przebudowując flat-tagowanego obrazu → badge update nigdy nie wracał).
+///
+/// `ContainerSummary.image` niesie napis tagu (a NIE digest jak top-level
+/// `Image` w inspect), dlatego listujemy po nazwie zamiast `inspect_container`.
+/// Zwraca `None` gdy daemon nieosiągalny lub brak running kontenera o tej
+/// nazwie (serwis zatrzymany / single-container nie istnieje). Nazwa kontenera
+/// to `tentaflow-<engine_id>-<host_port>` (jak w `run()` i `stop_checked`).
+#[cfg(feature = "docker")]
+pub(crate) async fn running_container_image_tag(engine_id: &str, host_port: u16) -> Option<String> {
+    let docker = backend::connect().await.ok()?;
+    let expected = format!("tentaflow-{}-{}", engine_id, host_port);
+    let listed = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .ok()?;
+    listed.into_iter().find_map(|c| {
+        // Tylko running — zatrzymany/exited kontener nie reprezentuje tego, co
+        // realnie obsługuje ruch; jego stary tag nie powinien sterować badge.
+        let running = matches!(
+            c.state,
+            Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+        );
+        if !running {
+            return None;
+        }
+        // Nazwy w bollard mają wiodący `/`; normalizujemy przed porównaniem.
+        let matches_name = c
+            .names
+            .as_ref()
+            .map(|ns| {
+                ns.iter()
+                    .any(|n| n.trim_start_matches('/') == expected)
+            })
+            .unwrap_or(false);
+        if matches_name {
+            c.image
+        } else {
+            None
+        }
+    })
+}
+
+/// Wyłuskuje 12-hex `docker_source_hash` z ostatniego segmentu tagu obrazu.
+/// Tag może być `<version>`, `<version>-<arch>` (np. `-sm86`),
+/// `<version>-<hash>` albo `<version>-<arch>-<hash>`. Hash to ZAWSZE ostatni
+/// segment pasujący do `-[0-9a-f]{12}$`; arch-tag (`-sm86`) nie jest 12-hex,
+/// więc nie zostanie złapany (flat-bez-hasha → `None` → stary obraz → badge).
+#[cfg(feature = "docker")]
+pub(crate) fn hash12_from_image_tag(image: &str) -> Option<String> {
+    // Tag to część po OSTATNIM `:` (repo może zawierać port rejestru z `:`).
+    let tag = image.rsplit(':').next()?;
+    let last = tag.rsplit('-').next()?;
+    if last.len() == 12 && last.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        Some(last.to_string())
+    } else {
+        None
+    }
+}
+
 /// Host ports currently published by any running docker container (incl. ones
 /// not managed by TentaFlow). Parsed from `docker ps --format '{{.Ports}}'`,
 /// whose entries look like `0.0.0.0:5001->19530/tcp, [::]:5001->19530/tcp`.
@@ -870,7 +937,8 @@ impl DeployStrategy for DockerDeploy {
         // deklaruje `arch_variants`, tag obrazu dostaje sufiks arch, zeby obrazy
         // pod rozne karty (np. sglang Ampere vs Blackwell) nie kolidowaly w
         // cache "build only when missing".
-        let arch_tag = crate::system_check::collect().gpu.cuda_arch_tag();
+        let gpu = crate::system_check::collect().gpu;
+        let arch_tag = gpu.cuda_arch_tag();
         let mut build_args: std::collections::HashMap<String, String> =
             docker_section.default_build_args.clone();
         if let Some(variant) = docker_section.arch_variants.get(&arch_tag) {
@@ -878,21 +946,88 @@ impl DeployStrategy for DockerDeploy {
                 build_args.insert(k.clone(), v.clone());
             }
         }
+        // Hardware-aware build custom-kerneli CUDA: wstrzykujemy dokladny
+        // TORCH_CUDA_ARCH_LIST pod wykryte GPU jako build-arg, zeby host
+        // kompilowal kernele (OCR quad_nms, yolox FastCOCOEvalOp) pod swoja
+        // realna karte. Manifest WYGRYWA (default_build_args/arch_variants),
+        // np. vllm-spark `12.1a` — nie nadpisujemy. Bez GPU (None) zostawiamy
+        // Dockerfile'owy default (fat-binary ARG).
+        //
+        // Gate na realnej deklaracji `ARG TORCH_CUDA_ARCH_LIST` w Dockerfile:
+        // tylko nemotron-ocr/yolox kompiluja custom-kernel i deklaruja ten ARG.
+        // Wstrzykniecie build-arga niekonsumowanego przez Dockerfile (rerank-vl,
+        // parse, embed-vl, comfyui) daje docker warning "build-args were not
+        // consumed" ORAZ niepotrzebny arch-aware tag -> zbedny per-arch rebuild
+        // serwisu bez custom-kernela. Czytamy DOKLADNIE ten plik, ktory idzie do
+        // Bollard build (`bundle_root.join(dockerfile_rel)`); IO error = nie
+        // wstrzykujemy (bezpieczny default, brak warningu).
+        if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
+            let dockerfile_declares_arch_arg = std::fs::read_to_string(
+                bundle_root.join(&dockerfile_rel),
+            )
+            .map(|contents| {
+                contents
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
+            })
+            .unwrap_or(false);
+            if dockerfile_declares_arch_arg {
+                if let Some(arch_list) = gpu.torch_cuda_arch_list() {
+                    build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+                }
+            }
+        }
         // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
         // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
         // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
         // tagu (brak niepotrzebnych przebudow).
-        let arch_aware =
-            !docker_section.arch_variants.is_empty() || !docker_section.default_build_args.is_empty();
+        // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki z
+        // custom-kernelem (nemotron-ocr, yolox; deklaruja `ARG TORCH_CUDA_ARCH_LIST`)
+        // dostaja wstrzykniety arch-list, wiec ich tag staje sie arch-aware — inaczej
+        // obraz zbudowany raz pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty
+        // na B300 (ten sam plaski tag) i odpalil zly kernel. Serwisy bez tego ARG
+        // (rerank-vl, parse, embed-vl, comfyui) nie dostaja wstrzykniecia -> plaski tag.
+        let arch_aware = !build_args.is_empty() || !docker_section.arch_variants.is_empty();
+        // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
+        // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
+        // wiec `if !image_exists` ponizej zwraca false i obraz SIE PRZEBUDOWUJE.
+        // Bez tego plaski tag :v1 nigdy sie nie zmienial -> kazda zmiana Dockerfile
+        // byla cicho ignorowana (deploy "0 ms", stary obraz reuzyty), a fix w
+        // Dockerfile (np. TORCH_CUDA_ARCH_LIST) nigdy sie nie kompilowal.
+        let src = self.manifest.docker_source_hash.as_str();
+        let src_suffix = if src.is_empty() {
+            String::new()
+        } else {
+            format!("-{}", &src[..src.len().min(12)])
+        };
         let image_tag = if arch_aware {
+            // Gruby arch_tag (cuda_arch_tag) NIE rozroznia kart w tej samej rodzinie:
+            // B200 (cc 10.0) i B300 (cc 10.3) mapuja sie oba na "cuda-blackwell", choc
+            // dostaja rozne TORCH_CUDA_ARCH_LIST ("10.0+PTX" vs "10.3+PTX"). Obraz
+            // zbudowany na B300 (SASS 10.3, brak 10.0) reuzyty na B200 by NIE odpalil
+            // (PTX forward-compat tylko w gore). Dlatego doklejamy krotki hash
+            // zdeterminizowanego odcisku build_args: KAZDA roznica (arch list, torch
+            // index, base image, wersja pakietu) -> inny tag -> rebuild; identyczne
+            // build-args (dwa B300) -> ten sam tag -> reuse.
+            use sha2::{Digest, Sha256};
+            let mut keys: Vec<_> = build_args.keys().collect();
+            keys.sort();
+            let mut hasher = Sha256::new();
+            for k in keys {
+                hasher.update(k.as_bytes());
+                hasher.update(b"=");
+                hasher.update(build_args[k].as_bytes());
+                hasher.update(b"\n");
+            }
+            let ba8 = hex::encode(hasher.finalize())[..8].to_string();
             format!(
-                "tentaflow/{}:{}-{}",
-                self.manifest.engine.id, self.manifest.engine.version, arch_tag
+                "tentaflow/{}:{}-{}-{}{}",
+                self.manifest.engine.id, self.manifest.engine.version, arch_tag, ba8, src_suffix
             )
         } else {
             format!(
-                "tentaflow/{}:{}",
-                self.manifest.engine.id, self.manifest.engine.version
+                "tentaflow/{}:{}{}",
+                self.manifest.engine.id, self.manifest.engine.version, src_suffix
             )
         };
         let build_args = if build_args.is_empty() {
