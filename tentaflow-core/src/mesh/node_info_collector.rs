@@ -52,6 +52,38 @@ fn net_prev() -> &'static Mutex<(Instant, HashMap<String, (u64, u64)>)> {
     C.get_or_init(|| Mutex::new((Instant::now(), HashMap::new())))
 }
 
+/// Cache wyniku detekcji sieci — `detect_networks` robi `nets.refresh` plus per
+/// interfejs garsc syscalli/odczytow `/sys` (carrier, MAC, typ, RDMA, speed, NUMA,
+/// gateway). To dane topologiczne, stabilne miedzy zdarzeniami sieciowymi, wiec
+/// odczytywanie ich co 500ms (heartbeat) niepotrzebnie pali CPU. Cache z krotkim
+/// TTL zostawia rate'y rx/tx liczone nad oknem TTL (rownie dokladne), a zdejmuje
+/// burze syscalli z idle.
+fn net_cache() -> &'static Mutex<(Instant, Vec<PeerNetworkInfo>)> {
+    static C: OnceLock<Mutex<(Instant, Vec<PeerNetworkInfo>)>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(10), vec![])))
+}
+
+/// TTL detekcji sieci — zgodny z cache'em GPU; heartbeat (500ms) nie potrzebuje
+/// sub-2s ziarnistosci topologii ani rate'ow.
+const NET_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Cache'owany wariant `detect_networks`: zwraca ostatni wynik, jesli swiezszy niz
+/// `NET_CACHE_TTL`, inaczej liczy na nowo. Eliminuje per-500ms storm syscalli.
+fn detect_networks_cached() -> Vec<PeerNetworkInfo> {
+    {
+        let cache = net_cache().lock();
+        if cache.0.elapsed() < NET_CACHE_TTL {
+            return cache.1.clone();
+        }
+    }
+    let result = detect_networks();
+    {
+        let mut cache = net_cache().lock();
+        *cache = (Instant::now(), result.clone());
+    }
+    result
+}
+
 /// Klasyfikacja producenta GPU po fragmentach nazwy adaptera. Heurystyka
 /// case-insensitive — wystarczajaca dla wgpu adapter_info.name (Vulkan/Metal/DX12
 /// zwracaja oficjalne marketingowe nazwy w stylu "NVIDIA GeForce RTX 4090").
@@ -410,7 +442,7 @@ pub fn collect_fast_metrics() -> CurrentMetrics {
 
     let cpu_temperature_c = detect_cpu_temperature();
     let gpus = detect_gpus_cached();
-    let networks = detect_networks();
+    let networks = detect_networks_cached();
 
     CurrentMetrics {
         cpu_usage_percent: cpu_usage,
