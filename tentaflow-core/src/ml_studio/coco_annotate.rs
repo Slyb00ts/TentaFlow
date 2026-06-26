@@ -137,11 +137,24 @@ pub fn get_image(
                 .filter(|a| a.get("image_id").and_then(|v| v.as_i64()) == Some(coco_id))
                 .filter_map(|a| {
                     let bbox = a.get("bbox")?.as_array()?;
-                    Some(json!({
+                    let mut out = json!({
                         "id": a.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
                         "category_id": a.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0),
                         "bbox": bbox,
-                    }))
+                    });
+                    // Per-box schema attribute values and the detector confidence are
+                    // carried through verbatim so the annotation editor can reload the
+                    // attributes panel and render predicted (autolabeled) boxes dashed.
+                    if let Some(attrs) = a.get("attributes") {
+                        out["attributes"] = attrs.clone();
+                    }
+                    if let Some(score) = a.get("score") {
+                        out["score"] = score.clone();
+                    }
+                    if let Some(predicted) = a.get("predicted") {
+                        out["predicted"] = predicted.clone();
+                    }
+                    Some(out)
                 })
                 .collect()
         })
@@ -185,14 +198,26 @@ pub fn save_annotations(dir: &Path, image_id: &str, annotations_json: &str) -> a
         let bbox = a.get("bbox").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let w = bbox.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let h = bbox.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0);
-        arr.push(json!({
+        let mut ann = json!({
             "id": next_id,
             "image_id": coco_id,
             "category_id": cat,
             "bbox": bbox,
             "area": w * h,
             "iscrowd": 0,
-        }));
+        });
+        // Persist per-box schema attribute values and detector confidence when the
+        // editor supplies them; absent keys keep the COCO record minimal.
+        if let Some(attrs) = a.get("attributes") {
+            ann["attributes"] = attrs.clone();
+        }
+        if let Some(score) = a.get("score") {
+            ann["score"] = score.clone();
+        }
+        if let Some(predicted) = a.get("predicted") {
+            ann["predicted"] = predicted.clone();
+        }
+        arr.push(ann);
         next_id += 1;
     }
 
