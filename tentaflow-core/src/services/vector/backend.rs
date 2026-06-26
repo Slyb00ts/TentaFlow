@@ -41,6 +41,15 @@ impl Metric {
 
 pub use tentaflow_sdk_spec::{Field, FieldSpec, FieldValue, Filter, Fusion, SparseVector};
 
+/// One item for a batch upsert: the vector under `ref_id` plus its typed
+/// metadata `fields` and optional `sparse` vector.
+pub struct UpsertItem<'a> {
+    pub ref_id: u64,
+    pub vector: &'a [f32],
+    pub fields: &'a [Field],
+    pub sparse: Option<&'a SparseVector>,
+}
+
 /// One result row from a k-NN search. `score` is the raw metric distance
 /// returned by the backend (lower = closer for cosine/euclidean; `1 - dot`
 /// for dot). `fields` carries the metadata requested via `output_fields`
@@ -69,6 +78,21 @@ pub trait VectorBackend: Send + Sync {
         fields: &[Field],
         sparse: Option<&SparseVector>,
     ) -> Result<()>;
+
+    /// Insert/replace many vectors in one go, persisting to disk ONCE at the end.
+    /// A flush fsyncs the whole growing index, so a per-element flush makes a
+    /// bulk ingest O(n) full-index syncs (a 305-chunk document = 305 flushes of
+    /// an index that keeps growing → minutes instead of seconds). Embedded
+    /// backends override this to upsert without per-element flush and flush once.
+    /// The default loops `upsert` (each flushes) — fine for remote/in-memory
+    /// backends where there is no local fsync cost. On error the partial writes
+    /// are NOT rolled back here; the caller owns cleanup-on-failure.
+    fn upsert_batch(&self, items: &[UpsertItem<'_>]) -> Result<()> {
+        for it in items {
+            self.upsert(it.ref_id, it.vector, it.fields, it.sparse)?;
+        }
+        Ok(())
+    }
 
     /// Top-k k-NN search; returns at most `k` hits ordered by ascending distance
     /// (closest first). `filter` restricts results by metadata (the backend

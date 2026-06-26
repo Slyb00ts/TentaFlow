@@ -483,6 +483,22 @@ impl Collection {
         fields: &[Field],
         sparse: Option<(&[u32], &[f32])>,
     ) -> Result<()> {
+        self.upsert_no_flush(ref_id, vector, fields, sparse)?;
+        self.flush()
+    }
+
+    /// Insert or replace the vector under `ref_id` WITHOUT flushing to disk.
+    /// A flush fsyncs the whole growing index, so doing it per element makes a
+    /// bulk insert O(n) full-index syncs (a 305-chunk document = 305 flushes of
+    /// an index that keeps growing). Batch callers use this and flush once at
+    /// the end via `flush()`; single-shot callers use `upsert` which flushes.
+    pub fn upsert_no_flush(
+        &self,
+        ref_id: u64,
+        vector: &[f32],
+        fields: &[Field],
+        sparse: Option<(&[u32], &[f32])>,
+    ) -> Result<()> {
         if vector.len() != self.dim as usize {
             return Err(ZvecError::InvalidArgument(format!(
                 "vector len {} != dim {}",
@@ -597,7 +613,7 @@ impl Collection {
                     message: format!("insert reported {success} ok / {errors} failed"),
                 });
             }
-            check(sys::zvec_collection_flush(self.handle))
+            Ok(())
         }
     }
 
