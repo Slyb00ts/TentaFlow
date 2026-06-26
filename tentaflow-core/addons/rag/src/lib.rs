@@ -435,6 +435,15 @@ fn handle_ask(params: &Value) -> Value {
         if !aliases.is_empty() {
             options["entity_aliases"] = json!(aliases);
         }
+        // Information Density (MemGraphRAG eq. 19): mapa rzadkosci encji (znormalizowane
+        // IDF z graph_artifacts) -> flow.meta. rag_graph_facts skaluje nia P_init relevance,
+        // by rzadkie/informacyjne encje w pasazu byly mocniejszymi kotwicami PPR. df liczone
+        // w SQLite addona (R1), wiec to JEDYNE miejsce, ktore moze je wstrzyknac. Cap chroni
+        // rozmiar opcji. Tylko przy grafie ON — bez PPR nie ma odbiorcy.
+        let density = load_entity_density();
+        if !density.is_empty() {
+            options["entity_density"] = json!(density);
+        }
     }
     // Flow zwraca JSON `{answer, citations}` w tresci odpowiedzi: answer to tekst
     // LLM, citations to REALNE hity retrievalu (doc_id/chunk_index/text/score)
@@ -5648,6 +5657,67 @@ fn load_active_aliases() -> Vec<Value> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// Cap liczby encji w mapie information-density (rozmiar flow.meta). Najrzadsze
+/// (najwyzsze IDF) maja pierwszenstwo — to one nosza sygnal; encje pospolite
+/// degraduja do plaskiego boostu po stronie core.
+const ENTITY_DENSITY_MAX: i64 = 512;
+
+/// Laduje mape rzadkosci encji `[{id, density}]` (MemGraphRAG eq. 19, Information
+/// Density) do skalowania P_init relevance w rag_graph_facts. `density` ∈ [0,1] to
+/// IDF encji znormalizowane przez maksimum w zwroconym zbiorze: `IDF(e)=ln(N/df(e))`,
+/// gdzie `df` = liczba dokumentow z dana encja (z `graph_artifacts`), `N` = liczba
+/// dokumentow w grafie. Zwraca najrzadsze encje (do `ENTITY_DENSITY_MAX`). Korpus
+/// <=1 dokumentu => pusto (IDF nieinformatywne).
+fn load_entity_density() -> Vec<Value> {
+    let n_docs = sql_query(
+        "SELECT COUNT(DISTINCT document_id) FROM graph_artifacts WHERE kind = 'node'",
+        &[],
+    )
+    .ok()
+    .and_then(|rows| rows.first().and_then(|r| r.first().and_then(|v| v.as_i64())))
+    .unwrap_or(0);
+    if n_docs <= 1 {
+        return Vec::new();
+    }
+    let rows = match sql_query(
+        "SELECT n_id, COUNT(DISTINCT document_id) AS df FROM graph_artifacts \
+         WHERE kind = 'node' AND n_id IS NOT NULL AND n_id <> '' \
+         GROUP BY n_id ORDER BY df ASC LIMIT ?",
+        &[SqlValue::I64(ENTITY_DENSITY_MAX)],
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let n = n_docs as f64;
+    // raw IDF, potem normalizacja do [0,1] przez max w zbiorze.
+    let mut raw: Vec<(String, f64)> = Vec::with_capacity(rows.len());
+    let mut max_idf = 0.0f64;
+    for r in &rows {
+        let id = match r.first().and_then(|v| v.as_str()).filter(|x| !x.is_empty()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let df = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        if df <= 0 {
+            continue;
+        }
+        let idf = (n / df as f64).ln();
+        if !idf.is_finite() || idf <= 0.0 {
+            continue;
+        }
+        if idf > max_idf {
+            max_idf = idf;
+        }
+        raw.push((id.to_string(), idf));
+    }
+    if max_idf <= 0.0 {
+        return Vec::new();
+    }
+    raw.into_iter()
+        .map(|(id, idf)| json!({ "id": id, "density": idf / max_idf }))
+        .collect()
 }
 
 // =============================================================================
