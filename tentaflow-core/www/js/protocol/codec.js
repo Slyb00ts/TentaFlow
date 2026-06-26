@@ -3161,6 +3161,44 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(RecogAutolabelRequest) — auto-etykietuje cały dataset
+   * COCO wbudowanym detektorem RF-DETR (ADR). payload: { datasetId, threshold, mode }
+   * (mode: 'only_empty'|'overwrite'). Zwraca jobId do pollingu statusu.
+   */
+  mlStudioRecogAutolabelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogAutolabelRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      Number(payload.threshold ?? 0.5),
+      String(payload.mode ?? 'only_empty'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(RecogAutolabelStatusRequest) — polling postępu
+   * asynchronicznego auto-etykietowania. payload: { jobId }. Zwraca status
+   * (running|succeeded|failed), licznik obrazów i łączną liczbę detekcji.
+   */
+  mlStudioRecogAutolabelStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioRecogAutolabelStatusRequest(
+      String(payload.jobId ?? payload.job_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(FtExportRequest) — startuje ASYNCHRONICZNY eksport
    * wytrenowanego modelu FT do GGUF. Odpowiedź wraca natychmiast ze statusem
    * 'running'; postęp odpytuj przez mlStudioFtExportStatusRequest.

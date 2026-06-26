@@ -2422,6 +2422,80 @@ pub fn ml_studio_recog_save_annotations(
     )))
 }
 
+#[handler(variant = "MlStudioRecogAutolabelRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_autolabel_dataset(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogAutolabelRequest")),
+    };
+    let org = require_org(ctx)?;
+    // resolve_recog_dataset_dir already checks coco_path kind + project membership.
+    let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_editor(&org.user_id, &dataset.project_id)?;
+
+    // Decoding + per-image inference is minutes of work for a large dataset, so it
+    // runs as an async background job; the UI polls progress via AutolabelStatus.
+    // The threshold/mode validation + per-dataset single-job guard live in
+    // `spawn_autolabel`, which also returns a clear error when the vision feature
+    // is not compiled in.
+    match crate::ml_studio::autolabel_recog_dataset::spawn_autolabel(
+        payload.dataset_id.clone(),
+        dir,
+        payload.threshold,
+        payload.mode.clone(),
+    ) {
+        Ok(job_id) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelResponse(
+            tentaflow_protocol::MlStudioRecogAutolabelResponse {
+                job_id,
+                status: "running".to_string(),
+                error: None,
+            },
+        ))),
+        Err(e) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelResponse(
+            tentaflow_protocol::MlStudioRecogAutolabelResponse {
+                job_id: String::new(),
+                status: "failed".to_string(),
+                error: Some(e.to_string()),
+            },
+        ))),
+    }
+}
+
+#[handler(variant = "MlStudioRecogAutolabelStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_autolabel_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogAutolabelStatusRequest")),
+    };
+    let _org = require_org(ctx)?;
+
+    let prog = crate::ml_studio::autolabel_recog_dataset::autolabel_progress(&payload.job_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "job not found"))?;
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusResponse(
+        tentaflow_protocol::MlStudioRecogAutolabelStatusResponse {
+            status: prog.status,
+            images_total: prog.images_total,
+            images_done: prog.images_done,
+            detections: prog.detections,
+            error: prog.error,
+        },
+    )))
+}
+
 /// Synchronizuje status zdalnego treningu recognition (z Node B) do bazy A:
 /// zapisuje metryki per epoka, a po `succeeded` rejestruje model (checkpoint na
 /// B, `node_id` w metrykach) i domyka run. Idempotentne przez guard `running`.
