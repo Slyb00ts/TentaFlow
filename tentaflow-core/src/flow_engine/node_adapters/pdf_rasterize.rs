@@ -1,10 +1,13 @@
 // =============================================================================
 // Plik: flow_engine/node_adapters/pdf_rasterize.rs
-// Opis: PdfRasterizeNodeAdapter — rasteryzuje PDF (payload Other) na obrazy stron
-//       (PNG) przez współdzielony `rasterize_pdf_streaming`. Strony lądują w
-//       blob store (ctx.blobs); wyjście to FlowValue::Json z listą blob-refów
-//       (fan-out stron w modelu 1:1 cardinality — patrz uwaga niżej). Bez modelu.
+// Opis: PdfRasterizeNodeAdapter — przyjmuje PDF (payload Other) i wybiera ścieżkę
+//       ingestu: PDF z GOTOWĄ warstwą tekstową → szybka ekstrakcja tekstu
+//       (FPDFText) na port `text` (pomija vision = sekundy zamiast minut); skan/
+//       obraz → rasteryzacja stron na obrazy (PNG, port `images`) dla
+//       vision-parse. Strony lądują w blob store (ctx.blobs). Bez modelu.
 // =============================================================================
+
+use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -12,12 +15,21 @@ use async_trait::async_trait;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
-use crate::services::document::rasterize::{rasterize_pdf_streaming, PageRender, SinkClosed};
-use crate::services::document::{DEFAULT_RENDER_DPI, MAX_PDF_PAGES};
+use crate::services::document::rasterize::{
+    extract_pdf_text, rasterize_pdf_streaming, PageRender, PdfTextResult, SinkClosed,
+};
+use crate::services::document::{
+    DEFAULT_RENDER_DPI, MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE,
+};
 
 const NODE_TYPE: &str = "pdf_rasterize";
 
 const PAGE_PNG_MIME: &str = "image/png";
+
+/// Klucz meta, pod którym `execute` zapisuje wybraną ścieżkę (`text` albo
+/// `images`). Czytany przez `active_output_ports` — jedno źródło prawdy, brak
+/// ponownej ekstrakcji (lustro `document_router` / `condition`).
+const ROUTE_META_KEY: &str = "pdf_route";
 
 pub struct PdfRasterizeNodeAdapter;
 
@@ -48,6 +60,18 @@ impl PdfRasterizeNodeAdapter {
             .unwrap_or(MAX_PDF_PAGES)
             .max(1)
     }
+
+    /// Decyzja text-vs-vision: PDF ma UŻYTECZNĄ warstwę tekstową gdy średnia
+    /// liczba znaków na stronę osiąga próg (`MIN_TEXT_LAYER_CHARS_PER_PAGE`).
+    /// Skan/obraz daje ~0 znaków/stronę → `false` → ścieżka rasteryzacja+vision.
+    /// PDF z osadzonym tekstem → `true` → ekstrakcja tekstu (sekundy zamiast
+    /// minut, bo pomijamy model vision strona-po-stronie).
+    fn has_text_layer(text: &PdfTextResult) -> bool {
+        if text.page_count == 0 {
+            return false;
+        }
+        text.total_chars / text.page_count >= MIN_TEXT_LAYER_CHARS_PER_PAGE
+    }
 }
 
 impl Default for PdfRasterizeNodeAdapter {
@@ -67,11 +91,17 @@ impl NodeAdapter for PdfRasterizeNodeAdapter {
     }
 
     fn output_ports(&self) -> Vec<PortSpec> {
-        // Lista stron-obrazów jako Json (blob-refy). Engine ma cardinality 1:1
-        // (envelope.rs hard rule 5), więc zamiast N envelope na porcie emitujemy
-        // JEDEN envelope z listą — downstream (document_merge / vision per-page)
-        // iteruje po `pages`. Json a nie Image, bo to KOLEKCJA obrazów.
-        vec![PortSpec::new("images", FlowDataType::Json)]
+        // Dwa wzajemnie wykluczające się porty (aktywny dokładnie jeden, patrz
+        // `active_output_ports`):
+        //   `images` — lista stron-obrazów jako Json (blob-refy) dla vision-parse.
+        //     Engine ma cardinality 1:1 (envelope.rs hard rule 5), więc zamiast N
+        //     envelope emitujemy JEDEN z listą; downstream iteruje po `pages`.
+        //   `text` — gotowa warstwa tekstowa PDF (Text) wpięta wprost w combine,
+        //     z pominięciem vision (szybka ścieżka dla PDF z osadzonym tekstem).
+        vec![
+            PortSpec::new("images", FlowDataType::Json),
+            PortSpec::new("text", FlowDataType::Text),
+        ]
     }
 
     async fn execute(
@@ -106,6 +136,38 @@ impl NodeAdapter for PdfRasterizeNodeAdapter {
 
         let dpi = Self::pick_dpi(node);
         let max_pages = Self::pick_max_pages(node);
+
+        // Szybka ścieżka: najpierw próba ekstrakcji warstwy tekstowej (FPDFText).
+        // PDF z osadzonym tekstem (oficjalne publikacje) ingestuje się w sekundy
+        // zamiast minut, bo pomijamy rasteryzację + model vision strona-po-stronie.
+        // Blokujące FFI pdfium → spawn_blocking. Skan/obraz da ~0 znaków → niżej
+        // schodzimy na ścieżkę rasteryzacja+vision (gałąź NIENARUSZONA).
+        let text_pdf_bytes = pdf_bytes.clone();
+        let text_max_pages = max_pages as usize;
+        let text_result: PdfTextResult = tokio::task::spawn_blocking(move || {
+            extract_pdf_text(&text_pdf_bytes, text_max_pages)
+        })
+        .await
+        .map_err(|e| anyhow!("pdf_rasterize: join ekstrakcji tekstu: {e}"))?
+        .map_err(|e| anyhow!("pdf_rasterize: ekstrakcja tekstu: {e}"))?;
+
+        if Self::has_text_layer(&text_result) {
+            let mut out = (**envelope).clone();
+            out.payload = FlowValue::Text(text_result.markdown);
+            out.meta.insert(
+                ROUTE_META_KEY.to_string(),
+                serde_json::json!("text"),
+            );
+            out.meta.insert(
+                "pdf_page_count".to_string(),
+                serde_json::json!(text_result.page_count),
+            );
+            out.meta.insert(
+                "pdf_text_chars".to_string(),
+                serde_json::json!(text_result.total_chars),
+            );
+            return Ok(out);
+        }
 
         // Rasteryzacja jest blokująca (FFI pdfium + kodowanie PNG) — odpalamy ją w
         // spawn_blocking, zbierając wyrenderowane strony przez sink. Reużywamy
@@ -157,7 +219,31 @@ impl NodeAdapter for PdfRasterizeNodeAdapter {
             "pdf_page_count".to_string(),
             serde_json::json!(page_count),
         );
+        out.meta.insert(
+            ROUTE_META_KEY.to_string(),
+            serde_json::json!("images"),
+        );
         Ok(out)
+    }
+
+    /// Bramkowanie: aktywuje DOKŁADNIE jeden port — ten zapisany w
+    /// `meta.pdf_route` przez `execute` (`text` dla PDF z warstwą tekstową,
+    /// `images` dla skanu/obrazu). Następnik osiągalny tylko nieaktywnym portem
+    /// (cała gałąź vision albo krawędź `text→combine`) staje się Skipped, więc do
+    /// `combine` (fan-in) dociera dokładnie jedna żywa ścieżka PDF. Brak wpisu →
+    /// `images` (zachowawczo: pełen render+vision, nie cichy pusty ingest).
+    fn active_output_ports(
+        &self,
+        _node: &FlowNode,
+        result: &FlowEnvelope,
+    ) -> Option<HashSet<String>> {
+        let port = result
+            .meta
+            .get(ROUTE_META_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap_or("images")
+            .to_string();
+        Some(HashSet::from([port]))
     }
 }
 
@@ -242,6 +328,71 @@ mod tests {
             _ => panic!("expected Json"),
         };
         assert_eq!(count, 2, "max_pages zacieśnia liczbę renderowanych stron");
+    }
+
+    /// PDF z BOGATĄ warstwą tekstową idzie szybką ścieżką: payload Text na
+    /// porcie `text`, port `text` aktywny (vision Skipped). Dowód, że PDF z
+    /// gotowym tekstem pomija render+vision (sekundy zamiast minut).
+    async fn text_pdf_input(ctx: &ExecutionContext, pages: usize) -> NodeInput {
+        let pdf = crate::services::document::rasterize::text_layer_pdf(pages);
+        let blob_ref = ctx.blobs.put(pdf, "application/pdf").await.unwrap();
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Other {
+            blob_ref,
+            mime: "application/pdf".into(),
+            filename: Some("txt.pdf".into()),
+        };
+        NodeInput {
+            from_node_id: "router".into(),
+            from_port: "pdf".into(),
+            envelope: Arc::new(env),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_layer_pdf_takes_text_fast_path() {
+        let ctx = stub_ctx();
+        let input = text_pdf_input(&ctx, 2).await;
+        let adapter = PdfRasterizeNodeAdapter::new();
+        let out = adapter
+            .execute(&node(serde_json::json!({})), &[input], &ctx)
+            .await
+            .unwrap();
+
+        let text = match &out.payload {
+            FlowValue::Text(t) => t.clone(),
+            other => panic!("expected Text fast-path payload, got {other:?}"),
+        };
+        assert!(text.contains("Tresc"), "warstwa tekstowa w payloadzie Text");
+
+        let active = adapter.active_output_ports(&node(serde_json::json!({})), &out).unwrap();
+        assert_eq!(
+            active,
+            HashSet::from(["text".to_string()]),
+            "port `text` aktywny, gałąź vision Skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_like_pdf_takes_images_path() {
+        let ctx = stub_ctx();
+        // `minimal_pdf` ma ~8 znaków/stronę < próg → ścieżka rasteryzacja+vision.
+        let input = pdf_input(&ctx, 2).await;
+        let adapter = PdfRasterizeNodeAdapter::new();
+        let out = adapter
+            .execute(&node(serde_json::json!({"dpi": 80})), &[input], &ctx)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.payload, FlowValue::Json(_)),
+            "skanopodobny PDF emituje listę obrazów (Json)"
+        );
+        let active = adapter.active_output_ports(&node(serde_json::json!({})), &out).unwrap();
+        assert_eq!(
+            active,
+            HashSet::from(["images".to_string()]),
+            "port `images` aktywny, gałąź text Skipped"
+        );
     }
 
     #[tokio::test]
