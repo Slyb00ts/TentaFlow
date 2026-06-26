@@ -1426,7 +1426,9 @@ fn documents_tab() -> Component {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
         ],
         max_size_bytes: 64 * 1024 * 1024,
-        max_files: 10,
+        // 64: pozwala wgrac caly korpus jednym wyborem (jedna akcja = zero
+        // nadpisywania pending uploadow; przy 10 batchowanie z GUI gubilo pliki).
+        max_files: 64,
         multiple: true,
         drag_and_drop: true,
         capture: None,
