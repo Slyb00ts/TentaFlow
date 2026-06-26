@@ -1960,15 +1960,63 @@ fn normalize_entity_name(name: &str) -> String {
 /// (brak parsowalnego JSON-a z oczekiwanym ksztaltem) -> pusty wynik (Default).
 fn parse_extraction_response(raw: &str) -> ChunkExtraction {
     let inner = chat_completion_content(raw).unwrap_or_else(|| raw.to_string());
-    let json_slice = match extract_json_object(&inner) {
-        Some(s) => s,
-        None => return ChunkExtraction::default(),
-    };
-    let value: Value = match serde_json::from_str(json_slice) {
-        Ok(v) => v,
-        Err(_) => return ChunkExtraction::default(),
-    };
-    parse_extraction_value(&value)
+    // Format liniowy (E|nazwa|typ / R|head|relacja|tail) — preferowany, bo niezawodny
+    // dla malych modeli on-device. Konwertujemy linie na Value {entities,relations} i
+    // przepuszczamy przez TEN SAM walidator co JSON (capy/dedup/normalizacja).
+    if let Some(value) = parse_extraction_lines(&inner) {
+        let extraction = parse_extraction_value(&value);
+        if !extraction.entities.is_empty() || !extraction.relations.is_empty() {
+            return extraction;
+        }
+    }
+    // Fallback: model zwrocil zagniezdzony JSON {entities,relations} (mocniejszy model
+    // ktory zignorowal instrukcje formatu liniowego) — dalej obslugiwany.
+    if let Some(json_slice) = extract_json_object(&inner) {
+        if let Ok(value) = serde_json::from_str::<Value>(json_slice) {
+            return parse_extraction_value(&value);
+        }
+    }
+    ChunkExtraction::default()
+}
+
+/// Parsuje format liniowy ekstrakcji na Value `{entities:[{name,type}], relations:[
+/// {head,relation,tail}]}` (potem walidowany przez `parse_extraction_value`).
+/// Tolerancyjny: pomija linie nie pasujace do schematu, akceptuje prefiksy
+/// E/ENCJA/ENTITY i R/RELACJA/RELATION (case-insensitive), znosi bullet/spacje wokol
+/// separatora '|'. Zwraca `None` gdy zadna linia nie pasuje (caller probuje fallback JSON).
+fn parse_extraction_lines(content: &str) -> Option<Value> {
+    let mut entities: Vec<Value> = Vec::new();
+    let mut relations: Vec<Value> = Vec::new();
+    for raw_line in content.lines() {
+        let line = raw_line
+            .trim()
+            .trim_start_matches(|c| c == '-' || c == '*' || c == '•')
+            .trim();
+        if line.is_empty() || !line.contains('|') {
+            continue;
+        }
+        let mut parts = line.split('|').map(|p| p.trim());
+        let tag = parts.next().unwrap_or("").to_uppercase();
+        let rest: Vec<&str> = parts.collect();
+        if tag == "E" || tag == "ENCJA" || tag == "ENTITY" {
+            if let Some(name) = rest.first().copied().filter(|s| !s.is_empty()) {
+                let typ = rest
+                    .get(1)
+                    .copied()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Entity");
+                entities.push(json!({ "name": name, "type": typ }));
+            }
+        } else if tag == "R" || tag == "RELACJA" || tag == "RELATION" {
+            if rest.len() >= 3 && !rest[0].is_empty() && !rest[1].is_empty() && !rest[2].is_empty() {
+                relations.push(json!({ "head": rest[0], "relation": rest[1], "tail": rest[2] }));
+            }
+        }
+    }
+    if entities.is_empty() && relations.is_empty() {
+        return None;
+    }
+    Some(json!({ "entities": entities, "relations": relations }))
 }
 
 /// Buduje `ChunkExtraction` z juz sparsowanego JSON-a, stosujac capy i dedup.
@@ -2089,18 +2137,25 @@ fn call_extraction_llm(chunk_text: &str) -> Result<String, String> {
     // Bez placeholderow "..." — slabe modele kwantyzowane (np. deepseek-q2) kopiuja
     // doslownie kazda wartosc-wzorzec zamiast ja wypelnic. Zamiast tego konkretny
     // jednostrzalowy przyklad z domeny + jawny zakaz kopiowania wartosci przykladu.
+    // Format LINIOWY (nie zagniezdzony JSON): male modele kwantyzowane on-device
+    // (llama.cpp/MLX na laptopie/telefonie, np. bielik-7B) produkuja poprawny JSON
+    // zawodnie (gubia nawiasy/klucze przy kolejnych elementach tablicy), ale jedna
+    // krotka linia z separatorem '|' wychodzi im niezawodnie. Parser czyta linia po
+    // linii i pomija bledne — uniwersalnie, bez zaleznosci od backendu/grammar.
     let prompt = format!(
-        "Twoje zadanie: wyodrebnij RZECZYWISTE encje i relacje z podanego tekstu i zwroc \
-         WYLACZNIE JSON. Bez komentarza, bez markdown, bez tekstu poza JSON. Uzywaj TYLKO \
-         faktow obecnych w tekscie, nie halucynuj. Pole head i tail kazdej relacji musi \
-         doslownie odpowiadac jakiejs nazwie encji (name).\n\n\
+        "Twoje zadanie: wyodrebnij RZECZYWISTE encje i relacje z podanego tekstu. Uzywaj \
+         TYLKO faktow obecnych w tekscie, nie halucynuj. Zwroc WYLACZNIE linie w formacie \
+         (jedna encja/relacja na linie, separator to znak |):\n\
+         E|nazwa_encji|typ_encji\n\
+         R|nazwa_head|relacja|nazwa_tail\n\
+         Bez JSON, bez markdown, bez komentarzy, bez numeracji. Nazwy head i tail kazdej \
+         relacji (R) musza doslownie odpowiadac nazwie jakiejs encji (E).\n\n\
          Przyklad formatu (NIE kopiuj wartosci):\n\
-         {{\"entities\":[{{\"name\":\"Dyrektywa 2018/2001\",\"type\":\"akt prawny\"}},\
-         {{\"name\":\"biometan\",\"type\":\"substancja\"}}],\
-         \"relations\":[{{\"head\":\"Dyrektywa 2018/2001\",\"relation\":\"reguluje\",\
-         \"tail\":\"biometan\"}}]}}\n\n\
-         Powyzej to TYLKO przyklad formatu — NIE kopiuj jego wartosci. Wypelnij \
-         RZECZYWISTYMI encjami i relacjami wystepujacymi w ponizszym tekscie.\n\n\
+         E|Dyrektywa 2018/2001|akt prawny\n\
+         E|biometan|substancja\n\
+         R|Dyrektywa 2018/2001|reguluje|biometan\n\n\
+         Powyzej to TYLKO przyklad formatu — NIE kopiuj jego wartosci. Wypisz \
+         RZECZYWISTE encje i relacje z ponizszego tekstu.\n\n\
          TEKST DO ANALIZY:\n{chunk_text}"
     );
     let model = "rag-llm";
