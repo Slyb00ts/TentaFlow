@@ -868,7 +868,48 @@ pub struct EmbeddingResponse {
 pub struct EmbeddingData {
     pub object: String, // "embedding"
     pub index: u32,
+    #[serde(deserialize_with = "deserialize_embedding_vector")]
     pub embedding: Vec<f32>,
+}
+
+/// Deserializuje wektor embeddingu z odpowiedzi OpenAI-compatible w DWÓCH
+/// formatach transportu: gdy backend zwraca `encoding_format:"base64"`, pole
+/// jest stringiem base64 spakowanych `f32` little-endian — dekodujemy raz na
+/// wektor zamiast parsować tysiące liczb JSON. Gdy backend zwraca klasyczną
+/// tablicę liczb (`encoding_format:"float"` lub brak wsparcia base64),
+/// deserializujemy ją wprost. Wynik jest bit-identyczny dla obu ścieżek.
+fn deserialize_embedding_vector<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as DeError;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Base64(String),
+        Floats(Vec<f32>),
+    }
+
+    match Wire::deserialize(deserializer)? {
+        Wire::Floats(v) => Ok(v),
+        Wire::Base64(s) => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map_err(|e| DeError::custom(format!("embedding base64 decode: {e}")))?;
+            if bytes.len() % 4 != 0 {
+                return Err(DeError::custom(format!(
+                    "embedding base64 length {} not a multiple of 4 (f32 LE)",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+    }
 }
 
 /// Token usage dla embeddings
@@ -950,4 +991,63 @@ pub struct ErrorDetail {
     /// Kod bledu (dla szczegolowych przypadkow)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+#[cfg(test)]
+mod embedding_decode_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn encode_b64_f32(v: &[f32]) -> String {
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for f in v {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn embedding_base64_roundtrip_bit_identical() {
+        let vector: Vec<f32> = vec![0.0, -1.5, 3.141_592_7, f32::MIN_POSITIVE, 12345.678];
+        let b64 = encode_b64_f32(&vector);
+        let json = format!(
+            r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#
+        );
+        let data: EmbeddingData = serde_json::from_str(&json).expect("decode base64 embedding");
+
+        assert_eq!(data.embedding.len(), vector.len());
+        for (got, want) in data.embedding.iter().zip(vector.iter()) {
+            assert_eq!(got.to_bits(), want.to_bits(), "bit-identyczny f32 LE");
+        }
+    }
+
+    #[test]
+    fn embedding_float_array_still_decodes() {
+        let json =
+            r#"{"object":"embedding","index":2,"embedding":[0.1,0.2,0.3]}"#;
+        let data: EmbeddingData = serde_json::from_str(json).expect("decode float embedding");
+        assert_eq!(data.embedding, vec![0.1_f32, 0.2, 0.3]);
+        assert_eq!(data.index, 2);
+    }
+
+    #[test]
+    fn embedding_base64_bad_length_rejected() {
+        let bad = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+        let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{bad}"}}"#);
+        assert!(serde_json::from_str::<EmbeddingData>(&json).is_err());
+    }
+
+    #[test]
+    fn embedding_full_response_base64_decodes() {
+        let v0 = vec![1.0_f32, 2.0];
+        let v1 = vec![-3.0_f32, 4.5];
+        let json = format!(
+            r#"{{"object":"list","model":"m","usage":{{"prompt_tokens":1,"total_tokens":1}},"data":[{{"object":"embedding","index":0,"embedding":"{}"}},{{"object":"embedding","index":1,"embedding":"{}"}}]}}"#,
+            encode_b64_f32(&v0),
+            encode_b64_f32(&v1)
+        );
+        let resp: EmbeddingResponse = serde_json::from_str(&json).expect("decode response");
+        assert_eq!(resp.data[0].embedding, v0);
+        assert_eq!(resp.data[1].embedding, v1);
+    }
 }
