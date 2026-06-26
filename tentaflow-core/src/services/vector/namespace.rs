@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use super::backend::{Field, FieldSpec, Metric, SparseVector, VectorBackend};
+use super::backend::{Field, FieldSpec, Metric, SparseVector, UpsertItem, VectorBackend};
 use super::error::{Result, VectorError};
 use super::zvec_backend::ZvecBackend;
 use crate::db::DbPool;
@@ -812,6 +812,96 @@ impl NamespaceManager {
         }
 
         if let Err(e) = backend.upsert(ref_id, vector, field_values, sparse_value) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
+
+        let new_count = backend.count();
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(e) = conn.execute(
+            "UPDATE addon_vector_namespaces SET count = ?1, updated_at = ?2 \
+             WHERE addon_id = ?3 AND namespace = ?4 AND org_id = ?5",
+            rusqlite::params![new_count as i64, now, addon_id, namespace, org_id],
+        ) {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(VectorError::Db(e.to_string()));
+        }
+        conn.execute("COMMIT", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+        Ok(new_count)
+    }
+
+    /// Bulk variant of `upsert_with_quota`: validates the per-tenant quota for
+    /// the WHOLE batch up front, then persists every vector with a SINGLE flush
+    /// (`backend.upsert_batch`), and bumps the cached `count` once. This avoids
+    /// the per-element fsync of a growing index that made a 305-chunk document
+    /// ingest take minutes instead of ~1s. Quota is checked against the count of
+    /// truly new ref_ids (replaces do not consume quota), matching the
+    /// single-shot path.
+    ///
+    /// Returns the new count for the namespace. On a backend write error the
+    /// (unflushed) partial writes are not persisted; the caller owns
+    /// cleanup-on-failure of any ref_ids it considers written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_batch_with_quota(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        items: &[UpsertItem<'_>],
+        dim: u32,
+        metric: Metric,
+        field_specs: &[FieldSpec],
+        sparse_flag: bool,
+    ) -> Result<u64> {
+        if items.is_empty() {
+            return Err(VectorError::EmptyVector);
+        }
+        let backend = self.get_or_create(
+            org_id,
+            addon_id,
+            namespace,
+            dim,
+            metric,
+            field_specs,
+            sparse_flag,
+        )?;
+        // Liczba REALNIE nowych wektorów (replace nie zżera limitu) — liczone raz
+        // dla całego batcha, jak pojedynczy upsert sprawdza `has_ref`.
+        let new_inserts = items
+            .iter()
+            .filter(|it| !backend.has_ref(it.ref_id))
+            .count() as u64;
+
+        let conn = self
+            .pool
+            .write()
+            .map_err(|_| VectorError::Db("pool mutex poisoned".into()))?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| VectorError::Db(e.to_string()))?;
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM addon_vector_namespaces \
+                 WHERE addon_id = ?1 AND org_id = ?2",
+                rusqlite::params![addon_id, org_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                VectorError::Db(e.to_string())
+            })?;
+
+        if total as u64 + new_inserts > MAX_VECTORS_PER_ADDON {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(VectorError::VectorQuotaExceeded {
+                addon_id: addon_id.to_string(),
+                current: total as u64,
+                max: MAX_VECTORS_PER_ADDON,
+            });
+        }
+
+        if let Err(e) = backend.upsert_batch(items) {
             let _ = conn.execute("ROLLBACK", []);
             return Err(e);
         }
