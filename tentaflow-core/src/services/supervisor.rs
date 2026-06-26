@@ -1474,6 +1474,22 @@ async fn update_status_detached(db: &DbPool, id: i64, status: ServiceStatus, err
 
 // ----- HTTP probe helper ----------------------------------------------------
 
+/// Wspoldzielony klient HTTP dla health-probe. Budowanie `reqwest::Client`
+/// laduje i parsuje CALY systemowy bundle certyfikatow CA (~150 PEM) — robienie
+/// tego per-probe (supervisor sprawdza N serwisow co ~1-3s w nieskonczonosc)
+/// palilo rdzen na parsowaniu certow w tle i dlawilo m.in. ingest RAG.
+/// `reqwest::Client` jest tani do klonowania (Arc + pool wewnatrz) i bezpieczny
+/// wspolbieznie — budujemy go RAZ, a timeout nakladamy per-request.
+static HEALTH_PROBE_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn health_probe_client() -> &'static reqwest::Client {
+    HEALTH_PROBE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .build()
+            .expect("zbudowanie wspoldzielonego health-probe reqwest::Client")
+    })
+}
+
 async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
     // Engines speak OpenAI-compatible APIs in the dominant case, so probe the
     // /v1/models endpoint. `endpoint_url` z `build_endpoint_url` jest baza API
@@ -1490,12 +1506,9 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
         format!("{}/v1/models", trimmed)
     };
 
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
-        Ok(c) => c,
-        Err(e) => return HealthStatus::Failed(format!("reqwest builder: {}", e)),
-    };
+    let client = health_probe_client();
 
-    match client.get(&probe_url).send().await {
+    match client.get(&probe_url).timeout(timeout).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
@@ -1539,11 +1552,8 @@ async fn http_probe_external(url: &str, timeout: Duration) -> HealthStatus {
     } else {
         format!("{}/v1/models", trimmed)
     };
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
-        Ok(c) => c,
-        Err(e) => return HealthStatus::Failed(format!("reqwest builder: {}", e)),
-    };
-    match client.get(&probe_url).send().await {
+    let client = health_probe_client();
+    match client.get(&probe_url).timeout(timeout).send().await {
         Ok(resp) if resp.status().as_u16() < 500 => HealthStatus::Ok,
         Ok(resp) => HealthStatus::Degraded(format!("provider http {}", resp.status())),
         Err(e) => HealthStatus::Degraded(format!("provider unreachable: {}", e)),
