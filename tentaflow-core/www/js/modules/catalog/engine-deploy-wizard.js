@@ -411,8 +411,15 @@ function manifestParams() {
 // llama.cpp + MLX). They must NOT fall into the generic manifest-param renderer.
 const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'];
 
+// vLLM-backed engines (embed / rerank / VL pooling models) carry backend="vllm"
+// in the manifest — they get the SAME VRAM calculator + gpu_memory_utilization
+// slider as the named vLLM engines, without a second hand-maintained id list.
+function isAdvCalcEngine(id) {
+  return ADV_CALC_ENGINES.includes(id) || engineEntry?.engine?.backend === 'vllm';
+}
+
 function hasGenericParams() {
-  if (ADV_CALC_ENGINES.includes(engineId())) return false;
+  if (isAdvCalcEngine(engineId())) return false;
   return manifestParams().length > 0;
 }
 
@@ -430,7 +437,7 @@ function shouldSkipAdvancedStep() {
   if (hasGenericParams()) return false;
   // MLX (embedded, Apple unified memory) reuzywa ten sam krok, ale liczy
   // "ile tokenow kontekstu zmiesci sie w budzecie pamieci" zamiast vLLM args.
-  if (!ADV_CALC_ENGINES.includes(id)) return true;
+  if (!isAdvCalcEngine(id)) return true;
   // Bez wybranego modelu nie ma jak liczyc VRAM/KV
   if (!selection.modelRepo && !selection.modelPresetId) return true;
   // Bez wybranych GPU tez nie — ale MLX nie ma dyskretnego GPU (unified memory),
@@ -678,7 +685,16 @@ function isMlxEngine() {
 // vLLM-rodzina = silniki ktore akceptuja safetensors override kwantyzacji wag
 // i jeden select KV (auto/fp8). Wagi llama.cpp/MLX wynikaja z pobranego pliku.
 function isVllmFamilyEngine() {
-  return ['vllm', 'vllm-spark', 'sglang', 'tensorrt-llm'].includes(engineId());
+  return ['vllm', 'vllm-spark', 'sglang', 'tensorrt-llm'].includes(engineId())
+    || engineEntry?.engine?.backend === 'vllm';
+}
+
+// Pooling engines (embeddings / reranker) have no KV-cache pool, so their
+// resting gpu_memory_utilization default is a tight budget, not the generative
+// 0.9 — mirrors Core's `auto_gpu_memory_utilization(is_pooling)` cap.
+function isPoolingEngine() {
+  const cat = String(engineEntry?.engine?.category || '').toLowerCase();
+  return cat === 'embeddings' || cat === 'reranker';
 }
 
 function formatCount(n) {
@@ -1298,7 +1314,7 @@ function renderAdvancedManualControls(adv, rec) {
   const normKv = (v) => (isLcpp && v === 'auto') ? 'f16' : v;
   const kv = normKv(adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto'));
   const kvV = normKv(adv.kv_cache_dtype_v || kv);
-  const memUtil = valueFor('gpu_memory_utilization', 0.9);
+  const memUtil = valueFor('gpu_memory_utilization', isPoolingEngine() ? 0.2 : 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
   // Helper: render the auto-adjust hint shown below a slider.
@@ -1480,7 +1496,7 @@ function renderAdvancedManualControls(adv, rec) {
       ${isLcpp ? '' : `
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
-        <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
+        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.9" step="0.05" value="${memUtil}">
         <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
       </div>`}
@@ -1623,7 +1639,11 @@ function bindAdvancedHandlers() {
       // llama.cpp default KV type is f16 and the engine emits no flag for it,
       // so an explicit 'f16' is equivalent to 'auto' on the wire.
       kv_cache_dtype: (a.kv_cache_dtype !== 'auto' && !(isLcpp && a.kv_cache_dtype === 'f16')) ? a.kv_cache_dtype : undefined,
-      gpu_memory_utilization: a.gpu_memory_utilization || undefined,
+      // Send a value ONLY when the user actually moved the slider. Untouched →
+      // undefined → Core's pooling-aware auto picks the budget (tight cap for
+      // embed/rerank, generous for LLMs). Sending the slider's resting default
+      // would mask that auto and starve pooling engines on a shared GPU.
+      gpu_memory_utilization: a.gpu_memory_touched ? a.gpu_memory_utilization : undefined,
       lock_max_model_len: lock === 'max_model_len' || undefined,
       lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
       lock_tensor_parallel: lock === 'tensor_parallel' || undefined,

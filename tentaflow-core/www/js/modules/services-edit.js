@@ -14,6 +14,16 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
+import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
+
+// True when the engine is served by CUDA vLLM (manifest backend="vllm", not the
+// Metal variant) — single source of truth shared with the deploy wizard and the
+// Rust `Engine::is_cuda_vllm`, replacing the old `engineId === 'vllm'` literal so
+// every vLLM-backed engine (embed / rerank / VL) also gets the VRAM calculator.
+function engineUsesCudaVllm(engineId) {
+  return ManifestStore.byId(engineId)?.engine?.backend === 'vllm'
+    && !String(engineId || '').endsWith('-metal');
+}
 
 let currentModalEl = null;
 let vramPollHandle = null;
@@ -31,7 +41,10 @@ export async function openEditModal(svc, opts = {}) {
   const cfg = parseConfig(svc.config_json);
   const initialPresetId = cfg.model_preset_id || null;
   const initialModelRepo = cfg.model_repo || '';
-  const isVllm = engineId === 'vllm';
+  // Load the manifest (idempotent) so the vLLM-backed check below sees the
+  // `backend` field for embed/rerank/VL engines, not just literal "vllm".
+  await ManifestStore.init();
+  const isVllm = engineUsesCudaVllm(engineId);
 
   // Fetch presetow z manifestu (CBOR binary) ZAMIAST hardcoded list. Backend
   // zwraca dokladnie te [[model_preset]] ktore sa w pliku TOML silnika.
@@ -270,7 +283,7 @@ function closeModal() {
 // card są renderowane z `vram_estimate` (model_weights_gb/kv_cache_gb/
 // activations_gb/per_gpu_gb/fits_per_gpu/warnings).
 function scheduleRecommendRefresh(overlay, svc, engineId) {
-  if (engineId !== 'vllm') return;
+  if (!engineUsesCudaVllm(engineId)) return;
   if (recommendDebounceHandle) clearTimeout(recommendDebounceHandle);
   recommendDebounceHandle = setTimeout(() => {
     fetchRecommendation(overlay, svc).catch((e) => {
@@ -747,9 +760,9 @@ function renderVramSection(tk) {
             <span>gpu_memory_utilization</span>
             <span data-mu-value style="color:var(--accent-2);font-family:'JetBrains Mono',monospace;font-weight:700;">0.90</span>
           </label>
-          <input type="range" data-mu-slider min="0.10" max="0.95" step="0.01" value="0.90" style="width:100%;margin-top:6px;">
+          <input type="range" data-mu-slider min="0.15" max="0.9" step="0.01" value="0.90" style="width:100%;margin-top:6px;">
           <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--text-3);margin-top:4px;padding:0 8px;">
-            <span>0.10</span><span>0.30</span><span>0.50</span><span>0.70</span><span>0.95</span>
+            <span>0.15</span><span>0.30</span><span>0.50</span><span>0.70</span><span>0.90</span>
           </div>
         </div>
       </div>
