@@ -410,6 +410,14 @@ pub fn vector_upsert_v1(
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let mgr = manager(caller.data()).clone();
 
+    // Wymiar przestrzeni bierzemy z RZECZYWISTEGO wektora, nie z manifestu.
+    // Model embeddingu jest konfigurowalny (np. RAG: jina=1024d / nemotron=2048d),
+    // wiec `spec.dimensions` z manifestu nie moze pinowac przestrzeni — robi to ta
+    // sama sciezka co flow-store (tworzy namespace na dlugosci wektora). Manifest
+    // nadal DEKLARUJE namespace (gate dostepu wyzej), ale jego `dimensions` jest
+    // pogladowe. get_or_create i tak kapuje wymiar do 1..=4096, a istniejacy
+    // namespace o innym wymiarze zwraca DimMismatch (zmiana modelu => nowa kolekcja).
+    let dim = u32::try_from(vector.len()).unwrap_or(u32::MAX);
     // upsert_with_quota holds an IMMEDIATE SQLite transaction across the
     // quota check + backend insert + count UPDATE, so two concurrent
     // upserts cannot both pass the cap. The backend persists internally,
@@ -420,7 +428,7 @@ pub fn vector_upsert_v1(
         &input.namespace,
         input.ref_id,
         &vector,
-        spec.dimensions,
+        dim,
         metric,
         &field_specs,
         &field_values,
