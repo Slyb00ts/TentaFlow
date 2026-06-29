@@ -1,0 +1,43 @@
+# =============================================================================
+# Plik: reranker/_services/jina-rerank.toml
+# Opis: Reranker jina-reranker-v3 (listwise, Qwen3-0.6B) serwowany przez vLLM
+#       (--task score). Wystawia OpenAI-compatible /v1/rerank + /v1/score.
+#       UWAGA: v3 jest listwise (jeden forward query+do 64 dokumentow), a vLLM
+#       --task score to pointwise cross-encoder — przy starszym vLLM ranking moze
+#       sie roznic od oficjalnego API Jina; zweryfikuj jakosc po deployu albo
+#       uzyj wariantu transformers. Licencja CC-BY-NC-4.0 (niekomercyjna).
+#       Warianty: GGUF `jina-rerank-gguf`, Apple MLX `jina-rerank-mlx`.
+# =============================================================================
+
+[engine]
+id = "jina-rerank"
+provider = "tentaflow"
+category = "reranker"
+name = "Jina Reranker v3"
+description_pl = "Reranker jina-reranker-v3 (listwise, Qwen3-0.6B) przez vLLM (--task score). Ranguje pasaze wzgledem zapytania. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. Licencja NC."
+description_en = "jina-reranker-v3 (listwise, Qwen3-0.6B) via vLLM (--task score). Ranks passages against a query. GGUF: jina-rerank-gguf, Apple: jina-rerank-mlx. NC license."
+homepage = "https://huggingface.co/jinaai/jina-reranker-v3"
+license = "cc-by-nc-4.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "v3"
+service_surfaces = ["rerank"]
+input_modalities = ["text"]
+dgx_spark = false
+
+[deploy.docker]
+context_path = "reranker/docker/jina-rerank"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "reranker/python/jina-rerank"
+
+[[model_preset]]
+id = "jina-reranker-v3"
+display_name = "Jina Reranker v3 (0.6B)"
+repo = "jinaai/jina-reranker-v3"
+recommended = true

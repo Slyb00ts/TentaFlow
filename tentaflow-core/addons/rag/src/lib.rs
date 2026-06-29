@@ -39,8 +39,16 @@ const PASSAGES_NS: &str = "passages";
 /// Embedding nazwy wezla grafu pod k-NN kandydatow scalenia (zgodna z [[vector_namespace]]).
 const ENTITIES_NS: &str = "entities";
 
-/// Wymiar wektora (zgodny z manifestem i suggested_default rag-embeddings).
-const EMBED_DIMENSIONS: usize = 2048;
+/// Klucz instancyjnego KV z wymiarem embeddingu rag-embeddings. Wymiar NIE jest
+/// staly — zalezy od modelu: jina-v5-small=1024d (on-device, slaby sprzet),
+/// llama-nemotron-embed=2048d (NVIDIA), itd. Seedowany leniwie z PIERWSZEGO
+/// embeddingu modelu (probny "x"), potem czytany przy zero-query enumeracji
+/// chunkow i walidacji wektorow. Namespace 'passages'/'entities' biora wymiar z
+/// DANYCH (pierwszy upsert, deklaracja w manifescie jest tylko pogladowa), wiec
+/// addon MUSI uzywac tego samego realnego wymiaru — inaczej re-ingest (zero-query)
+/// i merge encji daja rozjazd z przestrzenia (AbiError). Wzor jak
+/// [[GRAPH_ENABLED_STATE_KEY]]: jeden klucz state, zero osobnego systemu configu.
+const EMBED_DIM_STATE_KEY: &str = "embed_dimensions";
 
 // --- Ekstrakcja encji/relacji do grafu wiedzy (GraphRAG, Etap 2 / slice E3.0) ---
 
@@ -820,7 +828,7 @@ struct DocChunk {
 /// (cleanup_document_artifacts), a graf czyta pierwsze 1000 (wystarcza realnie).
 fn fetch_document_chunks(document_id: &str) -> Result<Vec<DocChunk>, String> {
     const FETCH_K: u32 = 1000;
-    let zero_query = vec![0.0f32; EMBED_DIMENSIONS];
+    let zero_query = vec![0.0f32; ensure_embed_dim()?];
     let filter = VectorFilter::Eq(
         "doc_id".to_string(),
         VectorFieldValue::Str(document_id.to_string()),
@@ -6109,13 +6117,30 @@ fn embed_and_match_entity(node_id: &str, label: &str) -> Result<Option<(String, 
     Ok(None)
 }
 
-/// Embedding NAZWY encji (bez prefiksu "Document:"): nazwa to krotka fraza, nie pasaz. Reszta
-/// mechanizmu jak generate_embedding (alias rag-embeddings, task=embedding, walidacja wymiaru).
-fn generate_name_embedding(name: &str) -> Result<Vec<f32>, String> {
+/// Wymiar embeddingu z instancyjnego KV; brak/zly wpis => None.
+fn embed_dim_cached() -> Option<usize> {
+    state_get(EMBED_DIM_STATE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&d| d > 0)
+}
+
+/// Zapamietuje wymiar embeddingu (Durable, per-instancja) przy pierwszym poznaniu.
+fn cache_embed_dim(dim: usize) {
+    let _ = state_set(EMBED_DIM_STATE_KEY, dim.to_string().as_bytes(), StateTier::Durable);
+}
+
+/// Surowa odpowiedz embeddingu rag-embeddings dla `text`. Opcje NIE wymuszaja
+/// `dimensions` — model zwraca swoj natywny wymiar, spojny z flow-ingestem (ten sam
+/// model, tez bez wymuszonego wymiaru), wiec wektory nazw encji i pasazy zyja w tej
+/// samej przestrzeni. Zwraca surowy JSON (parsowanie/walidacja u wolajacego).
+fn embed_raw(text: &str) -> Result<String, String> {
     let model = "rag-embeddings";
-    let options = json!({ "task": "embedding", "dimensions": EMBED_DIMENSIONS, "adapter": "retrieval" });
+    let options = json!({ "task": "embedding", "adapter": "retrieval" });
     let options_str = serde_json::to_string(&options).map_err(|e| format!("Blad serializacji opcji: {e}"))?;
-    let prompt_bytes = name.as_bytes();
+    let prompt_bytes = text.as_bytes();
     let model_bytes = model.as_bytes();
     let options_bytes = options_str.as_bytes();
     let mut buffer = vec![0u8; EMBED_BUFFER_SIZE];
@@ -6130,13 +6155,36 @@ fn generate_name_embedding(name: &str) -> Result<Vec<f32>, String> {
         )
     };
     if rc < 0 {
-        return Err(format!("llm_generate (nazwa encji) zwrocil blad: {rc}"));
+        return Err(format!("llm_generate (embedding) zwrocil blad: {rc}"));
     }
     if out_len <= 0 {
-        return Err("llm_generate (nazwa encji) zwrocil pusta odpowiedz".to_string());
+        return Err("llm_generate (embedding) zwrocil pusta odpowiedz".to_string());
     }
-    let response = String::from_utf8_lossy(&buffer[..out_len as usize]).to_string();
-    parse_embedding_response(&response)
+    Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
+}
+
+/// Wymiar embeddingu rag-embeddings dla TEJ instancji. Cache w KV; gdy brak, liczy
+/// PROBNY embedding ("x"), zapamietuje jego dlugosc i ja zwraca. Tak wymiar adaptuje
+/// sie do modelu (jina 1024 / nemotron 2048) bez stalej w kodzie i bez configu.
+fn ensure_embed_dim() -> Result<usize, String> {
+    if let Some(d) = embed_dim_cached() {
+        return Ok(d);
+    }
+    let response = embed_raw("x")?;
+    let dim = parse_embedding_vector(&response)?.len();
+    if dim == 0 {
+        return Err("rag-embeddings zwrocil pusty wektor (wymiar 0)".to_string());
+    }
+    cache_embed_dim(dim);
+    Ok(dim)
+}
+
+/// Embedding NAZWY encji (bez prefiksu "Document:"): nazwa to krotka fraza, nie pasaz.
+/// Walidacja wymiaru wzgledem realnego wymiaru przestrzeni tej instancji.
+fn generate_name_embedding(name: &str) -> Result<Vec<f32>, String> {
+    let dim = ensure_embed_dim()?;
+    let response = embed_raw(name)?;
+    parse_embedding_response(&response, dim)
 }
 
 /// Konsumuje konflikty 'resolved_merge_pending' (A_res zdecydowal merge_entities w D4). Dla kazdego
@@ -6710,10 +6758,9 @@ fn delete_canonical_if_unreferenced_stmts(new_fact_key: &str, src: &str, rel: &s
 // =============================================================================
 
 /// Wyciaga wektor f32 z odpowiedzi embeddingu (tablica floatow albo obiekt z
-/// polem embedding/vector/data[0].embedding) i waliduje jego wymiar. Zla dlugosc
-/// (!= EMBED_DIMENSIONS = dim namespace 'passages') to twardy blad — wektor o zlym
-/// wymiarze nie moze trafic do upsertu (rozjazd z przestrzenia wektorowa).
-fn parse_embedding_response(response: &str) -> Result<Vec<f32>, String> {
+/// polem embedding/vector/data[0].embedding) BEZ walidacji wymiaru. Walidacje
+/// (wzgledem realnego wymiaru przestrzeni) robi `parse_embedding_response`.
+fn parse_embedding_vector(response: &str) -> Result<Vec<f32>, String> {
     let parsed: Value = serde_json::from_str(response)
         .map_err(|e| format!("Blad parsowania odpowiedzi embeddingu: {e}"))?;
 
@@ -6723,10 +6770,14 @@ fn parse_embedding_response(response: &str) -> Result<Vec<f32>, String> {
             &response[..response.len().min(200)]
         )
     })??;
+    Ok(vector)
+}
 
-    if vector.len() != EMBED_DIMENSIONS {
+fn parse_embedding_response(response: &str, expected_dim: usize) -> Result<Vec<f32>, String> {
+    let vector = parse_embedding_vector(response)?;
+    if vector.len() != expected_dim {
         return Err(format!(
-            "Zly wymiar embeddingu: {} (oczekiwano {EMBED_DIMENSIONS})",
+            "Zly wymiar embeddingu: {} (oczekiwano {expected_dim})",
             vector.len()
         ));
     }
@@ -7009,17 +7060,19 @@ mod tests {
 
     #[test]
     fn parse_embedding_accepts_exact_dimension() {
-        let resp = array_response(EMBED_DIMENSIONS);
-        let v = parse_embedding_response(&resp).expect("powinien przejsc dla 2048");
-        assert_eq!(v.len(), EMBED_DIMENSIONS);
+        // Wymiar jest dynamiczny (runtime per-instancja) — test sprawdza walidacje
+        // wzgledem podanego oczekiwanego wymiaru (tu 1024 = jina-v5-small).
+        let resp = array_response(1024);
+        let v = parse_embedding_response(&resp, 1024).expect("powinien przejsc dla 1024");
+        assert_eq!(v.len(), 1024);
     }
 
     #[test]
     fn parse_embedding_rejects_wrong_dimension() {
-        for len in [1usize, 512, 1024, 2047, 2049] {
+        for len in [1usize, 512, 1023, 1025, 2048] {
             let resp = array_response(len);
-            let res = parse_embedding_response(&resp);
-            assert!(res.is_err(), "dlugosc {len} powinna byc odrzucona");
+            let res = parse_embedding_response(&resp, 1024);
+            assert!(res.is_err(), "dlugosc {len} powinna byc odrzucona dla expected=1024");
             assert!(res.unwrap_err().contains("wymiar"), "blad powinien wskazywac wymiar");
         }
     }
@@ -7027,22 +7080,22 @@ mod tests {
     #[test]
     fn parse_embedding_validates_object_shapes() {
         // Pole "embedding" w obiekcie tez podlega walidacji wymiaru.
-        let inner = array_response(EMBED_DIMENSIONS);
+        let inner = array_response(1024);
         let ok = format!(r#"{{"embedding":{inner}}}"#);
-        assert!(parse_embedding_response(&ok).is_ok());
+        assert!(parse_embedding_response(&ok, 1024).is_ok());
 
         let bad_inner = array_response(10);
         let bad = format!(r#"{{"embedding":{bad_inner}}}"#);
-        assert!(parse_embedding_response(&bad).is_err());
+        assert!(parse_embedding_response(&bad, 1024).is_err());
 
         // data[0].embedding (ksztalt OpenAI).
         let data_ok = format!(r#"{{"data":[{{"embedding":{inner}}}]}}"#);
-        assert!(parse_embedding_response(&data_ok).is_ok());
+        assert!(parse_embedding_response(&data_ok, 1024).is_ok());
     }
 
     #[test]
     fn parse_embedding_rejects_unrecognized_shape() {
-        assert!(parse_embedding_response(r#"{"foo":123}"#).is_err());
+        assert!(parse_embedding_response(r#"{"foo":123}"#, 1024).is_err());
     }
 
     #[test]

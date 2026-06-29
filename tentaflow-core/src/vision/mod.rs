@@ -51,6 +51,12 @@ pub mod ocr_plate;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod apple_ocr;
 
+// PaddleOCR-VL (MLX) — parser dokumentow (tekst + struktura tabel + wzory) przez
+// libMLXBridge.dylib. Zawsze na macOS/iOS (target_os, bez feature flag), jak
+// apple_ocr. Rejestruje sie jako DocumentParser przy deployu `paddle-ocr-mlx`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod paddle_ocr_mlx;
+
 // PaddleOCR PP-OCRv5 (det -> cls -> rec) przez tract-onnx — embedded OCR runner
 // dla nie-Apple (Linux/Windows). Ten sam trait OcrRunner co apple-ocr; pure tract
 // (jak reszta vision), wiec kompiluje sie w domyslnym buildzie bez feature flag.
@@ -162,6 +168,39 @@ pub fn get_ocr_runner() -> Option<Arc<dyn OcrRunner>> {
 /// Usuwa globalny OCR runner (stop service / rollback deployu apple-ocr).
 pub fn clear_ocr_runner() {
     *ocr_runner_slot().write() = None;
+}
+
+/// In-process parser dokumentow: obraz strony (PNG/JPEG) -> markdown ze
+/// strukturą (tabele HTML, wzory LaTeX). Ten sam kontrakt co serwisowy
+/// `parse_document` (executor `dispatch_documents_blocking`), tylko liczony
+/// lokalnie. Ustawiany przez deploy embedded `paddle-ocr-mlx` na Apple, dzięki
+/// czemu `documents.infer`/`vision_parse` działają identycznie jak przez
+/// serwis HTTP — bez feature flag, zawsze dostępne na macOS/iOS.
+pub trait DocumentParser: Send + Sync {
+    /// Zwraca markdown strony. `mime` opisuje format wejścia (image/png itp.).
+    fn parse(&self, image_bytes: &[u8], mime: &str) -> Result<String>;
+}
+
+static DOCUMENT_PARSER: OnceLock<RwLock<Option<Arc<dyn DocumentParser>>>> = OnceLock::new();
+
+fn document_parser_slot() -> &'static RwLock<Option<Arc<dyn DocumentParser>>> {
+    DOCUMENT_PARSER.get_or_init(|| RwLock::new(None))
+}
+
+/// Ustawia globalny in-process parser dokumentów (deploy `paddle-ocr-mlx`).
+pub fn set_document_parser(parser: Arc<dyn DocumentParser>) {
+    *document_parser_slot().write() = Some(parser);
+}
+
+/// Zwraca clone Arc-a do aktywnego parsera dokumentów, jeżeli ustawiony.
+/// Executor woła to dla embedded backendu PRZED zwróceniem błędu HTTP-only.
+pub fn get_document_parser() -> Option<Arc<dyn DocumentParser>> {
+    document_parser_slot().read().clone()
+}
+
+/// Usuwa globalny parser dokumentów (stop service / rollback paddle-ocr-mlx).
+pub fn clear_document_parser() {
+    *document_parser_slot().write() = None;
 }
 
 /// Identyfikator silnika vision — odpowiada `engine.id` z manifestu TOML.
