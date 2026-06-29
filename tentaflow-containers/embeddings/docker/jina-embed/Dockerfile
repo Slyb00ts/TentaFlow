@@ -35,11 +35,3 @@ RUN pip install --no-cache-dir \
 # wiec wymuszamy klasyczne pobieranie po HTTP, ktore dziala niezawodnie.
 RUN pip install --no-cache-dir "huggingface_hub[cli]"
 ENV HF_HUB_DISABLE_XET=1
-
-COPY tentaflow-containers/embeddings/docker/jina-embed/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${VLLM_PORT:-8000}/health" || exit 1
-
-ENTRYPOINT ["/app/entrypoint.sh"]

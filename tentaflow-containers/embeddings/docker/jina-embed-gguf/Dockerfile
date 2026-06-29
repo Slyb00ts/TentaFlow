@@ -35,10 +35,3 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=llamacpp-builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=llamacpp-builder /build/llama.cpp/build/bin/*.so /usr/local/lib/
 RUN ldconfig
-COPY tentaflow-containers/embeddings/docker/jina-embed-gguf/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${LLAMA_PORT:-8080}/health" || exit 1
-
-ENTRYPOINT ["/app/entrypoint.sh"]

@@ -7,31 +7,3 @@
 #       surface Rerank in-process (rerank_forward + executor + resolver kieruja
 #       embedded handle do mlx_swift_bridge::rerank). Licencja CC-BY-NC-4.0
 #       (niekomercyjna). Dziala na macOS i iOS (mlx-swift).
-# =============================================================================
-
-[engine]
-id = "jina-rerank-mlx"
-provider = "tentaflow"
-category = "reranker"
-name = "Jina Reranker v3 (MLX)"
-description_pl = "Reranker jina-reranker-v3 na Apple Silicon (MLX). Serwuje /v1/rerank na macOS przez natywny port MLX Jiny. Licencja NC."
-description_en = "jina-reranker-v3 on Apple Silicon (MLX). Serves /v1/rerank on macOS via Jina's native MLX port. NC license."
-homepage = "https://huggingface.co/jinaai/jina-reranker-v3-mlx"
-license = "cc-by-nc-4.0"
-icon = "mlx"
-default_port = 8000
-api = "openai-compatible"
-version = "v3"
-service_surfaces = ["rerank"]
-input_modalities = ["text"]
-
-[deploy.native]
-platforms = ["macos", "ios"]
-runtime = "embedded"
-feature_flag = "inference-mlx"
-
-[[model_preset]]
-id = "jina-reranker-v3-mlx"
-display_name = "Jina Reranker v3 (MLX)"
-repo = "jinaai/jina-reranker-v3-mlx"
-recommended = true
