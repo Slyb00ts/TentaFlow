@@ -9,7 +9,7 @@ author = "TentaFlow"
 license = "Apache-2.0"
 icon = "video"
 runtime = "wasmtime"
-platforms = ["linux"]
+platforms = ["linux", "macos", "windows", "ios", "android"]
 wasm_file = "addon.wasm"
 
 [application]
