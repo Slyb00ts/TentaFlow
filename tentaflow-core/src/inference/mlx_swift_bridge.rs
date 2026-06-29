@@ -63,6 +63,13 @@ type TokenCallbackFn = extern "C" fn(
 /// Callback: pobierz info o modelu (nazwa, backend, rozmiar). Zwraca JSON C string (caller musi zwolnic)
 type ModelInfoFn = extern "C" fn(context: *mut c_void) -> *mut c_char;
 
+/// Callback: policz embedding dla jednego tekstu. Zwraca bufor `f32` zaalokowany
+/// przez malloc (Rust zwalnia przez libc free) i zapisuje dlugosc do `out_len`.
+/// NULL = blad. Rejestrowany osobno od czworki gen (`tentaflow_register_mlx_swift_embed`),
+/// zeby nie zmieniac sygnatury rejestracji LLM uzywanej tez na iOS.
+type EmbedFn =
+    extern "C" fn(text: *const c_char, out_len: *mut i32, context: *mut c_void) -> *mut f32;
+
 // =============================================================================
 // Wrapper na raw pointer — bezpieczne przesylanie miedzy watkami
 // =============================================================================
@@ -105,6 +112,69 @@ unsafe impl Sync for SwiftCallbacks {}
 
 /// Globalny singleton — ustawiany raz przy starcie przez Swift
 static SWIFT_CALLBACKS: OnceLock<SwiftCallbacks> = OnceLock::new();
+
+/// Callback embeddingow — rejestrowany osobno, bo nie kazda binarka z bridge'm
+/// ma symbol `MLXBridge_embed` (starsze dyliby). Kontekst (singleton silnika)
+/// wspoldzielony z `SWIFT_CALLBACKS`.
+struct SwiftEmbedCallback {
+    embed_fn: EmbedFn,
+}
+unsafe impl Send for SwiftEmbedCallback {}
+unsafe impl Sync for SwiftEmbedCallback {}
+static SWIFT_EMBED: OnceLock<SwiftEmbedCallback> = OnceLock::new();
+
+/// Rejestruje callback embeddingow MLX (osobno od czworki gen). Wolane z
+/// `mlx_swift_init.rs` gdy dylib eksponuje `MLXBridge_embed`.
+#[no_mangle]
+pub extern "C" fn tentaflow_register_mlx_swift_embed(embed_fn: EmbedFn) {
+    let _ = SWIFT_EMBED.set(SwiftEmbedCallback { embed_fn });
+    tracing::info!("Swift MLX embed callback zarejestrowany");
+}
+
+/// Callback: zaladuj model embeddingow (wymusza sciezke EmbedderModelFactory
+/// niezaleznie od `1_Pooling`). Zwraca 0=OK, <0=blad.
+type LoadEmbedderFn = extern "C" fn(model_path: *const c_char, context: *mut c_void) -> i32;
+
+struct SwiftLoadEmbedderCallback {
+    load_fn: LoadEmbedderFn,
+}
+unsafe impl Send for SwiftLoadEmbedderCallback {}
+unsafe impl Sync for SwiftLoadEmbedderCallback {}
+static SWIFT_LOAD_EMBEDDER: OnceLock<SwiftLoadEmbedderCallback> = OnceLock::new();
+
+/// Rejestruje callback ladowania embeddera MLX (osobno od czworki gen). Wolane
+/// z `mlx_swift_init.rs` gdy dylib eksponuje `MLXBridge_loadEmbedder`.
+#[no_mangle]
+pub extern "C" fn tentaflow_register_mlx_swift_load_embedder(load_fn: LoadEmbedderFn) {
+    let _ = SWIFT_LOAD_EMBEDDER.set(SwiftLoadEmbedderCallback { load_fn });
+    tracing::info!("Swift MLX load-embedder callback zarejestrowany");
+}
+
+/// Laduje model embeddingow do slotu embeddera w MLXBridge (osobny od LLM).
+/// Wolane przez embedded deploy embeddingow (jina-embed-mlx) — wymusza
+/// EmbedderModelFactory niezaleznie od heurystyki `1_Pooling`.
+pub async fn load_embedder_model(model_path: &std::path::Path) -> Result<()> {
+    let cb = SWIFT_LOAD_EMBEDDER.get().context(
+        "Swift MLX load-embedder callback nie zostal zarejestrowany (stary libMLXBridge.dylib?)",
+    )?;
+    let callbacks = get_callbacks()?;
+    let load_fn = cb.load_fn;
+    let ctx = SendPtr::from_raw(callbacks.context);
+    let path_str = model_path
+        .to_str()
+        .context("Sciezka modelu zawiera nieprawidlowe znaki UTF-8")?
+        .to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let c_path = to_cstring(&path_str);
+        load_fn(c_path.as_ptr(), ctx.as_ptr())
+    })
+    .await
+    .context("Blad watku ladowania embeddera")?;
+    if result < 0 {
+        anyhow::bail!("Swift MLX: blad ladowania embeddera (kod: {})", result);
+    }
+    Ok(())
+}
 
 // =============================================================================
 // Rejestracja FFI — wywolywane z Swift przy starcie aplikacji
@@ -478,8 +548,44 @@ impl InferenceEngine for MlxSwiftEngine {
         Ok(rx)
     }
 
-    async fn embeddings(&self, _params: EmbeddingParams) -> Result<EmbeddingResult> {
-        anyhow::bail!("Embeddingi nie sa obslugiwane przez backend mlx-swift")
+    async fn embeddings(&self, params: EmbeddingParams) -> Result<EmbeddingResult> {
+        let embed = SWIFT_EMBED
+            .get()
+            .context("Swift MLX embed callback nie zostal zarejestrowany (stary libMLXBridge.dylib?)")?;
+        let callbacks = get_callbacks()?;
+        let embed_fn = embed.embed_fn;
+        let ctx = SendPtr::from_raw(callbacks.context);
+        let texts = params.texts.clone();
+
+        // Kazdy tekst liczony osobno na dedykowanym watku — Swift blokuje.
+        let embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for t in &texts {
+                let c_text = to_cstring(t);
+                let mut len: i32 = 0;
+                let ptr = embed_fn(c_text.as_ptr(), &mut len as *mut i32, ctx.as_ptr());
+                if ptr.is_null() || len <= 0 {
+                    anyhow::bail!("Swift MLX: embed zwrocil pusty wynik");
+                }
+                // SAFETY: Swift zaalokowal `len` floatow przez malloc; kopiujemy
+                // i zwalniamy przez libc free (ten sam alokator).
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                let vec = slice.to_vec();
+                unsafe {
+                    libc_free(ptr as *mut c_void);
+                }
+                out.push(vec);
+            }
+            Ok(out)
+        })
+        .await
+        .context("Blad watku embeddingow")??;
+
+        let dimensions = embeddings.first().map(|v| v.len()).unwrap_or(0);
+        Ok(EmbeddingResult {
+            embeddings,
+            dimensions,
+        })
     }
 }
 

@@ -1,0 +1,35 @@
+# =============================================================================
+# Plik: reranker/_services/jina-rerank-mlx.toml
+# Opis: Reranker jina-reranker-v3 (MLX) na Apple Silicon — python-bundle z
+#       serwerem /v1/rerank. server.py sciaga repo `jina-reranker-v3-mlx`
+#       (natywny port MLX, 100% zgodnosc score z oryginalem) i woła jego
+#       `MLXReranker`. Licencja CC-BY-NC-4.0 (niekomercyjna). iOS nie jest
+#       wspierany (python-bundle dziala na macOS).
+# =============================================================================
+
+[engine]
+id = "jina-rerank-mlx"
+provider = "tentaflow"
+category = "reranker"
+name = "Jina Reranker v3 (MLX)"
+description_pl = "Reranker jina-reranker-v3 na Apple Silicon (MLX). Serwuje /v1/rerank na macOS przez natywny port MLX Jiny. Licencja NC."
+description_en = "jina-reranker-v3 on Apple Silicon (MLX). Serves /v1/rerank on macOS via Jina's native MLX port. NC license."
+homepage = "https://huggingface.co/jinaai/jina-reranker-v3-mlx"
+license = "cc-by-nc-4.0"
+icon = "mlx"
+default_port = 8000
+api = "openai-compatible"
+version = "v3"
+service_surfaces = ["rerank"]
+input_modalities = ["text"]
+
+[deploy.native]
+platforms = ["macos"]
+runtime = "python-bundle"
+bundle_path = "reranker/python/jina-rerank-mlx"
+
+[[model_preset]]
+id = "jina-reranker-v3-mlx"
+display_name = "Jina Reranker v3 (MLX)"
+repo = "jinaai/jina-reranker-v3-mlx"
+recommended = true

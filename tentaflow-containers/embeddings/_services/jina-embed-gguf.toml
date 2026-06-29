@@ -1,0 +1,50 @@
+# Manifest serwisu Jina Embeddings v5 (GGUF / llama.cpp) — lekka sciezka
+# embeddingow tekstu na slaby sprzet: CPU, AMD i telefon. Te same modele Jina v5
+# (Qwen3-0.6B, 1024d) co `jina-embed`, ale w formacie GGUF z last-token pooling.
+# Docker buduje llama-server CPU-only (GGML_NATIVE=OFF — przenosny miedzy CPU),
+# direct-http /v1/embeddings. Natywny wariant to wbudowany silnik llama.cpp
+# (inference-llamacpp, sciezka LlamaCppEngine::embeddings) na WSZYSTKICH
+# platformach, w tym Android/iOS. Licencja CC-BY-NC-4.0 (niekomercyjna).
+
+[engine]
+id = "jina-embed-gguf"
+provider = "tentaflow"
+category = "embeddings"
+name = "Jina Embeddings v5 (GGUF / llama.cpp)"
+description_pl = "Lekkie embeddingi Jina v5 przez llama.cpp (GGUF, pooling last). CPU/AMD/telefon — kwantyzacje od IQ1_S (~210 MB). Docker CPU + natywny embedded (wszystkie platformy)."
+description_en = "Light Jina v5 embeddings via llama.cpp (GGUF, last pooling). CPU/AMD/phone — quants from IQ1_S (~210 MB). CPU Docker + native embedded (all platforms)."
+homepage = "https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF"
+license = "cc-by-nc-4.0"
+icon = "llama-cpp"
+default_port = 8080
+api = "openai-compatible"
+version = "v5"
+service_surfaces = ["embeddings"]
+input_modalities = ["text"]
+output_modalities = ["embedding"]
+
+[deploy.docker]
+context_path = "embeddings/docker/jina-embed-gguf"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-llamacpp"
+
+# Jedno repo GGUF z wieloma kwantyzacjami — pole `quantization` wybiera plik.
+# Q4_K_M = domyslny kompromis jakosc/rozmiar; Q8_0 = najwyzsza jakosc on-device;
+# IQ1_S = skrajnie maly (~210 MB) na telefon / bardzo slaby sprzet.
+[[model_preset]]
+id = "jina-v5-small-retrieval-q5-k-m"
+display_name = "Jina v5 Small Retrieval — Q5_K_M (~440 MB)"
+repo = "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF"
+quantization = "Q5_K_M"
+recommended = true
+
+[[model_preset]]
+id = "jina-v5-small-retrieval-iq1-s"
+display_name = "Jina v5 Small Retrieval — IQ1_S (~210 MB, telefon)"
+repo = "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF"
+quantization = "IQ1_S"

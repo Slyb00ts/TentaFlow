@@ -25,15 +25,20 @@ output_modalities = ["text"]
 [deploy.native]
 platforms = ["macos", "ios"]
 runtime = "embedded"
-feature_flag = "inference-mlx-ocr"
+# Bez feature flag — silnik (PaddleOCR-VL MLX) jest wkompilowany zawsze na
+# macOS/iOS (gating target_os, jak apple-ocr). Vendored w MLXBridge.
 
+# Wagi oryginalnego PaddleOCR-VL (config.json + safetensors + tokenizer) —
+# port MLX (vendored w MLXBridge, PaddleOCRVLModel.load + AutoTokenizer.from)
+# laduje je wprost z tego katalogu. NIE repo swift-package (to tylko kod).
 [[model_preset]]
 id = "paddleocr-vl-mlx"
 display_name = "PaddleOCR-VL (MLX)"
-repo = "mlx-community/paddleocr-vl.swift"
+repo = "PaddlePaddle/PaddleOCR-VL"
 recommended = true
 
+# Wariant juz-skonwertowany do MLX (alternatywa, gdy port nie laduje oryginalu).
 [[model_preset]]
 id = "paddleocr-vl-mlx-gamhtoi"
-display_name = "PaddleOCR-VL-MLX"
+display_name = "PaddleOCR-VL-MLX (prekonwertowany)"
 repo = "gamhtoi/PaddleOCR-VL-MLX"

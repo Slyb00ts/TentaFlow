@@ -15,6 +15,7 @@
 import Foundation
 import HuggingFace
 import MLX
+import MLXEmbedders
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
@@ -29,6 +30,11 @@ public final class MLXBridgeEngine: @unchecked Sendable {
 
     private var modelContainer: ModelContainer?
     private var modelPath: String?
+
+    /// Kontener modelu embeddingow (osobny od LLM — moga wspolistniec).
+    /// Ladowany przez `loadModel` gdy katalog ma `1_Pooling/config.json`
+    /// (sentence-transformers, np. jina-embeddings-v5 / Qwen3-Embedding).
+    private var embedderContainer: EmbedderModelContainer?
 
     private init() {
         // Limit cache GPU — wystarczy duzo dla M-series, ale nie bezgranicznie.
@@ -45,6 +51,13 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: path) else {
             print("[MLXBridge] Sciezka nie istnieje: \(path)")
             return false
+        }
+
+        // Sentence-transformers (embeddingi) maja `1_Pooling/config.json` —
+        // wtedy ladujemy przez EmbedderModelFactory zamiast LLMModelFactory.
+        let poolingConfig = url.appending(components: "1_Pooling", "config.json")
+        if FileManager.default.fileExists(atPath: poolingConfig.path) {
+            return loadEmbedder(url: url, path: path)
         }
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -79,11 +92,92 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         return success
     }
 
-    /// Wyladowuje model z pamieci.
+    /// Wyladowuje model z pamieci (LLM i embedder).
     public func unloadModel() {
         print("[MLXBridge] Wyladowywanie modelu")
         modelContainer = nil
+        embedderContainer = nil
         modelPath = nil
+    }
+
+    /// Wymusza zaladowanie modelu embeddingow przez EmbedderModelFactory,
+    /// niezaleznie od obecnosci `1_Pooling/config.json`. Repo `-mlx` Jina v5
+    /// (qwen3 decoder-only) NIE niesie katalogu sentence-transformers, wiec
+    /// heurystyka `loadModel` wziela by je za LLM. Deploy zna `category =
+    /// embeddings`, wiec wola te sciezke wprost. Pooling fallbackuje na
+    /// `Qwen3Model.poolingStrategy = .last` gdy brak 1_Pooling.
+    public func loadEmbedderModel(path: String) -> Bool {
+        let url = URL(filePath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            print("[MLXBridge] Sciezka embeddera nie istnieje: \(path)")
+            return false
+        }
+        return loadEmbedder(url: url, path: path)
+    }
+
+    /// Laduje model embeddingow (sentence-transformers) przez EmbedderModelFactory.
+    /// Synchroniczne (blokuje watek wolajacy), jak loadModel.
+    private func loadEmbedder(url: URL, path: String) -> Bool {
+        print("[MLXBridge] Ladowanie modelu embeddingow: \(path)")
+        let semaphore = DispatchSemaphore(value: 0)
+        var success = false
+        Task {
+            do {
+                let config = ModelConfiguration(directory: url)
+                self.embedderContainer = try await EmbedderModelFactory.shared.loadContainer(
+                    from: #hubDownloader(),
+                    using: #huggingFaceTokenizerLoader(),
+                    configuration: config
+                ) { progress in
+                    let pct = Int(progress.fractionCompleted * 100)
+                    if pct % 25 == 0 {
+                        print("[MLXBridge] Ladowanie embeddera: \(pct)%")
+                    }
+                }
+                self.modelPath = path
+                success = true
+                print("[MLXBridge] Model embeddingow zaladowany")
+            } catch {
+                print("[MLXBridge] Blad ladowania embeddera: \(error)")
+                success = false
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return success
+    }
+
+    /// Liczy embedding dla jednego tekstu. Zwraca wektor floatow albo nil.
+    /// Pooling (mean/last/cls) i L2-normalizacja sa wyznaczane z 1_Pooling
+    /// config modelu — dla jina-embeddings-v5 to last-token + normalize.
+    public func embed(text: String) -> [Float]? {
+        guard let container = embedderContainer else {
+            print("[MLXBridge] Brak zaladowanego modelu embeddingow")
+            return nil
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [Float]? = nil
+        Task {
+            do {
+                let vec = try await container.perform { (ctx: EmbedderModelContext) -> [Float] in
+                    let ids = ctx.tokenizer.encode(text: text, addSpecialTokens: true)
+                    let input = MLXArray(ids).reshaped([1, ids.count])
+                    let mask = MLXArray.ones([1, ids.count])
+                    let output = ctx.model(
+                        input, positionIds: nil, tokenTypeIds: nil, attentionMask: mask)
+                    let pooled = ctx.pooling(output, mask: mask, normalize: true)
+                    pooled.eval()
+                    return pooled.asArray(Float.self)
+                }
+                result = vec
+            } catch {
+                print("[MLXBridge] Blad embed: \(error)")
+                result = nil
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return result
     }
 
     /// Generuje tekst z callbackiem na każdy token. Synchroniczne.
@@ -264,6 +358,17 @@ public func MLXBridge_loadModel(
     return engine.loadModel(path: path) ? 0 : -1
 }
 
+@_cdecl("MLXBridge_loadEmbedder")
+public func MLXBridge_loadEmbedder(
+    modelPath: UnsafePointer<CChar>?,
+    context: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let path = modelPath.flatMap({ String(cString: $0) }),
+          let ctx = context else { return -1 }
+    let engine = Unmanaged<MLXBridgeEngine>.fromOpaque(ctx).takeUnretainedValue()
+    return engine.loadEmbedderModel(path: path) ? 0 : -1
+}
+
 @_cdecl("MLXBridge_unloadModel")
 public func MLXBridge_unloadModel(context: UnsafeMutableRawPointer?) {
     guard let ctx = context else { return }
@@ -312,4 +417,28 @@ public func MLXBridge_modelInfo(
     guard let json = engine.modelInfo() else { return nil }
     // strdup() alokuje przez malloc — Rust zwolni przez libc free().
     return strdup(json)
+}
+
+/// Liczy embedding dla jednego tekstu. Zwraca bufor `Float` zaalokowany przez
+/// malloc (Rust zwalnia go przez libc free()) i zapisuje dlugosc do `outLen`.
+/// NULL = blad. Sygnatura MUSI pasowac do `EmbedFn` w mlx_swift_bridge.rs.
+@_cdecl("MLXBridge_embed")
+public func MLXBridge_embed(
+    text: UnsafePointer<CChar>?,
+    outLen: UnsafeMutablePointer<Int32>?,
+    context: UnsafeMutableRawPointer?
+) -> UnsafeMutablePointer<Float>? {
+    guard let textStr = text.flatMap({ String(cString: $0) }),
+          let ctx = context else { return nil }
+    let engine = Unmanaged<MLXBridgeEngine>.fromOpaque(ctx).takeUnretainedValue()
+    guard let vec = engine.embed(text: textStr), !vec.isEmpty else { return nil }
+
+    let bytes = vec.count * MemoryLayout<Float>.stride
+    guard let raw = malloc(bytes) else { return nil }
+    let fptr = raw.assumingMemoryBound(to: Float.self)
+    vec.withUnsafeBufferPointer { src in
+        fptr.update(from: src.baseAddress!, count: vec.count)
+    }
+    outLen?.pointee = Int32(vec.count)
+    return fptr
 }

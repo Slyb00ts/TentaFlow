@@ -60,6 +60,10 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                // MLXEmbedders — silnik embeddingow (BERT/Qwen3/Gemma3 ...).
+                // Qwen3 jest w EmbedderTypeRegistry, wiec jina-embeddings-v5
+                // (Qwen3-0.6B + 1_Pooling) laduje sie natywnie.
+                .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
                 // Tokenizer HF dla portu Whispera (parsowanie tokenizer.json) oraz
                 // HubApi dla makr MLXHuggingFace (loadContainer from/using).
                 .product(name: "Tokenizers", package: "swift-transformers"),

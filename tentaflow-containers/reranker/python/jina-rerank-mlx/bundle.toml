@@ -1,0 +1,37 @@
+# =============================================================================
+# Plik: reranker/python/jina-rerank-mlx/bundle.toml
+# Opis: jina-reranker-v3 MLX jako python-bundle (Apple Silicon). FastAPI
+#       server.py sciaga repo MLX Jiny (snapshot_download) i uzywa jego
+#       `MLXReranker`, wystawiajac /v1/rerank. Metal backend; tylko macOS.
+# =============================================================================
+
+[bundle]
+engine = "jina-rerank-mlx"
+description = "jina-reranker-v3 via Jina MLX port + FastAPI /v1/rerank (Apple Silicon)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "mlx"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}", "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 2
+disk_gb = 4
+platforms = ["macos-aarch64"]
+
+[[install_variants]]
+backend = "metal"
+extras = [
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "mlx-lm",
+    "transformers",
+    "huggingface_hub",
+]
