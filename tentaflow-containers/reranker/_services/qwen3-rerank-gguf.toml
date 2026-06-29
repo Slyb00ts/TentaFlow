@@ -1,0 +1,42 @@
+# =============================================================================
+# Plik: reranker/_services/qwen3-rerank-gguf.toml
+# Opis: Reranker Qwen3 (GGUF / llama.cpp) — lekka sciezka rerankingu na slaby
+#       sprzet: CPU, AMD, telefon. Qwen3-Reranker konwertuje sie oficjalnym
+#       convert_hf_to_gguf.py (ekstrakcja cls.output.weight) i dziala w MAINLINE
+#       llama.cpp przez `llama-server --reranking`. Apache-2.0. Docker buduje
+#       llama-server CPU-only (GGML_NATIVE=OFF), direct-http /v1/rerank. Natywny
+#       wariant to wbudowany silnik (inference-llamacpp) na wszystkich platformach.
+# =============================================================================
+
+[engine]
+id = "qwen3-rerank-gguf"
+provider = "tentaflow"
+category = "reranker"
+name = "Qwen3 Reranker (GGUF / llama.cpp)"
+description_pl = "Lekki reranker Qwen3 przez llama.cpp (GGUF, --reranking). CPU/AMD/telefon. Apache-2.0. Docker CPU + natywny embedded (wszystkie platformy)."
+description_en = "Light Qwen3 reranker via llama.cpp (GGUF, --reranking). CPU/AMD/phone. Apache-2.0. CPU Docker + native embedded (all platforms)."
+homepage = "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B"
+license = "Apache-2.0"
+icon = "llama-cpp"
+default_port = 8080
+api = "openai-compatible"
+version = "v3"
+service_surfaces = ["rerank"]
+input_modalities = ["text"]
+
+[deploy.docker]
+context_path = "reranker/docker/qwen3-rerank-gguf"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-llamacpp"
+
+[[model_preset]]
+id = "qwen3-reranker-0-6b-q5-k-m"
+display_name = "Qwen3 Reranker 0.6B — Q5_K_M"
+repo = "Mungert/Qwen3-Reranker-0.6B-GGUF"
+quantization = "Q5_K_M"
+recommended = true

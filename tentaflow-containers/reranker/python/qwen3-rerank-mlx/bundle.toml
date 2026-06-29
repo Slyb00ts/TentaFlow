@@ -1,0 +1,35 @@
+# =============================================================================
+# Plik: reranker/python/qwen3-rerank-mlx/bundle.toml
+# Opis: Qwen3 Reranker MLX jako python-bundle (Apple Silicon). FastAPI server.py
+#       laduje model przez mlx-lm i wystawia /v1/rerank (OpenAI-compatible).
+#       Metal backend; tylko macOS (mlx-lm nie biega w iOS python-bundle).
+# =============================================================================
+
+[bundle]
+engine = "qwen3-rerank-mlx"
+description = "Qwen3 Reranker via mlx-lm + FastAPI /v1/rerank (Apple Silicon)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "mlx-lm"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}", "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 2
+disk_gb = 4
+platforms = ["macos-aarch64"]
+
+[[install_variants]]
+backend = "metal"
+extras = [
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "huggingface_hub",
+]
