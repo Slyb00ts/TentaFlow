@@ -30,6 +30,8 @@ type GenerateFn = unsafe extern "C" fn(
 ) -> i32;
 type ModelInfoFn = unsafe extern "C" fn(*mut c_void) -> *mut c_char;
 type GetContextFn = unsafe extern "C" fn() -> *mut c_void;
+type EmbedFn = unsafe extern "C" fn(*const c_char, *mut i32, *mut c_void) -> *mut f32;
+type LoadEmbedderFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> i32;
 
 unsafe extern "C" {
     fn tentaflow_register_mlx_swift(
@@ -39,6 +41,8 @@ unsafe extern "C" {
         model_info_fn: ModelInfoFn,
         context: *mut c_void,
     );
+    fn tentaflow_register_mlx_swift_embed(embed_fn: EmbedFn);
+    fn tentaflow_register_mlx_swift_load_embedder(load_fn: LoadEmbedderFn);
 }
 
 fn locate_dylib() -> Option<PathBuf> {
@@ -100,6 +104,22 @@ pub fn init() -> Result<()> {
 
     unsafe {
         tentaflow_register_mlx_swift(*load_fn, *unload_fn, *generate_fn, *model_info_fn, context);
+    }
+
+    // Embeddingi MLX — osobny symbol; starsze dyliby go nie maja, wiec brak
+    // symbolu logujemy jako warn i jedziemy dalej (sama generacja dziala).
+    match unsafe { lib.get::<EmbedFn>(b"MLXBridge_embed\0") } {
+        Ok(embed_fn) => unsafe { tentaflow_register_mlx_swift_embed(*embed_fn) },
+        Err(_) => warn!("[mlx-swift] Brak symbolu MLXBridge_embed — embeddingi MLX niedostepne"),
+    }
+
+    // Ladowanie embeddera — wymusza EmbedderModelFactory dla repo bez 1_Pooling
+    // (jina-embed-mlx / qwen3). Osobny symbol; starsze dyliby go nie maja.
+    match unsafe { lib.get::<LoadEmbedderFn>(b"MLXBridge_loadEmbedder\0") } {
+        Ok(load_fn) => unsafe { tentaflow_register_mlx_swift_load_embedder(*load_fn) },
+        Err(_) => {
+            warn!("[mlx-swift] Brak symbolu MLXBridge_loadEmbedder — load embeddera MLX niedostepny")
+        }
     }
 
     info!("[mlx-swift] Bridge zarejestrowany — MLX inferencja idzie przez mlx-swift");

@@ -2230,12 +2230,29 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
-                // Gniazdo embedded (Burn parser na telefonie) — jeszcze nie
-                // zaimplementowane. Internal (nie abort) → pętla failover
-                // schodzi na następnego kandydata (zdalny serwis).
-                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
-                    "embedded document parse TBD".into(),
-                )),
+                // Embedded parser dokumentów (PaddleOCR-VL MLX na macOS/iOS,
+                // zarejestrowany przez deploy `paddle-ocr-mlx`). Gdy brak
+                // zarejestrowanego parsera → Internal (nie abort), żeby pętla
+                // failover zeszła na zdalny serwis.
+                BackendHandle::Embedded { .. } => match crate::vision::get_document_parser() {
+                    Some(parser) => {
+                        let img = request.image_bytes.clone();
+                        let mime = request.mime.clone();
+                        // MLX liczy synchronicznie — poza tokio worker poolem.
+                        let markdown = tokio::task::spawn_blocking(move || parser.parse(&img, &mime))
+                            .await
+                            .map_err(|e| ExecutorError::Internal(format!("paddle parse task: {e}")))?
+                            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        Ok(DocumentParseResponse {
+                            markdown,
+                            blocks: Vec::new(),
+                            usage: None,
+                        })
+                    }
+                    None => Err(ExecutorError::Internal(
+                        "embedded document parse: brak zarejestrowanego DocumentParser".into(),
+                    )),
+                },
                 BackendHandle::Http(client) => client
                     .parse_document(&request.model, &request.image_bytes, &request.mime)
                     .await

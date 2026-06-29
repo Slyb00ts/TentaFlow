@@ -103,6 +103,59 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
+        // PaddleOCR-VL (MLX) — embedded parser dokumentow na Apple (tekst +
+        // struktura tabel + wzory). Pobiera katalog modelu HF (safetensors MLX)
+        // i rejestruje silnik jako globalny in-process DocumentParser
+        // (set_document_parser). Bez feature flag — zawsze na macOS/iOS, jak
+        // apple-ocr. Po rejestracji `documents`/`vision_parse` przez embedded
+        // backend ida przez ten silnik zamiast HTTP do serwisu.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if engine_id == "paddle-ocr-mlx" {
+            let repo = self.selected_model_repo();
+            if let Some(s) = &self.log_sink {
+                s.phase("download-model", &format!("[documents] downloading {repo}"));
+            }
+            let store = crate::hub::model_store::ModelStore::default_for_platform();
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
+            let progress_sink = self.log_sink.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(p) = progress_rx.recv().await {
+                    if let Some(sink) = &progress_sink {
+                        sink.progress(
+                            "download-model",
+                            p.percent.round().clamp(0.0, 100.0) as u8,
+                            &format!("[documents] {} {:.1}%", p.file_name, p.percent),
+                        );
+                    }
+                }
+            });
+            let model_path = store
+                .download_model_selection(
+                    &repo,
+                    None,
+                    progress_tx,
+                    crate::hub::model_store::ModelDownloadSelection::All,
+                )
+                .await
+                .map_err(|e| DeployError::Other(format!("download paddle-ocr-mlx {repo}: {e}")))?;
+            let _ = progress_task.await;
+            let load_path = model_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::vision::paddle_ocr_mlx::register_as_document_parser(&load_path)
+            })
+            .await
+            .map_err(|e| DeployError::Other(format!("paddle-ocr-mlx register task: {e}")))?
+            .map_err(|e| DeployError::Other(format!("load embedded paddle-ocr-mlx: {e:#}")))?;
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[documents] paddle-ocr-mlx registered as in-process DocumentParser ({})",
+                    model_path.display()
+                ));
+            }
+            return Ok(());
+        }
+
         // PP-OCRv5 (`onnx-ocr`) — embedded OCR runner dla nie-Apple. Najpierw
         // pobieramy bundle (det/rec/cls/dict) do vision_models_dir(), potem
         // rejestrujemy silnik tract jako globalny in-process OCR runner przez
@@ -308,6 +361,131 @@ impl EmbeddedDeploy {
             .or_else(|| self.manifest.model_presets.first())
             .map(|p| p.repo.clone())
             .unwrap_or_default()
+    }
+
+    /// Embedded embeddings (MLX sentence-transformers) — laduje model do
+    /// slotu embeddera w MLXBridge. Wspolistnieje z LLM (osobny kontener po
+    /// stronie Swift), wiec jina-embed-mlx i bielik-mlx zyja jednoczesnie.
+    /// Tylko backend MLX (Apple); CUDA/CPU embeddingi ida przez gguf/vllm.
+    async fn prepare_embedded_embeddings(&self) -> DeployResult<()> {
+        if self.manifest.engine.category != Category::Embeddings {
+            return Ok(());
+        }
+        if self.manifest.engine.id != "jina-embed-mlx" {
+            return Ok(());
+        }
+
+        let (repo, model_name) = if let Some(repo) = self
+            .user_config
+            .get("model_repo")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            (repo.to_string(), repo.to_string())
+        } else {
+            let preset = self
+                .user_config
+                .get("model_preset_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|id| self.manifest.model_presets.iter().find(|p| p.id == id))
+                .or_else(|| self.manifest.model_presets.iter().find(|p| p.recommended))
+                .or_else(|| self.manifest.model_presets.first())
+                .ok_or_else(|| {
+                    DeployError::Manifest("jina-embed-mlx: brak model_preset".to_string())
+                })?;
+            (preset.repo.clone(), preset.id.clone())
+        };
+
+        #[cfg(test)]
+        {
+            let _ = (repo, model_name);
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            if self.user_config.get("model_path").is_none() {
+                if repo.starts_with("http://") || repo.starts_with("https://") {
+                    return Err(DeployError::Manifest(format!(
+                        "embedded embeddings repo '{repo}' must be a HuggingFace repo id"
+                    )));
+                }
+            }
+
+            if let Some(s) = &self.log_sink {
+                s.phase("download-model", &format!("[embeddings] downloading {repo}"));
+            }
+            let store = crate::hub::model_store::ModelStore::default_for_platform();
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
+            let progress_sink = self.log_sink.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(p) = progress_rx.recv().await {
+                    if let Some(sink) = &progress_sink {
+                        sink.progress(
+                            "download-model",
+                            p.percent.round().clamp(0.0, 100.0) as u8,
+                            &format!(
+                                "[embeddings] {} {:.1}% ({}/{})",
+                                p.file_name, p.percent, p.bytes_downloaded, p.bytes_total
+                            ),
+                        );
+                    }
+                }
+            });
+            // Pelny katalog sentence-transformers (config.json, tokenizer,
+            // 1_Pooling, modules.json, *.safetensors) — embedder MLX potrzebuje
+            // calej struktury, nie pojedynczego pliku wag.
+            let load_path = store
+                .download_model_selection(
+                    &repo,
+                    None,
+                    progress_tx,
+                    crate::hub::model_store::ModelDownloadSelection::All,
+                )
+                .await
+                .map_err(|e| DeployError::Other(format!("download embeddings {repo}: {e}")))?;
+            let _ = progress_task.await;
+
+            if let Some(s) = &self.log_sink {
+                s.phase(
+                    "load-model",
+                    &format!("[embeddings] loading {model_name} from {}", load_path.display()),
+                );
+            }
+            let _load_gate = EMBEDDED_LOAD_GATE
+                .acquire()
+                .await
+                .expect("EMBEDDED_LOAD_GATE never closed");
+
+            // Wymuszamy sciezke EmbedderModelFactory (osobny slot embeddera w
+            // MLXBridge, wspolistnieje z LLM). NIE przez manager.load_model —
+            // tamta heurystyka (1_Pooling) wzielaby qwen3 za LLM.
+            #[cfg(feature = "inference-mlx")]
+            {
+                crate::inference::mlx_swift_bridge::load_embedder_model(&load_path)
+                    .await
+                    .map_err(|e| {
+                        DeployError::Other(format!(
+                            "load embedded embeddings '{}': {:#}",
+                            load_path.display(),
+                            e
+                        ))
+                    })?;
+                if let Some(s) = &self.log_sink {
+                    s.info(&format!("[embeddings] loaded {model_name} via mlx (embedder)"));
+                }
+            }
+            #[cfg(not(feature = "inference-mlx"))]
+            {
+                return Err(DeployError::Other(
+                    "jina-embed-mlx wymaga feature inference-mlx".to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 
     fn selected_llm_model(&self) -> Option<EmbeddedLlmSelection> {
@@ -689,6 +867,7 @@ impl DeployStrategy for EmbeddedDeploy {
         self.prepare_embedded_vision().await?;
         self.prepare_embedded_stt().await?;
         self.prepare_embedded_tts().await?;
+        self.prepare_embedded_embeddings().await?;
         let loaded_model_path = self.prepare_embedded_llm().await?;
 
         let runtime = RuntimeHandle::default();
@@ -749,6 +928,10 @@ impl DeployStrategy for EmbeddedDeploy {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.manifest.engine.id == "apple-ocr" {
             crate::vision::apple_ocr::unregister_as_ocr_runner();
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.manifest.engine.id == "paddle-ocr-mlx" {
+            crate::vision::paddle_ocr_mlx::unregister_as_document_parser();
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         if self.manifest.engine.id == "onnx-ocr" {
