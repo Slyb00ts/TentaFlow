@@ -210,7 +210,7 @@ reason = "OCR stron w flow-ingescie (ocr_pages)."
 
 [[vector_namespace]]
 name = "passages"
-dimensions = 2048
+dimensions = 1024
 distance = "cosine"
 data_class = "C"
 
@@ -251,7 +251,7 @@ indexed = false
 # re-embedding tej samej encji nadpisywal jej wektor, nie duplikowal).
 [[vector_namespace]]
 name = "entities"
-dimensions = 2048
+dimensions = 1024
 distance = "cosine"
 data_class = "C"
 
