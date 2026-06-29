@@ -276,6 +276,9 @@ if not MODEL_REPO:
 # czasu gotowosci. Wzorzec spojny z nemotron-ocr/server.py.
 _state: dict = {"model": None, "device": None, "labels": None, "error": None}
 _LOAD_LOCK = threading.Lock()
+# Serializes GPU inference across FastAPI's threadpool for the sync `/v1/infer`
+# handler — one shared model, so concurrent forward passes would race the CUDA stream.
+_INFER_LOCK = threading.Lock()
 
 
 def _ensure_model() -> None:
@@ -348,8 +351,13 @@ def health() -> dict:
     }
 
 
+# SYNC handler on purpose: FastAPI runs `def` path operations in a worker thread,
+# so the blocking GPU forward does NOT occupy the event loop. As `async def` the
+# multi-second inference ran ON the loop, `/health` stalled during it, and Core's
+# supervisor health-probe timed out and respawned the engine mid-request
+# ("error sending request to /v1/infer"). Keep sync; serialize GPU with the lock.
 @app.post("/v1/infer")
-async def infer(req: InferRequest) -> dict:
+def infer(req: InferRequest) -> dict:
     if not req.input:
         raise HTTPException(status_code=400, detail="Pole 'input' nie moze byc puste.")
 
@@ -366,9 +374,10 @@ async def infer(req: InferRequest) -> dict:
         obraz = _decode_data_url(wejscie.url)
         wys, szer = obraz.shape[0], obraz.shape[1]
         tensor, skala = _preprocess(obraz, device)
-        with torch.no_grad():
-            wyjscie = model(tensor)
-        wyjscie = wyjscie.detach().to("cpu", dtype=torch.float32).numpy()
+        with _INFER_LOCK:
+            with torch.no_grad():
+                wyjscie = model(tensor)
+            wyjscie = wyjscie.detach().to("cpu", dtype=torch.float32).numpy()
         detekcje = _postprocess(wyjscie, skala)
         data.append(
             {"index": indeks, "bounding_boxes": _bounding_boxes_nim(detekcje, etykiety, szer, wys)}
