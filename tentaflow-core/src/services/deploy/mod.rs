@@ -2281,19 +2281,21 @@ pub(crate) fn query_cuda0_vram_mib() -> Option<(u64, u64)> {
 /// `min(0.92, 0.94 * free/total)` — leaves ~6% headroom for fragmentation,
 /// torch allocator slack, kernel JIT scratch. Returns `None` when nvidia-smi
 /// is unavailable (caller should keep the manifest default).
-pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
+pub(crate) fn auto_gpu_memory_utilization(is_pooling: bool) -> Option<f64> {
     let (free_mib, total_mib) = query_cuda0_vram_mib()?;
     if total_mib == 0 {
         return None;
     }
     let free_ratio = free_mib as f64 / total_mib as f64;
-    // Cap 0.85 (nie 0.92): vLLM przy profilowaniu pamieci (zwlaszcza duzy
-    // max_model_len) przekracza ustawiony budzet o kilka % i alokuje peaki
-    // aktywacji ponad KV-cache; przy 0.92 brakowalo ~1.5GB zapasu -> CUDA OOM.
-    let ratio = (0.94 * free_ratio).min(0.85);
-    if ratio < 0.10 {
-        return Some(ratio);
-    }
+    // Pooling engines (embeddings / reranker) NIE maja autoregresyjnego KV-cache
+    // do wypelnienia — `--gpu-memory-utilization` to u nich gigantyczna, pusta
+    // rezerwacja. Na DGX (267 GiB) 0.85 = ~227 GiB pod model 1B: absurd, ktory na
+    // WSPOLDZIELONYM GPU przekracza wolna pamiec i vLLM ODMAWIA startu ("free <
+    // desired") -> "exited before readiness". Cap 0.30 (floor 0.15) trzyma im
+    // ciasny budzet, zeby kilka uslug zmiescilo sie na jednej karcie. Generatywne
+    // LLM zostaja przy 0.85 (peaki aktywacji ponad KV bez OOM).
+    let cap = if is_pooling { 0.30 } else { 0.85 };
+    let ratio = (0.94 * free_ratio).min(cap).max(0.15);
     let rounded = (ratio * 100.0).floor() / 100.0;
     Some(rounded)
 }
@@ -2563,10 +2565,6 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
     // pakietu hf_transfer w obrazie (ImportError gdy go brak).
     env.insert("HF_HUB_DOWNLOAD_TIMEOUT".into(), "30".into());
     env
-}
-
-pub(crate) fn is_cuda_vllm_engine(engine_id: &str) -> bool {
-    matches!(engine_id, "vllm" | "vllm-spark")
 }
 
 pub(crate) fn strip_gpu_memory_utilization(raw: &str) -> String {

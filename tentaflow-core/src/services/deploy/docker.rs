@@ -1311,7 +1311,12 @@ impl DeployStrategy for DockerDeploy {
         {
             engine_args.extend(spec_args);
         }
-        if super::is_cuda_vllm_engine(&self.manifest.engine.id) {
+        if self.manifest.engine.is_cuda_vllm() {
+            let is_pooling = matches!(
+                self.manifest.engine.category,
+                crate::services::manifest::Category::Embeddings
+                    | crate::services::manifest::Category::Reranker
+            );
             let user_explicit_ratio = self
                 .user_config
                 .get("gpu_memory_utilization")
@@ -1319,7 +1324,7 @@ impl DeployStrategy for DockerDeploy {
             let from_args = super::parse_gpu_memory_utilization_arg(&engine_args.join(" "));
             let ratio = user_explicit_ratio
                 .or(from_args)
-                .or_else(super::auto_gpu_memory_utilization);
+                .or_else(|| super::auto_gpu_memory_utilization(is_pooling));
             if let Some(ratio) = ratio {
                 engine_args.push("--gpu-memory-utilization".to_string());
                 engine_args.push(format!("{:.2}", ratio));

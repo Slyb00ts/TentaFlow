@@ -16,7 +16,7 @@ use rusqlite::Transaction;
 
 use super::{
     auto_gpu_memory_utilization, build_endpoint_url, build_new_service, category_tag,
-    host_os_supported, is_cuda_vllm_engine, models_from_manifest, parse_gpu_memory_utilization_arg,
+    host_os_supported, models_from_manifest, parse_gpu_memory_utilization_arg,
     query_cuda0_vram_mib, resolve_display_name, smart_health_probe, strip_gpu_memory_utilization,
     DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle,
     SmartProbeConfig, SmartProbeOutcome,
@@ -242,7 +242,15 @@ impl DeployStrategy for PythonBundleDeploy {
         if let Some(served) = super::resolve_served_model_name(&self.manifest, &self.user_config) {
             env.insert("SERVED_MODEL_NAME".into(), served);
         }
-        let is_cuda_vllm = is_cuda_vllm_engine(&engine_id);
+        let is_cuda_vllm = self.manifest.engine.is_cuda_vllm();
+        // Pooling engines (embeddings / reranker) get a tight gpu_memory_utilization
+        // cap — they have no KV-cache pool to fill, so the generative-sized budget
+        // would starve a shared GPU and make vLLM refuse to start.
+        let is_pooling = matches!(
+            self.manifest.engine.category,
+            crate::services::manifest::Category::Embeddings
+                | crate::services::manifest::Category::Reranker
+        );
         // HF_TOKEN tylko dla bundli, ktore realnie pobieraja model z HF —
         // searxng/browser-renderer (python-bundle bez modelu) nie moga dziedziczyc
         // sekretu. Single source: `engine_uses_hf_model` (jak docker w P2.1).
@@ -323,7 +331,7 @@ impl DeployStrategy for PythonBundleDeploy {
         } else {
             user_explicit_ratio
                 .or(from_vllm_args)
-                .or_else(auto_gpu_memory_utilization)
+                .or_else(|| auto_gpu_memory_utilization(is_pooling))
         };
         if let Some(ratio) = final_ratio {
             // Stare wystapienia flagi w user VLLM_ARGS wytnij — dedup last-wins
@@ -348,7 +356,7 @@ impl DeployStrategy for PythonBundleDeploy {
             // capture i utrzymuje peak alloc w budgecie kosztem ~5-10%
             // throughput. Skip gdy user explicit dal `--enforce-eager`
             // albo `--no-enforce-eager` w vllm_args (nie nadpisujemy).
-            let auto_safe = auto_gpu_memory_utilization();
+            let auto_safe = auto_gpu_memory_utilization(is_pooling);
             let user_capped = (user_explicit_ratio.is_some() || from_vllm_args.is_some())
                 && match auto_safe {
                     Some(safe) => ratio + 0.001 < safe,
@@ -369,7 +377,7 @@ impl DeployStrategy for PythonBundleDeploy {
             if let Some(s) = &self.log_sink {
                 let (free_mib, total_mib) = query_cuda0_vram_mib().unwrap_or((0, 0));
                 if user_explicit_ratio.is_some() || from_vllm_args.is_some() {
-                    let auto_ratio = auto_gpu_memory_utilization();
+                    let auto_ratio = auto_gpu_memory_utilization(is_pooling);
                     let warn = match auto_ratio {
                         Some(safe) if ratio > safe => format!(
                             " — UWAGA: przekracza bezpieczna wartosc {:.2} (free={}/total={} MiB), vllm moze paść przy starcie",
@@ -593,13 +601,6 @@ mod tests {
     fn strip_no_op_when_flag_absent() {
         let raw = "--dtype auto --max-model-len 8192";
         assert_eq!(strip_gpu_memory_utilization(raw), raw);
-    }
-
-    #[test]
-    fn only_cuda_vllm_engines_get_gpu_memory_utilization() {
-        assert!(is_cuda_vllm_engine("vllm"));
-        assert!(is_cuda_vllm_engine("vllm-spark"));
-        assert!(!is_cuda_vllm_engine("vllm-metal"));
     }
 
     #[test]
