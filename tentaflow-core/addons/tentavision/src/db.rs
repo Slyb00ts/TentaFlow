@@ -315,20 +315,6 @@ pub fn set_camera_status(id: &str, status: &str) -> Result<u64, AbiError> {
     )
 }
 
-/// Updates only the liveness status of a camera (e.g. after a reachability
-/// probe). Returns rows affected (0 if the camera does not exist).
-pub fn set_camera_status(id: &str, status: &str) -> Result<u64, AbiError> {
-    let now = now_secs();
-    exec(
-        "UPDATE cameras SET status = ?2, updated_at = ?3 WHERE id = ?1",
-        &[
-            SqlValue::Text(id.into()),
-            SqlValue::Text(status.into()),
-            SqlValue::I64(now),
-        ],
-    )
-}
-
 /// Deletes a camera by id. Returns rows affected (0 if it did not exist).
 pub fn delete_camera(id: &str) -> Result<u64, AbiError> {
     exec("DELETE FROM cameras WHERE id = ?1", &[SqlValue::Text(id.into())])
