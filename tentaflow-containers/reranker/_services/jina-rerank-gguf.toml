@@ -1,0 +1,49 @@
+# =============================================================================
+# Plik: reranker/_services/jina-rerank-gguf.toml
+# Opis: Reranker jina-reranker-v3 (GGUF / llama.cpp) — lekka sciezka na slaby
+#       sprzet: CPU, AMD, telefon. Kwantyzacje od IQ1_S (~210 MB).
+#       UWAGA: v3 jest listwise; README repo GGUF wskazuje fork llama.cpp
+#       (github.com/hanxiao/llama.cpp) i sciezke `llama-embedding`. Mainline
+#       `llama-server --reranking` moze nie dac identycznego rankingu — po
+#       deployu zweryfikuj jakosc; jesli niewystarczajaca, uzyj `qwen3-rerank-gguf`
+#       (mainline) albo wariantu MLX/transformers. Licencja CC-BY-NC-4.0 (NC).
+# =============================================================================
+
+[engine]
+id = "jina-rerank-gguf"
+provider = "tentaflow"
+category = "reranker"
+name = "Jina Reranker v3 (GGUF / llama.cpp)"
+description_pl = "Lekki reranker jina-reranker-v3 przez llama.cpp (GGUF). CPU/AMD/telefon, kwantyzacje od IQ1_S. v3 listwise — patrz UWAGA w manifescie. Licencja NC."
+description_en = "Light jina-reranker-v3 via llama.cpp (GGUF). CPU/AMD/phone, quants from IQ1_S. v3 is listwise — see manifest NOTE. NC license."
+homepage = "https://huggingface.co/jinaai/jina-reranker-v3-GGUF"
+license = "cc-by-nc-4.0"
+icon = "llama-cpp"
+default_port = 8080
+api = "openai-compatible"
+version = "v3"
+service_surfaces = ["rerank"]
+input_modalities = ["text"]
+
+[deploy.docker]
+context_path = "reranker/docker/jina-rerank-gguf"
+platforms = ["linux", "windows"]
+transport = "direct-http"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-llamacpp"
+
+[[model_preset]]
+id = "jina-reranker-v3-q5-k-m"
+display_name = "Jina Reranker v3 — Q5_K_M (~440 MB)"
+repo = "jinaai/jina-reranker-v3-GGUF"
+quantization = "Q5_K_M"
+recommended = true
+
+[[model_preset]]
+id = "jina-reranker-v3-iq1-s"
+display_name = "Jina Reranker v3 — IQ1_S (~210 MB, telefon)"
+repo = "jinaai/jina-reranker-v3-GGUF"
+quantization = "IQ1_S"

@@ -1,0 +1,19 @@
+# =============================================================================
+# Plik: config.default.toml
+# Opis: Fallback dla sidecara w obrazie Jina Reranker GGUF - nadpisany przez
+#       /data/config.toml wygenerowany przez tentaflow-core/src/deploy/runner.rs
+#       przy deployu. Proxuje /v1 (w tym /v1/rerank) z llama-server.
+# =============================================================================
+service_name = "reranker-jina-gguf"
+model_aliases = []
+
+[transport]
+port = 5000
+enable_lan_discovery = false
+enable_dht_discovery = false
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8080/v1"
+api = "open_ai"
+timeout_ms = 600000

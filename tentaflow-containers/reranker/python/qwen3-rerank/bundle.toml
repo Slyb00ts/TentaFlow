@@ -1,0 +1,47 @@
+# =============================================================================
+# Plik: reranker/python/qwen3-rerank/bundle.toml
+# Opis: Qwen3 Reranker jako natywny bundle vLLM (PyPI, pinned 0.23.0). vLLM
+#       serwuje cross-encoder w trybie score/rerank i wystawia OpenAI-compatible
+#       /v1/rerank + /v1/score. CUDA (cu130) i ROCm (rocm7.0).
+# =============================================================================
+
+[bundle]
+engine = "qwen3-rerank"
+description = "Qwen3 Reranker cross-encoder via vLLM (PyPI, pinned 0.23.0)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "vllm==0.23.0"
+
+[launch]
+command = "python"
+# --task score wlacza tryb cross-encoder vLLM (endpointy /v1/rerank + /v1/score).
+# Qwen3 Reranker wymaga --hf-overrides (Qwen3ForSequenceClassification) — Core
+# dokleja go w argach dla tego presetu. --served-model-name = preset id.
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--task", "score",
+    "--served-model-name", "${SERVED_MODEL_NAME}",
+    "--trust-remote-code",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 2
+disk_gb = 6
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://wheels.vllm.ai/nightly/cu130"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "VLLM_TARGET_DEVICE=rocm"
