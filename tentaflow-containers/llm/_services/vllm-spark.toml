@@ -7,6 +7,7 @@
 
 [engine]
 id = "vllm-spark"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "vLLM (DGX Spark)"
 description_pl = "vLLM 0.23.0 budowane ze zrodel pod DGX Spark (GB10, sm_121a). Dlugi pierwszy build."

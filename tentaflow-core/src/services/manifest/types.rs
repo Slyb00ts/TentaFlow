@@ -74,6 +74,36 @@ pub struct Engine {
     /// "image"]`). Same fallback rules as the input list.
     #[serde(default)]
     pub output_modalities: Option<Vec<String>>,
+    /// Inference backend that actually serves this engine, when it is a shared
+    /// runtime rather than a bespoke server. `"vllm"` marks every vLLM-served
+    /// engine — generative LLMs AND the embed/rerank/VL pooling models — so a
+    /// single flag (not a hand-maintained id list) drives both the
+    /// `--gpu-memory-utilization` injection and the VRAM calculator/slider in the
+    /// deploy wizard. `None` = bespoke server (whisper, sherpa, custom HTTP).
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
+impl Engine {
+    /// True when this engine is served by CUDA vLLM and therefore accepts the
+    /// `--gpu-memory-utilization` budget. Excludes the Metal variant: vLLM on
+    /// Apple has no CUDA memory budget to set.
+    pub fn is_cuda_vllm(&self) -> bool {
+        is_cuda_vllm_backend(self.backend.as_deref(), &self.id)
+    }
+
+    /// True for any vLLM-served engine regardless of accelerator — drives the
+    /// GUI VRAM calculator/slider (Metal included; the calculator is informational
+    /// there even though the CUDA memory flag does not apply).
+    pub fn is_vllm(&self) -> bool {
+        self.backend.as_deref() == Some("vllm")
+    }
+}
+
+/// Pure rule behind [`Engine::is_cuda_vllm`], split out so it can be unit-tested
+/// without constructing a full `Engine`.
+pub(crate) fn is_cuda_vllm_backend(backend: Option<&str>, id: &str) -> bool {
+    backend == Some("vllm") && !id.ends_with("-metal")
 }
 
 /// Pojedynczy parametr silnika — wizard renderuje formularz na podstawie
@@ -608,4 +638,19 @@ pub struct VllmPreset {
     /// Quantize the `speculator_repo` draft model to this scheme.
     #[serde(default)]
     pub quantize_draft: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cuda_vllm_backend;
+
+    #[test]
+    fn cuda_vllm_backend_matches_vllm_except_metal() {
+        assert!(is_cuda_vllm_backend(Some("vllm"), "vllm"));
+        assert!(is_cuda_vllm_backend(Some("vllm"), "vllm-spark"));
+        assert!(is_cuda_vllm_backend(Some("vllm"), "nemotron-embed-vl"));
+        assert!(!is_cuda_vllm_backend(Some("vllm"), "vllm-metal"));
+        assert!(!is_cuda_vllm_backend(None, "whisper"));
+        assert!(!is_cuda_vllm_backend(Some("sherpa"), "sherpa-onnx"));
+    }
 }

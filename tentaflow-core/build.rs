@@ -919,6 +919,11 @@ mod services_manifest_build {
         pub input_modalities: Option<Vec<String>>,
         #[serde(default)]
         pub output_modalities: Option<Vec<String>>,
+        /// Mirror runtime `Engine.backend` — `"vllm"` for every vLLM-served
+        /// engine. Must be carried through to the generated manifest so the GUI
+        /// (deploy wizard + service editor) can gate the VRAM calculator on it.
+        #[serde(default)]
+        pub backend: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

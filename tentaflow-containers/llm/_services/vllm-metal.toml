@@ -5,6 +5,7 @@
 
 [engine]
 id = "vllm-metal"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "vLLM-Metal"
 description_pl = "vLLM na Apple Silicon przez plugin vllm-metal (MLX). Serwer OpenAI-compatible."

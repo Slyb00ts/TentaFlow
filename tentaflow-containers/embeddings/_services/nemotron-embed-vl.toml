@@ -4,6 +4,7 @@
 
 [engine]
 id = "nemotron-embed-vl"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 provider = "tentaflow"
 category = "embeddings"
 name = "NVIDIA Llama-Nemotron Embed VL"

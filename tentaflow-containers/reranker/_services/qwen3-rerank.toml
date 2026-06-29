@@ -9,6 +9,7 @@
 
 [engine]
 id = "qwen3-rerank"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 provider = "tentaflow"
 category = "reranker"
 name = "Qwen3 Reranker"

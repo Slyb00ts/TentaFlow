@@ -5,6 +5,7 @@
 
 [engine]
 id = "vllm"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "vLLM"
 description_pl = "Serwer LLM z PagedAttention i continuous batching. CUDA (Linux/Windows) albo ROCm (Linux)."
