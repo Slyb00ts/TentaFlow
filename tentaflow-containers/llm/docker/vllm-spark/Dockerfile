@@ -12,10 +12,14 @@
 # Runtime variant nie ma toolchainu, vanilla `pip install -e .` by sie wywalil
 # na "nvcc not found".
 FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+# rdma-core/libibverbs: bez nich NCCL nie otworzy libibverbs.so i przy multi-node
+# tensor-parallel (Ray) spadnie z RoCE/ConnectX na wolny TCP. Userspace IB verbs
+# = high-speed interconnect miedzy nodami clustra (D3 distributed deploy).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev \
       git curl ca-certificates ninja-build cmake \
       gcc g++ \
+      libibverbs1 librdmacm1 ibverbs-providers rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/vllm-venv
@@ -48,6 +52,11 @@ RUN git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.gi
     && cd vllm \
     && pip install --no-cache-dir -e . \
     && pip cache purge
+
+# Ray w TYM SAMYM venv co vllm — wymagany do multi-node tensor-parallel
+# (head+worker, --distributed-executor-backend ray). 2.55.1 ma kola aarch64 i
+# jest kompatybilny z vllm 0.23 / torch 2.11 (D3 distributed deploy).
+RUN pip install --no-cache-dir ray==2.55.1
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
 # do pobierania zrodel. Na Sparku (sm_121a) NVFP4 ma akceleracje sprzetowa.
