@@ -1,0 +1,39 @@
+{
+  "id": "universal-document-parse",
+  "name": "Uniwersalny parsing dokumentu (per-urządzenie)",
+  "description": "W PEŁNI JAWNY flow ingestu obrazu dokumentu, działający na każdym urządzeniu. trigger podaje obraz strony do platform_switch (jedno uniwersalne wejście). Switch aktywuje DOKŁADNIE jedną gałąź = bieżący target_os; każda gałąź to widoczny blok document_parse z JAWNYM modelem (paddle-ocr-mlx na Apple, nemotron-parse na NVIDIA/Linux/Windows, rag-parse/mesh na Android). Gałęzie rekonwergują w combine (fan-in) -> chunk -> embed_chunks -> store. Wybór silnika i urządzenia jest na diagramie, nic nie jest ukryte w resolverze.",
+  "nodes": [
+    { "id": "trigger", "type": "trigger", "config": {}, "position": { "x": 0, "y": 0 } },
+    { "id": "platform_switch", "type": "platform_switch", "config": {}, "position": { "x": 260, "y": 0 } },
+
+    { "id": "parse_macos",   "type": "document_parse", "config": { "model": "paddle-ocr-mlx" }, "position": { "x": 560, "y": -260 } },
+    { "id": "parse_ios",     "type": "document_parse", "config": { "model": "paddle-ocr-mlx" }, "position": { "x": 560, "y": -130 } },
+    { "id": "parse_linux",   "type": "document_parse", "config": { "model": "nemotron-parse" }, "position": { "x": 560, "y": 0 } },
+    { "id": "parse_windows", "type": "document_parse", "config": { "model": "nemotron-parse" }, "position": { "x": 560, "y": 130 } },
+    { "id": "parse_android", "type": "document_parse", "config": { "model": "rag-parse" },      "position": { "x": 560, "y": 260 } },
+
+    { "id": "combine", "type": "combine", "config": {}, "position": { "x": 880, "y": 0 } },
+    { "id": "chunk", "type": "chunk", "config": { "size": 2048, "overlap": 200 }, "position": { "x": 1140, "y": 0 } },
+    { "id": "embed", "type": "embed_chunks", "config": { "model": "rag-embeddings" }, "position": { "x": 1400, "y": 0 } },
+    { "id": "store", "type": "store", "config": { "namespace": "passages" }, "position": { "x": 1660, "y": 0 } }
+  ],
+  "edges": [
+    { "from_node": "trigger", "to_node": "platform_switch", "from_port": "image", "to_port": "in", "data_type": "image" },
+
+    { "from_node": "platform_switch", "to_node": "parse_macos",   "from_port": "macos",   "to_port": "in", "data_type": "image" },
+    { "from_node": "platform_switch", "to_node": "parse_ios",     "from_port": "ios",     "to_port": "in", "data_type": "image" },
+    { "from_node": "platform_switch", "to_node": "parse_linux",   "from_port": "linux",   "to_port": "in", "data_type": "image" },
+    { "from_node": "platform_switch", "to_node": "parse_windows", "from_port": "windows", "to_port": "in", "data_type": "image" },
+    { "from_node": "platform_switch", "to_node": "parse_android", "from_port": "android", "to_port": "in", "data_type": "image" },
+
+    { "from_node": "parse_macos",   "to_node": "combine", "from_port": "full", "to_port": "in", "data_type": "text" },
+    { "from_node": "parse_ios",     "to_node": "combine", "from_port": "full", "to_port": "in", "data_type": "text" },
+    { "from_node": "parse_linux",   "to_node": "combine", "from_port": "full", "to_port": "in", "data_type": "text" },
+    { "from_node": "parse_windows", "to_node": "combine", "from_port": "full", "to_port": "in", "data_type": "text" },
+    { "from_node": "parse_android", "to_node": "combine", "from_port": "full", "to_port": "in", "data_type": "text" },
+
+    { "from_node": "combine", "to_node": "chunk", "from_port": "full", "to_port": "in", "data_type": "text" },
+    { "from_node": "chunk", "to_node": "embed", "from_port": "full", "to_port": "in", "data_type": "json" },
+    { "from_node": "embed", "to_node": "store", "from_port": "full", "to_port": "in", "data_type": "json" }
+  ]
+}

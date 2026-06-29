@@ -23,4 +23,11 @@ pub trait DocumentsDispatcher: Send + Sync {
         mime: &str,
         task: &str,
     ) -> Result<DocumentInferResult, String>;
+
+    /// Parsuje stronę dokumentu (obraz) na markdown ze strukturą (tabele GFM/
+    /// HTML, wzory, kolejność czytania) przez powierzchnię document-parse
+    /// (`execute_documents`). Backend dobiera resolver wg urządzenia z failoverem
+    /// aliasu: embedded (PaddleOCR-VL MLX na Apple), HTTP (docker nemotron-parse/
+    /// paddle-ocr), QUIC, mesh-forward. Zwraca markdown.
+    async fn parse(&self, model: &str, image: &[u8], mime: &str) -> Result<String, String>;
 }

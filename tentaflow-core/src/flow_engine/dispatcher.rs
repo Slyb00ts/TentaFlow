@@ -41,13 +41,15 @@ use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentRouterNodeAdapter,
+    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentParseNodeAdapter,
+    DocumentRouterNodeAdapter,
     EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter,
     GraphicElementsNodeAdapter, IntervalNodeAdapter,
     LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter,
     OutputNodeAdapter, PageDetectNodeAdapter, PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter,
+    PlatformSwitchNodeAdapter,
     PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
     RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
@@ -1115,6 +1117,10 @@ fn build_registry(
         // klasyfikacja+routing pliku, rasteryzacja PDF, ekstrakcja office,
         // chunking, scalanie stron i zapis chunków do przestrzeni wektorowej.
         Arc::new(DocumentRouterNodeAdapter::new()),
+        // Jawny switch platformy — jedno wejście (Any), 5 wyjść (android/ios/
+        // macos/windows/linux); aktywuje port = bieżący target_os. Widoczny na
+        // diagramie router gałęzi per-urządzenie (uniwersalny flow).
+        Arc::new(PlatformSwitchNodeAdapter::new()),
         Arc::new(TextExtractNodeAdapter::new()),
         Arc::new(PdfRasterizeNodeAdapter::new()),
         Arc::new(ExcelExtractNodeAdapter::new()),
@@ -1129,6 +1135,10 @@ fn build_registry(
         // na markdown przez VLM (vision-chat) oraz detektory struktury dokumentu
         // (layout / tabele / grafika / OCR) przez typed surface Documents.
         Arc::new(VisionParseNodeAdapter::new()),
+        // Jawny blok parse na powierzchni document-parse (ctx.documents.parse).
+        // Model widoczny w configu (paddle-ocr-mlx / nemotron-parse / ...);
+        // resolver dobiera backend per-urządzenie (embedded MLX / docker / mesh).
+        Arc::new(DocumentParseNodeAdapter::new()),
         Arc::new(PageDetectNodeAdapter::new()),
         Arc::new(TableStructureNodeAdapter::new()),
         Arc::new(GraphicElementsNodeAdapter::new()),
