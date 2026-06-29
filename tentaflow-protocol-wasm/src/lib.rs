@@ -42,6 +42,7 @@ use tentaflow_protocol::{
         ApiKeyCreateRequest, AuthLoginRequest,
         BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
+        ClusterDeployRequest, ClusterDeployStopRequest,
         ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
         ClusterUpdateRequest, DeployVllmRecommendRequest, SuggestServicePortRequest,
         FlowCreateRequest, FlowUpdateRequest,
@@ -575,7 +576,78 @@ pub fn encode_cluster_remove_member_request(
 #[wasm_bindgen(js_name = encodeClusterProbeStreamRequest)]
 pub fn encode_cluster_probe_stream_request(node_ids: Vec<String>) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterProbeStreamRequestBody(
-        ClusterProbeStreamRequest { node_ids },
+        ClusterProbeStreamRequest {
+            node_ids,
+            cluster_id: None,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ClusterRdmaConfigureRequest { cluster_id, sudo_password, mtu }.
+#[wasm_bindgen(js_name = encodeClusterRdmaConfigureRequest)]
+pub fn encode_cluster_rdma_configure_request(
+    cluster_id: String,
+    sudo_password: String,
+    mtu: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ClusterRdmaConfigureRequestBody(
+        tentaflow_protocol::ClusterRdmaConfigureRequest {
+            cluster_id,
+            sudo_password,
+            mtu,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ClusterDeployRequest — deploy one model split across the whole
+/// cluster (vLLM tensor-parallel). Optional fields fall back to backend defaults
+/// when passed `None`.
+#[wasm_bindgen(js_name = encodeClusterDeployRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_cluster_deploy_request(
+    cluster_id: String,
+    engine_id: String,
+    model_repo: Option<String>,
+    model_preset_id: Option<String>,
+    served_model_name: Option<String>,
+    gpu_memory_utilization: Option<f32>,
+    max_model_len: Option<u32>,
+    port: Option<u16>,
+    gpus_per_node: Option<u32>,
+    config_json: Option<String>,
+    gcs_timeout_secs: Option<u32>,
+    ready_timeout_secs: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ClusterDeployRequestBody(ClusterDeployRequest {
+        cluster_id,
+        engine_id,
+        model_repo,
+        model_preset_id,
+        served_model_name,
+        gpu_memory_utilization,
+        max_model_len,
+        port,
+        gpus_per_node,
+        config_json,
+        gcs_timeout_secs,
+        ready_timeout_secs,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ClusterDeployStopRequest { cluster_id, deployment_cluster_id }.
+#[wasm_bindgen(js_name = encodeClusterDeployStopRequest)]
+pub fn encode_cluster_deploy_stop_request(
+    cluster_id: String,
+    deployment_cluster_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ClusterDeployStopRequestBody(
+        ClusterDeployStopRequest {
+            cluster_id,
+            deployment_cluster_id,
+        },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -6435,18 +6507,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "cluster", cluster_info_to_js(resp.cluster).into());
             let arr = js_sys::Array::new();
             for m in resp.members {
-                let item = js_sys::Object::new();
-                set(&item, "nodeId", m.node_id.into());
-                set(&item, "hostname", m.hostname.into());
-                set(&item, "status", m.status.into());
-                if let Some(t) = m.interface_type {
-                    set(&item, "interfaceType", t.into());
-                }
-                if let Some(s) = m.interface_speed_mbps {
-                    set(&item, "interfaceSpeedMbps", s.into());
-                }
-                set(&item, "joinedAt", m.joined_at.clone().into());
-                arr.push(&item.into());
+                arr.push(&cluster_member_to_js(m).into());
             }
             set(&obj, "members", arr.into());
         }
@@ -6542,6 +6603,123 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "totalPairs", e.total_pairs.into());
             set(&obj, "successful", e.successful.into());
             set(&obj, "failed", e.failed.into());
+            if let Some(b) = e.bottleneck_mbps {
+                set(&obj, "bottleneckMbps", b.into());
+            }
+            if let Some(s) = e.assignment_status {
+                set(&obj, "assignmentStatus", s.into());
+            }
+            let arr = js_sys::Array::new();
+            for a in e.assignments {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", a.node_id.into());
+                set(&item, "interfaceName", a.interface_name.into());
+                set(&item, "interfaceIp", a.interface_ip.into());
+                set(&item, "interfaceSpeedMbps", a.interface_speed_mbps.into());
+                set(&item, "interfaceType", a.interface_type.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "assignments", arr.into());
+        }
+        MessageBody::ClusterRdmaConfigureRequestBody(req) => {
+            set(&obj, "variant", "ClusterRdmaConfigureRequest".into());
+            set(&obj, "clusterId", req.cluster_id.into());
+            // sudo_password intentionally NOT surfaced back to JS.
+            if let Some(m) = req.mtu {
+                set(&obj, "mtu", m.into());
+            }
+        }
+        MessageBody::ClusterRdmaConfigureResponseBody(resp) => {
+            set(&obj, "variant", "ClusterRdmaConfigureResponse".into());
+            set(&obj, "ok", resp.ok.into());
+            if let Some(msg) = resp.message {
+                set(&obj, "message", msg.into());
+            }
+            let members = js_sys::Array::new();
+            for m in resp.members {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", m.node_id.into());
+                set(&item, "hostname", m.hostname.into());
+                set(&item, "status", m.status.into());
+                if let Some(err) = m.error {
+                    set(&item, "error", err.into());
+                }
+                let ifaces = js_sys::Array::new();
+                for i in m.interfaces {
+                    let io = js_sys::Object::new();
+                    set(&io, "netdev", i.netdev.into());
+                    set(&io, "roceDevice", i.roce_device.into());
+                    if let Some(ip) = i.ipv4 {
+                        set(&io, "ipv4", ip.into());
+                    }
+                    set(&io, "mtu", i.mtu.into());
+                    set(&io, "role", i.role.into());
+                    set(&io, "action", i.action.into());
+                    ifaces.push(&io.into());
+                }
+                set(&item, "interfaces", ifaces.into());
+                members.push(&item.into());
+            }
+            set(&obj, "members", members.into());
+        }
+        // ---- Cluster distributed deploy (D3) ----
+        MessageBody::ClusterDeployRequestBody(req) => {
+            set(&obj, "variant", "ClusterDeployRequest".into());
+            set(&obj, "clusterId", req.cluster_id.into());
+            set(&obj, "engineId", req.engine_id.into());
+        }
+        MessageBody::ClusterDeployResponseBody(resp) => {
+            set(&obj, "variant", "ClusterDeployResponse".into());
+            set(&obj, "ok", resp.ok.into());
+            set(&obj, "deploymentClusterId", resp.deployment_cluster_id.into());
+            set(&obj, "headNodeId", resp.head_node_id.into());
+            if let Some(url) = resp.endpoint_url {
+                set(&obj, "endpointUrl", url.into());
+            }
+            if let Some(msg) = resp.message {
+                set(&obj, "message", msg.into());
+            }
+            let members = js_sys::Array::new();
+            for m in resp.members {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", m.node_id.into());
+                set(&item, "hostname", m.hostname.into());
+                set(&item, "role", m.role.into());
+                set(&item, "ok", m.ok.into());
+                if let Some(id) = m.deploy_id {
+                    set(&item, "deployId", id.into());
+                }
+                if let Some(err) = m.error {
+                    set(&item, "error", err.into());
+                }
+                members.push(&item.into());
+            }
+            set(&obj, "members", members.into());
+        }
+        MessageBody::ClusterDeployStopRequestBody(req) => {
+            set(&obj, "variant", "ClusterDeployStopRequest".into());
+            set(&obj, "clusterId", req.cluster_id.into());
+            set(&obj, "deploymentClusterId", req.deployment_cluster_id.into());
+        }
+        MessageBody::ClusterDeployStopResponseBody(resp) => {
+            set(&obj, "variant", "ClusterDeployStopResponse".into());
+            set(&obj, "ok", resp.ok.into());
+            if let Some(msg) = resp.message {
+                set(&obj, "message", msg.into());
+            }
+            let members = js_sys::Array::new();
+            for m in resp.members {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", m.node_id.into());
+                set(&item, "hostname", m.hostname.into());
+                set(&item, "role", m.role.into());
+                set(&item, "ok", m.ok.into());
+                if let Some(err) = m.error {
+                    set(&item, "error", err.into());
+                }
+                members.push(&item.into());
+            }
+            set(&obj, "members", members.into());
         }
         // ---- Mesh read-only (FAZA 1a) ----
         MessageBody::MeshNodeListRequest => {
@@ -11176,6 +11354,30 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     obj
 }
 
+fn cluster_member_to_js(m: tentaflow_protocol::ClusterMember) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "nodeId", m.node_id.into());
+    set(&item, "hostname", m.hostname.into());
+    set(&item, "status", m.status.into());
+    if let Some(t) = m.interface_type {
+        set(&item, "interfaceType", t.into());
+    }
+    if let Some(s) = m.interface_speed_mbps {
+        set(&item, "interfaceSpeedMbps", s.into());
+    }
+    set(&item, "joinedAt", m.joined_at.into());
+    if let Some(d) = m.rdma_devices {
+        set(&item, "rdmaDevices", d.into());
+    }
+    if let Some(ip) = m.rdma_ip {
+        set(&item, "rdmaIp", ip.into());
+    }
+    if let Some(s) = m.rdma_socket_ifname {
+        set(&item, "rdmaSocketIfname", s.into());
+    }
+    item
+}
+
 fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
     let obj = js_sys::Object::new();
     set(&obj, "id", c.id.into());
@@ -11199,6 +11401,11 @@ fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
         c.health_check_interval_ms.into(),
     );
     set(&obj, "timeoutMs", c.timeout_ms.into());
+    let members = js_sys::Array::new();
+    for m in c.members {
+        members.push(&cluster_member_to_js(m).into());
+    }
+    set(&obj, "members", members.into());
     obj
 }
 

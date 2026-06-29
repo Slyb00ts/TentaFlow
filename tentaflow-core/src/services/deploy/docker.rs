@@ -517,6 +517,85 @@ fn gpu_count_to_selection(count: Option<i64>) -> GpuSelection {
     }
 }
 
+/// Klucz w `user_config` niosacy konfiguracje distributed-deployu (multi-node TP).
+/// Obecnosc bloku przelacza `DockerDeploy::prepare` na sciezke host-networking +
+/// RDMA, a komenda `ray start ... && vllm serve ...` i NCCL env przychodza przez
+/// istniejace pola `launch_command_override` + `engine_env` (zero nowej sciezki env).
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+pub(super) const DISTRIBUTED_CONFIG_KEY: &str = "_distributed";
+
+/// Etykieta docker grupujaca kontenery jednego distributed-deploymentu — fallback
+/// teardownu gdy wiersza serwisu brak.
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+pub(super) const DISTRIBUTED_LABEL: &str = "tentaflow.deployment_cluster_id";
+
+/// Runtime distributed sciagniety z `_distributed` bloku `user_config`.
+#[cfg(feature = "docker")]
+#[derive(Debug, Clone)]
+struct DistributedRuntime {
+    /// "head" | "worker".
+    role: String,
+    /// Port OpenAI head-a (head nasluchuje; worker headless — port tylko do nazwy
+    /// kontenera, bez bindu, bo i tak na innym nodzie).
+    port: u16,
+    deployment_cluster_id: String,
+}
+
+#[cfg(feature = "docker")]
+fn parse_distributed(user_config: &serde_json::Value) -> Option<DistributedRuntime> {
+    let d = user_config.get(DISTRIBUTED_CONFIG_KEY)?;
+    let role = d.get("role").and_then(|v| v.as_str())?.to_string();
+    let port = d.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let deployment_cluster_id = d
+        .get("deployment_cluster_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(DistributedRuntime {
+        role,
+        port,
+        deployment_cluster_id,
+    })
+}
+
+/// Readiness headless workera Ray (`ray start --address ... --block`). Worker nie
+/// wystawia HTTP, wiec gotowosc = kontener zyje nieprzerwanie przez `grace`
+/// (czas na dolaczenie do GCS Ray). Exit przed `grace` => deploy-fatal.
+#[cfg(feature = "docker")]
+async fn wait_worker_alive_grace(
+    docker: &bollard::Docker,
+    name: &str,
+    grace: std::time::Duration,
+    log: Option<&LogSink>,
+) -> SmartProbeOutcome {
+    use std::time::Instant;
+    let started = Instant::now();
+    let probe = std::time::Duration::from_millis(500);
+    loop {
+        match docker.inspect_container(name, None).await {
+            Ok(info) => {
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+                if !running {
+                    let code = info
+                        .state
+                        .as_ref()
+                        .and_then(|s| s.exit_code)
+                        .map(|c| c as i32);
+                    return SmartProbeOutcome::ProcessExited(code);
+                }
+            }
+            Err(_) => return SmartProbeOutcome::ProcessExited(None),
+        }
+        if started.elapsed() >= grace {
+            if let Some(s) = log {
+                s.info("[docker] ray worker dolaczyl do klastra (alive grace ok)");
+            }
+            return SmartProbeOutcome::Ready;
+        }
+        tokio::time::sleep(probe).await;
+    }
+}
+
 #[cfg(feature = "docker")]
 mod backend {
     use super::*;
@@ -741,8 +820,23 @@ mod backend {
         Ok(())
     }
 
+    /// Opcje docker dla distributed (multi-node tensor-parallel) deployu. Replikuja
+    /// flagi z proven recipe: `--network host` (NCCL/Ray gadaja po realnych
+    /// interfejsach RDMA, nie po docker-bridge NAT), `--device /dev/infiniband`
+    /// (userspace IB verbs), `--cap-add IPC_LOCK` + `--ulimit memlock=-1`
+    /// (pinowanie pamieci GPUDirect/RDMA), `--shm-size` (domyslne 64MB -> NCCL
+    /// "No space left on device"), neutralny CWD `/root` (editable vllm w /src
+    /// cieniuje `import vllm`). Przy host-networking NIE publikujemy portow —
+    /// kontener bindu je wprost na hoscie.
+    pub(super) struct DistributedDockerOpts {
+        pub shm_size_bytes: i64,
+        pub working_dir: String,
+    }
+
     /// Creates and starts a container. Returns container id.
     /// `binds` entries: (host_path, container_path, read_only).
+    /// `distributed` Some => host-networking + RDMA device + IPC_LOCK + memlock +
+    /// shm-size, no port publishing (multi-node TP path).
     pub(super) async fn run(
         docker: &Docker,
         image: &str,
@@ -753,23 +847,28 @@ mod backend {
         binds: &[(PathBuf, String, bool)],
         labels: &HashMap<String, String>,
         gpu: GpuSelection,
+        distributed: Option<DistributedDockerOpts>,
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed: Vec<String> = Vec::new();
-        for (host, ctr, proto) in ports {
-            let key = format!("{}/{}", ctr, proto);
-            port_bindings.insert(
-                key.clone(),
-                Some(vec![PortBinding {
-                    // Bind published ports to loopback only: Core reaches services
-                    // via 127.0.0.1 and they must not be exposed to the LAN. With
-                    // the sidecar gone, this host binding is the containment that
-                    // keeps the engine's HTTP port off the network.
-                    host_ip: Some("127.0.0.1".into()),
-                    host_port: Some(host.to_string()),
-                }]),
-            );
-            exposed.push(key);
+        // Host-networking distributed deploy publishes nothing — the engine binds
+        // directly on the host's network namespace (Ray/NCCL need the real NICs).
+        if distributed.is_none() {
+            for (host, ctr, proto) in ports {
+                let key = format!("{}/{}", ctr, proto);
+                port_bindings.insert(
+                    key.clone(),
+                    Some(vec![PortBinding {
+                        // Bind published ports to loopback only: Core reaches services
+                        // via 127.0.0.1 and they must not be exposed to the LAN. With
+                        // the sidecar gone, this host binding is the containment that
+                        // keeps the engine's HTTP port off the network.
+                        host_ip: Some("127.0.0.1".into()),
+                        host_port: Some(host.to_string()),
+                    }]),
+                );
+                exposed.push(key);
+            }
         }
 
         let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
@@ -806,7 +905,7 @@ mod backend {
             }]),
         };
 
-        let host_config = HostConfig {
+        let mut host_config = HostConfig {
             port_bindings: Some(port_bindings),
             binds: if binds_vec.is_empty() {
                 None
@@ -816,6 +915,25 @@ mod backend {
             device_requests,
             ..Default::default()
         };
+        // Distributed (multi-node TP): swap to host-networking + RDMA passthrough.
+        if let Some(opts) = &distributed {
+            use bollard::models::{DeviceMapping, ResourcesUlimits};
+            host_config.network_mode = Some("host".to_string());
+            host_config.port_bindings = None;
+            host_config.devices = Some(vec![DeviceMapping {
+                path_on_host: Some("/dev/infiniband".to_string()),
+                path_in_container: Some("/dev/infiniband".to_string()),
+                cgroup_permissions: Some("rwm".to_string()),
+            }]);
+            host_config.cap_add = Some(vec!["IPC_LOCK".to_string()]);
+            // memlock=-1 => unlimited locked memory for GPUDirect/RDMA pinning.
+            host_config.ulimits = Some(vec![ResourcesUlimits {
+                name: Some("memlock".to_string()),
+                soft: Some(-1),
+                hard: Some(-1),
+            }]);
+            host_config.shm_size = Some(opts.shm_size_bytes);
+        }
         let body = ContainerCreateBody {
             image: Some(image.into()),
             cmd: if cmd.is_empty() {
@@ -838,6 +956,7 @@ mod backend {
             } else {
                 Some(labels.clone())
             },
+            working_dir: distributed.as_ref().map(|o| o.working_dir.clone()),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -1059,7 +1178,21 @@ impl DeployStrategy for DockerDeploy {
             .await?;
         }
 
-        let transport = self.pick_transport();
+        // Distributed (multi-node TP): host-networking, no allocator lease. Head
+        // runs the OpenAI endpoint on `spec.port`; worker is headless (Embedded
+        // transport, no model rows, no HTTP probe) — `port` is reused only to name
+        // the container deterministically (different node, no collision).
+        let distributed = parse_distributed(&self.user_config);
+        let is_worker = distributed
+            .as_ref()
+            .map(|d| d.role == "worker")
+            .unwrap_or(false);
+
+        let transport = match &distributed {
+            Some(_) if is_worker => Transport::Embedded,
+            Some(_) => Transport::HttpDirect,
+            None => self.pick_transport(),
+        };
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();
 
@@ -1067,7 +1200,10 @@ impl DeployStrategy for DockerDeploy {
         // (preserved_port). Dla SidecarQuic preserved_port to host_http;
         // sidecar_quic_port jest zawsze swiezy bo nie trzymamy go w DB
         // jako stable identifier (rzadko exposed do klientow).
-        let (host_http, sidecar_quic) = if transport == Transport::SidecarQuic {
+        let (host_http, sidecar_quic) = if let Some(d) = &distributed {
+            // Host networking: the engine binds the host port directly, no lease.
+            (d.port, None)
+        } else if transport == Transport::SidecarQuic {
             let http = self
                 .ports
                 .acquire_or_specific(self.preserved_port)
@@ -1213,7 +1349,12 @@ impl DeployStrategy for DockerDeploy {
             self.manifest.engine.id.clone(),
         );
 
-        let mut port_map = vec![(host_http, internal_port, "tcp")];
+        // Distributed uses host-networking → publish nothing.
+        let mut port_map: Vec<(u16, u16, &str)> = if distributed.is_some() {
+            Vec::new()
+        } else {
+            vec![(host_http, internal_port, "tcp")]
+        };
         if let Some(q) = sidecar_quic {
             // The sidecar always listens on the fixed container port 5000 (its
             // baked `config.default.toml [transport].port`; Core does not inject
@@ -1221,6 +1362,12 @@ impl DeployStrategy for DockerDeploy {
             // 5000 inside the container — NOT `q → q`, which targeted a container
             // port nothing listens on.
             port_map.push((q, SIDECAR_QUIC_CONTAINER_PORT, "udp"));
+        }
+        // Group label so a distributed teardown can find every member container
+        // even when the service row is gone.
+        if let Some(d) = &distributed {
+            labels.insert(DISTRIBUTED_LABEL.to_string(), d.deployment_cluster_id.clone());
+            labels.insert("tentaflow.distributed_role".to_string(), d.role.clone());
         }
 
         let container_name = format!("tentaflow-{}-{}", self.manifest.engine.id, host_http);
@@ -1344,6 +1491,11 @@ impl DeployStrategy for DockerDeploy {
             }
         }
 
+        // Recipe shm-size: 16 GiB (default 64 MB → NCCL "No space left on device").
+        let distributed_opts = distributed.as_ref().map(|_| backend::DistributedDockerOpts {
+            shm_size_bytes: 16 * 1024 * 1024 * 1024,
+            working_dir: "/root".to_string(),
+        });
         let id = backend::run(
             &docker,
             &image_tag,
@@ -1354,6 +1506,7 @@ impl DeployStrategy for DockerDeploy {
             &binds,
             &labels,
             gpu,
+            distributed_opts,
         )
         .await?;
 
@@ -1399,54 +1552,69 @@ impl DeployStrategy for DockerDeploy {
             });
         }
 
-        // Smart probe: race readiness URLs forever, abort only on
-        // container exit.
-        let probe_cfg = SmartProbeConfig {
-            readiness_urls: vec![
-                format!("http://127.0.0.1:{}/v1/models", host_http),
-                format!("http://127.0.0.1:{}/health", host_http),
-                // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
-                // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
-                format!("http://127.0.0.1:{}/healthz", host_http),
-                // ComfyUI nie ma /health ani /v1/models — gotowosc po /system_stats.
-                format!("http://127.0.0.1:{}/system_stats", host_http),
-            ],
-            status_report_interval: std::time::Duration::from_secs(30),
-            log_sink: self.log_sink.clone(),
-            // Brak hard timeoutu — docker container exit (CUDA OOM,
-            // OOMKilled przez kernel cgroups itp.) flag'uje jako
-            // Failed natychmiast. Bez timeoutu zeby duze modele
-            // (70B+, multi-GB HF download) mogly sie ladowac dluzej.
-            max_wait: None,
-        };
-        let docker_for_probe = docker.clone();
-        let name_for_probe = container_name.clone();
-        let outcome = smart_health_probe(probe_cfg, move || {
-            let d = docker_for_probe.clone();
-            let n = name_for_probe.clone();
-            async move {
-                match d.inspect_container(&n, None).await {
-                    Ok(info) => {
-                        let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-                        if running {
-                            None
-                        } else {
-                            // Exited — surface the exit code if Docker
-                            // reported one.
-                            let code = info
-                                .state
-                                .as_ref()
-                                .and_then(|s| s.exit_code)
-                                .map(|c| c as i32);
-                            Some(code)
+        // Readiness. A Ray worker is headless (no HTTP) — its gotowosc is an
+        // alive-grace (container stays up long enough to join the GCS). Head and
+        // single-node deploys race the OpenAI/health URLs. The head with
+        // `--distributed-executor-backend ray` naturally BLOCKS until the workers
+        // join, so no hard timeout (the workers are launched right after by the
+        // coordinator).
+        let outcome = if is_worker {
+            wait_worker_alive_grace(
+                &docker,
+                &container_name,
+                std::time::Duration::from_secs(8),
+                self.log_sink.as_ref(),
+            )
+            .await
+        } else {
+            let probe_cfg = SmartProbeConfig {
+                readiness_urls: vec![
+                    format!("http://127.0.0.1:{}/v1/models", host_http),
+                    format!("http://127.0.0.1:{}/health", host_http),
+                    // SearXNG i inne aplikacje webowe wystawiaja /healthz (konwencja
+                    // k8s) zamiast /health — pierwszy 2xx wygrywa, reszta ignorowana.
+                    format!("http://127.0.0.1:{}/healthz", host_http),
+                    // ComfyUI nie ma /health ani /v1/models — gotowosc po /system_stats.
+                    format!("http://127.0.0.1:{}/system_stats", host_http),
+                ],
+                status_report_interval: std::time::Duration::from_secs(30),
+                log_sink: self.log_sink.clone(),
+                // Brak hard timeoutu — docker container exit (CUDA OOM,
+                // OOMKilled przez kernel cgroups itp.) flag'uje jako
+                // Failed natychmiast. Bez timeoutu zeby duze modele
+                // (70B+, multi-GB HF download) mogly sie ladowac dluzej.
+                max_wait: None,
+            };
+            let docker_for_probe = docker.clone();
+            let name_for_probe = container_name.clone();
+            smart_health_probe(probe_cfg, move || {
+                let d = docker_for_probe.clone();
+                let n = name_for_probe.clone();
+                async move {
+                    match d.inspect_container(&n, None).await {
+                        Ok(info) => {
+                            let running =
+                                info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+                            if running {
+                                None
+                            } else {
+                                // Exited — surface the exit code if Docker
+                                // reported one.
+                                let code = info
+                                    .state
+                                    .as_ref()
+                                    .and_then(|s| s.exit_code)
+                                    .map(|c| c as i32);
+                                Some(code)
+                            }
                         }
+                        // Inspect failed — likely the container vanished.
+                        Err(_) => Some(None),
                     }
-                    // Inspect failed — likely the container vanished.
-                    Err(_) => Some(None),
                 }
-            }
-        })
-        .await;
+            })
+            .await
+        };
 
         match outcome {
             SmartProbeOutcome::Ready => {}
@@ -1481,13 +1649,24 @@ impl DeployStrategy for DockerDeploy {
 
         let runtime = RuntimeHandle {
             pid: None,
+            // Head + single-node keep the port (routing + container teardown by
+            // `tentaflow-<engine>-<port>` name). Worker is headless (Embedded),
+            // no endpoint, but it still carries the port so `stop()` can rebuild
+            // the deterministic container name on teardown/shutdown.
             port: Some(host_http),
             sidecar_port: sidecar_quic,
             endpoint_url,
             container_id: Some(id),
             instance_dir: None,
         };
-        let models = models_from_manifest(&self.manifest, &self.user_config);
+        // A Ray worker must NOT advertise the model — it is headless and never
+        // serves inference (only the head endpoint is routable). Empty model rows
+        // keep it out of the resolver while staying a tracked docker service.
+        let models = if is_worker {
+            Vec::new()
+        } else {
+            models_from_manifest(&self.manifest, &self.user_config)
+        };
         // Typed schema params + request_time → config_json. Docker silniki
         // konsumuja env binding (vllm/sglang/tensorrt-llm — env do
         // entrypoint.sh) plus opcjonalnie request-time (gdy api jest

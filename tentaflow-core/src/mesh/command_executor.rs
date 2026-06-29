@@ -163,6 +163,7 @@ impl MeshCommandExecutor {
                 gateway,
                 dhcp,
                 mut sudo_password,
+                mtu,
             } => {
                 // Blokujaca operacja sudo — przenies na oddzielny watek
                 let iface = interface.clone();
@@ -178,6 +179,7 @@ impl MeshCommandExecutor {
                         mask.as_deref(),
                         gw.as_deref(),
                         dhcp,
+                        mtu,
                         &pwd,
                     );
                     pwd.zeroize();
@@ -189,6 +191,12 @@ impl MeshCommandExecutor {
                     Ok(Err(e)) => CommandResponse::fail(e.to_string()),
                     Err(e) => CommandResponse::fail(format!("Blad watku: {}", e)),
                 }
+            }
+
+            MeshCommandType::RoceProbe => {
+                // Enumeracja RoCE/RDMA kart noda — czysto lokalne czytanie /sys.
+                let interfaces = crate::mesh::roce_config::enumerate_roce_interfaces();
+                CommandResponse::ok(MeshCommandResponsePayload::RoceInterfaceList(interfaces))
             }
 
             MeshCommandType::ContainerStart { container_id } => {
@@ -380,6 +388,34 @@ impl MeshCommandExecutor {
                     &config_json,
                 )
                 .await
+            }
+            MeshCommandType::ServiceDeployDistributed { spec } => {
+                self.handle_service_deploy_distributed(from_node_id, spec).await
+            }
+            MeshCommandType::ServiceStopDistributed {
+                deployment_cluster_id,
+            } => {
+                self.handle_service_stop_distributed(&deployment_cluster_id)
+                    .await
+            }
+            MeshCommandType::DistributedReadiness {
+                deployment_cluster_id,
+                ray_port,
+                serve_port,
+                expected_nodes: _,
+            } => {
+                let st = crate::services::deploy::distributed::probe_readiness(
+                    &deployment_cluster_id,
+                    ray_port,
+                    serve_port,
+                )
+                .await;
+                CommandResponse::ok(MeshCommandResponsePayload::DistributedReadinessResult {
+                    ray_gcs_up: st.ray_gcs_up,
+                    ray_nodes: st.ray_nodes,
+                    serve_ready: st.serve_ready,
+                    error: st.error,
+                })
             }
             MeshCommandType::ServiceUpdateRemote {
                 service_id,
@@ -1616,6 +1652,74 @@ impl MeshCommandExecutor {
             engine_id: engine_id.to_string(),
             deploy_method: deploy_method.to_string(),
         })
+    }
+
+    /// Distributed (multi-node TP) deploy JEDNEGO slice'a modelu NA TYM nodzie.
+    /// Buduje `user_config` z `_distributed` + komenda `ray ... && vllm serve` +
+    /// NCCL env, po czym REUZYWA dokladnie ten sam potok co `ServiceDeployRemote`
+    /// (`handle_service_deploy_remote`: create_deploy_job + deploy() + log stream +
+    /// broadcast rejestru). `DockerDeploy` rozpoznaje `_distributed` i przelacza na
+    /// host-networking + RDMA. Zwraca slug, nazwe kontenera i endpoint (head only).
+    async fn handle_service_deploy_distributed(
+        &self,
+        requester_node_id: &str,
+        spec: tentaflow_protocol::mesh::DistributedDeploySpec,
+    ) -> CommandResponse {
+        // Preflight (P1-4): clean stale Ray containers from a prior attempt and,
+        // for the head, verify the serve + GCS ports are free BEFORE launching
+        // (host networking offers no port protection). Fail clearly otherwise.
+        if let Err(e) = crate::services::deploy::distributed::preflight_member(&spec).await {
+            return CommandResponse::fail(e);
+        }
+        let config_json = match crate::services::deploy::distributed::build_member_config_json(&spec)
+        {
+            Ok(c) => c,
+            Err(e) => return CommandResponse::fail(e),
+        };
+        let resp = self
+            .handle_service_deploy_remote(requester_node_id, &spec.engine_id, "docker", &config_json)
+            .await;
+        if !resp.ok {
+            return resp;
+        }
+        let deploy_id = match &resp.payload {
+            MeshCommandResponsePayload::ServiceDeployResult { deploy_id, .. } => deploy_id.clone(),
+            _ => String::new(),
+        };
+        let container_name =
+            crate::services::deploy::distributed::container_name(&spec.engine_id, spec.port);
+        let endpoint_url = crate::services::deploy::distributed::endpoint_url_for(&spec);
+        CommandResponse::ok(MeshCommandResponsePayload::ServiceDeployDistributedResult {
+            deploy_id,
+            container_name,
+            endpoint_url,
+        })
+    }
+
+    /// Teardown distributed-deploymentu NA TYM nodzie: usuwa kontener(y) po
+    /// etykiecie `deployment_cluster_id` ORAZ kasuje wiersze serwisow niosace ten
+    /// id (head + workery), broadcastujac usuniecie do reszty mesh. Idempotentne.
+    async fn handle_service_stop_distributed(&self, deployment_cluster_id: &str) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        let (removed, errors) = crate::services::deploy::distributed::stop_distributed(
+            &actions.db,
+            actions.port_allocator.clone(),
+            deployment_cluster_id,
+        )
+        .await;
+        for id in removed {
+            push_service_change_after_action(&actions, &self.local_node_id, id, true).await;
+        }
+        // P1-2: incomplete teardown must surface as a failure so the coordinator
+        // keeps the deployment record for retry (no silently-orphaned Ray).
+        if errors.is_empty() {
+            CommandResponse::ok(MeshCommandResponsePayload::Empty)
+        } else {
+            CommandResponse::fail(format!("teardown niekompletny: {}", errors.join("; ")))
+        }
     }
 
     /// Zapisuje certyfikaty do dozwolonego katalogu

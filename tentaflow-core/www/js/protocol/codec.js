@@ -601,6 +601,62 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ClusterRdmaConfigureRequest { clusterId, sudoPassword, mtu? } */
+  clusterRdmaConfigureRequest(correlationId, { clusterId, sudoPassword, mtu }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterRdmaConfigureRequest(
+      clusterId,
+      sudoPassword,
+      mtu ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::ClusterDeployRequest — deploy one model split across the whole
+   * cluster (vLLM tensor-parallel). Optional fields fall back to backend defaults.
+   */
+  clusterDeployRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterDeployRequest(
+      payload.clusterId,
+      payload.engineId,
+      payload.modelRepo ?? null,
+      payload.modelPresetId ?? null,
+      payload.servedModelName ?? null,
+      payload.gpuMemoryUtilization ?? null,
+      payload.maxModelLen ?? null,
+      payload.port ?? null,
+      payload.gpusPerNode ?? null,
+      payload.configJson ?? null,
+      payload.gcsTimeoutSecs ?? null,
+      payload.readyTimeoutSecs ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterDeployStopRequest { clusterId, deploymentClusterId } */
+  clusterDeployStopRequest(correlationId, { clusterId, deploymentClusterId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterDeployStopRequest(clusterId, deploymentClusterId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ClusterUpdateRequest — wszystkie pola opcjonalne. */
   clusterUpdateRequest(correlationId, opts, sequence = 1) {
     assertReady();

@@ -1970,6 +1970,66 @@ export function encodeClusterDeleteRequest(cluster_id) {
 }
 
 /**
+ * MessageBody::ClusterDeployRequest — deploy one model split across the whole
+ * cluster (vLLM tensor-parallel). Optional fields fall back to backend defaults
+ * when passed `None`.
+ * @param {string} cluster_id
+ * @param {string} engine_id
+ * @param {string | null} [model_repo]
+ * @param {string | null} [model_preset_id]
+ * @param {string | null} [served_model_name]
+ * @param {number | null} [gpu_memory_utilization]
+ * @param {number | null} [max_model_len]
+ * @param {number | null} [port]
+ * @param {number | null} [gpus_per_node]
+ * @param {string | null} [config_json]
+ * @param {number | null} [gcs_timeout_secs]
+ * @param {number | null} [ready_timeout_secs]
+ * @returns {Uint8Array}
+ */
+export function encodeClusterDeployRequest(cluster_id, engine_id, model_repo, model_preset_id, served_model_name, gpu_memory_utilization, max_model_len, port, gpus_per_node, config_json, gcs_timeout_secs, ready_timeout_secs) {
+    const ptr0 = passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(engine_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    var ptr2 = isLikeNone(model_repo) ? 0 : passStringToWasm0(model_repo, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(model_preset_id) ? 0 : passStringToWasm0(model_preset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(served_model_name) ? 0 : passStringToWasm0(served_model_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(config_json) ? 0 : passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeClusterDeployRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(gpu_memory_utilization) ? Number.MAX_SAFE_INTEGER : Math.fround(gpu_memory_utilization), isLikeNone(max_model_len) ? Number.MAX_SAFE_INTEGER : (max_model_len) >>> 0, isLikeNone(port) ? 0xFFFFFF : port, isLikeNone(gpus_per_node) ? Number.MAX_SAFE_INTEGER : (gpus_per_node) >>> 0, ptr5, len5, isLikeNone(gcs_timeout_secs) ? Number.MAX_SAFE_INTEGER : (gcs_timeout_secs) >>> 0, isLikeNone(ready_timeout_secs) ? Number.MAX_SAFE_INTEGER : (ready_timeout_secs) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * MessageBody::ClusterDeployStopRequest { cluster_id, deployment_cluster_id }.
+ * @param {string} cluster_id
+ * @param {string} deployment_cluster_id
+ * @returns {Uint8Array}
+ */
+export function encodeClusterDeployStopRequest(cluster_id, deployment_cluster_id) {
+    const ptr0 = passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(deployment_cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeClusterDeployStopRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::ClusterDetailRequest { cluster_id }.
  * @param {string} cluster_id
  * @returns {Uint8Array}
@@ -2015,6 +2075,27 @@ export function encodeClusterProbeStreamRequest(node_ids) {
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
+}
+
+/**
+ * MessageBody::ClusterRdmaConfigureRequest { cluster_id, sudo_password, mtu }.
+ * @param {string} cluster_id
+ * @param {string} sudo_password
+ * @param {number | null} [mtu]
+ * @returns {Uint8Array}
+ */
+export function encodeClusterRdmaConfigureRequest(cluster_id, sudo_password, mtu) {
+    const ptr0 = passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(sudo_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeClusterRdmaConfigureRequest(ptr0, len0, ptr1, len1, isLikeNone(mtu) ? Number.MAX_SAFE_INTEGER : (mtu) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
 }
 
 /**

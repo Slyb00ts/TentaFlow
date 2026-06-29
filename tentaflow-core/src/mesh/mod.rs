@@ -26,6 +26,8 @@ pub mod pipeline;
 pub mod proto_conv;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
+pub mod cluster_rdma;
+pub mod roce_config;
 pub mod reconnect;
 pub mod relay_health;
 pub mod robot_control;

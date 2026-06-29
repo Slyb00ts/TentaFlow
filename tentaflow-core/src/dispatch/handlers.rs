@@ -1635,10 +1635,71 @@ fn parse_ts_i64(s: &str) -> i64 {
     parse_ts(s) as i64
 }
 
+/// Buduje liste czlonkow klastra z DB wzbogacona o hostname/status z peer_store.
+/// Wspoldzielone przez cluster_list i cluster_detail — jedno zrodlo prawdy.
+fn build_cluster_members(
+    ctx: &HandlerContext,
+    cluster_id: &str,
+) -> Vec<tentaflow_protocol::ClusterMember> {
+    let db_members = match repository::list_cluster_members(&ctx.state.db, cluster_id) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    db_members
+        .into_iter()
+        .map(|m| {
+            let peer = ctx.state.mesh_peer_store.get(&m.node_id);
+            tentaflow_protocol::ClusterMember {
+                node_id: m.node_id.clone(),
+                hostname: peer
+                    .as_ref()
+                    .map(|p| {
+                        if p.hostname.is_empty() {
+                            m.node_id.clone()
+                        } else {
+                            p.hostname.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| m.node_id.clone()),
+                status: peer
+                    .map(|p| p.status)
+                    .unwrap_or_else(|| "offline".to_string()),
+                interface_type: if m.interface_type.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_type)
+                },
+                interface_speed_mbps: if m.interface_speed_mbps > 0 {
+                    Some(m.interface_speed_mbps as u32)
+                } else {
+                    None
+                },
+                joined_at: parse_ts_i64(&m.joined_at),
+                rdma_devices: if m.rdma_devices.is_empty() {
+                    None
+                } else {
+                    Some(m.rdma_devices.clone())
+                },
+                rdma_ip: if m.rdma_ip.is_empty() {
+                    None
+                } else {
+                    Some(m.rdma_ip.clone())
+                },
+                rdma_socket_ifname: if m.rdma_socket_ifname.is_empty() {
+                    None
+                } else {
+                    Some(m.rdma_socket_ifname.clone())
+                },
+            }
+        })
+        .collect()
+}
+
 fn db_cluster_to_info(
     cluster: &crate::db::models::DbCluster,
     members_count: u32,
     members_online: u32,
+    members: Vec<tentaflow_protocol::ClusterMember>,
 ) -> tentaflow_protocol::ClusterInfo {
     tentaflow_protocol::ClusterInfo {
         id: cluster.cluster_id.clone(),
@@ -1663,6 +1724,7 @@ fn db_cluster_to_info(
         failover_target: cluster.failover_target.clone(),
         health_check_interval_ms: cluster.health_check_interval_ms as u32,
         timeout_ms: cluster.timeout_ms as u32,
+        members,
     }
 }
 
@@ -1698,7 +1760,8 @@ pub fn cluster_list(
         .into_iter()
         .map(|r| {
             let (_, online) = count_online_members(ctx, &r.cluster.cluster_id);
-            db_cluster_to_info(&r.cluster, r.members_count as u32, online)
+            let members = build_cluster_members(ctx, &r.cluster.cluster_id);
+            db_cluster_to_info(&r.cluster, r.members_count as u32, online, members)
         })
         .collect();
     Ok(MessageBody::ClusterListResponseBody(
@@ -1725,45 +1788,10 @@ pub fn cluster_detail(
     let cluster = repository::get_cluster(&ctx.state.db, &payload.cluster_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("cluster not found"))?;
-    let db_members =
-        repository::list_cluster_members(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
 
     let (total, online) = count_online_members(ctx, &payload.cluster_id);
-    let info = db_cluster_to_info(&cluster, total, online);
-
-    let members: Vec<tentaflow_protocol::ClusterMember> = db_members
-        .into_iter()
-        .map(|m| {
-            let peer = ctx.state.mesh_peer_store.get(&m.node_id);
-            tentaflow_protocol::ClusterMember {
-                node_id: m.node_id.clone(),
-                hostname: peer
-                    .as_ref()
-                    .map(|p| {
-                        if p.hostname.is_empty() {
-                            m.node_id.clone()
-                        } else {
-                            p.hostname.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| m.node_id.clone()),
-                status: peer
-                    .map(|p| p.status)
-                    .unwrap_or_else(|| "offline".to_string()),
-                interface_type: if m.interface_type.is_empty() {
-                    None
-                } else {
-                    Some(m.interface_type)
-                },
-                interface_speed_mbps: if m.interface_speed_mbps > 0 {
-                    Some(m.interface_speed_mbps as u32)
-                } else {
-                    None
-                },
-                joined_at: parse_ts_i64(&m.joined_at),
-            }
-        })
-        .collect();
+    let members = build_cluster_members(ctx, &payload.cluster_id);
+    let info = db_cluster_to_info(&cluster, total, online, members.clone());
 
     Ok(MessageBody::ClusterDetailResponseBody(
         tentaflow_protocol::ClusterDetailResponse {
@@ -4160,7 +4188,7 @@ pub async fn service_manifest_deploy(
 /// (`deploy_id`) do streamu logów. Wyodrębnione z `service_manifest_deploy`,
 /// żeby `service_redeploy` reużywał DOKŁADNIE tę samą ścieżkę — zero duplikacji
 /// logiki post-deploy (rejestr mesh, live handles, rebuild katalogu).
-fn spawn_deploy_pipeline(
+pub(super) fn spawn_deploy_pipeline(
     ctx: &HandlerContext,
     job: crate::services::deploy::DeployJob,
     deploy_method: crate::services_repo::services::DeployMethod,
@@ -8980,7 +9008,10 @@ fn build_service_info(
 /// so peers' `MeshServicesRegistry` view converges in real time instead of
 /// waiting for the 5-min anti-drift announce. No-op when the mesh manager is
 /// not initialised (single-node mode, tests).
-fn broadcast_service_change(ctx: &HandlerContext, change: tentaflow_protocol::ServiceChange) {
+pub(super) fn broadcast_service_change(
+    ctx: &HandlerContext,
+    change: tentaflow_protocol::ServiceChange,
+) {
     let qm = match ctx.state.quic_mesh.as_ref() {
         Some(q) => q.clone(),
         None => return,

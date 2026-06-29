@@ -56,6 +56,7 @@ pub fn build_config_command(
     netmask: Option<&str>,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
     validate_interface_name(interface)?;
     if !dhcp {
@@ -66,24 +67,45 @@ pub fn build_config_command(
             validate_ipv4(gw)?;
         }
     }
+    if let Some(m) = mtu {
+        validate_mtu(m)?;
+    }
+
+    // MTU-only update (P1-4): gdy nie podano adresu ani DHCP, ale jest MTU,
+    // zmieniamy WYLACZNIE MTU bez przepisywania konfiguracji IP. To chroni
+    // interfejs interconnectu — pelny zapis netplan/networkd nadpisalby jego
+    // istniejace adresowanie. Robimy to runtime (`ip link set ... mtu`), bo to
+    // operacja non-destructive na adresach.
+    if ipv4.is_none() && gateway.is_none() && !dhcp {
+        if let Some(m) = mtu {
+            return build_mtu_only_command(manager, interface, m);
+        }
+    }
 
     let prefix = netmask.map(netmask_to_prefix).transpose()?.unwrap_or(24);
 
     match manager {
-        NetworkManager::NetworkManager => build_nm_command(interface, ipv4, prefix, gateway, dhcp),
-        NetworkManager::SystemdNetworkd => {
-            build_systemd_networkd_command(interface, ipv4, prefix, gateway, dhcp)
+        NetworkManager::NetworkManager => {
+            build_nm_command(interface, ipv4, prefix, gateway, dhcp, mtu)
         }
-        NetworkManager::Netplan => build_netplan_command(interface, ipv4, prefix, gateway, dhcp),
+        NetworkManager::SystemdNetworkd => {
+            build_systemd_networkd_command(interface, ipv4, prefix, gateway, dhcp, mtu)
+        }
+        NetworkManager::Netplan => {
+            build_netplan_command(interface, ipv4, prefix, gateway, dhcp, mtu)
+        }
         NetworkManager::Ifupdown => build_ifupdown_command(
             interface,
             ipv4,
             netmask.unwrap_or("255.255.255.0"),
             gateway,
             dhcp,
+            mtu,
         ),
-        NetworkManager::MacOS => build_macos_command(interface, ipv4, netmask, gateway, dhcp),
-        NetworkManager::Windows => build_windows_command(interface, ipv4, prefix, gateway, dhcp),
+        NetworkManager::MacOS => build_macos_command(interface, ipv4, netmask, gateway, dhcp, mtu),
+        NetworkManager::Windows => {
+            build_windows_command(interface, ipv4, prefix, gateway, dhcp, mtu)
+        }
         NetworkManager::Unknown => bail!("Nie wykryto network managera na tym systemie"),
     }
 }
@@ -136,6 +158,7 @@ pub fn apply_network_config(
     netmask: Option<&str>,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
     sudo_password: &str,
 ) -> Result<String> {
     let manager = detect_network_manager();
@@ -143,10 +166,11 @@ pub fn apply_network_config(
         manager = ?manager,
         interface = %interface,
         dhcp = dhcp,
+        mtu = ?mtu,
         "Aplikowanie konfiguracji sieciowej"
     );
 
-    let command = build_config_command(&manager, interface, ipv4, netmask, gateway, dhcp)?;
+    let command = build_config_command(&manager, interface, ipv4, netmask, gateway, dhcp, mtu)?;
     execute_with_sudo(&command, sudo_password)
 }
 
@@ -181,6 +205,36 @@ fn validate_ipv4(ip: &str) -> Result<()> {
         if octet > 255 {
             bail!("Oktet IPv4 poza zakresem 0-255: {}", octet);
         }
+    }
+    Ok(())
+}
+
+/// Buduje komende zmieniajaca TYLKO MTU interfejsu, bez dotykania adresacji IP.
+/// Na Linuksie uzywamy `ip link set` (runtime) niezaleznie od managera — to
+/// najprostsza droga, ktora nie nadpisuje istniejacej konfiguracji IP karty.
+fn build_mtu_only_command(
+    manager: &NetworkManager,
+    interface: &str,
+    mtu: u32,
+) -> Result<String> {
+    match manager {
+        NetworkManager::NetworkManager
+        | NetworkManager::SystemdNetworkd
+        | NetworkManager::Netplan
+        | NetworkManager::Ifupdown => Ok(format!("ip link set dev \"{}\" mtu {}", interface, mtu)),
+        NetworkManager::MacOS => Ok(format!("ifconfig \"{}\" mtu {}", interface, mtu)),
+        NetworkManager::Windows => Ok(format!(
+            "netsh interface ipv4 set subinterface \"{}\" mtu={} store=persistent",
+            interface, mtu
+        )),
+        NetworkManager::Unknown => bail!("Nie wykryto network managera na tym systemie"),
+    }
+}
+
+/// Walidacja MTU — zakres akceptowany przez karty Ethernet/RoCE (jumbo do 9216).
+fn validate_mtu(mtu: u32) -> Result<()> {
+    if !(576..=9216).contains(&mtu) {
+        bail!("MTU poza zakresem 576-9216: {}", mtu);
     }
     Ok(())
 }
@@ -226,11 +280,15 @@ fn build_nm_command(
     prefix: u8,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
+    let mtu_clause = mtu
+        .map(|m| format!(" 802-3-ethernet.mtu {}", m))
+        .unwrap_or_default();
     if dhcp {
         Ok(format!(
-            "nmcli con mod \"{}\" ipv4.method auto && nmcli con up \"{}\"",
-            interface, interface
+            "nmcli con mod \"{}\" ipv4.method auto{} && nmcli con up \"{}\"",
+            interface, mtu_clause, interface
         ))
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
@@ -241,6 +299,7 @@ fn build_nm_command(
         if let Some(gw) = gateway {
             cmd.push_str(&format!(" ipv4.gateway \"{}\"", gw));
         }
+        cmd.push_str(&mtu_clause);
         cmd.push_str(&format!(" && nmcli con up \"{}\"", interface));
         Ok(cmd)
     }
@@ -252,10 +311,18 @@ fn build_systemd_networkd_command(
     prefix: u8,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
     let network_file = format!("/etc/systemd/network/99-tentaflow-{}.network", interface);
+    // MTU nalezy do sekcji [Link], nie [Network].
+    let link_section = mtu
+        .map(|m| format!("\n[Link]\nMTUBytes={}\n", m))
+        .unwrap_or_default();
     let content = if dhcp {
-        format!("[Match]\nName={}\n\n[Network]\nDHCP=yes\n", interface)
+        format!(
+            "[Match]\nName={}\n\n[Network]\nDHCP=yes\n{}",
+            interface, link_section
+        )
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
         let mut net = format!(
@@ -265,6 +332,7 @@ fn build_systemd_networkd_command(
         if let Some(gw) = gateway {
             net.push_str(&format!("Gateway={}\n", gw));
         }
+        net.push_str(&link_section);
         net
     };
 
@@ -282,11 +350,15 @@ fn build_netplan_command(
     prefix: u8,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
+    let mtu_line = mtu
+        .map(|m| format!("      mtu: {}\n", m))
+        .unwrap_or_default();
     let yaml = if dhcp {
         format!(
-            "network:\n  version: 2\n  ethernets:\n    {}:\n      dhcp4: true\n",
-            interface
+            "network:\n  version: 2\n  ethernets:\n    {}:\n      dhcp4: true\n{}",
+            interface, mtu_line
         )
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
@@ -300,6 +372,7 @@ fn build_netplan_command(
                 gw
             ));
         }
+        y.push_str(&mtu_line);
         y
     };
 
@@ -316,10 +389,15 @@ fn build_ifupdown_command(
     netmask: &str,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
     let iface_file = format!("/etc/network/interfaces.d/tentaflow-{}", interface);
+    let mtu_line = mtu.map(|m| format!("  mtu {}\n", m)).unwrap_or_default();
     let content = if dhcp {
-        format!("auto {}\niface {} inet dhcp\n", interface, interface)
+        format!(
+            "auto {}\niface {} inet dhcp\n{}",
+            interface, interface, mtu_line
+        )
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
         let mut c = format!(
@@ -329,6 +407,7 @@ fn build_ifupdown_command(
         if let Some(gw) = gateway {
             c.push_str(&format!("  gateway {}\n", gw));
         }
+        c.push_str(&mtu_line);
         c
     };
 
@@ -347,16 +426,25 @@ fn build_macos_command(
     netmask: Option<&str>,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
+    // networksetup uzywa nazwy uslugi sieciowej; MTU ustawiamy bezposrednio na
+    // urzadzeniu BSD przez ifconfig (nazwa = `interface`).
+    let mtu_suffix = mtu
+        .map(|m| format!(" && ifconfig \"{}\" mtu {}", interface, m))
+        .unwrap_or_default();
     if dhcp {
-        Ok(format!("networksetup -setdhcp \"{}\"", interface))
+        Ok(format!(
+            "networksetup -setdhcp \"{}\"{}",
+            interface, mtu_suffix
+        ))
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
         let mask = netmask.unwrap_or("255.255.255.0");
         let gw = gateway.unwrap_or("0.0.0.0");
         Ok(format!(
-            "networksetup -setmanual \"{}\" {} {} {}",
-            interface, ip, mask, gw
+            "networksetup -setmanual \"{}\" {} {} {}{}",
+            interface, ip, mask, gw, mtu_suffix
         ))
     }
 }
@@ -367,11 +455,20 @@ fn build_windows_command(
     prefix: u8,
     gateway: Option<&str>,
     dhcp: bool,
+    mtu: Option<u32>,
 ) -> Result<String> {
+    let mtu_suffix = mtu
+        .map(|m| {
+            format!(
+                "; netsh interface ipv4 set subinterface '{}' mtu={} store=persistent",
+                interface, m
+            )
+        })
+        .unwrap_or_default();
     if dhcp {
         Ok(format!(
-            "powershell -Command \"Set-NetIPInterface -InterfaceAlias '{}' -Dhcp Enabled\"",
-            interface
+            "powershell -Command \"Set-NetIPInterface -InterfaceAlias '{}' -Dhcp Enabled{}\"",
+            interface, mtu_suffix
         ))
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
@@ -382,6 +479,7 @@ fn build_windows_command(
         if let Some(gw) = gateway {
             cmd.push_str(&format!(" -DefaultGateway '{}'", gw));
         }
+        cmd.push_str(&mtu_suffix);
         cmd.push('"');
         Ok(cmd)
     }

@@ -3384,7 +3384,7 @@ fn row_to_cluster(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbCluster> {
     })
 }
 
-const CLUSTER_MEMBER_COLS: &str = "id, cluster_id, node_id, role, joined_at, interface_name, interface_ip, interface_speed_mbps, interface_type";
+const CLUSTER_MEMBER_COLS: &str = "id, cluster_id, node_id, role, joined_at, interface_name, interface_ip, interface_speed_mbps, interface_type, rdma_devices, rdma_ip, rdma_socket_ifname, rdma_gid_index";
 
 fn row_to_cluster_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterMember> {
     Ok(DbClusterMember {
@@ -3397,7 +3397,30 @@ fn row_to_cluster_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterM
         interface_ip: row.get(6)?,
         interface_speed_mbps: row.get(7)?,
         interface_type: row.get(8)?,
+        rdma_devices: row.get(9)?,
+        rdma_ip: row.get(10)?,
+        rdma_socket_ifname: row.get(11)?,
+        rdma_gid_index: row.get(12)?,
     })
+}
+
+/// Persist the cluster RDMA auto-config result for one member (D1 → D3 handoff):
+/// the RoCE device list for `NCCL_IB_HCA`, the primary RDMA IP and the QSFP
+/// socket netdev. Leaves `role`/`joined_at`/probe interface columns untouched.
+pub fn update_cluster_member_rdma(
+    pool: &DbPool,
+    cluster_id: &str,
+    node_id: &str,
+    rdma_devices: &str,
+    rdma_ip: &str,
+    rdma_socket_ifname: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5 WHERE cluster_id = ?1 AND node_id = ?2",
+        rusqlite::params![cluster_id, node_id, rdma_devices, rdma_ip, rdma_socket_ifname],
+    )?;
+    Ok(())
 }
 
 pub fn create_cluster(
@@ -3499,6 +3522,54 @@ pub fn add_cluster_member(
     Ok(())
 }
 
+/// Aktualizuje TYLKO kolumny interfejsu wybranego czlonka (po tescie polaczen).
+/// Nie rusza `role`/`joined_at` — w przeciwienstwie do `add_cluster_member`
+/// (INSERT OR REPLACE), ktory zresetowalby date dolaczenia.
+pub fn update_cluster_member_interface(
+    pool: &DbPool,
+    cluster_id: &str,
+    node_id: &str,
+    interface_name: &str,
+    interface_ip: &str,
+    interface_speed_mbps: i64,
+    interface_type: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE cluster_members SET interface_name = ?3, interface_ip = ?4, interface_speed_mbps = ?5, interface_type = ?6 WHERE cluster_id = ?1 AND node_id = ?2",
+        rusqlite::params![cluster_id, node_id, interface_name, interface_ip, interface_speed_mbps, interface_type],
+    )?;
+    Ok(())
+}
+
+/// Znajduje cluster, ktorego zbior `node_id` czlonkow jest rowny podanemu
+/// zbiorowi. Uzywane przez probe stream, gdy request nie niesie `cluster_id`.
+pub fn find_cluster_by_member_set(
+    pool: &DbPool,
+    node_ids: &[String],
+) -> Result<Option<String>> {
+    let target: std::collections::HashSet<&str> = node_ids.iter().map(|s| s.as_str()).collect();
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached("SELECT cluster_id FROM clusters")?;
+    let cluster_ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for cluster_id in cluster_ids {
+        let mut mstmt =
+            conn.prepare_cached("SELECT node_id FROM cluster_members WHERE cluster_id = ?1")?;
+        let members: std::collections::HashSet<String> = mstmt
+            .query_map(rusqlite::params![cluster_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        if members.len() == target.len()
+            && members.iter().all(|m| target.contains(m.as_str()))
+        {
+            return Ok(Some(cluster_id));
+        }
+    }
+    Ok(None)
+}
+
 pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -3590,6 +3661,149 @@ pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClu
     Ok(rows)
 }
 
+// --- Cluster distributed deployments (D3) ---
+
+const CLUSTER_DEPLOYMENT_COLS: &str = "deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, created_at, updated_at";
+
+fn row_to_cluster_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterDeployment> {
+    Ok(DbClusterDeployment {
+        deployment_cluster_id: row.get(0)?,
+        cluster_id: row.get(1)?,
+        engine_id: row.get(2)?,
+        model: row.get(3)?,
+        served_model_name: row.get(4)?,
+        tp_size: row.get(5)?,
+        head_node_id: row.get(6)?,
+        port: row.get(7)?,
+        endpoint_url: row.get(8)?,
+        status: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// Inserts (or replaces) a distributed deployment row + its head/worker members
+/// in one transaction. Replace-on-conflict keeps redeploy with the same
+/// `deployment_cluster_id` idempotent.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_cluster_deployment(
+    pool: &DbPool,
+    deployment: &DbClusterDeployment,
+    members: &[DbClusterDeploymentMember],
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO cluster_deployments (deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         ON CONFLICT(deployment_cluster_id) DO UPDATE SET \
+            cluster_id=excluded.cluster_id, engine_id=excluded.engine_id, model=excluded.model, \
+            served_model_name=excluded.served_model_name, tp_size=excluded.tp_size, \
+            head_node_id=excluded.head_node_id, port=excluded.port, endpoint_url=excluded.endpoint_url, \
+            status=excluded.status, updated_at=datetime('now')",
+        rusqlite::params![
+            deployment.deployment_cluster_id,
+            deployment.cluster_id,
+            deployment.engine_id,
+            deployment.model,
+            deployment.served_model_name,
+            deployment.tp_size,
+            deployment.head_node_id,
+            deployment.port,
+            deployment.endpoint_url,
+            deployment.status,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM cluster_deployment_members WHERE deployment_cluster_id = ?1",
+        rusqlite::params![deployment.deployment_cluster_id],
+    )?;
+    for m in members {
+        tx.execute(
+            "INSERT INTO cluster_deployment_members (deployment_cluster_id, node_id, role, container_name) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![m.deployment_cluster_id, m.node_id, m.role, m.container_name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn set_cluster_deployment_status(
+    pool: &DbPool,
+    deployment_cluster_id: &str,
+    status: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE cluster_deployments SET status = ?2, updated_at = datetime('now') WHERE deployment_cluster_id = ?1",
+        rusqlite::params![deployment_cluster_id, status],
+    )?;
+    Ok(())
+}
+
+pub fn get_cluster_deployment(
+    pool: &DbPool,
+    deployment_cluster_id: &str,
+) -> Result<Option<DbClusterDeployment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM cluster_deployments WHERE deployment_cluster_id = ?1",
+        CLUSTER_DEPLOYMENT_COLS
+    ))?;
+    let res = stmt
+        .query_row(rusqlite::params![deployment_cluster_id], row_to_cluster_deployment)
+        .optional()?;
+    Ok(res)
+}
+
+pub fn list_cluster_deployment_members(
+    pool: &DbPool,
+    deployment_cluster_id: &str,
+) -> Result<Vec<DbClusterDeploymentMember>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT deployment_cluster_id, node_id, role, container_name FROM cluster_deployment_members WHERE deployment_cluster_id = ?1 ORDER BY role DESC, node_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![deployment_cluster_id], |row| {
+            Ok(DbClusterDeploymentMember {
+                deployment_cluster_id: row.get(0)?,
+                node_id: row.get(1)?,
+                role: row.get(2)?,
+                container_name: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn delete_cluster_deployment(pool: &DbPool, deployment_cluster_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM cluster_deployments WHERE deployment_cluster_id = ?1",
+        rusqlite::params![deployment_cluster_id],
+    )?;
+    Ok(())
+}
+
+/// First non-stopped distributed deployment of a cluster (`deploying`/`running`/
+/// `failed`). Used to reject a second deploy on the same cluster — a node has one
+/// GPU set, so two TP deployments would collide on GPU + host ports.
+pub fn active_cluster_deployment(
+    pool: &DbPool,
+    cluster_id: &str,
+) -> Result<Option<DbClusterDeployment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status != 'stopped' ORDER BY created_at LIMIT 1",
+        CLUSTER_DEPLOYMENT_COLS
+    ))?;
+    let res = stmt
+        .query_row(rusqlite::params![cluster_id], row_to_cluster_deployment)
+        .optional()?;
+    Ok(res)
+}
+
 /// Czlonkowie wszystkich klastrow — uzywane do budowy snapshotu konfiguracji
 /// routingu broadcastowanego przez mesh (`MESH_MSG_ROUTING_SYNC`).
 pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
@@ -3677,8 +3891,9 @@ pub fn replace_routing_config_from_sync(
     for m in members {
         tx.execute(
             "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, joined_at, \
-                interface_name, interface_ip, interface_speed_mbps, interface_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                interface_name, interface_ip, interface_speed_mbps, interface_type, \
+                rdma_devices, rdma_ip, rdma_socket_ifname, rdma_gid_index) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 m.cluster_id,
                 m.node_id,
@@ -3687,7 +3902,11 @@ pub fn replace_routing_config_from_sync(
                 m.interface_name,
                 m.interface_ip,
                 m.interface_speed_mbps,
-                m.interface_type
+                m.interface_type,
+                m.rdma_devices,
+                m.rdma_ip,
+                m.rdma_socket_ifname,
+                m.rdma_gid_index
             ],
         )?;
     }
