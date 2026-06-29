@@ -4341,5 +4341,18 @@
       "restricted": "restricted",
       "public": "public"
     }
+  },
+  "ml_studio": {
+    "annotate": {
+      "save": "Zapisz",
+      "save_and_approve": "Zapisz i zatwierdź",
+      "approved": "Zatwierdzone",
+      "saved": "Anotacje zapisane.",
+      "saved_approved": "Zapisano i zatwierdzono.",
+      "editing_now": "edytowane teraz",
+      "unlabeled": "nieoznaczone",
+      "boxes": "{n} ramek",
+      "progress_meta": "{labeled} z {total} oznaczonych · {approved} zatwierdzonych"
+    }
   }
 }

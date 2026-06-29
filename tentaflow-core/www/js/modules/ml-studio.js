@@ -9,6 +9,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { Router } from '/js/router.js';
+import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-badge.js';
@@ -3120,34 +3121,43 @@ function renderRecogAnnotateTab(panel, p) {
   function renderProgress() {
     const total = S.images.length;
     const labeled = S.images.filter((im) => (im.ann_count || 0) > 0).length;
+    const approved = S.images.filter((im) => im.approved === true).length;
     const pct = total ? Math.round((labeled / total) * 100) : 0;
     byId('ml-studio-annotate-progress')?.setAttribute('value', String(pct));
     byId('ml-studio-annotate-pct').textContent = `${pct}%`;
-    byId('ml-studio-annotate-progress-meta').textContent = `${labeled} z ${total} oznaczonych`;
+    byId('ml-studio-annotate-progress-meta').textContent = I18n.t('ml_studio.annotate.progress_meta', { labeled, total, approved });
   }
 
   function imageStatus(im, i) {
     if (i === S.curIdx) {
-      const n = S.curIdx === i && S.boxes.length ? S.boxes.length : (im.ann_count || 0);
-      return `edytowane teraz${n ? ` · ${n} ${plRamki(n)}` : ''}`;
+      const n = S.boxes.length ? S.boxes.length : (im.ann_count || 0);
+      return `${I18n.t('ml_studio.annotate.editing_now')}${n ? ` · ${boxCount(n)}` : ''}`;
     }
     const n = im.ann_count || 0;
-    return n > 0 ? `${n} ${plRamki(n)}` : 'nieoznaczone';
+    if (im.approved) return `${I18n.t('ml_studio.annotate.approved')}${n ? ` · ${boxCount(n)}` : ''}`;
+    return n > 0 ? boxCount(n) : I18n.t('ml_studio.annotate.unlabeled');
   }
 
+  // Polski zachowuje deklinację (ramka/ramki/ramek); pozostałe języki używają
+  // zlokalizowanego szablonu „{n} boxes".
   function plRamki(n) { return n === 1 ? 'ramka' : (n >= 2 && n <= 4 ? 'ramki' : 'ramek'); }
+  function boxCount(n) {
+    return I18n.getLanguage() === 'pl' ? `${n} ${plRamki(n)}` : I18n.t('ml_studio.annotate.boxes', { n });
+  }
 
   function renderTaskList() {
     const host = byId('ml-studio-annotate-task-list');
     host.innerHTML = S.images.map((im, i) => {
       const labeled = (im.ann_count || 0) > 0;
+      const approved = im.approved === true;
       const active = i === S.curIdx;
+      const metaClass = approved && !active ? ' approved' : (labeled && !active ? ' ok' : '');
       return `
-        <div class="ml-studio-task-item${active ? ' active' : ''}" data-idx="${i}">
+        <div class="ml-studio-task-item${active ? ' active' : ''}${approved ? ' approved' : ''}" data-idx="${i}">
           <div class="t-thumb">${sprite('image')}</div>
           <div class="t-body">
             <div class="t-name">${escapeHtml(im.file_name)}</div>
-            <div class="t-meta${labeled && !active ? ' ok' : ''}">${active ? '' : (labeled ? sprite('check') : '')}${escapeHtml(imageStatus(im, i))}</div>
+            <div class="t-meta${metaClass}">${active ? '' : (approved || labeled ? sprite('check') : '')}${escapeHtml(imageStatus(im, i))}</div>
           </div>
         </div>`;
     }).join('');
@@ -3227,10 +3237,14 @@ function renderRecogAnnotateTab(panel, p) {
       <span class="ml-studio-annotate-pos">${S.curIdx + 1}/${S.images.length}</span>
       <tf-button id="ml-studio-annotate-next" variant="ghost" icon="chevron-right"></tf-button>
       <span class="ml-studio-annotate-filemeta">${escapeHtml(im?.file_name || '')} · ${S.origW}×${S.origH}</span>
-      <tf-button id="ml-studio-annotate-save" variant="primary" icon="download">Zapisz anotacje</tf-button>`;
+      <div class="ml-studio-annotate-save-group">
+        <tf-button id="ml-studio-annotate-save" variant="secondary" icon="download">${escapeHtml(I18n.t('ml_studio.annotate.save'))}</tf-button>
+        <tf-button id="ml-studio-annotate-save-approve" variant="primary" icon="check">${escapeHtml(I18n.t('ml_studio.annotate.save_and_approve'))}</tf-button>
+      </div>`;
     byId('ml-studio-annotate-prev').addEventListener('click', () => maybeLeave(() => selectImage(S.curIdx - 1)));
     byId('ml-studio-annotate-next').addEventListener('click', () => maybeLeave(() => selectImage(S.curIdx + 1)));
-    byId('ml-studio-annotate-save').addEventListener('click', saveAnns);
+    byId('ml-studio-annotate-save').addEventListener('click', () => saveAnns(false));
+    byId('ml-studio-annotate-save-approve').addEventListener('click', () => saveAnns(true));
   }
 
   function renderStage(src) {
@@ -3449,8 +3463,10 @@ function renderRecogAnnotateTab(panel, p) {
     host.innerHTML = `<span class="ml-studio-annotate-attr-lookup-hit">${sprite('check')} ${escapeHtml(String(value))} → ${mapped}</span>`;
   }
 
-  async function saveAnns() {
-    const btn = byId('ml-studio-annotate-save'); btn?.setAttribute('disabled', '');
+  async function saveAnns(approve = false) {
+    const btn = byId('ml-studio-annotate-save');
+    const btnApprove = byId('ml-studio-annotate-save-approve');
+    btn?.setAttribute('disabled', ''); btnApprove?.setAttribute('disabled', '');
     try {
       const anns = S.boxes.filter((b) => b.w >= 3 && b.h >= 3).map((b) => {
         const out = {
@@ -3461,14 +3477,16 @@ function renderRecogAnnotateTab(panel, p) {
         return out;
       });
       const resp = await ApiBinary.one('mlStudioRecogSaveAnnotationsRequest', {
-        datasetId: S.datasetId, imageId: S.images[S.curIdx].image_id, annotationsJson: JSON.stringify(anns),
+        datasetId: S.datasetId, imageId: S.images[S.curIdx].image_id, annotationsJson: JSON.stringify(anns), approve,
       });
       if (!resp.ok) throw new Error(resp.error || 'zapis nieudany');
       S.dirty = false;
-      S.images[S.curIdx].ann_count = anns.length; renderProgress(); renderTaskList();
-      toast('Anotacje zapisane.', 'success');
-    } catch (err) { toast(`Zapis anotacji: ${err.message}`, 'error'); }
-    finally { btn?.removeAttribute('disabled'); }
+      S.images[S.curIdx].ann_count = anns.length;
+      if (approve) S.images[S.curIdx].approved = true;
+      renderProgress(); renderTaskList();
+      toast(I18n.t(approve ? 'ml_studio.annotate.saved_approved' : 'ml_studio.annotate.saved'), 'success');
+    } catch (err) { toast(`${I18n.t('ml_studio.annotate.save')}: ${err.message}`, 'error'); }
+    finally { btn?.removeAttribute('disabled'); btnApprove?.removeAttribute('disabled'); }
   }
 
   // Skróty klawiszowe: Delete usuwa zaznaczoną ramkę, 1-9 przypisuje klasę.

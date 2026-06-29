@@ -3124,13 +3124,14 @@ export const encode = {
   },
 
   /** MlStudioBody(RecogSaveAnnotationsRequest) — zapis bboxów obrazu do COCO.
-   * payload: { datasetId, imageId, annotationsJson }. */
+   * payload: { datasetId, imageId, annotationsJson, approve }. */
   mlStudioRecogSaveAnnotationsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMlStudioRecogSaveAnnotationsRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.imageId ?? payload.image_id ?? ''),
       String(payload.annotationsJson ?? payload.annotations_json ?? '[]'),
+      Boolean(payload.approve ?? false),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

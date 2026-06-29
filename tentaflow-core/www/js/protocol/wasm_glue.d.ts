@@ -789,7 +789,7 @@ export function encodeMlStudioRecogImageRequest(dataset_id: string, image_id: st
 
 export function encodeMlStudioRecogImagesListRequest(dataset_id: string): Uint8Array;
 
-export function encodeMlStudioRecogSaveAnnotationsRequest(dataset_id: string, image_id: string, annotations_json: string): Uint8Array;
+export function encodeMlStudioRecogSaveAnnotationsRequest(dataset_id: string, image_id: string, annotations_json: string, approve: boolean): Uint8Array;
 
 export function encodeMlStudioRecogTrainStartRequest(project_id: string, dataset_id: string, variant: string, epochs: number, batch_size: number, grad_accum: number, learning_rate: number, resolution: number, early_stopping: boolean, target_node_id?: string | null): Uint8Array;
 
@@ -1523,7 +1523,7 @@ export interface InitOutput {
     readonly encodeMlStudioRecogDetectRequest: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly encodeMlStudioRecogImageRequest: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly encodeMlStudioRecogImagesListRequest: (a: number, b: number) => [number, number, number, number];
-    readonly encodeMlStudioRecogSaveAnnotationsRequest: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly encodeMlStudioRecogSaveAnnotationsRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly encodeMlStudioRecogTrainStartRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => [number, number, number, number];
     readonly encodeMlStudioRecogTrainStatusRequest: (a: number, b: number) => [number, number, number, number];
     readonly encodeMlStudioResourceGrantCreateRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];

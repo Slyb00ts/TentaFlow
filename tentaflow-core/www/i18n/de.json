@@ -3122,5 +3122,18 @@
     "access_err_load": "Zugriffsanforderungen konnten nicht geladen werden",
     "access_advance_blocked": "Erforderlichen Zugriff vor dem Fortfahren gewähren oder entfernen.",
     "access_required_blocked": "Erforderlicher Zugriff wurde nicht gewährt"
+  },
+  "ml_studio": {
+    "annotate": {
+      "save": "Speichern",
+      "save_and_approve": "Speichern und bestätigen",
+      "approved": "Bestätigt",
+      "saved": "Anmerkungen gespeichert.",
+      "saved_approved": "Gespeichert und bestätigt.",
+      "editing_now": "wird bearbeitet",
+      "unlabeled": "nicht markiert",
+      "boxes": "{n} Boxen",
+      "progress_meta": "{labeled} von {total} markiert · {approved} bestätigt"
+    }
   }
 }

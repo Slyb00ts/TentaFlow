@@ -2277,6 +2277,7 @@ pub fn encode_ml_studio_recog_save_annotations_request(
     dataset_id: String,
     image_id: String,
     annotations_json: String,
+    approve: bool,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsRequest(
@@ -2284,6 +2285,7 @@ pub fn encode_ml_studio_recog_save_annotations_request(
                 dataset_id,
                 image_id,
                 annotations_json,
+                approve,
             },
         ),
     ))
@@ -9765,6 +9767,7 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "dataset_id", req.dataset_id.into());
             set(obj, "imageId", req.image_id.clone().into());
             set(obj, "image_id", req.image_id.into());
+            set(obj, "approve", req.approve.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsResponse(resp) => {
             set(obj, "variant", "MlStudioRecogSaveAnnotationsResponse".into());

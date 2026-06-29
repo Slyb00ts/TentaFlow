@@ -3122,5 +3122,18 @@
     "access_err_load": "Impossible de charger les exigences d’accès",
     "access_advance_blocked": "Accordez ou supprimez l’accès requis avant de continuer.",
     "access_required_blocked": "L’accès requis n’a pas été accordé"
+  },
+  "ml_studio": {
+    "annotate": {
+      "save": "Enregistrer",
+      "save_and_approve": "Enregistrer et valider",
+      "approved": "Validé",
+      "saved": "Annotations enregistrées.",
+      "saved_approved": "Enregistré et validé.",
+      "editing_now": "en cours d’édition",
+      "unlabeled": "non annoté",
+      "boxes": "{n} cadres",
+      "progress_meta": "{labeled} sur {total} annotés · {approved} validés"
+    }
   }
 }

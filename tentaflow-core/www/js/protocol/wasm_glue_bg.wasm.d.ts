@@ -206,7 +206,7 @@ export const encodeMlStudioRecogDatasetRegisterRequest: (a: number, b: number, c
 export const encodeMlStudioRecogDetectRequest: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const encodeMlStudioRecogImageRequest: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const encodeMlStudioRecogImagesListRequest: (a: number, b: number) => [number, number, number, number];
-export const encodeMlStudioRecogSaveAnnotationsRequest: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const encodeMlStudioRecogSaveAnnotationsRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
 export const encodeMlStudioRecogTrainStartRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => [number, number, number, number];
 export const encodeMlStudioRecogTrainStatusRequest: (a: number, b: number) => [number, number, number, number];
 export const encodeMlStudioResourceGrantCreateRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];

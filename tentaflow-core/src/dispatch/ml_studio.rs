@@ -2586,6 +2586,7 @@ pub fn ml_studio_recog_save_annotations(
         &dir,
         &payload.image_id,
         &payload.annotations_json,
+        payload.approve,
     ) {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),

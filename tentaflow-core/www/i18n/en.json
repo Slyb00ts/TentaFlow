@@ -4205,5 +4205,18 @@
       "restricted": "restricted",
       "public": "public"
     }
+  },
+  "ml_studio": {
+    "annotate": {
+      "save": "Save",
+      "save_and_approve": "Save and approve",
+      "approved": "Approved",
+      "saved": "Annotations saved.",
+      "saved_approved": "Saved and approved.",
+      "editing_now": "editing now",
+      "unlabeled": "unlabeled",
+      "boxes": "{n} boxes",
+      "progress_meta": "{labeled} of {total} labeled · {approved} approved"
+    }
   }
 }
