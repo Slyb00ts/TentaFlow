@@ -664,6 +664,26 @@ fn create_venv(python: &Path, venv: &Path, log: &LogSink) -> Result<()> {
     .context("tworzenie venv")
 }
 
+/// Per-template-dir build lock. Engines that share a bundle (the three YOLOX
+/// detectors: page-elements / graphic-elements / table-structure) resolve to the
+/// SAME template venv and deploy concurrently at boot. Without serialization they
+/// all run `remove_dir_all` + `python -m venv` + `install_deps` on the same dir
+/// at once: one wins, the others hit a half-built venv ("tworzenie venv exit 1"),
+/// fail, and only recover on a later respawn. All deploys live in this one Core
+/// process, so an in-process lock per template dir is enough — different templates
+/// never contend.
+fn template_build_lock(template_dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(template_dir.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 fn prepare_template_env(
     cache: &Path,
     python: &Path,
@@ -679,6 +699,13 @@ fn prepare_template_env(
         .join(&spec.bundle.engine)
         .join(&template_id)
         .join("venv");
+
+    // Serialize the reuse-check + build for THIS template so concurrent deploys of
+    // engines sharing the bundle don't race on the same venv dir. Held through the
+    // whole build; a waiter that wakes after the winner finishes sees the
+    // completion marker below and reuses.
+    let build_lock = template_build_lock(&template_dir);
+    let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Marker pisany dopiero po SUKCESIE install_deps + copy_bundle_files.
     // pyvenv.cfg powstaje na samym poczatku `python -m venv`, wiec gdy uv
