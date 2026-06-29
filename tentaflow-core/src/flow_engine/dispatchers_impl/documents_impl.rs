@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use super::ModelRuntimeSlot;
 use crate::flow_engine::dispatchers::DocumentsDispatcher;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
-use crate::services::runtime::executor::DocumentInferRequest;
+use crate::services::runtime::executor::{DocumentInferRequest, DocumentParseRequest};
 
 use tentaflow_protocol::DocumentInferResult;
 
@@ -62,5 +62,32 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
         Ok(DocumentInferResult {
             regions: response.regions,
         })
+    }
+
+    async fn parse(&self, model: &str, image: &[u8], mime: &str) -> Result<String, String> {
+        if image.is_empty() {
+            return Err("DocumentsDispatcher: empty image".to_string());
+        }
+
+        let request = DocumentParseRequest {
+            model: model.to_string(),
+            image_bytes: image.to_vec(),
+            mime: mime.to_string(),
+            flow_depth: 0,
+        };
+
+        let mut rctx = RuntimeContext::default();
+        let runtime = self
+            .runtime
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "DocumentsDispatcher: ModelRuntimeExecutor not wired".to_string())?;
+        let response = runtime
+            .execute_documents(request, &mut rctx)
+            .await
+            .map_err(|e| format!("DocumentsDispatcher: {e}"))?;
+
+        Ok(response.markdown)
     }
 }

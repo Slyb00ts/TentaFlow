@@ -650,6 +650,14 @@ pub mod test_support {
                 regions: Vec::new(),
             })
         }
+        async fn parse(
+            &self,
+            _model: &str,
+            _image: &[u8],
+            _mime: &str,
+        ) -> std::result::Result<String, String> {
+            Ok(String::new())
+        }
     }
 
     pub struct StubStt;
