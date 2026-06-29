@@ -3122,5 +3122,18 @@
     "access_err_load": "No se pudieron cargar los requisitos de acceso",
     "access_advance_blocked": "Concede o elimina el acceso requerido antes de continuar.",
     "access_required_blocked": "El acceso requerido no se ha concedido"
+  },
+  "ml_studio": {
+    "annotate": {
+      "save": "Guardar",
+      "save_and_approve": "Guardar y aprobar",
+      "approved": "Aprobado",
+      "saved": "Anotaciones guardadas.",
+      "saved_approved": "Guardado y aprobado.",
+      "editing_now": "editando ahora",
+      "unlabeled": "sin etiquetar",
+      "boxes": "{n} cuadros",
+      "progress_meta": "{labeled} de {total} etiquetados · {approved} aprobados"
+    }
   }
 }

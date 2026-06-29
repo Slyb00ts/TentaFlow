@@ -4150,16 +4150,17 @@ export function encodeMlStudioRecogImagesListRequest(dataset_id) {
  * @param {string} dataset_id
  * @param {string} image_id
  * @param {string} annotations_json
+ * @param {boolean} approve
  * @returns {Uint8Array}
  */
-export function encodeMlStudioRecogSaveAnnotationsRequest(dataset_id, image_id, annotations_json) {
+export function encodeMlStudioRecogSaveAnnotationsRequest(dataset_id, image_id, annotations_json, approve) {
     const ptr0 = passStringToWasm0(dataset_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(image_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(annotations_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeMlStudioRecogSaveAnnotationsRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    const ret = wasm.encodeMlStudioRecogSaveAnnotationsRequest(ptr0, len0, ptr1, len1, ptr2, len2, approve);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

@@ -1793,6 +1793,9 @@ pub struct MlStudioRecogSaveAnnotationsRequest {
     pub dataset_id: String,
     pub image_id: String,
     pub annotations_json: String,
+    /// `true` = zapis + oznaczenie obrazu jako zatwierdzony; `false` = sam zapis
+    /// (istniejący stan zatwierdzenia pozostaje nietknięty).
+    pub approve: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

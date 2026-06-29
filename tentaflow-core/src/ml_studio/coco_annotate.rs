@@ -79,6 +79,7 @@ pub fn list_images(dir: &Path) -> anyhow::Result<(String, String)> {
                     "width": im.get("width").and_then(|v| v.as_i64()).unwrap_or(0),
                     "height": im.get("height").and_then(|v| v.as_i64()).unwrap_or(0),
                     "ann_count": counts.get(&id).copied().unwrap_or(0),
+                    "approved": im.get("approved").and_then(|v| v.as_bool()).unwrap_or(false),
                 }));
             }
         }
@@ -171,8 +172,15 @@ pub fn get_image(
 
 /// Zapisuje edytowane bboxy obrazu z powrotem do `_annotations.coco.json` splitu:
 /// usuwa stare anotacje tego obrazu, dopisuje nowe (świeże id), reszta bez zmian.
+/// Gdy `approve` = true, oznacza rekord obrazu jako zatwierdzony (`approved: true`);
+/// przy zwykłym zapisie istniejący stan zatwierdzenia pozostaje nietknięty.
 /// Zapis atomowy (temp + rename), by nie uszkodzić pliku przy błędzie.
-pub fn save_annotations(dir: &Path, image_id: &str, annotations_json: &str) -> anyhow::Result<()> {
+pub fn save_annotations(
+    dir: &Path,
+    image_id: &str,
+    annotations_json: &str,
+    approve: bool,
+) -> anyhow::Result<()> {
     let (split, coco_id) = split_image_id(image_id)?;
     let path = annot_path(dir, &split);
     let buf = std::fs::read(&path)?;
@@ -219,6 +227,17 @@ pub fn save_annotations(dir: &Path, image_id: &str, annotations_json: &str) -> a
         }
         arr.push(ann);
         next_id += 1;
+    }
+
+    if approve {
+        if let Some(imgs) = coco.get_mut("images").and_then(|i| i.as_array_mut()) {
+            if let Some(im) = imgs
+                .iter_mut()
+                .find(|im| im.get("id").and_then(|v| v.as_i64()) == Some(coco_id))
+            {
+                im["approved"] = json!(true);
+            }
+        }
     }
 
     let tmp = path.with_extension("json.tmp");

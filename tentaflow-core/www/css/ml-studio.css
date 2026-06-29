@@ -2564,7 +2564,12 @@
   font-size: 10px; color: var(--text-3); display: flex; align-items: center; gap: 4px;
 }
 .ml-studio-task-item .t-meta.ok { color: var(--success); }
+.ml-studio-task-item .t-meta.approved { color: var(--accent-1); font-weight: 700; }
+.ml-studio-task-item.approved { border-color: color-mix(in srgb, var(--accent-1) 45%, transparent); }
+.ml-studio-task-item.approved.active { border-color: var(--accent-1); }
 .ml-studio-task-item .t-meta .icon { width: 11px; height: 11px; }
+
+.ml-studio-annotate-save-group { display: flex; gap: 8px; align-items: center; }
 
 /* ----- CENTRUM: płótno ----- */
 .ml-studio-annotate-canvas {
