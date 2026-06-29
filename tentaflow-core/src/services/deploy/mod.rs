@@ -936,6 +936,85 @@ async fn kill_listener_on_port(port: u16) {
     }
 }
 
+/// DELETE-time belt-and-suspenders. `stop()` only targets the row's recorded
+/// `runtime_pid`/`runtime_port`; after a prior non-graceful Core exit those drift
+/// or go stale, so the real runtime survives a delete and becomes an untraceable
+/// orphan (the observed ghost `tentaflow-<engine>-<port>` container / detached
+/// native process). This sweep kills EVERY runtime that belongs to `engine_id`,
+/// matched by the deterministic container name (`tentaflow-<engine>-<port>`) and
+/// native instance marker (`bundle-instances/<engine>/<engine>-<port>`), independent
+/// of DB tracking. `keep_ports` (ports of sibling rows of the same engine that are
+/// NOT being deleted) are skipped so a second live instance is not collaterally
+/// killed. Engine ids are matched with a trailing numeric port so deleting `vllm`
+/// never sweeps `vllm-spark`. Best-effort; all errors swallowed.
+pub async fn stop_engine_orphans(engine_id: &str, keep_ports: &[u16]) {
+    // Native: any process whose argv carries this engine's instance dir.
+    let marker = format!("bundle-instances/{}/", engine_id);
+    let inst_prefix = format!("{}-", engine_id);
+    if let Ok(out) = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .await
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid_s, args)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Some(idx) = args.find(&marker) else { continue };
+            // Path segment right after the marker is `<engine>-<port>`.
+            let inst = args[idx + marker.len()..].split('/').next().unwrap_or("");
+            let port = inst.strip_prefix(&inst_prefix).and_then(|s| s.parse::<u16>().ok());
+            if let Some(p) = port {
+                if keep_ports.contains(&p) {
+                    continue;
+                }
+            }
+            if let Ok(pid) = pid_s.trim().parse::<u32>() {
+                let _ = crate::deploy::process_ctl::terminate(pid);
+            }
+        }
+    }
+
+    // Docker: any container named exactly `tentaflow-<engine>-<port>`.
+    #[cfg(feature = "docker")]
+    if let Ok(docker) = bollard::Docker::connect_with_local_defaults() {
+        let name_prefix = format!("tentaflow-{}-", engine_id);
+        if let Ok(o) = tokio::process::Command::new("docker")
+            .args(["ps", "-a", "--format", "{{.Names}}"])
+            .output()
+            .await
+        {
+            for name in String::from_utf8_lossy(&o.stdout).lines() {
+                let name = name.trim();
+                let Some(rest) = name.strip_prefix(&name_prefix) else {
+                    continue;
+                };
+                // Suffix must be ONLY the port digits — excludes `vllm-spark-*`
+                // when sweeping `vllm`.
+                if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                if let Ok(p) = rest.parse::<u16>() {
+                    if keep_ports.contains(&p) {
+                        continue;
+                    }
+                }
+                let _ = docker.stop_container(name, None).await;
+                let _ = docker
+                    .remove_container(
+                        name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
 fn find_listener_pid(port: u16) -> Option<u32> {
     let out = std::process::Command::new("ss")
         .args(["-Hlntp", &format!("sport = :{}", port)])

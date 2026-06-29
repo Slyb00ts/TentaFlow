@@ -948,7 +948,10 @@ pub fn model_install(
 #[handler(variant = "ModelDeleteRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+pub async fn model_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
     let model_id = match req {
         MessageBody::ModelDeleteRequest { model_id } => model_id,
         _ => return Err(ProtocolError::bad_request("expected ModelDeleteRequest")),
@@ -970,16 +973,34 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         (row.service_id, row.engine_id)
     };
 
-    let _ = engine_id; // mesh dereg now driven by supervisor + services_repo delete
-
+    // Stop the runtime BEFORE dropping the row — same contract as service_delete.
+    // Without this the process/container is orphaned with no DB trace (the model
+    // list's delete must clean up exactly like the service list's).
+    if let (Ok(svc), Some(port_allocator)) =
+        (fetch_service_row(ctx, service_id), ctx.state.port_allocator.clone())
     {
+        let _ = crate::services::deploy::stop(&svc, port_allocator).await;
+    }
+
+    // Delete the row and read sibling ports under the SAME guard, in a sync block
+    // so the DB guard drops before the await below (the future must stay `Send`).
+    let keep_ports: Vec<u16> = {
         let conn = ctx
             .state
             .db
             .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
-    }
+        crate::services_repo::services::list_all(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.engine_id == engine_id)
+            .filter_map(|r| r.runtime_port)
+            .collect()
+    };
+
+    // Belt-and-suspenders sweep for port-drift / stale-pid orphans of this engine.
+    crate::services::deploy::stop_engine_orphans(&engine_id, &keep_ports).await;
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -9268,13 +9289,29 @@ pub async fn service_delete(
         .err()
         .map(|e| e.to_string());
 
-    let conn = ctx
-        .state
-        .db
-        .write()
-        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-    crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
-    drop(conn);
+    // Delete the row and, under the SAME guard, read the ports still owned by
+    // sibling rows of this engine. Confined to a sync block so the DB guard is
+    // dropped before the await below (the future must stay `Send`).
+    let keep_ports: Vec<u16> = {
+        let conn = ctx
+            .state
+            .db
+            .write()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+        crate::services_repo::services::list_all(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.engine_id == svc.engine_id)
+            .filter_map(|r| r.runtime_port)
+            .collect()
+    };
+
+    // Belt-and-suspenders: `stop()` only targeted the row's recorded pid/port.
+    // Sweep any runtime of this engine that drifted ports or lost its pid to a
+    // prior non-graceful Core exit, so a delete can't leave an untraceable orphan.
+    crate::services::deploy::stop_engine_orphans(&svc.engine_id, &keep_ports).await;
+
     // Service row gone — refresh the catalog so its model entries stop
     // appearing on `/v1/models`. Supervisor reconcile would catch this on
     // its next tick, but desktop has no supervisor and even on the binary
