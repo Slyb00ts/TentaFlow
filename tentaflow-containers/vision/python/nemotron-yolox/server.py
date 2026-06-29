@@ -16,6 +16,7 @@ import base64
 import logging
 import os
 import re
+import threading
 
 import cv2
 import numpy as np
@@ -260,16 +261,50 @@ def _bounding_boxes_nim(
     return grupy
 
 
-DEVICE = _wymagaj_gpu()
 # Docker mapuje MODEL->MODEL_REPO w entrypoincie; native (python-bundle) nie ma
 # entrypointu i Core wstrzykuje tylko MODEL — czytamy MODEL_REPO z fallbackiem.
 MODEL_REPO = os.environ.get("MODEL_REPO") or os.environ.get("MODEL")
 if not MODEL_REPO:
     raise RuntimeError("Brak env MODEL_REPO/MODEL — nie wiadomo ktore repo modelu zaladowac.")
-MODEL, LICZBA_KLAS = _zbuduj_model(MODEL_REPO, DEVICE)
-ETYKIETY = _wybierz_etykiety(MODEL_REPO, LICZBA_KLAS)
+
+# Model ladowany leniwie w watku tla: budowa sieci + pobranie wag .pth z HF +
+# pierwsza inicjalizacja CUDA (na nowych GPU jak B300/sm_103 pierwszy `.to(cuda)`
+# kompiluje kernele JIT i potrafi trwac dziesiatki sekund). Synchroniczne
+# ladowanie na top-levelu blokowalo start uvicorna — serwer NIGDY nie zaczynal
+# nasluchu, /health nie odpowiadal, deploy w Core wisil i przy restarcie zostawal
+# osierocony proces. W tle /health odpowiada od razu, /v1/infer zwraca 503 do
+# czasu gotowosci. Wzorzec spojny z nemotron-ocr/server.py.
+_state: dict = {"model": None, "device": None, "labels": None, "error": None}
+_LOAD_LOCK = threading.Lock()
+
+
+def _ensure_model() -> None:
+    if _state["model"] is not None:
+        return
+    with _LOAD_LOCK:
+        if _state["model"] is not None:
+            return
+        device = _wymagaj_gpu()
+        model, liczba_klas = _zbuduj_model(MODEL_REPO, device)
+        _state["device"] = device
+        _state["labels"] = _wybierz_etykiety(MODEL_REPO, liczba_klas)
+        _state["model"] = model
+
+
+def _background_load() -> None:
+    try:
+        _ensure_model()
+    except Exception as exc:  # noqa: BLE001 — zapamietujemy blad dla /health i /v1/infer
+        _state["error"] = str(exc)
+        logger.exception("Ladowanie modelu %s nie powiodlo sie", MODEL_REPO)
+
 
 app = FastAPI(title="nemotron-yolox")
+
+
+@app.on_event("startup")
+def _start_background_load() -> None:
+    threading.Thread(target=_background_load, name="model-load", daemon=True).start()
 
 
 class InputImage(BaseModel):
@@ -298,13 +333,18 @@ def _decode_data_url(url: str) -> np.ndarray:
 
 @app.get("/health")
 def health() -> dict:
+    """Zawsze 200 — health probe Core ma odpowiedz od razu, niezaleznie od
+    postepu ladowania modelu. `ready` rozroznia model gotowy / w trakcie / blad."""
+    ready = _state["model"] is not None
     return {
         "status": "ok",
+        "ready": ready,
         "model": MODEL_REPO,
-        "labels": ETYKIETY,
-        "device": str(DEVICE),
+        "labels": _state["labels"],
+        "device": str(_state["device"]) if _state["device"] is not None else None,
         "cuda": torch.version.cuda,
         "hip": getattr(torch.version, "hip", None),
+        "error": _state["error"],
     }
 
 
@@ -313,17 +353,25 @@ async def infer(req: InferRequest) -> dict:
     if not req.input:
         raise HTTPException(status_code=400, detail="Pole 'input' nie moze byc puste.")
 
+    model = _state["model"]
+    if model is None:
+        if _state["error"] is not None:
+            raise HTTPException(status_code=503, detail=f"Model nie zaladowal sie: {_state['error']}")
+        raise HTTPException(status_code=503, detail="Model jeszcze sie laduje — sprobuj ponownie.")
+    device = _state["device"]
+    etykiety = _state["labels"]
+
     data = []
     for indeks, wejscie in enumerate(req.input):
         obraz = _decode_data_url(wejscie.url)
         wys, szer = obraz.shape[0], obraz.shape[1]
-        tensor, skala = _preprocess(obraz, DEVICE)
+        tensor, skala = _preprocess(obraz, device)
         with torch.no_grad():
-            wyjscie = MODEL(tensor)
+            wyjscie = model(tensor)
         wyjscie = wyjscie.detach().to("cpu", dtype=torch.float32).numpy()
         detekcje = _postprocess(wyjscie, skala)
         data.append(
-            {"index": indeks, "bounding_boxes": _bounding_boxes_nim(detekcje, ETYKIETY, szer, wys)}
+            {"index": indeks, "bounding_boxes": _bounding_boxes_nim(detekcje, etykiety, szer, wys)}
         )
 
     return {"data": data}
